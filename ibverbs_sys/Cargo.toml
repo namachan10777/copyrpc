@@ -1,0 +1,14 @@
+[package]
+name = "ibverbs_sys"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+ofed = []
+
+[dependencies]
+libc.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true
+bindgen.workspace = true
