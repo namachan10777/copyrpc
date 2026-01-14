@@ -9,10 +9,6 @@ fn main() {
 
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
-        .allowlist_function("mlx5dv_.*")
-        .allowlist_type("mlx5dv_.*")
-        .allowlist_type("mlx5_.*")
-        .allowlist_var("MLX5.*")
         // mlx5_wqe_ctrl_seg has both __packed__ and __aligned__(4) which Rust doesn't support
         .blocklist_type("mlx5_wqe_ctrl_seg")
         .layout_tests(false)

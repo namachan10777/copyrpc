@@ -1,11 +1,11 @@
 use std::{io, mem::MaybeUninit, ops::Deref, ptr::NonNull};
 
 pub struct Device {
-    device: NonNull<ibverbs_sys::ibv_device>,
+    device: NonNull<mlx5_sys::ibv_device>,
 }
 
 pub struct DeviceList {
-    list: NonNull<*mut ibverbs_sys::ibv_device>,
+    list: NonNull<*mut mlx5_sys::ibv_device>,
     list_ref: Box<[Device]>,
 }
 
@@ -13,7 +13,7 @@ impl DeviceList {
     pub fn list() -> io::Result<Self> {
         unsafe {
             let mut num_devices = MaybeUninit::uninit();
-            let list = ibverbs_sys::ibv_get_device_list(num_devices.as_mut_ptr());
+            let list = mlx5_sys::ibv_get_device_list(num_devices.as_mut_ptr());
             let Some(list) = NonNull::new(list) else {
                 return Err(io::Error::last_os_error());
             };
@@ -31,7 +31,7 @@ impl DeviceList {
 impl Drop for DeviceList {
     fn drop(&mut self) {
         unsafe {
-            ibverbs_sys::ibv_free_device_list(self.list.as_ptr());
+            mlx5_sys::ibv_free_device_list(self.list.as_ptr());
         }
     }
 }
@@ -44,13 +44,15 @@ impl Deref for DeviceList {
 }
 
 pub struct Context {
-    ctx: NonNull<ibverbs_sys::ibv_context>,
+    ctx: NonNull<mlx5_sys::ibv_context>,
 }
 
 impl Device {
+    /// Open the device with mlx5dv_open_device.
     pub fn open(&self) -> io::Result<Context> {
         unsafe {
-            let ctx = ibverbs_sys::ibv_open_device(self.device.as_ptr());
+            let mut attr: mlx5_sys::mlx5dv_context_attr = std::mem::zeroed();
+            let ctx = mlx5_sys::mlx5dv_open_device(self.device.as_ptr(), &mut attr);
             NonNull::new(ctx).map_or(Err(io::Error::last_os_error()), |ctx| Ok(Context { ctx }))
         }
     }
@@ -59,7 +61,21 @@ impl Device {
 impl Drop for Context {
     fn drop(&mut self) {
         unsafe {
-            ibverbs_sys::ibv_close_device(self.ctx.as_ptr());
+            mlx5_sys::ibv_close_device(self.ctx.as_ptr());
+        }
+    }
+}
+
+impl Context {
+    /// Query mlx5 device attributes.
+    pub fn query_device(&self) -> io::Result<mlx5_sys::mlx5dv_context> {
+        unsafe {
+            let mut attrs: MaybeUninit<mlx5_sys::mlx5dv_context> = MaybeUninit::zeroed();
+            let ret = mlx5_sys::mlx5dv_query_device(self.ctx.as_ptr(), attrs.as_mut_ptr());
+            if ret != 0 {
+                return Err(io::Error::from_raw_os_error(-ret));
+            }
+            Ok(attrs.assume_init())
         }
     }
 }
