@@ -118,10 +118,13 @@ impl Context {
     ///
     /// # Errors
     /// Returns an error if the query fails.
-    pub fn query_ibv_device(&self) -> io::Result<mlx5_sys::ibv_device_attr> {
+    pub fn query_ibv_device(&self) -> io::Result<crate::types::DeviceAttr> {
         unsafe {
-            let mut attrs: MaybeUninit<mlx5_sys::ibv_device_attr> = MaybeUninit::uninit();
-            let ret = mlx5_sys::ibv_query_device(self.ctx.as_ptr(), attrs.as_mut_ptr());
+            let mut attrs: MaybeUninit<crate::types::DeviceAttr> = MaybeUninit::uninit();
+            let ret = mlx5_sys::ibv_query_device(
+                self.ctx.as_ptr(),
+                attrs.as_mut_ptr() as *mut mlx5_sys::ibv_device_attr,
+            );
             if ret != 0 {
                 return Err(io::Error::from_raw_os_error(-ret));
             }
@@ -134,7 +137,7 @@ impl Context {
     /// Returns HW device-specific information important for data-path
     /// that isn't provided by [`query_ibv_device()`](Self::query_ibv_device).
     ///
-    /// The returned [`mlx5dv_context`](mlx5_sys::mlx5dv_context) includes:
+    /// The returned [`Mlx5DeviceAttr`](crate::types::Mlx5DeviceAttr) includes:
     /// - `version`: Format version of internal hardware structures
     /// - `flags`: Device capability flags (CQE version, MPW support, etc.)
     /// - `comp_mask`: Indicates which optional fields are valid
@@ -147,10 +150,41 @@ impl Context {
     ///
     /// # Errors
     /// Returns an error if the query fails.
-    pub fn query_mlx5_device(&self) -> io::Result<mlx5_sys::mlx5dv_context> {
+    pub fn query_mlx5_device(&self) -> io::Result<crate::types::Mlx5DeviceAttr> {
         unsafe {
-            let mut attrs: MaybeUninit<mlx5_sys::mlx5dv_context> = MaybeUninit::zeroed();
-            let ret = mlx5_sys::mlx5dv_query_device(self.ctx.as_ptr(), attrs.as_mut_ptr());
+            let mut attrs: MaybeUninit<crate::types::Mlx5DeviceAttr> = MaybeUninit::zeroed();
+            let ret = mlx5_sys::mlx5dv_query_device(
+                self.ctx.as_ptr(),
+                attrs.as_mut_ptr() as *mut mlx5_sys::mlx5dv_context,
+            );
+            if ret != 0 {
+                return Err(io::Error::from_raw_os_error(-ret));
+            }
+            Ok(attrs.assume_init())
+        }
+    }
+
+    /// Query port attributes.
+    ///
+    /// Returns attributes for the specified port, including:
+    /// - Port state (down, init, armed, active)
+    /// - MTU settings
+    /// - LID (Local Identifier)
+    /// - Link layer type (InfiniBand or Ethernet/RoCE)
+    ///
+    /// # Arguments
+    /// * `port_num` - Port number (1-based)
+    ///
+    /// # Errors
+    /// Returns an error if the query fails.
+    pub fn query_port(&self, port_num: u8) -> io::Result<crate::types::PortAttr> {
+        unsafe {
+            let mut attrs: MaybeUninit<crate::types::PortAttr> = MaybeUninit::uninit();
+            let ret = mlx5_sys::ibv_query_port_ex(
+                self.ctx.as_ptr(),
+                port_num,
+                attrs.as_mut_ptr() as *mut mlx5_sys::ibv_port_attr,
+            );
             if ret != 0 {
                 return Err(io::Error::from_raw_os_error(-ret));
             }
