@@ -1,15 +1,40 @@
+//! Device enumeration and context management.
+//!
+//! This module provides access to mlx5 RDMA devices via the mlx5dv API.
+
 use std::{io, mem::MaybeUninit, ops::Deref, ptr::NonNull};
 
+/// An RDMA device.
+///
+/// Represents a single InfiniBand or RoCE device in the system.
+/// Use [`DeviceList::list()`] to enumerate available devices.
 pub struct Device {
     device: NonNull<mlx5_sys::ibv_device>,
 }
 
+/// A list of available RDMA devices.
+///
+/// Obtained via [`DeviceList::list()`]. The list owns references to all
+/// devices and will free them when dropped.
+///
+/// # Example
+/// ```ignore
+/// let devices = DeviceList::list()?;
+/// for device in devices.iter() {
+///     let ctx = device.open()?;
+///     // use context...
+/// }
+/// ```
 pub struct DeviceList {
     list: NonNull<*mut mlx5_sys::ibv_device>,
     list_ref: Box<[Device]>,
 }
 
 impl DeviceList {
+    /// Get a list of available RDMA devices.
+    ///
+    /// # Errors
+    /// Returns an error if no devices are found or if the query fails.
     pub fn list() -> io::Result<Self> {
         unsafe {
             let mut num_devices = MaybeUninit::uninit();
@@ -43,12 +68,24 @@ impl Deref for DeviceList {
     }
 }
 
+/// An opened RDMA device context.
+///
+/// The context is required for creating RDMA resources such as Protection Domains,
+/// Queue Pairs, Completion Queues, etc.
+///
+/// Created via [`Device::open()`]. The device will be closed when the context is dropped.
 pub struct Context {
     pub(crate) ctx: NonNull<mlx5_sys::ibv_context>,
 }
 
 impl Device {
     /// Open the device with mlx5dv_open_device.
+    ///
+    /// Opens an RDMA device context with mlx5 provider attributes.
+    /// This is required before creating any RDMA resources.
+    ///
+    /// # Errors
+    /// Returns an error if the device cannot be opened.
     pub fn open(&self) -> io::Result<Context> {
         unsafe {
             let mut attr: mlx5_sys::mlx5dv_context_attr = std::mem::zeroed();
@@ -67,7 +104,20 @@ impl Drop for Context {
 }
 
 impl Context {
-    /// Query ibverbs device attributes.
+    /// Query standard ibverbs device attributes.
+    ///
+    /// Returns device attributes defined by the ibverbs API, including:
+    /// - Maximum supported QPs, CQs, MRs, PDs
+    /// - Maximum work requests, scatter/gather entries
+    /// - Device capabilities flags
+    /// - Physical port count
+    ///
+    /// Note: The maximum values returned are upper limits. Actual available
+    /// resources may be limited by machine configuration, host memory,
+    /// user permissions, and resources already in use.
+    ///
+    /// # Errors
+    /// Returns an error if the query fails.
     pub fn query_ibv_device(&self) -> io::Result<mlx5_sys::ibv_device_attr> {
         unsafe {
             let mut attrs: MaybeUninit<mlx5_sys::ibv_device_attr> = MaybeUninit::uninit();
@@ -79,7 +129,24 @@ impl Context {
         }
     }
 
-    /// Query mlx5 device attributes.
+    /// Query mlx5-specific device attributes.
+    ///
+    /// Returns HW device-specific information important for data-path
+    /// that isn't provided by [`query_ibv_device()`](Self::query_ibv_device).
+    ///
+    /// The returned [`mlx5dv_context`](mlx5_sys::mlx5dv_context) includes:
+    /// - `version`: Format version of internal hardware structures
+    /// - `flags`: Device capability flags (CQE version, MPW support, etc.)
+    /// - `comp_mask`: Indicates which optional fields are valid
+    /// - `cqe_comp_caps`: CQE compression capabilities
+    /// - `sw_parsing_caps`: Software parsing capabilities
+    /// - `striding_rq_caps`: Striding RQ capabilities
+    /// - `max_dynamic_bfregs`: Max blue-flame registers that can be dynamically allocated
+    /// - `dci_streams_caps`: DCI streams capabilities
+    /// - And more mlx5-specific capabilities
+    ///
+    /// # Errors
+    /// Returns an error if the query fails.
     pub fn query_mlx5_device(&self) -> io::Result<mlx5_sys::mlx5dv_context> {
         unsafe {
             let mut attrs: MaybeUninit<mlx5_sys::mlx5dv_context> = MaybeUninit::zeroed();
