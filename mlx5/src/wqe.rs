@@ -155,6 +155,58 @@ impl AddressVector {
 // WQE Opcodes and Flags
 // =============================================================================
 
+/// Tag Matching Segment (32 bytes).
+///
+/// Used for TM operations (TAG_ADD, TAG_DEL) via Command QP.
+pub struct TmSeg;
+
+impl TmSeg {
+    /// Size of the TM segment in bytes.
+    pub const SIZE: usize = 32;
+
+    /// Write the TM segment for TAG_ADD operation.
+    ///
+    /// # Safety
+    /// The pointer must point to at least 32 bytes of writable memory.
+    #[inline]
+    pub unsafe fn write_add(ptr: *mut u8, index: u16, tag: u64, mask: u64, signaled: bool) {
+        // opcode = MLX5_TM_OPCODE_APPEND << 4 = 0x10
+        std::ptr::write_volatile(ptr, 0x10);
+        // flags: TM_CQE_REQ = 0x80
+        let flags = if signaled { 0x80 } else { 0x00 };
+        std::ptr::write_volatile(ptr.add(1), flags);
+        // index (big-endian)
+        std::ptr::write_volatile(ptr.add(2) as *mut u16, index.to_be());
+        // rsvd0
+        std::ptr::write_volatile(ptr.add(4) as *mut u16, 0);
+        // sw_cnt
+        std::ptr::write_volatile(ptr.add(6) as *mut u16, 0);
+        // rsvd1
+        std::ptr::write_bytes(ptr.add(8), 0, 8);
+        // append_tag (big-endian)
+        std::ptr::write_volatile(ptr.add(16) as *mut u64, tag.to_be());
+        // append_mask (big-endian)
+        std::ptr::write_volatile(ptr.add(24) as *mut u64, mask.to_be());
+    }
+
+    /// Write the TM segment for TAG_DEL operation.
+    ///
+    /// # Safety
+    /// The pointer must point to at least 32 bytes of writable memory.
+    #[inline]
+    pub unsafe fn write_del(ptr: *mut u8, index: u16, signaled: bool) {
+        // opcode = MLX5_TM_OPCODE_REMOVE << 4 = 0x20
+        std::ptr::write_volatile(ptr, 0x20);
+        // flags
+        let flags = if signaled { 0x80 } else { 0x00 };
+        std::ptr::write_volatile(ptr.add(1), flags);
+        // index (big-endian)
+        std::ptr::write_volatile(ptr.add(2) as *mut u16, index.to_be());
+        // Clear remaining bytes
+        std::ptr::write_bytes(ptr.add(4), 0, 28);
+    }
+}
+
 /// WQE opcodes.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +220,7 @@ pub enum WqeOpcode {
     RdmaRead = 0x10,
     AtomicCs = 0x11,
     AtomicFa = 0x12,
+    TagMatching = 0x28,
 }
 
 /// WQE flags for fm_ce_se field.
