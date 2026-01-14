@@ -8,6 +8,10 @@ use std::{io, mem::MaybeUninit, ptr::NonNull};
 use crate::cq::CompletionQueue;
 use crate::device::Context;
 use crate::pd::ProtectionDomain;
+use crate::wqe::{
+    CtrlSeg, DataSeg, InlineHeader, RdmaSeg, ReceiveQueue, SendQueue, WQEBB_SIZE, WqeHandle,
+    WqeOpcode, calc_wqebb_cnt,
+};
 
 /// RC QP configuration.
 #[derive(Debug, Clone)]
@@ -82,12 +86,247 @@ pub struct QpInfo {
     pub sqn: u32,
 }
 
+// =============================================================================
+// Send Queue State
+// =============================================================================
+
+/// Send Queue state for direct WQE posting.
+pub(crate) struct SendQueueState {
+    /// SQ buffer base address
+    buf: *mut u8,
+    /// Number of WQEBBs (64-byte blocks)
+    wqe_cnt: u16,
+    /// SQ number
+    sqn: u32,
+    /// Producer index (next WQE slot)
+    pi: u16,
+    /// Consumer index (last completed WQE)
+    ci: u16,
+    /// Last posted WQE pointer and size (for BlueFlame)
+    last_wqe: Option<(*mut u8, usize)>,
+    /// Doorbell record pointer
+    dbrec: *mut u32,
+    /// BlueFlame register pointer
+    bf_reg: *mut u8,
+    /// BlueFlame size (64 or 0 if not available)
+    bf_size: u32,
+    /// Current BlueFlame offset (alternates between 0 and bf_size)
+    bf_offset: u32,
+}
+
+impl SendQueueState {
+    fn available(&self) -> u16 {
+        self.wqe_cnt - self.pi.wrapping_sub(self.ci)
+    }
+
+    fn update_ci(&mut self, ci: u16) {
+        self.ci = ci;
+    }
+
+    fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
+        let offset = ((idx & (self.wqe_cnt - 1)) as usize) * WQEBB_SIZE;
+        unsafe { self.buf.add(offset) }
+    }
+
+    fn advance_pi(&mut self, count: u16) {
+        self.pi = self.pi.wrapping_add(count);
+    }
+
+    fn set_last_wqe(&mut self, ptr: *mut u8, size: usize) {
+        self.last_wqe = Some((ptr, size));
+    }
+
+    fn ring_doorbell(&mut self) {
+        let Some((last_wqe_ptr, last_wqe_size)) = self.last_wqe.take() else {
+            return;
+        };
+
+        mmio_flush_writes!();
+
+        unsafe {
+            std::ptr::write_volatile(self.dbrec.add(1), (self.pi as u32).to_be());
+        }
+
+        udma_to_device_barrier!();
+
+        if self.bf_size > 0 && last_wqe_size <= WQEBB_SIZE {
+            self.ring_bf(last_wqe_ptr);
+        } else {
+            self.ring_db(last_wqe_ptr);
+        }
+    }
+
+    fn ring_bf(&mut self, wqe_ptr: *mut u8) {
+        let bf = unsafe { self.bf_reg.add(self.bf_offset as usize) };
+        mlx5_bf_copy!(bf, wqe_ptr);
+        mmio_flush_writes!();
+        self.bf_offset ^= self.bf_size;
+    }
+
+    fn ring_db(&mut self, wqe_ptr: *mut u8) {
+        let bf = unsafe { self.bf_reg.add(self.bf_offset as usize) as *mut u64 };
+        let ctrl = wqe_ptr as *const u64;
+        unsafe {
+            std::ptr::write_volatile(bf, *ctrl);
+        }
+        mmio_flush_writes!();
+        self.bf_offset ^= self.bf_size;
+    }
+}
+
+// =============================================================================
+// Receive Queue State
+// =============================================================================
+
+/// Receive Queue state for direct WQE posting.
+pub(crate) struct ReceiveQueueState {
+    /// RQ buffer base address
+    buf: *mut u8,
+    /// Number of WQE slots
+    wqe_cnt: u32,
+    /// Stride (bytes per WQE slot)
+    stride: u32,
+    /// Producer index (next WQE slot)
+    pi: u16,
+    /// Doorbell record pointer (dbrec[0] for RQ)
+    dbrec: *mut u32,
+}
+
+impl ReceiveQueueState {
+    fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
+        let offset = ((idx as u32) & (self.wqe_cnt - 1)) * self.stride;
+        unsafe { self.buf.add(offset as usize) }
+    }
+
+    unsafe fn post(&mut self, addr: u64, len: u32, lkey: u32) {
+        let wqe_ptr = self.get_wqe_ptr(self.pi);
+        DataSeg::write(wqe_ptr, len, lkey, addr);
+        self.pi = self.pi.wrapping_add(1);
+    }
+
+    fn ring_doorbell(&mut self) {
+        mmio_flush_writes!();
+        unsafe {
+            std::ptr::write_volatile(self.dbrec, (self.pi as u32).to_be());
+        }
+    }
+}
+
+// =============================================================================
+// WQE Builder
+// =============================================================================
+
+/// Zero-copy WQE builder for RC QP.
+///
+/// Writes segments directly to the SQ buffer without intermediate copies.
+pub struct WqeBuilder<'a> {
+    sq: &'a mut SendQueueState,
+    wqe_ptr: *mut u8,
+    wqe_idx: u16,
+    offset: usize,
+    ds_count: u8,
+}
+
+impl<'a> WqeBuilder<'a> {
+    /// Write the control segment.
+    ///
+    /// This must be the first segment in every WQE.
+    pub fn ctrl(mut self, opcode: WqeOpcode, flags: u8, imm: u32) -> Self {
+        unsafe {
+            CtrlSeg::write(
+                self.wqe_ptr,
+                opcode as u8,
+                self.wqe_idx,
+                self.sq.sqn,
+                0,
+                flags,
+                imm,
+            );
+        }
+        self.offset = CtrlSeg::SIZE;
+        self.ds_count = 1;
+        self
+    }
+
+    /// Add an RDMA segment (for WRITE/READ).
+    pub fn rdma(mut self, remote_addr: u64, rkey: u32) -> Self {
+        unsafe {
+            RdmaSeg::write(self.wqe_ptr.add(self.offset), remote_addr, rkey);
+        }
+        self.offset += RdmaSeg::SIZE;
+        self.ds_count += 1;
+        self
+    }
+
+    /// Add a data segment (SGE).
+    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
+        unsafe {
+            DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
+        }
+        self.offset += DataSeg::SIZE;
+        self.ds_count += 1;
+        self
+    }
+
+    /// Add inline data.
+    pub fn inline_data(mut self, data: &[u8]) -> Self {
+        let padded_size = unsafe {
+            let ptr = self.wqe_ptr.add(self.offset);
+            let size = InlineHeader::write(ptr, data.len() as u32);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
+            size
+        };
+        self.offset += padded_size;
+        self.ds_count += (padded_size / 16) as u8;
+        self
+    }
+
+    /// Get a mutable slice for inline data (zero-copy).
+    ///
+    /// Returns the builder and a slice that can be written to directly.
+    pub fn inline_slice(mut self, len: usize) -> (Self, &'a mut [u8]) {
+        let padded_size = unsafe {
+            let ptr = self.wqe_ptr.add(self.offset);
+            InlineHeader::write(ptr, len as u32)
+        };
+        let data_ptr = unsafe { self.wqe_ptr.add(self.offset + 4) };
+        let slice = unsafe { std::slice::from_raw_parts_mut(data_ptr, len) };
+        self.offset += padded_size;
+        self.ds_count += (padded_size / 16) as u8;
+        (self, slice)
+    }
+
+    /// Finish the WQE construction.
+    ///
+    /// Updates the DS count and advances the SQ producer index.
+    pub fn finish(self) -> WqeHandle {
+        unsafe {
+            CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
+        }
+
+        let wqebb_cnt = calc_wqebb_cnt(self.offset);
+        self.sq.advance_pi(wqebb_cnt);
+        self.sq.set_last_wqe(self.wqe_ptr, self.offset);
+
+        WqeHandle {
+            wqe_idx: self.wqe_idx,
+            size: self.offset,
+        }
+    }
+}
+
+// =============================================================================
+// RC QP
+// =============================================================================
+
 /// RC (Reliable Connection) Queue Pair.
 ///
 /// Created using mlx5dv_create_qp for direct hardware access.
 pub struct RcQp {
     qp: NonNull<mlx5_sys::ibv_qp>,
     state: QpState,
+    sq: Option<SendQueueState>,
+    rq: Option<ReceiveQueueState>,
 }
 
 impl Context {
@@ -122,13 +361,14 @@ impl Context {
             qp_attr.pd = pd.as_ptr();
 
             let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
-            // No special mlx5 flags needed for basic RC QP
 
             let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
             NonNull::new(qp).map_or(Err(io::Error::last_os_error()), |qp| {
                 Ok(RcQp {
                     qp,
                     state: QpState::Reset,
+                    sq: None,
+                    rq: None,
                 })
             })
         }
@@ -155,9 +395,7 @@ impl RcQp {
     }
 
     /// Get mlx5-specific QP information for direct WQE access.
-    ///
-    /// Returns buffer pointers and metadata needed for posting WQEs directly.
-    pub fn info(&self) -> io::Result<QpInfo> {
+    fn query_info(&self) -> io::Result<QpInfo> {
         unsafe {
             let mut dv_qp: MaybeUninit<mlx5_sys::mlx5dv_qp> = MaybeUninit::zeroed();
             let mut obj: MaybeUninit<mlx5_sys::mlx5dv_obj> = MaybeUninit::zeroed();
@@ -195,11 +433,37 @@ impl RcQp {
         }
     }
 
-    /// Transition QP from RESET to INIT.
+    /// Initialize direct queue access.
     ///
-    /// # Arguments
-    /// * `port` - Port number (1-based)
-    /// * `access_flags` - QP access flags for remote operations
+    /// Call this after the QP is ready (RTS state).
+    pub fn init_direct_access(&mut self) -> io::Result<()> {
+        let info = self.query_info()?;
+
+        self.sq = Some(SendQueueState {
+            buf: info.sq_buf,
+            wqe_cnt: info.sq_wqe_cnt as u16,
+            sqn: info.sqn,
+            pi: 0,
+            ci: 0,
+            last_wqe: None,
+            dbrec: info.dbrec,
+            bf_reg: info.bf_reg,
+            bf_size: info.bf_size,
+            bf_offset: 0,
+        });
+
+        self.rq = Some(ReceiveQueueState {
+            buf: info.rq_buf,
+            wqe_cnt: info.rq_wqe_cnt,
+            stride: info.rq_stride,
+            pi: 0,
+            dbrec: info.dbrec,
+        });
+
+        Ok(())
+    }
+
+    /// Transition QP from RESET to INIT.
     pub fn modify_to_init(&mut self, port: u8, access_flags: u32) -> io::Result<()> {
         if self.state != QpState::Reset {
             return Err(io::Error::new(
@@ -231,11 +495,6 @@ impl RcQp {
     }
 
     /// Transition QP from INIT to RTR (Ready to Receive).
-    ///
-    /// # Arguments
-    /// * `remote` - Remote QP information
-    /// * `port` - Port number (1-based)
-    /// * `max_dest_rd_atomic` - Maximum outstanding RDMA read/atomic as responder
     pub fn modify_to_rtr(
         &mut self,
         remote: &RemoteQpInfo,
@@ -282,10 +541,6 @@ impl RcQp {
     }
 
     /// Transition QP from RTR to RTS (Ready to Send).
-    ///
-    /// # Arguments
-    /// * `local_psn` - Local packet sequence number
-    /// * `max_rd_atomic` - Maximum outstanding RDMA read/atomic as initiator
     pub fn modify_to_rts(&mut self, local_psn: u32, max_rd_atomic: u8) -> io::Result<()> {
         if self.state != QpState::Rtr {
             return Err(io::Error::new(
@@ -322,15 +577,8 @@ impl RcQp {
 
     /// Connect to a remote QP.
     ///
-    /// Transitions the QP through RESET -> INIT -> RTR -> RTS.
-    ///
-    /// # Arguments
-    /// * `remote` - Remote QP information
-    /// * `port` - Port number (1-based)
-    /// * `local_psn` - Local packet sequence number
-    /// * `max_rd_atomic` - Maximum outstanding RDMA read/atomic as initiator
-    /// * `max_dest_rd_atomic` - Maximum outstanding RDMA read/atomic as responder
-    /// * `access_flags` - QP access flags for remote operations
+    /// Transitions the QP through RESET -> INIT -> RTR -> RTS and initializes
+    /// direct queue access.
     pub fn connect(
         &mut self,
         remote: &RemoteQpInfo,
@@ -343,6 +591,65 @@ impl RcQp {
         self.modify_to_init(port, access_flags)?;
         self.modify_to_rtr(remote, port, max_dest_rd_atomic)?;
         self.modify_to_rts(local_psn, max_rd_atomic)?;
+        self.init_direct_access()?;
         Ok(())
+    }
+
+    fn sq_mut(&mut self) -> io::Result<&mut SendQueueState> {
+        self.sq
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "direct access not initialized"))
+    }
+}
+
+impl SendQueue for RcQp {
+    type Builder<'a> = WqeBuilder<'a>;
+
+    fn sq_available(&self) -> u16 {
+        self.sq.as_ref().map(|sq| sq.available()).unwrap_or(0)
+    }
+
+    fn sq_update_ci(&mut self, ci: u16) {
+        if let Some(sq) = self.sq.as_mut() {
+            sq.update_ci(ci);
+        }
+    }
+
+    fn wqe_builder(&mut self) -> io::Result<WqeBuilder<'_>> {
+        let sq = self.sq_mut()?;
+        if sq.available() == 0 {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+
+        let wqe_idx = sq.pi;
+        let wqe_ptr = sq.get_wqe_ptr(wqe_idx);
+
+        Ok(WqeBuilder {
+            sq,
+            wqe_ptr,
+            wqe_idx,
+            offset: 0,
+            ds_count: 0,
+        })
+    }
+
+    fn ring_sq_doorbell(&mut self) {
+        if let Some(sq) = self.sq.as_mut() {
+            sq.ring_doorbell();
+        }
+    }
+}
+
+impl ReceiveQueue for RcQp {
+    unsafe fn post_recv(&mut self, addr: u64, len: u32, lkey: u32) {
+        if let Some(rq) = self.rq.as_mut() {
+            rq.post(addr, len, lkey);
+        }
+    }
+
+    fn ring_rq_doorbell(&mut self) {
+        if let Some(rq) = self.rq.as_mut() {
+            rq.ring_doorbell();
+        }
     }
 }

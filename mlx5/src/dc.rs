@@ -11,6 +11,10 @@ use crate::device::Context;
 use crate::pd::ProtectionDomain;
 use crate::qp::QpInfo;
 use crate::srq::SharedReceiveQueue;
+use crate::wqe::{
+    AddressVector, CtrlSeg, DataSeg, InlineHeader, RdmaSeg, WQEBB_SIZE, WqeHandle, WqeOpcode,
+    calc_wqebb_cnt,
+};
 
 /// DCI configuration.
 #[derive(Debug, Clone)]
@@ -67,6 +71,203 @@ pub struct RemoteDctInfo {
     pub lid: u16,
 }
 
+// =============================================================================
+// DCI Send Queue State
+// =============================================================================
+
+/// Send Queue state for DCI.
+struct DciSendQueueState {
+    buf: *mut u8,
+    wqe_cnt: u16,
+    sqn: u32,
+    pi: u16,
+    ci: u16,
+    last_wqe: Option<(*mut u8, usize)>,
+    dbrec: *mut u32,
+    bf_reg: *mut u8,
+    bf_size: u32,
+    bf_offset: u32,
+}
+
+impl DciSendQueueState {
+    fn available(&self) -> u16 {
+        self.wqe_cnt - self.pi.wrapping_sub(self.ci)
+    }
+
+    fn update_ci(&mut self, ci: u16) {
+        self.ci = ci;
+    }
+
+    fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
+        let offset = ((idx & (self.wqe_cnt - 1)) as usize) * WQEBB_SIZE;
+        unsafe { self.buf.add(offset) }
+    }
+
+    fn advance_pi(&mut self, count: u16) {
+        self.pi = self.pi.wrapping_add(count);
+    }
+
+    fn set_last_wqe(&mut self, ptr: *mut u8, size: usize) {
+        self.last_wqe = Some((ptr, size));
+    }
+
+    fn ring_doorbell(&mut self) {
+        let Some((last_wqe_ptr, last_wqe_size)) = self.last_wqe.take() else {
+            return;
+        };
+
+        mmio_flush_writes!();
+
+        unsafe {
+            std::ptr::write_volatile(self.dbrec.add(1), (self.pi as u32).to_be());
+        }
+
+        udma_to_device_barrier!();
+
+        if self.bf_size > 0 && last_wqe_size <= WQEBB_SIZE {
+            self.ring_bf(last_wqe_ptr);
+        } else {
+            self.ring_db(last_wqe_ptr);
+        }
+    }
+
+    fn ring_bf(&mut self, wqe_ptr: *mut u8) {
+        let bf = unsafe { self.bf_reg.add(self.bf_offset as usize) };
+        mlx5_bf_copy!(bf, wqe_ptr);
+        mmio_flush_writes!();
+        self.bf_offset ^= self.bf_size;
+    }
+
+    fn ring_db(&mut self, wqe_ptr: *mut u8) {
+        let bf = unsafe { self.bf_reg.add(self.bf_offset as usize) as *mut u64 };
+        let ctrl = wqe_ptr as *const u64;
+        unsafe {
+            std::ptr::write_volatile(bf, *ctrl);
+        }
+        mmio_flush_writes!();
+        self.bf_offset ^= self.bf_size;
+    }
+}
+
+// =============================================================================
+// DCI WQE Builder
+// =============================================================================
+
+/// Zero-copy WQE builder for DCI.
+///
+/// Similar to WqeBuilder but has Address Vector segment for DC operations.
+pub struct DciWqeBuilder<'a> {
+    sq: &'a mut DciSendQueueState,
+    wqe_ptr: *mut u8,
+    wqe_idx: u16,
+    offset: usize,
+    ds_count: u8,
+}
+
+impl<'a> DciWqeBuilder<'a> {
+    /// Write the control segment.
+    ///
+    /// This must be the first segment in every WQE.
+    pub fn ctrl(mut self, opcode: WqeOpcode, flags: u8, imm: u32) -> Self {
+        unsafe {
+            CtrlSeg::write(
+                self.wqe_ptr,
+                opcode as u8,
+                self.wqe_idx,
+                self.sq.sqn,
+                0,
+                flags,
+                imm,
+            );
+        }
+        self.offset = CtrlSeg::SIZE;
+        self.ds_count = 1;
+        self
+    }
+
+    /// Add an address vector (required for DC operations).
+    ///
+    /// This segment specifies the destination DCT.
+    pub fn av(mut self, dc_key: u64, dctn: u32, dlid: u16) -> Self {
+        unsafe {
+            AddressVector::write(self.wqe_ptr.add(self.offset), dc_key, dctn, dlid);
+        }
+        self.offset += AddressVector::SIZE;
+        self.ds_count += 3; // AV = 48 bytes = 3 DS
+        self
+    }
+
+    /// Add an RDMA segment (for WRITE/READ).
+    pub fn rdma(mut self, remote_addr: u64, rkey: u32) -> Self {
+        unsafe {
+            RdmaSeg::write(self.wqe_ptr.add(self.offset), remote_addr, rkey);
+        }
+        self.offset += RdmaSeg::SIZE;
+        self.ds_count += 1;
+        self
+    }
+
+    /// Add a data segment (SGE).
+    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
+        unsafe {
+            DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
+        }
+        self.offset += DataSeg::SIZE;
+        self.ds_count += 1;
+        self
+    }
+
+    /// Add inline data.
+    pub fn inline_data(mut self, data: &[u8]) -> Self {
+        let padded_size = unsafe {
+            let ptr = self.wqe_ptr.add(self.offset);
+            let size = InlineHeader::write(ptr, data.len() as u32);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
+            size
+        };
+        self.offset += padded_size;
+        self.ds_count += (padded_size / 16) as u8;
+        self
+    }
+
+    /// Get a mutable slice for inline data (zero-copy).
+    ///
+    /// Returns the builder and a slice that can be written to directly.
+    pub fn inline_slice(mut self, len: usize) -> (Self, &'a mut [u8]) {
+        let padded_size = unsafe {
+            let ptr = self.wqe_ptr.add(self.offset);
+            InlineHeader::write(ptr, len as u32)
+        };
+        let data_ptr = unsafe { self.wqe_ptr.add(self.offset + 4) };
+        let slice = unsafe { std::slice::from_raw_parts_mut(data_ptr, len) };
+        self.offset += padded_size;
+        self.ds_count += (padded_size / 16) as u8;
+        (self, slice)
+    }
+
+    /// Finish the WQE construction.
+    ///
+    /// Updates the DS count and advances the SQ producer index.
+    pub fn finish(self) -> WqeHandle {
+        unsafe {
+            CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
+        }
+
+        let wqebb_cnt = calc_wqebb_cnt(self.offset);
+        self.sq.advance_pi(wqebb_cnt);
+        self.sq.set_last_wqe(self.wqe_ptr, self.offset);
+
+        WqeHandle {
+            wqe_idx: self.wqe_idx,
+            size: self.offset,
+        }
+    }
+}
+
+// =============================================================================
+// DCI
+// =============================================================================
+
 /// DC Initiator (DCI).
 ///
 /// Used for sending RDMA operations to DCTs.
@@ -74,6 +275,7 @@ pub struct RemoteDctInfo {
 pub struct Dci {
     qp: NonNull<mlx5_sys::ibv_qp>,
     state: DcQpState,
+    sq: Option<DciSendQueueState>,
 }
 
 impl Context {
@@ -96,9 +298,9 @@ impl Context {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_DRIVER;
             qp_attr.send_cq = send_cq.as_ptr();
-            qp_attr.recv_cq = send_cq.as_ptr(); // DCI doesn't use recv CQ but needs valid pointer
+            qp_attr.recv_cq = send_cq.as_ptr();
             qp_attr.cap.max_send_wr = config.max_send_wr;
-            qp_attr.cap.max_recv_wr = 0; // DCI is send-only
+            qp_attr.cap.max_recv_wr = 0;
             qp_attr.cap.max_send_sge = config.max_send_sge;
             qp_attr.cap.max_recv_sge = 0;
             qp_attr.cap.max_inline_data = config.max_inline_data;
@@ -125,6 +327,7 @@ impl Context {
                 Ok(Dci {
                     qp,
                     state: DcQpState::Reset,
+                    sq: None,
                 })
             })
         }
@@ -151,7 +354,7 @@ impl Dci {
     }
 
     /// Get mlx5-specific QP information for direct WQE access.
-    pub fn info(&self) -> io::Result<QpInfo> {
+    fn query_info(&self) -> io::Result<QpInfo> {
         unsafe {
             let mut dv_qp: MaybeUninit<mlx5_sys::mlx5dv_qp> = MaybeUninit::zeroed();
             let mut obj: MaybeUninit<mlx5_sys::mlx5dv_obj> = MaybeUninit::zeroed();
@@ -187,6 +390,28 @@ impl Dci {
                 sqn,
             })
         }
+    }
+
+    /// Initialize direct queue access.
+    ///
+    /// Call this after the DCI is ready (RTS state).
+    pub fn init_direct_access(&mut self) -> io::Result<()> {
+        let info = self.query_info()?;
+
+        self.sq = Some(DciSendQueueState {
+            buf: info.sq_buf,
+            wqe_cnt: info.sq_wqe_cnt as u16,
+            sqn: info.sqn,
+            pi: 0,
+            ci: 0,
+            last_wqe: None,
+            dbrec: info.dbrec,
+            bf_reg: info.bf_reg,
+            bf_size: info.bf_size,
+            bf_offset: 0,
+        });
+
+        Ok(())
     }
 
     /// Transition DCI from RESET to INIT.
@@ -282,14 +507,65 @@ impl Dci {
         Ok(())
     }
 
-    /// Activate DCI (transition to RTS).
+    /// Activate DCI (transition to RTS) and initialize direct access.
     pub fn activate(&mut self, port: u8, local_psn: u32, max_rd_atomic: u8) -> io::Result<()> {
         self.modify_to_init(port)?;
         self.modify_to_rtr(port)?;
         self.modify_to_rts(local_psn, max_rd_atomic)?;
+        self.init_direct_access()?;
         Ok(())
     }
+
+    fn sq_mut(&mut self) -> io::Result<&mut DciSendQueueState> {
+        self.sq
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "direct access not initialized"))
+    }
+
+    /// Get the number of available WQE slots.
+    pub fn sq_available(&self) -> u16 {
+        self.sq.as_ref().map(|sq| sq.available()).unwrap_or(0)
+    }
+
+    /// Update the consumer index after completions.
+    pub fn sq_update_ci(&mut self, ci: u16) {
+        if let Some(sq) = self.sq.as_mut() {
+            sq.update_ci(ci);
+        }
+    }
+
+    /// Get a WQE builder for zero-copy WQE construction.
+    ///
+    /// DCI uses DciWqeBuilder which requires Address Vector for DC operations.
+    pub fn wqe_builder(&mut self) -> io::Result<DciWqeBuilder<'_>> {
+        let sq = self.sq_mut()?;
+        if sq.available() == 0 {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+
+        let wqe_idx = sq.pi;
+        let wqe_ptr = sq.get_wqe_ptr(wqe_idx);
+
+        Ok(DciWqeBuilder {
+            sq,
+            wqe_ptr,
+            wqe_idx,
+            offset: 0,
+            ds_count: 0,
+        })
+    }
+
+    /// Ring the SQ doorbell to notify HCA of new WQEs.
+    pub fn ring_sq_doorbell(&mut self) {
+        if let Some(sq) = self.sq.as_mut() {
+            sq.ring_doorbell();
+        }
+    }
 }
+
+// =============================================================================
+// DCT
+// =============================================================================
 
 /// DC Target (DCT).
 ///
@@ -325,7 +601,7 @@ impl Context {
             qp_attr.send_cq = cq.as_ptr();
             qp_attr.recv_cq = cq.as_ptr();
             qp_attr.srq = srq.as_ptr();
-            qp_attr.cap.max_recv_wr = 0; // Uses SRQ
+            qp_attr.cap.max_recv_wr = 0;
             qp_attr.cap.max_recv_sge = 0;
             qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
             qp_attr.pd = pd.as_ptr();

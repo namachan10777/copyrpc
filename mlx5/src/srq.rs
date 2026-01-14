@@ -6,6 +6,7 @@
 use std::{io, mem::MaybeUninit, ptr::NonNull};
 
 use crate::pd::ProtectionDomain;
+use crate::wqe::{DataSeg, ReceiveQueue};
 
 /// SRQ configuration.
 #[derive(Debug, Clone)]
@@ -38,12 +39,57 @@ pub struct SrqInfo {
     pub srqn: u32,
 }
 
+// =============================================================================
+// SRQ State
+// =============================================================================
+
+/// SRQ state for direct WQE posting.
+struct SrqState {
+    buf: *mut u8,
+    wqe_cnt: u32,
+    stride: u32,
+    head: u32,
+    dbrec: *mut u32,
+}
+
+impl SrqState {
+    fn get_wqe_ptr(&self, idx: u32) -> *mut u8 {
+        let offset = (idx & (self.wqe_cnt - 1)) * self.stride;
+        unsafe { self.buf.add(offset as usize) }
+    }
+
+    unsafe fn post(&mut self, addr: u64, len: u32, lkey: u32) {
+        let wqe_ptr = self.get_wqe_ptr(self.head);
+
+        // SRQ WQE format: Next Segment (16 bytes) + Data Segment (16 bytes)
+        std::ptr::write_bytes(wqe_ptr, 0, 16);
+
+        // Write Data Segment at offset 16
+        DataSeg::write(wqe_ptr.add(16), len, lkey, addr);
+
+        self.head = self.head.wrapping_add(1);
+    }
+
+    fn ring_doorbell(&mut self) {
+        mmio_flush_writes!();
+        unsafe {
+            std::ptr::write_volatile(self.dbrec, self.head.to_be());
+        }
+    }
+}
+
+// =============================================================================
+// Shared Receive Queue
+// =============================================================================
+
 /// Shared Receive Queue.
 ///
 /// Allows multiple QPs to share receive buffers. This is useful for DC
 /// (Dynamically Connected) transport where many connections share one SRQ.
 pub struct SharedReceiveQueue {
     srq: NonNull<mlx5_sys::ibv_srq>,
+    wqe_cnt: u32,
+    state: Option<SrqState>,
 }
 
 impl ProtectionDomain {
@@ -67,7 +113,11 @@ impl ProtectionDomain {
 
             let srq = mlx5_sys::ibv_create_srq(self.as_ptr(), &attr as *const _ as *mut _);
             NonNull::new(srq).map_or(Err(io::Error::last_os_error()), |srq| {
-                Ok(SharedReceiveQueue { srq })
+                Ok(SharedReceiveQueue {
+                    srq,
+                    wqe_cnt: config.max_wr.next_power_of_two(),
+                    state: None,
+                })
             })
         }
     }
@@ -88,9 +138,7 @@ impl SharedReceiveQueue {
     }
 
     /// Get mlx5-specific SRQ information for direct WQE access.
-    ///
-    /// Returns buffer pointers and metadata needed for posting receive WQEs directly.
-    pub fn info(&self) -> io::Result<SrqInfo> {
+    fn query_info(&self) -> io::Result<SrqInfo> {
         unsafe {
             let mut dv_srq: MaybeUninit<mlx5_sys::mlx5dv_srq> = MaybeUninit::zeroed();
             let mut obj: MaybeUninit<mlx5_sys::mlx5dv_obj> = MaybeUninit::zeroed();
@@ -116,8 +164,39 @@ impl SharedReceiveQueue {
         }
     }
 
+    /// Initialize direct access for the SRQ.
+    ///
+    /// Call this before using post_recv/ring_doorbell.
+    pub fn init_direct_access(&mut self) -> io::Result<()> {
+        let info = self.query_info()?;
+
+        self.state = Some(SrqState {
+            buf: info.buf,
+            wqe_cnt: self.wqe_cnt,
+            stride: info.stride,
+            head: 0,
+            dbrec: info.dbrec,
+        });
+
+        Ok(())
+    }
+
     /// Get the SRQ number.
     pub fn srqn(&self) -> io::Result<u32> {
-        self.info().map(|info| info.srqn)
+        self.query_info().map(|info| info.srqn)
+    }
+}
+
+impl ReceiveQueue for SharedReceiveQueue {
+    unsafe fn post_recv(&mut self, addr: u64, len: u32, lkey: u32) {
+        if let Some(state) = self.state.as_mut() {
+            state.post(addr, len, lkey);
+        }
+    }
+
+    fn ring_rq_doorbell(&mut self) {
+        if let Some(state) = self.state.as_mut() {
+            state.ring_doorbell();
+        }
     }
 }

@@ -1,0 +1,238 @@
+//! WQE (Work Queue Element) common definitions.
+//!
+//! Provides segment definitions, opcodes, and traits shared across QP types.
+
+use std::io;
+
+/// WQEBB (Work Queue Element Basic Block) size in bytes.
+pub const WQEBB_SIZE: usize = 64;
+
+// =============================================================================
+// WQE Segments
+// =============================================================================
+
+/// Control Segment (16 bytes).
+///
+/// First segment of every WQE.
+pub struct CtrlSeg;
+
+impl CtrlSeg {
+    /// Size of the control segment in bytes.
+    pub const SIZE: usize = 16;
+
+    /// Write the control segment to the given pointer.
+    ///
+    /// # Safety
+    /// The pointer must point to at least 16 bytes of writable memory.
+    #[inline]
+    pub unsafe fn write(
+        ptr: *mut u8,
+        opcode: u8,
+        wqe_idx: u16,
+        qpn: u32,
+        ds_cnt: u8,
+        fm_ce_se: u8,
+        imm: u32,
+    ) {
+        let opmod_idx_opcode = ((wqe_idx as u32) << 8) | (opcode as u32);
+        let qpn_ds = (qpn << 8) | (ds_cnt as u32);
+
+        let ptr32 = ptr as *mut u32;
+        std::ptr::write_volatile(ptr32, opmod_idx_opcode.to_be());
+        std::ptr::write_volatile(ptr32.add(1), qpn_ds.to_be());
+        std::ptr::write_volatile(ptr.add(8), 0); // signature
+        std::ptr::write_volatile(ptr.add(9), 0); // dci_stream[15:8]
+        std::ptr::write_volatile(ptr.add(10), 0); // dci_stream[7:0]
+        std::ptr::write_volatile(ptr.add(11), fm_ce_se);
+        std::ptr::write_volatile(ptr32.add(3), imm.to_be());
+    }
+
+    /// Update the DS count after WQE is complete.
+    ///
+    /// # Safety
+    /// The pointer must point to a valid control segment.
+    #[inline]
+    pub unsafe fn update_ds_cnt(ptr: *mut u8, ds_cnt: u8) {
+        std::ptr::write_volatile(ptr.add(7), ds_cnt);
+    }
+}
+
+/// RDMA Segment (16 bytes).
+///
+/// Used for RDMA WRITE, RDMA READ operations.
+pub struct RdmaSeg;
+
+impl RdmaSeg {
+    /// Size of the RDMA segment in bytes.
+    pub const SIZE: usize = 16;
+
+    /// Write the RDMA segment to the given pointer.
+    ///
+    /// # Safety
+    /// The pointer must point to at least 16 bytes of writable memory.
+    #[inline]
+    pub unsafe fn write(ptr: *mut u8, remote_addr: u64, rkey: u32) {
+        let ptr64 = ptr as *mut u64;
+        let ptr32 = ptr.add(8) as *mut u32;
+        std::ptr::write_volatile(ptr64, remote_addr.to_be());
+        std::ptr::write_volatile(ptr32, rkey.to_be());
+        std::ptr::write_volatile(ptr32.add(1), 0);
+    }
+}
+
+/// Data Segment / SGE (16 bytes).
+///
+/// Points to a memory region for data transfer.
+pub struct DataSeg;
+
+impl DataSeg {
+    /// Size of the data segment in bytes.
+    pub const SIZE: usize = 16;
+
+    /// Write the data segment to the given pointer.
+    ///
+    /// # Safety
+    /// The pointer must point to at least 16 bytes of writable memory.
+    #[inline]
+    pub unsafe fn write(ptr: *mut u8, byte_count: u32, lkey: u32, addr: u64) {
+        let ptr32 = ptr as *mut u32;
+        let ptr64 = ptr.add(8) as *mut u64;
+        std::ptr::write_volatile(ptr32, byte_count.to_be());
+        std::ptr::write_volatile(ptr32.add(1), lkey.to_be());
+        std::ptr::write_volatile(ptr64, addr.to_be());
+    }
+}
+
+/// Inline data header.
+pub struct InlineHeader;
+
+impl InlineHeader {
+    /// Write inline header.
+    ///
+    /// Returns the padded size (16-byte aligned).
+    ///
+    /// # Safety
+    /// The pointer must point to at least 4 bytes of writable memory.
+    #[inline]
+    pub unsafe fn write(ptr: *mut u8, byte_count: u32) -> usize {
+        let ptr32 = ptr as *mut u32;
+        let header = 0x8000_0000 | byte_count;
+        std::ptr::write_volatile(ptr32, header.to_be());
+        ((4 + byte_count as usize) + 15) & !15
+    }
+}
+
+/// Address Vector (for DC QPs).
+///
+/// 48 bytes, specifies the destination for DC operations.
+pub struct AddressVector;
+
+impl AddressVector {
+    /// Size of the address vector in bytes.
+    pub const SIZE: usize = 48;
+
+    /// Write the address vector to the given pointer.
+    ///
+    /// # Safety
+    /// The pointer must point to at least 48 bytes of writable memory.
+    #[inline]
+    pub unsafe fn write(ptr: *mut u8, dc_key: u64, dctn: u32, dlid: u16) {
+        let ptr64 = ptr as *mut u64;
+        let ptr32 = ptr.add(8) as *mut u32;
+        let ptr16 = ptr.add(14) as *mut u16;
+
+        std::ptr::write_volatile(ptr64, dc_key.to_be());
+        let dqp_dct = 0x8000_0000 | (dctn & 0x00FF_FFFF);
+        std::ptr::write_volatile(ptr32, dqp_dct.to_be());
+        std::ptr::write_volatile(ptr.add(12), 0);
+        std::ptr::write_volatile(ptr.add(13), 0);
+        std::ptr::write_volatile(ptr16, dlid.to_be());
+        std::ptr::write_bytes(ptr.add(16), 0, 32);
+    }
+}
+
+// =============================================================================
+// WQE Opcodes and Flags
+// =============================================================================
+
+/// WQE opcodes.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WqeOpcode {
+    Nop = 0x00,
+    SendInval = 0x01,
+    RdmaWrite = 0x08,
+    RdmaWriteImm = 0x09,
+    Send = 0x0A,
+    SendImm = 0x0B,
+    RdmaRead = 0x10,
+    AtomicCs = 0x11,
+    AtomicFa = 0x12,
+}
+
+/// WQE flags for fm_ce_se field.
+#[allow(non_snake_case)]
+pub mod WqeFlags {
+    /// Fence (wait for previous WQEs to complete).
+    pub const FENCE: u8 = 0x40;
+    /// Completion requested.
+    pub const COMPLETION: u8 = 0x08;
+    /// Solicited event.
+    pub const SOLICITED: u8 = 0x02;
+}
+
+/// Calculate the number of WQEBBs for a WQE size.
+#[inline]
+pub fn calc_wqebb_cnt(wqe_size: usize) -> u16 {
+    wqe_size.div_ceil(WQEBB_SIZE) as u16
+}
+
+// =============================================================================
+// Handle
+// =============================================================================
+
+/// Handle to a posted WQE.
+#[derive(Debug, Clone, Copy)]
+pub struct WqeHandle {
+    /// WQE index in the SQ.
+    pub wqe_idx: u16,
+    /// WQE size in bytes.
+    pub size: usize,
+}
+
+// =============================================================================
+// Traits
+// =============================================================================
+
+/// Trait for types that can post send WQEs.
+pub trait SendQueue {
+    /// Builder type for this send queue.
+    type Builder<'a>
+    where
+        Self: 'a;
+
+    /// Get the number of available WQE slots.
+    fn sq_available(&self) -> u16;
+
+    /// Update the consumer index after completions.
+    fn sq_update_ci(&mut self, ci: u16);
+
+    /// Get a WQE builder for zero-copy WQE construction.
+    fn wqe_builder(&mut self) -> io::Result<Self::Builder<'_>>;
+
+    /// Ring the SQ doorbell to notify HCA of new WQEs.
+    fn ring_sq_doorbell(&mut self);
+}
+
+/// Trait for types that can post receive WQEs.
+pub trait ReceiveQueue {
+    /// Post a receive WQE.
+    ///
+    /// # Safety
+    /// - The buffer must be registered and valid
+    /// - There must be available slots in the RQ
+    unsafe fn post_recv(&mut self, addr: u64, len: u32, lkey: u32);
+
+    /// Ring the RQ doorbell to notify HCA of new WQEs.
+    fn ring_rq_doorbell(&mut self);
+}
