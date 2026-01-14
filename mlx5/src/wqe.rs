@@ -254,22 +254,24 @@ pub struct WqeHandle {
 }
 
 // =============================================================================
-// WQE Table
+// WQE Table (Sparse - for signaled-only completion)
 // =============================================================================
 
-/// WQE table for tracking in-flight operations.
+/// Sparse WQE table for tracking signaled operations only.
 ///
-/// Maps WQE indices to user-defined entries. Used to associate completion
-/// events (CQEs) with the original request metadata.
+/// Only signaled WQEs have entries stored. When a CQE arrives, only the
+/// single entry at that wqe_idx is retrieved (no draining).
+///
+/// Also used for unordered queues where entries track slot availability.
 ///
 /// The table size must be a power of 2 for fast modulo via bit masking.
-pub struct WqeTable<T> {
+pub struct SparseWqeTable<T> {
     entries: Box<[Option<T>]>,
     mask: u16,
 }
 
-impl<T> WqeTable<T> {
-    /// Create a new WQE table with the given capacity.
+impl<T> SparseWqeTable<T> {
+    /// Create a new sparse WQE table with the given capacity.
     ///
     /// # Arguments
     /// * `wqe_cnt` - Number of entries (must be power of 2)
@@ -306,18 +308,6 @@ impl<T> WqeTable<T> {
         self.entries[slot].is_none()
     }
 
-    /// Drain entries from old_ci (exclusive) to new_ci (inclusive).
-    ///
-    /// For ordered queues: iterates through all completed WQEs and yields
-    /// entries that were stored (Some values).
-    pub fn drain_range(&mut self, old_ci: u16, new_ci: u16) -> DrainRange<'_, T> {
-        DrainRange {
-            table: self,
-            current: old_ci.wrapping_add(1),
-            end: new_ci.wrapping_add(1),
-        }
-    }
-
     /// Count available slots by scanning the table.
     ///
     /// For unordered queues where gaps may exist.
@@ -326,25 +316,90 @@ impl<T> WqeTable<T> {
     }
 }
 
-/// Iterator that drains entries from a WQE table range.
-pub struct DrainRange<'a, T> {
-    table: &'a mut WqeTable<T>,
+// =============================================================================
+// WQE Table (Dense - for all-entry callback)
+// =============================================================================
+
+use std::mem::MaybeUninit;
+
+/// Dense WQE table for tracking all WQE operations.
+///
+/// Every WQE must have an entry. When a signaled CQE arrives, all entries
+/// from old_ci to new_ci are drained and passed to the callback.
+///
+/// Uses `MaybeUninit<T>` internally for efficiency (no Option check).
+///
+/// The table size must be a power of 2 for fast modulo via bit masking.
+pub struct DenseWqeTable<T> {
+    entries: Box<[MaybeUninit<T>]>,
+    mask: u16,
+}
+
+impl<T> DenseWqeTable<T> {
+    /// Create a new dense WQE table with the given capacity.
+    ///
+    /// # Arguments
+    /// * `wqe_cnt` - Number of entries (must be power of 2)
+    pub fn new(wqe_cnt: u16) -> Self {
+        debug_assert!(wqe_cnt.is_power_of_two(), "wqe_cnt must be power of 2");
+        let entries = (0..wqe_cnt)
+            .map(|_| MaybeUninit::uninit())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            entries,
+            mask: wqe_cnt - 1,
+        }
+    }
+
+    /// Store an entry at the given index.
+    #[inline]
+    pub fn store(&mut self, idx: u16, entry: T) {
+        let slot = (idx & self.mask) as usize;
+        self.entries[slot].write(entry);
+    }
+
+    /// Take the entry at the given index.
+    ///
+    /// # Safety
+    /// The entry at this index must have been stored previously.
+    #[inline]
+    unsafe fn take(&mut self, idx: u16) -> T {
+        let slot = (idx & self.mask) as usize;
+        self.entries[slot].assume_init_read()
+    }
+
+    /// Drain all entries from old_ci (exclusive) to new_ci (inclusive).
+    ///
+    /// All slots in range must have entries stored.
+    pub fn drain_range(&mut self, old_ci: u16, new_ci: u16) -> DenseDrainRange<'_, T> {
+        DenseDrainRange {
+            table: self,
+            current: old_ci.wrapping_add(1),
+            end: new_ci.wrapping_add(1),
+        }
+    }
+}
+
+/// Iterator that drains all entries from a dense WQE table range.
+pub struct DenseDrainRange<'a, T> {
+    table: &'a mut DenseWqeTable<T>,
     current: u16,
     end: u16,
 }
 
-impl<T> Iterator for DrainRange<'_, T> {
+impl<T> Iterator for DenseDrainRange<'_, T> {
     type Item = (u16, T);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.current != self.end {
+        if self.current != self.end {
             let idx = self.current;
             self.current = self.current.wrapping_add(1);
-            if let Some(entry) = self.table.take(idx) {
-                return Some((idx, entry));
-            }
+            // SAFETY: Dense table guarantees all entries in range are initialized
+            Some((idx, unsafe { self.table.take(idx) }))
+        } else {
+            None
         }
-        None
     }
 }
 
@@ -352,11 +407,55 @@ impl<T> Iterator for DrainRange<'_, T> {
 // Traits
 // =============================================================================
 
-/// Trait for ordered send queues with WQE table support.
+/// Trait for ordered send queues with dense WQE table (all entries callback).
 ///
-/// Used for RC QP, DCI without streams where WQE completion order matches
-/// submission order.
-pub trait OrderedSendQueue {
+/// Used for RC QP, DCI without streams where:
+/// - WQE completion order matches submission order
+/// - Every WQE must have an entry
+/// - All completions trigger callbacks (efficient, no Option check)
+///
+/// Use this when you need to track every WQE, not just signaled ones.
+/// For signaled-only tracking, use `SparseSendQueue` instead.
+pub trait DenseSendQueue {
+    /// Builder type for this send queue.
+    type Builder<'a>
+    where
+        Self: 'a;
+
+    /// Entry type stored in the WQE table.
+    type Entry;
+
+    /// Get the number of available WQE slots.
+    fn sq_available(&self) -> u16;
+
+    /// Get a WQE builder for zero-copy WQE construction.
+    ///
+    /// # Arguments
+    /// * `entry` - Entry to store in WQE table (required for every WQE)
+    /// * `signaled` - Whether to request a completion for this WQE
+    fn wqe_builder(&mut self, entry: Self::Entry, signaled: bool) -> io::Result<Self::Builder<'_>>;
+
+    /// Ring the SQ doorbell to notify HCA of new WQEs.
+    fn ring_sq_doorbell(&mut self);
+
+    /// Process completions up to the given wqe_counter.
+    ///
+    /// Calls the callback for all entries in range (old_ci, new_ci].
+    fn process_completions<F>(&mut self, new_ci: u16, callback: F)
+    where
+        F: FnMut(u16, Self::Entry);
+}
+
+/// Trait for ordered send queues with sparse WQE table (signaled-only callback).
+///
+/// Used for RC QP, DCI without streams where:
+/// - WQE completion order matches submission order
+/// - Only signaled WQEs have entries
+/// - CQE arrives only for signaled WQEs, so just take that one entry
+///
+/// Use this when you only need to track signaled WQEs.
+/// For tracking every WQE, use `DenseSendQueue` instead.
+pub trait SparseSendQueue {
     /// Builder type for this send queue.
     type Builder<'a>
     where
@@ -379,12 +478,11 @@ pub trait OrderedSendQueue {
     /// Ring the SQ doorbell to notify HCA of new WQEs.
     fn ring_sq_doorbell(&mut self);
 
-    /// Process completions up to the given wqe_counter.
+    /// Process a single completion at the given wqe_idx.
     ///
-    /// Calls the callback for each entry that was stored (signaled WQEs).
-    fn process_completions<F>(&mut self, new_ci: u16, callback: F)
-    where
-        F: FnMut(u16, Self::Entry);
+    /// Updates consumer index and returns the entry stored at wqe_idx.
+    /// Returns None if no entry was stored (shouldn't happen for signaled WQEs).
+    fn process_completion(&mut self, wqe_idx: u16) -> Option<Self::Entry>;
 }
 
 /// Trait for unordered send queues with WQE table support.

@@ -41,8 +41,8 @@ use crate::device::Context;
 use crate::pd::ProtectionDomain;
 use crate::srq::SrqInfo;
 use crate::wqe::{
-    CtrlSeg, DataSeg, TmSeg, UnorderedSendQueue, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode,
-    WqeTable,
+    CtrlSeg, DataSeg, SparseWqeTable, TmSeg, UnorderedSendQueue, WQEBB_SIZE, WqeFlags, WqeHandle,
+    WqeOpcode,
 };
 
 /// Offset from ibv_srq to cmd_qp pointer in mlx5_srq structure.
@@ -106,7 +106,7 @@ struct CmdQpState<T> {
     /// Last WQE pointer and size for doorbell.
     last_wqe: Option<(*mut u8, usize)>,
     /// WQE table for tracking in-flight operations.
-    table: WqeTable<T>,
+    table: SparseWqeTable<T>,
 }
 
 impl<T> CmdQpState<T> {
@@ -445,7 +445,7 @@ impl<T> TagMatchingSrq<T> {
                 bf_size: dv_qp.bf.size,
                 bf_offset: 0,
                 last_wqe: None,
-                table: WqeTable::new(sq_wqe_cnt),
+                table: SparseWqeTable::new(sq_wqe_cnt),
             })
         }
     }
