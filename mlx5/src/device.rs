@@ -44,7 +44,7 @@ impl Deref for DeviceList {
 }
 
 pub struct Context {
-    ctx: NonNull<mlx5_sys::ibv_context>,
+    pub(crate) ctx: NonNull<mlx5_sys::ibv_context>,
 }
 
 impl Device {
