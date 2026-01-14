@@ -107,6 +107,13 @@ impl Drop for ProtectionDomain {
     }
 }
 
+impl ProtectionDomain {
+    /// Get the raw ibv_pd pointer.
+    pub(crate) fn as_ptr(&self) -> *mut mlx5_sys::ibv_pd {
+        self.pd.as_ptr()
+    }
+}
+
 /// Memory Region registered with the HCA.
 ///
 /// An MR allows the HCA to access a memory buffer. The MR provides:
