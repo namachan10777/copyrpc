@@ -1,6 +1,6 @@
 //! WQE (Work Queue Element) common definitions.
 //!
-//! Provides segment definitions, opcodes, and traits shared across QP types.
+//! Provides segment definitions, opcodes, WQE table, and traits shared across QP types.
 
 use std::io;
 
@@ -254,27 +254,175 @@ pub struct WqeHandle {
 }
 
 // =============================================================================
+// WQE Table
+// =============================================================================
+
+/// WQE table for tracking in-flight operations.
+///
+/// Maps WQE indices to user-defined entries. Used to associate completion
+/// events (CQEs) with the original request metadata.
+///
+/// The table size must be a power of 2 for fast modulo via bit masking.
+pub struct WqeTable<T> {
+    entries: Box<[Option<T>]>,
+    mask: u16,
+}
+
+impl<T> WqeTable<T> {
+    /// Create a new WQE table with the given capacity.
+    ///
+    /// # Arguments
+    /// * `wqe_cnt` - Number of entries (must be power of 2)
+    pub fn new(wqe_cnt: u16) -> Self {
+        debug_assert!(wqe_cnt.is_power_of_two(), "wqe_cnt must be power of 2");
+        let entries = (0..wqe_cnt)
+            .map(|_| None)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            entries,
+            mask: wqe_cnt - 1,
+        }
+    }
+
+    /// Store an entry at the given index.
+    #[inline]
+    pub fn store(&mut self, idx: u16, entry: T) {
+        let slot = (idx & self.mask) as usize;
+        self.entries[slot] = Some(entry);
+    }
+
+    /// Take the entry at the given index, leaving None.
+    #[inline]
+    pub fn take(&mut self, idx: u16) -> Option<T> {
+        let slot = (idx & self.mask) as usize;
+        self.entries[slot].take()
+    }
+
+    /// Check if the slot at the given index is available (None).
+    #[inline]
+    pub fn is_available(&self, idx: u16) -> bool {
+        let slot = (idx & self.mask) as usize;
+        self.entries[slot].is_none()
+    }
+
+    /// Drain entries from old_ci (exclusive) to new_ci (inclusive).
+    ///
+    /// For ordered queues: iterates through all completed WQEs and yields
+    /// entries that were stored (Some values).
+    pub fn drain_range(&mut self, old_ci: u16, new_ci: u16) -> DrainRange<'_, T> {
+        DrainRange {
+            table: self,
+            current: old_ci.wrapping_add(1),
+            end: new_ci.wrapping_add(1),
+        }
+    }
+
+    /// Count available slots by scanning the table.
+    ///
+    /// For unordered queues where gaps may exist.
+    pub fn count_available(&self) -> u16 {
+        self.entries.iter().filter(|e| e.is_none()).count() as u16
+    }
+}
+
+/// Iterator that drains entries from a WQE table range.
+pub struct DrainRange<'a, T> {
+    table: &'a mut WqeTable<T>,
+    current: u16,
+    end: u16,
+}
+
+impl<T> Iterator for DrainRange<'_, T> {
+    type Item = (u16, T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.current != self.end {
+            let idx = self.current;
+            self.current = self.current.wrapping_add(1);
+            if let Some(entry) = self.table.take(idx) {
+                return Some((idx, entry));
+            }
+        }
+        None
+    }
+}
+
+// =============================================================================
 // Traits
 // =============================================================================
 
-/// Trait for types that can post send WQEs.
-pub trait SendQueue {
+/// Trait for ordered send queues with WQE table support.
+///
+/// Used for RC QP, DCI without streams where WQE completion order matches
+/// submission order.
+pub trait OrderedSendQueue {
     /// Builder type for this send queue.
     type Builder<'a>
     where
         Self: 'a;
 
+    /// Entry type stored in the WQE table.
+    type Entry;
+
     /// Get the number of available WQE slots.
     fn sq_available(&self) -> u16;
 
-    /// Update the consumer index after completions.
-    fn sq_update_ci(&mut self, ci: u16);
-
     /// Get a WQE builder for zero-copy WQE construction.
-    fn wqe_builder(&mut self) -> io::Result<Self::Builder<'_>>;
+    ///
+    /// # Arguments
+    /// * `entry` - Optional entry to store in WQE table.
+    ///   - `Some(entry)`: Store entry and set SIGNALED flag
+    ///   - `None`: No entry stored, no completion requested
+    fn wqe_builder(&mut self, entry: Option<Self::Entry>) -> io::Result<Self::Builder<'_>>;
 
     /// Ring the SQ doorbell to notify HCA of new WQEs.
     fn ring_sq_doorbell(&mut self);
+
+    /// Process completions up to the given wqe_counter.
+    ///
+    /// Calls the callback for each entry that was stored (signaled WQEs).
+    fn process_completions<F>(&mut self, new_ci: u16, callback: F)
+    where
+        F: FnMut(u16, Self::Entry);
+}
+
+/// Trait for unordered send queues with WQE table support.
+///
+/// Used for TM-SRQ Command QP, DCI with streams where completions may arrive
+/// out of order.
+pub trait UnorderedSendQueue {
+    /// Builder type for this send queue.
+    type Builder<'a>
+    where
+        Self: 'a;
+
+    /// Entry type stored in the WQE table.
+    type Entry;
+
+    /// Get optimistic available count.
+    ///
+    /// Based on pi - ci, but actual availability may be less due to gaps.
+    fn optimistic_available(&self) -> u16;
+
+    /// Scan the table to get exact available count (slower).
+    fn exact_available(&self) -> u16;
+
+    /// Check if a specific slot is available.
+    fn is_slot_available(&self, idx: u16) -> bool;
+
+    /// Get a WQE builder for zero-copy WQE construction.
+    ///
+    /// Entry is required (always signaled for unordered queues).
+    fn wqe_builder(&mut self, entry: Self::Entry) -> io::Result<Self::Builder<'_>>;
+
+    /// Ring the SQ doorbell to notify HCA of new WQEs.
+    fn ring_sq_doorbell(&mut self);
+
+    /// Process a single completion.
+    ///
+    /// Returns the entry that was stored at the given wqe_idx.
+    fn process_completion(&mut self, wqe_idx: u16) -> Option<Self::Entry>;
 }
 
 /// Trait for types that can post receive WQEs.

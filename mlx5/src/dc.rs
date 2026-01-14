@@ -12,8 +12,8 @@ use crate::pd::ProtectionDomain;
 use crate::qp::QpInfo;
 use crate::srq::SharedReceiveQueue;
 use crate::wqe::{
-    AddressVector, CtrlSeg, DataSeg, InlineHeader, RdmaSeg, WQEBB_SIZE, WqeHandle, WqeOpcode,
-    calc_wqebb_cnt,
+    AddressVector, CtrlSeg, DataSeg, InlineHeader, OrderedSendQueue, RdmaSeg, WQEBB_SIZE, WqeFlags,
+    WqeHandle, WqeOpcode, WqeTable, calc_wqebb_cnt,
 };
 
 /// DCI configuration.
@@ -76,7 +76,7 @@ pub struct RemoteDctInfo {
 // =============================================================================
 
 /// Send Queue state for DCI.
-struct DciSendQueueState {
+struct DciSendQueueState<T> {
     buf: *mut u8,
     wqe_cnt: u16,
     sqn: u32,
@@ -87,15 +87,12 @@ struct DciSendQueueState {
     bf_reg: *mut u8,
     bf_size: u32,
     bf_offset: u32,
+    table: WqeTable<T>,
 }
 
-impl DciSendQueueState {
+impl<T> DciSendQueueState<T> {
     fn available(&self) -> u16 {
         self.wqe_cnt - self.pi.wrapping_sub(self.ci)
-    }
-
-    fn update_ci(&mut self, ci: u16) {
-        self.ci = ci;
     }
 
     fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
@@ -147,6 +144,16 @@ impl DciSendQueueState {
         mmio_flush_writes!();
         self.bf_offset ^= self.bf_size;
     }
+
+    fn process_completions<F>(&mut self, new_ci: u16, mut callback: F)
+    where
+        F: FnMut(u16, T),
+    {
+        for (idx, entry) in self.table.drain_range(self.ci, new_ci) {
+            callback(idx, entry);
+        }
+        self.ci = new_ci;
+    }
 }
 
 // =============================================================================
@@ -156,19 +163,26 @@ impl DciSendQueueState {
 /// Zero-copy WQE builder for DCI.
 ///
 /// Similar to WqeBuilder but has Address Vector segment for DC operations.
-pub struct DciWqeBuilder<'a> {
-    sq: &'a mut DciSendQueueState,
+pub struct DciWqeBuilder<'a, T> {
+    sq: &'a mut DciSendQueueState<T>,
     wqe_ptr: *mut u8,
     wqe_idx: u16,
     offset: usize,
     ds_count: u8,
+    entry: Option<T>,
 }
 
-impl<'a> DciWqeBuilder<'a> {
+impl<'a, T> DciWqeBuilder<'a, T> {
     /// Write the control segment.
     ///
     /// This must be the first segment in every WQE.
+    /// The SIGNALED flag is automatically set if an entry was provided.
     pub fn ctrl(mut self, opcode: WqeOpcode, flags: u8, imm: u32) -> Self {
+        let flags = if self.entry.is_some() {
+            flags | WqeFlags::COMPLETION
+        } else {
+            flags
+        };
         unsafe {
             CtrlSeg::write(
                 self.wqe_ptr,
@@ -248,17 +262,25 @@ impl<'a> DciWqeBuilder<'a> {
     /// Finish the WQE construction.
     ///
     /// Updates the DS count and advances the SQ producer index.
+    /// If an entry was provided, stores it in the WQE table.
     pub fn finish(self) -> WqeHandle {
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
         }
 
         let wqebb_cnt = calc_wqebb_cnt(self.offset);
+        let wqe_idx = self.wqe_idx;
+
+        // Store entry in table if provided
+        if let Some(entry) = self.entry {
+            self.sq.table.store(wqe_idx, entry);
+        }
+
         self.sq.advance_pi(wqebb_cnt);
         self.sq.set_last_wqe(self.wqe_ptr, self.offset);
 
         WqeHandle {
-            wqe_idx: self.wqe_idx,
+            wqe_idx,
             size: self.offset,
         }
     }
@@ -272,10 +294,14 @@ impl<'a> DciWqeBuilder<'a> {
 ///
 /// Used for sending RDMA operations to DCTs.
 /// Created using mlx5dv_create_qp with DC type.
-pub struct Dci {
+///
+/// Type parameter `T` is the entry type stored in the WQE table for tracking
+/// in-flight operations. When a completion arrives, the associated entry is
+/// returned via the callback.
+pub struct Dci<T> {
     qp: NonNull<mlx5_sys::ibv_qp>,
     state: DcQpState,
-    sq: Option<DciSendQueueState>,
+    sq: Option<DciSendQueueState<T>>,
 }
 
 impl Context {
@@ -288,12 +314,12 @@ impl Context {
     ///
     /// # Errors
     /// Returns an error if the DCI cannot be created.
-    pub fn create_dci(
+    pub fn create_dci<T>(
         &self,
         pd: &ProtectionDomain,
         send_cq: &CompletionQueue,
         config: &DciConfig,
-    ) -> io::Result<Dci> {
+    ) -> io::Result<Dci<T>> {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_DRIVER;
@@ -334,7 +360,7 @@ impl Context {
     }
 }
 
-impl Drop for Dci {
+impl<T> Drop for Dci<T> {
     fn drop(&mut self) {
         unsafe {
             mlx5_sys::ibv_destroy_qp(self.qp.as_ptr());
@@ -342,7 +368,7 @@ impl Drop for Dci {
     }
 }
 
-impl Dci {
+impl<T> Dci<T> {
     /// Get the QP number.
     pub fn qpn(&self) -> u32 {
         unsafe { (*self.qp.as_ptr()).qp_num }
@@ -397,10 +423,11 @@ impl Dci {
     /// Call this after the DCI is ready (RTS state).
     pub fn init_direct_access(&mut self) -> io::Result<()> {
         let info = self.query_info()?;
+        let wqe_cnt = info.sq_wqe_cnt as u16;
 
         self.sq = Some(DciSendQueueState {
             buf: info.sq_buf,
-            wqe_cnt: info.sq_wqe_cnt as u16,
+            wqe_cnt,
             sqn: info.sqn,
             pi: 0,
             ci: 0,
@@ -409,6 +436,7 @@ impl Dci {
             bf_reg: info.bf_reg,
             bf_size: info.bf_size,
             bf_offset: 0,
+            table: WqeTable::new(wqe_cnt),
         });
 
         Ok(())
@@ -516,28 +544,25 @@ impl Dci {
         Ok(())
     }
 
-    fn sq_mut(&mut self) -> io::Result<&mut DciSendQueueState> {
+    fn sq_mut(&mut self) -> io::Result<&mut DciSendQueueState<T>> {
         self.sq
             .as_mut()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "direct access not initialized"))
     }
+}
 
-    /// Get the number of available WQE slots.
-    pub fn sq_available(&self) -> u16 {
+impl<T> OrderedSendQueue for Dci<T> {
+    type Builder<'a>
+        = DciWqeBuilder<'a, T>
+    where
+        T: 'a;
+    type Entry = T;
+
+    fn sq_available(&self) -> u16 {
         self.sq.as_ref().map(|sq| sq.available()).unwrap_or(0)
     }
 
-    /// Update the consumer index after completions.
-    pub fn sq_update_ci(&mut self, ci: u16) {
-        if let Some(sq) = self.sq.as_mut() {
-            sq.update_ci(ci);
-        }
-    }
-
-    /// Get a WQE builder for zero-copy WQE construction.
-    ///
-    /// DCI uses DciWqeBuilder which requires Address Vector for DC operations.
-    pub fn wqe_builder(&mut self) -> io::Result<DciWqeBuilder<'_>> {
+    fn wqe_builder(&mut self, entry: Option<Self::Entry>) -> io::Result<DciWqeBuilder<'_, T>> {
         let sq = self.sq_mut()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -552,13 +577,22 @@ impl Dci {
             wqe_idx,
             offset: 0,
             ds_count: 0,
+            entry,
         })
     }
 
-    /// Ring the SQ doorbell to notify HCA of new WQEs.
-    pub fn ring_sq_doorbell(&mut self) {
+    fn ring_sq_doorbell(&mut self) {
         if let Some(sq) = self.sq.as_mut() {
             sq.ring_doorbell();
+        }
+    }
+
+    fn process_completions<F>(&mut self, new_ci: u16, callback: F)
+    where
+        F: FnMut(u16, Self::Entry),
+    {
+        if let Some(sq) = self.sq.as_mut() {
+            sq.process_completions(new_ci, callback);
         }
     }
 }

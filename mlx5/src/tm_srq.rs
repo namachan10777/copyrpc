@@ -40,7 +40,10 @@ use crate::cq::CompletionQueue;
 use crate::device::Context;
 use crate::pd::ProtectionDomain;
 use crate::srq::SrqInfo;
-use crate::wqe::{CtrlSeg, DataSeg, TmSeg, WQEBB_SIZE, WqeOpcode};
+use crate::wqe::{
+    CtrlSeg, DataSeg, TmSeg, UnorderedSendQueue, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode,
+    WqeTable,
+};
 
 /// Offset from ibv_srq to cmd_qp pointer in mlx5_srq structure.
 ///
@@ -81,7 +84,7 @@ impl Default for TmSrqConfig {
 // =============================================================================
 
 /// Command QP state for TM tag operations.
-struct CmdQpState {
+struct CmdQpState<T> {
     /// QP number.
     qpn: u32,
     /// Send queue buffer.
@@ -90,6 +93,8 @@ struct CmdQpState {
     sq_wqe_cnt: u16,
     /// Producer index.
     pi: u16,
+    /// Consumer index (for optimistic available calculation).
+    ci: u16,
     /// Doorbell record pointer.
     dbrec: *mut u32,
     /// BlueFlame register.
@@ -98,22 +103,32 @@ struct CmdQpState {
     bf_size: u32,
     /// BlueFlame offset.
     bf_offset: u32,
-    /// Last WQE pointer for doorbell.
-    last_wqe: Option<*mut u8>,
+    /// Last WQE pointer and size for doorbell.
+    last_wqe: Option<(*mut u8, usize)>,
+    /// WQE table for tracking in-flight operations.
+    table: WqeTable<T>,
 }
 
-impl CmdQpState {
+impl<T> CmdQpState<T> {
     fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
         let offset = ((idx & (self.sq_wqe_cnt - 1)) as usize) * WQEBB_SIZE;
         unsafe { self.sq_buf.add(offset) }
     }
 
-    fn advance_pi(&mut self) {
-        self.pi = self.pi.wrapping_add(1);
+    fn advance_pi(&mut self, count: u16) {
+        self.pi = self.pi.wrapping_add(count);
+    }
+
+    fn set_last_wqe(&mut self, ptr: *mut u8, size: usize) {
+        self.last_wqe = Some((ptr, size));
+    }
+
+    fn optimistic_available(&self) -> u16 {
+        self.sq_wqe_cnt - self.pi.wrapping_sub(self.ci)
     }
 
     fn ring_doorbell(&mut self) {
-        let Some(wqe_ptr) = self.last_wqe.take() else {
+        let Some((wqe_ptr, wqe_size)) = self.last_wqe.take() else {
             return;
         };
 
@@ -126,8 +141,8 @@ impl CmdQpState {
 
         udma_to_device_barrier!();
 
-        // BlueFlame write
-        if self.bf_size > 0 {
+        // BlueFlame write for small WQEs
+        if self.bf_size > 0 && wqe_size <= WQEBB_SIZE {
             let bf = unsafe { self.bf_reg.add(self.bf_offset as usize) };
             mlx5_bf_copy!(bf, wqe_ptr);
             mmio_flush_writes!();
@@ -141,6 +156,95 @@ impl CmdQpState {
             }
             mmio_flush_writes!();
             self.bf_offset ^= self.bf_size;
+        }
+    }
+
+    fn process_completion(&mut self, wqe_idx: u16) -> Option<T> {
+        self.ci = self.ci.wrapping_add(1);
+        self.table.take(wqe_idx)
+    }
+}
+
+// =============================================================================
+// Command QP WQE Builder
+// =============================================================================
+
+/// WQE builder for Command QP tag operations.
+pub struct CmdQpWqeBuilder<'a, T> {
+    cmd_qp: &'a mut CmdQpState<T>,
+    wqe_ptr: *mut u8,
+    wqe_idx: u16,
+    offset: usize,
+    ds_count: u8,
+    entry: T,
+}
+
+impl<'a, T> CmdQpWqeBuilder<'a, T> {
+    /// Write the control segment.
+    ///
+    /// This must be the first segment in every WQE.
+    /// Always sets SIGNALED flag for unordered queues.
+    pub fn ctrl(mut self, opcode: WqeOpcode, imm: u32) -> Self {
+        unsafe {
+            CtrlSeg::write(
+                self.wqe_ptr,
+                opcode as u8,
+                self.wqe_idx,
+                self.cmd_qp.qpn,
+                0,
+                WqeFlags::COMPLETION,
+                imm,
+            );
+        }
+        self.offset = 16; // CtrlSeg::SIZE
+        self.ds_count = 1;
+        self
+    }
+
+    /// Add TAG_ADD segment with data segment.
+    pub fn tag_add(mut self, index: u16, tag: u64, addr: u64, len: u32, lkey: u32) -> Self {
+        unsafe {
+            TmSeg::write_add(self.wqe_ptr.add(self.offset), index, tag, !0u64, true);
+        }
+        self.offset += TmSeg::SIZE;
+        self.ds_count += 2; // TmSeg = 32 bytes = 2 DS
+
+        unsafe {
+            DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
+        }
+        self.offset += DataSeg::SIZE;
+        self.ds_count += 1;
+        self
+    }
+
+    /// Add TAG_DEL segment.
+    pub fn tag_del(mut self, index: u16) -> Self {
+        unsafe {
+            TmSeg::write_del(self.wqe_ptr.add(self.offset), index, true);
+        }
+        self.offset += TmSeg::SIZE;
+        self.ds_count += 2; // TmSeg = 32 bytes = 2 DS
+        self
+    }
+
+    /// Finish the WQE construction.
+    pub fn finish(self) -> WqeHandle {
+        unsafe {
+            // Update DS count in control segment
+            std::ptr::write_volatile(self.wqe_ptr.add(7), self.ds_count);
+        }
+
+        let wqe_idx = self.wqe_idx;
+
+        // Store entry in table (always signaled for unordered)
+        self.cmd_qp.table.store(wqe_idx, self.entry);
+
+        self.cmd_qp.advance_pi(1);
+        self.cmd_qp.set_last_wqe(self.wqe_ptr, self.offset);
+
+        WqeHandle {
+            wqe_idx,
+            size: self.offset,
         }
     }
 }
@@ -200,7 +304,11 @@ impl TmSrqState {
 /// corresponding buffer.
 ///
 /// TM operations (add_tag, remove_tag) use the internal Command QP.
-pub struct TagMatchingSrq {
+///
+/// Type parameter `T` is the entry type stored in the WQE table for tracking
+/// in-flight tag operations. When a completion arrives, the associated entry is
+/// returned via `process_completion`.
+pub struct TagMatchingSrq<T> {
     srq: NonNull<mlx5_sys::ibv_srq>,
     /// Number of WQE slots (power of 2).
     wqe_cnt: u32,
@@ -209,7 +317,7 @@ pub struct TagMatchingSrq {
     /// SRQ state for direct posting.
     srq_state: Option<TmSrqState>,
     /// Command QP state for tag operations.
-    cmd_qp: Option<CmdQpState>,
+    cmd_qp: Option<CmdQpState<T>>,
 }
 
 impl Context {
@@ -222,12 +330,12 @@ impl Context {
     ///
     /// # Errors
     /// Returns an error if the TM-SRQ cannot be created.
-    pub fn create_tm_srq(
+    pub fn create_tm_srq<T>(
         &self,
         pd: &ProtectionDomain,
         cq: &CompletionQueue,
         config: &TmSrqConfig,
-    ) -> io::Result<TagMatchingSrq> {
+    ) -> io::Result<TagMatchingSrq<T>> {
         unsafe {
             let mut attr: mlx5_sys::ibv_srq_init_attr_ex = MaybeUninit::zeroed().assume_init();
             attr.attr.max_wr = config.max_wr;
@@ -256,7 +364,7 @@ impl Context {
     }
 }
 
-impl Drop for TagMatchingSrq {
+impl<T> Drop for TagMatchingSrq<T> {
     fn drop(&mut self) {
         unsafe {
             mlx5_sys::ibv_destroy_srq(self.srq.as_ptr());
@@ -264,12 +372,7 @@ impl Drop for TagMatchingSrq {
     }
 }
 
-impl TagMatchingSrq {
-    /// Get the raw ibv_srq pointer.
-    pub(crate) fn as_ptr(&self) -> *mut mlx5_sys::ibv_srq {
-        self.srq.as_ptr()
-    }
-
+impl<T> TagMatchingSrq<T> {
     /// Query SRQ info using mlx5dv_init_obj.
     fn query_srq_info(&self) -> io::Result<SrqInfo> {
         unsafe {
@@ -298,7 +401,7 @@ impl TagMatchingSrq {
     }
 
     /// Query Command QP info.
-    fn query_cmd_qp_info(&self) -> io::Result<CmdQpState> {
+    fn query_cmd_qp_info(&self) -> io::Result<CmdQpState<T>> {
         unsafe {
             // Get the internal Command QP from mlx5_srq structure
             let cmd_qp_ptr = {
@@ -329,17 +432,20 @@ impl TagMatchingSrq {
 
             let dv_qp = dv_qp.assume_init();
             let qpn = (*cmd_qp_ptr).qp_num;
+            let sq_wqe_cnt = dv_qp.sq.wqe_cnt as u16;
 
             Ok(CmdQpState {
                 qpn,
                 sq_buf: dv_qp.sq.buf as *mut u8,
-                sq_wqe_cnt: dv_qp.sq.wqe_cnt as u16,
+                sq_wqe_cnt,
                 pi: 0,
+                ci: 0,
                 dbrec: dv_qp.dbrec as *mut u32,
                 bf_reg: dv_qp.bf.reg as *mut u8,
                 bf_size: dv_qp.bf.size,
                 bf_offset: 0,
                 last_wqe: None,
+                table: WqeTable::new(sq_wqe_cnt),
             })
         }
     }
@@ -375,100 +481,10 @@ impl TagMatchingSrq {
         self.max_num_tags
     }
 
-    // =========================================================================
-    // Tag Operations (via Command QP)
-    // =========================================================================
-
-    /// Add a tagged receive buffer.
-    ///
-    /// Posts a receive buffer with the specified tag. When a message with
-    /// matching tag arrives, it will be delivered to this buffer.
-    ///
-    /// Call `ring_cmd_doorbell()` after posting one or more tag operations.
-    ///
-    /// # Arguments
-    /// * `index` - Tag entry index (0 to max_num_tags-1)
-    /// * `tag` - The 64-bit tag to match
-    /// * `addr` - Buffer address
-    /// * `len` - Buffer length
-    /// * `lkey` - Local key for the buffer
-    ///
-    /// # Safety
-    /// - The buffer must be registered and valid
-    /// - Direct access must be initialized
-    /// - Index must be valid
-    pub unsafe fn add_tag(&mut self, index: u16, tag: u64, addr: u64, len: u32, lkey: u32) {
-        let cmd_qp = self.cmd_qp.as_mut().expect("direct access not initialized");
-
-        let wqe_idx = cmd_qp.pi;
-        let wqe_ptr = cmd_qp.get_wqe_ptr(wqe_idx);
-
-        // WQE layout for TAG_ADD:
-        // - Control Segment (16 bytes)
-        // - TM Segment (32 bytes)
-        // - Data Segment (16 bytes)
-        // Total: 64 bytes = 1 WQEBB, DS count = 4
-
-        CtrlSeg::write(
-            wqe_ptr,
-            WqeOpcode::TagMatching as u8,
-            wqe_idx,
-            cmd_qp.qpn,
-            4, // DS count
-            0, // no completion
-            0, // no imm
-        );
-
-        TmSeg::write_add(wqe_ptr.add(16), index, tag, !0u64, false);
-
-        DataSeg::write(wqe_ptr.add(48), len, lkey, addr);
-
-        cmd_qp.last_wqe = Some(wqe_ptr);
-        cmd_qp.advance_pi();
-    }
-
-    /// Remove a previously added tag.
-    ///
-    /// Call `ring_cmd_doorbell()` after posting one or more tag operations.
-    ///
-    /// # Arguments
-    /// * `index` - Tag entry index to remove
-    ///
-    /// # Safety
-    /// - Direct access must be initialized
-    /// - Index must be valid
-    pub unsafe fn remove_tag(&mut self, index: u16) {
-        let cmd_qp = self.cmd_qp.as_mut().expect("direct access not initialized");
-
-        let wqe_idx = cmd_qp.pi;
-        let wqe_ptr = cmd_qp.get_wqe_ptr(wqe_idx);
-
-        // WQE layout for TAG_DEL:
-        // - Control Segment (16 bytes)
-        // - TM Segment (32 bytes)
-        // Total: 48 bytes, DS count = 3
-
-        CtrlSeg::write(
-            wqe_ptr,
-            WqeOpcode::TagMatching as u8,
-            wqe_idx,
-            cmd_qp.qpn,
-            3, // DS count
-            0, // no completion
-            0, // no imm
-        );
-
-        TmSeg::write_del(wqe_ptr.add(16), index, false);
-
-        cmd_qp.last_wqe = Some(wqe_ptr);
-        cmd_qp.advance_pi();
-    }
-
-    /// Ring the Command QP doorbell to submit tag operations.
-    pub fn ring_cmd_doorbell(&mut self) {
-        if let Some(cmd_qp) = self.cmd_qp.as_mut() {
-            cmd_qp.ring_doorbell();
-        }
+    fn cmd_qp_mut(&mut self) -> io::Result<&mut CmdQpState<T>> {
+        self.cmd_qp
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "direct access not initialized"))
     }
 
     // =========================================================================
@@ -493,5 +509,69 @@ impl TagMatchingSrq {
         if let Some(state) = self.srq_state.as_mut() {
             state.ring_doorbell();
         }
+    }
+}
+
+// =============================================================================
+// UnorderedSendQueue Implementation for Command QP
+// =============================================================================
+
+impl<T> UnorderedSendQueue for TagMatchingSrq<T> {
+    type Builder<'a>
+        = CmdQpWqeBuilder<'a, T>
+    where
+        T: 'a;
+    type Entry = T;
+
+    fn optimistic_available(&self) -> u16 {
+        self.cmd_qp
+            .as_ref()
+            .map(|cq| cq.optimistic_available())
+            .unwrap_or(0)
+    }
+
+    fn exact_available(&self) -> u16 {
+        self.cmd_qp
+            .as_ref()
+            .map(|cq| cq.table.count_available())
+            .unwrap_or(0)
+    }
+
+    fn is_slot_available(&self, idx: u16) -> bool {
+        self.cmd_qp
+            .as_ref()
+            .map(|cq| cq.table.is_available(idx))
+            .unwrap_or(false)
+    }
+
+    fn wqe_builder(&mut self, entry: Self::Entry) -> io::Result<CmdQpWqeBuilder<'_, T>> {
+        let cmd_qp = self.cmd_qp_mut()?;
+        if !cmd_qp.table.is_available(cmd_qp.pi) {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+
+        let wqe_idx = cmd_qp.pi;
+        let wqe_ptr = cmd_qp.get_wqe_ptr(wqe_idx);
+
+        Ok(CmdQpWqeBuilder {
+            cmd_qp,
+            wqe_ptr,
+            wqe_idx,
+            offset: 0,
+            ds_count: 0,
+            entry,
+        })
+    }
+
+    fn ring_sq_doorbell(&mut self) {
+        if let Some(cmd_qp) = self.cmd_qp.as_mut() {
+            cmd_qp.ring_doorbell();
+        }
+    }
+
+    fn process_completion(&mut self, wqe_idx: u16) -> Option<Self::Entry> {
+        self.cmd_qp
+            .as_mut()
+            .and_then(|cq| cq.process_completion(wqe_idx))
     }
 }

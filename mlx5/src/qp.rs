@@ -9,8 +9,8 @@ use crate::cq::CompletionQueue;
 use crate::device::Context;
 use crate::pd::ProtectionDomain;
 use crate::wqe::{
-    CtrlSeg, DataSeg, InlineHeader, RdmaSeg, ReceiveQueue, SendQueue, WQEBB_SIZE, WqeHandle,
-    WqeOpcode, calc_wqebb_cnt,
+    CtrlSeg, DataSeg, InlineHeader, OrderedSendQueue, RdmaSeg, ReceiveQueue, WQEBB_SIZE, WqeFlags,
+    WqeHandle, WqeOpcode, WqeTable, calc_wqebb_cnt,
 };
 
 /// RC QP configuration.
@@ -91,7 +91,7 @@ pub struct QpInfo {
 // =============================================================================
 
 /// Send Queue state for direct WQE posting.
-pub(crate) struct SendQueueState {
+pub(crate) struct SendQueueState<T> {
     /// SQ buffer base address
     buf: *mut u8,
     /// Number of WQEBBs (64-byte blocks)
@@ -112,15 +112,13 @@ pub(crate) struct SendQueueState {
     bf_size: u32,
     /// Current BlueFlame offset (alternates between 0 and bf_size)
     bf_offset: u32,
+    /// WQE table for tracking in-flight operations
+    table: WqeTable<T>,
 }
 
-impl SendQueueState {
+impl<T> SendQueueState<T> {
     fn available(&self) -> u16 {
         self.wqe_cnt - self.pi.wrapping_sub(self.ci)
-    }
-
-    fn update_ci(&mut self, ci: u16) {
-        self.ci = ci;
     }
 
     fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
@@ -172,6 +170,16 @@ impl SendQueueState {
         mmio_flush_writes!();
         self.bf_offset ^= self.bf_size;
     }
+
+    fn process_completions<F>(&mut self, new_ci: u16, mut callback: F)
+    where
+        F: FnMut(u16, T),
+    {
+        for (idx, entry) in self.table.drain_range(self.ci, new_ci) {
+            callback(idx, entry);
+        }
+        self.ci = new_ci;
+    }
 }
 
 // =============================================================================
@@ -219,19 +227,27 @@ impl ReceiveQueueState {
 /// Zero-copy WQE builder for RC QP.
 ///
 /// Writes segments directly to the SQ buffer without intermediate copies.
-pub struct WqeBuilder<'a> {
-    sq: &'a mut SendQueueState,
+pub struct WqeBuilder<'a, T> {
+    sq: &'a mut SendQueueState<T>,
     wqe_ptr: *mut u8,
     wqe_idx: u16,
     offset: usize,
     ds_count: u8,
+    /// Entry to store in WQE table on finish (if signaled)
+    entry: Option<T>,
 }
 
-impl<'a> WqeBuilder<'a> {
+impl<'a, T> WqeBuilder<'a, T> {
     /// Write the control segment.
     ///
     /// This must be the first segment in every WQE.
+    /// The SIGNALED flag is automatically set if an entry was provided.
     pub fn ctrl(mut self, opcode: WqeOpcode, flags: u8, imm: u32) -> Self {
+        let flags = if self.entry.is_some() {
+            flags | WqeFlags::COMPLETION
+        } else {
+            flags
+        };
         unsafe {
             CtrlSeg::write(
                 self.wqe_ptr,
@@ -299,17 +315,25 @@ impl<'a> WqeBuilder<'a> {
     /// Finish the WQE construction.
     ///
     /// Updates the DS count and advances the SQ producer index.
+    /// If an entry was provided, stores it in the WQE table.
     pub fn finish(self) -> WqeHandle {
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
         }
 
         let wqebb_cnt = calc_wqebb_cnt(self.offset);
+        let wqe_idx = self.wqe_idx;
+
+        // Store entry in table if provided
+        if let Some(entry) = self.entry {
+            self.sq.table.store(wqe_idx, entry);
+        }
+
         self.sq.advance_pi(wqebb_cnt);
         self.sq.set_last_wqe(self.wqe_ptr, self.offset);
 
         WqeHandle {
-            wqe_idx: self.wqe_idx,
+            wqe_idx,
             size: self.offset,
         }
     }
@@ -322,10 +346,14 @@ impl<'a> WqeBuilder<'a> {
 /// RC (Reliable Connection) Queue Pair.
 ///
 /// Created using mlx5dv_create_qp for direct hardware access.
-pub struct RcQp {
+///
+/// Type parameter `T` is the entry type stored in the WQE table for tracking
+/// in-flight operations. When a completion arrives, the associated entry is
+/// returned via the callback.
+pub struct RcQp<T> {
     qp: NonNull<mlx5_sys::ibv_qp>,
     state: QpState,
-    sq: Option<SendQueueState>,
+    sq: Option<SendQueueState<T>>,
     rq: Option<ReceiveQueueState>,
 }
 
@@ -340,13 +368,13 @@ impl Context {
     ///
     /// # Errors
     /// Returns an error if the QP cannot be created.
-    pub fn create_rc_qp(
+    pub fn create_rc_qp<T>(
         &self,
         pd: &ProtectionDomain,
         send_cq: &CompletionQueue,
         recv_cq: &CompletionQueue,
         config: &RcQpConfig,
-    ) -> io::Result<RcQp> {
+    ) -> io::Result<RcQp<T>> {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
@@ -375,7 +403,7 @@ impl Context {
     }
 }
 
-impl Drop for RcQp {
+impl<T> Drop for RcQp<T> {
     fn drop(&mut self) {
         unsafe {
             mlx5_sys::ibv_destroy_qp(self.qp.as_ptr());
@@ -383,7 +411,7 @@ impl Drop for RcQp {
     }
 }
 
-impl RcQp {
+impl<T> RcQp<T> {
     /// Get the QP number.
     pub fn qpn(&self) -> u32 {
         unsafe { (*self.qp.as_ptr()).qp_num }
@@ -438,10 +466,11 @@ impl RcQp {
     /// Call this after the QP is ready (RTS state).
     pub fn init_direct_access(&mut self) -> io::Result<()> {
         let info = self.query_info()?;
+        let wqe_cnt = info.sq_wqe_cnt as u16;
 
         self.sq = Some(SendQueueState {
             buf: info.sq_buf,
-            wqe_cnt: info.sq_wqe_cnt as u16,
+            wqe_cnt,
             sqn: info.sqn,
             pi: 0,
             ci: 0,
@@ -450,6 +479,7 @@ impl RcQp {
             bf_reg: info.bf_reg,
             bf_size: info.bf_size,
             bf_offset: 0,
+            table: WqeTable::new(wqe_cnt),
         });
 
         self.rq = Some(ReceiveQueueState {
@@ -595,27 +625,25 @@ impl RcQp {
         Ok(())
     }
 
-    fn sq_mut(&mut self) -> io::Result<&mut SendQueueState> {
+    fn sq_mut(&mut self) -> io::Result<&mut SendQueueState<T>> {
         self.sq
             .as_mut()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "direct access not initialized"))
     }
 }
 
-impl SendQueue for RcQp {
-    type Builder<'a> = WqeBuilder<'a>;
+impl<T> OrderedSendQueue for RcQp<T> {
+    type Builder<'a>
+        = WqeBuilder<'a, T>
+    where
+        T: 'a;
+    type Entry = T;
 
     fn sq_available(&self) -> u16 {
         self.sq.as_ref().map(|sq| sq.available()).unwrap_or(0)
     }
 
-    fn sq_update_ci(&mut self, ci: u16) {
-        if let Some(sq) = self.sq.as_mut() {
-            sq.update_ci(ci);
-        }
-    }
-
-    fn wqe_builder(&mut self) -> io::Result<WqeBuilder<'_>> {
+    fn wqe_builder(&mut self, entry: Option<Self::Entry>) -> io::Result<WqeBuilder<'_, T>> {
         let sq = self.sq_mut()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -630,6 +658,7 @@ impl SendQueue for RcQp {
             wqe_idx,
             offset: 0,
             ds_count: 0,
+            entry,
         })
     }
 
@@ -638,9 +667,18 @@ impl SendQueue for RcQp {
             sq.ring_doorbell();
         }
     }
+
+    fn process_completions<F>(&mut self, new_ci: u16, callback: F)
+    where
+        F: FnMut(u16, Self::Entry),
+    {
+        if let Some(sq) = self.sq.as_mut() {
+            sq.process_completions(new_ci, callback);
+        }
+    }
 }
 
-impl ReceiveQueue for RcQp {
+impl<T> ReceiveQueue for RcQp<T> {
     unsafe fn post_recv(&mut self, addr: u64, len: u32, lkey: u32) {
         if let Some(rq) = self.rq.as_mut() {
             rq.post(addr, len, lkey);
