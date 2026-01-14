@@ -43,7 +43,13 @@ use crate::srq::SrqInfo;
 use crate::wqe::{CtrlSeg, DataSeg, TmSeg, WQEBB_SIZE, WqeOpcode};
 
 /// Offset from ibv_srq to cmd_qp pointer in mlx5_srq structure.
-/// This is determined by the mlx5 provider's internal layout.
+///
+/// This is determined by the mlx5 provider's internal layout and may change
+/// between rdma-core versions. The official API `ibv_post_srq_ops()` exists
+/// but has verbs overhead. This hack provides direct WQE access for lower latency.
+///
+/// Tested with rdma-core v28+. If TM operations fail, verify this offset
+/// against your rdma-core version's `struct mlx5_srq` in `providers/mlx5/mlx5.h`.
 const CMD_QP_OFFSET: isize = 296;
 
 /// TM-SRQ configuration.
