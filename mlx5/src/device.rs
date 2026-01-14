@@ -67,8 +67,20 @@ impl Drop for Context {
 }
 
 impl Context {
+    /// Query ibverbs device attributes.
+    pub fn query_ibv_device(&self) -> io::Result<mlx5_sys::ibv_device_attr> {
+        unsafe {
+            let mut attrs: MaybeUninit<mlx5_sys::ibv_device_attr> = MaybeUninit::uninit();
+            let ret = mlx5_sys::ibv_query_device(self.ctx.as_ptr(), attrs.as_mut_ptr());
+            if ret != 0 {
+                return Err(io::Error::from_raw_os_error(-ret));
+            }
+            Ok(attrs.assume_init())
+        }
+    }
+
     /// Query mlx5 device attributes.
-    pub fn query_device(&self) -> io::Result<mlx5_sys::mlx5dv_context> {
+    pub fn query_mlx5_device(&self) -> io::Result<mlx5_sys::mlx5dv_context> {
         unsafe {
             let mut attrs: MaybeUninit<mlx5_sys::mlx5dv_context> = MaybeUninit::zeroed();
             let ret = mlx5_sys::mlx5dv_query_device(self.ctx.as_ptr(), attrs.as_mut_ptr());
