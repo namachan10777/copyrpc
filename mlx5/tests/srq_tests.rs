@@ -1,0 +1,375 @@
+//! SRQ (Shared Receive Queue) tests.
+//!
+//! This module tests SRQ functionality:
+//! - SRQ creation
+//! - SRQ direct access initialization
+//! - SRQ receive posting
+//! - SRQ used with DCT for receiving DC SEND operations
+//!
+//! Run with:
+//! ```bash
+//! cargo test --release -p mlx5 --test srq_tests -- --nocapture
+//! ```
+
+mod common;
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use mlx5::dc::{DciConfig, DctConfig};
+use mlx5::srq::SrqConfig;
+use mlx5::wqe::{WqeFlags, WqeOpcode};
+
+use common::{full_access, poll_cq_timeout, AlignedBuffer, TestContext};
+
+// =============================================================================
+// SRQ Creation Tests
+// =============================================================================
+
+#[test]
+fn test_srq_creation() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    let config = SrqConfig {
+        max_wr: 128,
+        max_sge: 1,
+    };
+
+    let srq = ctx.pd.create_srq(&config).expect("Failed to create SRQ");
+
+    let srqn = srq.srqn().expect("Failed to get SRQN");
+    println!("SRQ creation test passed!");
+    println!("  SRQN: 0x{:x}", srqn);
+}
+
+#[test]
+fn test_srq_direct_access() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    let config = SrqConfig {
+        max_wr: 128,
+        max_sge: 1,
+    };
+
+    let mut srq = ctx.pd.create_srq(&config).expect("Failed to create SRQ");
+
+    // Initialize direct access
+    srq.init_direct_access()
+        .expect("Failed to init SRQ direct access");
+
+    println!("SRQ direct access test passed!");
+}
+
+// =============================================================================
+// SRQ Receive Posting Tests
+// =============================================================================
+
+#[test]
+fn test_srq_post_recv() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    let config = SrqConfig {
+        max_wr: 128,
+        max_sge: 1,
+    };
+
+    let mut srq = ctx.pd.create_srq(&config).expect("Failed to create SRQ");
+    srq.init_direct_access()
+        .expect("Failed to init SRQ direct access");
+
+    // Allocate receive buffer
+    let recv_buf = AlignedBuffer::new(4096);
+    let mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
+        .expect("Failed to register MR");
+
+    // Post multiple receive buffers
+    for i in 0..10 {
+        let offset = (i * 256) as usize;
+        unsafe {
+            srq.post_recv(recv_buf.addr() + offset as u64, 256, mr.lkey());
+        }
+    }
+
+    // Ring doorbell
+    srq.ring_doorbell();
+
+    println!("SRQ post recv test passed!");
+    println!("  Posted 10 receive WQEs");
+}
+
+// =============================================================================
+// SRQ with DCT Tests
+// =============================================================================
+
+#[test]
+fn test_srq_with_dct_send() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    require_dct!(&ctx);
+
+    // Create CQs
+    let dci_cq = Rc::new(RefCell::new(
+        ctx.ctx.create_cq(256).expect("Failed to create DCI CQ"),
+    ));
+    dci_cq
+        .borrow_mut()
+        .init_direct_access()
+        .expect("Failed to init DCI CQ direct access");
+
+    let mut dct_cq = ctx.ctx.create_cq(256).expect("Failed to create DCT CQ");
+    dct_cq
+        .init_direct_access()
+        .expect("Failed to init DCT CQ direct access");
+
+    // Create SRQ
+    let srq_config = SrqConfig {
+        max_wr: 128,
+        max_sge: 1,
+    };
+    let mut srq = ctx
+        .pd
+        .create_srq(&srq_config)
+        .expect("Failed to create SRQ");
+    srq.init_direct_access()
+        .expect("Failed to init SRQ direct access");
+
+    // Create receive buffer and post to SRQ
+    let mut recv_buf = AlignedBuffer::new(4096);
+    let recv_mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
+        .expect("Failed to register recv MR");
+
+    unsafe {
+        srq.post_recv(recv_buf.addr(), 4096, recv_mr.lkey());
+    }
+    srq.ring_doorbell();
+
+    // Create and activate DCI
+    let dci_config = DciConfig::default();
+    let dci = ctx
+        .ctx
+        .create_dci_sparse::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
+        .expect("Failed to create DCI");
+    dci.borrow_mut()
+        .activate(ctx.port, 0, 4)
+        .expect("Failed to activate DCI");
+
+    // Create and activate DCT
+    let dc_key: u64 = 0xABCDEF01;
+    let dct_config = DctConfig { dc_key };
+    let mut dct = ctx
+        .ctx
+        .create_dct(&ctx.pd, &srq, &dct_cq, &dct_config)
+        .expect("Failed to create DCT");
+    let access = full_access().bits();
+    dct.activate(ctx.port, access, 4)
+        .expect("Failed to activate DCT");
+
+    let dctn = dct.dctn();
+    let dlid = ctx.port_attr.lid;
+
+    // Prepare send data
+    let mut send_buf = AlignedBuffer::new(4096);
+    let send_mr = unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }
+        .expect("Failed to register send MR");
+
+    let test_data = b"DC SEND via SRQ test!";
+    send_buf.fill_bytes(test_data);
+
+    // Post DC SEND
+    dci.borrow_mut()
+        .wqe_builder(1u64)
+        .expect("wqe_builder failed")
+        .ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
+        .av(dc_key, dctn, dlid)
+        .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
+        .finish_with_blueflame();
+
+    // Poll DCI CQ for send completion
+    let send_cqe = poll_cq_timeout(&mut dci_cq.borrow_mut(), 5000).expect("Send CQE timeout");
+    assert_eq!(
+        send_cqe.syndrome, 0,
+        "Send CQE error: syndrome={}",
+        send_cqe.syndrome
+    );
+    dci_cq.borrow().flush();
+
+    // Poll DCT CQ for receive completion
+    let recv_cqe = poll_cq_timeout(&mut dct_cq, 5000).expect("Recv CQE timeout");
+    assert_eq!(
+        recv_cqe.syndrome, 0,
+        "Recv CQE error: syndrome={}",
+        recv_cqe.syndrome
+    );
+    dct_cq.flush();
+
+    // Verify received data
+    // Note: DC receive has a 40-byte GRH header prepended
+    let grh_size = 40;
+    let received = recv_buf.read_bytes(grh_size + test_data.len());
+    assert_eq!(
+        &received[grh_size..],
+        test_data,
+        "Received data mismatch"
+    );
+
+    println!("SRQ with DCT SEND test passed!");
+    println!("  Sent {} bytes via DC SEND", test_data.len());
+    println!("  Received byte count: {}", recv_cqe.byte_cnt);
+}
+
+// =============================================================================
+// SRQ Multiple QP Tests
+// =============================================================================
+
+#[test]
+fn test_srq_shared_by_multiple_dcts() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    require_dct!(&ctx);
+
+    // Create CQs
+    let dci_cq = Rc::new(RefCell::new(
+        ctx.ctx.create_cq(256).expect("Failed to create DCI CQ"),
+    ));
+    dci_cq
+        .borrow_mut()
+        .init_direct_access()
+        .expect("Failed to init DCI CQ direct access");
+
+    let mut dct_cq = ctx.ctx.create_cq(256).expect("Failed to create DCT CQ");
+    dct_cq
+        .init_direct_access()
+        .expect("Failed to init DCT CQ direct access");
+
+    // Create shared SRQ
+    let srq_config = SrqConfig {
+        max_wr: 256,
+        max_sge: 1,
+    };
+    let mut srq = ctx
+        .pd
+        .create_srq(&srq_config)
+        .expect("Failed to create SRQ");
+    srq.init_direct_access()
+        .expect("Failed to init SRQ direct access");
+
+    // Create receive buffers and post to SRQ
+    let mut recv_bufs: Vec<_> = (0..4).map(|_| AlignedBuffer::new(4096)).collect();
+    let recv_mrs: Vec<_> = recv_bufs
+        .iter()
+        .map(|buf| {
+            unsafe { ctx.pd.register(buf.as_ptr(), buf.size(), full_access()) }
+                .expect("Failed to register recv MR")
+        })
+        .collect();
+
+    // Post receive buffers
+    for (buf, mr) in recv_bufs.iter().zip(recv_mrs.iter()) {
+        unsafe {
+            srq.post_recv(buf.addr(), 4096, mr.lkey());
+        }
+    }
+    srq.ring_doorbell();
+
+    // Create and activate DCI
+    let dci_config = DciConfig::default();
+    let dci = ctx
+        .ctx
+        .create_dci_sparse::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
+        .expect("Failed to create DCI");
+    dci.borrow_mut()
+        .activate(ctx.port, 0, 4)
+        .expect("Failed to activate DCI");
+
+    // Create multiple DCTs sharing the same SRQ
+    let num_dcts = 2;
+    let mut dcts = Vec::new();
+    let access = full_access().bits();
+
+    for i in 0..num_dcts {
+        let dc_key: u64 = 0x1000 + i as u64;
+        let dct_config = DctConfig { dc_key };
+        let mut dct = ctx
+            .ctx
+            .create_dct(&ctx.pd, &srq, &dct_cq, &dct_config)
+            .expect(&format!("Failed to create DCT {}", i));
+        dct.activate(ctx.port, access, 4)
+            .expect(&format!("Failed to activate DCT {}", i));
+        dcts.push(dct);
+    }
+
+    // Prepare send buffer
+    let mut send_buf = AlignedBuffer::new(4096);
+    let send_mr = unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }
+        .expect("Failed to register send MR");
+
+    let dlid = ctx.port_attr.lid;
+
+    // Send to each DCT
+    for (i, dct) in dcts.iter().enumerate() {
+        let test_data = format!("Message to DCT {}", i);
+        send_buf.fill_bytes(test_data.as_bytes());
+
+        dci.borrow_mut()
+            .wqe_builder((i + 1) as u64)
+            .expect("wqe_builder failed")
+            .ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
+            .av(dct.dc_key(), dct.dctn(), dlid)
+            .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
+            .finish_with_blueflame();
+
+        // Poll send completion
+        let send_cqe = poll_cq_timeout(&mut dci_cq.borrow_mut(), 5000)
+            .expect(&format!("Send CQE timeout for DCT {}", i));
+        assert_eq!(
+            send_cqe.syndrome, 0,
+            "Send CQE error for DCT {}: syndrome={}",
+            i, send_cqe.syndrome
+        );
+
+        // Poll receive completion
+        let recv_cqe = poll_cq_timeout(&mut dct_cq, 5000)
+            .expect(&format!("Recv CQE timeout for DCT {}", i));
+        assert_eq!(
+            recv_cqe.syndrome, 0,
+            "Recv CQE error for DCT {}: syndrome={}",
+            i, recv_cqe.syndrome
+        );
+    }
+
+    dci_cq.borrow().flush();
+    dct_cq.flush();
+
+    println!("SRQ shared by multiple DCTs test passed!");
+    println!("  {} DCTs shared single SRQ", num_dcts);
+}

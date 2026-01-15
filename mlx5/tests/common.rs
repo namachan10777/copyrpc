@@ -222,3 +222,85 @@ pub fn full_access() -> AccessFlags {
         | AccessFlags::REMOTE_READ
         | AccessFlags::REMOTE_ATOMIC
 }
+
+/// Check if DCT (DC Target) is supported via verbs API.
+///
+/// DCT activation requires kernel driver support that may not be available
+/// on all systems. Returns true if DCT can be activated.
+pub fn is_dct_supported(ctx: &TestContext) -> bool {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use mlx5::dc::DctConfig;
+    use mlx5::srq::SrqConfig;
+
+    let dct_cq = match ctx.ctx.create_cq(16) {
+        Ok(cq) => cq,
+        Err(_) => return false,
+    };
+
+    let srq_config = SrqConfig {
+        max_wr: 16,
+        max_sge: 1,
+    };
+    let srq = match ctx.pd.create_srq(&srq_config) {
+        Ok(srq) => srq,
+        Err(_) => return false,
+    };
+
+    let dct_config = DctConfig { dc_key: 0x12345 };
+    let mut dct = match ctx.ctx.create_dct(&ctx.pd, &srq, &dct_cq, &dct_config) {
+        Ok(dct) => dct,
+        Err(_) => return false,
+    };
+
+    let access = full_access().bits();
+    dct.activate(ctx.port, access, 4).is_ok()
+}
+
+/// Check if TM-SRQ (Tag Matching SRQ) is supported via verbs API.
+///
+/// TM-SRQ creation requires kernel driver support that may not be available
+/// on all systems. Returns true if TM-SRQ can be created.
+pub fn is_tm_srq_supported(ctx: &TestContext) -> bool {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use mlx5::tm_srq::TmSrqConfig;
+
+    let cq = match ctx.ctx.create_cq(16) {
+        Ok(cq) => Rc::new(RefCell::new(cq)),
+        Err(_) => return false,
+    };
+
+    let config = TmSrqConfig {
+        max_wr: 16,
+        max_sge: 1,
+        max_num_tags: 8,
+        max_ops: 4,
+    };
+
+    ctx.ctx
+        .create_tm_srq::<u64, _>(&ctx.pd, &cq, &config, |_, _| {})
+        .is_ok()
+}
+
+/// Skip test if DCT is not supported.
+#[macro_export]
+macro_rules! require_dct {
+    ($ctx:expr) => {{
+        if !$crate::common::is_dct_supported($ctx) {
+            eprintln!("Skipping test: DCT not supported via verbs API (kernel/driver limitation)");
+            return;
+        }
+    }};
+}
+
+/// Skip test if TM-SRQ is not supported.
+#[macro_export]
+macro_rules! require_tm_srq {
+    ($ctx:expr) => {{
+        if !$crate::common::is_tm_srq_supported($ctx) {
+            eprintln!("Skipping test: TM-SRQ not supported via verbs API (kernel/driver limitation)");
+            return;
+        }
+    }};
+}
