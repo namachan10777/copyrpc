@@ -40,7 +40,7 @@ use std::{io, mem::MaybeUninit, ptr::NonNull};
 
 use crate::cq::CompletionQueue;
 use crate::device::Context;
-use crate::pd::ProtectionDomain;
+use crate::pd::Pd;
 use crate::srq::SrqInfo;
 use crate::wqe::{
     CtrlSeg, DataSeg, SparseWqeTable, TmSeg, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode,
@@ -378,7 +378,7 @@ impl Context {
     /// Returns an error if the TM-SRQ cannot be created.
     pub fn create_tm_srq<T>(
         &self,
-        pd: &ProtectionDomain,
+        pd: &Pd,
         cq: &CompletionQueue,
         config: &TmSrqConfig,
     ) -> io::Result<TagMatchingSrq<T>> {

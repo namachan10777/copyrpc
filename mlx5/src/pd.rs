@@ -80,7 +80,7 @@ bitflags! {
 ///
 /// The PD will be deallocated when dropped. Deallocation may fail if any
 /// other resource is still associated with the PD.
-pub struct ProtectionDomain {
+pub struct Pd {
     pd: NonNull<mlx5_sys::ibv_pd>,
 }
 
@@ -89,17 +89,15 @@ impl Context {
     ///
     /// # Errors
     /// Returns an error if the allocation fails.
-    pub fn alloc_pd(&self) -> io::Result<ProtectionDomain> {
+    pub fn alloc_pd(&self) -> io::Result<Pd> {
         unsafe {
             let pd = mlx5_sys::ibv_alloc_pd(self.ctx.as_ptr());
-            NonNull::new(pd).map_or(Err(io::Error::last_os_error()), |pd| {
-                Ok(ProtectionDomain { pd })
-            })
+            NonNull::new(pd).map_or(Err(io::Error::last_os_error()), |pd| Ok(Pd { pd }))
         }
     }
 }
 
-impl Drop for ProtectionDomain {
+impl Drop for Pd {
     fn drop(&mut self) {
         unsafe {
             mlx5_sys::ibv_dealloc_pd(self.pd.as_ptr());
@@ -107,7 +105,7 @@ impl Drop for ProtectionDomain {
     }
 }
 
-impl ProtectionDomain {
+impl Pd {
     /// Get the raw ibv_pd pointer.
     pub(crate) fn as_ptr(&self) -> *mut mlx5_sys::ibv_pd {
         self.pd.as_ptr()
@@ -126,7 +124,7 @@ pub struct MemoryRegion {
     mr: NonNull<mlx5_sys::ibv_mr>,
 }
 
-impl ProtectionDomain {
+impl Pd {
     /// Register a memory region with the HCA.
     ///
     /// Registers a memory buffer starting at `addr` with size `len` bytes.

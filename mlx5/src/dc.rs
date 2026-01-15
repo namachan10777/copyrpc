@@ -8,9 +8,9 @@ use std::{io, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
 use crate::cq::CompletionQueue;
 use crate::device::Context;
-use crate::pd::ProtectionDomain;
+use crate::pd::Pd;
 use crate::qp::QpInfo;
-use crate::srq::SharedReceiveQueue;
+use crate::srq::Srq;
 use crate::wqe::{
     AddressVector, CtrlSeg, DataSeg, DenseSendQueue, DenseWqeTable, InlineHeader, RdmaSeg,
     SparseSendQueue, SparseWqeTable, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
@@ -494,7 +494,7 @@ impl Context {
     /// Returns an error if the DCI cannot be created.
     pub fn create_dci_sparse<T>(
         &self,
-        pd: &ProtectionDomain,
+        pd: &Pd,
         send_cq: &CompletionQueue,
         config: &DciConfig,
     ) -> io::Result<DciSparseWqeTable<T>> {
@@ -514,7 +514,7 @@ impl Context {
     /// Returns an error if the DCI cannot be created.
     pub fn create_dci_dense<T>(
         &self,
-        pd: &ProtectionDomain,
+        pd: &Pd,
         send_cq: &CompletionQueue,
         config: &DciConfig,
     ) -> io::Result<DciDenseWqeTable<T>> {
@@ -523,7 +523,7 @@ impl Context {
 
     fn create_dci<T, Tab>(
         &self,
-        pd: &ProtectionDomain,
+        pd: &Pd,
         send_cq: &CompletionQueue,
         config: &DciConfig,
     ) -> io::Result<Dci<T, Tab>> {
@@ -941,8 +941,8 @@ impl Context {
     /// Returns an error if the DCT cannot be created.
     pub fn create_dct(
         &self,
-        pd: &ProtectionDomain,
-        srq: &SharedReceiveQueue,
+        pd: &Pd,
+        srq: &Srq,
         cq: &CompletionQueue,
         config: &DctConfig,
     ) -> io::Result<Dct> {

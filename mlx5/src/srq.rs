@@ -5,7 +5,7 @@
 
 use std::{io, mem::MaybeUninit, ptr::NonNull};
 
-use crate::pd::ProtectionDomain;
+use crate::pd::Pd;
 use crate::wqe::{DataSeg, ReceiveQueue};
 
 /// SRQ configuration.
@@ -86,13 +86,13 @@ impl SrqState {
 ///
 /// Allows multiple QPs to share receive buffers. This is useful for DC
 /// (Dynamically Connected) transport where many connections share one SRQ.
-pub struct SharedReceiveQueue {
+pub struct Srq {
     srq: NonNull<mlx5_sys::ibv_srq>,
     wqe_cnt: u32,
     state: Option<SrqState>,
 }
 
-impl ProtectionDomain {
+impl Pd {
     /// Create a Shared Receive Queue.
     ///
     /// # Arguments
@@ -100,7 +100,7 @@ impl ProtectionDomain {
     ///
     /// # Errors
     /// Returns an error if the SRQ cannot be created.
-    pub fn create_srq(&self, config: &SrqConfig) -> io::Result<SharedReceiveQueue> {
+    pub fn create_srq(&self, config: &SrqConfig) -> io::Result<Srq> {
         unsafe {
             let attr = mlx5_sys::ibv_srq_init_attr {
                 srq_context: std::ptr::null_mut(),
@@ -113,7 +113,7 @@ impl ProtectionDomain {
 
             let srq = mlx5_sys::ibv_create_srq(self.as_ptr(), &attr as *const _ as *mut _);
             NonNull::new(srq).map_or(Err(io::Error::last_os_error()), |srq| {
-                Ok(SharedReceiveQueue {
+                Ok(Srq {
                     srq,
                     wqe_cnt: config.max_wr.next_power_of_two(),
                     state: None,
@@ -123,7 +123,7 @@ impl ProtectionDomain {
     }
 }
 
-impl Drop for SharedReceiveQueue {
+impl Drop for Srq {
     fn drop(&mut self) {
         unsafe {
             mlx5_sys::ibv_destroy_srq(self.srq.as_ptr());
@@ -131,7 +131,7 @@ impl Drop for SharedReceiveQueue {
     }
 }
 
-impl SharedReceiveQueue {
+impl Srq {
     /// Get the raw ibv_srq pointer.
     pub(crate) fn as_ptr(&self) -> *mut mlx5_sys::ibv_srq {
         self.srq.as_ptr()
@@ -187,7 +187,7 @@ impl SharedReceiveQueue {
     }
 }
 
-impl ReceiveQueue for SharedReceiveQueue {
+impl ReceiveQueue for Srq {
     unsafe fn post_recv(&mut self, addr: u64, len: u32, lkey: u32) {
         if let Some(state) = self.state.as_mut() {
             state.post(addr, len, lkey);

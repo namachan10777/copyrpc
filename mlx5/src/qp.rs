@@ -7,7 +7,7 @@ use std::{io, mem::MaybeUninit, ptr::NonNull};
 
 use crate::cq::CompletionQueue;
 use crate::device::Context;
-use crate::pd::ProtectionDomain;
+use crate::pd::Pd;
 use crate::wqe::{
     CtrlSeg, DataSeg, DenseSendQueue, DenseWqeTable, InlineHeader, RdmaSeg, ReceiveQueue,
     SparseSendQueue, SparseWqeTable, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
@@ -424,7 +424,7 @@ impl Context {
     /// Returns an error if the QP cannot be created.
     pub fn create_rc_qp<T>(
         &self,
-        pd: &ProtectionDomain,
+        pd: &Pd,
         send_cq: &CompletionQueue,
         recv_cq: &CompletionQueue,
         config: &RcQpConfig,
@@ -446,7 +446,7 @@ impl Context {
     /// Returns an error if the QP cannot be created.
     pub fn create_dense_rc_qp<T>(
         &self,
-        pd: &ProtectionDomain,
+        pd: &Pd,
         send_cq: &CompletionQueue,
         recv_cq: &CompletionQueue,
         config: &RcQpConfig,
@@ -456,7 +456,7 @@ impl Context {
 
     fn create_rc_qp_inner<T, Tab>(
         &self,
-        pd: &ProtectionDomain,
+        pd: &Pd,
         send_cq: &CompletionQueue,
         recv_cq: &CompletionQueue,
         config: &RcQpConfig,
