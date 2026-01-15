@@ -228,14 +228,15 @@ pub fn full_access() -> AccessFlags {
 /// DCT activation requires kernel driver support that may not be available
 /// on all systems. Returns true if DCT can be activated.
 pub fn is_dct_supported(ctx: &TestContext) -> bool {
-    use std::cell::RefCell;
-    use std::rc::Rc;
     use mlx5::dc::DctConfig;
     use mlx5::srq::SrqConfig;
 
     let dct_cq = match ctx.ctx.create_cq(16) {
         Ok(cq) => cq,
-        Err(_) => return false,
+        Err(e) => {
+            eprintln!("  DCT check: CQ creation failed: {}", e);
+            return false;
+        }
     };
 
     let srq_config = SrqConfig {
@@ -244,17 +245,42 @@ pub fn is_dct_supported(ctx: &TestContext) -> bool {
     };
     let srq = match ctx.pd.create_srq(&srq_config) {
         Ok(srq) => srq,
-        Err(_) => return false,
+        Err(e) => {
+            eprintln!("  DCT check: SRQ creation failed: {}", e);
+            return false;
+        }
     };
 
     let dct_config = DctConfig { dc_key: 0x12345 };
     let mut dct = match ctx.ctx.create_dct(&ctx.pd, &srq, &dct_cq, &dct_config) {
         Ok(dct) => dct,
-        Err(_) => return false,
+        Err(e) => {
+            eprintln!("  DCT check: DCT creation failed: {}", e);
+            return false;
+        }
     };
 
+    eprintln!("  DCT check: DCT created, DCTN=0x{:x}", dct.dctn());
+
     let access = full_access().bits();
-    dct.activate(ctx.port, access, 4).is_ok()
+    match dct.modify_to_init(ctx.port, access) {
+        Ok(_) => eprintln!("  DCT check: INIT succeeded"),
+        Err(e) => {
+            eprintln!("  DCT check: INIT failed: {} (raw: {:?})", e, e.raw_os_error());
+            return false;
+        }
+    }
+
+    match dct.modify_to_rtr(ctx.port, 12) {
+        Ok(_) => {
+            eprintln!("  DCT check: RTR succeeded, DCTN=0x{:x}", dct.dctn());
+            true
+        }
+        Err(e) => {
+            eprintln!("  DCT check: RTR failed: {} (raw: {:?})", e, e.raw_os_error());
+            false
+        }
+    }
 }
 
 /// Check if TM-SRQ (Tag Matching SRQ) is supported via verbs API.
@@ -266,21 +292,53 @@ pub fn is_tm_srq_supported(ctx: &TestContext) -> bool {
     use std::rc::Rc;
     use mlx5::tm_srq::TmSrqConfig;
 
+    // First check device TM capabilities
+    match ctx.ctx.query_tm_caps() {
+        Some(caps) => {
+            eprintln!("  TM-SRQ check: Device TM caps:");
+            eprintln!("    max_num_tags: {}", caps.max_num_tags);
+            eprintln!("    max_ops: {}", caps.max_ops);
+            eprintln!("    max_sge: {}", caps.max_sge);
+            eprintln!("    flags: 0x{:x}", caps.flags);
+            if caps.max_num_tags == 0 {
+                eprintln!("  TM-SRQ check: TM not supported (max_num_tags=0)");
+                return false;
+            }
+        }
+        None => {
+            eprintln!("  TM-SRQ check: query_tm_caps failed");
+            return false;
+        }
+    }
+
     let cq = match ctx.ctx.create_cq(16) {
         Ok(cq) => Rc::new(RefCell::new(cq)),
-        Err(_) => return false,
+        Err(e) => {
+            eprintln!("  TM-SRQ check: CQ creation failed: {}", e);
+            return false;
+        }
     };
 
+    // Use power of 2 for max_wr and reasonable values for TM params
     let config = TmSrqConfig {
-        max_wr: 16,
+        max_wr: 256,  // Must be power of 2 for SRQ
         max_sge: 1,
-        max_num_tags: 8,
-        max_ops: 4,
+        max_num_tags: 64,  // Within device max of 127
+        max_ops: 16,
     };
+    eprintln!("  TM-SRQ check: trying config: max_wr={}, max_num_tags={}, max_ops={}",
+              config.max_wr, config.max_num_tags, config.max_ops);
 
-    ctx.ctx
-        .create_tm_srq::<u64, _>(&ctx.pd, &cq, &config, |_, _| {})
-        .is_ok()
+    match ctx.ctx.create_tm_srq::<u64, _>(&ctx.pd, &cq, &config, |_, _| {}) {
+        Ok(_) => {
+            eprintln!("  TM-SRQ check: creation succeeded");
+            true
+        }
+        Err(e) => {
+            eprintln!("  TM-SRQ check: creation failed: {} (raw: {:?})", e, e.raw_os_error());
+            false
+        }
+    }
 }
 
 /// Skip test if DCT is not supported.

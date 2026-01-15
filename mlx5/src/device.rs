@@ -191,4 +191,49 @@ impl Context {
             Ok(attrs.assume_init())
         }
     }
+
+    /// Query extended device attributes including TM (Tag Matching) capabilities.
+    ///
+    /// Returns the TM capabilities of the device:
+    /// - `max_num_tags`: Maximum number of tagged buffers in matching list
+    /// - `max_ops`: Maximum number of outstanding tag operations
+    /// - `max_sge`: Maximum number of SGEs in a tagged buffer
+    ///
+    /// Returns `None` if the query fails or TM is not supported.
+    pub fn query_tm_caps(&self) -> Option<TmCaps> {
+        unsafe {
+            let mut attr: MaybeUninit<mlx5_sys::ibv_device_attr_ex> = MaybeUninit::zeroed();
+            let ret = mlx5_sys::ibv_query_device_ex_ex(
+                self.ctx.as_ptr(),
+                std::ptr::null(),
+                attr.as_mut_ptr(),
+            );
+            if ret != 0 {
+                return None;
+            }
+            let attr = attr.assume_init();
+            Some(TmCaps {
+                max_rndv_hdr_size: attr.tm_caps.max_rndv_hdr_size,
+                max_num_tags: attr.tm_caps.max_num_tags,
+                flags: attr.tm_caps.flags,
+                max_ops: attr.tm_caps.max_ops,
+                max_sge: attr.tm_caps.max_sge,
+            })
+        }
+    }
+}
+
+/// Tag Matching capabilities.
+#[derive(Debug, Clone, Copy)]
+pub struct TmCaps {
+    /// Maximum size of rendezvous request header.
+    pub max_rndv_hdr_size: u32,
+    /// Maximum number of tagged buffers in a TM-SRQ matching list.
+    pub max_num_tags: u32,
+    /// Capability flags.
+    pub flags: u32,
+    /// Maximum number of outstanding list operations.
+    pub max_ops: u32,
+    /// Maximum number of SGEs in a tagged buffer.
+    pub max_sge: u32,
 }

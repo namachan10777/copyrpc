@@ -19,9 +19,10 @@ mod common;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use mlx5::dc::{DciConfig, DctConfig};
+use mlx5::cq::CqeOpcode;
+use mlx5::dc::DciConfig;
 use mlx5::tm_srq::TmSrqConfig;
-use mlx5::wqe::{WqeFlags, WqeOpcode};
+use mlx5::wqe::WqeOpcode;
 
 use common::{full_access, poll_cq_timeout, AlignedBuffer, TestContext};
 
@@ -150,17 +151,32 @@ fn test_tm_tag_add_remove() {
     // Add a tag
     let tag: u64 = 0xDEADBEEF_CAFEBABE;
     let tag_index: u16 = 0;
+    let _recv_wr_id: u64 = 100; // Work request ID for the receive buffer
 
-    tm_srq.borrow_mut()
+    // Debug: print Command QP state
+    println!("Cmd QP available slots: {}", tm_srq.borrow().cmd_optimistic_available());
+
+    // Build WQE and get the pointer for debugging
+    // Try regular doorbell instead of BlueFlame
+    let handle = tm_srq.borrow_mut()
         .cmd_wqe_builder(1u64)
         .expect("cmd_wqe_builder failed")
         .ctrl(WqeOpcode::TagMatching, 0)
         .tag_add(tag_index, tag, recv_buf.addr(), 256, mr.lkey())
-        .finish_with_blueflame();
+        .finish();
+    tm_srq.borrow_mut().ring_cmd_doorbell();
 
-    // Poll for add completion
+    println!("WQE handle: idx={}, size={}", handle.wqe_idx, handle.size);
+    println!("Buffer addr: 0x{:016x}, lkey: 0x{:08x}", recv_buf.addr(), mr.lkey());
+
+    // Poll for add completion - wait a bit for hardware to process
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
     let add_cqe = poll_cq_timeout(&mut cq.borrow_mut(), 5000).expect("Add CQE timeout");
-    assert_eq!(add_cqe.syndrome, 0, "Add CQE error: syndrome={}", add_cqe.syndrome);
+    println!("Add CQE: opcode={:?}, wqe_counter={}, qp_num=0x{:x}",
+        add_cqe.opcode, add_cqe.wqe_counter, add_cqe.qp_num);
+    // TM operations return TmFinish opcode on success
+    assert_eq!(add_cqe.opcode, CqeOpcode::TmFinish, "Add CQE error: opcode={:?}", add_cqe.opcode);
     cq.borrow().flush();
 
     println!("Tag added: index={}, tag=0x{:016x}", tag_index, tag);
@@ -174,8 +190,10 @@ fn test_tm_tag_add_remove() {
         .finish_with_blueflame();
 
     // Poll for delete completion
+    // TAG_DEL may return Req (0x00) or TmFinish (0x06) depending on hardware
     let del_cqe = poll_cq_timeout(&mut cq.borrow_mut(), 5000).expect("Del CQE timeout");
-    assert_eq!(del_cqe.syndrome, 0, "Del CQE error: syndrome={}", del_cqe.syndrome);
+    assert!(matches!(del_cqe.opcode, CqeOpcode::Req | CqeOpcode::TmFinish),
+        "Del CQE error: opcode={:?}", del_cqe.opcode);
     cq.borrow().flush();
 
     println!("Tag removed: index={}", tag_index);
@@ -311,9 +329,11 @@ fn test_tm_multiple_tags() {
             .finish_with_blueflame();
 
         // Poll for completion
+        // TM operations may return Req (0x00) or TmFinish (0x06)
         let cqe = poll_cq_timeout(&mut cq.borrow_mut(), 5000)
             .expect(&format!("Add CQE timeout for tag {}", i));
-        assert_eq!(cqe.syndrome, 0, "Add CQE error for tag {}: syndrome={}", i, cqe.syndrome);
+        assert!(matches!(cqe.opcode, CqeOpcode::Req | CqeOpcode::TmFinish),
+            "Add CQE error for tag {}: opcode={:?}", i, cqe.opcode);
     }
     cq.borrow().flush();
 
@@ -329,9 +349,11 @@ fn test_tm_multiple_tags() {
             .finish_with_blueflame();
 
         // Poll for completion
+        // TAG_DEL may return Req (0x00) or TmFinish (0x06)
         let cqe = poll_cq_timeout(&mut cq.borrow_mut(), 5000)
             .expect(&format!("Del CQE timeout for tag {}", i));
-        assert_eq!(cqe.syndrome, 0, "Del CQE error for tag {}: syndrome={}", i, cqe.syndrome);
+        assert!(matches!(cqe.opcode, CqeOpcode::Req | CqeOpcode::TmFinish),
+            "Del CQE error for tag {}: opcode={:?}", i, cqe.opcode);
     }
     cq.borrow().flush();
 
@@ -394,4 +416,160 @@ fn test_tm_unordered_recv() {
 
     println!("TM unordered recv test passed!");
     println!("  Posted 10 unordered receive WQEs");
+}
+
+// =============================================================================
+// TM Tag Operations via Verbs API Test
+// =============================================================================
+
+#[test]
+fn test_tm_tag_via_verbs_api() {
+    use std::mem::MaybeUninit;
+
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    require_tm_srq!(&ctx);
+
+    let cq = Rc::new(RefCell::new(
+        ctx.ctx.create_cq(256).expect("Failed to create CQ"),
+    ));
+    cq.borrow_mut()
+        .init_direct_access()
+        .expect("Failed to init CQ direct access");
+
+    let config = TmSrqConfig {
+        max_wr: 256,
+        max_sge: 1,
+        max_num_tags: 32,
+        max_ops: 8,
+    };
+
+    let tm_srq = ctx
+        .ctx
+        .create_tm_srq::<u64, _>(&ctx.pd, &cq, &config, |_cqe, _entry| {})
+        .expect("Failed to create TM-SRQ");
+
+    // Allocate receive buffer
+    let recv_buf = AlignedBuffer::new(4096);
+    let mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
+        .expect("Failed to register MR");
+
+    // Prepare SGE for the tag add operation
+    let mut sge = mlx5_sys::ibv_sge {
+        addr: recv_buf.addr(),
+        length: 256,
+        lkey: mr.lkey(),
+    };
+
+    // Prepare TAG_ADD work request
+    let tag: u64 = 0xDEADBEEF_CAFEBABE;
+    let mut add_wr: MaybeUninit<mlx5_sys::ibv_ops_wr> = MaybeUninit::zeroed();
+    unsafe {
+        let wr = add_wr.as_mut_ptr();
+        (*wr).wr_id = 1;
+        (*wr).next = std::ptr::null_mut();
+        (*wr).opcode = mlx5_sys::ibv_ops_wr_opcode_IBV_WR_TAG_ADD;
+        (*wr).flags = mlx5_sys::ibv_ops_flags_IBV_OPS_SIGNALED as i32;
+        (*wr).tm.add.recv_wr_id = 100;
+        (*wr).tm.add.sg_list = &mut sge;
+        (*wr).tm.add.num_sge = 1;
+        (*wr).tm.add.tag = tag;
+        (*wr).tm.add.mask = !0u64;
+    }
+
+    // Post TAG_ADD via verbs API
+    let mut bad_wr: *mut mlx5_sys::ibv_ops_wr = std::ptr::null_mut();
+    let ret = unsafe {
+        mlx5_sys::ibv_post_srq_ops_ex(
+            tm_srq.borrow().as_ptr(),
+            add_wr.as_mut_ptr(),
+            &mut bad_wr,
+        )
+    };
+
+    if ret != 0 {
+        eprintln!("ibv_post_srq_ops failed: {} (errno: {})", ret, std::io::Error::last_os_error());
+        panic!("ibv_post_srq_ops failed");
+    }
+
+    // Poll for completion using verbs API
+    let mut wc: MaybeUninit<mlx5_sys::ibv_wc> = MaybeUninit::zeroed();
+    let timeout = 5000;
+    let mut found = false;
+    for _ in 0..timeout {
+        let ret = unsafe { mlx5_sys::ibv_poll_cq_ex(cq.borrow().as_ptr(), 1, wc.as_mut_ptr()) };
+        if ret > 0 {
+            let wc = unsafe { wc.assume_init() };
+            println!("WC: status={}, opcode={}, vendor_err=0x{:x}, wr_id={}",
+                     wc.status, wc.opcode, wc.vendor_err, wc.wr_id);
+            if wc.status != 0 {
+                panic!("TAG_ADD failed: status={}, vendor_err=0x{:x}", wc.status, wc.vendor_err);
+            }
+            found = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    if !found {
+        panic!("Timeout waiting for completion");
+    }
+
+    // Get handle for delete operation
+    let handle = unsafe { (*add_wr.as_ptr()).tm.handle };
+    println!("Tag added via verbs API: handle={}, tag=0x{:016x}", handle, tag);
+
+    // Prepare TAG_DEL work request
+    let mut del_wr: MaybeUninit<mlx5_sys::ibv_ops_wr> = MaybeUninit::zeroed();
+    unsafe {
+        let wr = del_wr.as_mut_ptr();
+        (*wr).wr_id = 2;
+        (*wr).next = std::ptr::null_mut();
+        (*wr).opcode = mlx5_sys::ibv_ops_wr_opcode_IBV_WR_TAG_DEL;
+        (*wr).flags = mlx5_sys::ibv_ops_flags_IBV_OPS_SIGNALED as i32;
+        (*wr).tm.handle = handle;
+    }
+
+    // Post TAG_DEL via verbs API
+    let ret = unsafe {
+        mlx5_sys::ibv_post_srq_ops_ex(
+            tm_srq.borrow().as_ptr(),
+            del_wr.as_mut_ptr(),
+            &mut bad_wr,
+        )
+    };
+
+    if ret != 0 {
+        eprintln!("ibv_post_srq_ops (del) failed: {} (errno: {})", ret, std::io::Error::last_os_error());
+        panic!("ibv_post_srq_ops (del) failed");
+    }
+
+    // Poll for delete completion using verbs API
+    let mut wc2: MaybeUninit<mlx5_sys::ibv_wc> = MaybeUninit::zeroed();
+    let mut found2 = false;
+    for _ in 0..timeout {
+        let ret = unsafe { mlx5_sys::ibv_poll_cq_ex(cq.borrow().as_ptr(), 1, wc2.as_mut_ptr()) };
+        if ret > 0 {
+            let wc = unsafe { wc2.assume_init() };
+            println!("Del WC: status={}, opcode={}, vendor_err=0x{:x}, wr_id={}",
+                     wc.status, wc.opcode, wc.vendor_err, wc.wr_id);
+            if wc.status != 0 {
+                panic!("TAG_DEL failed: status={}, vendor_err=0x{:x}", wc.status, wc.vendor_err);
+            }
+            found2 = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    if !found2 {
+        panic!("Timeout waiting for delete completion");
+    }
+
+    println!("Tag removed via verbs API: handle={}", handle);
+    println!("TM tag operations via verbs API test passed!");
 }

@@ -29,6 +29,10 @@ pub enum CqeOpcode {
     RespSendImm = 0x03,
     /// Responder send with invalidate
     RespSendInv = 0x04,
+    /// Tag Matching context match
+    TmMatchContext = 0x05,
+    /// Tag Matching operation finish (TM add/remove completed)
+    TmFinish = 0x06,
     /// Requester error
     ReqErr = 0x0d,
     /// Responder error
@@ -43,6 +47,8 @@ impl CqeOpcode {
             0x02 => Some(Self::RespSend),
             0x03 => Some(Self::RespSendImm),
             0x04 => Some(Self::RespSendInv),
+            0x05 => Some(Self::TmMatchContext),
+            0x06 => Some(Self::TmFinish),
             0x0d => Some(Self::ReqErr),
             0x0e => Some(Self::RespErr),
             _ => None,
@@ -65,6 +71,10 @@ pub struct Cqe {
     pub imm: u32,
     /// Error syndrome (0 = success)
     pub syndrome: u8,
+    /// Vendor error syndrome (for error CQEs)
+    pub vendor_err: u8,
+    /// Application info (TM tag handle for Tag Matching operations)
+    pub app_info: u16,
 }
 
 impl Cqe {
@@ -76,7 +86,9 @@ impl Cqe {
     /// CQE64 layout (success):
     /// - offset 36: imm_inval_pkey (4B, big-endian)
     /// - offset 44: byte_cnt (4B, big-endian)
-    /// - offset 48-55: timestamp (8B) - NOT syndrome!
+    /// - offset 48-49: timestamp_h (2B)
+    /// - offset 50-51: app_info (2B, big-endian) - TM tag handle for Tag Matching
+    /// - offset 52-55: timestamp_l (4B)
     /// - offset 56: sop_drop_qpn (4B, big-endian) - QP number in [23:0]
     /// - offset 60: wqe_counter (2B, big-endian)
     /// - offset 63: op_own (1B) - opcode[7:4] | owner_bit[0]
@@ -103,12 +115,19 @@ impl Cqe {
         let imm =
             u32::from_be(std::ptr::read_volatile(ptr.add(36) as *const u32));
 
-        // Syndrome is only valid for error CQEs (opcode 0x0d=ReqErr or 0x0e=RespErr).
-        // For success CQEs, offset 55 is part of the timestamp field.
-        let syndrome = if opcode == CqeOpcode::ReqErr || opcode == CqeOpcode::RespErr {
-            std::ptr::read_volatile(ptr.add(55))
+        // app_info at offset 50: contains TM tag handle for Tag Matching operations
+        let app_info =
+            u16::from_be(std::ptr::read_volatile(ptr.add(50) as *const u16));
+
+        // Syndrome and vendor_err are only valid for error CQEs (opcode 0x0d=ReqErr or 0x0e=RespErr).
+        // For success CQEs, offsets 54-55 are part of the timestamp field.
+        let (vendor_err, syndrome) = if opcode == CqeOpcode::ReqErr || opcode == CqeOpcode::RespErr {
+            (
+                std::ptr::read_volatile(ptr.add(54)),
+                std::ptr::read_volatile(ptr.add(55)),
+            )
         } else {
-            0
+            (0, 0)
         };
 
         Self {
@@ -118,6 +137,8 @@ impl Cqe {
             byte_cnt,
             imm,
             syndrome,
+            vendor_err,
+            app_info,
         }
     }
 }
@@ -156,7 +177,10 @@ pub struct CompletionQueue {
 }
 
 impl Context {
-    /// Create a Completion Queue.
+    /// Create a Completion Queue using extended CQ API.
+    ///
+    /// Extended CQs support additional features required for TM-SRQ and other
+    /// advanced operations.
     ///
     /// # Arguments
     /// * `cqe` - Minimum number of CQ entries (actual may be larger)
@@ -165,19 +189,26 @@ impl Context {
     /// Returns an error if the CQ cannot be created.
     pub fn create_cq(&self, cqe: i32) -> io::Result<CompletionQueue> {
         unsafe {
-            let cq = mlx5_sys::ibv_create_cq(
-                self.ctx.as_ptr(),
-                cqe,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                0,
-            );
-            NonNull::new(cq).map_or(Err(io::Error::last_os_error()), |cq| {
-                Ok(CompletionQueue {
-                    cq,
-                    state: None,
-                    queues: HashMap::new(),
-                })
+            let mut attr: mlx5_sys::ibv_cq_init_attr_ex = MaybeUninit::zeroed().assume_init();
+            attr.cqe = cqe as u32;
+            attr.cq_context = std::ptr::null_mut();
+            attr.channel = std::ptr::null_mut();
+            attr.comp_vector = 0;
+            attr.wc_flags = 0;
+            attr.comp_mask = 0;
+            attr.flags = 0;
+
+            let cq_ex = mlx5_sys::ibv_create_cq_ex_ex(self.ctx.as_ptr(), &mut attr);
+            if cq_ex.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+
+            // ibv_cq_ex can be cast to ibv_cq (first fields are identical)
+            let cq = cq_ex as *mut mlx5_sys::ibv_cq;
+            Ok(CompletionQueue {
+                cq: NonNull::new(cq).unwrap(),
+                state: None,
+                queues: HashMap::new(),
             })
         }
     }
@@ -193,7 +224,7 @@ impl Drop for CompletionQueue {
 
 impl CompletionQueue {
     /// Get the raw ibv_cq pointer.
-    pub(crate) fn as_ptr(&self) -> *mut mlx5_sys::ibv_cq {
+    pub fn as_ptr(&self) -> *mut mlx5_sys::ibv_cq {
         self.cq.as_ptr()
     }
 

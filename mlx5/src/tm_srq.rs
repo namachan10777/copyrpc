@@ -45,7 +45,7 @@ use crate::device::Context;
 use crate::pd::Pd;
 use crate::srq::SrqInfo;
 use crate::wqe::{
-    CtrlSeg, DataSeg, SparseWqeTable, TmSeg, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode,
+    CtrlSeg, DataSeg, SparseWqeTable, TmSeg, WQEBB_SIZE, WqeHandle, WqeOpcode,
 };
 use crate::CompletionTarget;
 
@@ -205,8 +205,10 @@ impl<'a, T> CmdQpWqeBuilder<'a, T> {
     /// Write the control segment.
     ///
     /// This must be the first segment in every WQE.
-    /// Always sets SIGNALED flag for unordered queues.
+    /// For TM operations, CQ_UPDATE (0x08) must be set in addition to TM segment flags.
     pub fn ctrl(mut self, opcode: WqeOpcode, imm: u32) -> Self {
+        // MLX5_WQE_CTRL_CQ_UPDATE = 0x08 - required for TM operations
+        const CQ_UPDATE: u8 = 0x08;
         unsafe {
             CtrlSeg::write(
                 self.wqe_ptr,
@@ -214,7 +216,7 @@ impl<'a, T> CmdQpWqeBuilder<'a, T> {
                 self.wqe_idx,
                 self.cmd_qp.qpn,
                 0,
-                WqeFlags::COMPLETION.bits(),
+                CQ_UPDATE, // TM operations require CQ_UPDATE in ctrl segment
                 imm,
             );
         }
@@ -224,9 +226,30 @@ impl<'a, T> CmdQpWqeBuilder<'a, T> {
     }
 
     /// Add TAG_ADD segment with data segment.
-    pub fn tag_add(mut self, index: u16, tag: u64, addr: u64, len: u32, lkey: u32) -> Self {
+    ///
+    /// # Arguments
+    /// * `index` - Tag index in the SRQ tag list
+    /// * `tag` - Tag value to match against incoming messages
+    /// * `addr` - Buffer address for received data
+    /// * `len` - Buffer length
+    /// * `lkey` - Local key for the memory region
+    pub fn tag_add(
+        mut self,
+        index: u16,
+        tag: u64,
+        addr: u64,
+        len: u32,
+        lkey: u32,
+    ) -> Self {
         unsafe {
-            TmSeg::write_add(self.wqe_ptr.add(self.offset), index, tag, !0u64, true);
+            TmSeg::write_add(
+                self.wqe_ptr.add(self.offset),
+                index,
+                index, // sw_cnt - same as index, per rdma-core
+                tag,
+                !0u64, // mask: all bits must match
+                true,  // signaled
+            );
         }
         self.offset += TmSeg::SIZE;
         self.ds_count += 2; // TmSeg = 32 bytes = 2 DS
@@ -511,12 +534,17 @@ impl<T, F> TagMatchingSrq<T, F> {
             let qpn = (*cmd_qp_ptr).qp_num;
             let sq_wqe_cnt = dv_qp.sq.wqe_cnt as u16;
 
+            // Read current PI from doorbell record (dbrec[1] is SQ doorbell)
+            // The Command QP may have been used by rdma-core internally
+            let dbrec = dv_qp.dbrec as *mut u32;
+            let current_pi = u32::from_be(std::ptr::read_volatile(dbrec.add(1))) as u16;
+
             Ok(CmdQpState {
                 qpn,
                 sq_buf: dv_qp.sq.buf as *mut u8,
                 sq_wqe_cnt,
-                pi: 0,
-                ci: 0,
+                pi: current_pi,
+                ci: current_pi, // Assume all previous WQEs completed
                 dbrec: dv_qp.dbrec as *mut u32,
                 bf_reg: dv_qp.bf.reg as *mut u8,
                 bf_size: dv_qp.bf.size,
@@ -559,6 +587,11 @@ impl<T, F> TagMatchingSrq<T, F> {
     /// Get the maximum number of tags.
     pub fn max_num_tags(&self) -> u16 {
         self.max_num_tags
+    }
+
+    /// Get the raw ibv_srq pointer.
+    pub fn as_ptr(&self) -> *mut mlx5_sys::ibv_srq {
+        self.srq.as_ptr()
     }
 
     fn cmd_qp_mut(&mut self) -> io::Result<&mut CmdQpState<T>> {
@@ -697,11 +730,17 @@ where
 
     fn dispatch_cqe(&mut self, cqe: Cqe) {
         match cqe.opcode {
-            CqeOpcode::Req => {
+            CqeOpcode::Req | CqeOpcode::TmFinish => {
                 // Command QP completion (tag add/remove)
+                // TmFinish is the success opcode for TM operations
                 if let Some(entry) = self.process_cmd_completion(cqe.wqe_counter) {
                     (self.callback)(cqe, Some(entry));
                 }
+            }
+            CqeOpcode::TmMatchContext => {
+                // Tag matching context match - incoming message matched a tag
+                // app_info contains the tag handle
+                (self.callback)(cqe, None);
             }
             CqeOpcode::RespSend
             | CqeOpcode::RespSendImm

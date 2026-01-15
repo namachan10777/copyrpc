@@ -1158,7 +1158,9 @@ impl Dct {
     }
 
     /// Transition DCT from INIT to RTR.
-    pub fn modify_to_rtr(&mut self, port: u8, max_dest_rd_atomic: u8) -> io::Result<()> {
+    ///
+    /// DCT requires STATE, PATH_MTU, MIN_RNR_TIMER, and AV attributes for RTR transition.
+    pub fn modify_to_rtr(&mut self, port: u8, min_rnr_timer: u8) -> io::Result<()> {
         if self.state != DcQpState::Init {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1170,13 +1172,11 @@ impl Dct {
             let mut attr: mlx5_sys::ibv_qp_attr = MaybeUninit::zeroed().assume_init();
             attr.qp_state = mlx5_sys::ibv_qp_state_IBV_QPS_RTR;
             attr.path_mtu = mlx5_sys::ibv_mtu_IBV_MTU_4096;
-            attr.max_dest_rd_atomic = max_dest_rd_atomic;
-            attr.min_rnr_timer = 12;
+            attr.min_rnr_timer = min_rnr_timer;
             attr.ah_attr.port_num = port;
 
             let mask = mlx5_sys::ibv_qp_attr_mask_IBV_QP_STATE
                 | mlx5_sys::ibv_qp_attr_mask_IBV_QP_PATH_MTU
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_MAX_DEST_RD_ATOMIC
                 | mlx5_sys::ibv_qp_attr_mask_IBV_QP_MIN_RNR_TIMER
                 | mlx5_sys::ibv_qp_attr_mask_IBV_QP_AV;
 
@@ -1197,10 +1197,10 @@ impl Dct {
         &mut self,
         port: u8,
         access_flags: u32,
-        max_dest_rd_atomic: u8,
+        min_rnr_timer: u8,
     ) -> io::Result<()> {
         self.modify_to_init(port, access_flags)?;
-        self.modify_to_rtr(port, max_dest_rd_atomic)?;
+        self.modify_to_rtr(port, min_rnr_timer)?;
         Ok(())
     }
 

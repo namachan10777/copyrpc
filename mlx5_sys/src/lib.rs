@@ -119,6 +119,48 @@ pub unsafe fn ibv_post_srq_ops_ex(
     }
 }
 
+/// Query extended device attributes including TM capabilities.
+#[inline]
+pub unsafe fn ibv_query_device_ex_ex(
+    context: *mut ibv_context,
+    input: *const ibv_query_device_ex_input,
+    attr: *mut ibv_device_attr_ex,
+) -> ::std::os::raw::c_int {
+    let vctx = verbs_get_ctx(context);
+
+    if vctx.is_null() {
+        -1
+    } else if let Some(query_fn) = (*vctx).query_device_ex {
+        query_fn(context, input, attr, std::mem::size_of::<ibv_device_attr_ex>())
+    } else {
+        -1
+    }
+}
+
+/// Create an extended CQ with additional capabilities.
+///
+/// Extended CQs support additional features like:
+/// - Work completion flags filtering
+/// - Parent domain association
+/// - Single-threaded optimization
+///
+/// TM-SRQ (Tag Matching SRQ) requires an extended CQ.
+#[inline]
+pub unsafe fn ibv_create_cq_ex_ex(
+    context: *mut ibv_context,
+    cq_attr: *mut ibv_cq_init_attr_ex,
+) -> *mut ibv_cq_ex {
+    let vctx = verbs_get_ctx(context);
+
+    if vctx.is_null() {
+        std::ptr::null_mut()
+    } else if let Some(create_cq_ex_fn) = (*vctx).create_cq_ex {
+        create_cq_ex_fn(context, cq_attr)
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
 /// Inner packed struct for mlx5_wqe_ctrl_seg.
 /// Rust doesn't support both packed and aligned attributes simultaneously,
 /// so we use this inner struct with packed layout and wrap it in an aligned outer struct.

@@ -208,8 +208,33 @@ impl TmSeg {
     ///
     /// # Safety
     /// The pointer must point to at least 32 bytes of writable memory.
+    ///
+    /// # Arguments
+    /// * `ptr` - Pointer to 32-byte TM segment buffer
+    /// * `index` - TM tag index in the SRQ tag list
+    /// * `sw_cnt` - Software count (typically used for tracking)
+    /// * `tag` - Tag value to match against incoming messages
+    /// * `mask` - Mask for tag matching (1 bits = must match)
+    /// * `signaled` - Whether to generate a CQE on completion
     #[inline]
-    pub unsafe fn write_add(ptr: *mut u8, index: u16, tag: u64, mask: u64, signaled: bool) {
+    pub unsafe fn write_add(
+        ptr: *mut u8,
+        index: u16,
+        sw_cnt: u16,
+        tag: u64,
+        mask: u64,
+        signaled: bool,
+    ) {
+        // mlx5_wqe_tm_seg layout (32 bytes):
+        //   offset 0: opcode (1 byte) - APPEND=0x01 shifted left 4 bits = 0x10
+        //   offset 1: flags (1 byte) - 0x80 for CQE request
+        //   offset 2-3: index (2 bytes, big-endian)
+        //   offset 4-5: rsvd0 (2 bytes)
+        //   offset 6-7: sw_cnt (2 bytes, big-endian)
+        //   offset 8-15: rsvd1 (8 bytes)
+        //   offset 16-23: append_tag (8 bytes, big-endian)
+        //   offset 24-31: append_mask (8 bytes, big-endian)
+
         // opcode = MLX5_TM_OPCODE_APPEND << 4 = 0x10
         std::ptr::write_volatile(ptr, 0x10);
         // flags: TM_CQE_REQ = 0x80
@@ -217,12 +242,12 @@ impl TmSeg {
         std::ptr::write_volatile(ptr.add(1), flags);
         // index (big-endian)
         std::ptr::write_volatile(ptr.add(2) as *mut u16, index.to_be());
-        // rsvd0
+        // rsvd0 (2 bytes at offset 4-5)
         std::ptr::write_volatile(ptr.add(4) as *mut u16, 0);
-        // sw_cnt
-        std::ptr::write_volatile(ptr.add(6) as *mut u16, 0);
-        // rsvd1
-        std::ptr::write_bytes(ptr.add(8), 0, 8);
+        // sw_cnt (2 bytes at offset 6-7, big-endian)
+        std::ptr::write_volatile(ptr.add(6) as *mut u16, sw_cnt.to_be());
+        // rsvd1 (8 bytes at offset 8-15)
+        std::ptr::write_volatile(ptr.add(8) as *mut u64, 0);
         // append_tag (big-endian)
         std::ptr::write_volatile(ptr.add(16) as *mut u64, tag.to_be());
         // append_mask (big-endian)

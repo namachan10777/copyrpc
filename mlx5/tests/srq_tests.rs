@@ -227,11 +227,10 @@ fn test_srq_with_dct_send() {
     dct_cq.flush();
 
     // Verify received data
-    // Note: DC receive has a 40-byte GRH header prepended
-    let grh_size = 40;
-    let received = recv_buf.read_bytes(grh_size + test_data.len());
+    // SRQ receive: data starts at beginning of buffer (no GRH prepended)
+    let received = recv_buf.read_bytes(test_data.len());
     assert_eq!(
-        &received[grh_size..],
+        received.as_slice(),
         test_data,
         "Received data mismatch"
     );
