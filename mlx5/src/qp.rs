@@ -138,8 +138,9 @@ impl<T, Tab> SendQueueState<T, Tab> {
         self.last_wqe = Some((ptr, size));
     }
 
+    /// Ring the doorbell using regular doorbell write.
     fn ring_doorbell(&mut self) {
-        let Some((last_wqe_ptr, last_wqe_size)) = self.last_wqe.take() else {
+        let Some((last_wqe_ptr, _)) = self.last_wqe.take() else {
             return;
         };
 
@@ -151,18 +152,28 @@ impl<T, Tab> SendQueueState<T, Tab> {
 
         udma_to_device_barrier!();
 
-        if self.bf_size > 0 && last_wqe_size <= WQEBB_SIZE {
-            self.ring_bf(last_wqe_ptr);
-        } else {
-            self.ring_db(last_wqe_ptr);
-        }
+        self.ring_db(last_wqe_ptr);
     }
 
-    fn ring_bf(&mut self, wqe_ptr: *mut u8) {
-        let bf = unsafe { self.bf_reg.add(self.bf_offset as usize) };
-        mlx5_bf_copy!(bf, wqe_ptr);
+    /// Ring the doorbell using BlueFlame (low latency, single WQE).
+    fn ring_blueflame(&mut self, wqe_ptr: *mut u8) {
         mmio_flush_writes!();
-        self.bf_offset ^= self.bf_size;
+
+        unsafe {
+            std::ptr::write_volatile(self.dbrec.add(1), (self.pi as u32).to_be());
+        }
+
+        udma_to_device_barrier!();
+
+        if self.bf_size > 0 {
+            let bf = unsafe { self.bf_reg.add(self.bf_offset as usize) };
+            mlx5_bf_copy!(bf, wqe_ptr);
+            mmio_flush_writes!();
+            self.bf_offset ^= self.bf_size;
+        } else {
+            // Fallback to regular doorbell if BlueFlame not available
+            self.ring_db(wqe_ptr);
+        }
     }
 
     fn ring_db(&mut self, wqe_ptr: *mut u8) {
@@ -254,7 +265,7 @@ impl<'a, T, Tab> WqeBuilder<'a, T, Tab> {
     /// Write the control segment.
     ///
     /// This must be the first segment in every WQE.
-    pub fn ctrl(mut self, opcode: WqeOpcode, flags: u8, imm: u32) -> Self {
+    pub fn ctrl(mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) -> Self {
         let flags = if self.signaled {
             flags | WqeFlags::COMPLETION
         } else {
@@ -267,7 +278,7 @@ impl<'a, T, Tab> WqeBuilder<'a, T, Tab> {
                 self.wqe_idx,
                 self.sq.sqn,
                 0,
-                flags,
+                flags.bits(),
                 imm,
             );
         }
@@ -335,6 +346,28 @@ impl<'a, T, Tab> WqeBuilder<'a, T, Tab> {
 
         self.sq.advance_pi(wqebb_cnt);
         self.sq.set_last_wqe(self.wqe_ptr, self.offset);
+
+        WqeHandle {
+            wqe_idx,
+            size: self.offset,
+        }
+    }
+
+    /// Finish the WQE construction and immediately ring BlueFlame doorbell.
+    ///
+    /// Use this for low-latency single WQE submission. The doorbell is issued
+    /// immediately, so no need to call `ring_sq_doorbell()` afterwards.
+    fn finish_internal_with_blueflame(self) -> WqeHandle {
+        unsafe {
+            CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
+        }
+
+        let wqebb_cnt = calc_wqebb_cnt(self.offset);
+        let wqe_idx = self.wqe_idx;
+        let wqe_ptr = self.wqe_ptr;
+
+        self.sq.advance_pi(wqebb_cnt);
+        self.sq.ring_blueflame(wqe_ptr);
 
         WqeHandle {
             wqe_idx,
@@ -765,7 +798,7 @@ pub struct SparseWqeBuilder<'a, T> {
 
 impl<'a, T> SparseWqeBuilder<'a, T> {
     /// Write the control segment.
-    pub fn ctrl(mut self, opcode: WqeOpcode, flags: u8, imm: u32) -> Self {
+    pub fn ctrl(mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) -> Self {
         self.inner = self.inner.ctrl(opcode, flags, imm);
         self
     }
@@ -796,6 +829,18 @@ impl<'a, T> SparseWqeBuilder<'a, T> {
         }
         self.inner.finish_internal()
     }
+
+    /// Finish the WQE construction and immediately ring BlueFlame doorbell.
+    ///
+    /// Use this for low-latency single WQE submission. No need to call
+    /// `ring_sq_doorbell()` afterwards.
+    pub fn finish_with_blueflame(self) -> WqeHandle {
+        let wqe_idx = self.inner.wqe_idx;
+        if let Some(entry) = self.entry {
+            self.inner.sq.table.store(wqe_idx, entry);
+        }
+        self.inner.finish_internal_with_blueflame()
+    }
 }
 
 /// Dense WQE builder that stores entry on finish.
@@ -806,7 +851,7 @@ pub struct DenseWqeBuilder<'a, T> {
 
 impl<'a, T> DenseWqeBuilder<'a, T> {
     /// Write the control segment.
-    pub fn ctrl(mut self, opcode: WqeOpcode, flags: u8, imm: u32) -> Self {
+    pub fn ctrl(mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) -> Self {
         self.inner = self.inner.ctrl(opcode, flags, imm);
         self
     }
@@ -834,6 +879,16 @@ impl<'a, T> DenseWqeBuilder<'a, T> {
         let wqe_idx = self.inner.wqe_idx;
         self.inner.sq.table.store(wqe_idx, self.entry);
         self.inner.finish_internal()
+    }
+
+    /// Finish the WQE construction and immediately ring BlueFlame doorbell.
+    ///
+    /// Use this for low-latency single WQE submission. No need to call
+    /// `ring_sq_doorbell()` afterwards.
+    pub fn finish_with_blueflame(self) -> WqeHandle {
+        let wqe_idx = self.inner.wqe_idx;
+        self.inner.sq.table.store(wqe_idx, self.entry);
+        self.inner.finish_internal_with_blueflame()
     }
 }
 

@@ -7,7 +7,7 @@
 //!
 //! This implementation provides direct WQE posting for:
 //! - Tag operations (add/remove) via the internal Command QP
-//! - Receive WQE posting to the SRQ
+//! - Unordered receive WQE posting to the SRQ
 //!
 //! # Example
 //!
@@ -15,23 +15,25 @@
 //! // Initialize direct access
 //! tm_srq.init_direct_access()?;
 //!
-//! // Add a tagged receive
+//! // Add a tagged receive using Command QP
+//! let builder = tm_srq.cmd_wqe_builder(my_entry)?;
+//! builder.ctrl(WqeOpcode::TagMatching, 0)
+//!     .tag_add(index, tag, addr, len, lkey)
+//!     .finish();
+//! tm_srq.ring_cmd_doorbell();
+//!
+//! // Post unordered receive (for unexpected messages)
 //! unsafe {
-//!     tm_srq.add_tag(0, tag, addr, len, lkey);
-//!     tm_srq.ring_cmd_doorbell();
+//!     tm_srq.post_unordered_recv(addr, len, lkey);
+//!     tm_srq.ring_srq_doorbell();
 //! }
 //!
-//! // Post untagged receive (for unexpected messages)
-//! unsafe {
-//!     tm_srq.post_recv(addr, len, lkey);
-//!     tm_srq.ring_doorbell();
-//! }
-//!
-//! // Remove a tag
-//! unsafe {
-//!     tm_srq.remove_tag(handle);
-//!     tm_srq.ring_cmd_doorbell();
-//! }
+//! // Remove a tag using Command QP
+//! let builder = tm_srq.cmd_wqe_builder(my_entry)?;
+//! builder.ctrl(WqeOpcode::TagMatching, 0)
+//!     .tag_del(index)
+//!     .finish();
+//! tm_srq.ring_cmd_doorbell();
 //! ```
 
 use std::{io, mem::MaybeUninit, ptr::NonNull};
@@ -41,8 +43,7 @@ use crate::device::Context;
 use crate::pd::ProtectionDomain;
 use crate::srq::SrqInfo;
 use crate::wqe::{
-    CtrlSeg, DataSeg, SparseWqeTable, TmSeg, UnorderedSendQueue, WQEBB_SIZE, WqeFlags, WqeHandle,
-    WqeOpcode,
+    CtrlSeg, DataSeg, SparseWqeTable, TmSeg, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode,
 };
 
 /// Offset from ibv_srq to cmd_qp pointer in mlx5_srq structure.
@@ -127,8 +128,9 @@ impl<T> CmdQpState<T> {
         self.sq_wqe_cnt - self.pi.wrapping_sub(self.ci)
     }
 
+    /// Ring the doorbell using regular doorbell write.
     fn ring_doorbell(&mut self) {
-        let Some((wqe_ptr, wqe_size)) = self.last_wqe.take() else {
+        let Some((wqe_ptr, _)) = self.last_wqe.take() else {
             return;
         };
 
@@ -141,22 +143,39 @@ impl<T> CmdQpState<T> {
 
         udma_to_device_barrier!();
 
-        // BlueFlame write for small WQEs
-        if self.bf_size > 0 && wqe_size <= WQEBB_SIZE {
+        self.ring_db(wqe_ptr);
+    }
+
+    /// Ring the doorbell using BlueFlame (low latency, single WQE).
+    fn ring_blueflame(&mut self, wqe_ptr: *mut u8) {
+        mmio_flush_writes!();
+
+        // Update doorbell record (dbrec[1] is SQ doorbell)
+        unsafe {
+            std::ptr::write_volatile(self.dbrec.add(1), (self.pi as u32).to_be());
+        }
+
+        udma_to_device_barrier!();
+
+        if self.bf_size > 0 {
             let bf = unsafe { self.bf_reg.add(self.bf_offset as usize) };
             mlx5_bf_copy!(bf, wqe_ptr);
             mmio_flush_writes!();
             self.bf_offset ^= self.bf_size;
         } else {
-            // Regular doorbell
-            let bf = unsafe { self.bf_reg.add(self.bf_offset as usize) as *mut u64 };
-            let ctrl = wqe_ptr as *const u64;
-            unsafe {
-                std::ptr::write_volatile(bf, *ctrl);
-            }
-            mmio_flush_writes!();
-            self.bf_offset ^= self.bf_size;
+            // Fallback to regular doorbell if BlueFlame not available
+            self.ring_db(wqe_ptr);
         }
+    }
+
+    fn ring_db(&mut self, wqe_ptr: *mut u8) {
+        let bf = unsafe { self.bf_reg.add(self.bf_offset as usize) as *mut u64 };
+        let ctrl = wqe_ptr as *const u64;
+        unsafe {
+            std::ptr::write_volatile(bf, *ctrl);
+        }
+        mmio_flush_writes!();
+        self.bf_offset ^= self.bf_size;
     }
 
     fn process_completion(&mut self, wqe_idx: u16) -> Option<T> {
@@ -192,7 +211,7 @@ impl<'a, T> CmdQpWqeBuilder<'a, T> {
                 self.wqe_idx,
                 self.cmd_qp.qpn,
                 0,
-                WqeFlags::COMPLETION,
+                WqeFlags::COMPLETION.bits(),
                 imm,
             );
         }
@@ -228,6 +247,8 @@ impl<'a, T> CmdQpWqeBuilder<'a, T> {
     }
 
     /// Finish the WQE construction.
+    ///
+    /// The doorbell will be issued when `ring_cmd_doorbell()` is called.
     pub fn finish(self) -> WqeHandle {
         unsafe {
             // Update DS count in control segment
@@ -241,6 +262,31 @@ impl<'a, T> CmdQpWqeBuilder<'a, T> {
 
         self.cmd_qp.advance_pi(1);
         self.cmd_qp.set_last_wqe(self.wqe_ptr, self.offset);
+
+        WqeHandle {
+            wqe_idx,
+            size: self.offset,
+        }
+    }
+
+    /// Finish the WQE construction and immediately ring BlueFlame doorbell.
+    ///
+    /// Use this for low-latency single WQE submission. No need to call
+    /// `ring_cmd_doorbell()` afterwards.
+    pub fn finish_with_blueflame(self) -> WqeHandle {
+        unsafe {
+            // Update DS count in control segment
+            std::ptr::write_volatile(self.wqe_ptr.add(7), self.ds_count);
+        }
+
+        let wqe_idx = self.wqe_idx;
+        let wqe_ptr = self.wqe_ptr;
+
+        // Store entry in table (always signaled for unordered)
+        self.cmd_qp.table.store(wqe_idx, self.entry);
+
+        self.cmd_qp.advance_pi(1);
+        self.cmd_qp.ring_blueflame(wqe_ptr);
 
         WqeHandle {
             wqe_idx,
@@ -488,66 +534,66 @@ impl<T> TagMatchingSrq<T> {
     }
 
     // =========================================================================
-    // Receive WQE Operations (via SRQ)
+    // Unordered Receive WQE Operations (via SRQ)
     // =========================================================================
 
-    /// Post a receive WQE for unexpected messages.
+    /// Post an unordered receive WQE for unexpected messages.
     ///
-    /// Call `ring_doorbell()` after posting one or more receive WQEs.
+    /// Call `ring_srq_doorbell()` after posting one or more receive WQEs.
     ///
     /// # Safety
     /// - The buffer must be registered and valid
     /// - Direct access must be initialized
-    pub unsafe fn post_recv(&mut self, addr: u64, len: u32, lkey: u32) {
+    pub unsafe fn post_unordered_recv(&mut self, addr: u64, len: u32, lkey: u32) {
         if let Some(state) = self.srq_state.as_mut() {
             state.post(addr, len, lkey);
         }
     }
 
     /// Ring the SRQ doorbell to submit receive WQEs.
-    pub fn ring_doorbell(&mut self) {
+    pub fn ring_srq_doorbell(&mut self) {
         if let Some(state) = self.srq_state.as_mut() {
             state.ring_doorbell();
         }
     }
-}
 
-// =============================================================================
-// UnorderedSendQueue Implementation for Command QP
-// =============================================================================
+    // =========================================================================
+    // Command QP Operations (for TM tag add/remove)
+    // =========================================================================
 
-impl<T> UnorderedSendQueue for TagMatchingSrq<T> {
-    type Builder<'a>
-        = CmdQpWqeBuilder<'a, T>
-    where
-        T: 'a;
-    type Entry = T;
-
-    fn optimistic_available(&self) -> u16 {
+    /// Get optimistic available count for Command QP.
+    ///
+    /// Based on pi - ci, but actual availability may be less due to gaps.
+    pub fn cmd_optimistic_available(&self) -> u16 {
         self.cmd_qp
             .as_ref()
             .map(|cq| cq.optimistic_available())
             .unwrap_or(0)
     }
 
-    fn exact_available(&self) -> u16 {
+    /// Scan the table to get exact available count (slower).
+    pub fn cmd_exact_available(&self) -> u16 {
         self.cmd_qp
             .as_ref()
             .map(|cq| cq.table.count_available())
             .unwrap_or(0)
     }
 
-    fn is_slot_available(&self, idx: u16) -> bool {
+    /// Check if a specific Command QP slot is available.
+    pub fn cmd_is_slot_available(&self, idx: u16) -> bool {
         self.cmd_qp
             .as_ref()
             .map(|cq| cq.table.is_available(idx))
             .unwrap_or(false)
     }
 
-    fn wqe_builder(&mut self, entry: Self::Entry) -> io::Result<CmdQpWqeBuilder<'_, T>> {
+    /// Get a WQE builder for Command QP tag operations.
+    ///
+    /// Entry is required (always signaled for Command QP).
+    pub fn cmd_wqe_builder(&mut self, entry: T) -> io::Result<CmdQpWqeBuilder<'_, T>> {
         let cmd_qp = self.cmd_qp_mut()?;
         if !cmd_qp.table.is_available(cmd_qp.pi) {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Command QP full"));
         }
 
         let wqe_idx = cmd_qp.pi;
@@ -563,13 +609,17 @@ impl<T> UnorderedSendQueue for TagMatchingSrq<T> {
         })
     }
 
-    fn ring_sq_doorbell(&mut self) {
+    /// Ring the Command QP doorbell to submit TM operations.
+    pub fn ring_cmd_doorbell(&mut self) {
         if let Some(cmd_qp) = self.cmd_qp.as_mut() {
             cmd_qp.ring_doorbell();
         }
     }
 
-    fn process_completion(&mut self, wqe_idx: u16) -> Option<Self::Entry> {
+    /// Process a Command QP completion.
+    ///
+    /// Returns the entry that was stored at the given wqe_idx.
+    pub fn process_cmd_completion(&mut self, wqe_idx: u16) -> Option<T> {
         self.cmd_qp
             .as_mut()
             .and_then(|cq| cq.process_completion(wqe_idx))

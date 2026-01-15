@@ -4,6 +4,8 @@
 
 use std::io;
 
+use bitflags::bitflags;
+
 /// WQEBB (Work Queue Element Basic Block) size in bytes.
 pub const WQEBB_SIZE: usize = 64;
 
@@ -223,15 +225,17 @@ pub enum WqeOpcode {
     TagMatching = 0x28,
 }
 
-/// WQE flags for fm_ce_se field.
-#[allow(non_snake_case)]
-pub mod WqeFlags {
-    /// Fence (wait for previous WQEs to complete).
-    pub const FENCE: u8 = 0x40;
-    /// Completion requested.
-    pub const COMPLETION: u8 = 0x08;
-    /// Solicited event.
-    pub const SOLICITED: u8 = 0x02;
+bitflags! {
+    /// WQE flags for fm_ce_se field.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct WqeFlags: u8 {
+        /// Fence (wait for previous WQEs to complete).
+        const FENCE = 0x40;
+        /// Completion requested.
+        const COMPLETION = 0x08;
+        /// Solicited event.
+        const SOLICITED = 0x02;
+    }
 }
 
 /// Calculate the number of WQEBBs for a WQE size.
@@ -482,44 +486,6 @@ pub trait SparseSendQueue {
     ///
     /// Updates consumer index and returns the entry stored at wqe_idx.
     /// Returns None if no entry was stored (shouldn't happen for signaled WQEs).
-    fn process_completion(&mut self, wqe_idx: u16) -> Option<Self::Entry>;
-}
-
-/// Trait for unordered send queues with WQE table support.
-///
-/// Used for TM-SRQ Command QP, DCI with streams where completions may arrive
-/// out of order.
-pub trait UnorderedSendQueue {
-    /// Builder type for this send queue.
-    type Builder<'a>
-    where
-        Self: 'a;
-
-    /// Entry type stored in the WQE table.
-    type Entry;
-
-    /// Get optimistic available count.
-    ///
-    /// Based on pi - ci, but actual availability may be less due to gaps.
-    fn optimistic_available(&self) -> u16;
-
-    /// Scan the table to get exact available count (slower).
-    fn exact_available(&self) -> u16;
-
-    /// Check if a specific slot is available.
-    fn is_slot_available(&self, idx: u16) -> bool;
-
-    /// Get a WQE builder for zero-copy WQE construction.
-    ///
-    /// Entry is required (always signaled for unordered queues).
-    fn wqe_builder(&mut self, entry: Self::Entry) -> io::Result<Self::Builder<'_>>;
-
-    /// Ring the SQ doorbell to notify HCA of new WQEs.
-    fn ring_sq_doorbell(&mut self);
-
-    /// Process a single completion.
-    ///
-    /// Returns the entry that was stored at the given wqe_idx.
     fn process_completion(&mut self, wqe_idx: u16) -> Option<Self::Entry>;
 }
 
