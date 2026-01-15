@@ -155,6 +155,46 @@ impl AddressVector {
 // WQE Opcodes and Flags
 // =============================================================================
 
+/// Atomic Segment (16 bytes).
+///
+/// Used for atomic Compare-and-Swap and Fetch-and-Add operations.
+/// Follows the RDMA segment in an atomic WQE.
+pub struct AtomicSeg;
+
+impl AtomicSeg {
+    /// Size of the atomic segment in bytes.
+    pub const SIZE: usize = 16;
+
+    /// Write the atomic segment for Compare-and-Swap operation.
+    ///
+    /// The CAS operation atomically compares the value at the remote address
+    /// with `compare`. If equal, replaces it with `swap`. Returns the original
+    /// value in the local buffer.
+    ///
+    /// # Safety
+    /// The pointer must point to at least 16 bytes of writable memory.
+    #[inline]
+    pub unsafe fn write_cas(ptr: *mut u8, swap: u64, compare: u64) {
+        let ptr64 = ptr as *mut u64;
+        std::ptr::write_volatile(ptr64, swap.to_be());
+        std::ptr::write_volatile(ptr64.add(1), compare.to_be());
+    }
+
+    /// Write the atomic segment for Fetch-and-Add operation.
+    ///
+    /// The FA operation atomically adds `add_value` to the value at the remote
+    /// address. Returns the original value in the local buffer.
+    ///
+    /// # Safety
+    /// The pointer must point to at least 16 bytes of writable memory.
+    #[inline]
+    pub unsafe fn write_fa(ptr: *mut u8, add_value: u64) {
+        let ptr64 = ptr as *mut u64;
+        std::ptr::write_volatile(ptr64, add_value.to_be());
+        std::ptr::write_volatile(ptr64.add(1), 0u64.to_be());
+    }
+}
+
 /// Tag Matching Segment (32 bytes).
 ///
 /// Used for TM operations (TAG_ADD, TAG_DEL) via Command QP.

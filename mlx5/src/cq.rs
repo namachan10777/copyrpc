@@ -73,13 +73,20 @@ impl Cqe {
     /// # Safety
     /// The pointer must point to a valid 64-byte CQE.
     ///
-    /// CQE64 layout:
+    /// CQE64 layout (success):
     /// - offset 36: imm_inval_pkey (4B, big-endian)
     /// - offset 44: byte_cnt (4B, big-endian)
-    /// - offset 55: syndrome (1B)
+    /// - offset 48-55: timestamp (8B) - NOT syndrome!
     /// - offset 56: sop_drop_qpn (4B, big-endian) - QP number in [23:0]
     /// - offset 60: wqe_counter (2B, big-endian)
     /// - offset 63: op_own (1B) - opcode[7:4] | owner_bit[0]
+    ///
+    /// CQE64 layout (error - opcode 0x0d or 0x0e):
+    /// - offset 54: vendor_err_synd (1B)
+    /// - offset 55: syndrome (1B)
+    /// - offset 56: s_wqe_opcode_qpn (4B, big-endian)
+    /// - offset 60: wqe_counter (2B, big-endian)
+    /// - offset 63: op_own (1B)
     pub(crate) unsafe fn from_ptr(ptr: *const u8) -> Self {
         let op_own = std::ptr::read_volatile(ptr.add(63));
         let opcode = CqeOpcode::from_u8(op_own >> 4).unwrap_or(CqeOpcode::ReqErr);
@@ -96,7 +103,13 @@ impl Cqe {
         let imm =
             u32::from_be(std::ptr::read_volatile(ptr.add(36) as *const u32));
 
-        let syndrome = std::ptr::read_volatile(ptr.add(55));
+        // Syndrome is only valid for error CQEs (opcode 0x0d=ReqErr or 0x0e=RespErr).
+        // For success CQEs, offset 55 is part of the timestamp field.
+        let syndrome = if opcode == CqeOpcode::ReqErr || opcode == CqeOpcode::RespErr {
+            std::ptr::read_volatile(ptr.add(55))
+        } else {
+            0
+        };
 
         Self {
             opcode,
@@ -187,7 +200,8 @@ impl CompletionQueue {
     /// Initialize direct access for CQE polling.
     ///
     /// This is called automatically when a QP is registered.
-    pub(crate) fn init_direct_access(&mut self) -> io::Result<()> {
+    /// Can also be called manually if using `poll_one()` without registered QPs.
+    pub fn init_direct_access(&mut self) -> io::Result<()> {
         if self.state.is_some() {
             return Ok(());
         }
@@ -260,10 +274,21 @@ impl CompletionQueue {
         }
     }
 
+    /// Poll for a single CQE without dispatching to callbacks.
+    ///
+    /// This is useful for testing or when you want to process CQEs manually.
+    /// Returns None if no CQE is available.
+    ///
+    /// Note: When using this method, you should call `flush()` afterwards
+    /// to acknowledge the completions to the hardware.
+    pub fn poll_one(&mut self) -> Option<Cqe> {
+        self.try_next_cqe()
+    }
+
     /// Try to get the next CQE.
     ///
     /// Returns None if no CQE is available.
-    pub(crate) fn try_next_cqe(&mut self) -> Option<Cqe> {
+    fn try_next_cqe(&mut self) -> Option<Cqe> {
         let state = self.state.as_mut()?;
 
         let cqe_mask = state.cqe_cnt - 1;

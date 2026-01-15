@@ -192,3 +192,86 @@ impl MemoryRegion {
         unsafe { (*self.mr.as_ptr()).length }
     }
 }
+
+// =============================================================================
+// Address Handle
+// =============================================================================
+
+/// Remote UD QP information for creating Address Handle.
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteUdQpInfo {
+    /// Remote QP number.
+    pub qpn: u32,
+    /// Remote Q_Key.
+    pub qkey: u32,
+    /// Remote LID.
+    pub lid: u16,
+}
+
+/// Address Handle for UD (Unreliable Datagram) transport.
+///
+/// An AH defines the path (route) to a remote UD QP.
+/// It encapsulates addressing information required to send messages.
+pub struct AddressHandle {
+    ah: NonNull<mlx5_sys::ibv_ah>,
+    /// Remote QP number.
+    qpn: u32,
+    /// Q_Key for this destination.
+    qkey: u32,
+}
+
+impl Pd {
+    /// Create an Address Handle for UD transport.
+    ///
+    /// # Arguments
+    /// * `port` - Local port number
+    /// * `remote` - Remote UD QP information
+    ///
+    /// # Errors
+    /// Returns an error if the AH cannot be created.
+    pub fn create_ah(&self, port: u8, remote: &RemoteUdQpInfo) -> io::Result<AddressHandle> {
+        use std::mem::MaybeUninit;
+
+        unsafe {
+            let mut ah_attr: mlx5_sys::ibv_ah_attr = MaybeUninit::zeroed().assume_init();
+            ah_attr.dlid = remote.lid;
+            ah_attr.sl = 0;
+            ah_attr.src_path_bits = 0;
+            ah_attr.port_num = port;
+
+            let ah = mlx5_sys::ibv_create_ah(self.pd.as_ptr(), &mut ah_attr);
+            NonNull::new(ah).map_or(Err(io::Error::last_os_error()), |ah| {
+                Ok(AddressHandle {
+                    ah,
+                    qpn: remote.qpn,
+                    qkey: remote.qkey,
+                })
+            })
+        }
+    }
+}
+
+impl Drop for AddressHandle {
+    fn drop(&mut self) {
+        unsafe {
+            mlx5_sys::ibv_destroy_ah(self.ah.as_ptr());
+        }
+    }
+}
+
+impl AddressHandle {
+    /// Get the raw ibv_ah pointer.
+    pub(crate) fn as_ptr(&self) -> *mut mlx5_sys::ibv_ah {
+        self.ah.as_ptr()
+    }
+
+    /// Get the remote QP number.
+    pub fn qpn(&self) -> u32 {
+        self.qpn
+    }
+
+    /// Get the Q_Key.
+    pub fn qkey(&self) -> u32 {
+        self.qkey
+    }
+}

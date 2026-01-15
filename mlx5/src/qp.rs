@@ -11,8 +11,8 @@ use crate::cq::{CompletionQueue, Cqe};
 use crate::device::Context;
 use crate::pd::Pd;
 use crate::wqe::{
-    CtrlSeg, DataSeg, DenseWqeTable, InlineHeader, RdmaSeg, SparseWqeTable, WQEBB_SIZE, WqeFlags,
-    WqeHandle, WqeOpcode, calc_wqebb_cnt,
+    AtomicSeg, CtrlSeg, DataSeg, DenseWqeTable, InlineHeader, RdmaSeg, SparseWqeTable, WQEBB_SIZE,
+    WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
 };
 use crate::CompletionTarget;
 
@@ -336,6 +336,48 @@ impl<'a, T, Tab> WqeBuilder<'a, T, Tab> {
         self.offset += padded_size;
         self.ds_count += (padded_size / 16) as u8;
         (self, slice)
+    }
+
+    /// Add an atomic Compare-and-Swap segment.
+    ///
+    /// The CAS operation atomically compares the 8-byte value at `remote_addr`
+    /// (specified in the preceding RDMA segment) with `compare`. If equal,
+    /// replaces it with `swap`. The original value is written to the local
+    /// buffer (specified in the following data segment).
+    ///
+    /// WQE structure for atomic CAS:
+    /// - Control segment (ctrl)
+    /// - RDMA segment (rdma) - specifies remote address and rkey
+    /// - Atomic segment (atomic_cas) - specifies swap and compare values
+    /// - Data segment (sge) - specifies local buffer for result
+    pub fn atomic_cas(mut self, swap: u64, compare: u64) -> Self {
+        unsafe {
+            AtomicSeg::write_cas(self.wqe_ptr.add(self.offset), swap, compare);
+        }
+        self.offset += AtomicSeg::SIZE;
+        self.ds_count += 1;
+        self
+    }
+
+    /// Add an atomic Fetch-and-Add segment.
+    ///
+    /// The FA operation atomically adds `add_value` to the 8-byte value at
+    /// `remote_addr` (specified in the preceding RDMA segment). The original
+    /// value is written to the local buffer (specified in the following data
+    /// segment).
+    ///
+    /// WQE structure for atomic FA:
+    /// - Control segment (ctrl)
+    /// - RDMA segment (rdma) - specifies remote address and rkey
+    /// - Atomic segment (atomic_fa) - specifies add value
+    /// - Data segment (sge) - specifies local buffer for result
+    pub fn atomic_fa(mut self, add_value: u64) -> Self {
+        unsafe {
+            AtomicSeg::write_fa(self.wqe_ptr.add(self.offset), add_value);
+        }
+        self.offset += AtomicSeg::SIZE;
+        self.ds_count += 1;
+        self
     }
 
     /// Finish the WQE construction (internal).
@@ -999,6 +1041,18 @@ impl<'a, T> SparseWqeBuilder<'a, T> {
         self
     }
 
+    /// Add an atomic Compare-and-Swap segment.
+    pub fn atomic_cas(mut self, swap: u64, compare: u64) -> Self {
+        self.inner = self.inner.atomic_cas(swap, compare);
+        self
+    }
+
+    /// Add an atomic Fetch-and-Add segment.
+    pub fn atomic_fa(mut self, add_value: u64) -> Self {
+        self.inner = self.inner.atomic_fa(add_value);
+        self
+    }
+
     /// Finish the WQE construction.
     pub fn finish(self) -> WqeHandle {
         let wqe_idx = self.inner.wqe_idx;
@@ -1049,6 +1103,18 @@ impl<'a, T> DenseWqeBuilder<'a, T> {
     /// Add inline data.
     pub fn inline_data(mut self, data: &[u8]) -> Self {
         self.inner = self.inner.inline_data(data);
+        self
+    }
+
+    /// Add an atomic Compare-and-Swap segment.
+    pub fn atomic_cas(mut self, swap: u64, compare: u64) -> Self {
+        self.inner = self.inner.atomic_cas(swap, compare);
+        self
+    }
+
+    /// Add an atomic Fetch-and-Add segment.
+    pub fn atomic_fa(mut self, add_value: u64) -> Self {
+        self.inner = self.inner.atomic_fa(add_value);
         self
     }
 

@@ -11,6 +11,7 @@ pub mod qp;
 pub mod srq;
 pub mod tm_srq;
 pub mod types;
+pub mod ud;
 pub mod wqe;
 
 // Re-export CQE types

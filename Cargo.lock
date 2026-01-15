@@ -138,6 +138,7 @@ name = "mlx5"
 version = "0.1.0"
 dependencies = [
  "bitflags",
+ "libc",
  "mlx5_sys",
 ]
 
