@@ -218,6 +218,8 @@ pub struct AddressHandle {
     qpn: u32,
     /// Q_Key for this destination.
     qkey: u32,
+    /// Destination LID.
+    dlid: u16,
 }
 
 impl Pd {
@@ -245,6 +247,7 @@ impl Pd {
                     ah,
                     qpn: remote.qpn,
                     qkey: remote.qkey,
+                    dlid: remote.lid,
                 })
             })
         }
@@ -273,5 +276,10 @@ impl AddressHandle {
     /// Get the Q_Key.
     pub fn qkey(&self) -> u32 {
         self.qkey
+    }
+
+    /// Get the destination LID.
+    pub fn dlid(&self) -> u16 {
+        self.dlid
     }
 }

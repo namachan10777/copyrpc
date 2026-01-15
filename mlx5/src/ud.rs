@@ -203,6 +203,7 @@ pub struct UdAddressSeg;
 
 impl UdAddressSeg {
     /// Size of the UD address segment in bytes.
+    /// mlx5_wqe_datagram_seg = mlx5_wqe_av = 48 bytes (no reserved header)
     pub const SIZE: usize = 48;
 
     /// Write the UD address segment from an Address Handle.
@@ -211,29 +212,38 @@ impl UdAddressSeg {
     /// The pointer must point to at least 48 bytes of writable memory.
     #[inline]
     pub unsafe fn write(ptr: *mut u8, ah: &AddressHandle, qkey: u32) {
-        // UD AV segment format:
-        // [0-7]:   Reserved/flags
-        // [8-11]:  dqp (destination QPN)
-        // [12-15]: qkey
-        // [16-47]: GRH (if needed) or padding
+        // mlx5_wqe_av format (48 bytes):
+        // [0-7]:   key union (qkey at [0-3], reserved at [4-7])
+        // [8-11]:  dqp_dct (destination QPN in [23:0] | MLX5_EXTENDED_UD_AV)
+        // [12]:    stat_rate_sl (SL in [7:4], static_rate in [3:0])
+        // [13]:    fl_mlid (force_lb in [7], source_lid[6:0])
+        // [14-15]: rlid (remote LID, big-endian)
+        // [16-19]: reserved0
+        // [20-25]: rmac (remote MAC)
+        // [26]:    tclass
+        // [27]:    hop_limit
+        // [28-31]: grh_gid_fl
+        // [32-47]: rgid (remote GID)
 
-        let ptr32 = ptr as *mut u32;
+        // Q_Key at offset 0
+        std::ptr::write_volatile(ptr as *mut u32, qkey.to_be());
+        // Reserved at offset 4
+        std::ptr::write_volatile(ptr.add(4) as *mut u32, 0);
 
-        // Clear first 8 bytes (flags/reserved)
-        std::ptr::write_volatile(ptr32, 0);
-        std::ptr::write_volatile(ptr32.add(1), 0);
-
-        // Remote QPN at offset 8
-        let dqp = ah.qpn() & 0x00FF_FFFF;
+        // Remote QPN at offset 8 with MLX5_EXTENDED_UD_AV flag (bit 31=1)
+        const MLX5_EXTENDED_UD_AV: u32 = 0x8000_0000;
+        let dqp = (ah.qpn() & 0x00FF_FFFF) | MLX5_EXTENDED_UD_AV;
         std::ptr::write_volatile(ptr.add(8) as *mut u32, dqp.to_be());
 
-        // Q_Key at offset 12
-        std::ptr::write_volatile(ptr.add(12) as *mut u32, qkey.to_be());
+        // stat_rate_sl at offset 12 (SL=0, rate=0)
+        std::ptr::write_volatile(ptr.add(12), 0u8);
+        // fl_mlid at offset 13 (force_lb=0, mlid=0)
+        std::ptr::write_volatile(ptr.add(13), 0u8);
 
-        // AH index at offset 16 (mlx5dv format)
-        // Get AH index from the ah_attr - for now use simplified format
-        // In mlx5, the AH needs to be converted to internal format
-        // Clear remaining bytes
+        // Remote LID at offset 14
+        std::ptr::write_volatile(ptr.add(14) as *mut u16, ah.dlid().to_be());
+
+        // Clear remaining fields (offset 16-47)
         std::ptr::write_bytes(ptr.add(16), 0, 32);
     }
 
@@ -245,24 +255,26 @@ impl UdAddressSeg {
     /// The pointer must point to at least 48 bytes of writable memory.
     #[inline]
     pub unsafe fn write_raw(ptr: *mut u8, remote_qpn: u32, qkey: u32, dlid: u16) {
-        let ptr32 = ptr as *mut u32;
+        // Q_Key at offset 0
+        std::ptr::write_volatile(ptr as *mut u32, qkey.to_be());
+        // Reserved at offset 4
+        std::ptr::write_volatile(ptr.add(4) as *mut u32, 0);
 
-        // Clear first 8 bytes
-        std::ptr::write_volatile(ptr32, 0);
-        std::ptr::write_volatile(ptr32.add(1), 0);
-
-        // Remote QPN at offset 8
-        let dqp = remote_qpn & 0x00FF_FFFF;
+        // Remote QPN at offset 8 with MLX5_EXTENDED_UD_AV flag (bit 31=1)
+        const MLX5_EXTENDED_UD_AV: u32 = 0x8000_0000;
+        let dqp = (remote_qpn & 0x00FF_FFFF) | MLX5_EXTENDED_UD_AV;
         std::ptr::write_volatile(ptr.add(8) as *mut u32, dqp.to_be());
 
-        // Q_Key at offset 12
-        std::ptr::write_volatile(ptr.add(12) as *mut u32, qkey.to_be());
+        // stat_rate_sl at offset 12
+        std::ptr::write_volatile(ptr.add(12), 0u8);
+        // fl_mlid at offset 13
+        std::ptr::write_volatile(ptr.add(13), 0u8);
 
-        // DLID at offset 16 (in AV format)
-        std::ptr::write_volatile(ptr.add(16) as *mut u16, dlid.to_be());
+        // Remote LID at offset 14
+        std::ptr::write_volatile(ptr.add(14) as *mut u16, dlid.to_be());
 
-        // Clear remaining
-        std::ptr::write_bytes(ptr.add(18), 0, 30);
+        // Clear remaining fields (offset 16-47)
+        std::ptr::write_bytes(ptr.add(16), 0, 32);
     }
 }
 
