@@ -6,7 +6,7 @@
 use std::{io, mem::MaybeUninit, ptr::NonNull};
 
 use crate::pd::Pd;
-use crate::wqe::{DataSeg, ReceiveQueue};
+use crate::wqe::DataSeg;
 
 /// SRQ configuration.
 #[derive(Debug, Clone)]
@@ -185,16 +185,20 @@ impl Srq {
     pub fn srqn(&self) -> io::Result<u32> {
         self.query_info().map(|info| info.srqn)
     }
-}
 
-impl ReceiveQueue for Srq {
-    unsafe fn post_recv(&mut self, addr: u64, len: u32, lkey: u32) {
+    /// Post a receive WQE.
+    ///
+    /// # Safety
+    /// - The buffer must be registered and valid
+    /// - There must be available slots in the SRQ
+    pub unsafe fn post_recv(&mut self, addr: u64, len: u32, lkey: u32) {
         if let Some(state) = self.state.as_mut() {
             state.post(addr, len, lkey);
         }
     }
 
-    fn ring_rq_doorbell(&mut self) {
+    /// Ring the SRQ doorbell to notify HCA of new WQEs.
+    pub fn ring_doorbell(&mut self) {
         if let Some(state) = self.state.as_mut() {
             state.ring_doorbell();
         }

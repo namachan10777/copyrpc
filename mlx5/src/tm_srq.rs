@@ -36,15 +36,18 @@
 //! tm_srq.ring_cmd_doorbell();
 //! ```
 
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
 use std::{io, mem::MaybeUninit, ptr::NonNull};
 
-use crate::cq::CompletionQueue;
+use crate::cq::{CompletionQueue, Cqe, CqeOpcode};
 use crate::device::Context;
 use crate::pd::Pd;
 use crate::srq::SrqInfo;
 use crate::wqe::{
     CtrlSeg, DataSeg, SparseWqeTable, TmSeg, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode,
 };
+use crate::CompletionTarget;
 
 /// Offset from ibv_srq to cmd_qp pointer in mlx5_srq structure.
 ///
@@ -352,9 +355,10 @@ impl TmSrqState {
 /// TM operations (add_tag, remove_tag) use the internal Command QP.
 ///
 /// Type parameter `T` is the entry type stored in the WQE table for tracking
-/// in-flight tag operations. When a completion arrives, the associated entry is
-/// returned via `process_completion`.
-pub struct TagMatchingSrq<T> {
+/// in-flight tag operations. Type parameter `F` is the callback function type
+/// that receives `(Cqe, Option<T>)` - `Some(entry)` for Command QP completions,
+/// `None` for RX queue completions.
+pub struct TagMatchingSrq<T, F> {
     srq: NonNull<mlx5_sys::ibv_srq>,
     /// Number of WQE slots (power of 2).
     wqe_cnt: u32,
@@ -364,6 +368,10 @@ pub struct TagMatchingSrq<T> {
     srq_state: Option<TmSrqState>,
     /// Command QP state for tag operations.
     cmd_qp: Option<CmdQpState<T>>,
+    /// Callback for completion handling.
+    callback: F,
+    /// Weak reference to the CQ for unregistration on drop.
+    send_cq: Weak<RefCell<CompletionQueue>>,
 }
 
 impl Context {
@@ -373,22 +381,29 @@ impl Context {
     /// * `pd` - Protection Domain
     /// * `cq` - Completion Queue for TM operation completions
     /// * `config` - TM-SRQ configuration
+    /// * `callback` - Callback for completions: `(Cqe, Option<T>)` where
+    ///   `Some(entry)` for Command QP completions, `None` for RX completions
     ///
     /// # Errors
     /// Returns an error if the TM-SRQ cannot be created.
-    pub fn create_tm_srq<T>(
+    pub fn create_tm_srq<T, F>(
         &self,
         pd: &Pd,
-        cq: &CompletionQueue,
+        cq: &Rc<RefCell<CompletionQueue>>,
         config: &TmSrqConfig,
-    ) -> io::Result<TagMatchingSrq<T>> {
+        callback: F,
+    ) -> io::Result<Rc<RefCell<TagMatchingSrq<T, F>>>>
+    where
+        T: 'static,
+        F: Fn(Cqe, Option<T>) + 'static,
+    {
         unsafe {
             let mut attr: mlx5_sys::ibv_srq_init_attr_ex = MaybeUninit::zeroed().assume_init();
             attr.attr.max_wr = config.max_wr;
             attr.attr.max_sge = config.max_sge;
             attr.srq_type = mlx5_sys::ibv_srq_type_IBV_SRQT_TM;
             attr.pd = pd.as_ptr();
-            attr.cq = cq.as_ptr();
+            attr.cq = cq.borrow().as_ptr();
             attr.tm_cap.max_num_tags = config.max_num_tags;
             attr.tm_cap.max_ops = config.max_ops;
             attr.comp_mask = mlx5_sys::ibv_srq_init_attr_mask_IBV_SRQ_INIT_ATTR_TYPE
@@ -397,28 +412,44 @@ impl Context {
                 | mlx5_sys::ibv_srq_init_attr_mask_IBV_SRQ_INIT_ATTR_TM;
 
             let srq = mlx5_sys::ibv_create_srq_ex_ex(self.ctx.as_ptr(), &mut attr);
-            NonNull::new(srq).map_or(Err(io::Error::last_os_error()), |srq| {
-                Ok(TagMatchingSrq {
-                    srq,
-                    wqe_cnt: config.max_wr.next_power_of_two(),
-                    max_num_tags: config.max_num_tags as u16,
-                    srq_state: None,
-                    cmd_qp: None,
-                })
-            })
+            let srq_nn = NonNull::new(srq).ok_or_else(io::Error::last_os_error)?;
+
+            let tm_srq = TagMatchingSrq {
+                srq: srq_nn,
+                wqe_cnt: config.max_wr.next_power_of_two(),
+                max_num_tags: config.max_num_tags as u16,
+                srq_state: None,
+                cmd_qp: None,
+                callback,
+                send_cq: Rc::downgrade(cq),
+            };
+
+            let tm_srq_rc = Rc::new(RefCell::new(tm_srq));
+
+            // Register with CQ using Command QP's qpn (will be set after init_direct_access)
+            // For now, we'll register after init_direct_access is called
+
+            Ok(tm_srq_rc)
         }
     }
 }
 
-impl<T> Drop for TagMatchingSrq<T> {
+impl<T, F> Drop for TagMatchingSrq<T, F> {
     fn drop(&mut self) {
+        // Unregister from CQ
+        if let Some(cmd_qp) = &self.cmd_qp {
+            if let Some(cq) = self.send_cq.upgrade() {
+                cq.borrow_mut().unregister_queue(cmd_qp.qpn);
+            }
+        }
+
         unsafe {
             mlx5_sys::ibv_destroy_srq(self.srq.as_ptr());
         }
     }
 }
 
-impl<T> TagMatchingSrq<T> {
+impl<T, F> TagMatchingSrq<T, F> {
     /// Query SRQ info using mlx5dv_init_obj.
     fn query_srq_info(&self) -> io::Result<SrqInfo> {
         unsafe {
@@ -496,13 +527,11 @@ impl<T> TagMatchingSrq<T> {
         }
     }
 
-    /// Initialize direct access for TM-SRQ.
-    ///
-    /// This initializes both the SRQ state for receive posting and the
-    /// Command QP state for tag operations.
-    pub fn init_direct_access(&mut self) -> io::Result<()> {
+    /// Initialize direct access for TM-SRQ (internal implementation).
+    fn init_direct_access_inner(&mut self) -> io::Result<u32> {
         let srq_info = self.query_srq_info()?;
         let cmd_qp = self.query_cmd_qp_info()?;
+        let qpn = cmd_qp.qpn;
 
         self.srq_state = Some(TmSrqState {
             buf: srq_info.buf,
@@ -514,7 +543,12 @@ impl<T> TagMatchingSrq<T> {
 
         self.cmd_qp = Some(cmd_qp);
 
-        Ok(())
+        Ok(qpn)
+    }
+
+    /// Get the Command QP number (for CQ registration).
+    pub(crate) fn cmd_qpn(&self) -> Option<u32> {
+        self.cmd_qp.as_ref().map(|cq| cq.qpn)
     }
 
     /// Get the SRQ number.
@@ -623,5 +657,64 @@ impl<T> TagMatchingSrq<T> {
         self.cmd_qp
             .as_mut()
             .and_then(|cq| cq.process_completion(wqe_idx))
+    }
+}
+
+impl<T, F> TagMatchingSrq<T, F>
+where
+    T: 'static,
+    F: Fn(Cqe, Option<T>) + 'static,
+{
+    /// Initialize direct access for TM-SRQ and register with CQ.
+    ///
+    /// This initializes both the SRQ state for receive posting and the
+    /// Command QP state for tag operations. Also registers with the CQ
+    /// for automatic completion dispatch.
+    pub fn init_direct_access(this: &Rc<RefCell<Self>>) -> io::Result<()> {
+        let qpn = this.borrow_mut().init_direct_access_inner()?;
+
+        // Register with CQ
+        if let Some(cq) = this.borrow().send_cq.upgrade() {
+            cq.borrow_mut()
+                .register_queue(qpn, Rc::downgrade(this) as _);
+        }
+
+        Ok(())
+    }
+}
+
+// =============================================================================
+// CompletionTarget Implementation
+// =============================================================================
+
+impl<T, F> CompletionTarget for TagMatchingSrq<T, F>
+where
+    F: Fn(Cqe, Option<T>),
+{
+    fn qpn(&self) -> u32 {
+        self.cmd_qp.as_ref().map(|cq| cq.qpn).unwrap_or(0)
+    }
+
+    fn dispatch_cqe(&mut self, cqe: Cqe) {
+        match cqe.opcode {
+            CqeOpcode::Req => {
+                // Command QP completion (tag add/remove)
+                if let Some(entry) = self.process_cmd_completion(cqe.wqe_counter) {
+                    (self.callback)(cqe, Some(entry));
+                }
+            }
+            CqeOpcode::RespSend
+            | CqeOpcode::RespSendImm
+            | CqeOpcode::RespSendInv
+            | CqeOpcode::RespRdmaWriteImm => {
+                // RX queue completion (unordered receive)
+                (self.callback)(cqe, None);
+            }
+            CqeOpcode::ReqErr | CqeOpcode::RespErr => {
+                // Error completion - try to get entry if it's a Command QP error
+                let entry = self.process_cmd_completion(cqe.wqe_counter);
+                (self.callback)(cqe, entry);
+            }
+        }
     }
 }

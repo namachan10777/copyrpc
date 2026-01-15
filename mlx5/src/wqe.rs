@@ -2,8 +2,6 @@
 //!
 //! Provides segment definitions, opcodes, WQE table, and traits shared across QP types.
 
-use std::io;
-
 use bitflags::bitflags;
 
 /// WQEBB (Work Queue Element Basic Block) size in bytes.
@@ -407,97 +405,3 @@ impl<T> Iterator for DenseDrainRange<'_, T> {
     }
 }
 
-// =============================================================================
-// Traits
-// =============================================================================
-
-/// Trait for ordered send queues with dense WQE table (all entries callback).
-///
-/// Used for RC QP, DCI without streams where:
-/// - WQE completion order matches submission order
-/// - Every WQE must have an entry
-/// - All completions trigger callbacks (efficient, no Option check)
-///
-/// Use this when you need to track every WQE, not just signaled ones.
-/// For signaled-only tracking, use `SparseSendQueue` instead.
-pub trait DenseSendQueue {
-    /// Builder type for this send queue.
-    type Builder<'a>
-    where
-        Self: 'a;
-
-    /// Entry type stored in the WQE table.
-    type Entry;
-
-    /// Get the number of available WQE slots.
-    fn sq_available(&self) -> u16;
-
-    /// Get a WQE builder for zero-copy WQE construction.
-    ///
-    /// # Arguments
-    /// * `entry` - Entry to store in WQE table (required for every WQE)
-    /// * `signaled` - Whether to request a completion for this WQE
-    fn wqe_builder(&mut self, entry: Self::Entry, signaled: bool) -> io::Result<Self::Builder<'_>>;
-
-    /// Ring the SQ doorbell to notify HCA of new WQEs.
-    fn ring_sq_doorbell(&mut self);
-
-    /// Process completions up to the given wqe_counter.
-    ///
-    /// Calls the callback for all entries in range (old_ci, new_ci].
-    fn process_completions<F>(&mut self, new_ci: u16, callback: F)
-    where
-        F: FnMut(u16, Self::Entry);
-}
-
-/// Trait for ordered send queues with sparse WQE table (signaled-only callback).
-///
-/// Used for RC QP, DCI without streams where:
-/// - WQE completion order matches submission order
-/// - Only signaled WQEs have entries
-/// - CQE arrives only for signaled WQEs, so just take that one entry
-///
-/// Use this when you only need to track signaled WQEs.
-/// For tracking every WQE, use `DenseSendQueue` instead.
-pub trait SparseSendQueue {
-    /// Builder type for this send queue.
-    type Builder<'a>
-    where
-        Self: 'a;
-
-    /// Entry type stored in the WQE table.
-    type Entry;
-
-    /// Get the number of available WQE slots.
-    fn sq_available(&self) -> u16;
-
-    /// Get a WQE builder for zero-copy WQE construction.
-    ///
-    /// # Arguments
-    /// * `entry` - Optional entry to store in WQE table.
-    ///   - `Some(entry)`: Store entry and set SIGNALED flag
-    ///   - `None`: No entry stored, no completion requested
-    fn wqe_builder(&mut self, entry: Option<Self::Entry>) -> io::Result<Self::Builder<'_>>;
-
-    /// Ring the SQ doorbell to notify HCA of new WQEs.
-    fn ring_sq_doorbell(&mut self);
-
-    /// Process a single completion at the given wqe_idx.
-    ///
-    /// Updates consumer index and returns the entry stored at wqe_idx.
-    /// Returns None if no entry was stored (shouldn't happen for signaled WQEs).
-    fn process_completion(&mut self, wqe_idx: u16) -> Option<Self::Entry>;
-}
-
-/// Trait for types that can post receive WQEs.
-pub trait ReceiveQueue {
-    /// Post a receive WQE.
-    ///
-    /// # Safety
-    /// - The buffer must be registered and valid
-    /// - There must be available slots in the RQ
-    unsafe fn post_recv(&mut self, addr: u64, len: u32, lkey: u32);
-
-    /// Ring the RQ doorbell to notify HCA of new WQEs.
-    fn ring_rq_doorbell(&mut self);
-}
