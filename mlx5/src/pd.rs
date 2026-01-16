@@ -4,6 +4,7 @@
 //! Memory Regions (MRs) must be registered within a PD before they can be
 //! used for RDMA operations.
 
+use std::rc::Rc;
 use std::{io, ptr::NonNull};
 
 use bitflags::bitflags;
@@ -72,6 +73,23 @@ bitflags! {
     }
 }
 
+/// Internal PD structure holding the raw ibv_pd pointer.
+///
+/// This is wrapped in Rc to ensure proper resource lifetime management.
+pub(crate) struct PdInner {
+    pd: NonNull<mlx5_sys::ibv_pd>,
+    /// Keep the context alive while this PD exists.
+    _ctx: Context,
+}
+
+impl Drop for PdInner {
+    fn drop(&mut self) {
+        unsafe {
+            mlx5_sys::ibv_dealloc_pd(self.pd.as_ptr());
+        }
+    }
+}
+
 /// Protection Domain for RDMA resources.
 ///
 /// A PD defines a protection scope for RDMA resources. All resources
@@ -80,9 +98,10 @@ bitflags! {
 ///
 /// The PD will be deallocated when dropped. Deallocation may fail if any
 /// other resource is still associated with the PD.
-pub struct Pd {
-    pd: NonNull<mlx5_sys::ibv_pd>,
-}
+///
+/// This type uses `Rc` internally and can be cheaply cloned.
+#[derive(Clone)]
+pub struct Pd(Rc<PdInner>);
 
 impl Context {
     /// Allocate a Protection Domain for this RDMA device context.
@@ -91,16 +110,13 @@ impl Context {
     /// Returns an error if the allocation fails.
     pub fn alloc_pd(&self) -> io::Result<Pd> {
         unsafe {
-            let pd = mlx5_sys::ibv_alloc_pd(self.ctx.as_ptr());
-            NonNull::new(pd).map_or(Err(io::Error::last_os_error()), |pd| Ok(Pd { pd }))
-        }
-    }
-}
-
-impl Drop for Pd {
-    fn drop(&mut self) {
-        unsafe {
-            mlx5_sys::ibv_dealloc_pd(self.pd.as_ptr());
+            let pd = mlx5_sys::ibv_alloc_pd(self.as_ptr());
+            NonNull::new(pd).map_or(Err(io::Error::last_os_error()), |pd| {
+                Ok(Pd(Rc::new(PdInner {
+                    pd,
+                    _ctx: self.clone(),
+                })))
+            })
         }
     }
 }
@@ -108,7 +124,7 @@ impl Drop for Pd {
 impl Pd {
     /// Get the raw ibv_pd pointer.
     pub(crate) fn as_ptr(&self) -> *mut mlx5_sys::ibv_pd {
-        self.pd.as_ptr()
+        self.0.pd.as_ptr()
     }
 }
 
@@ -122,6 +138,8 @@ impl Pd {
 /// Memory Window is still bound to this MR.
 pub struct MemoryRegion {
     mr: NonNull<mlx5_sys::ibv_mr>,
+    /// Keep the PD alive while this MR exists.
+    _pd: Pd,
 }
 
 impl Pd {
@@ -146,14 +164,17 @@ impl Pd {
     ) -> io::Result<MemoryRegion> {
         let mr = unsafe {
             mlx5_sys::ibv_reg_mr(
-                self.pd.as_ptr(),
+                self.as_ptr(),
                 addr as *mut std::ffi::c_void,
                 len,
                 access.bits() as i32,
             )
         };
         NonNull::new(mr).map_or(Err(io::Error::last_os_error()), |mr| {
-            Ok(MemoryRegion { mr })
+            Ok(MemoryRegion {
+                mr,
+                _pd: self.clone(),
+            })
         })
     }
 }
@@ -220,6 +241,8 @@ pub struct AddressHandle {
     qkey: u32,
     /// Destination LID.
     dlid: u16,
+    /// Keep the PD alive while this AH exists.
+    _pd: Pd,
 }
 
 impl Pd {
@@ -241,13 +264,14 @@ impl Pd {
             ah_attr.src_path_bits = 0;
             ah_attr.port_num = port;
 
-            let ah = mlx5_sys::ibv_create_ah(self.pd.as_ptr(), &mut ah_attr);
+            let ah = mlx5_sys::ibv_create_ah(self.as_ptr(), &mut ah_attr);
             NonNull::new(ah).map_or(Err(io::Error::last_os_error()), |ah| {
                 Ok(AddressHandle {
                     ah,
                     qpn: remote.qpn,
                     qkey: remote.qkey,
                     dlid: remote.lid,
+                    _pd: self.clone(),
                 })
             })
         }

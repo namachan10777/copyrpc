@@ -395,6 +395,8 @@ pub struct TagMatchingSrq<T, F> {
     callback: F,
     /// Weak reference to the CQ for unregistration on drop.
     send_cq: Weak<RefCell<CompletionQueue>>,
+    /// Keep the PD alive while this TM-SRQ exists.
+    _pd: Pd,
 }
 
 impl Context {
@@ -434,7 +436,7 @@ impl Context {
                 | mlx5_sys::ibv_srq_init_attr_mask_IBV_SRQ_INIT_ATTR_CQ
                 | mlx5_sys::ibv_srq_init_attr_mask_IBV_SRQ_INIT_ATTR_TM;
 
-            let srq = mlx5_sys::ibv_create_srq_ex_ex(self.ctx.as_ptr(), &mut attr);
+            let srq = mlx5_sys::ibv_create_srq_ex_ex(self.as_ptr(), &mut attr);
             let srq_nn = NonNull::new(srq).ok_or_else(io::Error::last_os_error)?;
 
             let tm_srq = TagMatchingSrq {
@@ -445,6 +447,7 @@ impl Context {
                 cmd_qp: None,
                 callback,
                 send_cq: Rc::downgrade(cq),
+                _pd: pd.clone(),
             };
 
             let tm_srq_rc = Rc::new(RefCell::new(tm_srq));

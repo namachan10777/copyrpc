@@ -2,9 +2,6 @@
 //!
 //! This module provides helper functions and types for writing RDMA tests.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use mlx5::cq::{CompletionQueue, Cqe};
 use mlx5::device::{Context, DeviceList};
 use mlx5::pd::{AccessFlags, Pd};
@@ -182,19 +179,18 @@ pub fn assert_cqe_success(cqe: &Cqe) {
 
 /// Test context with common RDMA resources.
 ///
-/// IMPORTANT: Field order matters for drop order! In Rust, struct fields
-/// are dropped in declaration order. Resources must be dropped before
-/// the context they depend on:
-/// - pd (and all QPs/CQs using it) must be dropped before ctx
+/// Note: Field drop order is now automatically handled by the Rc-based
+/// resource management in the mlx5 crate. Resources hold references to
+/// their parent resources (PD → Context), ensuring correct cleanup order.
 pub struct TestContext {
-    /// Protection Domain - dropped first (before ctx)
-    pub pd: Rc<Pd>,
+    /// Device context
+    pub ctx: Context,
+    /// Protection Domain
+    pub pd: Pd,
     /// Port attributes (plain data, no cleanup needed)
     pub port_attr: PortAttr,
     /// Port number (plain data, no cleanup needed)
     pub port: u8,
-    /// Device context - dropped last (after pd and all resources)
-    pub ctx: Context,
 }
 
 impl TestContext {
@@ -204,7 +200,7 @@ impl TestContext {
 
         let port = 1u8;
         let port_attr = ctx.query_port(port).ok()?;
-        let pd = Rc::new(ctx.alloc_pd().ok()?);
+        let pd = ctx.alloc_pd().ok()?;
 
         Some(Self {
             ctx,

@@ -477,6 +477,8 @@ pub struct RcQpInner<T, Tab, F> {
     callback: F,
     /// Weak reference to the CQ for unregistration on drop
     send_cq: Weak<RefCell<CompletionQueue>>,
+    /// Keep the PD alive while this QP exists.
+    _pd: Pd,
 }
 
 impl Context {
@@ -590,7 +592,7 @@ impl Context {
             mlx5_attr.create_flags =
                 mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
 
-            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
             NonNull::new(qp).map_or(Err(io::Error::last_os_error()), |qp| {
                 Ok(RcQpInner {
                     qp,
@@ -599,6 +601,7 @@ impl Context {
                     rq: None,
                     callback,
                     send_cq: Rc::downgrade(send_cq),
+                    _pd: pd.clone(),
                 })
             })
         }
@@ -636,7 +639,7 @@ impl Context {
             mlx5_attr.create_flags =
                 mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
 
-            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
             NonNull::new(qp).map_or(Err(io::Error::last_os_error()), |qp| {
                 Ok(RcQpInner {
                     qp,
@@ -645,6 +648,7 @@ impl Context {
                     rq: None,
                     callback,
                     send_cq: Rc::downgrade(send_cq),
+                    _pd: pd.clone(),
                 })
             })
         }

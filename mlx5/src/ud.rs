@@ -529,6 +529,8 @@ pub struct UdQp<T, Tab, F> {
     rq: Option<UdRecvQueueState>,
     callback: F,
     send_cq: Weak<RefCell<CompletionQueue>>,
+    /// Keep the PD alive while this QP exists.
+    _pd: Pd,
 }
 
 impl Context {
@@ -612,7 +614,7 @@ impl Context {
 
             let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
 
-            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
             NonNull::new(qp).map_or(Err(io::Error::last_os_error()), |qp| {
                 Ok(UdQp {
                     qp,
@@ -622,6 +624,7 @@ impl Context {
                     rq: None,
                     callback,
                     send_cq: Rc::downgrade(send_cq),
+                    _pd: pd.clone(),
                 })
             })
         }
@@ -653,7 +656,7 @@ impl Context {
 
             let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
 
-            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
             NonNull::new(qp).map_or(Err(io::Error::last_os_error()), |qp| {
                 Ok(UdQp {
                     qp,
@@ -663,6 +666,7 @@ impl Context {
                     rq: None,
                     callback,
                     send_cq: Rc::downgrade(send_cq),
+                    _pd: pd.clone(),
                 })
             })
         }

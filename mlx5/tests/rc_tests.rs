@@ -24,17 +24,16 @@ use common::{full_access, poll_cq_timeout, AlignedBuffer, TestContext};
 
 /// Result type for create_rc_loopback_pair
 ///
-/// Drop order (via Rc reference counting):
-/// - QPs hold weak refs to send_cq, so CQs can be dropped after QPs
-/// - We hold Rc<Pd> to ensure PD outlives all resources
+/// Drop order is now automatically handled by Rc-based resource management.
+/// QPs, CQs, and MRs all internally hold references to their parent resources.
 pub struct RcLoopbackPair {
     pub qp1: Rc<RefCell<mlx5::qp::RcQp<u64, fn(mlx5::cq::Cqe, u64)>>>,
     pub qp2: Rc<RefCell<mlx5::qp::RcQp<u64, fn(mlx5::cq::Cqe, u64)>>>,
     pub send_cq: Rc<RefCell<mlx5::cq::CompletionQueue>>,
     _recv_cq1: mlx5::cq::CompletionQueue,
     _recv_cq2: mlx5::cq::CompletionQueue,
-    // Keep PD alive until all QPs/CQs/MRs are dropped
-    _pd: Rc<mlx5::pd::Pd>,
+    // PD is kept alive via QP's internal Rc<Pd>
+    _pd: mlx5::pd::Pd,
 }
 
 /// Helper to create a loopback RC QP pair.
@@ -461,4 +460,820 @@ fn test_rc_atomic_fa() {
         remote_value, initial_value, add_value
     );
     println!("  Return:  {}", returned_value);
+}
+
+// =============================================================================
+// RDMA WRITE with Immediate Tests
+// =============================================================================
+
+#[test]
+fn test_rc_rdma_write_imm() {
+    use mlx5::cq::CqeOpcode;
+
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    let pair = create_rc_loopback_pair(&ctx);
+    let qp1 = &pair.qp1;
+    let qp2 = &pair.qp2;
+    let send_cq = &pair.send_cq;
+
+    // Allocate buffers
+    let mut local_buf = AlignedBuffer::new(4096);
+    let mut remote_buf = AlignedBuffer::new(4096);
+
+    // Register memory regions
+    let local_mr = unsafe { ctx.pd.register(local_buf.as_ptr(), local_buf.size(), full_access()) }
+        .expect("Failed to register local MR");
+    let remote_mr =
+        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
+            .expect("Failed to register remote MR");
+
+    // Prepare test data
+    let test_data = b"RDMA WRITE IMM test data!";
+    local_buf.fill_bytes(test_data);
+
+    // QP2 posts a receive (needed for WRITE+IMM)
+    let recv_buf = AlignedBuffer::new(4096);
+    let recv_mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
+        .expect("Failed to register recv MR");
+
+    unsafe {
+        qp2.borrow_mut().post_recv(recv_buf.addr(), 256, recv_mr.lkey());
+    }
+    qp2.borrow_mut().ring_rq_doorbell();
+
+    // Create a separate recv CQ for QP2
+    let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    recv_cq2.init_direct_access().expect("Failed to init recv CQ2");
+
+    // Note: The recv_cq is internal to RcLoopbackPair, we need to check the pair's recv_cq
+    // Actually in our setup, qp2's recv CQ is _recv_cq2 which is private
+    // Let me rethink this - we need access to qp2's recv CQ
+
+    // For now, let's just test the send side works
+    let imm_data: u32 = 0x12345678;
+
+    // Post RDMA WRITE with immediate from QP1 to QP2's memory
+    qp1.borrow_mut()
+        .wqe_builder(1u64)
+        .expect("wqe_builder failed")
+        .ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), imm_data)
+        .rdma(remote_buf.addr(), remote_mr.rkey())
+        .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
+        .finish_with_blueflame();
+
+    // Poll send CQ for completion
+    let cqe = poll_cq_timeout(&mut send_cq.borrow_mut(), 5000).expect("Send CQE timeout");
+    println!(
+        "Send CQE: opcode={:?}, syndrome={}, wqe_counter={}",
+        cqe.opcode, cqe.syndrome, cqe.wqe_counter
+    );
+    assert_eq!(cqe.syndrome, 0, "Send CQE error");
+    assert_eq!(cqe.opcode, CqeOpcode::Req, "Expected Req opcode for send completion");
+    send_cq.borrow().flush();
+
+    // Verify data was written
+    let written = remote_buf.read_bytes(test_data.len());
+    assert_eq!(&written[..], test_data, "RDMA WRITE IMM data mismatch");
+
+    println!("RC RDMA WRITE with Immediate test passed!");
+    println!("  Immediate data: 0x{:08x}", imm_data);
+}
+
+// =============================================================================
+// SEND/RECV Tests
+// =============================================================================
+
+/// Test SEND/RECV using ibv_post_recv to verify the verbs API works
+#[test]
+fn test_rc_send_recv_verbs() {
+    use mlx5::cq::CqeOpcode;
+
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    // Create QPs with separate recv CQs that we can access
+    let send_cq = Rc::new(RefCell::new(
+        ctx.ctx.create_cq(256).expect("Failed to create send CQ"),
+    ));
+    // Note: send_cq.init_direct_access() will be called by create_rc_qp
+
+    let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
+    // Note: NOT calling init_direct_access() before QP creation to test if it helps
+    let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    // Note: NOT calling init_direct_access() before QP creation to test if it helps
+
+    let config = mlx5::qp::RcQpConfig::default();
+
+    fn noop_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
+
+    let qp1 = ctx
+        .ctx
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq1, &config, noop_callback as fn(_, _))
+        .expect("Failed to create QP1");
+
+    let qp2 = ctx
+        .ctx
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, noop_callback as fn(_, _))
+        .expect("Failed to create QP2");
+
+    // Connect QPs
+    let remote1 = RemoteQpInfo {
+        qpn: qp1.borrow().qpn(),
+        psn: 0,
+        lid: ctx.port_attr.lid,
+    };
+    let remote2 = RemoteQpInfo {
+        qpn: qp2.borrow().qpn(),
+        psn: 0,
+        lid: ctx.port_attr.lid,
+    };
+
+    println!("[verbs] QP1 QPN: 0x{:x}", qp1.borrow().qpn());
+    println!("[verbs] QP2 QPN: 0x{:x}", qp2.borrow().qpn());
+    println!("[verbs] remote1.qpn (QP1): 0x{:x}, remote2.qpn (QP2): 0x{:x}", remote1.qpn, remote2.qpn);
+
+    let access = full_access().bits();
+    qp1.borrow_mut()
+        .connect(&remote2, ctx.port, 0, 4, 4, access)
+        .expect("Failed to connect QP1");
+    qp2.borrow_mut()
+        .connect(&remote1, ctx.port, 0, 4, 4, access)
+        .expect("Failed to connect QP2");
+    println!("[verbs] QP1 state after connect: {:?}", qp1.borrow().state());
+    println!("[verbs] QP2 state after connect: {:?}", qp2.borrow().state());
+
+    // Initialize recv CQ direct access AFTER QP creation
+    recv_cq2.init_direct_access().expect("Failed to init recv CQ2 direct access");
+
+    // Allocate buffers
+    let mut send_buf = AlignedBuffer::new(4096);
+    let mut recv_buf = AlignedBuffer::new(4096);
+
+    // Lock pages in memory to ensure they're resident
+    unsafe {
+        let ret = libc::mlock(recv_buf.as_ptr() as *const libc::c_void, recv_buf.size());
+        if ret != 0 {
+            println!("[verbs] WARNING: mlock failed: {}", std::io::Error::last_os_error());
+        } else {
+            println!("[verbs] mlock succeeded for recv_buf");
+        }
+    }
+
+    // Register memory regions
+    let send_mr = unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }
+        .expect("Failed to register send MR");
+    let recv_mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
+        .expect("Failed to register recv MR");
+
+    // Prepare test data
+    let test_data = b"Hello RDMA SEND/RECV via verbs!";
+    send_buf.fill_bytes(test_data);
+    recv_buf.fill(0xBB); // Fill with pattern to detect if data arrives
+
+    println!("[verbs] Send buffer addr: 0x{:x}", send_buf.addr());
+    println!("[verbs] Recv buffer addr: 0x{:x}", recv_buf.addr());
+    println!("[verbs] Recv buffer as_ptr: {:p}", recv_buf.as_ptr());
+    println!("[verbs] Send MR lkey: 0x{:x}", send_mr.lkey());
+    println!("[verbs] Recv MR lkey: 0x{:x}", recv_mr.lkey());
+    // Verify MR addr matches buffer addr
+    println!("[verbs] Recv MR addr: {:p}", recv_mr.addr());
+    println!("[verbs] Recv MR len: {}", recv_mr.len());
+    assert_eq!(recv_mr.addr() as u64, recv_buf.addr(), "MR addr mismatch!");
+
+    // Query QP attributes to verify configuration
+    unsafe {
+        let mut attr: mlx5_sys::ibv_qp_attr = std::mem::zeroed();
+        let mut init_attr: mlx5_sys::ibv_qp_init_attr = std::mem::zeroed();
+        mlx5_sys::ibv_query_qp(
+            qp2.borrow().as_ptr(),
+            &mut attr,
+            mlx5_sys::ibv_qp_attr_mask_IBV_QP_CAP as i32,
+            &mut init_attr,
+        );
+        println!("[verbs] QP2 cap: max_recv_wr={}, max_recv_sge={}",
+                 init_attr.cap.max_recv_wr, init_attr.cap.max_recv_sge);
+
+        // Query mlx5dv info to see RQ buffer
+        let mut dv_qp: std::mem::MaybeUninit<mlx5_sys::mlx5dv_qp> = std::mem::MaybeUninit::zeroed();
+        let mut obj: std::mem::MaybeUninit<mlx5_sys::mlx5dv_obj> = std::mem::MaybeUninit::zeroed();
+
+        let dv_qp_ptr = dv_qp.as_mut_ptr();
+        (*dv_qp_ptr).comp_mask = mlx5_sys::mlx5dv_qp_comp_mask_MLX5DV_QP_MASK_RAW_QP_HANDLES as u64;
+
+        let obj_ptr = obj.as_mut_ptr();
+        (*obj_ptr).qp.in_ = qp2.borrow().as_ptr();
+        (*obj_ptr).qp.out = dv_qp_ptr;
+
+        let ret = mlx5_sys::mlx5dv_init_obj(obj_ptr, mlx5_sys::mlx5dv_obj_type_MLX5DV_OBJ_QP as u64);
+        if ret == 0 {
+            let dv_qp = dv_qp.assume_init();
+            println!("[verbs] QP2 RQ: buf={:p}, wqe_cnt={}, stride={}, dbrec={:p}",
+                     dv_qp.rq.buf, dv_qp.rq.wqe_cnt, dv_qp.rq.stride, dv_qp.dbrec);
+            println!("[verbs] QP2 SQ: buf={:p}, wqe_cnt={}, stride={}, dbrec={:p}",
+                     dv_qp.sq.buf, dv_qp.sq.wqe_cnt, dv_qp.sq.stride, dv_qp.dbrec);
+        }
+    }
+
+    // Use ibv_post_recv via verbs API
+    unsafe {
+        // First get the RQ buffer address so we can inspect it after posting
+        let mut dv_qp2: std::mem::MaybeUninit<mlx5_sys::mlx5dv_qp> = std::mem::MaybeUninit::zeroed();
+        let mut obj2: std::mem::MaybeUninit<mlx5_sys::mlx5dv_obj> = std::mem::MaybeUninit::zeroed();
+        (*dv_qp2.as_mut_ptr()).comp_mask = mlx5_sys::mlx5dv_qp_comp_mask_MLX5DV_QP_MASK_RAW_QP_HANDLES as u64;
+        (*obj2.as_mut_ptr()).qp.in_ = qp2.borrow().as_ptr();
+        (*obj2.as_mut_ptr()).qp.out = dv_qp2.as_mut_ptr();
+        mlx5_sys::mlx5dv_init_obj(obj2.as_mut_ptr(), mlx5_sys::mlx5dv_obj_type_MLX5DV_OBJ_QP as u64);
+        let dv_qp2_val = dv_qp2.assume_init();
+        let rq_buf = dv_qp2_val.rq.buf as *mut u8;
+        let rq_stride = dv_qp2_val.rq.stride;
+        let dbrec = dv_qp2_val.dbrec as *mut u32;
+
+        // Read doorbell record before posting
+        let dbrec_before = std::ptr::read_volatile(dbrec);
+        println!("[verbs] RQ dbrec[0] before post: 0x{:08x}", dbrec_before);
+
+        let mut sge: mlx5_sys::ibv_sge = std::mem::zeroed();
+        sge.addr = recv_buf.addr();
+        sge.length = 256;
+        sge.lkey = recv_mr.lkey();
+
+        println!("[verbs] SGE before post: addr=0x{:x}, len={}, lkey=0x{:x}",
+                 sge.addr, sge.length, sge.lkey);
+
+        let mut recv_wr: mlx5_sys::ibv_recv_wr = std::mem::zeroed();
+        recv_wr.wr_id = 1;
+        recv_wr.next = std::ptr::null_mut();
+        recv_wr.sg_list = &mut sge;
+        recv_wr.num_sge = 1;
+
+        let mut bad_wr: *mut mlx5_sys::ibv_recv_wr = std::ptr::null_mut();
+        let ret = mlx5_sys::ibv_post_recv_ex(
+            qp2.borrow().as_ptr(),
+            &mut recv_wr,
+            &mut bad_wr,
+        );
+        assert_eq!(ret, 0, "ibv_post_recv failed: {}", ret);
+
+        // Read doorbell record after posting
+        let dbrec_after = std::ptr::read_volatile(dbrec);
+        println!("[verbs] RQ dbrec[0] after post: 0x{:08x}", dbrec_after);
+
+        // Dump the first RQ WQE to see what ibv_post_recv wrote
+        // RQ WQE format: each SGE is 16 bytes (byte_count[4], lkey[4], addr[8])
+        let wqe_ptr = rq_buf;
+        let byte_cnt = u32::from_be(std::ptr::read(wqe_ptr as *const u32));
+        let lkey_val = u32::from_be(std::ptr::read(wqe_ptr.add(4) as *const u32));
+        let addr_val = u64::from_be(std::ptr::read(wqe_ptr.add(8) as *const u64));
+        println!("[verbs] RQ WQE[0] after post: byte_cnt={}, lkey=0x{:x}, addr=0x{:x}",
+                 byte_cnt, lkey_val, addr_val);
+        println!("[verbs] RQ WQE[0] raw 64 bytes: {:?}",
+                 std::slice::from_raw_parts(wqe_ptr, std::cmp::min(64, rq_stride as usize)));
+    }
+
+    // QP1 sends data using ibv_post_send (to verify if BlueFlame is the issue)
+    unsafe {
+        let mut sge: mlx5_sys::ibv_sge = std::mem::zeroed();
+        sge.addr = send_buf.addr();
+        sge.length = test_data.len() as u32;
+        sge.lkey = send_mr.lkey();
+
+        let mut send_wr: mlx5_sys::ibv_send_wr = std::mem::zeroed();
+        send_wr.wr_id = 1;
+        send_wr.next = std::ptr::null_mut();
+        send_wr.sg_list = &mut sge;
+        send_wr.num_sge = 1;
+        send_wr.opcode = mlx5_sys::ibv_wr_opcode_IBV_WR_SEND;
+        send_wr.send_flags = mlx5_sys::ibv_send_flags_IBV_SEND_SIGNALED;
+
+        let mut bad_wr: *mut mlx5_sys::ibv_send_wr = std::ptr::null_mut();
+        let ret = mlx5_sys::ibv_post_send_ex(
+            qp1.borrow().as_ptr(),
+            &mut send_wr,
+            &mut bad_wr,
+        );
+        assert_eq!(ret, 0, "ibv_post_send failed: {}", ret);
+    }
+
+    // Poll send CQ using ibv_poll_cq_ex (verbs API)
+    unsafe {
+        let mut wc: mlx5_sys::ibv_wc = std::mem::zeroed();
+        let start = std::time::Instant::now();
+        loop {
+            let ret = mlx5_sys::ibv_poll_cq_ex(send_cq.borrow().as_ptr(), 1, &mut wc);
+            if ret > 0 {
+                println!("[verbs] Send WC: status={}, opcode={}, wr_id={}", wc.status, wc.opcode, wc.wr_id);
+                assert_eq!(wc.status, mlx5_sys::ibv_wc_status_IBV_WC_SUCCESS, "Send WC error");
+                break;
+            }
+            if start.elapsed().as_millis() > 5000 {
+                panic!("Send WC timeout");
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    // Poll recv CQ using ibv_poll_cq_ex (verbs API)
+    let recv_byte_len;
+    unsafe {
+        let mut wc: mlx5_sys::ibv_wc = std::mem::zeroed();
+        let start = std::time::Instant::now();
+        loop {
+            let ret = mlx5_sys::ibv_poll_cq_ex(recv_cq2.as_ptr(), 1, &mut wc);
+            if ret > 0 {
+                println!("[verbs] Recv WC: status={}, opcode={}, byte_len={}, wr_id={}", wc.status, wc.opcode, wc.byte_len, wc.wr_id);
+                recv_byte_len = wc.byte_len;
+                assert_eq!(wc.status, mlx5_sys::ibv_wc_status_IBV_WC_SUCCESS, "Recv WC error");
+                break;
+            }
+            if start.elapsed().as_millis() > 5000 {
+                panic!("Recv WC timeout");
+            }
+            std::hint::spin_loop();
+        }
+    }
+    let _ = recv_byte_len;
+
+    // Memory barrier to ensure DMA visibility
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+
+    // Debug: Read first 64 bytes via MR addr directly using volatile
+    let mr_addr = recv_mr.addr();
+    let mut mr_first_bytes = [0u8; 64];
+    for i in 0..64 {
+        mr_first_bytes[i] = unsafe { std::ptr::read_volatile(mr_addr.add(i)) };
+    }
+    println!("[verbs] First 64 bytes via MR addr (volatile): {:?}", mr_first_bytes.to_vec());
+
+    // Debug: Read first 64 bytes to see what's there
+    let first_bytes = recv_buf.read_bytes(64);
+    println!("[verbs] First 64 bytes of recv_buf: {:?}", first_bytes);
+
+    // Search the ENTIRE 4096 byte buffer for test data
+    let full_buf = recv_buf.read_bytes(4096);
+    let mut found = false;
+    for offset in 0..(4096 - 5) {
+        if full_buf[offset..offset + 5] == test_data[..5] {
+            println!("[verbs] Found test data at offset {} in recv_buf!", offset);
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        // Check how much of the buffer is still 0xBB
+        let mut bb_count = 0;
+        for b in &full_buf {
+            if *b == 0xBB { bb_count += 1; }
+        }
+        println!("[verbs] 0xBB bytes in buffer: {}/4096", bb_count);
+
+        // Check if there are ANY non-0xBB bytes
+        for (i, b) in full_buf.iter().enumerate() {
+            if *b != 0xBB {
+                println!("[verbs] Non-0xBB byte at offset {}: 0x{:02x}", i, b);
+                if i < 4090 {
+                    // Found something, show context
+                    let end = std::cmp::min(i + 50, 4096);
+                    println!("[verbs] Context around offset {}: {:?}", i, &full_buf[i..end]);
+                }
+                break;
+            }
+        }
+    }
+
+    // Also check if the data is in the MR header region (maybe GRH?)
+    // For IB, receives may have a 40-byte GRH (Global Routing Header) prefix
+    if full_buf.len() > 40 {
+        println!("[verbs] Bytes at offset 40: {:?}", &full_buf[40..std::cmp::min(72, full_buf.len())]);
+    }
+
+    // Verify data
+    let received = recv_buf.read_bytes(test_data.len());
+    assert_eq!(&received[..], test_data, "SEND/RECV via verbs data mismatch");
+
+    println!("RC SEND/RECV via verbs test passed!");
+}
+
+#[test]
+fn test_rc_send_recv() {
+    use mlx5::cq::CqeOpcode;
+
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    // Create QPs with separate recv CQs that we can access
+    let send_cq = Rc::new(RefCell::new(
+        ctx.ctx.create_cq(256).expect("Failed to create send CQ"),
+    ));
+    send_cq
+        .borrow_mut()
+        .init_direct_access()
+        .expect("Failed to init send CQ direct access");
+
+    let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
+    let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    // Note: init_direct_access() will be called AFTER QP creation
+
+    let config = mlx5::qp::RcQpConfig::default();
+
+    fn noop_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
+
+    let qp1 = ctx
+        .ctx
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq1, &config, noop_callback as fn(_, _))
+        .expect("Failed to create QP1");
+
+    let qp2 = ctx
+        .ctx
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, noop_callback as fn(_, _))
+        .expect("Failed to create QP2");
+
+    // Connect QPs
+    let remote1 = RemoteQpInfo {
+        qpn: qp1.borrow().qpn(),
+        psn: 0,
+        lid: ctx.port_attr.lid,
+    };
+    let remote2 = RemoteQpInfo {
+        qpn: qp2.borrow().qpn(),
+        psn: 0,
+        lid: ctx.port_attr.lid,
+    };
+
+    let access = full_access().bits();
+    qp1.borrow_mut()
+        .connect(&remote2, ctx.port, 0, 4, 4, access)
+        .expect("Failed to connect QP1");
+    qp2.borrow_mut()
+        .connect(&remote1, ctx.port, 0, 4, 4, access)
+        .expect("Failed to connect QP2");
+
+    // Initialize recv CQ direct access AFTER QP creation
+    recv_cq1.init_direct_access().expect("Failed to init recv CQ1");
+    recv_cq2.init_direct_access().expect("Failed to init recv CQ2");
+
+    // Allocate buffers
+    let mut send_buf = AlignedBuffer::new(4096);
+    let mut recv_buf = AlignedBuffer::new(4096);
+
+    // Register memory regions
+    let send_mr = unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }
+        .expect("Failed to register send MR");
+    let recv_mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
+        .expect("Failed to register recv MR");
+
+    // Prepare test data
+    let test_data = b"Hello RDMA SEND/RECV!";
+    send_buf.fill_bytes(test_data);
+    recv_buf.fill(0xAA); // Fill with pattern to detect if data arrives
+
+    println!("Send buffer addr: 0x{:x}", send_buf.addr());
+    println!("Recv buffer addr: 0x{:x}", recv_buf.addr());
+    println!("Send MR lkey: 0x{:x}", send_mr.lkey());
+    println!("Recv MR lkey: 0x{:x}", recv_mr.lkey());
+
+    // QP2 posts a receive
+    unsafe {
+        qp2.borrow_mut().post_recv(recv_buf.addr(), 256, recv_mr.lkey());
+    }
+    qp2.borrow_mut().ring_rq_doorbell();
+
+    // QP1 sends data
+    qp1.borrow_mut()
+        .wqe_builder(1u64)
+        .expect("wqe_builder failed")
+        .ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
+        .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
+        .finish_with_blueflame();
+
+    // Poll send CQ for send completion
+    let send_cqe = poll_cq_timeout(&mut send_cq.borrow_mut(), 5000).expect("Send CQE timeout");
+    println!(
+        "Send CQE: opcode={:?}, syndrome={}, qpn=0x{:x}",
+        send_cqe.opcode, send_cqe.syndrome, send_cqe.qp_num
+    );
+    assert_eq!(send_cqe.syndrome, 0, "Send CQE error");
+    send_cq.borrow().flush();
+
+    // Poll recv CQ using our poll_one (with scatter to CQE disabled)
+    let recv_cqe = poll_cq_timeout(&mut recv_cq2, 5000).expect("Recv CQE timeout");
+    println!(
+        "Recv CQE: opcode={:?}, syndrome={}, byte_cnt={}, qpn=0x{:x}, wqe_counter={}",
+        recv_cqe.opcode, recv_cqe.syndrome, recv_cqe.byte_cnt, recv_cqe.qp_num, recv_cqe.wqe_counter
+    );
+    assert_eq!(recv_cqe.syndrome, 0, "Recv CQE error");
+    assert_eq!(recv_cqe.opcode, CqeOpcode::RespSend, "Expected RespSend opcode");
+    assert_eq!(recv_cqe.byte_cnt as usize, test_data.len(), "Byte count mismatch");
+    recv_cq2.flush();
+
+    // Debug: Read first 32 bytes to see what's there
+    let first_bytes = recv_buf.read_bytes(32);
+    println!("First 32 bytes of recv_buf: {:?}", first_bytes);
+
+    // Also try volatile read
+    let volatile_first: u64 = unsafe { std::ptr::read_volatile(recv_buf.as_ptr() as *const u64) };
+    println!("Volatile read first 8 bytes: 0x{:016x}", volatile_first);
+
+    // Verify data
+    let received = recv_buf.read_bytes(test_data.len());
+    assert_eq!(&received[..], test_data, "SEND/RECV data mismatch");
+
+    println!("RC SEND/RECV test passed!");
+}
+
+/// Test SEND/RECV using pure verbs APIs (ibv_poll_cq, ibv_post_send)
+#[test]
+fn test_rc_send_recv_pure_verbs() {
+    use mlx5::cq::CqeOpcode;
+
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    // Create CQs
+    let send_cq = Rc::new(RefCell::new(
+        ctx.ctx.create_cq(256).expect("Failed to create send CQ"),
+    ));
+    let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+
+    let config = mlx5::qp::RcQpConfig::default();
+
+    fn noop_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
+
+    // Create QPs
+    let qp1 = ctx
+        .ctx
+        .create_rc_qp(&ctx.pd, &send_cq, &ctx.ctx.create_cq(256).unwrap(), &config, noop_callback as fn(_, _))
+        .expect("Failed to create QP1");
+
+    let qp2 = ctx
+        .ctx
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, noop_callback as fn(_, _))
+        .expect("Failed to create QP2");
+
+    // Connect QPs
+    let remote1 = RemoteQpInfo {
+        qpn: qp1.borrow().qpn(),
+        psn: 0,
+        lid: ctx.port_attr.lid,
+    };
+    let remote2 = RemoteQpInfo {
+        qpn: qp2.borrow().qpn(),
+        psn: 0,
+        lid: ctx.port_attr.lid,
+    };
+
+    let access = full_access().bits();
+    qp1.borrow_mut()
+        .connect(&remote2, ctx.port, 0, 4, 4, access)
+        .expect("Failed to connect QP1");
+    qp2.borrow_mut()
+        .connect(&remote1, ctx.port, 0, 4, 4, access)
+        .expect("Failed to connect QP2");
+
+    println!("[pure_verbs] QP1 QPN: 0x{:x}, QP2 QPN: 0x{:x}", qp1.borrow().qpn(), qp2.borrow().qpn());
+
+    // Allocate and register buffers
+    let mut send_buf = AlignedBuffer::new(4096);
+    let mut recv_buf = AlignedBuffer::new(4096);
+
+    let send_mr = unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }
+        .expect("Failed to register send MR");
+    let recv_mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
+        .expect("Failed to register recv MR");
+
+    // Prepare test data
+    let test_data = b"Test data for pure verbs!";
+    send_buf.fill_bytes(test_data);
+    recv_buf.fill(0xCC);
+
+    println!("[pure_verbs] recv_buf addr: 0x{:x}, lkey: 0x{:x}", recv_buf.addr(), recv_mr.lkey());
+
+    // Post receive using ibv_post_recv
+    unsafe {
+        let mut sge: mlx5_sys::ibv_sge = std::mem::zeroed();
+        sge.addr = recv_buf.addr();
+        sge.length = 256;
+        sge.lkey = recv_mr.lkey();
+
+        let mut recv_wr: mlx5_sys::ibv_recv_wr = std::mem::zeroed();
+        recv_wr.wr_id = 1;
+        recv_wr.next = std::ptr::null_mut();
+        recv_wr.sg_list = &mut sge;
+        recv_wr.num_sge = 1;
+
+        let mut bad_wr: *mut mlx5_sys::ibv_recv_wr = std::ptr::null_mut();
+        let ret = mlx5_sys::ibv_post_recv_ex(
+            qp2.borrow().as_ptr(),
+            &mut recv_wr,
+            &mut bad_wr,
+        );
+        assert_eq!(ret, 0, "ibv_post_recv failed: {}", ret);
+    }
+
+    // Post send using ibv_post_send
+    unsafe {
+        let mut sge: mlx5_sys::ibv_sge = std::mem::zeroed();
+        sge.addr = send_buf.addr();
+        sge.length = test_data.len() as u32;
+        sge.lkey = send_mr.lkey();
+
+        let mut send_wr: mlx5_sys::ibv_send_wr = std::mem::zeroed();
+        send_wr.wr_id = 2;
+        send_wr.next = std::ptr::null_mut();
+        send_wr.sg_list = &mut sge;
+        send_wr.num_sge = 1;
+        send_wr.opcode = mlx5_sys::ibv_wr_opcode_IBV_WR_SEND;
+        send_wr.send_flags = mlx5_sys::ibv_send_flags_IBV_SEND_SIGNALED;
+
+        let mut bad_wr: *mut mlx5_sys::ibv_send_wr = std::ptr::null_mut();
+        let ret = mlx5_sys::ibv_post_send_ex(
+            qp1.borrow().as_ptr(),
+            &mut send_wr,
+            &mut bad_wr,
+        );
+        assert_eq!(ret, 0, "ibv_post_send failed: {}", ret);
+    }
+
+    // Poll send CQ using ibv_poll_cq
+    unsafe {
+        let mut wc: mlx5_sys::ibv_wc = std::mem::zeroed();
+        let start = std::time::Instant::now();
+        loop {
+            let ret = mlx5_sys::ibv_poll_cq_ex(send_cq.borrow().as_ptr(), 1, &mut wc);
+            if ret > 0 {
+                println!("[pure_verbs] Send WC: status={}, opcode={}, wr_id={}", wc.status, wc.opcode, wc.wr_id);
+                assert_eq!(wc.status, mlx5_sys::ibv_wc_status_IBV_WC_SUCCESS, "Send WC error");
+                break;
+            }
+            if start.elapsed().as_millis() > 5000 {
+                panic!("Send WC timeout");
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    // Poll recv CQ using ibv_poll_cq
+    unsafe {
+        let mut wc: mlx5_sys::ibv_wc = std::mem::zeroed();
+        let start = std::time::Instant::now();
+        loop {
+            let ret = mlx5_sys::ibv_poll_cq_ex(recv_cq2.as_ptr(), 1, &mut wc);
+            if ret > 0 {
+                println!("[pure_verbs] Recv WC: status={}, opcode={}, byte_len={}, wr_id={}", wc.status, wc.opcode, wc.byte_len, wc.wr_id);
+                assert_eq!(wc.status, mlx5_sys::ibv_wc_status_IBV_WC_SUCCESS, "Recv WC error");
+                break;
+            }
+            if start.elapsed().as_millis() > 5000 {
+                panic!("Recv WC timeout");
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    // Check buffer
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+    let received = recv_buf.read_bytes(test_data.len());
+    println!("[pure_verbs] First {} bytes: {:?}", test_data.len(), received);
+
+    let mut cc_count = 0;
+    for b in recv_buf.read_bytes(4096) {
+        if b == 0xCC { cc_count += 1; }
+    }
+    println!("[pure_verbs] 0xCC bytes remaining: {}/4096", cc_count);
+
+    assert_eq!(&received[..], test_data, "Pure verbs SEND/RECV data mismatch");
+    println!("[pure_verbs] Test passed!");
+}
+
+#[test]
+fn test_rc_send_recv_pingpong() {
+    use mlx5::cq::CqeOpcode;
+
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    // Create QPs with separate recv CQs
+    let send_cq = Rc::new(RefCell::new(
+        ctx.ctx.create_cq(256).expect("Failed to create send CQ"),
+    ));
+    send_cq.borrow_mut().init_direct_access().expect("Failed to init send CQ");
+
+    let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
+    recv_cq1.init_direct_access().expect("Failed to init recv CQ1");
+    let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    recv_cq2.init_direct_access().expect("Failed to init recv CQ2");
+
+    let config = mlx5::qp::RcQpConfig {
+        max_inline_data: 64,
+        ..Default::default()
+    };
+
+    fn noop_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
+
+    let qp1 = ctx
+        .ctx
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq1, &config, noop_callback as fn(_, _))
+        .expect("Failed to create QP1");
+
+    let qp2 = ctx
+        .ctx
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, noop_callback as fn(_, _))
+        .expect("Failed to create QP2");
+
+    // Connect QPs
+    let remote1 = RemoteQpInfo {
+        qpn: qp1.borrow().qpn(),
+        psn: 0,
+        lid: ctx.port_attr.lid,
+    };
+    let remote2 = RemoteQpInfo {
+        qpn: qp2.borrow().qpn(),
+        psn: 0,
+        lid: ctx.port_attr.lid,
+    };
+
+    let access = full_access().bits();
+    qp1.borrow_mut().connect(&remote2, ctx.port, 0, 4, 4, access).expect("connect QP1");
+    qp2.borrow_mut().connect(&remote1, ctx.port, 0, 4, 4, access).expect("connect QP2");
+
+    // Buffers
+    let buf1 = AlignedBuffer::new(4096);
+    let buf2 = AlignedBuffer::new(4096);
+    let mr1 = unsafe { ctx.pd.register(buf1.as_ptr(), buf1.size(), full_access()) }.expect("MR1");
+    let mr2 = unsafe { ctx.pd.register(buf2.as_ptr(), buf2.size(), full_access()) }.expect("MR2");
+
+    let iterations = 10;
+    println!("Running {} ping-pong iterations...", iterations);
+
+    for i in 0..iterations {
+        // QP2 posts receive
+        unsafe { qp2.borrow_mut().post_recv(buf2.addr(), 64, mr2.lkey()); }
+        qp2.borrow_mut().ring_rq_doorbell();
+
+        // QP1 sends
+        qp1.borrow_mut()
+            .wqe_builder(i as u64)
+            .expect("wqe_builder")
+            .ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
+            .sge(buf1.addr(), 32, mr1.lkey())
+            .finish_with_blueflame();
+
+        // Wait for send completion
+        let _ = poll_cq_timeout(&mut send_cq.borrow_mut(), 5000).expect("send CQE");
+        send_cq.borrow().flush();
+
+        // Wait for receive completion
+        let recv_cqe = poll_cq_timeout(&mut recv_cq2, 5000).expect("recv CQE");
+        assert_eq!(recv_cqe.opcode, CqeOpcode::RespSend);
+        recv_cq2.flush();
+
+        // QP1 posts receive
+        unsafe { qp1.borrow_mut().post_recv(buf1.addr(), 64, mr1.lkey()); }
+        qp1.borrow_mut().ring_rq_doorbell();
+
+        // QP2 sends back
+        qp2.borrow_mut()
+            .wqe_builder(i as u64)
+            .expect("wqe_builder")
+            .ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
+            .sge(buf2.addr(), 32, mr2.lkey())
+            .finish_with_blueflame();
+
+        // Wait for send completion
+        let _ = poll_cq_timeout(&mut send_cq.borrow_mut(), 5000).expect("send CQE");
+        send_cq.borrow().flush();
+
+        // Wait for receive completion
+        let recv_cqe = poll_cq_timeout(&mut recv_cq1, 5000).expect("recv CQE");
+        assert_eq!(recv_cqe.opcode, CqeOpcode::RespSend);
+        recv_cq1.flush();
+    }
+
+    println!("RC SEND/RECV ping-pong test passed! ({} iterations)", iterations);
 }

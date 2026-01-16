@@ -147,7 +147,10 @@ impl Drop for ServerHandle {
 struct BenchmarkSetup {
     client: EndpointState,
     _server_handle: ServerHandle,
+    // Field order matters for drop order: PD must be dropped before Context
     _pd: Rc<Pd>,
+    // Context must be dropped LAST - all resources depend on it
+    _ctx: Context,
 }
 
 // =============================================================================
@@ -303,6 +306,7 @@ fn setup_benchmark() -> Option<BenchmarkSetup> {
         client,
         _server_handle: server_handle,
         _pd: pd,
+        _ctx: ctx,
     })
 }
 
@@ -679,13 +683,14 @@ fn pingpong_benchmarks(c: &mut Criterion) {
         }
     };
 
-    // Keep server handle to stop it before other resources are dropped
-    // Drop order is reverse of declaration, so server_handle must be declared AFTER
-    // the resources it depends on
+    // Drop order is REVERSE of declaration order in Rust.
+    // Context must be dropped LAST, so it must be declared FIRST.
+    // Order: ctx first (dropped last) -> pd (dropped second-to-last) -> client -> server_handle
+    let _ctx = setup._ctx;
     let _pd = setup._pd;
-    let mut server_handle = setup._server_handle;
     // Use RefCell for mutable access in closures
     let client = RefCell::new(setup.client);
+    let mut server_handle = setup._server_handle;
 
     let mut group = c.benchmark_group("pingpong");
     group.sample_size(10);
@@ -711,12 +716,29 @@ fn pingpong_benchmarks(c: &mut Criterion) {
 
     group.finish();
 
-    // Cleanup: stop server and leak resources
-    // Destroying RC QPs after the remote QP is gone can cause crashes.
-    // Since this is a benchmark, leaking is acceptable.
+    // Cleanup: stop server first, then drain CQs
     server_handle.stop();
-    std::mem::forget(client);
-    std::mem::forget(_pd);
+
+    // Drain any remaining completions
+    let mut client = client.into_inner();
+    loop {
+        let mut drained = false;
+        while client.recv_cq.poll_one().is_some() {
+            drained = true;
+        }
+        client.recv_cq.flush();
+        if client.send_cq.borrow_mut().poll() > 0 {
+            drained = true;
+        }
+        client.send_cq.borrow().flush();
+        if !drained {
+            break;
+        }
+    }
+
+    // Resources are dropped in reverse declaration order:
+    // server_handle -> client -> _pd -> _ctx
+    // This ensures proper cleanup order.
 }
 
 criterion_group!(benches, pingpong_benchmarks);

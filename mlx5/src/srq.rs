@@ -3,6 +3,7 @@
 //! An SRQ allows multiple Queue Pairs to share a common pool of receive buffers,
 //! reducing memory usage when many connections are needed.
 
+use std::rc::Rc;
 use std::{io, mem::MaybeUninit, ptr::NonNull};
 
 use crate::pd::Pd;
@@ -82,15 +83,33 @@ impl SrqState {
 // Shared Receive Queue
 // =============================================================================
 
+/// Internal SRQ structure.
+///
+/// This is wrapped in Rc to ensure proper resource lifetime management.
+pub(crate) struct SrqInner {
+    srq: NonNull<mlx5_sys::ibv_srq>,
+    wqe_cnt: u32,
+    state: Option<SrqState>,
+    /// Keep the PD alive while this SRQ exists.
+    _pd: Pd,
+}
+
+impl Drop for SrqInner {
+    fn drop(&mut self) {
+        unsafe {
+            mlx5_sys::ibv_destroy_srq(self.srq.as_ptr());
+        }
+    }
+}
+
 /// Shared Receive Queue.
 ///
 /// Allows multiple QPs to share receive buffers. This is useful for DC
 /// (Dynamically Connected) transport where many connections share one SRQ.
-pub struct Srq {
-    srq: NonNull<mlx5_sys::ibv_srq>,
-    wqe_cnt: u32,
-    state: Option<SrqState>,
-}
+///
+/// This type uses `Rc` internally and can be cheaply cloned.
+#[derive(Clone)]
+pub struct Srq(Rc<std::cell::RefCell<SrqInner>>);
 
 impl Pd {
     /// Create a Shared Receive Queue.
@@ -113,20 +132,13 @@ impl Pd {
 
             let srq = mlx5_sys::ibv_create_srq(self.as_ptr(), &attr as *const _ as *mut _);
             NonNull::new(srq).map_or(Err(io::Error::last_os_error()), |srq| {
-                Ok(Srq {
+                Ok(Srq(Rc::new(std::cell::RefCell::new(SrqInner {
                     srq,
                     wqe_cnt: config.max_wr.next_power_of_two(),
                     state: None,
-                })
+                    _pd: self.clone(),
+                }))))
             })
-        }
-    }
-}
-
-impl Drop for Srq {
-    fn drop(&mut self) {
-        unsafe {
-            mlx5_sys::ibv_destroy_srq(self.srq.as_ptr());
         }
     }
 }
@@ -134,7 +146,7 @@ impl Drop for Srq {
 impl Srq {
     /// Get the raw ibv_srq pointer.
     pub(crate) fn as_ptr(&self) -> *mut mlx5_sys::ibv_srq {
-        self.srq.as_ptr()
+        self.0.borrow().srq.as_ptr()
     }
 
     /// Get mlx5-specific SRQ information for direct WQE access.
@@ -144,7 +156,7 @@ impl Srq {
             let mut obj: MaybeUninit<mlx5_sys::mlx5dv_obj> = MaybeUninit::zeroed();
 
             let obj_ptr = obj.as_mut_ptr();
-            (*obj_ptr).srq.in_ = self.srq.as_ptr();
+            (*obj_ptr).srq.in_ = self.as_ptr();
             (*obj_ptr).srq.out = dv_srq.as_mut_ptr();
 
             let ret =
@@ -167,12 +179,13 @@ impl Srq {
     /// Initialize direct access for the SRQ.
     ///
     /// Call this before using post_recv/ring_doorbell.
-    pub fn init_direct_access(&mut self) -> io::Result<()> {
+    pub fn init_direct_access(&self) -> io::Result<()> {
         let info = self.query_info()?;
+        let mut inner = self.0.borrow_mut();
 
-        self.state = Some(SrqState {
+        inner.state = Some(SrqState {
             buf: info.buf,
-            wqe_cnt: self.wqe_cnt,
+            wqe_cnt: inner.wqe_cnt,
             stride: info.stride,
             head: 0,
             dbrec: info.dbrec,
@@ -191,15 +204,17 @@ impl Srq {
     /// # Safety
     /// - The buffer must be registered and valid
     /// - There must be available slots in the SRQ
-    pub unsafe fn post_recv(&mut self, addr: u64, len: u32, lkey: u32) {
-        if let Some(state) = self.state.as_mut() {
+    pub unsafe fn post_recv(&self, addr: u64, len: u32, lkey: u32) {
+        let mut inner = self.0.borrow_mut();
+        if let Some(state) = inner.state.as_mut() {
             state.post(addr, len, lkey);
         }
     }
 
     /// Ring the SRQ doorbell to notify HCA of new WQEs.
-    pub fn ring_doorbell(&mut self) {
-        if let Some(state) = self.state.as_mut() {
+    pub fn ring_doorbell(&self) {
+        let mut inner = self.0.borrow_mut();
+        if let Some(state) = inner.state.as_mut() {
             state.ring_doorbell();
         }
     }

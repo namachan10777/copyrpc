@@ -2,6 +2,7 @@
 //!
 //! This module provides access to mlx5 RDMA devices via the mlx5dv API.
 
+use std::rc::Rc;
 use std::{io, mem::MaybeUninit, ops::Deref, ptr::NonNull};
 
 /// An RDMA device.
@@ -68,15 +69,30 @@ impl Deref for DeviceList {
     }
 }
 
+/// Internal context structure holding the raw ibv_context pointer.
+///
+/// This is wrapped in Rc to ensure proper resource lifetime management.
+pub(crate) struct ContextInner {
+    ctx: NonNull<mlx5_sys::ibv_context>,
+}
+
+impl Drop for ContextInner {
+    fn drop(&mut self) {
+        unsafe {
+            mlx5_sys::ibv_close_device(self.ctx.as_ptr());
+        }
+    }
+}
+
 /// An opened RDMA device context.
 ///
 /// The context is required for creating RDMA resources such as Protection Domains,
 /// Queue Pairs, Completion Queues, etc.
 ///
 /// Created via [`Device::open()`]. The device will be closed when the context is dropped.
-pub struct Context {
-    pub(crate) ctx: NonNull<mlx5_sys::ibv_context>,
-}
+/// This type uses `Rc` internally and can be cheaply cloned.
+#[derive(Clone)]
+pub struct Context(Rc<ContextInner>);
 
 impl Device {
     /// Open the device with mlx5dv_open_device.
@@ -90,20 +106,19 @@ impl Device {
         unsafe {
             let mut attr: mlx5_sys::mlx5dv_context_attr = std::mem::zeroed();
             let ctx = mlx5_sys::mlx5dv_open_device(self.device.as_ptr(), &mut attr);
-            NonNull::new(ctx).map_or(Err(io::Error::last_os_error()), |ctx| Ok(Context { ctx }))
-        }
-    }
-}
-
-impl Drop for Context {
-    fn drop(&mut self) {
-        unsafe {
-            mlx5_sys::ibv_close_device(self.ctx.as_ptr());
+            NonNull::new(ctx).map_or(Err(io::Error::last_os_error()), |ctx| {
+                Ok(Context(Rc::new(ContextInner { ctx })))
+            })
         }
     }
 }
 
 impl Context {
+    /// Get the raw ibv_context pointer.
+    pub(crate) fn as_ptr(&self) -> *mut mlx5_sys::ibv_context {
+        self.0.ctx.as_ptr()
+    }
+
     /// Query standard ibverbs device attributes.
     ///
     /// Returns device attributes defined by the ibverbs API, including:
@@ -122,7 +137,7 @@ impl Context {
         unsafe {
             let mut attrs: MaybeUninit<crate::types::DeviceAttr> = MaybeUninit::uninit();
             let ret = mlx5_sys::ibv_query_device(
-                self.ctx.as_ptr(),
+                self.as_ptr(),
                 attrs.as_mut_ptr() as *mut mlx5_sys::ibv_device_attr,
             );
             if ret != 0 {
@@ -154,7 +169,7 @@ impl Context {
         unsafe {
             let mut attrs: MaybeUninit<crate::types::Mlx5DeviceAttr> = MaybeUninit::zeroed();
             let ret = mlx5_sys::mlx5dv_query_device(
-                self.ctx.as_ptr(),
+                self.as_ptr(),
                 attrs.as_mut_ptr() as *mut mlx5_sys::mlx5dv_context,
             );
             if ret != 0 {
@@ -181,7 +196,7 @@ impl Context {
         unsafe {
             let mut attrs: MaybeUninit<crate::types::PortAttr> = MaybeUninit::uninit();
             let ret = mlx5_sys::ibv_query_port_ex(
-                self.ctx.as_ptr(),
+                self.as_ptr(),
                 port_num,
                 attrs.as_mut_ptr() as *mut mlx5_sys::ibv_port_attr,
             );
@@ -204,7 +219,7 @@ impl Context {
         unsafe {
             let mut attr: MaybeUninit<mlx5_sys::ibv_device_attr_ex> = MaybeUninit::zeroed();
             let ret = mlx5_sys::ibv_query_device_ex_ex(
-                self.ctx.as_ptr(),
+                self.as_ptr(),
                 std::ptr::null(),
                 attr.as_mut_ptr(),
             );

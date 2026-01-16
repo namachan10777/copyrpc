@@ -174,6 +174,8 @@ pub struct CompletionQueue {
     state: Option<CqState>,
     /// Registered queues (QPN -> CompletionTarget)
     queues: HashMap<u32, Weak<RefCell<dyn CompletionTarget>>>,
+    /// Keep the context alive while this CQ exists.
+    _ctx: Context,
 }
 
 impl Context {
@@ -198,7 +200,7 @@ impl Context {
             attr.comp_mask = 0;
             attr.flags = 0;
 
-            let cq_ex = mlx5_sys::ibv_create_cq_ex_ex(self.ctx.as_ptr(), &mut attr);
+            let cq_ex = mlx5_sys::ibv_create_cq_ex_ex(self.as_ptr(), &mut attr);
             if cq_ex.is_null() {
                 return Err(io::Error::last_os_error());
             }
@@ -209,6 +211,7 @@ impl Context {
                 cq: NonNull::new(cq).unwrap(),
                 state: None,
                 queues: HashMap::new(),
+                _ctx: self.clone(),
             })
         }
     }

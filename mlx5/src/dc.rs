@@ -493,6 +493,8 @@ pub struct Dci<T, Tab, F> {
     callback: F,
     /// Weak reference to the CQ for unregistration on drop
     send_cq: Weak<RefCell<CompletionQueue>>,
+    /// Keep the PD alive while this DCI exists.
+    _pd: Pd,
 }
 
 impl Context {
@@ -608,7 +610,7 @@ impl Context {
                 .dci_streams
                 .log_num_errored = 0;
 
-            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
             NonNull::new(qp).map_or(Err(io::Error::last_os_error()), |qp| {
                 Ok(Dci {
                     qp,
@@ -616,6 +618,7 @@ impl Context {
                     sq: None,
                     callback,
                     send_cq: Rc::downgrade(send_cq),
+                    _pd: pd.clone(),
                 })
             })
         }
@@ -659,7 +662,7 @@ impl Context {
                 .dci_streams
                 .log_num_errored = 0;
 
-            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
             NonNull::new(qp).map_or(Err(io::Error::last_os_error()), |qp| {
                 Ok(Dci {
                     qp,
@@ -667,6 +670,7 @@ impl Context {
                     sq: None,
                     callback,
                     send_cq: Rc::downgrade(send_cq),
+                    _pd: pd.clone(),
                 })
             })
         }
@@ -1053,6 +1057,10 @@ pub struct Dct {
     qp: NonNull<mlx5_sys::ibv_qp>,
     dc_key: u64,
     state: DcQpState,
+    /// Keep the PD alive while this DCT exists.
+    _pd: Pd,
+    /// Keep the SRQ alive while this DCT exists.
+    _srq: Srq,
 }
 
 impl Context {
@@ -1090,12 +1098,14 @@ impl Context {
             mlx5_attr.dc_init_attr.dc_type = mlx5_sys::mlx5dv_dc_type_MLX5DV_DCTYPE_DCT;
             mlx5_attr.dc_init_attr.__bindgen_anon_1.dct_access_key = config.dc_key;
 
-            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
             NonNull::new(qp).map_or(Err(io::Error::last_os_error()), |qp| {
                 Ok(Dct {
                     qp,
                     dc_key: config.dc_key,
                     state: DcQpState::Reset,
+                    _pd: pd.clone(),
+                    _srq: srq.clone(),
                 })
             })
         }
