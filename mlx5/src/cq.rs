@@ -190,7 +190,8 @@ type CachedQueue = Option<(u32, Rc<RefCell<dyn CompletionTarget>>)>;
 /// Multiple QPs can share the same CQ.
 pub struct CompletionQueue {
     cq: NonNull<mlx5_sys::ibv_cq>,
-    state: Option<CqState>,
+    /// Direct verbs state for CQE polling (always initialized).
+    state: CqState,
     /// Registered queues for completion dispatch.
     queues: RefCell<QueueMap>,
     /// Cache for last looked up queue (QPN, Rc) to avoid HashMap lookup.
@@ -227,10 +228,34 @@ impl Context {
             }
 
             // ibv_cq_ex can be cast to ibv_cq (first fields are identical)
-            let cq = cq_ex as *mut mlx5_sys::ibv_cq;
+            let cq_ptr = cq_ex as *mut mlx5_sys::ibv_cq;
+
+            // Initialize direct verbs access immediately
+            let mut dv_cq: MaybeUninit<mlx5_sys::mlx5dv_cq> = MaybeUninit::zeroed();
+            let mut obj: MaybeUninit<mlx5_sys::mlx5dv_obj> = MaybeUninit::zeroed();
+
+            let obj_ptr = obj.as_mut_ptr();
+            (*obj_ptr).cq.in_ = cq_ptr;
+            (*obj_ptr).cq.out = dv_cq.as_mut_ptr();
+
+            let ret =
+                mlx5_sys::mlx5dv_init_obj(obj_ptr, mlx5_sys::mlx5dv_obj_type_MLX5DV_OBJ_CQ as u64);
+            if ret != 0 {
+                mlx5_sys::ibv_destroy_cq(cq_ptr);
+                return Err(io::Error::from_raw_os_error(-ret));
+            }
+
+            let dv_cq = dv_cq.assume_init();
+
             Ok(CompletionQueue {
-                cq: NonNull::new(cq).unwrap(),
-                state: None,
+                cq: NonNull::new(cq_ptr).unwrap(),
+                state: CqState {
+                    buf: dv_cq.buf as *mut u8,
+                    cqe_cnt: dv_cq.cqe_cnt,
+                    cqe_size: dv_cq.cqe_size,
+                    dbrec: dv_cq.dbrec as *mut u32,
+                    ci: Cell::new(0),
+                },
                 queues: RefCell::new(HashMap::with_hasher(BuildHasherDefault::default())),
                 last_queue_cache: RefCell::new(None),
                 _ctx: self.clone(),
@@ -255,39 +280,11 @@ impl CompletionQueue {
 
     /// Initialize direct access for CQE polling.
     ///
-    /// This is called automatically when a QP is registered.
-    /// Can also be called manually if using `poll_one()` without registered QPs.
+    /// This is now a no-op since direct access is initialized at CQ creation.
+    /// Kept for backward compatibility.
+    #[deprecated(note = "Direct access is now initialized at CQ creation")]
     pub fn init_direct_access(&mut self) -> io::Result<()> {
-        if self.state.is_some() {
-            return Ok(());
-        }
-
-        unsafe {
-            let mut dv_cq: MaybeUninit<mlx5_sys::mlx5dv_cq> = MaybeUninit::zeroed();
-            let mut obj: MaybeUninit<mlx5_sys::mlx5dv_obj> = MaybeUninit::zeroed();
-
-            let obj_ptr = obj.as_mut_ptr();
-            (*obj_ptr).cq.in_ = self.cq.as_ptr();
-            (*obj_ptr).cq.out = dv_cq.as_mut_ptr();
-
-            let ret =
-                mlx5_sys::mlx5dv_init_obj(obj_ptr, mlx5_sys::mlx5dv_obj_type_MLX5DV_OBJ_CQ as u64);
-            if ret != 0 {
-                return Err(io::Error::from_raw_os_error(-ret));
-            }
-
-            let dv_cq = dv_cq.assume_init();
-
-            self.state = Some(CqState {
-                buf: dv_cq.buf as *mut u8,
-                cqe_cnt: dv_cq.cqe_cnt,
-                cqe_size: dv_cq.cqe_size,
-                dbrec: dv_cq.dbrec as *mut u32,
-                ci: Cell::new(0),
-            });
-
-            Ok(())
-        }
+        Ok(())
     }
 
     /// Register a queue for completion dispatch.
@@ -366,10 +363,11 @@ impl CompletionQueue {
     /// The store will be visible to the device eventually (x86 TSO guarantees ordering).
     #[inline]
     pub fn flush(&self) {
-        if let Some(state) = &self.state {
-            unsafe {
-                std::ptr::write_volatile(state.dbrec, (state.ci.get() & 0x00FF_FFFF).to_be());
-            }
+        unsafe {
+            std::ptr::write_volatile(
+                self.state.dbrec,
+                (self.state.ci.get() & 0x00FF_FFFF).to_be(),
+            );
         }
     }
 
@@ -378,7 +376,7 @@ impl CompletionQueue {
     /// Returns None if no CQE is available.
     #[inline]
     fn try_next_cqe(&self, prefetch_next: bool) -> Option<Cqe> {
-        let state = self.state.as_ref()?;
+        let state = &self.state;
 
         let ci = state.ci.get();
         let cqe_mask = state.cqe_cnt - 1;
