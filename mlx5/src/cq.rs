@@ -324,9 +324,10 @@ impl CompletionQueue {
     /// Update the CQ doorbell record.
     ///
     /// Call this after processing completions to acknowledge them to the hardware.
+    /// Note: No sfence needed here - dbrec is in shared memory polled by NIC via DMA.
+    /// The store will be visible to the device eventually (x86 TSO guarantees ordering).
     pub fn flush(&self) {
         if let Some(state) = &self.state {
-            mmio_flush_writes!();
             unsafe {
                 std::ptr::write_volatile(state.dbrec, (state.ci.get() & 0x00FF_FFFF).to_be());
             }
