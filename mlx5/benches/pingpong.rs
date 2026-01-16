@@ -702,7 +702,6 @@ fn run_lowlatency_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
                 qp.ring_rq_doorbell();
                 break;
             }
-            std::hint::spin_loop();
         }
     }
 

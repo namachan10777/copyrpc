@@ -165,6 +165,8 @@ pub(crate) struct CqState {
     buf: *mut u8,
     /// Number of CQEs (power of 2)
     cqe_cnt: u32,
+    /// log2(cqe_cnt) - pre-computed for owner bit calculation
+    cqe_cnt_log2: u32,
     /// CQE size in bytes (64 or 128)
     cqe_size: u32,
     /// Doorbell record pointer
@@ -252,6 +254,7 @@ impl Context {
                 state: CqState {
                     buf: dv_cq.buf as *mut u8,
                     cqe_cnt: dv_cq.cqe_cnt,
+                    cqe_cnt_log2: dv_cq.cqe_cnt.trailing_zeros(),
                     cqe_size: dv_cq.cqe_size,
                     dbrec: dv_cq.dbrec as *mut u32,
                     ci: Cell::new(0),
@@ -386,7 +389,7 @@ impl CompletionQueue {
 
         // Owner bit check
         let op_own = unsafe { std::ptr::read_volatile(cqe_ptr.add(63)) };
-        let sw_owner = ((ci >> state.cqe_cnt.trailing_zeros()) & 1) as u8;
+        let sw_owner = ((ci >> state.cqe_cnt_log2) & 1) as u8;
         let hw_owner = op_own & 1;
 
         // Check owner bit and invalid opcode
