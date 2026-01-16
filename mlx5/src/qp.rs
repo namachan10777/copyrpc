@@ -227,6 +227,9 @@ pub(crate) struct ReceiveQueueState {
     dbrec: *mut u32,
 }
 
+/// MLX5 invalid lkey value used to mark end of SGE list.
+const MLX5_INVALID_LKEY: u32 = 0x100;
+
 impl ReceiveQueueState {
     fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
         let offset = ((idx as u32) & (self.wqe_cnt - 1)) * self.stride;
@@ -236,6 +239,16 @@ impl ReceiveQueueState {
     unsafe fn post(&mut self, addr: u64, len: u32, lkey: u32) {
         let wqe_ptr = self.get_wqe_ptr(self.pi);
         DataSeg::write(wqe_ptr, len, lkey, addr);
+
+        // If there's room for another SGE, write a sentinel to mark end of list.
+        // The sentinel has byte_count=0 and lkey=MLX5_INVALID_LKEY.
+        if self.stride > DataSeg::SIZE as u32 {
+            let sentinel_ptr = wqe_ptr.add(DataSeg::SIZE);
+            let ptr32 = sentinel_ptr as *mut u32;
+            std::ptr::write_volatile(ptr32, 0u32); // byte_count = 0
+            std::ptr::write_volatile(ptr32.add(1), MLX5_INVALID_LKEY.to_be()); // lkey = invalid
+        }
+
         self.pi = self.pi.wrapping_add(1);
     }
 
@@ -570,6 +583,12 @@ impl Context {
             qp_attr.pd = pd.as_ptr();
 
             let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
+            // Disable scatter to CQE to ensure received data goes to the receive buffer,
+            // not inline in the CQE. This is required for direct CQ polling to work correctly.
+            mlx5_attr.comp_mask =
+                mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS as u64;
+            mlx5_attr.create_flags =
+                mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
 
             let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
             NonNull::new(qp).map_or(Err(io::Error::last_os_error()), |qp| {
@@ -610,6 +629,12 @@ impl Context {
             qp_attr.pd = pd.as_ptr();
 
             let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
+            // Disable scatter to CQE to ensure received data goes to the receive buffer,
+            // not inline in the CQE. This is required for direct CQ polling to work correctly.
+            mlx5_attr.comp_mask =
+                mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS as u64;
+            mlx5_attr.create_flags =
+                mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
 
             let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
             NonNull::new(qp).map_or(Err(io::Error::last_os_error()), |qp| {
@@ -642,6 +667,11 @@ impl<T, Tab, F> RcQpInner<T, Tab, F> {
     /// Get the QP number.
     pub fn qpn(&self) -> u32 {
         unsafe { (*self.qp.as_ptr()).qp_num }
+    }
+
+    /// Get the raw ibv_qp pointer.
+    pub fn as_ptr(&self) -> *mut mlx5_sys::ibv_qp {
+        self.qp.as_ptr()
     }
 
     /// Get the current QP state.
@@ -797,6 +827,27 @@ impl<T, Tab, F> RcQpInner<T, Tab, F> {
         }
 
         self.state = QpState::Rts;
+        Ok(())
+    }
+
+    /// Transition QP to ERROR state.
+    ///
+    /// This cleanly tears down the connection and flushes any pending work requests.
+    /// Useful before destroying a QP to avoid crashes when the remote QP is already gone.
+    pub fn modify_to_error(&mut self) -> io::Result<()> {
+        unsafe {
+            let mut attr: mlx5_sys::ibv_qp_attr = MaybeUninit::zeroed().assume_init();
+            attr.qp_state = mlx5_sys::ibv_qp_state_IBV_QPS_ERR;
+
+            let mask = mlx5_sys::ibv_qp_attr_mask_IBV_QP_STATE;
+
+            let ret = mlx5_sys::ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask as i32);
+            if ret != 0 {
+                return Err(io::Error::from_raw_os_error(ret));
+            }
+        }
+
+        self.state = QpState::Error;
         Ok(())
     }
 

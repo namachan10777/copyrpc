@@ -30,6 +30,33 @@ macro_rules! mmio_flush_writes {
     };
 }
 
+/// Load barrier for device reads.
+///
+/// Used after reading CQE ownership bit to ensure subsequent reads
+/// (like the receive buffer) see the data written by the hardware.
+/// On x86/x86_64, this is a compiler barrier only - no instruction needed
+/// due to TSO (Total Store Order) guaranteeing load-load ordering.
+/// On ARM, explicit barrier is required (dmb ld).
+/// Equivalent to rdma-core's `udma_from_device_barrier()`.
+macro_rules! udma_from_device_barrier {
+    () => {
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            std::arch::asm!("dmb ld", options(nostack, preserves_flags));
+        }
+        // x86/x86_64: compiler barrier only (TSO guarantees load-load ordering)
+        // The compiler_fence prevents the compiler from reordering loads across this point
+        #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+        {
+            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::Acquire);
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
+        {
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        }
+    };
+}
+
 /// Store-store ordering barrier for device writes.
 ///
 /// Used between doorbell record write and BlueFlame write.

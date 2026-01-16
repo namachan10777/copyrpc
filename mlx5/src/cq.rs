@@ -336,6 +336,12 @@ impl CompletionQueue {
             return None;
         }
 
+        // After validating ownership, we need a load barrier to ensure subsequent
+        // reads (including the receive buffer data) see the data written by hardware.
+        // On x86, this is a compiler barrier only (TSO guarantees load-load ordering).
+        // On ARM, this requires an explicit dmb ld instruction.
+        udma_from_device_barrier!();
+
         let cqe = unsafe { Cqe::from_ptr(cqe_ptr) };
         state.ci = state.ci.wrapping_add(1);
 
