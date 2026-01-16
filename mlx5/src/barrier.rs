@@ -86,16 +86,11 @@ macro_rules! udma_to_device_barrier {
 macro_rules! mlx5_bf_copy {
     ($dst:expr, $src:expr) => {
         unsafe {
-            let src = $src as *const u8;
-            let dst = $dst as *mut u8;
-            std::arch::asm!(
-                "vmovdqu64 zmm0, [{src}]",
-                "vmovntdq [{dst}], zmm0",
-                src = in(reg) src,
-                dst = in(reg) dst,
-                out("zmm0") _,
-                options(nostack, preserves_flags),
-            );
+            use std::arch::x86_64::{__m512i, _mm512_loadu_si512, _mm512_stream_si512};
+            let src = $src as *const __m512i;
+            let dst = $dst as *mut __m512i;
+            let data = _mm512_loadu_si512(src);
+            _mm512_stream_si512(dst, data);
         }
     };
 }
