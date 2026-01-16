@@ -3,6 +3,7 @@
 //! An SRQ allows multiple Queue Pairs to share a common pool of receive buffers,
 //! reducing memory usage when many connections are needed.
 
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::{io, mem::MaybeUninit, ptr::NonNull};
 
@@ -45,37 +46,74 @@ pub struct SrqInfo {
 // =============================================================================
 
 /// SRQ state for direct WQE posting.
-struct SrqState {
+struct SrqState<T> {
     buf: *mut u8,
     wqe_cnt: u32,
     stride: u32,
-    head: u32,
+    pi: Cell<u32>,
+    ci: Cell<u32>,
     dbrec: *mut u32,
+    /// Entry table for tracking in-flight receives.
+    table: RefCell<Box<[Option<T>]>>,
 }
 
-impl SrqState {
+impl<T> SrqState<T> {
     fn get_wqe_ptr(&self, idx: u32) -> *mut u8 {
         let offset = (idx & (self.wqe_cnt - 1)) * self.stride;
         unsafe { self.buf.add(offset as usize) }
     }
 
-    unsafe fn post(&mut self, addr: u64, len: u32, lkey: u32) {
-        let wqe_ptr = self.get_wqe_ptr(self.head);
-
-        // SRQ WQE format: Next Segment (16 bytes) + Data Segment (16 bytes)
-        std::ptr::write_bytes(wqe_ptr, 0, 16);
-
-        // Write Data Segment at offset 16
-        DataSeg::write(wqe_ptr.add(16), len, lkey, addr);
-
-        self.head = self.head.wrapping_add(1);
-    }
-
-    fn ring_doorbell(&mut self) {
+    fn ring_doorbell(&self) {
         mmio_flush_writes!();
         unsafe {
-            std::ptr::write_volatile(self.dbrec, self.head.to_be());
+            std::ptr::write_volatile(self.dbrec, self.pi.get().to_be());
         }
+    }
+
+    /// Available slots based on pi - ci difference.
+    fn available(&self) -> u32 {
+        self.wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
+    }
+
+    /// Process a receive completion and return the associated entry.
+    fn process_completion(&self, wqe_idx: u16) -> Option<T> {
+        self.ci.set(self.ci.get().wrapping_add(1));
+        let idx = (wqe_idx as usize) & ((self.wqe_cnt - 1) as usize);
+        self.table.borrow_mut()[idx].take()
+    }
+}
+
+// =============================================================================
+// SRQ Receive WQE Builder
+// =============================================================================
+
+/// Builder for posting receive WQEs to SRQ.
+pub struct SrqRecvWqeBuilder<'a, T> {
+    state: &'a SrqState<T>,
+    entry: T,
+    wqe_idx: u32,
+}
+
+impl<'a, T> SrqRecvWqeBuilder<'a, T> {
+    /// Add an SGE (Scatter/Gather Element) to the receive WQE.
+    pub fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
+        unsafe {
+            let wqe_ptr = self.state.get_wqe_ptr(self.wqe_idx);
+
+            // SRQ WQE format: Next Segment (16 bytes) + Data Segment (16 bytes)
+            std::ptr::write_bytes(wqe_ptr, 0, 16);
+
+            // Write Data Segment at offset 16
+            DataSeg::write(wqe_ptr.add(16), len, lkey, addr);
+        }
+        self
+    }
+
+    /// Finish the WQE construction.
+    pub fn finish(self) {
+        let idx = (self.wqe_idx as usize) & ((self.state.wqe_cnt - 1) as usize);
+        self.state.table.borrow_mut()[idx] = Some(self.entry);
+        self.state.pi.set(self.state.pi.get().wrapping_add(1));
     }
 }
 
@@ -86,15 +124,15 @@ impl SrqState {
 /// Internal SRQ structure.
 ///
 /// This is wrapped in Rc to ensure proper resource lifetime management.
-pub(crate) struct SrqInner {
+pub(crate) struct SrqInner<T> {
     srq: NonNull<mlx5_sys::ibv_srq>,
     wqe_cnt: u32,
-    state: Option<SrqState>,
+    state: Option<SrqState<T>>,
     /// Keep the PD alive while this SRQ exists.
     _pd: Pd,
 }
 
-impl Drop for SrqInner {
+impl<T> Drop for SrqInner<T> {
     fn drop(&mut self) {
         unsafe {
             mlx5_sys::ibv_destroy_srq(self.srq.as_ptr());
@@ -107,9 +145,18 @@ impl Drop for SrqInner {
 /// Allows multiple QPs to share receive buffers. This is useful for DC
 /// (Dynamically Connected) transport where many connections share one SRQ.
 ///
+/// Type parameter `T` is the entry type stored for tracking in-flight receives.
+/// When a receive completion arrives, call `process_recv_completion()` to retrieve
+/// the associated entry.
+///
 /// This type uses `Rc` internally and can be cheaply cloned.
-#[derive(Clone)]
-pub struct Srq(Rc<std::cell::RefCell<SrqInner>>);
+pub struct Srq<T>(Rc<RefCell<SrqInner<T>>>);
+
+impl<T> Clone for Srq<T> {
+    fn clone(&self) -> Self {
+        Srq(Rc::clone(&self.0))
+    }
+}
 
 impl Pd {
     /// Create a Shared Receive Queue.
@@ -119,7 +166,7 @@ impl Pd {
     ///
     /// # Errors
     /// Returns an error if the SRQ cannot be created.
-    pub fn create_srq(&self, config: &SrqConfig) -> io::Result<Srq> {
+    pub fn create_srq<T>(&self, config: &SrqConfig) -> io::Result<Srq<T>> {
         unsafe {
             let attr = mlx5_sys::ibv_srq_init_attr {
                 srq_context: std::ptr::null_mut(),
@@ -132,7 +179,7 @@ impl Pd {
 
             let srq = mlx5_sys::ibv_create_srq(self.as_ptr(), &attr as *const _ as *mut _);
             NonNull::new(srq).map_or(Err(io::Error::last_os_error()), |srq| {
-                Ok(Srq(Rc::new(std::cell::RefCell::new(SrqInner {
+                Ok(Srq(Rc::new(RefCell::new(SrqInner {
                     srq,
                     wqe_cnt: config.max_wr.next_power_of_two(),
                     state: None,
@@ -143,7 +190,7 @@ impl Pd {
     }
 }
 
-impl Srq {
+impl<T> Srq<T> {
     /// Get the raw ibv_srq pointer.
     pub(crate) fn as_ptr(&self) -> *mut mlx5_sys::ibv_srq {
         self.0.borrow().srq.as_ptr()
@@ -178,17 +225,20 @@ impl Srq {
 
     /// Initialize direct access for the SRQ.
     ///
-    /// Call this before using post_recv/ring_doorbell.
+    /// Call this before using recv_builder/ring_doorbell.
     pub fn init_direct_access(&self) -> io::Result<()> {
         let info = self.query_info()?;
         let mut inner = self.0.borrow_mut();
+        let wqe_cnt = inner.wqe_cnt;
 
         inner.state = Some(SrqState {
             buf: info.buf,
-            wqe_cnt: inner.wqe_cnt,
+            wqe_cnt,
             stride: info.stride,
-            head: 0,
+            pi: Cell::new(0),
+            ci: Cell::new(0),
             dbrec: info.dbrec,
+            table: RefCell::new((0..wqe_cnt).map(|_| None).collect()),
         });
 
         Ok(())
@@ -199,23 +249,68 @@ impl Srq {
         self.query_info().map(|info| info.srqn)
     }
 
-    /// Post a receive WQE.
+    /// Get a WQE builder for posting a receive.
     ///
-    /// # Safety
-    /// - The buffer must be registered and valid
-    /// - There must be available slots in the SRQ
-    pub unsafe fn post_recv(&self, addr: u64, len: u32, lkey: u32) {
-        let mut inner = self.0.borrow_mut();
-        if let Some(state) = inner.state.as_mut() {
-            state.post(addr, len, lkey);
+    /// # Arguments
+    /// * `entry` - Entry to associate with this receive WQE
+    ///
+    /// # Errors
+    /// Returns `WouldBlock` if the SRQ is full.
+    pub fn recv_builder(&self, entry: T) -> io::Result<SrqRecvWqeBuilder<'_, T>> {
+        let inner = self.0.borrow();
+        let state = inner.state.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "direct access not initialized")
+        })?;
+
+        if state.available() == 0 {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SRQ full"));
         }
+
+        let wqe_idx = state.pi.get();
+
+        // SAFETY: We're returning a reference that borrows self, and state lives as long as inner
+        // which lives as long as self.0. This is a bit unsafe but the borrow checker ensures
+        // we can't drop self while the builder exists.
+        let state_ptr = state as *const SrqState<T>;
+        drop(inner);
+
+        Ok(SrqRecvWqeBuilder {
+            state: unsafe { &*state_ptr },
+            entry,
+            wqe_idx,
+        })
+    }
+
+    /// Get available slot count.
+    pub fn available(&self) -> u32 {
+        self.0
+            .borrow()
+            .state
+            .as_ref()
+            .map(|s| s.available())
+            .unwrap_or(0)
     }
 
     /// Ring the SRQ doorbell to notify HCA of new WQEs.
     pub fn ring_doorbell(&self) {
-        let mut inner = self.0.borrow_mut();
-        if let Some(state) = inner.state.as_mut() {
+        let inner = self.0.borrow();
+        if let Some(state) = inner.state.as_ref() {
             state.ring_doorbell();
         }
+    }
+
+    /// Process a receive completion and return the associated entry.
+    ///
+    /// Call this when a receive CQE is received to retrieve the entry
+    /// associated with the completed receive.
+    ///
+    /// # Arguments
+    /// * `wqe_idx` - WQE index from the CQE (wqe_counter field)
+    pub fn process_recv_completion(&self, wqe_idx: u16) -> Option<T> {
+        self.0
+            .borrow()
+            .state
+            .as_ref()
+            .and_then(|s| s.process_completion(wqe_idx))
     }
 }

@@ -266,7 +266,7 @@ pub fn is_dct_supported(ctx: &TestContext) -> bool {
         max_wr: 16,
         max_sge: 1,
     };
-    let srq = match ctx.pd.create_srq(&srq_config) {
+    let srq: mlx5::srq::Srq<()> = match ctx.pd.create_srq(&srq_config) {
         Ok(srq) => srq,
         Err(e) => {
             eprintln!("  DCT check: SRQ creation failed: {}", e);

@@ -504,10 +504,12 @@ fn test_rc_rdma_write_imm() {
     let recv_mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
         .expect("Failed to register recv MR");
 
-    unsafe {
-        qp2.borrow_mut().post_recv(recv_buf.addr(), 256, recv_mr.lkey());
-    }
-    qp2.borrow_mut().ring_rq_doorbell();
+    qp2.borrow()
+        .recv_builder(0u64)
+        .expect("recv_builder failed")
+        .sge(recv_buf.addr(), 256, recv_mr.lkey())
+        .finish();
+    qp2.borrow().ring_rq_doorbell();
 
     // Create a separate recv CQ for QP2
     let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
@@ -962,10 +964,12 @@ fn test_rc_send_recv() {
     println!("Recv MR lkey: 0x{:x}", recv_mr.lkey());
 
     // QP2 posts a receive
-    unsafe {
-        qp2.borrow_mut().post_recv(recv_buf.addr(), 256, recv_mr.lkey());
-    }
-    qp2.borrow_mut().ring_rq_doorbell();
+    qp2.borrow()
+        .recv_builder(0u64)
+        .expect("recv_builder failed")
+        .sge(recv_buf.addr(), 256, recv_mr.lkey())
+        .finish();
+    qp2.borrow().ring_rq_doorbell();
 
     // QP1 sends data
     qp1.borrow_mut()
@@ -1282,8 +1286,10 @@ fn test_rc_send_recv_pingpong() {
         recv2_opcode.set(None);
 
         // QP2 posts receive
-        unsafe { qp2.borrow_mut().post_recv(buf2.addr(), 64, mr2.lkey()); }
-        qp2.borrow_mut().ring_rq_doorbell();
+        let _ = qp2.borrow()
+            .recv_builder(i as u64)
+            .map(|b| b.sge(buf2.addr(), 64, mr2.lkey()).finish());
+        qp2.borrow().ring_rq_doorbell();
 
         // QP1 sends
         qp1.borrow_mut()
@@ -1316,8 +1322,10 @@ fn test_rc_send_recv_pingpong() {
         recv1_opcode.set(None);
 
         // QP1 posts receive
-        unsafe { qp1.borrow_mut().post_recv(buf1.addr(), 64, mr1.lkey()); }
-        qp1.borrow_mut().ring_rq_doorbell();
+        let _ = qp1.borrow()
+            .recv_builder(i as u64)
+            .map(|b| b.sge(buf1.addr(), 64, mr1.lkey()).finish());
+        qp1.borrow().ring_rq_doorbell();
 
         // QP2 sends back
         qp2.borrow_mut()

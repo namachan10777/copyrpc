@@ -40,7 +40,7 @@ fn test_srq_creation() {
         max_sge: 1,
     };
 
-    let srq = ctx.pd.create_srq(&config).expect("Failed to create SRQ");
+    let srq: mlx5::srq::Srq<u64> = ctx.pd.create_srq(&config).expect("Failed to create SRQ");
 
     let srqn = srq.srqn().expect("Failed to get SRQN");
     println!("SRQ creation test passed!");
@@ -62,7 +62,7 @@ fn test_srq_direct_access() {
         max_sge: 1,
     };
 
-    let mut srq = ctx.pd.create_srq(&config).expect("Failed to create SRQ");
+    let srq: mlx5::srq::Srq<u64> = ctx.pd.create_srq(&config).expect("Failed to create SRQ");
 
     // Initialize direct access
     srq.init_direct_access()
@@ -90,7 +90,7 @@ fn test_srq_post_recv() {
         max_sge: 1,
     };
 
-    let mut srq = ctx.pd.create_srq(&config).expect("Failed to create SRQ");
+    let srq: mlx5::srq::Srq<u64> = ctx.pd.create_srq(&config).expect("Failed to create SRQ");
     srq.init_direct_access()
         .expect("Failed to init SRQ direct access");
 
@@ -99,12 +99,13 @@ fn test_srq_post_recv() {
     let mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
         .expect("Failed to register MR");
 
-    // Post multiple receive buffers
+    // Post multiple receive buffers using recv_builder
     for i in 0..10 {
         let offset = (i * 256) as usize;
-        unsafe {
-            srq.post_recv(recv_buf.addr() + offset as u64, 256, mr.lkey());
-        }
+        srq.recv_builder(i as u64)
+            .expect("recv_builder failed")
+            .sge(recv_buf.addr() + offset as u64, 256, mr.lkey())
+            .finish();
     }
 
     // Ring doorbell
@@ -148,7 +149,7 @@ fn test_srq_with_dct_send() {
         max_wr: 128,
         max_sge: 1,
     };
-    let mut srq = ctx
+    let srq: mlx5::srq::Srq<u64> = ctx
         .pd
         .create_srq(&srq_config)
         .expect("Failed to create SRQ");
@@ -156,13 +157,14 @@ fn test_srq_with_dct_send() {
         .expect("Failed to init SRQ direct access");
 
     // Create receive buffer and post to SRQ
-    let mut recv_buf = AlignedBuffer::new(4096);
+    let recv_buf = AlignedBuffer::new(4096);
     let recv_mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
         .expect("Failed to register recv MR");
 
-    unsafe {
-        srq.post_recv(recv_buf.addr(), 4096, recv_mr.lkey());
-    }
+    srq.recv_builder(0u64)
+        .expect("recv_builder failed")
+        .sge(recv_buf.addr(), 4096, recv_mr.lkey())
+        .finish();
     srq.ring_doorbell();
 
     // Create and activate DCI
@@ -272,7 +274,7 @@ fn test_srq_shared_by_multiple_dcts() {
         max_wr: 256,
         max_sge: 1,
     };
-    let mut srq = ctx
+    let srq: mlx5::srq::Srq<u64> = ctx
         .pd
         .create_srq(&srq_config)
         .expect("Failed to create SRQ");
@@ -280,7 +282,7 @@ fn test_srq_shared_by_multiple_dcts() {
         .expect("Failed to init SRQ direct access");
 
     // Create receive buffers and post to SRQ
-    let mut recv_bufs: Vec<_> = (0..4).map(|_| AlignedBuffer::new(4096)).collect();
+    let recv_bufs: Vec<_> = (0..4).map(|_| AlignedBuffer::new(4096)).collect();
     let recv_mrs: Vec<_> = recv_bufs
         .iter()
         .map(|buf| {
@@ -289,11 +291,12 @@ fn test_srq_shared_by_multiple_dcts() {
         })
         .collect();
 
-    // Post receive buffers
-    for (buf, mr) in recv_bufs.iter().zip(recv_mrs.iter()) {
-        unsafe {
-            srq.post_recv(buf.addr(), 4096, mr.lkey());
-        }
+    // Post receive buffers using recv_builder
+    for (i, (buf, mr)) in recv_bufs.iter().zip(recv_mrs.iter()).enumerate() {
+        srq.recv_builder(i as u64)
+            .expect("recv_builder failed")
+            .sge(buf.addr(), 4096, mr.lkey())
+            .finish();
     }
     srq.ring_doorbell();
 

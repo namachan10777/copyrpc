@@ -1054,14 +1054,17 @@ where
 ///
 /// Receives RDMA operations from DCIs via an SRQ.
 /// Created using mlx5dv_create_qp with DC type.
-pub struct Dct {
+///
+/// Type parameter `T` is the entry type stored in the SRQ for tracking
+/// in-flight receives.
+pub struct Dct<T> {
     qp: NonNull<mlx5_sys::ibv_qp>,
     dc_key: u64,
     state: DcQpState,
     /// Keep the PD alive while this DCT exists.
     _pd: Pd,
-    /// Keep the SRQ alive while this DCT exists.
-    _srq: Srq,
+    /// SRQ for receive processing.
+    srq: Srq<T>,
 }
 
 impl Context {
@@ -1075,13 +1078,13 @@ impl Context {
     ///
     /// # Errors
     /// Returns an error if the DCT cannot be created.
-    pub fn create_dct(
+    pub fn create_dct<T>(
         &self,
         pd: &Pd,
-        srq: &Srq,
+        srq: &Srq<T>,
         cq: &CompletionQueue,
         config: &DctConfig,
-    ) -> io::Result<Dct> {
+    ) -> io::Result<Dct<T>> {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_DRIVER;
@@ -1106,14 +1109,14 @@ impl Context {
                     dc_key: config.dc_key,
                     state: DcQpState::Reset,
                     _pd: pd.clone(),
-                    _srq: srq.clone(),
+                    srq: srq.clone(),
                 })
             })
         }
     }
 }
 
-impl Drop for Dct {
+impl<T> Drop for Dct<T> {
     fn drop(&mut self) {
         unsafe {
             mlx5_sys::ibv_destroy_qp(self.qp.as_ptr());
@@ -1121,7 +1124,7 @@ impl Drop for Dct {
     }
 }
 
-impl Dct {
+impl<T> Dct<T> {
     /// Get the DCT number.
     pub fn dctn(&self) -> u32 {
         unsafe { (*self.qp.as_ptr()).qp_num }
@@ -1222,5 +1225,20 @@ impl Dct {
             dc_key: self.dc_key,
             lid,
         }
+    }
+
+    /// Get access to the SRQ.
+    pub fn srq(&self) -> &Srq<T> {
+        &self.srq
+    }
+
+    /// Process a receive completion and return the associated entry.
+    ///
+    /// Call this when a receive CQE for this DCT is received.
+    ///
+    /// # Arguments
+    /// * `wqe_idx` - WQE index from the CQE (wqe_counter field)
+    pub fn process_recv_completion(&self, wqe_idx: u16) -> Option<T> {
+        self.srq.process_recv_completion(wqe_idx)
     }
 }

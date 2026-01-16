@@ -326,13 +326,12 @@ fn setup_benchmark() -> Option<BenchmarkSetup> {
     // Pre-post receives on client
     for i in 0..QUEUE_DEPTH {
         let offset = (i * 256) as u64;
-        unsafe {
-            client_qp
-                .borrow_mut()
-                .post_recv(client_recv_buf.addr() + offset, 256, client_recv_mr.lkey());
-        }
+        let _ = client_qp
+            .borrow()
+            .recv_builder(i as u64)
+            .map(|b| b.sge(client_recv_buf.addr() + offset, 256, client_recv_mr.lkey()).finish());
     }
-    client_qp.borrow_mut().ring_rq_doorbell();
+    client_qp.borrow().ring_rq_doorbell();
 
     let client = EndpointState {
         qp: client_qp,
@@ -447,12 +446,12 @@ fn server_thread_main(
     // Pre-post receives
     for i in 0..QUEUE_DEPTH {
         let offset = (i * 256) as u64;
-        unsafe {
-            qp.borrow_mut()
-                .post_recv(recv_buf.addr() + offset, 256, recv_mr.lkey());
-        }
+        let _ = qp
+            .borrow()
+            .recv_builder(i as u64)
+            .map(|b| b.sge(recv_buf.addr() + offset, 256, recv_mr.lkey()).finish());
     }
-    qp.borrow_mut().ring_rq_doorbell();
+    qp.borrow().ring_rq_doorbell();
 
     // Signal ready
     ready_signal.store(1, Ordering::Release);
@@ -493,9 +492,9 @@ fn server_thread_main(
             for i in 0..rx_count {
                 let idx = rx_indices[i];
                 let offset = (idx * 256) as u64;
-                unsafe {
-                    qp_ref.post_recv(recv_buf.addr() + offset, 256, recv_mr.lkey());
-                }
+                let _ = qp_ref
+                    .recv_builder(idx as u64)
+                    .map(|b| b.sge(recv_buf.addr() + offset, 256, recv_mr.lkey()).finish());
             }
         }
 
@@ -599,9 +598,9 @@ fn run_throughput_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
             for i in 0..rx_count {
                 let idx = rx_indices[i];
                 let offset = (idx * 256) as u64;
-                unsafe {
-                    qp.post_recv(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey());
-                }
+                let _ = qp
+                    .recv_builder(idx as u64)
+                    .map(|b| b.sge(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey()).finish());
             }
         }
 
@@ -644,15 +643,13 @@ fn run_throughput_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
         inflight -= rx_count as u64;
 
         let rx_indices = *client.shared_state.rx_indices.borrow();
+        let qp = client.qp.borrow();
         for i in 0..rx_count {
             let idx = rx_indices[i];
             let offset = (idx * 256) as u64;
-            unsafe {
-                client
-                    .qp
-                    .borrow()
-                    .post_recv(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey());
-            }
+            let _ = qp
+                .recv_builder(idx as u64)
+                .map(|b| b.sge(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey()).finish());
         }
         client.send_cq.poll();
         client.send_cq.flush();
@@ -700,14 +697,11 @@ fn run_lowlatency_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
                 // Repost recv immediately
                 let recv_idx = client.shared_state.rx_indices.borrow()[0];
                 let offset = (recv_idx * 256) as u64;
-                unsafe {
-                    client.qp.borrow().post_recv(
-                        client.recv_buf.addr() + offset,
-                        256,
-                        client.recv_mr.lkey(),
-                    );
-                }
-                client.qp.borrow().ring_rq_doorbell();
+                let qp = client.qp.borrow();
+                let _ = qp
+                    .recv_builder(recv_idx as u64)
+                    .map(|b| b.sge(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey()).finish());
+                qp.ring_rq_doorbell();
                 break;
             }
             std::hint::spin_loop();

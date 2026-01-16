@@ -266,31 +266,6 @@ impl<T> ReceiveQueueState<T> {
             std::ptr::write_volatile(self.dbrec, (self.pi.get() as u32).to_be());
         }
     }
-
-    /// Post a receive WQE without entry tracking.
-    ///
-    /// This is a legacy method for backward compatibility. Prefer using
-    /// `RecvWqeBuilder` for new code to enable entry tracking.
-    ///
-    /// # Safety
-    /// - The buffer must be registered and valid.
-    /// - There must be available slots in the RQ.
-    unsafe fn post(&self, addr: u64, len: u32, lkey: u32) {
-        let pi = self.pi.get();
-        let wqe_ptr = self.get_wqe_ptr(pi);
-        DataSeg::write(wqe_ptr, len, lkey, addr);
-
-        // If there's room for another SGE, write a sentinel to mark end of list.
-        // The sentinel has byte_count=0 and lkey=MLX5_INVALID_LKEY.
-        if self.stride > DataSeg::SIZE as u32 {
-            let sentinel_ptr = wqe_ptr.add(DataSeg::SIZE);
-            let ptr32 = sentinel_ptr as *mut u32;
-            std::ptr::write_volatile(ptr32, 0u32); // byte_count = 0
-            std::ptr::write_volatile(ptr32.add(1), MLX5_INVALID_LKEY.to_be()); // lkey = invalid
-        }
-
-        self.pi.set(pi.wrapping_add(1));
-    }
 }
 
 // =============================================================================
@@ -1398,17 +1373,6 @@ where
 // =============================================================================
 
 impl<T, Tab, F> RcQpInner<T, Tab, F> {
-    /// Post a receive WQE.
-    ///
-    /// # Safety
-    /// - The buffer must be registered and valid
-    /// - There must be available slots in the RQ
-    pub unsafe fn post_recv(&self, addr: u64, len: u32, lkey: u32) {
-        if let Some(rq) = self.rq.as_ref() {
-            rq.post(addr, len, lkey);
-        }
-    }
-
     /// Ring the RQ doorbell to notify HCA of new WQEs.
     pub fn ring_rq_doorbell(&self) {
         if let Some(rq) = self.rq.as_ref() {

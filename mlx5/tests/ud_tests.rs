@@ -168,13 +168,13 @@ fn test_ud_send_recv() {
 
     // Post receive (must include space for GRH)
     let recv_len = 256 + GRH_SIZE as u32;
-    unsafe {
-        receiver
-            .borrow_mut()
-            .post_recv(recv_buf.addr(), recv_len, recv_mr.lkey())
-            .expect("Failed to post recv");
-    }
-    receiver.borrow_mut().ring_rq_doorbell();
+    receiver
+        .borrow()
+        .recv_builder(0u64)
+        .expect("Failed to create recv builder")
+        .sge(recv_buf.addr(), recv_len, recv_mr.lkey())
+        .finish();
+    receiver.borrow().ring_rq_doorbell();
 
     // Prepare test data
     let test_data = b"UD SEND test - connectionless datagram!";
@@ -303,13 +303,13 @@ fn test_ud_send_raw_av() {
 
     // Post receive
     let recv_len = 256 + GRH_SIZE as u32;
-    unsafe {
-        receiver
-            .borrow_mut()
-            .post_recv(recv_buf.addr(), recv_len, recv_mr.lkey())
-            .expect("Failed to post recv");
-    }
-    receiver.borrow_mut().ring_rq_doorbell();
+    receiver
+        .borrow()
+        .recv_builder(0u64)
+        .expect("Failed to create recv builder")
+        .sge(recv_buf.addr(), recv_len, recv_mr.lkey())
+        .finish();
+    receiver.borrow().ring_rq_doorbell();
 
     // Prepare test data
     let test_data = b"UD SEND with raw AV - direct addressing!";
@@ -422,13 +422,13 @@ fn test_ud_multiple_destinations() {
                 .expect("Failed to register recv MR");
 
         // Post receive
-        unsafe {
-            receiver
-                .borrow_mut()
-                .post_recv(recv_buf.addr(), 256 + GRH_SIZE as u32, recv_mr.lkey())
-                .expect("Failed to post recv");
-        }
-        receiver.borrow_mut().ring_rq_doorbell();
+        receiver
+            .borrow()
+            .recv_builder(i as u64)
+            .expect("Failed to create recv builder")
+            .sge(recv_buf.addr(), 256 + GRH_SIZE as u32, recv_mr.lkey())
+            .finish();
+        receiver.borrow().ring_rq_doorbell();
 
         receivers.push(receiver);
         recv_bufs.push(recv_buf);

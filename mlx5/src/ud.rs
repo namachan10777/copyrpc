@@ -194,21 +194,48 @@ impl<T> UdRecvQueueState<T> {
         (self.wqe_cnt as u32) - (self.pi.get().wrapping_sub(self.ci.get()) as u32)
     }
 
-    /// Post a receive WQE without entry tracking (legacy).
-    unsafe fn post(&self, addr: u64, len: u32, lkey: u32) {
-        let wqe_ptr = self.get_wqe_ptr(self.pi.get());
-
-        // RQ WQE format: Data Segment (16 bytes)
-        DataSeg::write(wqe_ptr, len, lkey, addr);
-
-        self.pi.set(self.pi.get().wrapping_add(1));
-    }
-
     fn ring_doorbell(&self) {
         mmio_flush_writes!();
         unsafe {
             std::ptr::write_volatile(self.dbrec, (self.pi.get() as u32).to_be());
         }
+    }
+}
+
+// =============================================================================
+// UD Receive WQE Builder
+// =============================================================================
+
+/// Zero-copy WQE builder for UD receive operations.
+///
+/// Writes segments directly to the RQ buffer without intermediate copies.
+pub struct UdRecvWqeBuilder<'a, T> {
+    rq: &'a UdRecvQueueState<T>,
+    entry: T,
+    wqe_idx: u16,
+}
+
+impl<'a, T> UdRecvWqeBuilder<'a, T> {
+    /// Add a data segment (SGE) for the receive buffer.
+    ///
+    /// # Safety
+    /// The caller must ensure the buffer is registered and valid.
+    pub fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
+        unsafe {
+            let wqe_ptr = self.rq.get_wqe_ptr(self.wqe_idx);
+            DataSeg::write(wqe_ptr, len, lkey, addr);
+        }
+        self
+    }
+
+    /// Finish the receive WQE construction.
+    ///
+    /// Stores the entry in the table and advances the producer index.
+    /// Call `ring_rq_doorbell()` after posting one or more WQEs to notify the HCA.
+    pub fn finish(self) {
+        let idx = (self.wqe_idx as usize) & ((self.rq.wqe_cnt - 1) as usize);
+        self.rq.table.borrow_mut()[idx] = Some(self.entry);
+        self.rq.pi.set(self.rq.pi.get().wrapping_add(1));
     }
 }
 
@@ -863,22 +890,28 @@ impl<T, Tab, F> UdQp<T, Tab, F> {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "direct access not initialized"))
     }
 
-    /// Post a receive WQE.
-    ///
-    /// # Safety
-    /// - The buffer must be registered and valid
-    /// - Direct access must be initialized
-    pub unsafe fn post_recv(&self, addr: u64, len: u32, lkey: u32) -> io::Result<()> {
-        let rq = self.rq()?;
-        rq.post(addr, len, lkey);
-        Ok(())
-    }
-
     /// Ring the receive queue doorbell.
     pub fn ring_rq_doorbell(&self) {
         if let Some(rq) = self.rq.as_ref() {
             rq.ring_doorbell();
         }
+    }
+
+    /// Get a receive WQE builder for zero-copy WQE construction.
+    ///
+    /// The entry will be stored and returned via callback on RQ completion.
+    pub fn recv_builder(&self, entry: T) -> io::Result<UdRecvWqeBuilder<'_, T>> {
+        let rq = self.rq()?;
+        if rq.available() == 0 {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "RQ full"));
+        }
+
+        let wqe_idx = rq.pi.get();
+        Ok(UdRecvWqeBuilder {
+            rq,
+            entry,
+            wqe_idx,
+        })
     }
 }
 

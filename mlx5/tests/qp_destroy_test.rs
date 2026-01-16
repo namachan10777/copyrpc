@@ -347,12 +347,11 @@ fn test_qp_destroy_after_data_transfer() {
 
         // Pre-post receives
         for i in 0..32 {
-            unsafe {
-                qp.borrow_mut()
-                    .post_recv(buf.addr() + (i * 64) as u64, 64, mr.lkey());
-            }
+            let _ = qp.borrow()
+                .recv_builder(i as u64)
+                .map(|b| b.sge(buf.addr() + (i * 64) as u64, 64, mr.lkey()).finish());
         }
-        qp.borrow_mut().ring_rq_doorbell();
+        qp.borrow().ring_rq_doorbell();
 
         eprintln!("Server: Ready");
         server_ready_clone.store(1, Ordering::Release);
@@ -423,12 +422,11 @@ fn test_qp_destroy_after_data_transfer() {
 
     // Pre-post receives
     for i in 0..32 {
-        unsafe {
-            qp.borrow_mut()
-                .post_recv(buf.addr() + (i * 64) as u64, 64, mr.lkey());
-        }
+        let _ = qp.borrow()
+            .recv_builder(i as u64)
+            .map(|b| b.sge(buf.addr() + (i * 64) as u64, 64, mr.lkey()).finish());
     }
-    qp.borrow_mut().ring_rq_doorbell();
+    qp.borrow().ring_rq_doorbell();
 
     // Wait for server ready
     while server_ready.load(Ordering::Acquire) == 0 {
@@ -553,12 +551,11 @@ fn test_qp_destroy_after_actual_send_recv() {
 
         // Pre-post receives
         for i in 0..32 {
-            unsafe {
-                qp.borrow_mut()
-                    .post_recv(buf.addr() + (i * 64) as u64, 64, mr.lkey());
-            }
+            let _ = qp.borrow()
+                .recv_builder(i as u64)
+                .map(|b| b.sge(buf.addr() + (i * 64) as u64, 64, mr.lkey()).finish());
         }
-        qp.borrow_mut().ring_rq_doorbell();
+        qp.borrow().ring_rq_doorbell();
 
         eprintln!("Server: Ready");
         server_ready_clone.store(1, Ordering::Release);
@@ -590,10 +587,10 @@ fn test_qp_destroy_after_actual_send_recv() {
                 });
 
                 // Repost recv
-                unsafe {
-                    qp.borrow_mut().post_recv(buf.addr() + offset, 64, mr.lkey());
-                }
-                qp.borrow_mut().ring_rq_doorbell();
+                let _ = qp.borrow()
+                    .recv_builder(idx as u64)
+                    .map(|b| b.sge(buf.addr() + offset, 64, mr.lkey()).finish());
+                qp.borrow().ring_rq_doorbell();
             }
 
             // Drain send CQ using poll()
@@ -677,12 +674,11 @@ fn test_qp_destroy_after_actual_send_recv() {
 
     // Pre-post receives
     for i in 0..32 {
-        unsafe {
-            qp.borrow_mut()
-                .post_recv(buf.addr() + (i * 64) as u64, 64, mr.lkey());
-        }
+        let _ = qp.borrow()
+            .recv_builder(i as u64)
+            .map(|b| b.sge(buf.addr() + (i * 64) as u64, 64, mr.lkey()).finish());
     }
-    qp.borrow_mut().ring_rq_doorbell();
+    qp.borrow().ring_rq_doorbell();
 
     // Wait for server ready
     while server_ready.load(Ordering::Acquire) == 0 {
@@ -731,10 +727,10 @@ fn test_qp_destroy_after_actual_send_recv() {
             let offset = (idx * 64) as u64;
 
             // Repost recv
-            unsafe {
-                qp.borrow_mut().post_recv(buf.addr() + offset, 64, mr.lkey());
-            }
-            qp.borrow_mut().ring_rq_doorbell();
+            let _ = qp.borrow()
+                .recv_builder(idx as u64)
+                .map(|b| b.sge(buf.addr() + offset, 64, mr.lkey()).finish());
+            qp.borrow().ring_rq_doorbell();
 
             // Send more if needed
             if sent < target {

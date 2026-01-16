@@ -53,7 +53,7 @@ fn test_dc_creation() {
         max_wr: 128,
         max_sge: 1,
     };
-    let srq = ctx
+    let srq: mlx5::srq::Srq<()> = ctx
         .pd
         .create_srq(&srq_config)
         .expect("Failed to create SRQ");
@@ -119,7 +119,7 @@ fn test_dc_rdma_write() {
         max_wr: 128,
         max_sge: 1,
     };
-    let srq = ctx
+    let srq: mlx5::srq::Srq<()> = ctx
         .pd
         .create_srq(&srq_config)
         .expect("Failed to create SRQ");
@@ -218,7 +218,7 @@ fn test_dc_rdma_read() {
         max_wr: 128,
         max_sge: 1,
     };
-    let srq = ctx
+    let srq: mlx5::srq::Srq<()> = ctx
         .pd
         .create_srq(&srq_config)
         .expect("Failed to create SRQ");
@@ -317,7 +317,7 @@ fn test_dc_multiple_dci() {
         max_wr: 128,
         max_sge: 1,
     };
-    let srq = ctx
+    let srq: mlx5::srq::Srq<()> = ctx
         .pd
         .create_srq(&srq_config)
         .expect("Failed to create SRQ");
