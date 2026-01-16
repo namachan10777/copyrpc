@@ -96,6 +96,7 @@ pub struct QpInfo {
 /// Send Queue state for direct WQE posting.
 ///
 /// Generic over the table type `Tab` which determines dense vs sparse behavior.
+/// Both table types use interior mutability (Cell) so no RefCell wrapper is needed.
 pub(crate) struct SendQueueState<T, Tab> {
     /// SQ buffer base address
     buf: *mut u8,
@@ -117,8 +118,9 @@ pub(crate) struct SendQueueState<T, Tab> {
     bf_size: u32,
     /// Current BlueFlame offset (alternates between 0 and bf_size)
     bf_offset: Cell<u32>,
-    /// WQE table for tracking in-flight operations
-    table: RefCell<Tab>,
+    /// WQE table for tracking in-flight operations.
+    /// Uses interior mutability (Cell<Option<T>>) so no RefCell needed.
+    table: Tab,
     /// Phantom for entry type
     _marker: std::marker::PhantomData<T>,
 }
@@ -195,7 +197,7 @@ impl<T, Tab> SendQueueState<T, Tab> {
 impl<T> SendQueueState<T, SparseWqeTable<T>> {
     fn process_completion_sparse(&self, wqe_idx: u16) -> Option<T> {
         self.ci.set(wqe_idx);
-        self.table.borrow_mut().take(wqe_idx)
+        self.table.take(wqe_idx)
     }
 }
 
@@ -204,7 +206,10 @@ impl<T> SendQueueState<T, DenseWqeTable<T>> {
     where
         F: FnMut(u16, T),
     {
-        for (idx, entry) in self.table.borrow_mut().drain_range(self.ci.get(), new_ci) {
+        // Use take_range which only holds a shared reference to the table.
+        // This allows callbacks to safely access the QP (e.g., post new WQEs)
+        // without causing a RefCell borrow conflict.
+        for (idx, entry) in self.table.take_range(self.ci.get(), new_ci) {
             callback(idx, entry);
         }
         self.ci.set(new_ci);
@@ -220,6 +225,9 @@ impl<T> SendQueueState<T, DenseWqeTable<T>> {
 /// Generic over `T`, the entry type stored in the WQE table.
 /// Unlike SQ, all RQ WQEs generate completions (all signaled),
 /// so we use a simple table without sparse/dense distinction.
+///
+/// Uses `Cell<Option<T>>` for interior mutability, allowing safe access
+/// without requiring `RefCell` or mutable borrows.
 pub(crate) struct ReceiveQueueState<T> {
     /// RQ buffer base address
     buf: *mut u8,
@@ -233,8 +241,8 @@ pub(crate) struct ReceiveQueueState<T> {
     ci: Cell<u16>,
     /// Doorbell record pointer (dbrec[0] for RQ)
     dbrec: *mut u32,
-    /// Entry table (all WQEs are signaled, so simple Option<T> array)
-    table: RefCell<Box<[Option<T>]>>,
+    /// Entry table (all WQEs are signaled, uses Cell for interior mutability)
+    table: Box<[Cell<Option<T>>]>,
 }
 
 /// MLX5 invalid lkey value used to mark end of SGE list.
@@ -252,7 +260,7 @@ impl<T> ReceiveQueueState<T> {
     fn process_completion(&self, wqe_idx: u16) -> Option<T> {
         self.ci.set(wqe_idx.wrapping_add(1));
         let idx = (wqe_idx as usize) & ((self.wqe_cnt - 1) as usize);
-        self.table.borrow_mut()[idx].take()
+        self.table[idx].take()
     }
 
     /// Get the number of available WQE slots.
@@ -310,7 +318,7 @@ impl<'a, T> RecvWqeBuilder<'a, T> {
     /// Call `ring_rq_doorbell()` after posting one or more WQEs to notify the HCA.
     pub fn finish(self) {
         let idx = (self.wqe_idx as usize) & ((self.rq.wqe_cnt - 1) as usize);
-        self.rq.table.borrow_mut()[idx] = Some(self.entry);
+        self.rq.table[idx].set(Some(self.entry));
         self.rq.pi.set(self.rq.pi.get().wrapping_add(1));
     }
 }
@@ -958,7 +966,7 @@ impl<T, F> RcQp<T, F> {
             bf_reg: info.bf_reg,
             bf_size: info.bf_size,
             bf_offset: Cell::new(0),
-            table: RefCell::new(SparseWqeTable::new(wqe_cnt)),
+            table: SparseWqeTable::new(wqe_cnt),
             _marker: std::marker::PhantomData,
         });
 
@@ -970,7 +978,7 @@ impl<T, F> RcQp<T, F> {
             pi: Cell::new(0),
             ci: Cell::new(0),
             dbrec: info.dbrec,
-            table: RefCell::new((0..rq_wqe_cnt).map(|_| None).collect()),
+            table: (0..rq_wqe_cnt).map(|_| Cell::new(None)).collect(),
         });
 
         Ok(())
@@ -1085,7 +1093,7 @@ impl<T, F> DenseRcQp<T, F> {
             bf_reg: info.bf_reg,
             bf_size: info.bf_size,
             bf_offset: Cell::new(0),
-            table: RefCell::new(DenseWqeTable::new(wqe_cnt)),
+            table: DenseWqeTable::new(wqe_cnt),
             _marker: std::marker::PhantomData,
         });
 
@@ -1097,7 +1105,7 @@ impl<T, F> DenseRcQp<T, F> {
             pi: Cell::new(0),
             ci: Cell::new(0),
             dbrec: info.dbrec,
-            table: RefCell::new((0..rq_wqe_cnt).map(|_| None).collect()),
+            table: (0..rq_wqe_cnt).map(|_| Cell::new(None)).collect(),
         });
 
         Ok(())
@@ -1221,7 +1229,7 @@ impl<'a, T> SparseWqeBuilder<'a, T> {
     pub fn finish(self) -> WqeHandle {
         let wqe_idx = self.inner.wqe_idx;
         if let Some(entry) = self.entry {
-            self.inner.sq.table.borrow_mut().store(wqe_idx, entry);
+            self.inner.sq.table.store(wqe_idx, entry);
         }
         self.inner.finish_internal()
     }
@@ -1233,7 +1241,7 @@ impl<'a, T> SparseWqeBuilder<'a, T> {
     pub fn finish_with_blueflame(self) -> WqeHandle {
         let wqe_idx = self.inner.wqe_idx;
         if let Some(entry) = self.entry {
-            self.inner.sq.table.borrow_mut().store(wqe_idx, entry);
+            self.inner.sq.table.store(wqe_idx, entry);
         }
         self.inner.finish_internal_with_blueflame()
     }
@@ -1285,7 +1293,7 @@ impl<'a, T> DenseWqeBuilder<'a, T> {
     /// Finish the WQE construction.
     pub fn finish(self) -> WqeHandle {
         let wqe_idx = self.inner.wqe_idx;
-        self.inner.sq.table.borrow_mut().store(wqe_idx, self.entry);
+        self.inner.sq.table.store(wqe_idx, self.entry);
         self.inner.finish_internal()
     }
 
@@ -1295,7 +1303,7 @@ impl<'a, T> DenseWqeBuilder<'a, T> {
     /// `ring_sq_doorbell()` afterwards.
     pub fn finish_with_blueflame(self) -> WqeHandle {
         let wqe_idx = self.inner.wqe_idx;
-        self.inner.sq.table.borrow_mut().store(wqe_idx, self.entry);
+        self.inner.sq.table.store(wqe_idx, self.entry);
         self.inner.finish_internal_with_blueflame()
     }
 }

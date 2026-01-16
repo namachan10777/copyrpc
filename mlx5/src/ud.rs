@@ -72,6 +72,8 @@ pub enum UdQpState {
 // =============================================================================
 
 /// Send Queue state for UD QP.
+///
+/// Both table types use interior mutability (Cell) so no RefCell wrapper is needed.
 struct UdSendQueueState<T, Tab> {
     buf: *mut u8,
     wqe_cnt: u16,
@@ -83,7 +85,9 @@ struct UdSendQueueState<T, Tab> {
     bf_reg: *mut u8,
     bf_size: u32,
     bf_offset: Cell<u32>,
-    table: RefCell<Tab>,
+    /// WQE table for tracking in-flight operations.
+    /// Uses interior mutability (Cell<Option<T>>) so no RefCell needed.
+    table: Tab,
     _marker: PhantomData<T>,
 }
 
@@ -139,7 +143,7 @@ impl<T, Tab> UdSendQueueState<T, Tab> {
 impl<T> UdSendQueueState<T, SparseWqeTable<T>> {
     fn process_completion_sparse(&self, wqe_idx: u16) -> Option<T> {
         self.ci.set(wqe_idx);
-        self.table.borrow_mut().take(wqe_idx)
+        self.table.take(wqe_idx)
     }
 }
 
@@ -148,7 +152,10 @@ impl<T> UdSendQueueState<T, DenseWqeTable<T>> {
     where
         F: FnMut(u16, T),
     {
-        for (idx, entry) in self.table.borrow_mut().drain_range(self.ci.get(), new_ci) {
+        // Use take_range which only holds a shared reference to the table.
+        // This allows callbacks to safely access the QP (e.g., post new WQEs)
+        // without causing a RefCell borrow conflict.
+        for (idx, entry) in self.table.take_range(self.ci.get(), new_ci) {
             callback(idx, entry);
         }
         self.ci.set(new_ci);
@@ -166,6 +173,9 @@ const MLX5_INVALID_LKEY: u32 = 0x100;
 ///
 /// Generic over `T`, the entry type stored in the WQE table.
 /// Unlike SQ, all RQ WQEs generate completions (all signaled).
+///
+/// Uses `Cell<Option<T>>` for interior mutability, allowing safe access
+/// without requiring `RefCell` or mutable borrows.
 struct UdRecvQueueState<T> {
     buf: *mut u8,
     wqe_cnt: u16,
@@ -173,7 +183,8 @@ struct UdRecvQueueState<T> {
     pi: Cell<u16>,
     ci: Cell<u16>,
     dbrec: *mut u32,
-    table: RefCell<Box<[Option<T>]>>,
+    /// Entry table (all WQEs are signaled, uses Cell for interior mutability)
+    table: Box<[Cell<Option<T>>]>,
 }
 
 impl<T> UdRecvQueueState<T> {
@@ -186,7 +197,7 @@ impl<T> UdRecvQueueState<T> {
     fn process_completion(&self, wqe_idx: u16) -> Option<T> {
         self.ci.set(wqe_idx.wrapping_add(1));
         let idx = (wqe_idx as usize) & ((self.wqe_cnt - 1) as usize);
-        self.table.borrow_mut()[idx].take()
+        self.table[idx].take()
     }
 
     /// Get the number of available WQE slots.
@@ -234,7 +245,7 @@ impl<'a, T> UdRecvWqeBuilder<'a, T> {
     /// Call `ring_rq_doorbell()` after posting one or more WQEs to notify the HCA.
     pub fn finish(self) {
         let idx = (self.wqe_idx as usize) & ((self.rq.wqe_cnt - 1) as usize);
-        self.rq.table.borrow_mut()[idx] = Some(self.entry);
+        self.rq.table[idx].set(Some(self.entry));
         self.rq.pi.set(self.rq.pi.get().wrapping_add(1));
     }
 }
@@ -488,7 +499,7 @@ impl<'a, T> SparseUdWqeBuilder<'a, T> {
     pub fn finish(self) -> WqeHandle {
         let wqe_idx = self.inner.wqe_idx;
         if let Some(entry) = self.entry {
-            self.inner.sq.table.borrow_mut().store(wqe_idx, entry);
+            self.inner.sq.table.store(wqe_idx, entry);
         }
         self.inner.finish_internal()
     }
@@ -497,7 +508,7 @@ impl<'a, T> SparseUdWqeBuilder<'a, T> {
     pub fn finish_with_blueflame(self) -> WqeHandle {
         let wqe_idx = self.inner.wqe_idx;
         if let Some(entry) = self.entry {
-            self.inner.sq.table.borrow_mut().store(wqe_idx, entry);
+            self.inner.sq.table.store(wqe_idx, entry);
         }
         self.inner.finish_internal_with_blueflame()
     }
@@ -543,14 +554,14 @@ impl<'a, T> DenseUdWqeBuilder<'a, T> {
     /// Finish the WQE construction.
     pub fn finish(self) -> WqeHandle {
         let wqe_idx = self.inner.wqe_idx;
-        self.inner.sq.table.borrow_mut().store(wqe_idx, self.entry);
+        self.inner.sq.table.store(wqe_idx, self.entry);
         self.inner.finish_internal()
     }
 
     /// Finish the WQE construction with BlueFlame doorbell.
     pub fn finish_with_blueflame(self) -> WqeHandle {
         let wqe_idx = self.inner.wqe_idx;
-        self.inner.sq.table.borrow_mut().store(wqe_idx, self.entry);
+        self.inner.sq.table.store(wqe_idx, self.entry);
         self.inner.finish_internal_with_blueflame()
     }
 }
@@ -932,7 +943,7 @@ impl<T, F> UdQpSparseWqeTable<T, F> {
             bf_reg: info.bf_reg,
             bf_size: info.bf_size,
             bf_offset: Cell::new(0),
-            table: RefCell::new(SparseWqeTable::new(wqe_cnt)),
+            table: SparseWqeTable::new(wqe_cnt),
             _marker: PhantomData,
         });
 
@@ -944,7 +955,7 @@ impl<T, F> UdQpSparseWqeTable<T, F> {
             pi: Cell::new(0),
             ci: Cell::new(0),
             dbrec: info.dbrec,
-            table: RefCell::new((0..rq_wqe_cnt).map(|_| None).collect()),
+            table: (0..rq_wqe_cnt).map(|_| Cell::new(None)).collect(),
         });
 
         Ok(())
@@ -1023,7 +1034,7 @@ impl<T, F> UdQpDenseWqeTable<T, F> {
             bf_reg: info.bf_reg,
             bf_size: info.bf_size,
             bf_offset: Cell::new(0),
-            table: RefCell::new(DenseWqeTable::new(wqe_cnt)),
+            table: DenseWqeTable::new(wqe_cnt),
             _marker: PhantomData,
         });
 
@@ -1035,7 +1046,7 @@ impl<T, F> UdQpDenseWqeTable<T, F> {
             pi: Cell::new(0),
             ci: Cell::new(0),
             dbrec: info.dbrec,
-            table: RefCell::new((0..rq_wqe_cnt).map(|_| None).collect()),
+            table: (0..rq_wqe_cnt).map(|_| Cell::new(None)).collect(),
         });
 
         Ok(())

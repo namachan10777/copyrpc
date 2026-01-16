@@ -81,6 +81,7 @@ pub struct RemoteDctInfo {
 /// Send Queue state for DCI.
 ///
 /// Generic over the table type `Tab` which determines dense vs sparse behavior.
+/// Both table types use interior mutability (Cell) so no RefCell wrapper is needed.
 struct DciSendQueueState<T, Tab> {
     buf: *mut u8,
     wqe_cnt: u16,
@@ -92,7 +93,9 @@ struct DciSendQueueState<T, Tab> {
     bf_reg: *mut u8,
     bf_size: u32,
     bf_offset: Cell<u32>,
-    table: RefCell<Tab>,
+    /// WQE table for tracking in-flight operations.
+    /// Uses interior mutability (Cell<Option<T>>) so no RefCell needed.
+    table: Tab,
     _marker: PhantomData<T>,
 }
 
@@ -167,7 +170,7 @@ impl<T, Tab> DciSendQueueState<T, Tab> {
 impl<T> DciSendQueueState<T, SparseWqeTable<T>> {
     fn process_completion_sparse(&self, wqe_idx: u16) -> Option<T> {
         self.ci.set(wqe_idx);
-        self.table.borrow_mut().take(wqe_idx)
+        self.table.take(wqe_idx)
     }
 }
 
@@ -176,7 +179,10 @@ impl<T> DciSendQueueState<T, DenseWqeTable<T>> {
     where
         F: FnMut(u16, T),
     {
-        for (idx, entry) in self.table.borrow_mut().drain_range(self.ci.get(), new_ci) {
+        // Use take_range which only holds a shared reference to the table.
+        // This allows callbacks to safely access the DCI (e.g., post new WQEs)
+        // without causing a RefCell borrow conflict.
+        for (idx, entry) in self.table.take_range(self.ci.get(), new_ci) {
             callback(idx, entry);
         }
         self.ci.set(new_ci);
@@ -376,7 +382,7 @@ impl<'a, T> SparseDciWqeBuilder<'a, T> {
     pub fn finish(self) -> WqeHandle {
         let wqe_idx = self.inner.wqe_idx;
         if let Some(entry) = self.entry {
-            self.inner.sq.table.borrow_mut().store(wqe_idx, entry);
+            self.inner.sq.table.store(wqe_idx, entry);
         }
         self.inner.finish_internal()
     }
@@ -388,7 +394,7 @@ impl<'a, T> SparseDciWqeBuilder<'a, T> {
     pub fn finish_with_blueflame(self) -> WqeHandle {
         let wqe_idx = self.inner.wqe_idx;
         if let Some(entry) = self.entry {
-            self.inner.sq.table.borrow_mut().store(wqe_idx, entry);
+            self.inner.sq.table.store(wqe_idx, entry);
         }
         self.inner.finish_internal_with_blueflame()
     }
@@ -434,7 +440,7 @@ impl<'a, T> DenseDciWqeBuilder<'a, T> {
     /// Finish the WQE construction.
     pub fn finish(self) -> WqeHandle {
         let wqe_idx = self.inner.wqe_idx;
-        self.inner.sq.table.borrow_mut().store(wqe_idx, self.entry);
+        self.inner.sq.table.store(wqe_idx, self.entry);
         self.inner.finish_internal()
     }
 
@@ -444,7 +450,7 @@ impl<'a, T> DenseDciWqeBuilder<'a, T> {
     /// `ring_sq_doorbell()` afterwards.
     pub fn finish_with_blueflame(self) -> WqeHandle {
         let wqe_idx = self.inner.wqe_idx;
-        self.inner.sq.table.borrow_mut().store(wqe_idx, self.entry);
+        self.inner.sq.table.store(wqe_idx, self.entry);
         self.inner.finish_internal_with_blueflame()
     }
 }
@@ -869,7 +875,7 @@ impl<T, F> DciSparseWqeTable<T, F> {
             bf_reg: info.bf_reg,
             bf_size: info.bf_size,
             bf_offset: Cell::new(0),
-            table: RefCell::new(SparseWqeTable::new(wqe_cnt)),
+            table: SparseWqeTable::new(wqe_cnt),
             _marker: PhantomData,
         });
 
@@ -955,7 +961,7 @@ impl<T, F> DciDenseWqeTable<T, F> {
             bf_reg: info.bf_reg,
             bf_size: info.bf_size,
             bf_offset: Cell::new(0),
-            table: RefCell::new(DenseWqeTable::new(wqe_cnt)),
+            table: DenseWqeTable::new(wqe_cnt),
             _marker: PhantomData,
         });
 

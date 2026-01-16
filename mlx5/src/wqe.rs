@@ -324,6 +324,8 @@ pub struct WqeHandle {
 // WQE Table (Sparse - for signaled-only completion)
 // =============================================================================
 
+use std::cell::Cell;
+
 /// Sparse WQE table for tracking signaled operations only.
 ///
 /// Only signaled WQEs have entries stored. When a CQE arrives, only the
@@ -331,9 +333,12 @@ pub struct WqeHandle {
 ///
 /// Also used for unordered queues where entries track slot availability.
 ///
+/// Uses `Cell<Option<T>>` for interior mutability, allowing safe access
+/// without requiring `RefCell` or mutable borrows.
+///
 /// The table size must be a power of 2 for fast modulo via bit masking.
 pub struct SparseWqeTable<T> {
-    entries: Box<[Option<T>]>,
+    entries: Box<[Cell<Option<T>>]>,
     mask: u16,
 }
 
@@ -345,7 +350,7 @@ impl<T> SparseWqeTable<T> {
     pub fn new(wqe_cnt: u16) -> Self {
         debug_assert!(wqe_cnt.is_power_of_two(), "wqe_cnt must be power of 2");
         let entries = (0..wqe_cnt)
-            .map(|_| None)
+            .map(|_| Cell::new(None))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
@@ -356,14 +361,14 @@ impl<T> SparseWqeTable<T> {
 
     /// Store an entry at the given index.
     #[inline]
-    pub fn store(&mut self, idx: u16, entry: T) {
+    pub fn store(&self, idx: u16, entry: T) {
         let slot = (idx & self.mask) as usize;
-        self.entries[slot] = Some(entry);
+        self.entries[slot].set(Some(entry));
     }
 
     /// Take the entry at the given index, leaving None.
     #[inline]
-    pub fn take(&mut self, idx: u16) -> Option<T> {
+    pub fn take(&self, idx: u16) -> Option<T> {
         let slot = (idx & self.mask) as usize;
         self.entries[slot].take()
     }
@@ -372,14 +377,26 @@ impl<T> SparseWqeTable<T> {
     #[inline]
     pub fn is_available(&self, idx: u16) -> bool {
         let slot = (idx & self.mask) as usize;
-        self.entries[slot].is_none()
+        // Temporarily take and put back to check
+        let val = self.entries[slot].take();
+        let is_none = val.is_none();
+        self.entries[slot].set(val);
+        is_none
     }
 
     /// Count available slots by scanning the table.
     ///
     /// For unordered queues where gaps may exist.
     pub fn count_available(&self) -> u16 {
-        self.entries.iter().filter(|e| e.is_none()).count() as u16
+        self.entries
+            .iter()
+            .filter(|e| {
+                let val = e.take();
+                let is_none = val.is_none();
+                e.set(val);
+                is_none
+            })
+            .count() as u16
     }
 }
 
@@ -387,18 +404,19 @@ impl<T> SparseWqeTable<T> {
 // WQE Table (Dense - for all-entry callback)
 // =============================================================================
 
-use std::mem::MaybeUninit;
-
 /// Dense WQE table for tracking all WQE operations.
 ///
 /// Every WQE must have an entry. When a signaled CQE arrives, all entries
 /// from old_ci to new_ci are drained and passed to the callback.
 ///
-/// Uses `MaybeUninit<T>` internally for efficiency (no Option check).
+/// Uses `Cell<Option<T>>` for interior mutability, allowing safe access
+/// without requiring `RefCell` or mutable borrows. This is critical for
+/// allowing callbacks to post new WQEs while completion processing is
+/// in progress.
 ///
 /// The table size must be a power of 2 for fast modulo via bit masking.
 pub struct DenseWqeTable<T> {
-    entries: Box<[MaybeUninit<T>]>,
+    entries: Box<[Cell<Option<T>>]>,
     mask: u16,
 }
 
@@ -410,7 +428,7 @@ impl<T> DenseWqeTable<T> {
     pub fn new(wqe_cnt: u16) -> Self {
         debug_assert!(wqe_cnt.is_power_of_two(), "wqe_cnt must be power of 2");
         let entries = (0..wqe_cnt)
-            .map(|_| MaybeUninit::uninit())
+            .map(|_| Cell::new(None))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
@@ -421,26 +439,29 @@ impl<T> DenseWqeTable<T> {
 
     /// Store an entry at the given index.
     #[inline]
-    pub fn store(&mut self, idx: u16, entry: T) {
+    pub fn store(&self, idx: u16, entry: T) {
         let slot = (idx & self.mask) as usize;
-        self.entries[slot].write(entry);
+        self.entries[slot].set(Some(entry));
     }
 
     /// Take the entry at the given index.
     ///
-    /// # Safety
-    /// The entry at this index must have been stored previously.
+    /// Returns the entry if present, None otherwise.
     #[inline]
-    unsafe fn take(&mut self, idx: u16) -> T {
+    pub fn take(&self, idx: u16) -> Option<T> {
         let slot = (idx & self.mask) as usize;
-        self.entries[slot].assume_init_read()
+        self.entries[slot].take()
     }
 
-    /// Drain all entries from old_ci (exclusive) to new_ci (inclusive).
+    /// Take all entries from old_ci (exclusive) to new_ci (inclusive).
     ///
-    /// All slots in range must have entries stored.
-    pub fn drain_range(&mut self, old_ci: u16, new_ci: u16) -> DenseDrainRange<'_, T> {
-        DenseDrainRange {
+    /// Unlike the previous mutable iterator approach, this method takes `&self`
+    /// and collects entries upfront, so no borrow is held during callback
+    /// invocation.
+    ///
+    /// All slots in range are expected to have entries (dense table invariant).
+    pub fn take_range(&self, old_ci: u16, new_ci: u16) -> impl Iterator<Item = (u16, T)> + '_ {
+        DenseTakeRange {
             table: self,
             current: old_ci.wrapping_add(1),
             end: new_ci.wrapping_add(1),
@@ -448,22 +469,26 @@ impl<T> DenseWqeTable<T> {
     }
 }
 
-/// Iterator that drains all entries from a dense WQE table range.
-pub struct DenseDrainRange<'a, T> {
-    table: &'a mut DenseWqeTable<T>,
+/// Iterator that takes entries from a dense WQE table range.
+///
+/// This iterator only holds a shared reference to the table, allowing
+/// callbacks to safely access the table through other references.
+pub struct DenseTakeRange<'a, T> {
+    table: &'a DenseWqeTable<T>,
     current: u16,
     end: u16,
 }
 
-impl<T> Iterator for DenseDrainRange<'_, T> {
+impl<T> Iterator for DenseTakeRange<'_, T> {
     type Item = (u16, T);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.current != self.end {
             let idx = self.current;
             self.current = self.current.wrapping_add(1);
-            // SAFETY: Dense table guarantees all entries in range are initialized
-            Some((idx, unsafe { self.table.take(idx) }))
+            // Take the entry using Cell::take (interior mutability)
+            // Dense table guarantees all entries in range are present
+            self.table.take(idx).map(|entry| (idx, entry))
         } else {
             None
         }
