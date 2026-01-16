@@ -309,8 +309,17 @@ impl CompletionQueue {
     /// Returns the number of completions processed.
     #[inline]
     pub fn poll(&self) -> usize {
-        let mut count = 0;
-        while let Some(cqe) = self.try_next_cqe() {
+        // First CQE: no prefetch (don't know if any CQE is ready)
+        let Some(cqe) = self.try_next_cqe(false) else {
+            return 0;
+        };
+        if let Some(queue) = self.find_queue(cqe.qp_num) {
+            queue.borrow().dispatch_cqe(cqe);
+        }
+
+        // Subsequent CQEs: prefetch next slot (batch processing path)
+        let mut count = 1;
+        while let Some(cqe) = self.try_next_cqe(true) {
             if let Some(queue) = self.find_queue(cqe.qp_num) {
                 queue.borrow().dispatch_cqe(cqe);
             }
@@ -337,13 +346,14 @@ impl CompletionQueue {
     ///
     /// Returns None if no CQE is available.
     #[inline]
-    fn try_next_cqe(&self) -> Option<Cqe> {
+    fn try_next_cqe(&self, prefetch_next: bool) -> Option<Cqe> {
         let state = self.state.as_ref()?;
 
         let ci = state.ci.get();
         let cqe_mask = state.cqe_cnt - 1;
         let idx = ci & cqe_mask;
-        let cqe_ptr = unsafe { state.buf.add((idx as usize) * (state.cqe_size as usize)) };
+        let cqe_size = state.cqe_size as usize;
+        let cqe_ptr = unsafe { state.buf.add((idx as usize) * cqe_size) };
 
         // Owner bit check
         let op_own = unsafe { std::ptr::read_volatile(cqe_ptr.add(63)) };
@@ -353,6 +363,14 @@ impl CompletionQueue {
         // Check owner bit and invalid opcode
         if sw_owner != hw_owner || (op_own >> 4) == 0x0f {
             return None;
+        }
+
+        // Prefetch next CQE slot if requested (for batch processing).
+        // This overlaps prefetch with CQE parsing below.
+        if prefetch_next {
+            let next_idx = (idx + 1) & cqe_mask;
+            let next_cqe_ptr = unsafe { state.buf.add((next_idx as usize) * cqe_size) };
+            prefetch_for_read!(next_cqe_ptr);
         }
 
         // After validating ownership, we need a load barrier to ensure subsequent

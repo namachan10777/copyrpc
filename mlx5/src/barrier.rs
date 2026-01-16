@@ -132,3 +132,39 @@ macro_rules! mlx5_bf_copy {
         }
     };
 }
+
+/// Prefetch memory for reading.
+///
+/// Used to prefetch the next CQE slot while processing the current one.
+/// On x86_64, uses `prefetcht0` (temporal hint, all cache levels).
+/// On ARM64, uses `prfm pldl1keep` (prefetch for load, L1 cache, keep).
+#[cfg(target_arch = "x86_64")]
+macro_rules! prefetch_for_read {
+    ($ptr:expr) => {
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            _mm_prefetch($ptr as *const i8, _MM_HINT_T0);
+        }
+    };
+}
+
+#[cfg(target_arch = "aarch64")]
+macro_rules! prefetch_for_read {
+    ($ptr:expr) => {
+        unsafe {
+            std::arch::asm!(
+                "prfm pldl1keep, [{ptr}]",
+                ptr = in(reg) $ptr,
+                options(nostack, preserves_flags),
+            );
+        }
+    };
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+macro_rules! prefetch_for_read {
+    ($ptr:expr) => {
+        // No-op on unsupported architectures
+        let _ = $ptr;
+    };
+}
