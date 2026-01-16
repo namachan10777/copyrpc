@@ -963,6 +963,16 @@ impl<T, Tab, F> RcQpInner<T, Tab, F> {
         self.sq.as_ref().map(|sq| sq.available()).unwrap_or(0)
     }
 
+    /// Get the total SQ WQE count (hardware queue size).
+    pub fn sq_wqe_cnt(&self) -> u16 {
+        self.sq.as_ref().map(|sq| sq.wqe_cnt).unwrap_or(0)
+    }
+
+    /// Get the total RQ WQE count (hardware queue size).
+    pub fn rq_wqe_cnt(&self) -> u32 {
+        self.rq.as_ref().map(|rq| rq.wqe_cnt).unwrap_or(0)
+    }
+
     /// Ring the SQ doorbell to notify HCA of new WQEs.
     pub fn ring_sq_doorbell(&self) {
         if let Some(sq) = self.sq.as_ref() {

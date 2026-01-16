@@ -29,9 +29,9 @@ use mlx5::wqe::{WqeFlags, WqeOpcode};
 // Constants
 // =============================================================================
 
-const QUEUE_DEPTH: usize = 64;
+const QUEUE_DEPTH: usize = 256;
 const PAGE_SIZE: usize = 4096;
-const BUFFER_SIZE: usize = 64 * 256; // 64 entries * 256 bytes
+const BUFFER_SIZE: usize = QUEUE_DEPTH * 256; // entries * 256 bytes
 
 // =============================================================================
 // Aligned Buffer
@@ -225,12 +225,8 @@ fn create_endpoint(
     MemoryRegion,
     MemoryRegion,
 )> {
-    let mut send_cq = ctx.create_cq(256).ok()?;
-    send_cq.init_direct_access().ok()?;
-    let send_cq = Rc::new(send_cq);
-    let mut recv_cq = ctx.create_cq(256).ok()?;
-    recv_cq.init_direct_access().ok()?;
-    let recv_cq = Rc::new(recv_cq);
+    let send_cq = Rc::new(ctx.create_cq(256).ok()?);
+    let recv_cq = Rc::new(ctx.create_cq(256).ok()?);
 
     let config = RcQpConfig {
         max_send_wr: 256,
@@ -326,10 +322,12 @@ fn setup_benchmark() -> Option<BenchmarkSetup> {
     // Pre-post receives on client
     for i in 0..QUEUE_DEPTH {
         let offset = (i * 256) as u64;
-        let _ = client_qp
+        client_qp
             .borrow()
             .recv_builder(i as u64)
-            .map(|b| b.sge(client_recv_buf.addr() + offset, 256, client_recv_mr.lkey()).finish());
+            .unwrap()
+            .sge(client_recv_buf.addr() + offset, 256, client_recv_mr.lkey())
+            .finish();
     }
     client_qp.borrow().ring_rq_doorbell();
 
@@ -446,10 +444,11 @@ fn server_thread_main(
     // Pre-post receives
     for i in 0..QUEUE_DEPTH {
         let offset = (i * 256) as u64;
-        let _ = qp
-            .borrow()
+        qp.borrow()
             .recv_builder(i as u64)
-            .map(|b| b.sge(recv_buf.addr() + offset, 256, recv_mr.lkey()).finish());
+            .unwrap()
+            .sge(recv_buf.addr() + offset, 256, recv_mr.lkey())
+            .finish();
     }
     qp.borrow().ring_rq_doorbell();
 
@@ -491,9 +490,11 @@ fn server_thread_main(
             for i in 0..rx_count {
                 let idx = rx_indices[i];
                 let offset = (idx * 256) as u64;
-                let _ = qp_ref
+                qp_ref
                     .recv_builder(idx as u64)
-                    .map(|b| b.sge(recv_buf.addr() + offset, 256, recv_mr.lkey()).finish());
+                    .unwrap()
+                    .sge(recv_buf.addr() + offset, 256, recv_mr.lkey())
+                    .finish();
             }
         }
 
@@ -507,19 +508,21 @@ fn server_thread_main(
 
                 if rx_is_write_imm[i] {
                     // Echo with WRITE+IMM
-                    let _ = qp_ref.wqe_builder(idx as u64).map(|b| {
-                        b.ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), idx as u32)
-                            .rdma(remote_addr + offset, remote_rkey)
-                            .sge(send_buf.addr() + offset, size, send_mr.lkey())
-                            .finish()
-                    });
+                    qp_ref
+                        .wqe_builder(idx as u64)
+                        .unwrap()
+                        .ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), idx as u32)
+                        .rdma(remote_addr + offset, remote_rkey)
+                        .sge(send_buf.addr() + offset, size, send_mr.lkey())
+                        .finish();
                 } else {
                     // Echo with SEND
-                    let _ = qp_ref.wqe_builder(idx as u64).map(|b| {
-                        b.ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
-                            .sge(send_buf.addr() + offset, size, send_mr.lkey())
-                            .finish()
-                    });
+                    qp_ref
+                        .wqe_builder(idx as u64)
+                        .unwrap()
+                        .ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
+                        .sge(send_buf.addr() + offset, size, send_mr.lkey())
+                        .finish();
                 }
             }
         }
@@ -553,12 +556,12 @@ fn run_throughput_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
         let qp = client.qp.borrow();
         for i in 0..QUEUE_DEPTH {
             let offset = (i * 256) as u64;
-            let _ = qp.wqe_builder(i as u64).map(|b| {
-                b.ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), i as u32)
-                    .rdma(client.remote_addr + offset, client.remote_rkey)
-                    .sge(client.send_buf.addr() + offset, size, client.send_mr.lkey())
-                    .finish()
-            });
+            qp.wqe_builder(i as u64)
+                .unwrap()
+                .ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), i as u32)
+                .rdma(client.remote_addr + offset, client.remote_rkey)
+                .sge(client.send_buf.addr() + offset, size, client.send_mr.lkey())
+                .finish();
         }
         qp.ring_sq_doorbell();
     }
@@ -596,9 +599,10 @@ fn run_throughput_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
             for i in 0..rx_count {
                 let idx = rx_indices[i];
                 let offset = (idx * 256) as u64;
-                let _ = qp
-                    .recv_builder(idx as u64)
-                    .map(|b| b.sge(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey()).finish());
+                qp.recv_builder(idx as u64)
+                    .unwrap()
+                    .sge(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey())
+                    .finish();
             }
         }
 
@@ -612,12 +616,12 @@ fn run_throughput_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
             for i in 0..to_send {
                 let idx = rx_indices[i];
                 let offset = (idx * 256) as u64;
-                let _ = qp.wqe_builder(idx as u64).map(|b| {
-                    b.ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), idx as u32)
-                        .rdma(client.remote_addr + offset, client.remote_rkey)
-                        .sge(client.send_buf.addr() + offset, size, client.send_mr.lkey())
-                        .finish()
-                });
+                qp.wqe_builder(idx as u64)
+                    .unwrap()
+                    .ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), idx as u32)
+                    .rdma(client.remote_addr + offset, client.remote_rkey)
+                    .sge(client.send_buf.addr() + offset, size, client.send_mr.lkey())
+                    .finish();
             }
             inflight += to_send as u64;
         }
@@ -645,13 +649,13 @@ fn run_throughput_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
         for i in 0..rx_count {
             let idx = rx_indices[i];
             let offset = (idx * 256) as u64;
-            let _ = qp
-                .recv_builder(idx as u64)
-                .map(|b| b.sge(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey()).finish());
+            qp.recv_builder(idx as u64)
+                .unwrap()
+                .sge(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey())
+                .finish();
         }
         client.send_cq.poll();
         client.send_cq.flush();
-        std::hint::spin_loop();
     }
     client.qp.borrow().ring_rq_doorbell();
 
@@ -672,13 +676,18 @@ fn run_lowlatency_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
         let idx = (i as usize) % QUEUE_DEPTH;
 
         // Post single WRITE+IMM with inline data + blueflame
-        let _ = client.qp.borrow().wqe_builder(idx as u64).map(|b| {
+        {
             let offset = (idx * 256) as u64;
-            b.ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), idx as u32)
+            client
+                .qp
+                .borrow()
+                .wqe_builder(idx as u64)
+                .unwrap()
+                .ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), idx as u32)
                 .rdma(client.remote_addr + offset, client.remote_rkey)
                 .inline_data(&data)
-                .finish_with_blueflame()
-        });
+                .finish_with_blueflame();
+        }
 
         // Wait for completion (recv CQ)
         loop {
@@ -696,9 +705,10 @@ fn run_lowlatency_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
                 let recv_idx = client.shared_state.rx_indices.borrow()[0];
                 let offset = (recv_idx * 256) as u64;
                 let qp = client.qp.borrow();
-                let _ = qp
-                    .recv_builder(recv_idx as u64)
-                    .map(|b| b.sge(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey()).finish());
+                qp.recv_builder(recv_idx as u64)
+                    .unwrap()
+                    .sge(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey())
+                    .finish();
                 qp.ring_rq_doorbell();
                 break;
             }
