@@ -12,5 +12,6 @@ cargo test --package mlx5 --lib
 cargo test --package mlx5 --test '*'
 
 # ベンチマーク（要RDMAハードウェア）
-cargo bench --bench pingpong
+# tasksetで物理コアのみを使用（HT無効化で安定した結果を得る）
+taskset -c 0,2,4,6,8 cargo bench --bench pingpong
 ```
