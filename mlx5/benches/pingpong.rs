@@ -473,7 +473,6 @@ fn server_thread_main(
         let rx_count = shared_state.rx_count.get();
 
         if rx_count == 0 {
-            std::hint::spin_loop();
             continue;
         }
 
@@ -581,7 +580,6 @@ fn run_throughput_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
 
         // Skip rest if no completions (busy wait)
         if rx_count == 0 {
-            std::hint::spin_loop();
             continue;
         }
 
