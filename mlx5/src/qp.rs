@@ -126,24 +126,29 @@ pub(crate) struct SendQueueState<T, Tab> {
 }
 
 impl<T, Tab> SendQueueState<T, Tab> {
+    #[inline]
     fn available(&self) -> u16 {
         self.wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
     }
 
+    #[inline]
     fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
         let offset = ((idx & (self.wqe_cnt - 1)) as usize) * WQEBB_SIZE;
         unsafe { self.buf.add(offset) }
     }
 
+    #[inline]
     fn advance_pi(&self, count: u16) {
         self.pi.set(self.pi.get().wrapping_add(count));
     }
 
+    #[inline]
     fn set_last_wqe(&self, ptr: *mut u8, size: usize) {
         self.last_wqe.set(Some((ptr, size)));
     }
 
     /// Ring the doorbell using regular doorbell write.
+    #[inline]
     fn ring_doorbell(&self) {
         let Some((last_wqe_ptr, _)) = self.last_wqe.take() else {
             return;
@@ -161,6 +166,7 @@ impl<T, Tab> SendQueueState<T, Tab> {
     }
 
     /// Ring the doorbell using BlueFlame (low latency, single WQE).
+    #[inline]
     fn ring_blueflame(&self, wqe_ptr: *mut u8) {
         mmio_flush_writes!();
 
@@ -182,6 +188,7 @@ impl<T, Tab> SendQueueState<T, Tab> {
         }
     }
 
+    #[inline]
     fn ring_db(&self, wqe_ptr: *mut u8) {
         let bf_offset = self.bf_offset.get();
         let bf = unsafe { self.bf_reg.add(bf_offset as usize) as *mut u64 };
@@ -195,6 +202,7 @@ impl<T, Tab> SendQueueState<T, Tab> {
 }
 
 impl<T> SendQueueState<T, SparseWqeTable<T>> {
+    #[inline]
     fn process_completion_sparse(&self, wqe_idx: u16) -> Option<T> {
         self.ci.set(wqe_idx);
         self.table.take(wqe_idx)
@@ -202,6 +210,7 @@ impl<T> SendQueueState<T, SparseWqeTable<T>> {
 }
 
 impl<T> SendQueueState<T, DenseWqeTable<T>> {
+    #[inline]
     fn process_completions_dense<F>(&self, new_ci: u16, mut callback: F)
     where
         F: FnMut(u16, T),
@@ -249,6 +258,7 @@ pub(crate) struct ReceiveQueueState<T> {
 const MLX5_INVALID_LKEY: u32 = 0x100;
 
 impl<T> ReceiveQueueState<T> {
+    #[inline]
     fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
         let offset = ((idx as u32) & (self.wqe_cnt - 1)) * self.stride;
         unsafe { self.buf.add(offset as usize) }
@@ -257,6 +267,7 @@ impl<T> ReceiveQueueState<T> {
     /// Process a receive completion.
     ///
     /// Returns the entry associated with the completed WQE.
+    #[inline]
     fn process_completion(&self, wqe_idx: u16) -> Option<T> {
         self.ci.set(wqe_idx.wrapping_add(1));
         let idx = (wqe_idx as usize) & ((self.wqe_cnt - 1) as usize);
@@ -264,10 +275,12 @@ impl<T> ReceiveQueueState<T> {
     }
 
     /// Get the number of available WQE slots.
+    #[inline]
     fn available(&self) -> u32 {
         self.wqe_cnt - (self.pi.get().wrapping_sub(self.ci.get()) as u32)
     }
 
+    #[inline]
     fn ring_doorbell(&self) {
         mmio_flush_writes!();
         unsafe {
@@ -295,6 +308,7 @@ impl<'a, T> RecvWqeBuilder<'a, T> {
     ///
     /// # Safety
     /// The caller must ensure the buffer is registered and valid.
+    #[inline]
     pub fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
         unsafe {
             let wqe_ptr = self.rq.get_wqe_ptr(self.wqe_idx);
@@ -316,6 +330,7 @@ impl<'a, T> RecvWqeBuilder<'a, T> {
     ///
     /// Stores the entry in the table and advances the producer index.
     /// Call `ring_rq_doorbell()` after posting one or more WQEs to notify the HCA.
+    #[inline]
     pub fn finish(self) {
         let idx = (self.wqe_idx as usize) & ((self.rq.wqe_cnt - 1) as usize);
         self.rq.table[idx].set(Some(self.entry));
@@ -344,6 +359,7 @@ impl<'a, T, Tab> WqeBuilder<'a, T, Tab> {
     /// Write the control segment.
     ///
     /// This must be the first segment in every WQE.
+    #[inline]
     pub fn ctrl(mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) -> Self {
         let flags = if self.signaled {
             flags | WqeFlags::COMPLETION
@@ -367,6 +383,7 @@ impl<'a, T, Tab> WqeBuilder<'a, T, Tab> {
     }
 
     /// Add an RDMA segment (for WRITE/READ).
+    #[inline]
     pub fn rdma(mut self, remote_addr: u64, rkey: u32) -> Self {
         unsafe {
             RdmaSeg::write(self.wqe_ptr.add(self.offset), remote_addr, rkey);
@@ -377,6 +394,7 @@ impl<'a, T, Tab> WqeBuilder<'a, T, Tab> {
     }
 
     /// Add a data segment (SGE).
+    #[inline]
     pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
         unsafe {
             DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
@@ -387,6 +405,7 @@ impl<'a, T, Tab> WqeBuilder<'a, T, Tab> {
     }
 
     /// Add inline data.
+    #[inline]
     pub fn inline_data(mut self, data: &[u8]) -> Self {
         let padded_size = unsafe {
             let ptr = self.wqe_ptr.add(self.offset);
@@ -402,6 +421,7 @@ impl<'a, T, Tab> WqeBuilder<'a, T, Tab> {
     /// Get a mutable slice for inline data (zero-copy).
     ///
     /// Returns the builder and a slice that can be written to directly.
+    #[inline]
     pub fn inline_slice(mut self, len: usize) -> (Self, &'a mut [u8]) {
         let padded_size = unsafe {
             let ptr = self.wqe_ptr.add(self.offset);
@@ -426,6 +446,7 @@ impl<'a, T, Tab> WqeBuilder<'a, T, Tab> {
     /// - RDMA segment (rdma) - specifies remote address and rkey
     /// - Atomic segment (atomic_cas) - specifies swap and compare values
     /// - Data segment (sge) - specifies local buffer for result
+    #[inline]
     pub fn atomic_cas(mut self, swap: u64, compare: u64) -> Self {
         unsafe {
             AtomicSeg::write_cas(self.wqe_ptr.add(self.offset), swap, compare);
@@ -447,6 +468,7 @@ impl<'a, T, Tab> WqeBuilder<'a, T, Tab> {
     /// - RDMA segment (rdma) - specifies remote address and rkey
     /// - Atomic segment (atomic_fa) - specifies add value
     /// - Data segment (sge) - specifies local buffer for result
+    #[inline]
     pub fn atomic_fa(mut self, add_value: u64) -> Self {
         unsafe {
             AtomicSeg::write_fa(self.wqe_ptr.add(self.offset), add_value);
@@ -457,6 +479,7 @@ impl<'a, T, Tab> WqeBuilder<'a, T, Tab> {
     }
 
     /// Finish the WQE construction (internal).
+    #[inline]
     fn finish_internal(self) -> WqeHandle {
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
@@ -478,6 +501,7 @@ impl<'a, T, Tab> WqeBuilder<'a, T, Tab> {
     ///
     /// Use this for low-latency single WQE submission. The doorbell is issued
     /// immediately, so no need to call `ring_sq_doorbell()` afterwards.
+    #[inline]
     fn finish_internal_with_blueflame(self) -> WqeHandle {
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);

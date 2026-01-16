@@ -307,6 +307,7 @@ impl CompletionQueue {
     /// Poll for completions and dispatch to registered queues.
     ///
     /// Returns the number of completions processed.
+    #[inline]
     pub fn poll(&self) -> usize {
         let mut count = 0;
         while let Some(cqe) = self.try_next_cqe() {
@@ -323,6 +324,7 @@ impl CompletionQueue {
     /// Call this after processing completions to acknowledge them to the hardware.
     /// Note: No sfence needed here - dbrec is in shared memory polled by NIC via DMA.
     /// The store will be visible to the device eventually (x86 TSO guarantees ordering).
+    #[inline]
     pub fn flush(&self) {
         if let Some(state) = &self.state {
             unsafe {
@@ -334,6 +336,7 @@ impl CompletionQueue {
     /// Try to get the next CQE.
     ///
     /// Returns None if no CQE is available.
+    #[inline]
     fn try_next_cqe(&self) -> Option<Cqe> {
         let state = self.state.as_ref()?;
 
