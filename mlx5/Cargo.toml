@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 bitflags = "2"
 mlx5_sys = { version = "0.1.0", path = "../mlx5_sys" }
+rapidhash = "1"
 
 [dev-dependencies]
 libc = "0.2"

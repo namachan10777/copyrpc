@@ -343,6 +343,7 @@ dependencies = [
  "criterion",
  "libc",
  "mlx5_sys",
+ "rapidhash",
 ]
 
 [[package]]
@@ -440,6 +441,12 @@ checksum = "dc74d9a594b72ae6656596548f56f667211f8a97b3d4c3d467150794690dc40a"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "rapidhash"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9813f789f95ee4fe6b4d01834404d7cccacbc3f6c029343af910b3c2835eb9f1"
 
 [[package]]
 name = "rayon"
