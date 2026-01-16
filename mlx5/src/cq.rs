@@ -181,6 +181,9 @@ pub(crate) struct CqState {
 type QueueMap =
     HashMap<u32, Weak<RefCell<dyn CompletionTarget>>, BuildHasherDefault<rapidhash::RapidHasher>>;
 
+/// Cached queue lookup result.
+type CachedQueue = Option<(u32, Rc<RefCell<dyn CompletionTarget>>)>;
+
 /// Completion Queue.
 ///
 /// Used to receive completion notifications for send and receive operations.
@@ -190,6 +193,8 @@ pub struct CompletionQueue {
     state: Option<CqState>,
     /// Registered queues for completion dispatch.
     queues: RefCell<QueueMap>,
+    /// Cache for last looked up queue (QPN, Rc) to avoid HashMap lookup.
+    last_queue_cache: RefCell<CachedQueue>,
     /// Keep the context alive while this CQ exists.
     _ctx: Context,
 }
@@ -227,6 +232,7 @@ impl Context {
                 cq: NonNull::new(cq).unwrap(),
                 state: None,
                 queues: RefCell::new(HashMap::with_hasher(BuildHasherDefault::default())),
+                last_queue_cache: RefCell::new(None),
                 _ctx: self.clone(),
             })
         }
@@ -296,12 +302,37 @@ impl CompletionQueue {
     /// Called automatically when a QP is dropped.
     pub(crate) fn unregister_queue(&self, qpn: u32) {
         self.queues.borrow_mut().remove(&qpn);
+        // Invalidate cache if it was for this QPN
+        let mut cache = self.last_queue_cache.borrow_mut();
+        if let Some((cached_qpn, _)) = cache.as_ref() {
+            if *cached_qpn == qpn {
+                *cache = None;
+            }
+        }
     }
 
     /// Find queue by QPN.
     #[inline]
     fn find_queue(&self, qpn: u32) -> Option<Rc<RefCell<dyn CompletionTarget>>> {
-        self.queues.borrow().get(&qpn).and_then(|w| w.upgrade())
+        // Fast path: check cache
+        {
+            let cache = self.last_queue_cache.borrow();
+            if let Some((cached_qpn, cached_rc)) = cache.as_ref() {
+                if *cached_qpn == qpn {
+                    return Some(cached_rc.clone());
+                }
+            }
+        }
+
+        // Slow path: HashMap lookup
+        let result = self.queues.borrow().get(&qpn).and_then(|w| w.upgrade());
+
+        // Update cache
+        if let Some(ref rc) = result {
+            *self.last_queue_cache.borrow_mut() = Some((qpn, rc.clone()));
+        }
+
+        result
     }
 
     /// Poll for completions and dispatch to registered queues.
