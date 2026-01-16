@@ -54,7 +54,7 @@ struct SrqState<T> {
     ci: Cell<u32>,
     dbrec: *mut u32,
     /// Entry table for tracking in-flight receives.
-    table: RefCell<Box<[Option<T>]>>,
+    table: Box<[Cell<Option<T>>]>,
 }
 
 impl<T> SrqState<T> {
@@ -79,7 +79,7 @@ impl<T> SrqState<T> {
     fn process_completion(&self, wqe_idx: u16) -> Option<T> {
         self.ci.set(self.ci.get().wrapping_add(1));
         let idx = (wqe_idx as usize) & ((self.wqe_cnt - 1) as usize);
-        self.table.borrow_mut()[idx].take()
+        self.table[idx].take()
     }
 }
 
@@ -112,7 +112,7 @@ impl<'a, T> SrqRecvWqeBuilder<'a, T> {
     /// Finish the WQE construction.
     pub fn finish(self) {
         let idx = (self.wqe_idx as usize) & ((self.state.wqe_cnt - 1) as usize);
-        self.state.table.borrow_mut()[idx] = Some(self.entry);
+        self.state.table[idx].set(Some(self.entry));
         self.state.pi.set(self.state.pi.get().wrapping_add(1));
     }
 }
@@ -238,7 +238,7 @@ impl<T> Srq<T> {
             pi: Cell::new(0),
             ci: Cell::new(0),
             dbrec: info.dbrec,
-            table: RefCell::new((0..wqe_cnt).map(|_| None).collect()),
+            table: (0..wqe_cnt).map(|_| Cell::new(None)).collect(),
         });
 
         Ok(())

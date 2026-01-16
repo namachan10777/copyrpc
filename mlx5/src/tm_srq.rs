@@ -110,7 +110,7 @@ struct CmdQpState<T> {
     /// Last WQE pointer and size for doorbell.
     last_wqe: Cell<Option<(*mut u8, usize)>>,
     /// WQE table for tracking in-flight operations.
-    table: RefCell<SparseWqeTable<T>>,
+    table: SparseWqeTable<T>,
 }
 
 impl<T> CmdQpState<T> {
@@ -184,7 +184,7 @@ impl<T> CmdQpState<T> {
 
     fn process_completion(&self, wqe_idx: u16) -> Option<T> {
         self.ci.set(self.ci.get().wrapping_add(1));
-        self.table.borrow_mut().take(wqe_idx)
+        self.table.take(wqe_idx)
     }
 }
 
@@ -285,7 +285,7 @@ impl<'a, T> CmdQpWqeBuilder<'a, T> {
         let wqe_idx = self.wqe_idx;
 
         // Store entry in table (always signaled for unordered)
-        self.cmd_qp.table.borrow_mut().store(wqe_idx, self.entry);
+        self.cmd_qp.table.store(wqe_idx, self.entry);
 
         self.cmd_qp.advance_pi(1);
         self.cmd_qp.set_last_wqe(self.wqe_ptr, self.offset);
@@ -310,7 +310,7 @@ impl<'a, T> CmdQpWqeBuilder<'a, T> {
         let wqe_ptr = self.wqe_ptr;
 
         // Store entry in table (always signaled for unordered)
-        self.cmd_qp.table.borrow_mut().store(wqe_idx, self.entry);
+        self.cmd_qp.table.store(wqe_idx, self.entry);
 
         self.cmd_qp.advance_pi(1);
         self.cmd_qp.ring_blueflame(wqe_ptr);
@@ -554,7 +554,7 @@ impl<T, F> TagMatchingSrq<T, F> {
                 bf_size: dv_qp.bf.size,
                 bf_offset: Cell::new(0),
                 last_wqe: Cell::new(None),
-                table: RefCell::new(SparseWqeTable::new(sq_wqe_cnt)),
+                table: SparseWqeTable::new(sq_wqe_cnt),
             })
         }
     }
@@ -646,7 +646,7 @@ impl<T, F> TagMatchingSrq<T, F> {
     pub fn cmd_exact_available(&self) -> u16 {
         self.cmd_qp
             .as_ref()
-            .map(|cq| cq.table.borrow().count_available())
+            .map(|cq| cq.table.count_available())
             .unwrap_or(0)
     }
 
@@ -654,7 +654,7 @@ impl<T, F> TagMatchingSrq<T, F> {
     pub fn cmd_is_slot_available(&self, idx: u16) -> bool {
         self.cmd_qp
             .as_ref()
-            .map(|cq| cq.table.borrow().is_available(idx))
+            .map(|cq| cq.table.is_available(idx))
             .unwrap_or(false)
     }
 
@@ -663,7 +663,7 @@ impl<T, F> TagMatchingSrq<T, F> {
     /// Entry is required (always signaled for Command QP).
     pub fn cmd_wqe_builder(&self, entry: T) -> io::Result<CmdQpWqeBuilder<'_, T>> {
         let cmd_qp = self.cmd_qp()?;
-        if !cmd_qp.table.borrow().is_available(cmd_qp.pi.get()) {
+        if !cmd_qp.table.is_available(cmd_qp.pi.get()) {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "Command QP full"));
         }
 
