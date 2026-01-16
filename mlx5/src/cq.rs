@@ -4,8 +4,7 @@
 //! have completed. CQs can be shared across multiple Queue Pairs.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
-use std::rc::Weak;
+use std::rc::{Rc, Weak};
 use std::{io, mem::MaybeUninit, ptr::NonNull};
 
 use crate::device::Context;
@@ -180,6 +179,12 @@ pub(crate) struct CqState {
 // Completion Queue
 // =============================================================================
 
+/// Registered queue entry.
+struct RegisteredQueue {
+    qpn: u32,
+    queue: Weak<RefCell<dyn CompletionTarget>>,
+}
+
 /// Completion Queue.
 ///
 /// Used to receive completion notifications for send and receive operations.
@@ -187,8 +192,9 @@ pub(crate) struct CqState {
 pub struct CompletionQueue {
     cq: NonNull<mlx5_sys::ibv_cq>,
     state: Option<CqState>,
-    /// Registered queues (QPN -> CompletionTarget wrapped in RefCell)
-    queues: RefCell<HashMap<u32, Weak<RefCell<dyn CompletionTarget>>>>,
+    /// Registered queues - uses Vec for fast linear search with few QPs.
+    /// Most RDMA applications use 1-4 QPs per CQ, making linear search faster than HashMap.
+    queues: RefCell<Vec<RegisteredQueue>>,
     /// Keep the context alive while this CQ exists.
     _ctx: Context,
 }
@@ -225,7 +231,7 @@ impl Context {
             Ok(CompletionQueue {
                 cq: NonNull::new(cq).unwrap(),
                 state: None,
-                queues: RefCell::new(HashMap::new()),
+                queues: RefCell::new(Vec::with_capacity(4)),
                 _ctx: self.clone(),
             })
         }
@@ -287,14 +293,35 @@ impl CompletionQueue {
     ///
     /// Called automatically when a QP is created with this CQ.
     pub(crate) fn register_queue(&self, qpn: u32, queue: Weak<RefCell<dyn CompletionTarget>>) {
-        self.queues.borrow_mut().insert(qpn, queue);
+        let mut queues = self.queues.borrow_mut();
+        // Check if already registered (update existing entry)
+        for entry in queues.iter_mut() {
+            if entry.qpn == qpn {
+                entry.queue = queue;
+                return;
+            }
+        }
+        queues.push(RegisteredQueue { qpn, queue });
     }
 
     /// Unregister a queue.
     ///
     /// Called automatically when a QP is dropped.
     pub(crate) fn unregister_queue(&self, qpn: u32) {
-        self.queues.borrow_mut().remove(&qpn);
+        let mut queues = self.queues.borrow_mut();
+        queues.retain(|entry| entry.qpn != qpn);
+    }
+
+    /// Find queue by QPN using linear search.
+    #[inline]
+    fn find_queue(&self, qpn: u32) -> Option<Rc<RefCell<dyn CompletionTarget>>> {
+        let queues = self.queues.borrow();
+        for entry in queues.iter() {
+            if entry.qpn == qpn {
+                return entry.queue.upgrade();
+            }
+        }
+        None
     }
 
     /// Poll for completions and dispatch to registered queues.
@@ -303,7 +330,7 @@ impl CompletionQueue {
     pub fn poll(&self) -> usize {
         let mut count = 0;
         while let Some(cqe) = self.try_next_cqe() {
-            if let Some(queue) = self.queues.borrow().get(&cqe.qp_num).and_then(Weak::upgrade) {
+            if let Some(queue) = self.find_queue(cqe.qp_num) {
                 queue.borrow().dispatch_cqe(cqe);
             }
             count += 1;
