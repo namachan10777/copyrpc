@@ -3,7 +3,7 @@
 //! A Completion Queue is used to notify the application when work requests
 //! have completed. CQs can be shared across multiple Queue Pairs.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::rc::{Rc, Weak};
@@ -197,7 +197,11 @@ pub struct CompletionQueue {
     /// Registered queues for completion dispatch.
     queues: RefCell<QueueMap>,
     /// Cache for last looked up queue (QPN, Rc) to avoid HashMap lookup.
-    last_queue_cache: RefCell<CachedQueue>,
+    ///
+    /// Uses UnsafeCell instead of RefCell to avoid borrow checking overhead in the hot path.
+    /// Safety: Single-threaded access is guaranteed by Rc (not Send), and there are no
+    /// recursive calls through dispatch_cqe that would access this cache.
+    last_queue_cache: UnsafeCell<CachedQueue>,
     /// Keep the context alive while this CQ exists.
     _ctx: Context,
 }
@@ -260,7 +264,7 @@ impl Context {
                     ci: Cell::new(0),
                 },
                 queues: RefCell::new(HashMap::with_hasher(BuildHasherDefault::default())),
-                last_queue_cache: RefCell::new(None),
+                last_queue_cache: UnsafeCell::new(None),
                 _ctx: self.clone(),
             })
         }
@@ -303,7 +307,9 @@ impl CompletionQueue {
     pub(crate) fn unregister_queue(&self, qpn: u32) {
         self.queues.borrow_mut().remove(&qpn);
         // Invalidate cache if it was for this QPN
-        let mut cache = self.last_queue_cache.borrow_mut();
+        // Safety: Single-threaded access guaranteed by Rc (not Send).
+        // unregister_queue is only called during QP drop, not from dispatch_cqe.
+        let cache = unsafe { &mut *self.last_queue_cache.get() };
         if let Some((cached_qpn, _)) = cache.as_ref() {
             if *cached_qpn == qpn {
                 *cache = None;
@@ -315,8 +321,12 @@ impl CompletionQueue {
     #[inline]
     fn find_queue(&self, qpn: u32) -> Option<Rc<RefCell<dyn CompletionTarget>>> {
         // Fast path: check cache
+        // Safety: Single-threaded access guaranteed by Rc (not Send).
+        // No recursive calls through dispatch_cqe access this cache.
+        // The scope block ensures the immutable reference is dropped before
+        // we create a mutable reference below.
         {
-            let cache = self.last_queue_cache.borrow();
+            let cache = unsafe { &*self.last_queue_cache.get() };
             if let Some((cached_qpn, cached_rc)) = cache.as_ref() {
                 if *cached_qpn == qpn {
                     return Some(cached_rc.clone());
@@ -329,7 +339,11 @@ impl CompletionQueue {
 
         // Update cache
         if let Some(ref rc) = result {
-            *self.last_queue_cache.borrow_mut() = Some((qpn, rc.clone()));
+            // Safety: The immutable reference from the cache check above has been
+            // dropped (scope ended), so we can safely create a mutable reference.
+            unsafe {
+                *self.last_queue_cache.get() = Some((qpn, rc.clone()));
+            }
         }
 
         result
