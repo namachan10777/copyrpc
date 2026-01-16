@@ -1,9 +1,3 @@
-- DciDense/Dci -> DciInnerをDciに改名。DciSparseWqeTableとDciDenseWqeTableのaliasにする
-- WqeBuilderについて、必須のパラメータが指定されていない場合はResultでErrorを返すのがいいかな。unlikely/likelyでの最適化を忘れずに
-- WqeBuilderのflags -> bitflagsを使う
-- CQ: これもメモリからの直接読み取りで実装するべきだね。CQで取得したキーをDCT/SQ/SRQに入れたら結果が出てくるって感じがいいかな。
-- cq -> SRQ/SQ/DCIのポインタも持ち、CQをpollするとそれらのキューに設定されたコールバックが呼ばれる設計が良さそう。これなら内部情報を公開しなくていい
-  - なので、SQ/SRQ/DCI/DCTはpollingインターフェースを持たない。これはCQをpollすればそちらから処理されるからね。
-- TmSRQでCommandQPと通常のRXWQEの投入がごっちゃになってない？UnorderedReceiveQueueで提供されるのはあくまで通常のRXWQE投入インターフェース。TM CMD WQEはTmSRQにだけ存在するキューで投入可能であるべきだね。
-- DCにDC Streamsを有効化する機能をつけたい。この型はWqeでstream_idを設定出来る。ただし、Unorderedになるので全てSignaledになる。
-- BlueFlame doorbellのインターフェースを変えたい。基本明示的に呼ぶのは通常のdoorbell。blueflame doorbellはWqeBuilderで設定する。BlueFlame有効なWQEをfinishすると、その時点でDoorbellが発行される。基本的にはレイテンシを下げるため単発WQEをblueflameで送るか、BlueFlame使わないかの二択だからこっちの方がいいと思う。
+# タスク
+- DC Stream対応（型で制御する）
+- Unordered対応じゃないと`RELAXED_ORDERING`を使えない様にする（もしかしたら実行がRelaxedなだけで可視化順序はあるのかも？）
