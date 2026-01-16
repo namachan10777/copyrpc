@@ -9,8 +9,8 @@ use std::hash::BuildHasherDefault;
 use std::rc::{Rc, Weak};
 use std::{io, mem::MaybeUninit, ptr::NonNull};
 
-use crate::device::Context;
 use crate::CompletionTarget;
+use crate::device::Context;
 
 // =============================================================================
 // CQE Types
@@ -119,25 +119,21 @@ impl Cqe {
         let op_own = std::ptr::read_volatile(ptr.add(63));
         let opcode = CqeOpcode::from_u8(op_own >> 4).unwrap_or(CqeOpcode::ReqErr);
 
-        let wqe_counter =
-            u16::from_be(std::ptr::read_volatile(ptr.add(60) as *const u16));
+        let wqe_counter = u16::from_be(std::ptr::read_volatile(ptr.add(60) as *const u16));
 
-        let qp_num =
-            u32::from_be(std::ptr::read_volatile(ptr.add(56) as *const u32)) & 0x00FF_FFFF;
+        let qp_num = u32::from_be(std::ptr::read_volatile(ptr.add(56) as *const u32)) & 0x00FF_FFFF;
 
-        let byte_cnt =
-            u32::from_be(std::ptr::read_volatile(ptr.add(44) as *const u32));
+        let byte_cnt = u32::from_be(std::ptr::read_volatile(ptr.add(44) as *const u32));
 
-        let imm =
-            u32::from_be(std::ptr::read_volatile(ptr.add(36) as *const u32));
+        let imm = u32::from_be(std::ptr::read_volatile(ptr.add(36) as *const u32));
 
         // app_info at offset 50: contains TM tag handle for Tag Matching operations
-        let app_info =
-            u16::from_be(std::ptr::read_volatile(ptr.add(50) as *const u16));
+        let app_info = u16::from_be(std::ptr::read_volatile(ptr.add(50) as *const u16));
 
         // Syndrome and vendor_err are only valid for error CQEs (opcode 0x0d=ReqErr or 0x0e=RespErr).
         // For success CQEs, offsets 54-55 are part of the timestamp field.
-        let (vendor_err, syndrome) = if opcode == CqeOpcode::ReqErr || opcode == CqeOpcode::RespErr {
+        let (vendor_err, syndrome) = if opcode == CqeOpcode::ReqErr || opcode == CqeOpcode::RespErr
+        {
             (
                 std::ptr::read_volatile(ptr.add(54)),
                 std::ptr::read_volatile(ptr.add(55)),
@@ -182,7 +178,8 @@ pub(crate) struct CqState {
 // =============================================================================
 
 /// Queue map type using rapidhash for fast lookups.
-type QueueMap = HashMap<u32, Weak<RefCell<dyn CompletionTarget>>, BuildHasherDefault<rapidhash::RapidHasher>>;
+type QueueMap =
+    HashMap<u32, Weak<RefCell<dyn CompletionTarget>>, BuildHasherDefault<rapidhash::RapidHasher>>;
 
 /// Completion Queue.
 ///
