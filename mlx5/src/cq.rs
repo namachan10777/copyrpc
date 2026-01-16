@@ -3,7 +3,7 @@
 //! A Completion Queue is used to notify the application when work requests
 //! have completed. CQs can be shared across multiple Queue Pairs.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Weak;
 use std::{io, mem::MaybeUninit, ptr::NonNull};
@@ -53,6 +53,21 @@ impl CqeOpcode {
             0x0e => Some(Self::RespErr),
             _ => None,
         }
+    }
+
+    /// Returns true if this is a responder (RQ) completion.
+    ///
+    /// Responder completions indicate that data was received on the Receive Queue.
+    /// This includes RDMA WRITE with immediate, SEND operations, and responder errors.
+    pub fn is_responder(&self) -> bool {
+        matches!(
+            self,
+            Self::RespRdmaWriteImm
+                | Self::RespSend
+                | Self::RespSendImm
+                | Self::RespSendInv
+                | Self::RespErr
+        )
     }
 }
 
@@ -158,7 +173,7 @@ pub(crate) struct CqState {
     /// Doorbell record pointer
     dbrec: *mut u32,
     /// Consumer index
-    ci: u32,
+    ci: Cell<u32>,
 }
 
 // =============================================================================
@@ -173,7 +188,7 @@ pub struct CompletionQueue {
     cq: NonNull<mlx5_sys::ibv_cq>,
     state: Option<CqState>,
     /// Registered queues (QPN -> CompletionTarget)
-    queues: HashMap<u32, Weak<RefCell<dyn CompletionTarget>>>,
+    queues: RefCell<HashMap<u32, Weak<RefCell<dyn CompletionTarget>>>>,
     /// Keep the context alive while this CQ exists.
     _ctx: Context,
 }
@@ -210,7 +225,7 @@ impl Context {
             Ok(CompletionQueue {
                 cq: NonNull::new(cq).unwrap(),
                 state: None,
-                queues: HashMap::new(),
+                queues: RefCell::new(HashMap::new()),
                 _ctx: self.clone(),
             })
         }
@@ -261,7 +276,7 @@ impl CompletionQueue {
                 cqe_cnt: dv_cq.cqe_cnt,
                 cqe_size: dv_cq.cqe_size,
                 dbrec: dv_cq.dbrec as *mut u32,
-                ci: 0,
+                ci: Cell::new(0),
             });
 
             Ok(())
@@ -271,25 +286,25 @@ impl CompletionQueue {
     /// Register a queue for completion dispatch.
     ///
     /// Called automatically when a QP is created with this CQ.
-    pub(crate) fn register_queue(&mut self, qpn: u32, queue: Weak<RefCell<dyn CompletionTarget>>) {
-        self.queues.insert(qpn, queue);
+    pub(crate) fn register_queue(&self, qpn: u32, queue: Weak<RefCell<dyn CompletionTarget>>) {
+        self.queues.borrow_mut().insert(qpn, queue);
     }
 
     /// Unregister a queue.
     ///
     /// Called automatically when a QP is dropped.
-    pub(crate) fn unregister_queue(&mut self, qpn: u32) {
-        self.queues.remove(&qpn);
+    pub(crate) fn unregister_queue(&self, qpn: u32) {
+        self.queues.borrow_mut().remove(&qpn);
     }
 
     /// Poll for completions and dispatch to registered queues.
     ///
     /// Returns the number of completions processed.
-    pub fn poll(&mut self) -> usize {
+    pub fn poll(&self) -> usize {
         let mut count = 0;
         while let Some(cqe) = self.try_next_cqe() {
-            if let Some(queue) = self.queues.get(&cqe.qp_num).and_then(Weak::upgrade) {
-                queue.borrow_mut().dispatch_cqe(cqe);
+            if let Some(queue) = self.queues.borrow().get(&cqe.qp_num).and_then(Weak::upgrade) {
+                queue.borrow().dispatch_cqe(cqe);
             }
             count += 1;
         }
@@ -303,7 +318,7 @@ impl CompletionQueue {
         if let Some(state) = &self.state {
             mmio_flush_writes!();
             unsafe {
-                std::ptr::write_volatile(state.dbrec, (state.ci & 0x00FF_FFFF).to_be());
+                std::ptr::write_volatile(state.dbrec, (state.ci.get() & 0x00FF_FFFF).to_be());
             }
         }
     }
@@ -315,23 +330,24 @@ impl CompletionQueue {
     ///
     /// Note: When using this method, you should call `flush()` afterwards
     /// to acknowledge the completions to the hardware.
-    pub fn poll_one(&mut self) -> Option<Cqe> {
+    pub fn poll_one(&self) -> Option<Cqe> {
         self.try_next_cqe()
     }
 
     /// Try to get the next CQE.
     ///
     /// Returns None if no CQE is available.
-    fn try_next_cqe(&mut self) -> Option<Cqe> {
-        let state = self.state.as_mut()?;
+    fn try_next_cqe(&self) -> Option<Cqe> {
+        let state = self.state.as_ref()?;
 
+        let ci = state.ci.get();
         let cqe_mask = state.cqe_cnt - 1;
-        let idx = state.ci & cqe_mask;
+        let idx = ci & cqe_mask;
         let cqe_ptr = unsafe { state.buf.add((idx as usize) * (state.cqe_size as usize)) };
 
         // Owner bit check
         let op_own = unsafe { std::ptr::read_volatile(cqe_ptr.add(63)) };
-        let sw_owner = ((state.ci >> state.cqe_cnt.trailing_zeros()) & 1) as u8;
+        let sw_owner = ((ci >> state.cqe_cnt.trailing_zeros()) & 1) as u8;
         let hw_owner = op_own & 1;
 
         // Check owner bit and invalid opcode
@@ -346,7 +362,7 @@ impl CompletionQueue {
         udma_from_device_barrier!();
 
         let cqe = unsafe { Cqe::from_ptr(cqe_ptr) };
-        state.ci = state.ci.wrapping_add(1);
+        state.ci.set(ci.wrapping_add(1));
 
         Some(cqe)
     }

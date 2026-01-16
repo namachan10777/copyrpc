@@ -3,7 +3,7 @@
 //! Queue Pairs are the fundamental communication endpoints in RDMA.
 //! This module provides RC (Reliable Connection) QP creation using mlx5dv_create_qp.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::{io, mem::MaybeUninit, ptr::NonNull};
 
@@ -104,11 +104,11 @@ pub(crate) struct SendQueueState<T, Tab> {
     /// SQ number
     sqn: u32,
     /// Producer index (next WQE slot)
-    pi: u16,
+    pi: Cell<u16>,
     /// Consumer index (last completed WQE)
-    ci: u16,
+    ci: Cell<u16>,
     /// Last posted WQE pointer and size (for BlueFlame)
-    last_wqe: Option<(*mut u8, usize)>,
+    last_wqe: Cell<Option<(*mut u8, usize)>>,
     /// Doorbell record pointer
     dbrec: *mut u32,
     /// BlueFlame register pointer
@@ -116,16 +116,16 @@ pub(crate) struct SendQueueState<T, Tab> {
     /// BlueFlame size (64 or 0 if not available)
     bf_size: u32,
     /// Current BlueFlame offset (alternates between 0 and bf_size)
-    bf_offset: u32,
+    bf_offset: Cell<u32>,
     /// WQE table for tracking in-flight operations
-    table: Tab,
+    table: RefCell<Tab>,
     /// Phantom for entry type
     _marker: std::marker::PhantomData<T>,
 }
 
 impl<T, Tab> SendQueueState<T, Tab> {
     fn available(&self) -> u16 {
-        self.wqe_cnt - self.pi.wrapping_sub(self.ci)
+        self.wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
     }
 
     fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
@@ -133,16 +133,16 @@ impl<T, Tab> SendQueueState<T, Tab> {
         unsafe { self.buf.add(offset) }
     }
 
-    fn advance_pi(&mut self, count: u16) {
-        self.pi = self.pi.wrapping_add(count);
+    fn advance_pi(&self, count: u16) {
+        self.pi.set(self.pi.get().wrapping_add(count));
     }
 
-    fn set_last_wqe(&mut self, ptr: *mut u8, size: usize) {
-        self.last_wqe = Some((ptr, size));
+    fn set_last_wqe(&self, ptr: *mut u8, size: usize) {
+        self.last_wqe.set(Some((ptr, size)));
     }
 
     /// Ring the doorbell using regular doorbell write.
-    fn ring_doorbell(&mut self) {
+    fn ring_doorbell(&self) {
         let Some((last_wqe_ptr, _)) = self.last_wqe.take() else {
             return;
         };
@@ -150,7 +150,7 @@ impl<T, Tab> SendQueueState<T, Tab> {
         mmio_flush_writes!();
 
         unsafe {
-            std::ptr::write_volatile(self.dbrec.add(1), (self.pi as u32).to_be());
+            std::ptr::write_volatile(self.dbrec.add(1), (self.pi.get() as u32).to_be());
         }
 
         udma_to_device_barrier!();
@@ -159,53 +159,55 @@ impl<T, Tab> SendQueueState<T, Tab> {
     }
 
     /// Ring the doorbell using BlueFlame (low latency, single WQE).
-    fn ring_blueflame(&mut self, wqe_ptr: *mut u8) {
+    fn ring_blueflame(&self, wqe_ptr: *mut u8) {
         mmio_flush_writes!();
 
         unsafe {
-            std::ptr::write_volatile(self.dbrec.add(1), (self.pi as u32).to_be());
+            std::ptr::write_volatile(self.dbrec.add(1), (self.pi.get() as u32).to_be());
         }
 
         udma_to_device_barrier!();
 
         if self.bf_size > 0 {
-            let bf = unsafe { self.bf_reg.add(self.bf_offset as usize) };
+            let bf_offset = self.bf_offset.get();
+            let bf = unsafe { self.bf_reg.add(bf_offset as usize) };
             mlx5_bf_copy!(bf, wqe_ptr);
             mmio_flush_writes!();
-            self.bf_offset ^= self.bf_size;
+            self.bf_offset.set(bf_offset ^ self.bf_size);
         } else {
             // Fallback to regular doorbell if BlueFlame not available
             self.ring_db(wqe_ptr);
         }
     }
 
-    fn ring_db(&mut self, wqe_ptr: *mut u8) {
-        let bf = unsafe { self.bf_reg.add(self.bf_offset as usize) as *mut u64 };
+    fn ring_db(&self, wqe_ptr: *mut u8) {
+        let bf_offset = self.bf_offset.get();
+        let bf = unsafe { self.bf_reg.add(bf_offset as usize) as *mut u64 };
         let ctrl = wqe_ptr as *const u64;
         unsafe {
             std::ptr::write_volatile(bf, *ctrl);
         }
         mmio_flush_writes!();
-        self.bf_offset ^= self.bf_size;
+        self.bf_offset.set(bf_offset ^ self.bf_size);
     }
 }
 
 impl<T> SendQueueState<T, SparseWqeTable<T>> {
-    fn process_completion_sparse(&mut self, wqe_idx: u16) -> Option<T> {
-        self.ci = wqe_idx;
-        self.table.take(wqe_idx)
+    fn process_completion_sparse(&self, wqe_idx: u16) -> Option<T> {
+        self.ci.set(wqe_idx);
+        self.table.borrow_mut().take(wqe_idx)
     }
 }
 
 impl<T> SendQueueState<T, DenseWqeTable<T>> {
-    fn process_completions_dense<F>(&mut self, new_ci: u16, mut callback: F)
+    fn process_completions_dense<F>(&self, new_ci: u16, mut callback: F)
     where
         F: FnMut(u16, T),
     {
-        for (idx, entry) in self.table.drain_range(self.ci, new_ci) {
+        for (idx, entry) in self.table.borrow_mut().drain_range(self.ci.get(), new_ci) {
             callback(idx, entry);
         }
-        self.ci = new_ci;
+        self.ci.set(new_ci);
     }
 }
 
@@ -214,7 +216,11 @@ impl<T> SendQueueState<T, DenseWqeTable<T>> {
 // =============================================================================
 
 /// Receive Queue state for direct WQE posting.
-pub(crate) struct ReceiveQueueState {
+///
+/// Generic over `T`, the entry type stored in the WQE table.
+/// Unlike SQ, all RQ WQEs generate completions (all signaled),
+/// so we use a simple table without sparse/dense distinction.
+pub(crate) struct ReceiveQueueState<T> {
     /// RQ buffer base address
     buf: *mut u8,
     /// Number of WQE slots
@@ -222,22 +228,56 @@ pub(crate) struct ReceiveQueueState {
     /// Stride (bytes per WQE slot)
     stride: u32,
     /// Producer index (next WQE slot)
-    pi: u16,
+    pi: Cell<u16>,
+    /// Consumer index (last completed WQE + 1)
+    ci: Cell<u16>,
     /// Doorbell record pointer (dbrec[0] for RQ)
     dbrec: *mut u32,
+    /// Entry table (all WQEs are signaled, so simple Option<T> array)
+    table: RefCell<Box<[Option<T>]>>,
 }
 
 /// MLX5 invalid lkey value used to mark end of SGE list.
 const MLX5_INVALID_LKEY: u32 = 0x100;
 
-impl ReceiveQueueState {
+impl<T> ReceiveQueueState<T> {
     fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
         let offset = ((idx as u32) & (self.wqe_cnt - 1)) * self.stride;
         unsafe { self.buf.add(offset as usize) }
     }
 
-    unsafe fn post(&mut self, addr: u64, len: u32, lkey: u32) {
-        let wqe_ptr = self.get_wqe_ptr(self.pi);
+    /// Process a receive completion.
+    ///
+    /// Returns the entry associated with the completed WQE.
+    fn process_completion(&self, wqe_idx: u16) -> Option<T> {
+        self.ci.set(wqe_idx.wrapping_add(1));
+        let idx = (wqe_idx as usize) & ((self.wqe_cnt - 1) as usize);
+        self.table.borrow_mut()[idx].take()
+    }
+
+    /// Get the number of available WQE slots.
+    fn available(&self) -> u32 {
+        self.wqe_cnt - (self.pi.get().wrapping_sub(self.ci.get()) as u32)
+    }
+
+    fn ring_doorbell(&self) {
+        mmio_flush_writes!();
+        unsafe {
+            std::ptr::write_volatile(self.dbrec, (self.pi.get() as u32).to_be());
+        }
+    }
+
+    /// Post a receive WQE without entry tracking.
+    ///
+    /// This is a legacy method for backward compatibility. Prefer using
+    /// `RecvWqeBuilder` for new code to enable entry tracking.
+    ///
+    /// # Safety
+    /// - The buffer must be registered and valid.
+    /// - There must be available slots in the RQ.
+    unsafe fn post(&self, addr: u64, len: u32, lkey: u32) {
+        let pi = self.pi.get();
+        let wqe_ptr = self.get_wqe_ptr(pi);
         DataSeg::write(wqe_ptr, len, lkey, addr);
 
         // If there's room for another SGE, write a sentinel to mark end of list.
@@ -249,14 +289,54 @@ impl ReceiveQueueState {
             std::ptr::write_volatile(ptr32.add(1), MLX5_INVALID_LKEY.to_be()); // lkey = invalid
         }
 
-        self.pi = self.pi.wrapping_add(1);
+        self.pi.set(pi.wrapping_add(1));
+    }
+}
+
+// =============================================================================
+// Receive WQE Builder
+// =============================================================================
+
+/// Zero-copy WQE builder for receive operations.
+///
+/// Writes segments directly to the RQ buffer without intermediate copies.
+/// Similar to the send WQE builder pattern, but for receive WQEs.
+pub struct RecvWqeBuilder<'a, T> {
+    rq: &'a ReceiveQueueState<T>,
+    entry: T,
+    wqe_idx: u16,
+}
+
+impl<'a, T> RecvWqeBuilder<'a, T> {
+    /// Add a data segment (SGE) for the receive buffer.
+    ///
+    /// # Safety
+    /// The caller must ensure the buffer is registered and valid.
+    pub fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
+        unsafe {
+            let wqe_ptr = self.rq.get_wqe_ptr(self.wqe_idx);
+            DataSeg::write(wqe_ptr, len, lkey, addr);
+
+            // If there's room for another SGE, write a sentinel to mark end of list.
+            // The sentinel has byte_count=0 and lkey=MLX5_INVALID_LKEY.
+            if self.rq.stride > DataSeg::SIZE as u32 {
+                let sentinel_ptr = wqe_ptr.add(DataSeg::SIZE);
+                let ptr32 = sentinel_ptr as *mut u32;
+                std::ptr::write_volatile(ptr32, 0u32); // byte_count = 0
+                std::ptr::write_volatile(ptr32.add(1), MLX5_INVALID_LKEY.to_be()); // lkey = invalid
+            }
+        }
+        self
     }
 
-    fn ring_doorbell(&mut self) {
-        mmio_flush_writes!();
-        unsafe {
-            std::ptr::write_volatile(self.dbrec, (self.pi as u32).to_be());
-        }
+    /// Finish the receive WQE construction.
+    ///
+    /// Stores the entry in the table and advances the producer index.
+    /// Call `ring_rq_doorbell()` after posting one or more WQEs to notify the HCA.
+    pub fn finish(self) {
+        let idx = (self.wqe_idx as usize) & ((self.rq.wqe_cnt - 1) as usize);
+        self.rq.table.borrow_mut()[idx] = Some(self.entry);
+        self.rq.pi.set(self.rq.pi.get().wrapping_add(1));
     }
 }
 
@@ -268,7 +348,7 @@ impl ReceiveQueueState {
 ///
 /// Writes segments directly to the SQ buffer without intermediate copies.
 pub struct WqeBuilder<'a, T, Tab> {
-    sq: &'a mut SendQueueState<T, Tab>,
+    sq: &'a SendQueueState<T, Tab>,
     wqe_ptr: *mut u8,
     wqe_idx: u16,
     offset: usize,
@@ -466,14 +546,14 @@ pub type DenseRcQp<T, F> = RcQpInner<T, DenseWqeTable<T>, F>;
 ///
 /// Created using mlx5dv_create_qp for direct hardware access.
 ///
-/// Type parameter `T` is the entry type stored in the WQE table.
-/// Type parameter `Tab` determines sparse vs dense table behavior.
+/// Type parameter `T` is the entry type stored in the WQE table (used for both SQ and RQ).
+/// Type parameter `Tab` determines sparse vs dense table behavior for the SQ.
 /// Type parameter `F` is the completion callback type.
 pub struct RcQpInner<T, Tab, F> {
     qp: NonNull<mlx5_sys::ibv_qp>,
-    state: QpState,
+    state: Cell<QpState>,
     sq: Option<SendQueueState<T, Tab>>,
-    rq: Option<ReceiveQueueState>,
+    rq: Option<ReceiveQueueState<T>>,
     callback: F,
     /// Weak reference to the CQ for unregistration on drop
     send_cq: Weak<RefCell<CompletionQueue>>,
@@ -596,7 +676,7 @@ impl Context {
             NonNull::new(qp).map_or(Err(io::Error::last_os_error()), |qp| {
                 Ok(RcQpInner {
                     qp,
-                    state: QpState::Reset,
+                    state: Cell::new(QpState::Reset),
                     sq: None,
                     rq: None,
                     callback,
@@ -643,7 +723,7 @@ impl Context {
             NonNull::new(qp).map_or(Err(io::Error::last_os_error()), |qp| {
                 Ok(RcQpInner {
                     qp,
-                    state: QpState::Reset,
+                    state: Cell::new(QpState::Reset),
                     sq: None,
                     rq: None,
                     callback,
@@ -680,7 +760,7 @@ impl<T, Tab, F> RcQpInner<T, Tab, F> {
 
     /// Get the current QP state.
     pub fn state(&self) -> QpState {
-        self.state
+        self.state.get()
     }
 
     /// Get mlx5-specific QP information for direct WQE access.
@@ -724,7 +804,7 @@ impl<T, Tab, F> RcQpInner<T, Tab, F> {
 
     /// Transition QP from RESET to INIT.
     pub fn modify_to_init(&mut self, port: u8, access_flags: u32) -> io::Result<()> {
-        if self.state != QpState::Reset {
+        if self.state.get() != QpState::Reset {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "QP must be in RESET state",
@@ -749,7 +829,7 @@ impl<T, Tab, F> RcQpInner<T, Tab, F> {
             }
         }
 
-        self.state = QpState::Init;
+        self.state.set(QpState::Init);
         Ok(())
     }
 
@@ -760,7 +840,7 @@ impl<T, Tab, F> RcQpInner<T, Tab, F> {
         port: u8,
         max_dest_rd_atomic: u8,
     ) -> io::Result<()> {
-        if self.state != QpState::Init {
+        if self.state.get() != QpState::Init {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "QP must be in INIT state",
@@ -795,13 +875,13 @@ impl<T, Tab, F> RcQpInner<T, Tab, F> {
             }
         }
 
-        self.state = QpState::Rtr;
+        self.state.set(QpState::Rtr);
         Ok(())
     }
 
     /// Transition QP from RTR to RTS (Ready to Send).
     pub fn modify_to_rts(&mut self, local_psn: u32, max_rd_atomic: u8) -> io::Result<()> {
-        if self.state != QpState::Rtr {
+        if self.state.get() != QpState::Rtr {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "QP must be in RTR state",
@@ -830,7 +910,7 @@ impl<T, Tab, F> RcQpInner<T, Tab, F> {
             }
         }
 
-        self.state = QpState::Rts;
+        self.state.set(QpState::Rts);
         Ok(())
     }
 
@@ -838,7 +918,7 @@ impl<T, Tab, F> RcQpInner<T, Tab, F> {
     ///
     /// This cleanly tears down the connection and flushes any pending work requests.
     /// Useful before destroying a QP to avoid crashes when the remote QP is already gone.
-    pub fn modify_to_error(&mut self) -> io::Result<()> {
+    pub fn modify_to_error(&self) -> io::Result<()> {
         unsafe {
             let mut attr: mlx5_sys::ibv_qp_attr = MaybeUninit::zeroed().assume_init();
             attr.qp_state = mlx5_sys::ibv_qp_state_IBV_QPS_ERR;
@@ -851,13 +931,13 @@ impl<T, Tab, F> RcQpInner<T, Tab, F> {
             }
         }
 
-        self.state = QpState::Error;
+        self.state.set(QpState::Error);
         Ok(())
     }
 
-    fn sq_mut(&mut self) -> io::Result<&mut SendQueueState<T, Tab>> {
+    fn sq(&self) -> io::Result<&SendQueueState<T, Tab>> {
         self.sq
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "direct access not initialized"))
     }
 
@@ -867,8 +947,8 @@ impl<T, Tab, F> RcQpInner<T, Tab, F> {
     }
 
     /// Ring the SQ doorbell to notify HCA of new WQEs.
-    pub fn ring_sq_doorbell(&mut self) {
-        if let Some(sq) = self.sq.as_mut() {
+    pub fn ring_sq_doorbell(&self) {
+        if let Some(sq) = self.sq.as_ref() {
             sq.ring_doorbell();
         }
     }
@@ -886,23 +966,26 @@ impl<T, F> RcQp<T, F> {
             buf: info.sq_buf,
             wqe_cnt,
             sqn: info.sqn,
-            pi: 0,
-            ci: 0,
-            last_wqe: None,
+            pi: Cell::new(0),
+            ci: Cell::new(0),
+            last_wqe: Cell::new(None),
             dbrec: info.dbrec,
             bf_reg: info.bf_reg,
             bf_size: info.bf_size,
-            bf_offset: 0,
-            table: SparseWqeTable::new(wqe_cnt),
+            bf_offset: Cell::new(0),
+            table: RefCell::new(SparseWqeTable::new(wqe_cnt)),
             _marker: std::marker::PhantomData,
         });
 
+        let rq_wqe_cnt = info.rq_wqe_cnt;
         self.rq = Some(ReceiveQueueState {
             buf: info.rq_buf,
-            wqe_cnt: info.rq_wqe_cnt,
+            wqe_cnt: rq_wqe_cnt,
             stride: info.rq_stride,
-            pi: 0,
+            pi: Cell::new(0),
+            ci: Cell::new(0),
             dbrec: info.dbrec,
+            table: RefCell::new((0..rq_wqe_cnt).map(|_| None).collect()),
         });
 
         Ok(())
@@ -928,16 +1011,35 @@ impl<T, F> RcQp<T, F> {
         Ok(())
     }
 
+    /// Get a receive WQE builder for zero-copy WQE construction.
+    ///
+    /// The entry will be stored and returned via callback on RQ completion.
+    pub fn recv_builder(&self, entry: T) -> io::Result<RecvWqeBuilder<'_, T>> {
+        let rq = self.rq.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "direct access not initialized")
+        })?;
+        if rq.available() == 0 {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "RQ full"));
+        }
+
+        let wqe_idx = rq.pi.get();
+        Ok(RecvWqeBuilder {
+            rq,
+            entry,
+            wqe_idx,
+        })
+    }
+
     /// Get a WQE builder for zero-copy WQE construction (signaled).
     ///
     /// The entry will be stored and returned via callback on completion.
-    pub fn wqe_builder(&mut self, entry: T) -> io::Result<SparseWqeBuilder<'_, T>> {
-        let sq = self.sq_mut()?;
+    pub fn wqe_builder(&self, entry: T) -> io::Result<SparseWqeBuilder<'_, T>> {
+        let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
         }
 
-        let wqe_idx = sq.pi;
+        let wqe_idx = sq.pi.get();
         let wqe_ptr = sq.get_wqe_ptr(wqe_idx);
 
         Ok(SparseWqeBuilder {
@@ -956,13 +1058,13 @@ impl<T, F> RcQp<T, F> {
     /// Get a WQE builder for zero-copy WQE construction (unsignaled).
     ///
     /// No entry is stored and no completion callback will be invoked.
-    pub fn wqe_builder_unsignaled(&mut self) -> io::Result<SparseWqeBuilder<'_, T>> {
-        let sq = self.sq_mut()?;
+    pub fn wqe_builder_unsignaled(&self) -> io::Result<SparseWqeBuilder<'_, T>> {
+        let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
         }
 
-        let wqe_idx = sq.pi;
+        let wqe_idx = sq.pi.get();
         let wqe_ptr = sq.get_wqe_ptr(wqe_idx);
 
         Ok(SparseWqeBuilder {
@@ -991,23 +1093,26 @@ impl<T, F> DenseRcQp<T, F> {
             buf: info.sq_buf,
             wqe_cnt,
             sqn: info.sqn,
-            pi: 0,
-            ci: 0,
-            last_wqe: None,
+            pi: Cell::new(0),
+            ci: Cell::new(0),
+            last_wqe: Cell::new(None),
             dbrec: info.dbrec,
             bf_reg: info.bf_reg,
             bf_size: info.bf_size,
-            bf_offset: 0,
-            table: DenseWqeTable::new(wqe_cnt),
+            bf_offset: Cell::new(0),
+            table: RefCell::new(DenseWqeTable::new(wqe_cnt)),
             _marker: std::marker::PhantomData,
         });
 
+        let rq_wqe_cnt = info.rq_wqe_cnt;
         self.rq = Some(ReceiveQueueState {
             buf: info.rq_buf,
-            wqe_cnt: info.rq_wqe_cnt,
+            wqe_cnt: rq_wqe_cnt,
             stride: info.rq_stride,
-            pi: 0,
+            pi: Cell::new(0),
+            ci: Cell::new(0),
             dbrec: info.dbrec,
+            table: RefCell::new((0..rq_wqe_cnt).map(|_| None).collect()),
         });
 
         Ok(())
@@ -1033,18 +1138,37 @@ impl<T, F> DenseRcQp<T, F> {
         Ok(())
     }
 
+    /// Get a receive WQE builder for zero-copy WQE construction.
+    ///
+    /// The entry will be stored and returned via callback on RQ completion.
+    pub fn recv_builder(&self, entry: T) -> io::Result<RecvWqeBuilder<'_, T>> {
+        let rq = self.rq.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "direct access not initialized")
+        })?;
+        if rq.available() == 0 {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "RQ full"));
+        }
+
+        let wqe_idx = rq.pi.get();
+        Ok(RecvWqeBuilder {
+            rq,
+            entry,
+            wqe_idx,
+        })
+    }
+
     /// Get a WQE builder for zero-copy WQE construction.
     ///
     /// Every WQE must have an entry. The signaled flag controls whether
     /// a CQE is generated. The callback receives `Some(Cqe)` for signaled
     /// WQEs and `None` for unsignaled ones.
-    pub fn wqe_builder(&mut self, entry: T, signaled: bool) -> io::Result<DenseWqeBuilder<'_, T>> {
-        let sq = self.sq_mut()?;
+    pub fn wqe_builder(&self, entry: T, signaled: bool) -> io::Result<DenseWqeBuilder<'_, T>> {
+        let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
         }
 
-        let wqe_idx = sq.pi;
+        let wqe_idx = sq.pi.get();
         let wqe_ptr = sq.get_wqe_ptr(wqe_idx);
 
         Ok(DenseWqeBuilder {
@@ -1112,7 +1236,7 @@ impl<'a, T> SparseWqeBuilder<'a, T> {
     pub fn finish(self) -> WqeHandle {
         let wqe_idx = self.inner.wqe_idx;
         if let Some(entry) = self.entry {
-            self.inner.sq.table.store(wqe_idx, entry);
+            self.inner.sq.table.borrow_mut().store(wqe_idx, entry);
         }
         self.inner.finish_internal()
     }
@@ -1124,7 +1248,7 @@ impl<'a, T> SparseWqeBuilder<'a, T> {
     pub fn finish_with_blueflame(self) -> WqeHandle {
         let wqe_idx = self.inner.wqe_idx;
         if let Some(entry) = self.entry {
-            self.inner.sq.table.store(wqe_idx, entry);
+            self.inner.sq.table.borrow_mut().store(wqe_idx, entry);
         }
         self.inner.finish_internal_with_blueflame()
     }
@@ -1176,7 +1300,7 @@ impl<'a, T> DenseWqeBuilder<'a, T> {
     /// Finish the WQE construction.
     pub fn finish(self) -> WqeHandle {
         let wqe_idx = self.inner.wqe_idx;
-        self.inner.sq.table.store(wqe_idx, self.entry);
+        self.inner.sq.table.borrow_mut().store(wqe_idx, self.entry);
         self.inner.finish_internal()
     }
 
@@ -1186,7 +1310,7 @@ impl<'a, T> DenseWqeBuilder<'a, T> {
     /// `ring_sq_doorbell()` afterwards.
     pub fn finish_with_blueflame(self) -> WqeHandle {
         let wqe_idx = self.inner.wqe_idx;
-        self.inner.sq.table.store(wqe_idx, self.entry);
+        self.inner.sq.table.borrow_mut().store(wqe_idx, self.entry);
         self.inner.finish_internal_with_blueflame()
     }
 }
@@ -1203,10 +1327,20 @@ where
         RcQpInner::qpn(self)
     }
 
-    fn dispatch_cqe(&mut self, cqe: Cqe) {
-        if let Some(sq) = self.sq.as_mut() {
-            if let Some(entry) = sq.process_completion_sparse(cqe.wqe_counter) {
-                (self.callback)(cqe, entry);
+    fn dispatch_cqe(&self, cqe: Cqe) {
+        if cqe.opcode.is_responder() {
+            // RQ completion (responder)
+            if let Some(rq) = self.rq.as_ref() {
+                if let Some(entry) = rq.process_completion(cqe.wqe_counter) {
+                    (self.callback)(cqe, entry);
+                }
+            }
+        } else {
+            // SQ completion (requester)
+            if let Some(sq) = self.sq.as_ref() {
+                if let Some(entry) = sq.process_completion_sparse(cqe.wqe_counter) {
+                    (self.callback)(cqe, entry);
+                }
             }
         }
     }
@@ -1224,17 +1358,27 @@ where
         RcQpInner::qpn(self)
     }
 
-    fn dispatch_cqe(&mut self, cqe: Cqe) {
-        if let Some(sq) = self.sq.as_mut() {
-            let signaled_idx = cqe.wqe_counter;
-            sq.process_completions_dense(signaled_idx, |idx, entry| {
-                let cqe_opt = if idx == signaled_idx {
-                    Some(cqe)
-                } else {
-                    None
-                };
-                (self.callback)(cqe_opt, entry);
-            });
+    fn dispatch_cqe(&self, cqe: Cqe) {
+        if cqe.opcode.is_responder() {
+            // RQ completion (responder) - all RQ WQEs are signaled
+            if let Some(rq) = self.rq.as_ref() {
+                if let Some(entry) = rq.process_completion(cqe.wqe_counter) {
+                    (self.callback)(Some(cqe), entry);
+                }
+            }
+        } else {
+            // SQ completion (requester)
+            if let Some(sq) = self.sq.as_ref() {
+                let signaled_idx = cqe.wqe_counter;
+                sq.process_completions_dense(signaled_idx, |idx, entry| {
+                    let cqe_opt = if idx == signaled_idx {
+                        Some(cqe)
+                    } else {
+                        None
+                    };
+                    (self.callback)(cqe_opt, entry);
+                });
+            }
         }
     }
 }
@@ -1249,15 +1393,15 @@ impl<T, Tab, F> RcQpInner<T, Tab, F> {
     /// # Safety
     /// - The buffer must be registered and valid
     /// - There must be available slots in the RQ
-    pub unsafe fn post_recv(&mut self, addr: u64, len: u32, lkey: u32) {
-        if let Some(rq) = self.rq.as_mut() {
+    pub unsafe fn post_recv(&self, addr: u64, len: u32, lkey: u32) {
+        if let Some(rq) = self.rq.as_ref() {
             rq.post(addr, len, lkey);
         }
     }
 
     /// Ring the RQ doorbell to notify HCA of new WQEs.
-    pub fn ring_rq_doorbell(&mut self) {
-        if let Some(rq) = self.rq.as_mut() {
+    pub fn ring_rq_doorbell(&self) {
+        if let Some(rq) = self.rq.as_ref() {
             rq.ring_doorbell();
         }
     }

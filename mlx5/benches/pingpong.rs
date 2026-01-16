@@ -1,9 +1,8 @@
-//! Ping-pong latency benchmarks for RDMA operations.
+//! Ping-pong latency and throughput benchmarks for RDMA operations.
 //!
 //! Benchmarks:
-//! - WRITE with Immediate
-//! - SEND/RECV
-//! - Inline SEND/RECV
+//! - Throughput: WRITE with Immediate (queue depth = 64, batched doorbells)
+//! - Low-latency: WRITE with Immediate (queue depth = 1, inline + blueflame)
 //!
 //! Run with:
 //! ```bash
@@ -18,7 +17,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use mlx5::cq::{CompletionQueue, Cqe, CqeOpcode};
 use mlx5::device::{Context, DeviceList};
@@ -30,9 +29,9 @@ use mlx5::wqe::{WqeFlags, WqeOpcode};
 // Constants
 // =============================================================================
 
-const QUEUE_DEPTH: usize = 32;
+const QUEUE_DEPTH: usize = 64;
 const PAGE_SIZE: usize = 4096;
-const BUFFER_SIZE: usize = 8192;
+const BUFFER_SIZE: usize = 64 * 256; // 64 entries * 256 bytes
 
 // =============================================================================
 // Aligned Buffer
@@ -411,9 +410,10 @@ fn server_thread_main(
     let remote_addr = client_info.buf_addr;
     let remote_rkey = client_info.rkey;
     let mut recv_posted = 0usize;
+    let mut send_posted = 0usize;
 
     while !stop_flag.load(Ordering::Relaxed) {
-        // Poll recv CQ
+        // Poll recv CQ - batch all available CQEs
         while let Some(cqe) = recv_cq.poll_one() {
             if cqe.syndrome != 0 {
                 continue;
@@ -423,7 +423,7 @@ fn server_thread_main(
             let offset = (idx * 256) as u64;
             let size = cqe.byte_cnt.min(256);
 
-            // Echo back based on opcode
+            // Queue echo response (without ringing doorbell yet)
             match cqe.opcode {
                 CqeOpcode::RespRdmaWriteImm => {
                     // Echo with WRITE+IMM
@@ -431,16 +431,18 @@ fn server_thread_main(
                         b.ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), idx as u32)
                             .rdma(remote_addr + offset, remote_rkey)
                             .sge(send_buf.addr() + offset, size, send_mr.lkey())
-                            .finish_with_blueflame()
+                            .finish() // No blueflame - batch doorbells
                     });
+                    send_posted += 1;
                 }
                 CqeOpcode::RespSend | CqeOpcode::RespSendImm => {
                     // Echo with SEND
                     let _ = qp.borrow_mut().wqe_builder(idx as u64).map(|b| {
                         b.ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
                             .sge(send_buf.addr() + offset, size, send_mr.lkey())
-                            .finish_with_blueflame()
+                            .finish() // No blueflame - batch doorbells
                     });
+                    send_posted += 1;
                 }
                 _ => {}
             }
@@ -451,12 +453,20 @@ fn server_thread_main(
                     .post_recv(recv_buf.addr() + offset, 256, recv_mr.lkey());
             }
             recv_posted += 1;
-            if recv_posted >= QUEUE_DEPTH / 2 {
-                qp.borrow_mut().ring_rq_doorbell();
-                recv_posted = 0;
-            }
         }
         recv_cq.flush();
+
+        // Batch send doorbell - ring after processing all available CQEs
+        if send_posted > 0 {
+            qp.borrow_mut().ring_sq_doorbell();
+            send_posted = 0;
+        }
+
+        // Batch recv doorbell
+        if recv_posted >= QUEUE_DEPTH / 2 {
+            qp.borrow_mut().ring_rq_doorbell();
+            recv_posted = 0;
+        }
 
         // Drain send CQ - use poll() to update QP's internal ci
         send_cq.borrow_mut().poll();
@@ -470,10 +480,15 @@ fn server_thread_main(
 // Benchmark Functions
 // =============================================================================
 
-fn run_write_imm_bench(client: &mut EndpointState, iters: u64, size: usize) -> Duration {
+/// Throughput benchmark: WRITE+IMM with queue depth = 64, batched doorbells.
+///
+/// Maintains 64 WQEs inflight at all times. Doorbells are batched:
+/// - Send doorbell is rung only after filling the queue to QUEUE_DEPTH
+/// - Recv doorbell is rung when half the queue is pending
+fn run_throughput_bench(client: &mut EndpointState, iters: u64, size: usize) -> Duration {
     let size = size.min(256) as u32;
 
-    // Initial fill
+    // Initial fill - post QUEUE_DEPTH WQEs, then ring doorbell once
     for i in 0..QUEUE_DEPTH {
         let offset = (i * 256) as u64;
         let _ = client.qp.borrow_mut().wqe_builder(i as u64).map(|b| {
@@ -488,15 +503,18 @@ fn run_write_imm_bench(client: &mut EndpointState, iters: u64, size: usize) -> D
     let start = std::time::Instant::now();
     let mut completed = 0u64;
     let mut recv_to_post = 0usize;
+    let mut send_to_post = 0usize;
+    let mut inflight = QUEUE_DEPTH as u64;
 
     while completed < iters {
-        // Poll send CQ - use poll() to update QP's internal ci
+        // Poll send CQ to free up slots
         client.send_cq.borrow_mut().poll();
         client.send_cq.borrow().flush();
 
-        // Poll recv CQ
+        // Poll recv CQ for completions
         while let Some(cqe) = client.recv_cq.poll_one() {
             completed += 1;
+            inflight -= 1;
             let idx = (cqe.imm as usize) % QUEUE_DEPTH;
 
             // Repost recv
@@ -509,162 +527,103 @@ fn run_write_imm_bench(client: &mut EndpointState, iters: u64, size: usize) -> D
             }
             recv_to_post += 1;
 
-            // Post new request if needed
-            if completed + QUEUE_DEPTH as u64 <= iters {
+            // Queue new send request (without ringing doorbell yet)
+            if completed + inflight < iters {
                 let _ = client.qp.borrow_mut().wqe_builder(idx as u64).map(|b| {
                     b.ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), idx as u32)
                         .rdma(client.remote_addr + offset, client.remote_rkey)
                         .sge(client.send_buf.addr() + offset, size, client.send_mr.lkey())
-                        .finish_with_blueflame()
+                        .finish()
                 });
+                send_to_post += 1;
+                inflight += 1;
             }
         }
 
-        // Batch doorbell for recvs
-        if recv_to_post >= QUEUE_DEPTH / 2 {
+        // Ring doorbells after each poll cycle (best-effort batching)
+        if send_to_post > 0 {
+            client.qp.borrow_mut().ring_sq_doorbell();
+            send_to_post = 0;
+        }
+        if recv_to_post > 0 {
             client.qp.borrow_mut().ring_rq_doorbell();
             recv_to_post = 0;
         }
 
         client.recv_cq.flush();
-        client.send_cq.borrow().flush();
     }
 
-    // Final doorbell
-    if recv_to_post > 0 {
-        client.qp.borrow_mut().ring_rq_doorbell();
-    }
-
-    start.elapsed()
-}
-
-fn run_send_recv_bench(client: &mut EndpointState, iters: u64, size: usize) -> Duration {
-    let size = size.min(256) as u32;
-
-    // Initial fill
-    for i in 0..QUEUE_DEPTH {
-        let offset = (i * 256) as u64;
-        let _ = client.qp.borrow_mut().wqe_builder(i as u64).map(|b| {
-            b.ctrl(WqeOpcode::SendImm, WqeFlags::empty(), i as u32)
-                .sge(client.send_buf.addr() + offset, size, client.send_mr.lkey())
-                .finish()
-        });
-    }
-    client.qp.borrow_mut().ring_sq_doorbell();
-
-    let start = std::time::Instant::now();
-    let mut completed = 0u64;
-    let mut recv_to_post = 0usize;
-
-    while completed < iters {
-        // Poll send CQ - use poll() to update QP's internal ci
+    // Drain remaining inflight messages for clean state
+    while inflight > 0 {
         client.send_cq.borrow_mut().poll();
         client.send_cq.borrow().flush();
-
-        // Poll recv CQ
         while let Some(cqe) = client.recv_cq.poll_one() {
-            completed += 1;
-            let idx = (completed as usize - 1) % QUEUE_DEPTH;
-
-            // Repost recv
+            inflight -= 1;
+            // Repost recv for clean state
+            let idx = (cqe.imm as usize) % QUEUE_DEPTH;
             let offset = (idx * 256) as u64;
             unsafe {
-                client
-                    .qp
-                    .borrow_mut()
-                    .post_recv(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey());
-            }
-            recv_to_post += 1;
-
-            // Post new request if needed
-            if completed + QUEUE_DEPTH as u64 <= iters {
-                let _ = client.qp.borrow_mut().wqe_builder(idx as u64).map(|b| {
-                    b.ctrl(WqeOpcode::SendImm, WqeFlags::empty(), idx as u32)
-                        .sge(client.send_buf.addr() + offset, size, client.send_mr.lkey())
-                        .finish_with_blueflame()
-                });
+                client.qp.borrow_mut().post_recv(
+                    client.recv_buf.addr() + offset,
+                    256,
+                    client.recv_mr.lkey(),
+                );
             }
         }
-
-        // Batch doorbell for recvs
-        if recv_to_post >= QUEUE_DEPTH / 2 {
-            client.qp.borrow_mut().ring_rq_doorbell();
-            recv_to_post = 0;
-        }
-
         client.recv_cq.flush();
-        client.send_cq.borrow().flush();
-    }
-
-    // Final doorbell
-    if recv_to_post > 0 {
         client.qp.borrow_mut().ring_rq_doorbell();
     }
 
     start.elapsed()
 }
 
-fn run_inline_send_recv_bench(client: &mut EndpointState, iters: u64, size: usize) -> Duration {
-    let size = size.min(64);
+/// Low-latency benchmark: WRITE+IMM with queue depth = 1, inline + blueflame.
+///
+/// Sends one message at a time with inline data and blueflame for minimum latency.
+/// Measures round-trip time per operation.
+fn run_lowlatency_bench(client: &mut EndpointState, iters: u64, size: usize) -> Duration {
+    let size = size.min(64); // Inline data limit
     let data = vec![0xABu8; size];
 
-    // Initial fill with inline data
-    for i in 0..QUEUE_DEPTH {
-        let _ = client.qp.borrow_mut().wqe_builder(i as u64).map(|b| {
-            b.ctrl(WqeOpcode::SendImm, WqeFlags::empty(), i as u32)
-                .inline_data(&data)
-                .finish()
-        });
-    }
-    client.qp.borrow_mut().ring_sq_doorbell();
-
     let start = std::time::Instant::now();
-    let mut completed = 0u64;
-    let mut recv_to_post = 0usize;
 
-    while completed < iters {
-        // Poll send CQ - use poll() to update QP's internal ci
-        client.send_cq.borrow_mut().poll();
-        client.send_cq.borrow().flush();
+    for i in 0..iters {
+        let idx = (i as usize) % QUEUE_DEPTH;
 
-        // Poll recv CQ
-        while let Some(_cqe) = client.recv_cq.poll_one() {
-            completed += 1;
-            let idx = (completed as usize - 1) % QUEUE_DEPTH;
-
-            // Repost recv
+        // Post single WRITE+IMM with inline data + blueflame
+        let _ = client.qp.borrow_mut().wqe_builder(idx as u64).map(|b| {
             let offset = (idx * 256) as u64;
-            unsafe {
-                client
-                    .qp
-                    .borrow_mut()
-                    .post_recv(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey());
+            b.ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), idx as u32)
+                .rdma(client.remote_addr + offset, client.remote_rkey)
+                .inline_data(&data)
+                .finish_with_blueflame()
+        });
+
+        // Wait for completion (recv CQ)
+        loop {
+            // Poll send CQ to keep it from filling up
+            client.send_cq.borrow_mut().poll();
+            client.send_cq.borrow().flush();
+
+            // Check for recv completion
+            if let Some(cqe) = client.recv_cq.poll_one() {
+                // Repost recv immediately
+                let recv_idx = (cqe.imm as usize) % QUEUE_DEPTH;
+                let offset = (recv_idx * 256) as u64;
+                unsafe {
+                    client.qp.borrow_mut().post_recv(
+                        client.recv_buf.addr() + offset,
+                        256,
+                        client.recv_mr.lkey(),
+                    );
+                }
+                client.qp.borrow_mut().ring_rq_doorbell();
+                client.recv_cq.flush();
+                break;
             }
-            recv_to_post += 1;
-
-            // Post new request if needed
-            if completed + QUEUE_DEPTH as u64 <= iters {
-                let _ = client.qp.borrow_mut().wqe_builder(idx as u64).map(|b| {
-                    b.ctrl(WqeOpcode::SendImm, WqeFlags::empty(), idx as u32)
-                        .inline_data(&data)
-                        .finish_with_blueflame()
-                });
-            }
+            client.recv_cq.flush();
+            std::hint::spin_loop();
         }
-
-        // Batch doorbell for recvs
-        if recv_to_post >= QUEUE_DEPTH / 2 {
-            client.qp.borrow_mut().ring_rq_doorbell();
-            recv_to_post = 0;
-        }
-
-        client.recv_cq.flush();
-        client.send_cq.borrow().flush();
-    }
-
-    // Final doorbell
-    if recv_to_post > 0 {
-        client.qp.borrow_mut().ring_rq_doorbell();
     }
 
     start.elapsed()
@@ -685,36 +644,47 @@ fn pingpong_benchmarks(c: &mut Criterion) {
 
     // Drop order is REVERSE of declaration order in Rust.
     // Context must be dropped LAST, so it must be declared FIRST.
-    // Order: ctx first (dropped last) -> pd (dropped second-to-last) -> client -> server_handle
     let _ctx = setup._ctx;
     let _pd = setup._pd;
-    // Use RefCell for mutable access in closures
     let client = RefCell::new(setup.client);
     let mut server_handle = setup._server_handle;
 
-    let mut group = c.benchmark_group("pingpong");
-    group.sample_size(10);
-    group.measurement_time(Duration::from_secs(1));
-
-    // Only 32B size
     let size = 32usize;
 
-    // WRITE+IMM
-    group.bench_with_input(BenchmarkId::new("write_imm", size), &size, |b, &size| {
-        b.iter_custom(|iters| run_write_imm_bench(&mut client.borrow_mut(), iters, size));
-    });
+    // Throughput benchmark: queue depth = 64, batched doorbells
+    {
+        let mut group = c.benchmark_group("throughput");
+        group.sample_size(10);
+        group.measurement_time(Duration::from_secs(3));
+        group.throughput(Throughput::Elements(1)); // Per operation throughput
 
-    // SEND/RECV
-    group.bench_with_input(BenchmarkId::new("send_recv", size), &size, |b, &size| {
-        b.iter_custom(|iters| run_send_recv_bench(&mut client.borrow_mut(), iters, size));
-    });
+        group.bench_with_input(
+            BenchmarkId::new("write_imm_qd64", size),
+            &size,
+            |b, &size| {
+                b.iter_custom(|iters| run_throughput_bench(&mut client.borrow_mut(), iters, size));
+            },
+        );
 
-    // Inline SEND/RECV
-    group.bench_with_input(BenchmarkId::new("inline_send_recv", size), &size, |b, &size| {
-        b.iter_custom(|iters| run_inline_send_recv_bench(&mut client.borrow_mut(), iters, size));
-    });
+        group.finish();
+    }
 
-    group.finish();
+    // Low-latency benchmark: queue depth = 1, inline + blueflame
+    {
+        let mut group = c.benchmark_group("latency");
+        group.sample_size(10);
+        group.measurement_time(Duration::from_secs(1));
+
+        group.bench_with_input(
+            BenchmarkId::new("write_imm_inline_bf", size),
+            &size,
+            |b, &size| {
+                b.iter_custom(|iters| run_lowlatency_bench(&mut client.borrow_mut(), iters, size));
+            },
+        );
+
+        group.finish();
+    }
 
     // Cleanup: stop server first, then drain CQs
     server_handle.stop();
@@ -735,10 +705,6 @@ fn pingpong_benchmarks(c: &mut Criterion) {
             break;
         }
     }
-
-    // Resources are dropped in reverse declaration order:
-    // server_handle -> client -> _pd -> _ctx
-    // This ensures proper cleanup order.
 }
 
 criterion_group!(benches, pingpong_benchmarks);

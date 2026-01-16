@@ -4,7 +4,7 @@
 //! - DCI (DC Initiator): Sends RDMA operations to DCTs
 //! - DCT (DC Target): Receives RDMA operations via SRQ
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::{io, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
@@ -85,20 +85,20 @@ struct DciSendQueueState<T, Tab> {
     buf: *mut u8,
     wqe_cnt: u16,
     sqn: u32,
-    pi: u16,
-    ci: u16,
-    last_wqe: Option<(*mut u8, usize)>,
+    pi: Cell<u16>,
+    ci: Cell<u16>,
+    last_wqe: Cell<Option<(*mut u8, usize)>>,
     dbrec: *mut u32,
     bf_reg: *mut u8,
     bf_size: u32,
-    bf_offset: u32,
-    table: Tab,
+    bf_offset: Cell<u32>,
+    table: RefCell<Tab>,
     _marker: PhantomData<T>,
 }
 
 impl<T, Tab> DciSendQueueState<T, Tab> {
     fn available(&self) -> u16 {
-        self.wqe_cnt - self.pi.wrapping_sub(self.ci)
+        self.wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
     }
 
     fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
@@ -106,24 +106,25 @@ impl<T, Tab> DciSendQueueState<T, Tab> {
         unsafe { self.buf.add(offset) }
     }
 
-    fn advance_pi(&mut self, count: u16) {
-        self.pi = self.pi.wrapping_add(count);
+    fn advance_pi(&self, count: u16) {
+        self.pi.set(self.pi.get().wrapping_add(count));
     }
 
-    fn set_last_wqe(&mut self, ptr: *mut u8, size: usize) {
-        self.last_wqe = Some((ptr, size));
+    fn set_last_wqe(&self, ptr: *mut u8, size: usize) {
+        self.last_wqe.set(Some((ptr, size)));
     }
 
     /// Ring the doorbell using regular doorbell write.
-    fn ring_doorbell(&mut self) {
-        let Some((last_wqe_ptr, _)) = self.last_wqe.take() else {
+    fn ring_doorbell(&self) {
+        let Some((last_wqe_ptr, _)) = self.last_wqe.get() else {
             return;
         };
+        self.last_wqe.set(None);
 
         mmio_flush_writes!();
 
         unsafe {
-            std::ptr::write_volatile(self.dbrec.add(1), (self.pi as u32).to_be());
+            std::ptr::write_volatile(self.dbrec.add(1), (self.pi.get() as u32).to_be());
         }
 
         udma_to_device_barrier!();
@@ -132,53 +133,53 @@ impl<T, Tab> DciSendQueueState<T, Tab> {
     }
 
     /// Ring the doorbell using BlueFlame (low latency, single WQE).
-    fn ring_blueflame(&mut self, wqe_ptr: *mut u8) {
+    fn ring_blueflame(&self, wqe_ptr: *mut u8) {
         mmio_flush_writes!();
 
         unsafe {
-            std::ptr::write_volatile(self.dbrec.add(1), (self.pi as u32).to_be());
+            std::ptr::write_volatile(self.dbrec.add(1), (self.pi.get() as u32).to_be());
         }
 
         udma_to_device_barrier!();
 
         if self.bf_size > 0 {
-            let bf = unsafe { self.bf_reg.add(self.bf_offset as usize) };
+            let bf = unsafe { self.bf_reg.add(self.bf_offset.get() as usize) };
             mlx5_bf_copy!(bf, wqe_ptr);
             mmio_flush_writes!();
-            self.bf_offset ^= self.bf_size;
+            self.bf_offset.set(self.bf_offset.get() ^ self.bf_size);
         } else {
             // Fallback to regular doorbell if BlueFlame not available
             self.ring_db(wqe_ptr);
         }
     }
 
-    fn ring_db(&mut self, wqe_ptr: *mut u8) {
-        let bf = unsafe { self.bf_reg.add(self.bf_offset as usize) as *mut u64 };
+    fn ring_db(&self, wqe_ptr: *mut u8) {
+        let bf = unsafe { self.bf_reg.add(self.bf_offset.get() as usize) as *mut u64 };
         let ctrl = wqe_ptr as *const u64;
         unsafe {
             std::ptr::write_volatile(bf, *ctrl);
         }
         mmio_flush_writes!();
-        self.bf_offset ^= self.bf_size;
+        self.bf_offset.set(self.bf_offset.get() ^ self.bf_size);
     }
 }
 
 impl<T> DciSendQueueState<T, SparseWqeTable<T>> {
-    fn process_completion_sparse(&mut self, wqe_idx: u16) -> Option<T> {
-        self.ci = wqe_idx;
-        self.table.take(wqe_idx)
+    fn process_completion_sparse(&self, wqe_idx: u16) -> Option<T> {
+        self.ci.set(wqe_idx);
+        self.table.borrow_mut().take(wqe_idx)
     }
 }
 
 impl<T> DciSendQueueState<T, DenseWqeTable<T>> {
-    fn process_completions_dense<F>(&mut self, new_ci: u16, mut callback: F)
+    fn process_completions_dense<F>(&self, new_ci: u16, mut callback: F)
     where
         F: FnMut(u16, T),
     {
-        for (idx, entry) in self.table.drain_range(self.ci, new_ci) {
+        for (idx, entry) in self.table.borrow_mut().drain_range(self.ci.get(), new_ci) {
             callback(idx, entry);
         }
-        self.ci = new_ci;
+        self.ci.set(new_ci);
     }
 }
 
@@ -190,7 +191,7 @@ impl<T> DciSendQueueState<T, DenseWqeTable<T>> {
 ///
 /// Similar to WqeBuilder but has Address Vector segment for DC operations.
 pub struct DciWqeBuilder<'a, T, Tab> {
-    sq: &'a mut DciSendQueueState<T, Tab>,
+    sq: &'a DciSendQueueState<T, Tab>,
     wqe_ptr: *mut u8,
     wqe_idx: u16,
     offset: usize,
@@ -375,7 +376,7 @@ impl<'a, T> SparseDciWqeBuilder<'a, T> {
     pub fn finish(self) -> WqeHandle {
         let wqe_idx = self.inner.wqe_idx;
         if let Some(entry) = self.entry {
-            self.inner.sq.table.store(wqe_idx, entry);
+            self.inner.sq.table.borrow_mut().store(wqe_idx, entry);
         }
         self.inner.finish_internal()
     }
@@ -387,7 +388,7 @@ impl<'a, T> SparseDciWqeBuilder<'a, T> {
     pub fn finish_with_blueflame(self) -> WqeHandle {
         let wqe_idx = self.inner.wqe_idx;
         if let Some(entry) = self.entry {
-            self.inner.sq.table.store(wqe_idx, entry);
+            self.inner.sq.table.borrow_mut().store(wqe_idx, entry);
         }
         self.inner.finish_internal_with_blueflame()
     }
@@ -433,7 +434,7 @@ impl<'a, T> DenseDciWqeBuilder<'a, T> {
     /// Finish the WQE construction.
     pub fn finish(self) -> WqeHandle {
         let wqe_idx = self.inner.wqe_idx;
-        self.inner.sq.table.store(wqe_idx, self.entry);
+        self.inner.sq.table.borrow_mut().store(wqe_idx, self.entry);
         self.inner.finish_internal()
     }
 
@@ -443,7 +444,7 @@ impl<'a, T> DenseDciWqeBuilder<'a, T> {
     /// `ring_sq_doorbell()` afterwards.
     pub fn finish_with_blueflame(self) -> WqeHandle {
         let wqe_idx = self.inner.wqe_idx;
-        self.inner.sq.table.store(wqe_idx, self.entry);
+        self.inner.sq.table.borrow_mut().store(wqe_idx, self.entry);
         self.inner.finish_internal_with_blueflame()
     }
 }
@@ -488,7 +489,7 @@ pub type DciDenseWqeTable<T, F> = Dci<T, DenseWqeTable<T>, F>;
 /// Type parameter `F` is the completion callback type.
 pub struct Dci<T, Tab, F> {
     qp: NonNull<mlx5_sys::ibv_qp>,
-    state: DcQpState,
+    state: Cell<DcQpState>,
     sq: Option<DciSendQueueState<T, Tab>>,
     callback: F,
     /// Weak reference to the CQ for unregistration on drop
@@ -614,7 +615,7 @@ impl Context {
             NonNull::new(qp).map_or(Err(io::Error::last_os_error()), |qp| {
                 Ok(Dci {
                     qp,
-                    state: DcQpState::Reset,
+                    state: Cell::new(DcQpState::Reset),
                     sq: None,
                     callback,
                     send_cq: Rc::downgrade(send_cq),
@@ -666,7 +667,7 @@ impl Context {
             NonNull::new(qp).map_or(Err(io::Error::last_os_error()), |qp| {
                 Ok(Dci {
                     qp,
-                    state: DcQpState::Reset,
+                    state: Cell::new(DcQpState::Reset),
                     sq: None,
                     callback,
                     send_cq: Rc::downgrade(send_cq),
@@ -697,7 +698,7 @@ impl<T, Tab, F> Dci<T, Tab, F> {
 
     /// Get the current QP state.
     pub fn state(&self) -> DcQpState {
-        self.state
+        self.state.get()
     }
 
     /// Get mlx5-specific QP information for direct WQE access.
@@ -741,7 +742,7 @@ impl<T, Tab, F> Dci<T, Tab, F> {
 
     /// Transition DCI from RESET to INIT.
     pub fn modify_to_init(&mut self, port: u8) -> io::Result<()> {
-        if self.state != DcQpState::Reset {
+        if self.state.get() != DcQpState::Reset {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "DCI must be in RESET state",
@@ -764,13 +765,13 @@ impl<T, Tab, F> Dci<T, Tab, F> {
             }
         }
 
-        self.state = DcQpState::Init;
+        self.state.set(DcQpState::Init);
         Ok(())
     }
 
     /// Transition DCI from INIT to RTR.
     pub fn modify_to_rtr(&mut self, port: u8) -> io::Result<()> {
-        if self.state != DcQpState::Init {
+        if self.state.get() != DcQpState::Init {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "DCI must be in INIT state",
@@ -793,13 +794,13 @@ impl<T, Tab, F> Dci<T, Tab, F> {
             }
         }
 
-        self.state = DcQpState::Rtr;
+        self.state.set(DcQpState::Rtr);
         Ok(())
     }
 
     /// Transition DCI from RTR to RTS.
     pub fn modify_to_rts(&mut self, local_psn: u32, max_rd_atomic: u8) -> io::Result<()> {
-        if self.state != DcQpState::Rtr {
+        if self.state.get() != DcQpState::Rtr {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "DCI must be in RTR state",
@@ -828,13 +829,13 @@ impl<T, Tab, F> Dci<T, Tab, F> {
             }
         }
 
-        self.state = DcQpState::Rts;
+        self.state.set(DcQpState::Rts);
         Ok(())
     }
 
-    fn sq_mut(&mut self) -> io::Result<&mut DciSendQueueState<T, Tab>> {
+    fn sq(&self) -> io::Result<&DciSendQueueState<T, Tab>> {
         self.sq
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "direct access not initialized"))
     }
 
@@ -842,8 +843,8 @@ impl<T, Tab, F> Dci<T, Tab, F> {
         self.sq.as_ref().map(|sq| sq.available()).unwrap_or(0)
     }
 
-    fn ring_sq_doorbell(&mut self) {
-        if let Some(sq) = self.sq.as_mut() {
+    fn ring_sq_doorbell(&self) {
+        if let Some(sq) = self.sq.as_ref() {
             sq.ring_doorbell();
         }
     }
@@ -861,14 +862,14 @@ impl<T, F> DciSparseWqeTable<T, F> {
             buf: info.sq_buf,
             wqe_cnt,
             sqn: info.sqn,
-            pi: 0,
-            ci: 0,
-            last_wqe: None,
+            pi: Cell::new(0),
+            ci: Cell::new(0),
+            last_wqe: Cell::new(None),
             dbrec: info.dbrec,
             bf_reg: info.bf_reg,
             bf_size: info.bf_size,
-            bf_offset: 0,
-            table: SparseWqeTable::new(wqe_cnt),
+            bf_offset: Cell::new(0),
+            table: RefCell::new(SparseWqeTable::new(wqe_cnt)),
             _marker: PhantomData,
         });
 
@@ -887,13 +888,13 @@ impl<T, F> DciSparseWqeTable<T, F> {
     /// Get a WQE builder for zero-copy WQE construction (signaled).
     ///
     /// The entry will be stored and returned via callback on completion.
-    pub fn wqe_builder(&mut self, entry: T) -> io::Result<SparseDciWqeBuilder<'_, T>> {
-        let sq = self.sq_mut()?;
+    pub fn wqe_builder(&self, entry: T) -> io::Result<SparseDciWqeBuilder<'_, T>> {
+        let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
         }
 
-        let wqe_idx = sq.pi;
+        let wqe_idx = sq.pi.get();
         let wqe_ptr = sq.get_wqe_ptr(wqe_idx);
 
         Ok(SparseDciWqeBuilder {
@@ -912,13 +913,13 @@ impl<T, F> DciSparseWqeTable<T, F> {
     /// Get a WQE builder for zero-copy WQE construction (unsignaled).
     ///
     /// No entry is stored and no completion callback will be invoked.
-    pub fn wqe_builder_unsignaled(&mut self) -> io::Result<SparseDciWqeBuilder<'_, T>> {
-        let sq = self.sq_mut()?;
+    pub fn wqe_builder_unsignaled(&self) -> io::Result<SparseDciWqeBuilder<'_, T>> {
+        let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
         }
 
-        let wqe_idx = sq.pi;
+        let wqe_idx = sq.pi.get();
         let wqe_ptr = sq.get_wqe_ptr(wqe_idx);
 
         Ok(SparseDciWqeBuilder {
@@ -947,14 +948,14 @@ impl<T, F> DciDenseWqeTable<T, F> {
             buf: info.sq_buf,
             wqe_cnt,
             sqn: info.sqn,
-            pi: 0,
-            ci: 0,
-            last_wqe: None,
+            pi: Cell::new(0),
+            ci: Cell::new(0),
+            last_wqe: Cell::new(None),
             dbrec: info.dbrec,
             bf_reg: info.bf_reg,
             bf_size: info.bf_size,
-            bf_offset: 0,
-            table: DenseWqeTable::new(wqe_cnt),
+            bf_offset: Cell::new(0),
+            table: RefCell::new(DenseWqeTable::new(wqe_cnt)),
             _marker: PhantomData,
         });
 
@@ -974,13 +975,13 @@ impl<T, F> DciDenseWqeTable<T, F> {
     ///
     /// Every WQE must have an entry. The signaled flag controls whether
     /// a CQE is generated.
-    pub fn wqe_builder(&mut self, entry: T, signaled: bool) -> io::Result<DenseDciWqeBuilder<'_, T>> {
-        let sq = self.sq_mut()?;
+    pub fn wqe_builder(&self, entry: T, signaled: bool) -> io::Result<DenseDciWqeBuilder<'_, T>> {
+        let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
         }
 
-        let wqe_idx = sq.pi;
+        let wqe_idx = sq.pi.get();
         let wqe_ptr = sq.get_wqe_ptr(wqe_idx);
 
         Ok(DenseDciWqeBuilder {
@@ -1009,8 +1010,8 @@ where
         Dci::qpn(self)
     }
 
-    fn dispatch_cqe(&mut self, cqe: Cqe) {
-        if let Some(sq) = self.sq.as_mut() {
+    fn dispatch_cqe(&self, cqe: Cqe) {
+        if let Some(sq) = self.sq.as_ref() {
             if let Some(entry) = sq.process_completion_sparse(cqe.wqe_counter) {
                 (self.callback)(cqe, entry);
             }
@@ -1030,8 +1031,8 @@ where
         Dci::qpn(self)
     }
 
-    fn dispatch_cqe(&mut self, cqe: Cqe) {
-        if let Some(sq) = self.sq.as_mut() {
+    fn dispatch_cqe(&self, cqe: Cqe) {
+        if let Some(sq) = self.sq.as_ref() {
             let signaled_idx = cqe.wqe_counter;
             sq.process_completions_dense(signaled_idx, |idx, entry| {
                 let cqe_opt = if idx == signaled_idx {
