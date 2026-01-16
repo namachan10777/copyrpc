@@ -551,7 +551,7 @@ pub struct UdQp<T, Tab, F> {
     sq: Option<UdSendQueueState<T, Tab>>,
     rq: Option<UdRecvQueueState<T>>,
     callback: F,
-    send_cq: Weak<RefCell<CompletionQueue>>,
+    send_cq: Weak<CompletionQueue>,
     /// Keep the PD alive while this QP exists.
     _pd: Pd,
 }
@@ -560,10 +560,13 @@ impl Context {
     /// Create a UD QP with sparse WQE table.
     ///
     /// Only signaled WQEs have entries stored.
+    ///
+    /// # Note
+    /// The send_cq must have `init_direct_access()` called before this function.
     pub fn create_ud_qp_sparse<T, F>(
         &self,
         pd: &Pd,
-        send_cq: &Rc<RefCell<CompletionQueue>>,
+        send_cq: &Rc<CompletionQueue>,
         recv_cq: &CompletionQueue,
         config: &UdQpConfig,
         callback: F,
@@ -576,10 +579,7 @@ impl Context {
         let qp_rc = Rc::new(RefCell::new(qp));
         let qpn = qp_rc.borrow().qpn();
 
-        send_cq.borrow_mut().init_direct_access()?;
-        send_cq
-            .borrow_mut()
-            .register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+        send_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
 
         Ok(qp_rc)
     }
@@ -587,10 +587,13 @@ impl Context {
     /// Create a UD QP with dense WQE table.
     ///
     /// Every WQE must have an entry stored.
+    ///
+    /// # Note
+    /// The send_cq must have `init_direct_access()` called before this function.
     pub fn create_ud_qp_dense<T, F>(
         &self,
         pd: &Pd,
-        send_cq: &Rc<RefCell<CompletionQueue>>,
+        send_cq: &Rc<CompletionQueue>,
         recv_cq: &CompletionQueue,
         config: &UdQpConfig,
         callback: F,
@@ -603,10 +606,7 @@ impl Context {
         let qp_rc = Rc::new(RefCell::new(qp));
         let qpn = qp_rc.borrow().qpn();
 
-        send_cq.borrow_mut().init_direct_access()?;
-        send_cq
-            .borrow_mut()
-            .register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+        send_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
 
         Ok(qp_rc)
     }
@@ -614,7 +614,7 @@ impl Context {
     fn create_ud_qp_raw<T, F>(
         &self,
         pd: &Pd,
-        send_cq: &Rc<RefCell<CompletionQueue>>,
+        send_cq: &Rc<CompletionQueue>,
         recv_cq: &CompletionQueue,
         config: &UdQpConfig,
         callback: F,
@@ -625,7 +625,7 @@ impl Context {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_UD;
-            qp_attr.send_cq = send_cq.borrow().as_ptr();
+            qp_attr.send_cq = send_cq.as_ptr();
             qp_attr.recv_cq = recv_cq.as_ptr();
             qp_attr.cap.max_send_wr = config.max_send_wr;
             qp_attr.cap.max_recv_wr = config.max_recv_wr;
@@ -656,7 +656,7 @@ impl Context {
     fn create_ud_qp_dense_raw<T, F>(
         &self,
         pd: &Pd,
-        send_cq: &Rc<RefCell<CompletionQueue>>,
+        send_cq: &Rc<CompletionQueue>,
         recv_cq: &CompletionQueue,
         config: &UdQpConfig,
         callback: F,
@@ -667,7 +667,7 @@ impl Context {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_UD;
-            qp_attr.send_cq = send_cq.borrow().as_ptr();
+            qp_attr.send_cq = send_cq.as_ptr();
             qp_attr.recv_cq = recv_cq.as_ptr();
             qp_attr.cap.max_send_wr = config.max_send_wr;
             qp_attr.cap.max_recv_wr = config.max_recv_wr;
@@ -699,7 +699,7 @@ impl Context {
 impl<T, Tab, F> Drop for UdQp<T, Tab, F> {
     fn drop(&mut self) {
         if let Some(cq) = self.send_cq.upgrade() {
-            cq.borrow_mut().unregister_queue(self.qpn());
+            cq.unregister_queue(self.qpn());
         }
         unsafe {
             mlx5_sys::ibv_destroy_qp(self.qp.as_ptr());

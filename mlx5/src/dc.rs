@@ -493,7 +493,7 @@ pub struct Dci<T, Tab, F> {
     sq: Option<DciSendQueueState<T, Tab>>,
     callback: F,
     /// Weak reference to the CQ for unregistration on drop
-    send_cq: Weak<RefCell<CompletionQueue>>,
+    send_cq: Weak<CompletionQueue>,
     /// Keep the PD alive while this DCI exists.
     _pd: Pd,
 }
@@ -512,10 +512,13 @@ impl Context {
     ///
     /// # Errors
     /// Returns an error if the DCI cannot be created.
+    ///
+    /// # Note
+    /// The send_cq must have `init_direct_access()` called before this function.
     pub fn create_dci_sparse<T, F>(
         &self,
         pd: &Pd,
-        send_cq: &Rc<RefCell<CompletionQueue>>,
+        send_cq: &Rc<CompletionQueue>,
         config: &DciConfig,
         callback: F,
     ) -> io::Result<Rc<RefCell<DciSparseWqeTable<T, F>>>>
@@ -527,11 +530,8 @@ impl Context {
         let dci_rc = Rc::new(RefCell::new(dci));
         let qpn = dci_rc.borrow().qpn();
 
-        // Initialize CQ direct access and register this DCI
-        send_cq.borrow_mut().init_direct_access()?;
-        send_cq
-            .borrow_mut()
-            .register_queue(qpn, Rc::downgrade(&dci_rc) as _);
+        // Register this DCI with the CQ for completion dispatch
+        send_cq.register_queue(qpn, Rc::downgrade(&dci_rc) as _);
 
         Ok(dci_rc)
     }
@@ -549,10 +549,13 @@ impl Context {
     ///
     /// # Errors
     /// Returns an error if the DCI cannot be created.
+    ///
+    /// # Note
+    /// The send_cq must have `init_direct_access()` called before this function.
     pub fn create_dci_dense<T, F>(
         &self,
         pd: &Pd,
-        send_cq: &Rc<RefCell<CompletionQueue>>,
+        send_cq: &Rc<CompletionQueue>,
         config: &DciConfig,
         callback: F,
     ) -> io::Result<Rc<RefCell<DciDenseWqeTable<T, F>>>>
@@ -564,11 +567,8 @@ impl Context {
         let dci_rc = Rc::new(RefCell::new(dci));
         let qpn = dci_rc.borrow().qpn();
 
-        // Initialize CQ direct access and register this DCI
-        send_cq.borrow_mut().init_direct_access()?;
-        send_cq
-            .borrow_mut()
-            .register_queue(qpn, Rc::downgrade(&dci_rc) as _);
+        // Register this DCI with the CQ for completion dispatch
+        send_cq.register_queue(qpn, Rc::downgrade(&dci_rc) as _);
 
         Ok(dci_rc)
     }
@@ -576,7 +576,7 @@ impl Context {
     fn create_dci_raw<T, F>(
         &self,
         pd: &Pd,
-        send_cq: &Rc<RefCell<CompletionQueue>>,
+        send_cq: &Rc<CompletionQueue>,
         config: &DciConfig,
         callback: F,
     ) -> io::Result<DciSparseWqeTable<T, F>>
@@ -586,8 +586,8 @@ impl Context {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_DRIVER;
-            qp_attr.send_cq = send_cq.borrow().as_ptr();
-            qp_attr.recv_cq = send_cq.borrow().as_ptr();
+            qp_attr.send_cq = send_cq.as_ptr();
+            qp_attr.recv_cq = send_cq.as_ptr();
             qp_attr.cap.max_send_wr = config.max_send_wr;
             qp_attr.cap.max_recv_wr = 0;
             qp_attr.cap.max_send_sge = config.max_send_sge;
@@ -628,7 +628,7 @@ impl Context {
     fn create_dci_dense_raw<T, F>(
         &self,
         pd: &Pd,
-        send_cq: &Rc<RefCell<CompletionQueue>>,
+        send_cq: &Rc<CompletionQueue>,
         config: &DciConfig,
         callback: F,
     ) -> io::Result<DciDenseWqeTable<T, F>>
@@ -638,8 +638,8 @@ impl Context {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_DRIVER;
-            qp_attr.send_cq = send_cq.borrow().as_ptr();
-            qp_attr.recv_cq = send_cq.borrow().as_ptr();
+            qp_attr.send_cq = send_cq.as_ptr();
+            qp_attr.recv_cq = send_cq.as_ptr();
             qp_attr.cap.max_send_wr = config.max_send_wr;
             qp_attr.cap.max_recv_wr = 0;
             qp_attr.cap.max_send_sge = config.max_send_sge;
@@ -682,7 +682,7 @@ impl<T, Tab, F> Drop for Dci<T, Tab, F> {
     fn drop(&mut self) {
         // Unregister from CQ before destroying QP
         if let Some(cq) = self.send_cq.upgrade() {
-            cq.borrow_mut().unregister_queue(self.qpn());
+            cq.unregister_queue(self.qpn());
         }
         unsafe {
             mlx5_sys::ibv_destroy_qp(self.qp.as_ptr());

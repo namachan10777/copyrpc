@@ -187,7 +187,7 @@ pub(crate) struct CqState {
 pub struct CompletionQueue {
     cq: NonNull<mlx5_sys::ibv_cq>,
     state: Option<CqState>,
-    /// Registered queues (QPN -> CompletionTarget)
+    /// Registered queues (QPN -> CompletionTarget wrapped in RefCell)
     queues: RefCell<HashMap<u32, Weak<RefCell<dyn CompletionTarget>>>>,
     /// Keep the context alive while this CQ exists.
     _ctx: Context,

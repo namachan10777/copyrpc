@@ -556,7 +556,7 @@ pub struct RcQpInner<T, Tab, F> {
     rq: Option<ReceiveQueueState<T>>,
     callback: F,
     /// Weak reference to the CQ for unregistration on drop
-    send_cq: Weak<RefCell<CompletionQueue>>,
+    send_cq: Weak<CompletionQueue>,
     /// Keep the PD alive while this QP exists.
     _pd: Pd,
 }
@@ -576,10 +576,13 @@ impl Context {
     ///
     /// # Errors
     /// Returns an error if the QP cannot be created.
+    ///
+    /// # Note
+    /// The send_cq must have `init_direct_access()` called before this function.
     pub fn create_rc_qp<T, F>(
         &self,
         pd: &Pd,
-        send_cq: &Rc<RefCell<CompletionQueue>>,
+        send_cq: &Rc<CompletionQueue>,
         recv_cq: &CompletionQueue,
         config: &RcQpConfig,
         callback: F,
@@ -592,11 +595,8 @@ impl Context {
         let qp_rc = Rc::new(RefCell::new(qp));
         let qpn = qp_rc.borrow().qpn();
 
-        // Initialize CQ direct access and register this QP
-        send_cq.borrow_mut().init_direct_access()?;
-        send_cq
-            .borrow_mut()
-            .register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+        // Register this QP with the CQ for completion dispatch
+        send_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
 
         Ok(qp_rc)
     }
@@ -615,10 +615,13 @@ impl Context {
     ///
     /// # Errors
     /// Returns an error if the QP cannot be created.
+    ///
+    /// # Note
+    /// The send_cq must have `init_direct_access()` called before this function.
     pub fn create_dense_rc_qp<T, F>(
         &self,
         pd: &Pd,
-        send_cq: &Rc<RefCell<CompletionQueue>>,
+        send_cq: &Rc<CompletionQueue>,
         recv_cq: &CompletionQueue,
         config: &RcQpConfig,
         callback: F,
@@ -631,11 +634,8 @@ impl Context {
         let qp_rc = Rc::new(RefCell::new(qp));
         let qpn = qp_rc.borrow().qpn();
 
-        // Initialize CQ direct access and register this QP
-        send_cq.borrow_mut().init_direct_access()?;
-        send_cq
-            .borrow_mut()
-            .register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+        // Register this QP with the CQ for completion dispatch
+        send_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
 
         Ok(qp_rc)
     }
@@ -643,7 +643,7 @@ impl Context {
     fn create_rc_qp_raw<T, F>(
         &self,
         pd: &Pd,
-        send_cq: &Rc<RefCell<CompletionQueue>>,
+        send_cq: &Rc<CompletionQueue>,
         recv_cq: &CompletionQueue,
         config: &RcQpConfig,
         callback: F,
@@ -654,7 +654,7 @@ impl Context {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
-            qp_attr.send_cq = send_cq.borrow().as_ptr();
+            qp_attr.send_cq = send_cq.as_ptr();
             qp_attr.recv_cq = recv_cq.as_ptr();
             qp_attr.cap.max_send_wr = config.max_send_wr;
             qp_attr.cap.max_recv_wr = config.max_recv_wr;
@@ -690,7 +690,7 @@ impl Context {
     fn create_dense_rc_qp_raw<T, F>(
         &self,
         pd: &Pd,
-        send_cq: &Rc<RefCell<CompletionQueue>>,
+        send_cq: &Rc<CompletionQueue>,
         recv_cq: &CompletionQueue,
         config: &RcQpConfig,
         callback: F,
@@ -701,7 +701,7 @@ impl Context {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
-            qp_attr.send_cq = send_cq.borrow().as_ptr();
+            qp_attr.send_cq = send_cq.as_ptr();
             qp_attr.recv_cq = recv_cq.as_ptr();
             qp_attr.cap.max_send_wr = config.max_send_wr;
             qp_attr.cap.max_recv_wr = config.max_recv_wr;
@@ -739,7 +739,7 @@ impl<T, Tab, F> Drop for RcQpInner<T, Tab, F> {
     fn drop(&mut self) {
         // Unregister from CQ before destroying QP
         if let Some(cq) = self.send_cq.upgrade() {
-            cq.borrow_mut().unregister_queue(self.qpn());
+            cq.unregister_queue(self.qpn());
         }
         unsafe {
             mlx5_sys::ibv_destroy_qp(self.qp.as_ptr());

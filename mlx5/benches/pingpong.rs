@@ -112,7 +112,7 @@ type BenchQp = RcQp<u64, fn(Cqe, u64)>;
 
 struct EndpointState {
     qp: Rc<RefCell<BenchQp>>,
-    send_cq: Rc<RefCell<CompletionQueue>>,
+    send_cq: Rc<CompletionQueue>,
     recv_cq: CompletionQueue,
     // MRs must be dropped before buffers (drop order is declaration order)
     send_mr: MemoryRegion,
@@ -171,15 +171,16 @@ fn create_endpoint(
     pd: &Rc<Pd>,
 ) -> Option<(
     Rc<RefCell<BenchQp>>,
-    Rc<RefCell<CompletionQueue>>,
+    Rc<CompletionQueue>,
     CompletionQueue,
     AlignedBuffer,
     AlignedBuffer,
     MemoryRegion,
     MemoryRegion,
 )> {
-    let send_cq = Rc::new(RefCell::new(ctx.create_cq(256).ok()?));
-    send_cq.borrow_mut().init_direct_access().ok()?;
+    let mut send_cq = ctx.create_cq(256).ok()?;
+    send_cq.init_direct_access().ok()?;
+    let send_cq = Rc::new(send_cq);
     let mut recv_cq = ctx.create_cq(256).ok()?;
     recv_cq.init_direct_access().ok()?;
 
@@ -346,7 +347,7 @@ fn server_thread_main(
     });
 
     // Create server endpoint
-    let (qp, send_cq, mut recv_cq, send_buf, recv_buf, send_mr, recv_mr) =
+    let (qp, send_cq, recv_cq, send_buf, recv_buf, send_mr, recv_mr) =
         match create_endpoint(&ctx, &pd) {
             Some(e) => e,
             None => {
@@ -406,73 +407,89 @@ fn server_thread_main(
     // Signal ready
     ready_signal.store(1, Ordering::Release);
 
-    // Server loop
+    // Server loop - optimized processing order:
+    // 1. RX CQE処理 (collect indices and sizes)
+    // 2. TX CQE処理 (free WQE slots)
+    // 3. RX WQE再補充
+    // 4. TX リクエスト再補充 (echo responses)
+    // 5. Ring doorbells
     let remote_addr = client_info.buf_addr;
     let remote_rkey = client_info.rkey;
-    let mut recv_posted = 0usize;
-    let mut send_posted = 0usize;
+
+    // Pre-allocated arrays for batch processing
+    let mut rx_indices: [usize; QUEUE_DEPTH] = [0; QUEUE_DEPTH];
+    let mut rx_sizes: [u32; QUEUE_DEPTH] = [0; QUEUE_DEPTH];
+    let mut rx_is_write_imm: [bool; QUEUE_DEPTH] = [false; QUEUE_DEPTH];
 
     while !stop_flag.load(Ordering::Relaxed) {
-        // Poll recv CQ - batch all available CQEs
+        // 1. RX CQE処理: collect all recv completions
+        let mut rx_count = 0usize;
         while let Some(cqe) = recv_cq.poll_one() {
             if cqe.syndrome != 0 {
                 continue;
             }
-
             let idx = (cqe.imm as usize) % QUEUE_DEPTH;
-            let offset = (idx * 256) as u64;
-            let size = cqe.byte_cnt.min(256);
-
-            // Queue echo response (without ringing doorbell yet)
-            match cqe.opcode {
-                CqeOpcode::RespRdmaWriteImm => {
-                    // Echo with WRITE+IMM
-                    let _ = qp.borrow_mut().wqe_builder(idx as u64).map(|b| {
-                        b.ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), idx as u32)
-                            .rdma(remote_addr + offset, remote_rkey)
-                            .sge(send_buf.addr() + offset, size, send_mr.lkey())
-                            .finish() // No blueflame - batch doorbells
-                    });
-                    send_posted += 1;
-                }
-                CqeOpcode::RespSend | CqeOpcode::RespSendImm => {
-                    // Echo with SEND
-                    let _ = qp.borrow_mut().wqe_builder(idx as u64).map(|b| {
-                        b.ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
-                            .sge(send_buf.addr() + offset, size, send_mr.lkey())
-                            .finish() // No blueflame - batch doorbells
-                    });
-                    send_posted += 1;
-                }
-                _ => {}
-            }
-
-            // Repost recv
-            unsafe {
-                qp.borrow_mut()
-                    .post_recv(recv_buf.addr() + offset, 256, recv_mr.lkey());
-            }
-            recv_posted += 1;
+            rx_indices[rx_count] = idx;
+            rx_sizes[rx_count] = cqe.byte_cnt.min(256);
+            rx_is_write_imm[rx_count] = matches!(cqe.opcode, CqeOpcode::RespRdmaWriteImm);
+            rx_count += 1;
         }
         recv_cq.flush();
 
-        // Batch send doorbell - ring after processing all available CQEs
-        if send_posted > 0 {
-            qp.borrow_mut().ring_sq_doorbell();
-            send_posted = 0;
+        if rx_count == 0 {
+            std::hint::spin_loop();
+            continue;
         }
 
-        // Batch recv doorbell
-        if recv_posted >= QUEUE_DEPTH / 2 {
-            qp.borrow_mut().ring_rq_doorbell();
-            recv_posted = 0;
+        // 2. TX CQE処理: drain send CQ to free WQE slots
+        send_cq.poll();
+        send_cq.flush();
+
+        // 3. RX WQE再補充
+        {
+            let qp_ref = qp.borrow();
+            for i in 0..rx_count {
+                let idx = rx_indices[i];
+                let offset = (idx * 256) as u64;
+                unsafe {
+                    qp_ref.post_recv(recv_buf.addr() + offset, 256, recv_mr.lkey());
+                }
+            }
         }
 
-        // Drain send CQ - use poll() to update QP's internal ci
-        send_cq.borrow_mut().poll();
-        send_cq.borrow().flush();
+        // 4. TX リクエスト再補充: queue echo responses
+        {
+            let qp_ref = qp.borrow();
+            for i in 0..rx_count {
+                let idx = rx_indices[i];
+                let offset = (idx * 256) as u64;
+                let size = rx_sizes[i];
 
-        std::hint::spin_loop();
+                if rx_is_write_imm[i] {
+                    // Echo with WRITE+IMM
+                    let _ = qp_ref.wqe_builder(idx as u64).map(|b| {
+                        b.ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), idx as u32)
+                            .rdma(remote_addr + offset, remote_rkey)
+                            .sge(send_buf.addr() + offset, size, send_mr.lkey())
+                            .finish()
+                    });
+                } else {
+                    // Echo with SEND
+                    let _ = qp_ref.wqe_builder(idx as u64).map(|b| {
+                        b.ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
+                            .sge(send_buf.addr() + offset, size, send_mr.lkey())
+                            .finish()
+                    });
+                }
+            }
+        }
+
+        // 5. Ring doorbells once each
+        {
+            let qp_ref = qp.borrow();
+            qp_ref.ring_rq_doorbell();
+            qp_ref.ring_sq_doorbell();
+        }
     }
 }
 
@@ -482,97 +499,120 @@ fn server_thread_main(
 
 /// Throughput benchmark: WRITE+IMM with queue depth = 64, batched doorbells.
 ///
-/// Maintains 64 WQEs inflight at all times. Doorbells are batched:
-/// - Send doorbell is rung only after filling the queue to QUEUE_DEPTH
-/// - Recv doorbell is rung when half the queue is pending
+/// Optimized processing order for maximum queue efficiency:
+/// 1. RX CQE処理 (decrement inflight, collect indices)
+/// 2. TX CQE処理 (free WQE slots via dispatch)
+/// 3. RX WQE再補充 (batch all recv reposts)
+/// 4. TX リクエスト再補充 (batch all send posts within inflight/slot limits)
+/// 5. Ring TX/RQ doorbells once each
 fn run_throughput_bench(client: &mut EndpointState, iters: u64, size: usize) -> Duration {
     let size = size.min(256) as u32;
 
     // Initial fill - post QUEUE_DEPTH WQEs, then ring doorbell once
-    for i in 0..QUEUE_DEPTH {
-        let offset = (i * 256) as u64;
-        let _ = client.qp.borrow_mut().wqe_builder(i as u64).map(|b| {
-            b.ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), i as u32)
-                .rdma(client.remote_addr + offset, client.remote_rkey)
-                .sge(client.send_buf.addr() + offset, size, client.send_mr.lkey())
-                .finish()
-        });
+    {
+        let qp = client.qp.borrow();
+        for i in 0..QUEUE_DEPTH {
+            let offset = (i * 256) as u64;
+            let _ = qp.wqe_builder(i as u64).map(|b| {
+                b.ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), i as u32)
+                    .rdma(client.remote_addr + offset, client.remote_rkey)
+                    .sge(client.send_buf.addr() + offset, size, client.send_mr.lkey())
+                    .finish()
+            });
+        }
+        qp.ring_sq_doorbell();
     }
-    client.qp.borrow_mut().ring_sq_doorbell();
 
     let start = std::time::Instant::now();
     let mut completed = 0u64;
-    let mut recv_to_post = 0usize;
-    let mut send_to_post = 0usize;
     let mut inflight = QUEUE_DEPTH as u64;
 
-    while completed < iters {
-        // Poll send CQ to free up slots
-        client.send_cq.borrow_mut().poll();
-        client.send_cq.borrow().flush();
+    // Pre-allocated array for collecting RX completion indices
+    let mut rx_indices: [usize; QUEUE_DEPTH] = [0; QUEUE_DEPTH];
 
-        // Poll recv CQ for completions
+    while completed < iters {
+        // 1. RX CQE処理: collect all recv completions, decrement inflight
+        let mut rx_count = 0usize;
         while let Some(cqe) = client.recv_cq.poll_one() {
+            let idx = (cqe.imm as usize) % QUEUE_DEPTH;
+            rx_indices[rx_count] = idx;
+            rx_count += 1;
             completed += 1;
             inflight -= 1;
-            let idx = (cqe.imm as usize) % QUEUE_DEPTH;
+        }
+        client.recv_cq.flush();
 
-            // Repost recv
-            let offset = (idx * 256) as u64;
-            unsafe {
-                client
-                    .qp
-                    .borrow_mut()
-                    .post_recv(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey());
+        // Skip rest if no completions (busy wait)
+        if rx_count == 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+
+        // 2. TX CQE処理: drain send CQ to free WQE slots
+        client.send_cq.poll();
+        client.send_cq.flush();
+
+        // 3. RX WQE再補充: batch all recv reposts
+        {
+            let qp = client.qp.borrow();
+            for i in 0..rx_count {
+                let idx = rx_indices[i];
+                let offset = (idx * 256) as u64;
+                unsafe {
+                    qp.post_recv(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey());
+                }
             }
-            recv_to_post += 1;
+        }
 
-            // Queue new send request (without ringing doorbell yet)
-            if completed + inflight < iters {
-                let _ = client.qp.borrow_mut().wqe_builder(idx as u64).map(|b| {
+        // 4. TX リクエスト再補充: post sends within inflight limit and available slots
+        let remaining = iters.saturating_sub(completed);
+        let can_send = (QUEUE_DEPTH as u64).saturating_sub(inflight).min(remaining) as usize;
+        let to_send = can_send.min(rx_count);
+
+        if to_send > 0 {
+            let qp = client.qp.borrow();
+            for i in 0..to_send {
+                let idx = rx_indices[i];
+                let offset = (idx * 256) as u64;
+                let _ = qp.wqe_builder(idx as u64).map(|b| {
                     b.ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), idx as u32)
                         .rdma(client.remote_addr + offset, client.remote_rkey)
                         .sge(client.send_buf.addr() + offset, size, client.send_mr.lkey())
                         .finish()
                 });
-                send_to_post += 1;
-                inflight += 1;
+            }
+            inflight += to_send as u64;
+        }
+
+        // 5. Ring doorbells once each
+        {
+            let qp = client.qp.borrow();
+            qp.ring_rq_doorbell();
+            if to_send > 0 {
+                qp.ring_sq_doorbell();
             }
         }
-
-        // Ring doorbells after each poll cycle (best-effort batching)
-        if send_to_post > 0 {
-            client.qp.borrow_mut().ring_sq_doorbell();
-            send_to_post = 0;
-        }
-        if recv_to_post > 0 {
-            client.qp.borrow_mut().ring_rq_doorbell();
-            recv_to_post = 0;
-        }
-
-        client.recv_cq.flush();
     }
 
     // Drain remaining inflight messages for clean state
     while inflight > 0 {
-        client.send_cq.borrow_mut().poll();
-        client.send_cq.borrow().flush();
         while let Some(cqe) = client.recv_cq.poll_one() {
             inflight -= 1;
-            // Repost recv for clean state
             let idx = (cqe.imm as usize) % QUEUE_DEPTH;
             let offset = (idx * 256) as u64;
             unsafe {
-                client.qp.borrow_mut().post_recv(
-                    client.recv_buf.addr() + offset,
-                    256,
-                    client.recv_mr.lkey(),
-                );
+                client
+                    .qp
+                    .borrow()
+                    .post_recv(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey());
             }
         }
         client.recv_cq.flush();
-        client.qp.borrow_mut().ring_rq_doorbell();
+        client.send_cq.poll();
+        client.send_cq.flush();
+        std::hint::spin_loop();
     }
+    client.qp.borrow().ring_rq_doorbell();
 
     start.elapsed()
 }
@@ -591,7 +631,7 @@ fn run_lowlatency_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
         let idx = (i as usize) % QUEUE_DEPTH;
 
         // Post single WRITE+IMM with inline data + blueflame
-        let _ = client.qp.borrow_mut().wqe_builder(idx as u64).map(|b| {
+        let _ = client.qp.borrow().wqe_builder(idx as u64).map(|b| {
             let offset = (idx * 256) as u64;
             b.ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), idx as u32)
                 .rdma(client.remote_addr + offset, client.remote_rkey)
@@ -602,8 +642,8 @@ fn run_lowlatency_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
         // Wait for completion (recv CQ)
         loop {
             // Poll send CQ to keep it from filling up
-            client.send_cq.borrow_mut().poll();
-            client.send_cq.borrow().flush();
+            client.send_cq.poll();
+            client.send_cq.flush();
 
             // Check for recv completion
             if let Some(cqe) = client.recv_cq.poll_one() {
@@ -611,13 +651,13 @@ fn run_lowlatency_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
                 let recv_idx = (cqe.imm as usize) % QUEUE_DEPTH;
                 let offset = (recv_idx * 256) as u64;
                 unsafe {
-                    client.qp.borrow_mut().post_recv(
+                    client.qp.borrow().post_recv(
                         client.recv_buf.addr() + offset,
                         256,
                         client.recv_mr.lkey(),
                     );
                 }
-                client.qp.borrow_mut().ring_rq_doorbell();
+                client.qp.borrow().ring_rq_doorbell();
                 client.recv_cq.flush();
                 break;
             }
@@ -690,17 +730,17 @@ fn pingpong_benchmarks(c: &mut Criterion) {
     server_handle.stop();
 
     // Drain any remaining completions
-    let mut client = client.into_inner();
+    let client = client.into_inner();
     loop {
         let mut drained = false;
         while client.recv_cq.poll_one().is_some() {
             drained = true;
         }
         client.recv_cq.flush();
-        if client.send_cq.borrow_mut().poll() > 0 {
+        if client.send_cq.poll() > 0 {
             drained = true;
         }
-        client.send_cq.borrow().flush();
+        client.send_cq.flush();
         if !drained {
             break;
         }

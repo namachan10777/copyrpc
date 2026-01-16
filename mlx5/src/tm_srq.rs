@@ -395,7 +395,7 @@ pub struct TagMatchingSrq<T, F> {
     /// Callback for completion handling.
     callback: F,
     /// Weak reference to the CQ for unregistration on drop.
-    send_cq: Weak<RefCell<CompletionQueue>>,
+    send_cq: Weak<CompletionQueue>,
     /// Keep the PD alive while this TM-SRQ exists.
     _pd: Pd,
 }
@@ -415,7 +415,7 @@ impl Context {
     pub fn create_tm_srq<T, F>(
         &self,
         pd: &Pd,
-        cq: &Rc<RefCell<CompletionQueue>>,
+        cq: &Rc<CompletionQueue>,
         config: &TmSrqConfig,
         callback: F,
     ) -> io::Result<Rc<RefCell<TagMatchingSrq<T, F>>>>
@@ -429,7 +429,7 @@ impl Context {
             attr.attr.max_sge = config.max_sge;
             attr.srq_type = mlx5_sys::ibv_srq_type_IBV_SRQT_TM;
             attr.pd = pd.as_ptr();
-            attr.cq = cq.borrow().as_ptr();
+            attr.cq = cq.as_ptr();
             attr.tm_cap.max_num_tags = config.max_num_tags;
             attr.tm_cap.max_ops = config.max_ops;
             attr.comp_mask = mlx5_sys::ibv_srq_init_attr_mask_IBV_SRQ_INIT_ATTR_TYPE
@@ -466,7 +466,7 @@ impl<T, F> Drop for TagMatchingSrq<T, F> {
         // Unregister from CQ
         if let Some(cmd_qp) = &self.cmd_qp {
             if let Some(cq) = self.send_cq.upgrade() {
-                cq.borrow_mut().unregister_queue(cmd_qp.qpn);
+                cq.unregister_queue(cmd_qp.qpn);
             }
         }
 
@@ -712,8 +712,7 @@ where
 
         // Register with CQ
         if let Some(cq) = this.borrow().send_cq.upgrade() {
-            cq.borrow_mut()
-                .register_queue(qpn, Rc::downgrade(this) as _);
+            cq.register_queue(qpn, Rc::downgrade(this) as _);
         }
 
         Ok(())
