@@ -9,7 +9,7 @@
 //! cargo bench --bench pingpong
 //! ```
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -108,12 +108,58 @@ struct ConnectionInfo {
 // Benchmark Context
 // =============================================================================
 
-type BenchQp = RcQp<u64, fn(Cqe, u64)>;
+/// Shared state for collecting CQEs from callback.
+#[derive(Clone)]
+struct SharedCqeState {
+    rx_count: Rc<Cell<usize>>,
+    rx_indices: Rc<RefCell<[usize; QUEUE_DEPTH]>>,
+    rx_sizes: Rc<RefCell<[u32; QUEUE_DEPTH]>>,
+    rx_is_write_imm: Rc<RefCell<[bool; QUEUE_DEPTH]>>,
+}
+
+impl SharedCqeState {
+    fn new() -> Self {
+        Self {
+            rx_count: Rc::new(Cell::new(0)),
+            rx_indices: Rc::new(RefCell::new([0; QUEUE_DEPTH])),
+            rx_sizes: Rc::new(RefCell::new([0; QUEUE_DEPTH])),
+            rx_is_write_imm: Rc::new(RefCell::new([false; QUEUE_DEPTH])),
+        }
+    }
+
+    fn reset(&self) {
+        self.rx_count.set(0);
+    }
+
+    fn push(&self, cqe: &Cqe) {
+        let count = self.rx_count.get();
+        if count < QUEUE_DEPTH {
+            let idx = (cqe.imm as usize) % QUEUE_DEPTH;
+            self.rx_indices.borrow_mut()[count] = idx;
+            self.rx_sizes.borrow_mut()[count] = cqe.byte_cnt.min(256);
+            self.rx_is_write_imm.borrow_mut()[count] = matches!(cqe.opcode, CqeOpcode::RespRdmaWriteImm);
+            self.rx_count.set(count + 1);
+        }
+    }
+}
+
+/// Callback that collects responder CQEs into shared state.
+fn make_callback(state: SharedCqeState) -> impl Fn(Cqe, u64) {
+    move |cqe: Cqe, _entry: u64| {
+        if cqe.opcode.is_responder() && cqe.syndrome == 0 {
+            state.push(&cqe);
+        }
+    }
+}
+
+type BenchCallback = Box<dyn Fn(Cqe, u64)>;
+type BenchQp = RcQp<u64, BenchCallback>;
 
 struct EndpointState {
     qp: Rc<RefCell<BenchQp>>,
     send_cq: Rc<CompletionQueue>,
-    recv_cq: CompletionQueue,
+    recv_cq: Rc<CompletionQueue>,
+    shared_state: SharedCqeState,
     // MRs must be dropped before buffers (drop order is declaration order)
     send_mr: MemoryRegion,
     recv_mr: MemoryRegion,
@@ -172,7 +218,8 @@ fn create_endpoint(
 ) -> Option<(
     Rc<RefCell<BenchQp>>,
     Rc<CompletionQueue>,
-    CompletionQueue,
+    Rc<CompletionQueue>,
+    SharedCqeState,
     AlignedBuffer,
     AlignedBuffer,
     MemoryRegion,
@@ -183,6 +230,7 @@ fn create_endpoint(
     let send_cq = Rc::new(send_cq);
     let mut recv_cq = ctx.create_cq(256).ok()?;
     recv_cq.init_direct_access().ok()?;
+    let recv_cq = Rc::new(recv_cq);
 
     let config = RcQpConfig {
         max_send_wr: 256,
@@ -192,10 +240,11 @@ fn create_endpoint(
         max_inline_data: 256,
     };
 
-    fn noop_callback(_cqe: Cqe, _entry: u64) {}
+    let shared_state = SharedCqeState::new();
+    let callback: BenchCallback = Box::new(make_callback(shared_state.clone()));
 
     let qp = ctx
-        .create_rc_qp(pd, &send_cq, &recv_cq, &config, noop_callback as fn(_, _))
+        .create_rc_qp(pd, &send_cq, &recv_cq, &config, callback)
         .ok()?;
 
     let send_buf = AlignedBuffer::new(BUFFER_SIZE);
@@ -206,7 +255,7 @@ fn create_endpoint(
     let recv_mr =
         unsafe { pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }.ok()?;
 
-    Some((qp, send_cq, recv_cq, send_buf, recv_buf, send_mr, recv_mr))
+    Some((qp, send_cq, recv_cq, shared_state, send_buf, recv_buf, send_mr, recv_mr))
 }
 
 fn setup_benchmark() -> Option<BenchmarkSetup> {
@@ -216,7 +265,7 @@ fn setup_benchmark() -> Option<BenchmarkSetup> {
     let pd = Rc::new(ctx.alloc_pd().ok()?);
 
     // Create client endpoint
-    let (client_qp, client_send_cq, client_recv_cq, client_send_buf, client_recv_buf, client_send_mr, client_recv_mr) =
+    let (client_qp, client_send_cq, client_recv_cq, client_shared_state, client_send_buf, client_recv_buf, client_send_mr, client_recv_mr) =
         create_endpoint(&ctx, &pd)?;
 
     // Client connection info
@@ -289,6 +338,7 @@ fn setup_benchmark() -> Option<BenchmarkSetup> {
         qp: client_qp,
         send_cq: client_send_cq,
         recv_cq: client_recv_cq,
+        shared_state: client_shared_state,
         send_mr: client_send_mr,
         recv_mr: client_recv_mr,
         send_buf: client_send_buf,
@@ -347,7 +397,7 @@ fn server_thread_main(
     });
 
     // Create server endpoint
-    let (qp, send_cq, recv_cq, send_buf, recv_buf, send_mr, recv_mr) =
+    let (qp, send_cq, recv_cq, shared_state, send_buf, recv_buf, send_mr, recv_mr) =
         match create_endpoint(&ctx, &pd) {
             Some(e) => e,
             None => {
@@ -408,7 +458,7 @@ fn server_thread_main(
     ready_signal.store(1, Ordering::Release);
 
     // Server loop - optimized processing order:
-    // 1. RX CQE処理 (collect indices and sizes)
+    // 1. RX CQE処理 (collect indices and sizes via callback)
     // 2. TX CQE処理 (free WQE slots)
     // 3. RX WQE再補充
     // 4. TX リクエスト再補充 (echo responses)
@@ -416,25 +466,12 @@ fn server_thread_main(
     let remote_addr = client_info.buf_addr;
     let remote_rkey = client_info.rkey;
 
-    // Pre-allocated arrays for batch processing
-    let mut rx_indices: [usize; QUEUE_DEPTH] = [0; QUEUE_DEPTH];
-    let mut rx_sizes: [u32; QUEUE_DEPTH] = [0; QUEUE_DEPTH];
-    let mut rx_is_write_imm: [bool; QUEUE_DEPTH] = [false; QUEUE_DEPTH];
-
     while !stop_flag.load(Ordering::Relaxed) {
-        // 1. RX CQE処理: collect all recv completions
-        let mut rx_count = 0usize;
-        while let Some(cqe) = recv_cq.poll_one() {
-            if cqe.syndrome != 0 {
-                continue;
-            }
-            let idx = (cqe.imm as usize) % QUEUE_DEPTH;
-            rx_indices[rx_count] = idx;
-            rx_sizes[rx_count] = cqe.byte_cnt.min(256);
-            rx_is_write_imm[rx_count] = matches!(cqe.opcode, CqeOpcode::RespRdmaWriteImm);
-            rx_count += 1;
-        }
+        // 1. RX CQE処理: poll recv CQ (callback collects completions)
+        shared_state.reset();
+        recv_cq.poll();
         recv_cq.flush();
+        let rx_count = shared_state.rx_count.get();
 
         if rx_count == 0 {
             std::hint::spin_loop();
@@ -444,6 +481,11 @@ fn server_thread_main(
         // 2. TX CQE処理: drain send CQ to free WQE slots
         send_cq.poll();
         send_cq.flush();
+
+        // Copy shared state data for use below
+        let rx_indices = *shared_state.rx_indices.borrow();
+        let rx_sizes = *shared_state.rx_sizes.borrow();
+        let rx_is_write_imm = *shared_state.rx_is_write_imm.borrow();
 
         // 3. RX WQE再補充
         {
@@ -500,7 +542,7 @@ fn server_thread_main(
 /// Throughput benchmark: WRITE+IMM with queue depth = 64, batched doorbells.
 ///
 /// Optimized processing order for maximum queue efficiency:
-/// 1. RX CQE処理 (decrement inflight, collect indices)
+/// 1. RX CQE処理 (decrement inflight, collect indices via callback)
 /// 2. TX CQE処理 (free WQE slots via dispatch)
 /// 3. RX WQE再補充 (batch all recv reposts)
 /// 4. TX リクエスト再補充 (batch all send posts within inflight/slot limits)
@@ -527,20 +569,16 @@ fn run_throughput_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
     let mut completed = 0u64;
     let mut inflight = QUEUE_DEPTH as u64;
 
-    // Pre-allocated array for collecting RX completion indices
-    let mut rx_indices: [usize; QUEUE_DEPTH] = [0; QUEUE_DEPTH];
-
     while completed < iters {
-        // 1. RX CQE処理: collect all recv completions, decrement inflight
-        let mut rx_count = 0usize;
-        while let Some(cqe) = client.recv_cq.poll_one() {
-            let idx = (cqe.imm as usize) % QUEUE_DEPTH;
-            rx_indices[rx_count] = idx;
-            rx_count += 1;
-            completed += 1;
-            inflight -= 1;
-        }
+        // 1. RX CQE処理: poll recv CQ (callback collects completions)
+        client.shared_state.reset();
+        client.recv_cq.poll();
         client.recv_cq.flush();
+        let rx_count = client.shared_state.rx_count.get();
+
+        // Update counters
+        completed += rx_count as u64;
+        inflight -= rx_count as u64;
 
         // Skip rest if no completions (busy wait)
         if rx_count == 0 {
@@ -551,6 +589,9 @@ fn run_throughput_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
         // 2. TX CQE処理: drain send CQ to free WQE slots
         client.send_cq.poll();
         client.send_cq.flush();
+
+        // Copy shared state data for use below
+        let rx_indices = *client.shared_state.rx_indices.borrow();
 
         // 3. RX WQE再補充: batch all recv reposts
         {
@@ -596,9 +637,15 @@ fn run_throughput_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
 
     // Drain remaining inflight messages for clean state
     while inflight > 0 {
-        while let Some(cqe) = client.recv_cq.poll_one() {
-            inflight -= 1;
-            let idx = (cqe.imm as usize) % QUEUE_DEPTH;
+        client.shared_state.reset();
+        client.recv_cq.poll();
+        client.recv_cq.flush();
+        let rx_count = client.shared_state.rx_count.get();
+        inflight -= rx_count as u64;
+
+        let rx_indices = *client.shared_state.rx_indices.borrow();
+        for i in 0..rx_count {
+            let idx = rx_indices[i];
             let offset = (idx * 256) as u64;
             unsafe {
                 client
@@ -607,7 +654,6 @@ fn run_throughput_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
                     .post_recv(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey());
             }
         }
-        client.recv_cq.flush();
         client.send_cq.poll();
         client.send_cq.flush();
         std::hint::spin_loop();
@@ -645,10 +691,14 @@ fn run_lowlatency_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
             client.send_cq.poll();
             client.send_cq.flush();
 
-            // Check for recv completion
-            if let Some(cqe) = client.recv_cq.poll_one() {
+            // Check for recv completion via callback
+            client.shared_state.reset();
+            client.recv_cq.poll();
+            client.recv_cq.flush();
+
+            if client.shared_state.rx_count.get() > 0 {
                 // Repost recv immediately
-                let recv_idx = (cqe.imm as usize) % QUEUE_DEPTH;
+                let recv_idx = client.shared_state.rx_indices.borrow()[0];
                 let offset = (recv_idx * 256) as u64;
                 unsafe {
                     client.qp.borrow().post_recv(
@@ -658,10 +708,8 @@ fn run_lowlatency_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
                     );
                 }
                 client.qp.borrow().ring_rq_doorbell();
-                client.recv_cq.flush();
                 break;
             }
-            client.recv_cq.flush();
             std::hint::spin_loop();
         }
     }
@@ -733,7 +781,9 @@ fn pingpong_benchmarks(c: &mut Criterion) {
     let client = client.into_inner();
     loop {
         let mut drained = false;
-        while client.recv_cq.poll_one().is_some() {
+        client.shared_state.reset();
+        client.recv_cq.poll();
+        if client.shared_state.rx_count.get() > 0 {
             drained = true;
         }
         client.recv_cq.flush();

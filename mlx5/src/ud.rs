@@ -551,7 +551,10 @@ pub struct UdQp<T, Tab, F> {
     sq: Option<UdSendQueueState<T, Tab>>,
     rq: Option<UdRecvQueueState<T>>,
     callback: F,
+    /// Weak reference to the send CQ for unregistration on drop.
     send_cq: Weak<CompletionQueue>,
+    /// Weak reference to the recv CQ for unregistration on drop.
+    recv_cq: Weak<CompletionQueue>,
     /// Keep the PD alive while this QP exists.
     _pd: Pd,
 }
@@ -567,7 +570,7 @@ impl Context {
         &self,
         pd: &Pd,
         send_cq: &Rc<CompletionQueue>,
-        recv_cq: &CompletionQueue,
+        recv_cq: &Rc<CompletionQueue>,
         config: &UdQpConfig,
         callback: F,
     ) -> io::Result<Rc<RefCell<UdQpSparseWqeTable<T, F>>>>
@@ -580,6 +583,7 @@ impl Context {
         let qpn = qp_rc.borrow().qpn();
 
         send_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+        recv_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
 
         Ok(qp_rc)
     }
@@ -594,7 +598,7 @@ impl Context {
         &self,
         pd: &Pd,
         send_cq: &Rc<CompletionQueue>,
-        recv_cq: &CompletionQueue,
+        recv_cq: &Rc<CompletionQueue>,
         config: &UdQpConfig,
         callback: F,
     ) -> io::Result<Rc<RefCell<UdQpDenseWqeTable<T, F>>>>
@@ -607,6 +611,7 @@ impl Context {
         let qpn = qp_rc.borrow().qpn();
 
         send_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+        recv_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
 
         Ok(qp_rc)
     }
@@ -615,7 +620,7 @@ impl Context {
         &self,
         pd: &Pd,
         send_cq: &Rc<CompletionQueue>,
-        recv_cq: &CompletionQueue,
+        recv_cq: &Rc<CompletionQueue>,
         config: &UdQpConfig,
         callback: F,
     ) -> io::Result<UdQpSparseWqeTable<T, F>>
@@ -647,6 +652,7 @@ impl Context {
                     rq: None,
                     callback,
                     send_cq: Rc::downgrade(send_cq),
+                    recv_cq: Rc::downgrade(recv_cq),
                     _pd: pd.clone(),
                 })
             })
@@ -657,7 +663,7 @@ impl Context {
         &self,
         pd: &Pd,
         send_cq: &Rc<CompletionQueue>,
-        recv_cq: &CompletionQueue,
+        recv_cq: &Rc<CompletionQueue>,
         config: &UdQpConfig,
         callback: F,
     ) -> io::Result<UdQpDenseWqeTable<T, F>>
@@ -689,6 +695,7 @@ impl Context {
                     rq: None,
                     callback,
                     send_cq: Rc::downgrade(send_cq),
+                    recv_cq: Rc::downgrade(recv_cq),
                     _pd: pd.clone(),
                 })
             })
@@ -698,8 +705,12 @@ impl Context {
 
 impl<T, Tab, F> Drop for UdQp<T, Tab, F> {
     fn drop(&mut self) {
+        let qpn = self.qpn();
         if let Some(cq) = self.send_cq.upgrade() {
-            cq.unregister_queue(self.qpn());
+            cq.unregister_queue(qpn);
+        }
+        if let Some(cq) = self.recv_cq.upgrade() {
+            cq.unregister_queue(qpn);
         }
         unsafe {
             mlx5_sys::ibv_destroy_qp(self.qp.as_ptr());

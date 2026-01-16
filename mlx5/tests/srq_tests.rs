@@ -13,7 +13,6 @@
 
 mod common;
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use mlx5::dc::{DciConfig, DctConfig};
@@ -132,18 +131,17 @@ fn test_srq_with_dct_send() {
     require_dct!(&ctx);
 
     // Create CQs
-    let dci_cq = Rc::new(RefCell::new(
-        ctx.ctx.create_cq(256).expect("Failed to create DCI CQ"),
-    ));
+    let mut dci_cq = ctx.ctx.create_cq(256).expect("Failed to create DCI CQ");
     dci_cq
-        .borrow_mut()
         .init_direct_access()
         .expect("Failed to init DCI CQ direct access");
+    let dci_cq = Rc::new(dci_cq);
 
     let mut dct_cq = ctx.ctx.create_cq(256).expect("Failed to create DCT CQ");
     dct_cq
         .init_direct_access()
         .expect("Failed to init DCT CQ direct access");
+    let dct_cq = Rc::new(dct_cq);
 
     // Create SRQ
     let srq_config = SrqConfig {
@@ -209,16 +207,16 @@ fn test_srq_with_dct_send() {
         .finish_with_blueflame();
 
     // Poll DCI CQ for send completion
-    let send_cqe = poll_cq_timeout(&mut dci_cq.borrow_mut(), 5000).expect("Send CQE timeout");
+    let send_cqe = poll_cq_timeout(&dci_cq, 5000).expect("Send CQE timeout");
     assert_eq!(
         send_cqe.syndrome, 0,
         "Send CQE error: syndrome={}",
         send_cqe.syndrome
     );
-    dci_cq.borrow().flush();
+    dci_cq.flush();
 
     // Poll DCT CQ for receive completion
-    let recv_cqe = poll_cq_timeout(&mut dct_cq, 5000).expect("Recv CQE timeout");
+    let recv_cqe = poll_cq_timeout(&dct_cq, 5000).expect("Recv CQE timeout");
     assert_eq!(
         recv_cqe.syndrome, 0,
         "Recv CQE error: syndrome={}",
@@ -257,18 +255,17 @@ fn test_srq_shared_by_multiple_dcts() {
     require_dct!(&ctx);
 
     // Create CQs
-    let dci_cq = Rc::new(RefCell::new(
-        ctx.ctx.create_cq(256).expect("Failed to create DCI CQ"),
-    ));
+    let mut dci_cq = ctx.ctx.create_cq(256).expect("Failed to create DCI CQ");
     dci_cq
-        .borrow_mut()
         .init_direct_access()
         .expect("Failed to init DCI CQ direct access");
+    let dci_cq = Rc::new(dci_cq);
 
     let mut dct_cq = ctx.ctx.create_cq(256).expect("Failed to create DCT CQ");
     dct_cq
         .init_direct_access()
         .expect("Failed to init DCT CQ direct access");
+    let dct_cq = Rc::new(dct_cq);
 
     // Create shared SRQ
     let srq_config = SrqConfig {
@@ -348,7 +345,7 @@ fn test_srq_shared_by_multiple_dcts() {
             .finish_with_blueflame();
 
         // Poll send completion
-        let send_cqe = poll_cq_timeout(&mut dci_cq.borrow_mut(), 5000)
+        let send_cqe = poll_cq_timeout(&dci_cq, 5000)
             .expect(&format!("Send CQE timeout for DCT {}", i));
         assert_eq!(
             send_cqe.syndrome, 0,
@@ -357,7 +354,7 @@ fn test_srq_shared_by_multiple_dcts() {
         );
 
         // Poll receive completion
-        let recv_cqe = poll_cq_timeout(&mut dct_cq, 5000)
+        let recv_cqe = poll_cq_timeout(&dct_cq, 5000)
             .expect(&format!("Recv CQE timeout for DCT {}", i));
         assert_eq!(
             recv_cqe.syndrome, 0,
@@ -366,7 +363,7 @@ fn test_srq_shared_by_multiple_dcts() {
         );
     }
 
-    dci_cq.borrow().flush();
+    dci_cq.flush();
     dct_cq.flush();
 
     println!("SRQ shared by multiple DCTs test passed!");

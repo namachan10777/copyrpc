@@ -14,7 +14,6 @@
 
 mod common;
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use mlx5::qp::{QpState, RcQpConfig, RemoteQpInfo};
@@ -27,11 +26,11 @@ use common::{full_access, poll_cq_timeout, AlignedBuffer, TestContext};
 /// Drop order is now automatically handled by Rc-based resource management.
 /// QPs, CQs, and MRs all internally hold references to their parent resources.
 pub struct RcLoopbackPair {
-    pub qp1: Rc<RefCell<mlx5::qp::RcQp<u64, fn(mlx5::cq::Cqe, u64)>>>,
-    pub qp2: Rc<RefCell<mlx5::qp::RcQp<u64, fn(mlx5::cq::Cqe, u64)>>>,
-    pub send_cq: Rc<RefCell<mlx5::cq::CompletionQueue>>,
-    _recv_cq1: mlx5::cq::CompletionQueue,
-    _recv_cq2: mlx5::cq::CompletionQueue,
+    pub qp1: Rc<std::cell::RefCell<mlx5::qp::RcQp<u64, fn(mlx5::cq::Cqe, u64)>>>,
+    pub qp2: Rc<std::cell::RefCell<mlx5::qp::RcQp<u64, fn(mlx5::cq::Cqe, u64)>>>,
+    pub send_cq: Rc<mlx5::cq::CompletionQueue>,
+    _recv_cq1: Rc<mlx5::cq::CompletionQueue>,
+    _recv_cq2: Rc<mlx5::cq::CompletionQueue>,
     // PD is kept alive via QP's internal Rc<Pd>
     _pd: mlx5::pd::Pd,
 }
@@ -39,15 +38,17 @@ pub struct RcLoopbackPair {
 /// Helper to create a loopback RC QP pair.
 fn create_rc_loopback_pair(ctx: &TestContext) -> RcLoopbackPair {
     // Create separate send CQ (shared for polling) and recv CQs
-    let send_cq = Rc::new(RefCell::new(
-        ctx.ctx.create_cq(256).expect("Failed to create send CQ"),
-    ));
+    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
     send_cq
-        .borrow_mut()
         .init_direct_access()
         .expect("Failed to init send CQ direct access");
-    let recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
-    let recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    let send_cq = Rc::new(send_cq);
+    let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
+    recv_cq1.init_direct_access().expect("Failed to init recv CQ1 direct access");
+    let recv_cq1 = Rc::new(recv_cq1);
+    let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    recv_cq2.init_direct_access().expect("Failed to init recv CQ2 direct access");
+    let recv_cq2 = Rc::new(recv_cq2);
 
     let config = RcQpConfig::default();
 
@@ -175,13 +176,13 @@ fn test_rc_rdma_write() {
     println!("WQE posted via BlueFlame");
 
     // Poll CQ
-    let cqe = poll_cq_timeout(&mut cq.borrow_mut(), 5000).expect("CQE timeout");
+    let cqe = poll_cq_timeout(&cq, 5000).expect("CQE timeout");
     println!(
         "CQE: opcode={:?}, syndrome={}, qpn=0x{:x}, wqe_counter={}",
         cqe.opcode, cqe.syndrome, cqe.qp_num, cqe.wqe_counter
     );
     assert_eq!(cqe.syndrome, 0, "CQE error: syndrome={}", cqe.syndrome);
-    cq.borrow().flush();
+    cq.flush();
 
     // Verify data
     let written = remote_buf.read_bytes(test_data.len());
@@ -234,9 +235,9 @@ fn test_rc_rdma_read() {
         .finish_with_blueflame();
 
     // Poll CQ
-    let cqe = poll_cq_timeout(&mut cq.borrow_mut(), 5000).expect("CQE timeout");
+    let cqe = poll_cq_timeout(&cq, 5000).expect("CQE timeout");
     assert_eq!(cqe.syndrome, 0, "CQE error: syndrome={}", cqe.syndrome);
-    cq.borrow().flush();
+    cq.flush();
 
     // Verify data
     let read_data = local_buf.read_bytes(test_data.len());
@@ -293,9 +294,9 @@ fn test_rc_atomic_cas_success() {
         .finish_with_blueflame();
 
     // Poll CQ
-    let cqe = poll_cq_timeout(&mut cq.borrow_mut(), 5000).expect("CQE timeout");
+    let cqe = poll_cq_timeout(&cq, 5000).expect("CQE timeout");
     assert_eq!(cqe.syndrome, 0, "CQE error: syndrome={}", cqe.syndrome);
-    cq.borrow().flush();
+    cq.flush();
 
     // Verify:
     // 1. Remote value should be swap_value (CAS succeeded)
@@ -364,9 +365,9 @@ fn test_rc_atomic_cas_failure() {
         .finish_with_blueflame();
 
     // Poll CQ
-    let cqe = poll_cq_timeout(&mut cq.borrow_mut(), 5000).expect("CQE timeout");
+    let cqe = poll_cq_timeout(&cq, 5000).expect("CQE timeout");
     assert_eq!(cqe.syndrome, 0, "CQE error: syndrome={}", cqe.syndrome);
-    cq.borrow().flush();
+    cq.flush();
 
     // Verify:
     // 1. Remote value should be unchanged (CAS failed)
@@ -432,9 +433,9 @@ fn test_rc_atomic_fa() {
         .finish_with_blueflame();
 
     // Poll CQ
-    let cqe = poll_cq_timeout(&mut cq.borrow_mut(), 5000).expect("CQE timeout");
+    let cqe = poll_cq_timeout(&cq, 5000).expect("CQE timeout");
     assert_eq!(cqe.syndrome, 0, "CQE error: syndrome={}", cqe.syndrome);
-    cq.borrow().flush();
+    cq.flush();
 
     // Verify:
     // 1. Remote value should be initial + add
@@ -529,14 +530,14 @@ fn test_rc_rdma_write_imm() {
         .finish_with_blueflame();
 
     // Poll send CQ for completion
-    let cqe = poll_cq_timeout(&mut send_cq.borrow_mut(), 5000).expect("Send CQE timeout");
+    let cqe = poll_cq_timeout(&send_cq, 5000).expect("Send CQE timeout");
     println!(
         "Send CQE: opcode={:?}, syndrome={}, wqe_counter={}",
         cqe.opcode, cqe.syndrome, cqe.wqe_counter
     );
     assert_eq!(cqe.syndrome, 0, "Send CQE error");
     assert_eq!(cqe.opcode, CqeOpcode::Req, "Expected Req opcode for send completion");
-    send_cq.borrow().flush();
+    send_cq.flush();
 
     // Verify data was written
     let written = remote_buf.read_bytes(test_data.len());
@@ -564,15 +565,16 @@ fn test_rc_send_recv_verbs() {
     };
 
     // Create QPs with separate recv CQs that we can access
-    let send_cq = Rc::new(RefCell::new(
-        ctx.ctx.create_cq(256).expect("Failed to create send CQ"),
-    ));
-    // Note: send_cq.init_direct_access() will be called by create_rc_qp
+    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    send_cq.init_direct_access().expect("Failed to init send CQ");
+    let send_cq = Rc::new(send_cq);
 
     let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
-    // Note: NOT calling init_direct_access() before QP creation to test if it helps
+    recv_cq1.init_direct_access().expect("Failed to init recv CQ1");
+    let recv_cq1 = Rc::new(recv_cq1);
     let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
-    // Note: NOT calling init_direct_access() before QP creation to test if it helps
+    recv_cq2.init_direct_access().expect("Failed to init recv CQ2");
+    let recv_cq2 = Rc::new(recv_cq2);
 
     let config = mlx5::qp::RcQpConfig::default();
 
@@ -613,9 +615,6 @@ fn test_rc_send_recv_verbs() {
         .expect("Failed to connect QP2");
     println!("[verbs] QP1 state after connect: {:?}", qp1.borrow().state());
     println!("[verbs] QP2 state after connect: {:?}", qp2.borrow().state());
-
-    // Initialize recv CQ direct access AFTER QP creation
-    recv_cq2.init_direct_access().expect("Failed to init recv CQ2 direct access");
 
     // Allocate buffers
     let mut send_buf = AlignedBuffer::new(4096);
@@ -771,7 +770,7 @@ fn test_rc_send_recv_verbs() {
         let mut wc: mlx5_sys::ibv_wc = std::mem::zeroed();
         let start = std::time::Instant::now();
         loop {
-            let ret = mlx5_sys::ibv_poll_cq_ex(send_cq.borrow().as_ptr(), 1, &mut wc);
+            let ret = mlx5_sys::ibv_poll_cq_ex(send_cq.as_ptr(), 1, &mut wc);
             if ret > 0 {
                 println!("[verbs] Send WC: status={}, opcode={}, wr_id={}", wc.status, wc.opcode, wc.wr_id);
                 assert_eq!(wc.status, mlx5_sys::ibv_wc_status_IBV_WC_SUCCESS, "Send WC error");
@@ -790,7 +789,7 @@ fn test_rc_send_recv_verbs() {
         let mut wc: mlx5_sys::ibv_wc = std::mem::zeroed();
         let start = std::time::Instant::now();
         loop {
-            let ret = mlx5_sys::ibv_poll_cq_ex(recv_cq2.as_ptr(), 1, &mut wc);
+            let ret = mlx5_sys::ibv_poll_cq_ex((*recv_cq2).as_ptr(), 1, &mut wc);
             if ret > 0 {
                 println!("[verbs] Recv WC: status={}, opcode={}, byte_len={}, wr_id={}", wc.status, wc.opcode, wc.byte_len, wc.wr_id);
                 recv_byte_len = wc.byte_len;
@@ -868,6 +867,7 @@ fn test_rc_send_recv_verbs() {
 #[test]
 fn test_rc_send_recv() {
     use mlx5::cq::CqeOpcode;
+    use std::cell::Cell;
 
     let ctx = match TestContext::new() {
         Some(ctx) => ctx,
@@ -878,21 +878,38 @@ fn test_rc_send_recv() {
     };
 
     // Create QPs with separate recv CQs that we can access
-    let send_cq = Rc::new(RefCell::new(
-        ctx.ctx.create_cq(256).expect("Failed to create send CQ"),
-    ));
+    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
     send_cq
-        .borrow_mut()
         .init_direct_access()
         .expect("Failed to init send CQ direct access");
+    let send_cq = Rc::new(send_cq);
 
     let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
+    recv_cq1.init_direct_access().expect("Failed to init recv CQ1");
+    let recv_cq1 = Rc::new(recv_cq1);
     let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
-    // Note: init_direct_access() will be called AFTER QP creation
+    recv_cq2.init_direct_access().expect("Failed to init recv CQ2");
+    let recv_cq2 = Rc::new(recv_cq2);
+
+    // Shared state to capture recv CQE info
+    let recv_cqe_opcode: Rc<Cell<Option<CqeOpcode>>> = Rc::new(Cell::new(None));
+    let recv_cqe_byte_cnt: Rc<Cell<u32>> = Rc::new(Cell::new(0));
+    let recv_cqe_syndrome: Rc<Cell<u8>> = Rc::new(Cell::new(0));
+
+    let recv_opcode_clone = recv_cqe_opcode.clone();
+    let recv_byte_cnt_clone = recv_cqe_byte_cnt.clone();
+    let recv_syndrome_clone = recv_cqe_syndrome.clone();
 
     let config = mlx5::qp::RcQpConfig::default();
 
     fn noop_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
+
+    // Callback to capture recv CQE info
+    let recv_callback = move |cqe: mlx5::cq::Cqe, _entry: u64| {
+        recv_opcode_clone.set(Some(cqe.opcode));
+        recv_byte_cnt_clone.set(cqe.byte_cnt);
+        recv_syndrome_clone.set(cqe.syndrome);
+    };
 
     let qp1 = ctx
         .ctx
@@ -901,7 +918,7 @@ fn test_rc_send_recv() {
 
     let qp2 = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, noop_callback as fn(_, _))
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, recv_callback)
         .expect("Failed to create QP2");
 
     // Connect QPs
@@ -923,10 +940,6 @@ fn test_rc_send_recv() {
     qp2.borrow_mut()
         .connect(&remote1, ctx.port, 0, 4, 4, access)
         .expect("Failed to connect QP2");
-
-    // Initialize recv CQ direct access AFTER QP creation
-    recv_cq1.init_direct_access().expect("Failed to init recv CQ1");
-    recv_cq2.init_direct_access().expect("Failed to init recv CQ2");
 
     // Allocate buffers
     let mut send_buf = AlignedBuffer::new(4096);
@@ -963,24 +976,38 @@ fn test_rc_send_recv() {
         .finish_with_blueflame();
 
     // Poll send CQ for send completion
-    let send_cqe = poll_cq_timeout(&mut send_cq.borrow_mut(), 5000).expect("Send CQE timeout");
+    let send_cqe = poll_cq_timeout(&send_cq, 5000).expect("Send CQE timeout");
     println!(
         "Send CQE: opcode={:?}, syndrome={}, qpn=0x{:x}",
         send_cqe.opcode, send_cqe.syndrome, send_cqe.qp_num
     );
     assert_eq!(send_cqe.syndrome, 0, "Send CQE error");
-    send_cq.borrow().flush();
+    send_cq.flush();
 
-    // Poll recv CQ using our poll_one (with scatter to CQE disabled)
-    let recv_cqe = poll_cq_timeout(&mut recv_cq2, 5000).expect("Recv CQE timeout");
+    // Poll recv CQ using poll() - callback will capture CQE info
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_millis(5000);
+    loop {
+        recv_cq2.poll();
+        recv_cq2.flush();
+        if recv_cqe_opcode.get().is_some() {
+            break;
+        }
+        if start.elapsed() > timeout {
+            panic!("Recv CQE timeout");
+        }
+        std::hint::spin_loop();
+    }
+    let recv_cqe_op = recv_cqe_opcode.get().expect("No CQE opcode");
+    let recv_byte_cnt = recv_cqe_byte_cnt.get();
+    let recv_syndrome = recv_cqe_syndrome.get();
     println!(
-        "Recv CQE: opcode={:?}, syndrome={}, byte_cnt={}, qpn=0x{:x}, wqe_counter={}",
-        recv_cqe.opcode, recv_cqe.syndrome, recv_cqe.byte_cnt, recv_cqe.qp_num, recv_cqe.wqe_counter
+        "Recv CQE: opcode={:?}, syndrome={}, byte_cnt={}",
+        recv_cqe_op, recv_syndrome, recv_byte_cnt
     );
-    assert_eq!(recv_cqe.syndrome, 0, "Recv CQE error");
-    assert_eq!(recv_cqe.opcode, CqeOpcode::RespSend, "Expected RespSend opcode");
-    assert_eq!(recv_cqe.byte_cnt as usize, test_data.len(), "Byte count mismatch");
-    recv_cq2.flush();
+    assert_eq!(recv_syndrome, 0, "Recv CQE error");
+    assert_eq!(recv_cqe_op, CqeOpcode::RespSend, "Expected RespSend opcode");
+    assert_eq!(recv_byte_cnt as usize, test_data.len(), "Byte count mismatch");
 
     // Debug: Read first 32 bytes to see what's there
     let first_bytes = recv_buf.read_bytes(32);
@@ -1011,10 +1038,15 @@ fn test_rc_send_recv_pure_verbs() {
     };
 
     // Create CQs
-    let send_cq = Rc::new(RefCell::new(
-        ctx.ctx.create_cq(256).expect("Failed to create send CQ"),
-    ));
-    let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    send_cq.init_direct_access().expect("Failed to init send CQ");
+    let send_cq = Rc::new(send_cq);
+    let mut recv_cq1_raw = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
+    recv_cq1_raw.init_direct_access().expect("Failed to init recv CQ1");
+    let recv_cq1 = Rc::new(recv_cq1_raw);
+    let mut recv_cq2_raw = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    recv_cq2_raw.init_direct_access().expect("Failed to init recv CQ2");
+    let recv_cq2 = Rc::new(recv_cq2_raw);
 
     let config = mlx5::qp::RcQpConfig::default();
 
@@ -1023,7 +1055,7 @@ fn test_rc_send_recv_pure_verbs() {
     // Create QPs
     let qp1 = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &ctx.ctx.create_cq(256).unwrap(), &config, noop_callback as fn(_, _))
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq1, &config, noop_callback as fn(_, _))
         .expect("Failed to create QP1");
 
     let qp2 = ctx
@@ -1120,7 +1152,7 @@ fn test_rc_send_recv_pure_verbs() {
         let mut wc: mlx5_sys::ibv_wc = std::mem::zeroed();
         let start = std::time::Instant::now();
         loop {
-            let ret = mlx5_sys::ibv_poll_cq_ex(send_cq.borrow().as_ptr(), 1, &mut wc);
+            let ret = mlx5_sys::ibv_poll_cq_ex(send_cq.as_ptr(), 1, &mut wc);
             if ret > 0 {
                 println!("[pure_verbs] Send WC: status={}, opcode={}, wr_id={}", wc.status, wc.opcode, wc.wr_id);
                 assert_eq!(wc.status, mlx5_sys::ibv_wc_status_IBV_WC_SUCCESS, "Send WC error");
@@ -1138,7 +1170,7 @@ fn test_rc_send_recv_pure_verbs() {
         let mut wc: mlx5_sys::ibv_wc = std::mem::zeroed();
         let start = std::time::Instant::now();
         loop {
-            let ret = mlx5_sys::ibv_poll_cq_ex(recv_cq2.as_ptr(), 1, &mut wc);
+            let ret = mlx5_sys::ibv_poll_cq_ex((*recv_cq2).as_ptr(), 1, &mut wc);
             if ret > 0 {
                 println!("[pure_verbs] Recv WC: status={}, opcode={}, byte_len={}, wr_id={}", wc.status, wc.opcode, wc.byte_len, wc.wr_id);
                 assert_eq!(wc.status, mlx5_sys::ibv_wc_status_IBV_WC_SUCCESS, "Recv WC error");
@@ -1169,6 +1201,7 @@ fn test_rc_send_recv_pure_verbs() {
 #[test]
 fn test_rc_send_recv_pingpong() {
     use mlx5::cq::CqeOpcode;
+    use std::cell::Cell;
 
     let ctx = match TestContext::new() {
         Some(ctx) => ctx,
@@ -1178,32 +1211,45 @@ fn test_rc_send_recv_pingpong() {
         }
     };
 
+    // Shared state for capturing recv CQE opcodes
+    let recv1_opcode: Rc<Cell<Option<CqeOpcode>>> = Rc::new(Cell::new(None));
+    let recv2_opcode: Rc<Cell<Option<CqeOpcode>>> = Rc::new(Cell::new(None));
+    let recv1_opcode_clone = recv1_opcode.clone();
+    let recv2_opcode_clone = recv2_opcode.clone();
+
     // Create QPs with separate recv CQs
-    let send_cq = Rc::new(RefCell::new(
-        ctx.ctx.create_cq(256).expect("Failed to create send CQ"),
-    ));
-    send_cq.borrow_mut().init_direct_access().expect("Failed to init send CQ");
+    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    send_cq.init_direct_access().expect("Failed to init send CQ");
+    let send_cq = Rc::new(send_cq);
 
     let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
     recv_cq1.init_direct_access().expect("Failed to init recv CQ1");
+    let recv_cq1 = Rc::new(recv_cq1);
     let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
     recv_cq2.init_direct_access().expect("Failed to init recv CQ2");
+    let recv_cq2 = Rc::new(recv_cq2);
 
     let config = mlx5::qp::RcQpConfig {
         max_inline_data: 64,
         ..Default::default()
     };
 
-    fn noop_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
+    // Callbacks that capture opcode
+    let callback1 = move |cqe: mlx5::cq::Cqe, _entry: u64| {
+        recv1_opcode_clone.set(Some(cqe.opcode));
+    };
+    let callback2 = move |cqe: mlx5::cq::Cqe, _entry: u64| {
+        recv2_opcode_clone.set(Some(cqe.opcode));
+    };
 
     let qp1 = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq1, &config, noop_callback as fn(_, _))
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq1, &config, callback1)
         .expect("Failed to create QP1");
 
     let qp2 = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, noop_callback as fn(_, _))
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, callback2)
         .expect("Failed to create QP2");
 
     // Connect QPs
@@ -1232,6 +1278,9 @@ fn test_rc_send_recv_pingpong() {
     println!("Running {} ping-pong iterations...", iterations);
 
     for i in 0..iterations {
+        // Reset opcode states
+        recv2_opcode.set(None);
+
         // QP2 posts receive
         unsafe { qp2.borrow_mut().post_recv(buf2.addr(), 64, mr2.lkey()); }
         qp2.borrow_mut().ring_rq_doorbell();
@@ -1245,13 +1294,26 @@ fn test_rc_send_recv_pingpong() {
             .finish_with_blueflame();
 
         // Wait for send completion
-        let _ = poll_cq_timeout(&mut send_cq.borrow_mut(), 5000).expect("send CQE");
-        send_cq.borrow().flush();
+        let _ = poll_cq_timeout(&send_cq, 5000).expect("send CQE");
+        send_cq.flush();
 
-        // Wait for receive completion
-        let recv_cqe = poll_cq_timeout(&mut recv_cq2, 5000).expect("recv CQE");
-        assert_eq!(recv_cqe.opcode, CqeOpcode::RespSend);
-        recv_cq2.flush();
+        // Wait for receive completion on recv_cq2
+        let start = std::time::Instant::now();
+        loop {
+            recv_cq2.poll();
+            recv_cq2.flush();
+            if recv2_opcode.get().is_some() {
+                break;
+            }
+            if start.elapsed().as_millis() > 5000 {
+                panic!("recv CQE timeout");
+            }
+            std::hint::spin_loop();
+        }
+        assert_eq!(recv2_opcode.get().unwrap(), CqeOpcode::RespSend);
+
+        // Reset opcode state
+        recv1_opcode.set(None);
 
         // QP1 posts receive
         unsafe { qp1.borrow_mut().post_recv(buf1.addr(), 64, mr1.lkey()); }
@@ -1266,13 +1328,23 @@ fn test_rc_send_recv_pingpong() {
             .finish_with_blueflame();
 
         // Wait for send completion
-        let _ = poll_cq_timeout(&mut send_cq.borrow_mut(), 5000).expect("send CQE");
-        send_cq.borrow().flush();
+        let _ = poll_cq_timeout(&send_cq, 5000).expect("send CQE");
+        send_cq.flush();
 
-        // Wait for receive completion
-        let recv_cqe = poll_cq_timeout(&mut recv_cq1, 5000).expect("recv CQE");
-        assert_eq!(recv_cqe.opcode, CqeOpcode::RespSend);
-        recv_cq1.flush();
+        // Wait for receive completion on recv_cq1
+        let start = std::time::Instant::now();
+        loop {
+            recv_cq1.poll();
+            recv_cq1.flush();
+            if recv1_opcode.get().is_some() {
+                break;
+            }
+            if start.elapsed().as_millis() > 5000 {
+                panic!("recv CQE timeout");
+            }
+            std::hint::spin_loop();
+        }
+        assert_eq!(recv1_opcode.get().unwrap(), CqeOpcode::RespSend);
     }
 
     println!("RC SEND/RECV ping-pong test passed! ({} iterations)", iterations);

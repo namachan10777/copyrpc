@@ -16,7 +16,6 @@
 
 mod common;
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use mlx5::dc::{DciConfig, DctConfig};
@@ -42,9 +41,9 @@ fn test_dc_creation() {
     require_dct!(&ctx);
 
     // Create CQ for DCI
-    let dci_cq = Rc::new(RefCell::new(
+    let dci_cq = Rc::new(
         ctx.ctx.create_cq(256).expect("Failed to create DCI CQ"),
-    ));
+    );
 
     // Create CQ for DCT (receives go to SRQ completion)
     let dct_cq = ctx.ctx.create_cq(256).expect("Failed to create DCT CQ");
@@ -106,13 +105,11 @@ fn test_dc_rdma_write() {
     require_dct!(&ctx);
 
     // Create CQ for DCI
-    let dci_cq = Rc::new(RefCell::new(
-        ctx.ctx.create_cq(256).expect("Failed to create DCI CQ"),
-    ));
+    let mut dci_cq = ctx.ctx.create_cq(256).expect("Failed to create DCI CQ");
     dci_cq
-        .borrow_mut()
         .init_direct_access()
         .expect("Failed to init DCI CQ direct access");
+    let dci_cq = Rc::new(dci_cq);
 
     // Create CQ for DCT
     let dct_cq = ctx.ctx.create_cq(256).expect("Failed to create DCT CQ");
@@ -179,9 +176,9 @@ fn test_dc_rdma_write() {
         .finish_with_blueflame();
 
     // Poll CQ
-    let cqe = poll_cq_timeout(&mut dci_cq.borrow_mut(), 5000).expect("CQE timeout");
+    let cqe = poll_cq_timeout(&dci_cq, 5000).expect("CQE timeout");
     assert_eq!(cqe.syndrome, 0, "CQE error: syndrome={}", cqe.syndrome);
-    dci_cq.borrow().flush();
+    dci_cq.flush();
 
     // Verify data
     let written = remote_buf.read_bytes(test_data.len());
@@ -207,13 +204,11 @@ fn test_dc_rdma_read() {
     require_dct!(&ctx);
 
     // Create CQ for DCI
-    let dci_cq = Rc::new(RefCell::new(
-        ctx.ctx.create_cq(256).expect("Failed to create DCI CQ"),
-    ));
+    let mut dci_cq = ctx.ctx.create_cq(256).expect("Failed to create DCI CQ");
     dci_cq
-        .borrow_mut()
         .init_direct_access()
         .expect("Failed to init DCI CQ direct access");
+    let dci_cq = Rc::new(dci_cq);
 
     // Create CQ for DCT
     let dct_cq = ctx.ctx.create_cq(256).expect("Failed to create DCT CQ");
@@ -280,9 +275,9 @@ fn test_dc_rdma_read() {
         .finish_with_blueflame();
 
     // Poll CQ
-    let cqe = poll_cq_timeout(&mut dci_cq.borrow_mut(), 5000).expect("CQE timeout");
+    let cqe = poll_cq_timeout(&dci_cq, 5000).expect("CQE timeout");
     assert_eq!(cqe.syndrome, 0, "CQE error: syndrome={}", cqe.syndrome);
-    dci_cq.borrow().flush();
+    dci_cq.flush();
 
     // Verify data
     let read_data = local_buf.read_bytes(test_data.len());
@@ -308,13 +303,11 @@ fn test_dc_multiple_dci() {
     require_dct!(&ctx);
 
     // Create shared CQ for all DCIs
-    let dci_cq = Rc::new(RefCell::new(
-        ctx.ctx.create_cq(256).expect("Failed to create DCI CQ"),
-    ));
+    let mut dci_cq = ctx.ctx.create_cq(256).expect("Failed to create DCI CQ");
     dci_cq
-        .borrow_mut()
         .init_direct_access()
         .expect("Failed to init DCI CQ direct access");
+    let dci_cq = Rc::new(dci_cq);
 
     // Create CQ for DCT
     let dct_cq = ctx.ctx.create_cq(256).expect("Failed to create DCT CQ");
@@ -392,7 +385,7 @@ fn test_dc_multiple_dci() {
             .finish_with_blueflame();
 
         // Poll for this DCI's completion
-        let cqe = poll_cq_timeout(&mut dci_cq.borrow_mut(), 5000)
+        let cqe = poll_cq_timeout(&dci_cq, 5000)
             .expect(&format!("CQE timeout for DCI {}", i));
         assert_eq!(
             cqe.syndrome, 0,
@@ -400,7 +393,7 @@ fn test_dc_multiple_dci() {
             i, cqe.syndrome
         );
     }
-    dci_cq.borrow().flush();
+    dci_cq.flush();
 
     // Verify all data
     for i in 0..num_dcis {

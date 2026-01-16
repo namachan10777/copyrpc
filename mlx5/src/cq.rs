@@ -323,17 +323,6 @@ impl CompletionQueue {
         }
     }
 
-    /// Poll for a single CQE without dispatching to callbacks.
-    ///
-    /// This is useful for testing or when you want to process CQEs manually.
-    /// Returns None if no CQE is available.
-    ///
-    /// Note: When using this method, you should call `flush()` afterwards
-    /// to acknowledge the completions to the hardware.
-    pub fn poll_one(&self) -> Option<Cqe> {
-        self.try_next_cqe()
-    }
-
     /// Try to get the next CQE.
     ///
     /// Returns None if no CQE is available.

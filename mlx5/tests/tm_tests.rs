@@ -16,7 +16,6 @@
 
 mod common;
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use mlx5::cq::CqeOpcode;
@@ -42,9 +41,9 @@ fn test_tm_srq_creation() {
 
     require_tm_srq!(&ctx);
 
-    let cq = Rc::new(RefCell::new(
+    let cq = Rc::new(
         ctx.ctx.create_cq(256).expect("Failed to create CQ"),
-    ));
+    );
 
     let config = TmSrqConfig {
         max_wr: 256,
@@ -78,12 +77,10 @@ fn test_tm_srq_direct_access() {
 
     require_tm_srq!(&ctx);
 
-    let cq = Rc::new(RefCell::new(
-        ctx.ctx.create_cq(256).expect("Failed to create CQ"),
-    ));
-    cq.borrow_mut()
-        .init_direct_access()
+    let mut cq = ctx.ctx.create_cq(256).expect("Failed to create CQ");
+    cq.init_direct_access()
         .expect("Failed to init CQ direct access");
+    let cq = Rc::new(cq);
 
     let config = TmSrqConfig {
         max_wr: 256,
@@ -121,12 +118,10 @@ fn test_tm_tag_add_remove() {
 
     require_tm_srq!(&ctx);
 
-    let cq = Rc::new(RefCell::new(
-        ctx.ctx.create_cq(256).expect("Failed to create CQ"),
-    ));
-    cq.borrow_mut()
-        .init_direct_access()
+    let mut cq = ctx.ctx.create_cq(256).expect("Failed to create CQ");
+    cq.init_direct_access()
         .expect("Failed to init CQ direct access");
+    let cq = Rc::new(cq);
 
     let config = TmSrqConfig {
         max_wr: 256,
@@ -172,12 +167,12 @@ fn test_tm_tag_add_remove() {
     // Poll for add completion - wait a bit for hardware to process
     std::thread::sleep(std::time::Duration::from_millis(10));
 
-    let add_cqe = poll_cq_timeout(&mut cq.borrow_mut(), 5000).expect("Add CQE timeout");
+    let add_cqe = poll_cq_timeout(&cq, 5000).expect("Add CQE timeout");
     println!("Add CQE: opcode={:?}, wqe_counter={}, qp_num=0x{:x}",
         add_cqe.opcode, add_cqe.wqe_counter, add_cqe.qp_num);
     // TM operations return TmFinish opcode on success
     assert_eq!(add_cqe.opcode, CqeOpcode::TmFinish, "Add CQE error: opcode={:?}", add_cqe.opcode);
-    cq.borrow().flush();
+    cq.flush();
 
     println!("Tag added: index={}, tag=0x{:016x}", tag_index, tag);
 
@@ -191,10 +186,10 @@ fn test_tm_tag_add_remove() {
 
     // Poll for delete completion
     // TAG_DEL may return Req (0x00) or TmFinish (0x06) depending on hardware
-    let del_cqe = poll_cq_timeout(&mut cq.borrow_mut(), 5000).expect("Del CQE timeout");
+    let del_cqe = poll_cq_timeout(&cq, 5000).expect("Del CQE timeout");
     assert!(matches!(del_cqe.opcode, CqeOpcode::Req | CqeOpcode::TmFinish),
         "Del CQE error: opcode={:?}", del_cqe.opcode);
-    cq.borrow().flush();
+    cq.flush();
 
     println!("Tag removed: index={}", tag_index);
     println!("TM tag add/remove test passed!");
@@ -217,22 +212,18 @@ fn test_tm_tag_matching_with_dc() {
     require_tm_srq!(&ctx);
 
     // Create CQ for DCI
-    let dci_cq = Rc::new(RefCell::new(
-        ctx.ctx.create_cq(256).expect("Failed to create DCI CQ"),
-    ));
+    let mut dci_cq = ctx.ctx.create_cq(256).expect("Failed to create DCI CQ");
     dci_cq
-        .borrow_mut()
         .init_direct_access()
         .expect("Failed to init DCI CQ direct access");
+    let dci_cq = Rc::new(dci_cq);
 
     // Create CQ for TM-SRQ
-    let tm_cq = Rc::new(RefCell::new(
-        ctx.ctx.create_cq(256).expect("Failed to create TM CQ"),
-    ));
+    let mut tm_cq = ctx.ctx.create_cq(256).expect("Failed to create TM CQ");
     tm_cq
-        .borrow_mut()
         .init_direct_access()
         .expect("Failed to init TM CQ direct access");
+    let tm_cq = Rc::new(tm_cq);
 
     // Create TM-SRQ
     let tm_config = TmSrqConfig {
@@ -284,12 +275,10 @@ fn test_tm_multiple_tags() {
 
     require_tm_srq!(&ctx);
 
-    let cq = Rc::new(RefCell::new(
-        ctx.ctx.create_cq(256).expect("Failed to create CQ"),
-    ));
-    cq.borrow_mut()
-        .init_direct_access()
+    let mut cq = ctx.ctx.create_cq(256).expect("Failed to create CQ");
+    cq.init_direct_access()
         .expect("Failed to init CQ direct access");
+    let cq = Rc::new(cq);
 
     let config = TmSrqConfig {
         max_wr: 256,
@@ -330,12 +319,12 @@ fn test_tm_multiple_tags() {
 
         // Poll for completion
         // TM operations may return Req (0x00) or TmFinish (0x06)
-        let cqe = poll_cq_timeout(&mut cq.borrow_mut(), 5000)
+        let cqe = poll_cq_timeout(&cq, 5000)
             .expect(&format!("Add CQE timeout for tag {}", i));
         assert!(matches!(cqe.opcode, CqeOpcode::Req | CqeOpcode::TmFinish),
             "Add CQE error for tag {}: opcode={:?}", i, cqe.opcode);
     }
-    cq.borrow().flush();
+    cq.flush();
 
     println!("Added 8 tags successfully");
 
@@ -350,12 +339,12 @@ fn test_tm_multiple_tags() {
 
         // Poll for completion
         // TAG_DEL may return Req (0x00) or TmFinish (0x06)
-        let cqe = poll_cq_timeout(&mut cq.borrow_mut(), 5000)
+        let cqe = poll_cq_timeout(&cq, 5000)
             .expect(&format!("Del CQE timeout for tag {}", i));
         assert!(matches!(cqe.opcode, CqeOpcode::Req | CqeOpcode::TmFinish),
             "Del CQE error for tag {}: opcode={:?}", i, cqe.opcode);
     }
-    cq.borrow().flush();
+    cq.flush();
 
     println!("Removed 8 tags successfully");
     println!("TM multiple tags test passed!");
@@ -377,12 +366,10 @@ fn test_tm_unordered_recv() {
 
     require_tm_srq!(&ctx);
 
-    let cq = Rc::new(RefCell::new(
-        ctx.ctx.create_cq(256).expect("Failed to create CQ"),
-    ));
-    cq.borrow_mut()
-        .init_direct_access()
+    let mut cq = ctx.ctx.create_cq(256).expect("Failed to create CQ");
+    cq.init_direct_access()
         .expect("Failed to init CQ direct access");
+    let cq = Rc::new(cq);
 
     let config = TmSrqConfig {
         max_wr: 256,
@@ -436,12 +423,10 @@ fn test_tm_tag_via_verbs_api() {
 
     require_tm_srq!(&ctx);
 
-    let cq = Rc::new(RefCell::new(
-        ctx.ctx.create_cq(256).expect("Failed to create CQ"),
-    ));
-    cq.borrow_mut()
-        .init_direct_access()
+    let mut cq = ctx.ctx.create_cq(256).expect("Failed to create CQ");
+    cq.init_direct_access()
         .expect("Failed to init CQ direct access");
+    let cq = Rc::new(cq);
 
     let config = TmSrqConfig {
         max_wr: 256,
@@ -503,7 +488,7 @@ fn test_tm_tag_via_verbs_api() {
     let timeout = 5000;
     let mut found = false;
     for _ in 0..timeout {
-        let ret = unsafe { mlx5_sys::ibv_poll_cq_ex(cq.borrow().as_ptr(), 1, wc.as_mut_ptr()) };
+        let ret = unsafe { mlx5_sys::ibv_poll_cq_ex(cq.as_ptr(), 1, wc.as_mut_ptr()) };
         if ret > 0 {
             let wc = unsafe { wc.assume_init() };
             println!("WC: status={}, opcode={}, vendor_err=0x{:x}, wr_id={}",
@@ -553,7 +538,7 @@ fn test_tm_tag_via_verbs_api() {
     let mut wc2: MaybeUninit<mlx5_sys::ibv_wc> = MaybeUninit::zeroed();
     let mut found2 = false;
     for _ in 0..timeout {
-        let ret = unsafe { mlx5_sys::ibv_poll_cq_ex(cq.borrow().as_ptr(), 1, wc2.as_mut_ptr()) };
+        let ret = unsafe { mlx5_sys::ibv_poll_cq_ex(cq.as_ptr(), 1, wc2.as_mut_ptr()) };
         if ret > 0 {
             let wc = unsafe { wc2.assume_init() };
             println!("Del WC: status={}, opcode={}, vendor_err=0x{:x}, wr_id={}",

@@ -15,7 +15,6 @@
 
 mod common;
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use mlx5::pd::RemoteUdQpInfo;
@@ -41,10 +40,10 @@ fn test_ud_creation() {
         }
     };
 
-    let send_cq = Rc::new(RefCell::new(
+    let send_cq = Rc::new(
         ctx.ctx.create_cq(256).expect("Failed to create send CQ"),
-    ));
-    let recv_cq = ctx.ctx.create_cq(256).expect("Failed to create recv CQ");
+    );
+    let recv_cq = Rc::new(ctx.ctx.create_cq(256).expect("Failed to create recv CQ"));
 
     let config = UdQpConfig {
         qkey: 0x12345678,
@@ -71,10 +70,10 @@ fn test_ud_activate() {
         }
     };
 
-    let send_cq = Rc::new(RefCell::new(
+    let send_cq = Rc::new(
         ctx.ctx.create_cq(256).expect("Failed to create send CQ"),
-    ));
-    let recv_cq = ctx.ctx.create_cq(256).expect("Failed to create recv CQ");
+    );
+    let recv_cq = Rc::new(ctx.ctx.create_cq(256).expect("Failed to create recv CQ"));
 
     let config = UdQpConfig {
         qkey: 0x12345678,
@@ -112,18 +111,17 @@ fn test_ud_send_recv() {
     };
 
     // Create CQs
-    let send_cq = Rc::new(RefCell::new(
-        ctx.ctx.create_cq(256).expect("Failed to create send CQ"),
-    ));
+    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
     send_cq
-        .borrow_mut()
         .init_direct_access()
         .expect("Failed to init send CQ direct access");
+    let send_cq = Rc::new(send_cq);
 
     let mut recv_cq = ctx.ctx.create_cq(256).expect("Failed to create recv CQ");
     recv_cq
         .init_direct_access()
         .expect("Failed to init recv CQ direct access");
+    let recv_cq = Rc::new(recv_cq);
 
     // Q_Key must have MSB=0 for non-privileged users (bit 31 indicates privileged Q_Key)
     let qkey: u32 = 0x1BCDEF00;
@@ -204,16 +202,16 @@ fn test_ud_send_recv() {
         .finish_with_blueflame();
 
     // Poll send CQ
-    let send_cqe = poll_cq_timeout(&mut send_cq.borrow_mut(), 5000).expect("Send CQE timeout");
+    let send_cqe = poll_cq_timeout(&send_cq, 5000).expect("Send CQE timeout");
     assert_eq!(
         send_cqe.syndrome, 0,
         "Send CQE error: syndrome={}",
         send_cqe.syndrome
     );
-    send_cq.borrow().flush();
+    send_cq.flush();
 
     // Poll recv CQ
-    let recv_cqe = poll_cq_timeout(&mut recv_cq, 5000).expect("Recv CQE timeout");
+    let recv_cqe = poll_cq_timeout(&recv_cq, 5000).expect("Recv CQE timeout");
     assert_eq!(
         recv_cqe.syndrome, 0,
         "Recv CQE error: syndrome={}",
@@ -249,18 +247,17 @@ fn test_ud_send_raw_av() {
     };
 
     // Create CQs
-    let send_cq = Rc::new(RefCell::new(
-        ctx.ctx.create_cq(256).expect("Failed to create send CQ"),
-    ));
+    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
     send_cq
-        .borrow_mut()
         .init_direct_access()
         .expect("Failed to init send CQ direct access");
+    let send_cq = Rc::new(send_cq);
 
     let mut recv_cq = ctx.ctx.create_cq(256).expect("Failed to create recv CQ");
     recv_cq
         .init_direct_access()
         .expect("Failed to init recv CQ direct access");
+    let recv_cq = Rc::new(recv_cq);
 
     let qkey: u32 = 0x11111111;
 
@@ -333,16 +330,16 @@ fn test_ud_send_raw_av() {
         .finish_with_blueflame();
 
     // Poll send CQ
-    let send_cqe = poll_cq_timeout(&mut send_cq.borrow_mut(), 5000).expect("Send CQE timeout");
+    let send_cqe = poll_cq_timeout(&send_cq, 5000).expect("Send CQE timeout");
     assert_eq!(
         send_cqe.syndrome, 0,
         "Send CQE error: syndrome={}",
         send_cqe.syndrome
     );
-    send_cq.borrow().flush();
+    send_cq.flush();
 
     // Poll recv CQ
-    let recv_cqe = poll_cq_timeout(&mut recv_cq, 5000).expect("Recv CQE timeout");
+    let recv_cqe = poll_cq_timeout(&recv_cq, 5000).expect("Recv CQE timeout");
     assert_eq!(
         recv_cqe.syndrome, 0,
         "Recv CQE error: syndrome={}",
@@ -376,17 +373,16 @@ fn test_ud_multiple_destinations() {
     };
 
     // Create CQs
-    let cq = Rc::new(RefCell::new(
-        ctx.ctx.create_cq(256).expect("Failed to create CQ"),
-    ));
-    cq.borrow_mut()
-        .init_direct_access()
+    let mut cq = ctx.ctx.create_cq(256).expect("Failed to create CQ");
+    cq.init_direct_access()
         .expect("Failed to init CQ direct access");
+    let cq = Rc::new(cq);
 
     let mut recv_cq = ctx.ctx.create_cq(256).expect("Failed to create recv CQ");
     recv_cq
         .init_direct_access()
         .expect("Failed to init recv CQ direct access");
+    let recv_cq = Rc::new(recv_cq);
 
     let qkey: u32 = 0x22222222;
 
@@ -469,7 +465,7 @@ fn test_ud_multiple_destinations() {
             .finish_with_blueflame();
 
         // Poll send CQ
-        let send_cqe = poll_cq_timeout(&mut cq.borrow_mut(), 5000)
+        let send_cqe = poll_cq_timeout(&cq, 5000)
             .expect(&format!("Send CQE timeout for receiver {}", i));
         assert_eq!(
             send_cqe.syndrome, 0,
@@ -478,7 +474,7 @@ fn test_ud_multiple_destinations() {
         );
 
         // Poll recv CQ
-        let recv_cqe = poll_cq_timeout(&mut recv_cq, 5000)
+        let recv_cqe = poll_cq_timeout(&recv_cq, 5000)
             .expect(&format!("Recv CQE timeout for receiver {}", i));
         assert_eq!(
             recv_cqe.syndrome, 0,
@@ -496,7 +492,7 @@ fn test_ud_multiple_destinations() {
         );
     }
 
-    cq.borrow().flush();
+    cq.flush();
     recv_cq.flush();
 
     println!("UD multiple destinations test passed!");
