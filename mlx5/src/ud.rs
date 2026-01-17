@@ -101,12 +101,47 @@ impl<Entry, TableType> UdSendQueueState<Entry, TableType> {
         unsafe { self.buf.add(offset) }
     }
 
+    /// Returns the number of WQEBBs from current PI to the end of the ring buffer.
+    fn slots_to_end(&self) -> u16 {
+        self.wqe_cnt - (self.pi.get() & (self.wqe_cnt - 1))
+    }
+
     fn advance_pi(&self, count: u16) {
         self.pi.set(self.pi.get().wrapping_add(count));
     }
 
     fn set_last_wqe(&self, ptr: *mut u8, size: usize) {
         self.last_wqe.set(Some((ptr, size)));
+    }
+
+    /// Post a NOP WQE to fill the remaining slots until the ring end.
+    ///
+    /// # Safety
+    /// Caller must ensure there are enough available slots for the NOP WQE.
+    unsafe fn post_nop(&self, nop_wqebb_cnt: u16) {
+        debug_assert!(nop_wqebb_cnt >= 1, "NOP must be at least 1 WQEBB");
+        debug_assert!(
+            self.available() >= nop_wqebb_cnt,
+            "Not enough slots for NOP"
+        );
+
+        let wqe_idx = self.pi.get();
+        let wqe_ptr = self.get_wqe_ptr(wqe_idx);
+
+        // Write NOP control segment
+        let ds_count = (nop_wqebb_cnt as u8) * 4;
+        CtrlSeg::write(
+            wqe_ptr,
+            WqeOpcode::Nop as u8,
+            wqe_idx,
+            self.sqn,
+            ds_count,
+            0,
+            0,
+        );
+
+        self.advance_pi(nop_wqebb_cnt);
+        self.set_last_wqe(wqe_ptr, (nop_wqebb_cnt as usize) * WQEBB_SIZE);
     }
 
     /// Ring the doorbell using BlueFlame (low latency, single WQE).
@@ -429,6 +464,15 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
         let wqebb_cnt = calc_wqebb_cnt(self.offset);
         let wqe_idx = self.wqe_idx;
 
+        // Check for ring wrap-around: WQE must not cross the ring boundary
+        debug_assert!(
+            wqebb_cnt <= self.sq.slots_to_end(),
+            "WQE wrap-around detected: WQE requires {} WQEBBs but only {} slots to ring end. \
+             Call post_nop_to_ring_end() before building large WQEs near ring boundary.",
+            wqebb_cnt,
+            self.sq.slots_to_end()
+        );
+
         self.sq.advance_pi(wqebb_cnt);
         self.sq.set_last_wqe(self.wqe_ptr, self.offset);
 
@@ -446,6 +490,15 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
         let wqebb_cnt = calc_wqebb_cnt(self.offset);
         let wqe_idx = self.wqe_idx;
         let wqe_ptr = self.wqe_ptr;
+
+        // Check for ring wrap-around: WQE must not cross the ring boundary
+        debug_assert!(
+            wqebb_cnt <= self.sq.slots_to_end(),
+            "WQE wrap-around detected: WQE requires {} WQEBBs but only {} slots to ring end. \
+             Call post_nop_to_ring_end() before building large WQEs near ring boundary.",
+            wqebb_cnt,
+            self.sq.slots_to_end()
+        );
 
         self.sq.advance_pi(wqebb_cnt);
         self.sq.ring_blueflame(wqe_ptr);
@@ -933,6 +986,50 @@ impl<Entry, TableType, OnComplete> UdQp<Entry, TableType, OnComplete> {
         if let Some(rq) = self.rq.as_ref() {
             rq.ring_doorbell();
         }
+    }
+
+    /// Get the number of WQEBBs from current position to the end of the ring buffer.
+    ///
+    /// Use this to check if a variable-length WQE would wrap around the ring boundary.
+    /// If the WQE size exceeds this value, you should call `post_nop_to_ring_end()`
+    /// first to align to the ring start.
+    ///
+    /// Returns 0 if direct access is not initialized.
+    #[inline]
+    pub fn slots_to_ring_end(&self) -> u16 {
+        self.sq.as_ref().map(|sq| sq.slots_to_end()).unwrap_or(0)
+    }
+
+    /// Post a NOP WQE to fill remaining slots until the ring end.
+    ///
+    /// This should be called before posting a variable-length WQE that would
+    /// wrap around the ring boundary. The NOP WQE consumes all slots until the
+    /// ring end, so the next WQE starts at the ring beginning.
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - Direct access is not initialized
+    /// - Not enough available slots (SQ is too full)
+    pub fn post_nop_to_ring_end(&self) -> io::Result<()> {
+        let sq = self.sq()?;
+        let slots_to_end = sq.slots_to_end();
+
+        // If we're already at the ring start, no NOP needed
+        if slots_to_end == sq.wqe_cnt {
+            return Ok(());
+        }
+
+        if sq.available() < slots_to_end {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Not enough slots for NOP",
+            ));
+        }
+
+        unsafe {
+            sq.post_nop(slots_to_end);
+        }
+        Ok(())
     }
 
     /// Get a receive WQE builder for zero-copy WQE construction.

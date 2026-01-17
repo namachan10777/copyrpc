@@ -38,6 +38,209 @@ pub enum CqeOpcode {
     ReqErr = 0x0d,
     /// Responder error
     RespErr = 0x0e,
+    /// Inline scatter 32 (data inlined in 32-byte CQE)
+    InlineScatter32 = 0x12,
+    /// Inline scatter 64 (data inlined in 64-byte CQE)
+    InlineScatter64 = 0x13,
+}
+
+/// Mini CQE format values (for CQE compression).
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiniCqeFormat {
+    /// Responder (RQ) mini CQE format: contains wqe_counter, byte_cnt, checksum
+    Responder = 0x00,
+    /// Requester (SQ) mini CQE format: contains wqe_counter, byte_cnt
+    Requester = 0x01,
+    /// Enhanced responder format with checksum
+    ResponderCsum = 0x02,
+    /// L3/L4 hash format (for RSS)
+    L3L4Hash = 0x03,
+}
+
+/// Mini CQE structure (8 bytes).
+///
+/// Used in CQE compression mode to pack multiple completions into a single CQE.
+/// The exact layout depends on the mini CQE format.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MiniCqe {
+    /// WQE counter (index) - computed from base + offset
+    pub wqe_counter: u16,
+    /// Byte count
+    pub byte_cnt: u32,
+    /// Checksum (for responder formats)
+    pub checksum: u16,
+}
+
+impl MiniCqe {
+    /// Parse a mini CQE from raw memory pointer (responder format).
+    ///
+    /// # Safety
+    /// The pointer must point to valid 8-byte mini CQE data.
+    ///
+    /// Responder mini CQE layout (8 bytes):
+    /// - offset 0-3: byte_cnt (4B, big-endian)
+    /// - offset 4-5: checksum (2B, big-endian)
+    /// - offset 6-7: reserved/stride_idx (2B)
+    #[inline]
+    pub unsafe fn from_ptr_responder(ptr: *const u8, wqe_counter: u16) -> Self {
+        let byte_cnt = u32::from_be(std::ptr::read_volatile(ptr as *const u32));
+        let checksum = u16::from_be(std::ptr::read_volatile(ptr.add(4) as *const u16));
+        Self {
+            wqe_counter,
+            byte_cnt,
+            checksum,
+        }
+    }
+
+    /// Parse a mini CQE from raw memory pointer (requester format).
+    ///
+    /// # Safety
+    /// The pointer must point to valid 8-byte mini CQE data.
+    ///
+    /// Requester mini CQE layout (8 bytes):
+    /// - offset 0-3: s_wqe_info (4B, contains wqe_counter in [31:16])
+    /// - offset 4-7: byte_cnt (4B, big-endian)
+    #[inline]
+    pub unsafe fn from_ptr_requester(ptr: *const u8) -> Self {
+        let s_wqe_info = u32::from_be(std::ptr::read_volatile(ptr as *const u32));
+        let wqe_counter = (s_wqe_info >> 16) as u16;
+        let byte_cnt = u32::from_be(std::ptr::read_volatile(ptr.add(4) as *const u32));
+        Self {
+            wqe_counter,
+            byte_cnt,
+            checksum: 0,
+        }
+    }
+}
+
+/// Maximum number of mini CQEs in a compressed CQE.
+/// For 64-byte CQE: (64 - 8) / 8 = 7 mini CQEs + 1 title (header) CQE
+pub const MAX_MINI_CQES: usize = 7;
+
+/// Compressed CQE header information.
+#[derive(Debug, Clone, Copy)]
+pub struct CompressedCqeHeader {
+    /// Number of completions in this compressed CQE (1-8)
+    pub count: u8,
+    /// Mini CQE format
+    pub format: MiniCqeFormat,
+    /// Base WQE counter for responder mini CQEs
+    pub base_wqe_counter: u16,
+    /// QP number (from title CQE)
+    pub qp_num: u32,
+    /// Opcode for all mini CQEs (from title CQE)
+    pub opcode: CqeOpcode,
+}
+
+impl CompressedCqeHeader {
+    /// Parse compressed CQE header from raw memory pointer.
+    ///
+    /// # Safety
+    /// The pointer must point to a valid 64-byte compressed CQE.
+    ///
+    /// Compressed CQE layout:
+    /// - offset 0-55: mini CQE array (up to 7 mini CQEs, 8 bytes each)
+    /// - offset 56: sop_drop_qpn (4B) - QP number in [23:0]
+    /// - offset 60: wqe_counter (2B) - base counter for responder format
+    /// - offset 62: mini_cqe_cnt (1B) - [7:6]=format, [5:2]=count-1, [1:0]=reserved
+    /// - offset 63: op_own (1B) - opcode[7:4]=0x0f (compression marker), owner[0]
+    #[inline]
+    pub unsafe fn from_ptr(ptr: *const u8, title_opcode: CqeOpcode) -> Self {
+        let qp_num =
+            u32::from_be(std::ptr::read_volatile(ptr.add(56) as *const u32)) & 0x00FF_FFFF;
+        let base_wqe_counter = u16::from_be(std::ptr::read_volatile(ptr.add(60) as *const u16));
+        let mini_cqe_cnt = std::ptr::read_volatile(ptr.add(62));
+
+        // format is in bits [7:6]
+        let format_val = (mini_cqe_cnt >> 6) & 0x03;
+        let format = match format_val {
+            0 => MiniCqeFormat::Responder,
+            1 => MiniCqeFormat::Requester,
+            2 => MiniCqeFormat::ResponderCsum,
+            _ => MiniCqeFormat::L3L4Hash,
+        };
+
+        // count-1 is in bits [5:2], so count = ((mini_cqe_cnt >> 2) & 0x0f) + 1
+        let count = ((mini_cqe_cnt >> 2) & 0x0f) + 1;
+
+        Self {
+            count,
+            format,
+            base_wqe_counter,
+            qp_num,
+            opcode: title_opcode,
+        }
+    }
+}
+
+/// State for iterating over mini CQEs in a compressed CQE.
+#[derive(Debug, Clone)]
+pub struct MiniCqeIterator {
+    /// Compressed CQE header information
+    header: CompressedCqeHeader,
+    /// Current index (0-based)
+    current: u8,
+    /// Pointer to mini CQE array in CQ buffer
+    mini_cqe_ptr: *const u8,
+}
+
+impl MiniCqeIterator {
+    /// Create a new iterator from a compressed CQE.
+    ///
+    /// # Safety
+    /// The pointer must point to a valid compressed CQE.
+    pub unsafe fn new(ptr: *const u8, title_opcode: CqeOpcode) -> Self {
+        let header = CompressedCqeHeader::from_ptr(ptr, title_opcode);
+        Self {
+            header,
+            current: 0,
+            mini_cqe_ptr: ptr, // Mini CQEs start at offset 0
+        }
+    }
+
+    /// Get the next mini CQE as a full Cqe.
+    pub fn next(&mut self) -> Option<Cqe> {
+        if self.current >= self.header.count {
+            return None;
+        }
+
+        let cqe = unsafe {
+            let mini_ptr = self.mini_cqe_ptr.add((self.current as usize) * 8);
+            let mini = match self.header.format {
+                MiniCqeFormat::Responder | MiniCqeFormat::ResponderCsum | MiniCqeFormat::L3L4Hash => {
+                    // For responder format, wqe_counter is computed from base + offset
+                    let wqe_counter = self.header.base_wqe_counter.wrapping_add(self.current as u16);
+                    MiniCqe::from_ptr_responder(mini_ptr, wqe_counter)
+                }
+                MiniCqeFormat::Requester => {
+                    // For requester format, wqe_counter is in the mini CQE itself
+                    MiniCqe::from_ptr_requester(mini_ptr)
+                }
+            };
+
+            Cqe {
+                opcode: self.header.opcode,
+                wqe_counter: mini.wqe_counter,
+                qp_num: self.header.qp_num,
+                byte_cnt: mini.byte_cnt,
+                imm: 0,
+                syndrome: 0,
+                vendor_err: 0,
+                app_info: 0,
+                inline_data: [0u8; MAX_INLINE_SCATTER_SIZE],
+            }
+        };
+
+        self.current += 1;
+        Some(cqe)
+    }
+
+    /// Check if there are more mini CQEs to process.
+    pub fn has_more(&self) -> bool {
+        self.current < self.header.count
+    }
 }
 
 impl CqeOpcode {
@@ -52,6 +255,8 @@ impl CqeOpcode {
             0x06 => Some(Self::TmFinish),
             0x0d => Some(Self::ReqErr),
             0x0e => Some(Self::RespErr),
+            0x12 => Some(Self::InlineScatter32),
+            0x13 => Some(Self::InlineScatter64),
             _ => None,
         }
     }
@@ -59,7 +264,8 @@ impl CqeOpcode {
     /// Returns true if this is a responder (RQ) completion.
     ///
     /// Responder completions indicate that data was received on the Receive Queue.
-    /// This includes RDMA WRITE with immediate, SEND operations, and responder errors.
+    /// This includes RDMA WRITE with immediate, SEND operations, responder errors,
+    /// and inline scatter completions.
     pub fn is_responder(&self) -> bool {
         matches!(
             self,
@@ -68,9 +274,26 @@ impl CqeOpcode {
                 | Self::RespSendImm
                 | Self::RespSendInv
                 | Self::RespErr
+                | Self::InlineScatter32
+                | Self::InlineScatter64
         )
     }
+
+    /// Returns true if this CQE contains inline scatter data.
+    ///
+    /// When scatter-to-CQE is enabled and the received data is small enough,
+    /// the hardware places the data directly in the CQE instead of the receive buffer.
+    /// Use [`Cqe::inline_data()`] to access the inlined data.
+    pub fn is_inline_scatter(&self) -> bool {
+        matches!(self, Self::InlineScatter32 | Self::InlineScatter64)
+    }
 }
+
+/// Maximum inline scatter data size in bytes.
+///
+/// For 64-byte CQEs, up to 32 bytes can be inlined (offset 0-31).
+/// For 32-byte CQEs (not currently supported), up to 16 bytes can be inlined.
+pub const MAX_INLINE_SCATTER_SIZE: usize = 32;
 
 /// Parsed CQE (Completion Queue Entry).
 #[derive(Debug, Clone, Copy)]
@@ -91,6 +314,10 @@ pub struct Cqe {
     pub vendor_err: u8,
     /// Application info (TM tag handle for Tag Matching operations)
     pub app_info: u16,
+    /// Inline scatter data buffer.
+    /// Valid only when `opcode.is_inline_scatter()` returns true.
+    /// The actual data length is `byte_cnt`.
+    inline_data: [u8; MAX_INLINE_SCATTER_SIZE],
 }
 
 impl Cqe {
@@ -100,6 +327,7 @@ impl Cqe {
     /// The pointer must point to a valid 64-byte CQE.
     ///
     /// CQE64 layout (success):
+    /// - offset 0-31: inline scatter data (for InlineScatter32/64 opcodes)
     /// - offset 36: imm_inval_pkey (4B, big-endian)
     /// - offset 44: byte_cnt (4B, big-endian)
     /// - offset 48-49: timestamp_h (2B)
@@ -142,6 +370,14 @@ impl Cqe {
             (0, 0)
         };
 
+        // Copy inline scatter data for InlineScatter32/64 opcodes.
+        // For 64-byte CQEs, inline data is at offset 0-31 (up to 32 bytes).
+        let mut inline_data = [0u8; MAX_INLINE_SCATTER_SIZE];
+        if opcode.is_inline_scatter() {
+            let copy_len = (byte_cnt as usize).min(MAX_INLINE_SCATTER_SIZE);
+            std::ptr::copy_nonoverlapping(ptr, inline_data.as_mut_ptr(), copy_len);
+        }
+
         Self {
             opcode,
             wqe_counter,
@@ -151,6 +387,34 @@ impl Cqe {
             syndrome,
             vendor_err,
             app_info,
+            inline_data,
+        }
+    }
+
+    /// Get the inline scatter data if present.
+    ///
+    /// Returns `Some(&[u8])` if the CQE contains inline scatter data
+    /// (opcode is `InlineScatter32` or `InlineScatter64`), `None` otherwise.
+    ///
+    /// The returned slice length is determined by `byte_cnt`, capped at
+    /// [`MAX_INLINE_SCATTER_SIZE`].
+    ///
+    /// # Example
+    /// ```ignore
+    /// if let Some(data) = cqe.inline_data() {
+    ///     // Process inline data directly without copying from receive buffer
+    ///     process_data(data);
+    /// } else {
+    ///     // Data is in the receive buffer, not inlined
+    ///     process_data(&recv_buffer[..cqe.byte_cnt as usize]);
+    /// }
+    /// ```
+    pub fn inline_data(&self) -> Option<&[u8]> {
+        if self.opcode.is_inline_scatter() {
+            let len = (self.byte_cnt as usize).min(MAX_INLINE_SCATTER_SIZE);
+            Some(&self.inline_data[..len])
+        } else {
+            None
         }
     }
 }
@@ -173,6 +437,12 @@ pub(crate) struct CqState {
     dbrec: *mut u32,
     /// Consumer index
     ci: Cell<u32>,
+    /// Pending mini CQE iterator for compressed CQE expansion.
+    /// Uses UnsafeCell for interior mutability without RefCell overhead.
+    pending_mini_cqes: UnsafeCell<Option<MiniCqeIterator>>,
+    /// Title CQE opcode for compressed CQE expansion.
+    /// Read from the preceding "title" CQE that indicates the opcode for all mini CQEs.
+    title_opcode: Cell<CqeOpcode>,
 }
 
 // =============================================================================
@@ -262,6 +532,8 @@ impl Context {
                     cqe_size: dv_cq.cqe_size,
                     dbrec: dv_cq.dbrec as *mut u32,
                     ci: Cell::new(0),
+                    pending_mini_cqes: UnsafeCell::new(None),
+                    title_opcode: Cell::new(CqeOpcode::Req),
                 },
                 queues: RefCell::new(HashMap::with_hasher(BuildHasherDefault::default())),
                 last_queue_cache: UnsafeCell::new(None),
@@ -391,9 +663,27 @@ impl CompletionQueue {
     /// Try to get the next CQE.
     ///
     /// Returns None if no CQE is available.
+    ///
+    /// This method handles both regular CQEs and compressed CQEs. When a compressed
+    /// CQE is encountered, it expands the mini CQE array and returns each mini CQE
+    /// as a full Cqe on subsequent calls.
     #[inline]
     fn try_next_cqe(&self, prefetch_next: bool) -> Option<Cqe> {
         let state = &self.state;
+
+        // First, check if we have pending mini CQEs from a compressed CQE
+        // Safety: Single-threaded access guaranteed by Rc (not Send).
+        let pending = unsafe { &mut *state.pending_mini_cqes.get() };
+        if let Some(iter) = pending {
+            if let Some(cqe) = iter.next() {
+                // If no more mini CQEs, clear the pending state
+                if !iter.has_more() {
+                    *pending = None;
+                }
+                return Some(cqe);
+            }
+            *pending = None;
+        }
 
         let ci = state.ci.get();
         let cqe_mask = state.cqe_cnt - 1;
@@ -406,8 +696,39 @@ impl CompletionQueue {
         let sw_owner = ((ci >> state.cqe_cnt_log2) & 1) as u8;
         let hw_owner = op_own & 1;
 
-        // Check owner bit and invalid opcode
-        if sw_owner != hw_owner || (op_own >> 4) == 0x0f {
+        // Check owner bit first
+        if sw_owner != hw_owner {
+            return None;
+        }
+
+        let opcode_raw = op_own >> 4;
+
+        // Check for compressed CQE (opcode 0x0f is the compression marker)
+        if opcode_raw == 0x0f {
+            // After validating ownership, we need a load barrier
+            udma_from_device_barrier!();
+
+            // Create mini CQE iterator using the title opcode from previous CQE
+            let title_opcode = state.title_opcode.get();
+            let mut iter = unsafe { MiniCqeIterator::new(cqe_ptr, title_opcode) };
+
+            state.ci.set(ci.wrapping_add(1));
+
+            // Get the first mini CQE
+            if let Some(cqe) = iter.next() {
+                // Store remaining mini CQEs for subsequent calls
+                if iter.has_more() {
+                    *pending = Some(iter);
+                }
+                return Some(cqe);
+            }
+            // Empty compressed CQE (shouldn't happen, but handle gracefully)
+            return None;
+        }
+
+        // Check for invalid/reserved opcode (0x0f was already handled as compression)
+        // Other invalid opcodes should be treated as errors
+        if CqeOpcode::from_u8(opcode_raw).is_none() {
             return None;
         }
 
@@ -426,6 +747,10 @@ impl CompletionQueue {
         udma_from_device_barrier!();
 
         let cqe = unsafe { Cqe::from_ptr(cqe_ptr) };
+
+        // Save the opcode as title opcode for potential compressed CQE following
+        state.title_opcode.set(cqe.opcode);
+
         state.ci.set(ci.wrapping_add(1));
 
         Some(cqe)

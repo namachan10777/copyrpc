@@ -1070,8 +1070,11 @@ where
             CqeOpcode::RespSend
             | CqeOpcode::RespSendImm
             | CqeOpcode::RespSendInv
-            | CqeOpcode::RespRdmaWriteImm => {
+            | CqeOpcode::RespRdmaWriteImm
+            | CqeOpcode::InlineScatter32
+            | CqeOpcode::InlineScatter64 => {
                 // RX queue completion (unordered receive)
+                // InlineScatter opcodes indicate data is inlined in the CQE
                 if let Some(entry) = self.process_rq_completion(cqe.wqe_counter) {
                     (self.callback)(TmSrqCompletion::Recv(cqe, entry));
                 }
@@ -1121,8 +1124,11 @@ where
             CqeOpcode::RespSend
             | CqeOpcode::RespSendImm
             | CqeOpcode::RespSendInv
-            | CqeOpcode::RespRdmaWriteImm => {
+            | CqeOpcode::RespRdmaWriteImm
+            | CqeOpcode::InlineScatter32
+            | CqeOpcode::InlineScatter64 => {
                 // RX queue completion (unordered receive)
+                // InlineScatter opcodes indicate data is inlined in the CQE
                 if let Some(entry) = self.process_rq_completion(cqe.wqe_counter) {
                     (self.callback)(TmSrqCompletion::Recv(cqe, entry));
                 }
