@@ -2,10 +2,6 @@
 //!
 //! Provides segment definitions, opcodes, WQE table, and traits shared across QP types.
 
-pub mod macros;
-
-pub use macros::wqebb_cnt;
-
 use bitflags::bitflags;
 
 /// WQEBB (Work Queue Element Basic Block) size in bytes.
@@ -312,6 +308,23 @@ pub fn calc_wqebb_cnt(wqe_size: usize) -> u16 {
 }
 
 // =============================================================================
+// WQE Entry
+// =============================================================================
+
+/// WQE table entry: user data + CI management data.
+///
+/// The `ci_delta` field is interpreted differently by sparse vs dense tables:
+/// - **Sparse**: `ci_delta` = accumulated PI value at signaled WQE completion (use `ci.set(ci_delta)`)
+/// - **Dense**: `ci_delta` = number of WQEBBs for this WQE (use `ci += ci_delta`)
+#[derive(Debug, Clone, Copy)]
+pub struct WqeEntry<T> {
+    /// User-provided entry data.
+    pub data: T,
+    /// CI delta value for correct CI management.
+    pub ci_delta: u16,
+}
+
+// =============================================================================
 // Handle
 // =============================================================================
 
@@ -337,12 +350,12 @@ use std::cell::Cell;
 ///
 /// Also used for unordered queues where entries track slot availability.
 ///
-/// Uses `Cell<Option<T>>` for interior mutability, allowing safe access
+/// Uses `Cell<Option<WqeEntry<T>>>` for interior mutability, allowing safe access
 /// without requiring `RefCell` or mutable borrows.
 ///
 /// The table size must be a power of 2 for fast modulo via bit masking.
 pub struct SparseWqeTable<T> {
-    entries: Box<[Cell<Option<T>>]>,
+    entries: Box<[Cell<Option<WqeEntry<T>>>]>,
     mask: u16,
 }
 
@@ -363,16 +376,24 @@ impl<T> SparseWqeTable<T> {
         }
     }
 
-    /// Store an entry at the given index.
+    /// Store an entry at the given index with CI delta.
+    ///
+    /// For sparse tables, `ci_delta` should be the accumulated PI value
+    /// at the time of signaled WQE completion.
     #[inline]
-    pub fn store(&self, idx: u16, entry: T) {
+    pub fn store(&self, idx: u16, entry: T, ci_delta: u16) {
         let slot = (idx & self.mask) as usize;
-        self.entries[slot].set(Some(entry));
+        self.entries[slot].set(Some(WqeEntry {
+            data: entry,
+            ci_delta,
+        }));
     }
 
     /// Take the entry at the given index, leaving None.
+    ///
+    /// Returns `WqeEntry<T>` containing both user data and CI delta.
     #[inline]
-    pub fn take(&self, idx: u16) -> Option<T> {
+    pub fn take(&self, idx: u16) -> Option<WqeEntry<T>> {
         let slot = (idx & self.mask) as usize;
         self.entries[slot].take()
     }
@@ -413,14 +434,14 @@ impl<T> SparseWqeTable<T> {
 /// Every WQE must have an entry. When a signaled CQE arrives, all entries
 /// from old_ci to new_ci are drained and passed to the callback.
 ///
-/// Uses `Cell<Option<T>>` for interior mutability, allowing safe access
+/// Uses `Cell<Option<WqeEntry<T>>>` for interior mutability, allowing safe access
 /// without requiring `RefCell` or mutable borrows. This is critical for
 /// allowing callbacks to post new WQEs while completion processing is
 /// in progress.
 ///
 /// The table size must be a power of 2 for fast modulo via bit masking.
 pub struct DenseWqeTable<T> {
-    entries: Box<[Cell<Option<T>>]>,
+    entries: Box<[Cell<Option<WqeEntry<T>>>]>,
     mask: u16,
 }
 
@@ -441,18 +462,24 @@ impl<T> DenseWqeTable<T> {
         }
     }
 
-    /// Store an entry at the given index.
+    /// Store an entry at the given index with CI delta.
+    ///
+    /// For dense tables, `ci_delta` should be the number of WQEBBs
+    /// consumed by this WQE.
     #[inline]
-    pub fn store(&self, idx: u16, entry: T) {
+    pub fn store(&self, idx: u16, entry: T, ci_delta: u16) {
         let slot = (idx & self.mask) as usize;
-        self.entries[slot].set(Some(entry));
+        self.entries[slot].set(Some(WqeEntry {
+            data: entry,
+            ci_delta,
+        }));
     }
 
     /// Take the entry at the given index.
     ///
-    /// Returns the entry if present, None otherwise.
+    /// Returns `WqeEntry<T>` containing both user data and CI delta.
     #[inline]
-    pub fn take(&self, idx: u16) -> Option<T> {
+    pub fn take(&self, idx: u16) -> Option<WqeEntry<T>> {
         let slot = (idx & self.mask) as usize;
         self.entries[slot].take()
     }
@@ -464,12 +491,43 @@ impl<T> DenseWqeTable<T> {
     /// invocation.
     ///
     /// All slots in range are expected to have entries (dense table invariant).
-    pub fn take_range(&self, old_ci: u16, new_ci: u16) -> impl Iterator<Item = (u16, T)> + '_ {
+    pub fn take_range(&self, old_ci: u16, new_ci: u16) -> impl Iterator<Item = (u16, WqeEntry<T>)> + '_ {
         DenseTakeRange {
             table: self,
             current: old_ci.wrapping_add(1),
             end: new_ci.wrapping_add(1),
         }
+    }
+
+    /// Check if a specific slot is available (empty).
+    ///
+    /// For dense tables, a slot is available if it contains None
+    /// (the entry has been consumed or never stored).
+    #[inline]
+    pub fn is_available(&self, idx: u16) -> bool {
+        let slot = (idx & self.mask) as usize;
+        // Temporarily take and put back to check (Cell::get requires Copy)
+        let val = self.entries[slot].take();
+        let is_none = val.is_none();
+        self.entries[slot].set(val);
+        is_none
+    }
+
+    /// Count available (empty) slots in the table.
+    ///
+    /// This scans all entries, so it's slower than optimistic availability
+    /// calculation based on pi-ci.
+    pub fn count_available(&self) -> u16 {
+        let mut count = 0u16;
+        for entry in self.entries.iter() {
+            // Temporarily take and put back to check
+            let val = entry.take();
+            if val.is_none() {
+                count += 1;
+            }
+            entry.set(val);
+        }
+        count
     }
 }
 
@@ -484,7 +542,7 @@ pub struct DenseTakeRange<'a, T> {
 }
 
 impl<T> Iterator for DenseTakeRange<'_, T> {
-    type Item = (u16, T);
+    type Item = (u16, WqeEntry<T>);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.current != self.end {
@@ -496,6 +554,167 @@ impl<T> Iterator for DenseTakeRange<'_, T> {
         } else {
             None
         }
+    }
+}
+
+// =============================================================================
+// Unordered WQE Table (for unordered completion)
+// =============================================================================
+
+/// Entry for unordered WQE table.
+#[derive(Debug, Clone, Copy)]
+pub struct UnorderedWqeEntry<T> {
+    /// User-provided entry data.
+    pub data: T,
+    /// Starting WQEBB index for this WQE.
+    pub wqebb_start: u16,
+    /// Number of WQEBBs consumed by this WQE.
+    pub wqebb_count: u16,
+}
+
+/// Unordered WQE table for tracking operations with out-of-order completion.
+///
+/// Uses a bitmap for WQEBB-level free space management, allowing efficient
+/// allocation and deallocation regardless of completion order.
+///
+/// This is used for TM-SRQ's RQ (Receive Queue) where completions arrive
+/// in arbitrary order based on incoming message timing.
+pub struct UnorderedWqeTable<T> {
+    /// Entry storage indexed by wqe_idx.
+    entries: Box<[Cell<Option<UnorderedWqeEntry<T>>>]>,
+    /// Bitmap for WQEBB allocation (1 = in-use, 0 = free).
+    /// Each u64 tracks 64 consecutive WQEBBs.
+    bitmap: Box<[Cell<u64>]>,
+    /// Total number of WQEBBs (power of 2).
+    wqebb_cnt: u16,
+    /// Mask for index wrapping (wqebb_cnt - 1).
+    mask: u16,
+    /// Hint for next allocation starting position.
+    alloc_hint: Cell<u16>,
+}
+
+impl<T> UnorderedWqeTable<T> {
+    /// Create a new unordered WQE table.
+    ///
+    /// # Arguments
+    /// * `wqebb_cnt` - Number of WQEBBs (must be power of 2)
+    pub fn new(wqebb_cnt: u16) -> Self {
+        debug_assert!(wqebb_cnt.is_power_of_two(), "wqebb_cnt must be power of 2");
+        let entries = (0..wqebb_cnt)
+            .map(|_| Cell::new(None))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let bitmap_len = (wqebb_cnt as usize + 63) / 64;
+        let bitmap = (0..bitmap_len)
+            .map(|_| Cell::new(0u64))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            entries,
+            bitmap,
+            wqebb_cnt,
+            mask: wqebb_cnt - 1,
+            alloc_hint: Cell::new(0),
+        }
+    }
+
+    /// Try to allocate the first WQEBB for a new WQE.
+    ///
+    /// Returns the starting WQEBB index on success.
+    pub fn try_allocate_first(&self) -> Option<u16> {
+        let hint = self.alloc_hint.get();
+        // Search from hint position
+        for offset in 0..self.wqebb_cnt {
+            let idx = (hint + offset) & self.mask;
+            let word = (idx / 64) as usize;
+            let bit = idx % 64;
+
+            let current = self.bitmap[word].get();
+            if (current & (1u64 << bit)) == 0 {
+                // Found a free WQEBB, mark it as used
+                self.bitmap[word].set(current | (1u64 << bit));
+                // Update hint to next position
+                self.alloc_hint.set((idx + 1) & self.mask);
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    /// Try to extend the allocation by one more WQEBB.
+    ///
+    /// # Arguments
+    /// * `start` - Starting WQEBB index of the current allocation
+    /// * `current_count` - Current number of allocated WQEBBs
+    ///
+    /// Returns `true` if extension succeeded, `false` if the next WQEBB is in use.
+    pub fn try_extend(&self, start: u16, current_count: u16) -> bool {
+        let next_idx = (start + current_count) & self.mask;
+        let word = (next_idx / 64) as usize;
+        let bit = next_idx % 64;
+
+        let current = self.bitmap[word].get();
+        if (current & (1u64 << bit)) == 0 {
+            // Free, mark as used
+            self.bitmap[word].set(current | (1u64 << bit));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Release allocated WQEBBs (for rollback on failure).
+    ///
+    /// # Arguments
+    /// * `start` - Starting WQEBB index
+    /// * `count` - Number of WQEBBs to release
+    pub fn release(&self, start: u16, count: u16) {
+        for i in 0..count {
+            let idx = (start + i) & self.mask;
+            let word = (idx / 64) as usize;
+            let bit = idx % 64;
+
+            let current = self.bitmap[word].get();
+            self.bitmap[word].set(current & !(1u64 << bit));
+        }
+    }
+
+    /// Store an entry at the given WQE index.
+    ///
+    /// The bitmap should already be allocated via `try_allocate_first` and
+    /// `try_extend` calls.
+    ///
+    /// # Arguments
+    /// * `wqe_idx` - WQE index (typically same as wqebb_start for single-WQEBB WQEs)
+    /// * `wqebb_start` - Starting WQEBB index
+    /// * `wqebb_count` - Number of WQEBBs used
+    /// * `data` - User-provided entry data
+    #[inline]
+    pub fn store(&self, wqe_idx: u16, wqebb_start: u16, wqebb_count: u16, data: T) {
+        let slot = (wqe_idx & self.mask) as usize;
+        self.entries[slot].set(Some(UnorderedWqeEntry {
+            data,
+            wqebb_start,
+            wqebb_count,
+        }));
+    }
+
+    /// Take an entry at the given WQE index, releasing its WQEBBs.
+    ///
+    /// Returns the user data on success.
+    #[inline]
+    pub fn take(&self, wqe_idx: u16) -> Option<T> {
+        let slot = (wqe_idx & self.mask) as usize;
+        let entry = self.entries[slot].take()?;
+        // Release the WQEBBs
+        self.release(entry.wqebb_start, entry.wqebb_count);
+        Some(entry.data)
+    }
+
+    /// Get the number of available (free) WQEBBs.
+    pub fn available_wqebbs(&self) -> u16 {
+        let used: u32 = self.bitmap.iter().map(|b| b.get().count_ones()).sum();
+        self.wqebb_cnt - used as u16
     }
 }
 

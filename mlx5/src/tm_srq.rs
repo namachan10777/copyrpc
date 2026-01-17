@@ -45,9 +45,29 @@ use crate::device::Context;
 use crate::pd::Pd;
 use crate::srq::SrqInfo;
 use crate::wqe::{
-    CtrlSeg, DataSeg, SparseWqeTable, TmSeg, WQEBB_SIZE, WqeHandle, WqeOpcode,
+    CtrlSeg, DataSeg, DenseWqeTable, SparseWqeTable, TmSeg, UnorderedWqeTable, WQEBB_SIZE,
+    WqeHandle, WqeOpcode,
 };
 use crate::CompletionTarget;
+
+// =============================================================================
+// TM-SRQ Completion Types
+// =============================================================================
+
+/// Completion type for TM-SRQ operations.
+///
+/// Distinguishes between Command QP completions (tag operations) and
+/// RQ completions (unordered receive).
+pub enum TmSrqCompletion<T, U> {
+    /// Command QP completion (TAG_ADD/TAG_DEL).
+    CmdQp(Cqe, T),
+    /// RQ completion (unordered receive).
+    Recv(Cqe, U),
+    /// Tag match notification (no entry, use `cqe.app_info` for tag handle).
+    TagMatch(Cqe),
+    /// Error completion (entry if from Command QP).
+    Error(Cqe, Option<T>),
+}
 
 /// Offset from ibv_srq to cmd_qp pointer in mlx5_srq structure.
 ///
@@ -88,7 +108,10 @@ impl Default for TmSrqConfig {
 // =============================================================================
 
 /// Command QP state for TM tag operations.
-struct CmdQpState<T> {
+///
+/// Generic over `Tab` to support both sparse (signaled-only) and dense (all WQE)
+/// completion modes, similar to the main Send Queue implementation.
+struct CmdQpState<T, Tab> {
     /// QP number.
     qpn: u32,
     /// Send queue buffer.
@@ -110,10 +133,12 @@ struct CmdQpState<T> {
     /// Last WQE pointer and size for doorbell.
     last_wqe: Cell<Option<(*mut u8, usize)>>,
     /// WQE table for tracking in-flight operations.
-    table: SparseWqeTable<T>,
+    table: Tab,
+    /// Phantom for entry type.
+    _marker: std::marker::PhantomData<T>,
 }
 
-impl<T> CmdQpState<T> {
+impl<T, Tab> CmdQpState<T, Tab> {
     fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
         let offset = ((idx & (self.sq_wqe_cnt - 1)) as usize) * WQEBB_SIZE;
         unsafe { self.sq_buf.add(offset) }
@@ -181,10 +206,29 @@ impl<T> CmdQpState<T> {
         mmio_flush_writes!();
         self.bf_offset.set(self.bf_offset.get() ^ self.bf_size);
     }
+}
 
-    fn process_completion(&self, wqe_idx: u16) -> Option<T> {
-        self.ci.set(self.ci.get().wrapping_add(1));
-        self.table.take(wqe_idx)
+impl<T> CmdQpState<T, SparseWqeTable<T>> {
+    /// Process a single completion (for sparse mode).
+    fn process_completion_sparse(&self, wqe_idx: u16) -> Option<T> {
+        let entry = self.table.take(wqe_idx)?;
+        // For sparse tables, ci_delta is the accumulated PI value at completion
+        self.ci.set(entry.ci_delta);
+        Some(entry.data)
+    }
+}
+
+impl<T> CmdQpState<T, DenseWqeTable<T>> {
+    /// Process all completions in range (for dense mode).
+    fn process_completions_dense<F>(&self, new_ci: u16, mut callback: F)
+    where
+        F: FnMut(u16, T),
+    {
+        for (idx, entry) in self.table.take_range(self.ci.get(), new_ci) {
+            callback(idx, entry.data);
+            // For dense tables, ci_delta is the number of WQEBBs for this WQE
+            self.ci.set(self.ci.get().wrapping_add(entry.ci_delta));
+        }
     }
 }
 
@@ -193,16 +237,18 @@ impl<T> CmdQpState<T> {
 // =============================================================================
 
 /// WQE builder for Command QP tag operations.
-pub struct CmdQpWqeBuilder<'a, T> {
-    cmd_qp: &'a CmdQpState<T>,
+pub struct CmdQpWqeBuilder<'a, T, Tab> {
+    cmd_qp: &'a CmdQpState<T, Tab>,
     wqe_ptr: *mut u8,
     wqe_idx: u16,
     offset: usize,
     ds_count: u8,
     entry: T,
+    /// Whether the TM operation requests a CQE on completion.
+    signaled: bool,
 }
 
-impl<'a, T> CmdQpWqeBuilder<'a, T> {
+impl<'a, T, Tab> CmdQpWqeBuilder<'a, T, Tab> {
     /// Write the control segment.
     ///
     /// This must be the first segment in every WQE.
@@ -234,6 +280,7 @@ impl<'a, T> CmdQpWqeBuilder<'a, T> {
     /// * `addr` - Buffer address for received data
     /// * `len` - Buffer length
     /// * `lkey` - Local key for the memory region
+    /// * `signaled` - Whether to request a CQE on completion
     pub fn tag_add(
         mut self,
         index: u16,
@@ -241,6 +288,7 @@ impl<'a, T> CmdQpWqeBuilder<'a, T> {
         addr: u64,
         len: u32,
         lkey: u32,
+        signaled: bool,
     ) -> Self {
         unsafe {
             TmSeg::write_add(
@@ -249,7 +297,7 @@ impl<'a, T> CmdQpWqeBuilder<'a, T> {
                 index, // sw_cnt - same as index, per rdma-core
                 tag,
                 !0u64, // mask: all bits must match
-                true,  // signaled
+                signaled,
             );
         }
         self.offset += TmSeg::SIZE;
@@ -260,64 +308,147 @@ impl<'a, T> CmdQpWqeBuilder<'a, T> {
         }
         self.offset += DataSeg::SIZE;
         self.ds_count += 1;
+        self.signaled = signaled;
         self
     }
 
     /// Add TAG_DEL segment.
-    pub fn tag_del(mut self, index: u16) -> Self {
+    ///
+    /// # Arguments
+    /// * `index` - Tag index to remove
+    /// * `signaled` - Whether to request a CQE on completion
+    pub fn tag_del(mut self, index: u16, signaled: bool) -> Self {
         unsafe {
-            TmSeg::write_del(self.wqe_ptr.add(self.offset), index, true);
+            TmSeg::write_del(self.wqe_ptr.add(self.offset), index, signaled);
         }
         self.offset += TmSeg::SIZE;
         self.ds_count += 2; // TmSeg = 32 bytes = 2 DS
+        self.signaled = signaled;
         self
     }
 
-    /// Finish the WQE construction.
+}
+
+impl<'a, T> CmdQpWqeBuilder<'a, T, SparseWqeTable<T>> {
+    /// Finish the WQE construction (sparse mode).
     ///
+    /// The entry is stored only if signaled is true.
     /// The doorbell will be issued when `ring_cmd_doorbell()` is called.
     pub fn finish(self) -> WqeHandle {
-        unsafe {
-            // Update DS count in control segment
-            std::ptr::write_volatile(self.wqe_ptr.add(7), self.ds_count);
+        // Extract all fields before any moves
+        let wqe_idx = self.wqe_idx;
+        let wqe_ptr = self.wqe_ptr;
+        let ds_count = self.ds_count;
+        let offset = self.offset;
+        let cmd_qp = self.cmd_qp;
+        let signaled = self.signaled;
+        let entry = self.entry;
+
+        // For sparse tables, only store if signaled
+        if signaled {
+            // ci_delta is the accumulated PI value at completion
+            let ci_delta = cmd_qp.pi.get().wrapping_add(1);
+            cmd_qp.table.store(wqe_idx, entry, ci_delta);
         }
 
-        let wqe_idx = self.wqe_idx;
-
-        // Store entry in table (always signaled for unordered)
-        self.cmd_qp.table.store(wqe_idx, self.entry);
-
-        self.cmd_qp.advance_pi(1);
-        self.cmd_qp.set_last_wqe(self.wqe_ptr, self.offset);
+        // Inline finish_internal logic
+        unsafe {
+            std::ptr::write_volatile(wqe_ptr.add(7), ds_count);
+        }
+        cmd_qp.advance_pi(1);
+        cmd_qp.set_last_wqe(wqe_ptr, offset);
 
         WqeHandle {
             wqe_idx,
-            size: self.offset,
+            size: offset,
         }
     }
 
     /// Finish the WQE construction and immediately ring BlueFlame doorbell.
-    ///
-    /// Use this for low-latency single WQE submission. No need to call
-    /// `ring_cmd_doorbell()` afterwards.
     pub fn finish_with_blueflame(self) -> WqeHandle {
-        unsafe {
-            // Update DS count in control segment
-            std::ptr::write_volatile(self.wqe_ptr.add(7), self.ds_count);
-        }
-
+        // Extract all fields before any moves
         let wqe_idx = self.wqe_idx;
         let wqe_ptr = self.wqe_ptr;
+        let ds_count = self.ds_count;
+        let offset = self.offset;
+        let cmd_qp = self.cmd_qp;
+        let signaled = self.signaled;
+        let entry = self.entry;
 
-        // Store entry in table (always signaled for unordered)
-        self.cmd_qp.table.store(wqe_idx, self.entry);
+        // For sparse tables, only store if signaled
+        if signaled {
+            let ci_delta = cmd_qp.pi.get().wrapping_add(1);
+            cmd_qp.table.store(wqe_idx, entry, ci_delta);
+        }
 
-        self.cmd_qp.advance_pi(1);
-        self.cmd_qp.ring_blueflame(wqe_ptr);
+        // Inline finish_internal_with_blueflame logic
+        unsafe {
+            std::ptr::write_volatile(wqe_ptr.add(7), ds_count);
+        }
+        cmd_qp.advance_pi(1);
+        cmd_qp.ring_blueflame(wqe_ptr);
 
         WqeHandle {
             wqe_idx,
-            size: self.offset,
+            size: offset,
+        }
+    }
+}
+
+impl<'a, T> CmdQpWqeBuilder<'a, T, DenseWqeTable<T>> {
+    /// Finish the WQE construction (dense mode).
+    ///
+    /// The entry is always stored regardless of signaled flag.
+    /// The doorbell will be issued when `ring_cmd_doorbell()` is called.
+    pub fn finish(self) -> WqeHandle {
+        // Extract all fields before any moves
+        let wqe_idx = self.wqe_idx;
+        let wqe_ptr = self.wqe_ptr;
+        let ds_count = self.ds_count;
+        let offset = self.offset;
+        let cmd_qp = self.cmd_qp;
+        let entry = self.entry;
+
+        // For dense tables, always store the entry
+        // ci_delta is the number of WQEBBs (always 1 for Command QP)
+        cmd_qp.table.store(wqe_idx, entry, 1);
+
+        // Inline finish_internal logic
+        unsafe {
+            std::ptr::write_volatile(wqe_ptr.add(7), ds_count);
+        }
+        cmd_qp.advance_pi(1);
+        cmd_qp.set_last_wqe(wqe_ptr, offset);
+
+        WqeHandle {
+            wqe_idx,
+            size: offset,
+        }
+    }
+
+    /// Finish the WQE construction and immediately ring BlueFlame doorbell.
+    pub fn finish_with_blueflame(self) -> WqeHandle {
+        // Extract all fields before any moves
+        let wqe_idx = self.wqe_idx;
+        let wqe_ptr = self.wqe_ptr;
+        let ds_count = self.ds_count;
+        let offset = self.offset;
+        let cmd_qp = self.cmd_qp;
+        let entry = self.entry;
+
+        // For dense tables, always store the entry
+        cmd_qp.table.store(wqe_idx, entry, 1);
+
+        // Inline finish_internal_with_blueflame logic
+        unsafe {
+            std::ptr::write_volatile(wqe_ptr.add(7), ds_count);
+        }
+        cmd_qp.advance_pi(1);
+        cmd_qp.ring_blueflame(wqe_ptr);
+
+        WqeHandle {
+            wqe_idx,
+            size: offset,
         }
     }
 }
@@ -327,7 +458,7 @@ impl<'a, T> CmdQpWqeBuilder<'a, T> {
 // =============================================================================
 
 /// SRQ state for direct receive WQE posting.
-struct TmSrqState {
+struct TmSrqState<U> {
     /// SRQ buffer pointer.
     buf: *mut u8,
     /// Number of WQE slots (power of 2).
@@ -338,24 +469,14 @@ struct TmSrqState {
     head: Cell<u32>,
     /// Doorbell record pointer.
     dbrec: *mut u32,
+    /// RQ WQE table for unordered completion tracking.
+    table: UnorderedWqeTable<U>,
 }
 
-impl TmSrqState {
+impl<U> TmSrqState<U> {
     fn get_wqe_ptr(&self, idx: u32) -> *mut u8 {
         let offset = (idx & (self.wqe_cnt - 1)) * self.stride;
         unsafe { self.buf.add(offset as usize) }
-    }
-
-    unsafe fn post(&self, addr: u64, len: u32, lkey: u32) {
-        let wqe_ptr = self.get_wqe_ptr(self.head.get());
-
-        // SRQ WQE format: Next Segment (16 bytes) + Data Segment (16 bytes)
-        std::ptr::write_bytes(wqe_ptr, 0, 16);
-
-        // Write Data Segment at offset 16
-        DataSeg::write(wqe_ptr.add(16), len, lkey, addr);
-
-        self.head.set(self.head.get().wrapping_add(1));
     }
 
     fn ring_doorbell(&self) {
@@ -364,13 +485,77 @@ impl TmSrqState {
             std::ptr::write_volatile(self.dbrec, self.head.get().to_be());
         }
     }
+
+    fn process_completion(&self, wqe_idx: u16) -> Option<U> {
+        self.table.take(wqe_idx)
+    }
+}
+
+// =============================================================================
+// RQ WQE Builder
+// =============================================================================
+
+/// WQE builder for RQ unordered receive operations.
+///
+/// Supports incremental WQEBB allocation for multi-segment WQEs.
+pub struct RqWqeBuilder<'a, U> {
+    srq_state: &'a TmSrqState<U>,
+    wqe_ptr: *mut u8,
+    wqe_idx: u32,
+    wqebb_start: u16,
+    wqebb_count: u16,
+    offset: usize,
+    entry: U,
+}
+
+impl<'a, U> RqWqeBuilder<'a, U> {
+    /// Add a data segment to the WQE.
+    ///
+    /// Automatically extends WQEBB allocation if needed.
+    pub fn data_seg(mut self, addr: u64, len: u32, lkey: u32) -> io::Result<Self> {
+        let new_offset = self.offset + DataSeg::SIZE;
+        let required_wqebbs = new_offset.div_ceil(WQEBB_SIZE) as u16;
+
+        // Extend allocation if we need more WQEBBs
+        while self.wqebb_count < required_wqebbs {
+            if !self.srq_state.table.try_extend(self.wqebb_start, self.wqebb_count) {
+                // Extension failed, rollback
+                self.srq_state
+                    .table
+                    .release(self.wqebb_start, self.wqebb_count);
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "RQ full"));
+            }
+            self.wqebb_count += 1;
+        }
+
+        unsafe {
+            DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
+        }
+        self.offset = new_offset;
+        Ok(self)
+    }
+
+    /// Finish the WQE construction and post it to the RQ.
+    ///
+    /// The doorbell should be rung via `ring_srq_doorbell()` after posting.
+    pub fn finish(self) {
+        self.srq_state.table.store(
+            self.wqe_idx as u16,
+            self.wqebb_start,
+            self.wqebb_count,
+            self.entry,
+        );
+        self.srq_state
+            .head
+            .set(self.srq_state.head.get().wrapping_add(1));
+    }
 }
 
 // =============================================================================
 // Tag Matching SRQ
 // =============================================================================
 
-/// Tag Matching Shared Receive Queue.
+/// Tag Matching Shared Receive Queue (inner implementation).
 ///
 /// TM-SRQ provides hardware-accelerated tag matching. When a message arrives,
 /// the hardware matches it against posted receive tags and delivers to the
@@ -378,20 +563,21 @@ impl TmSrqState {
 ///
 /// TM operations (add_tag, remove_tag) use the internal Command QP.
 ///
-/// Type parameter `T` is the entry type stored in the WQE table for tracking
-/// in-flight tag operations. Type parameter `F` is the callback function type
-/// that receives `(Cqe, Option<T>)` - `Some(entry)` for Command QP completions,
-/// `None` for RX queue completions.
-pub struct TagMatchingSrq<T, F> {
+/// # Type Parameters
+/// * `T` - Entry type for Command QP operations (TAG_ADD/TAG_DEL)
+/// * `Tab` - WQE table type for Command QP (SparseWqeTable or DenseWqeTable)
+/// * `U` - Entry type for RQ operations (unordered receive)
+/// * `F` - Callback function type receiving `TmSrqCompletion<T, U>`
+pub struct TagMatchingSrq<T, Tab, U, F> {
     srq: NonNull<mlx5_sys::ibv_srq>,
     /// Number of WQE slots (power of 2).
     wqe_cnt: u32,
     /// Maximum number of tags.
     max_num_tags: u16,
     /// SRQ state for direct posting.
-    srq_state: Option<TmSrqState>,
+    srq_state: Option<TmSrqState<U>>,
     /// Command QP state for tag operations.
-    cmd_qp: Option<CmdQpState<T>>,
+    cmd_qp: Option<CmdQpState<T, Tab>>,
     /// Callback for completion handling.
     callback: F,
     /// Weak reference to the CQ for unregistration on drop.
@@ -400,52 +586,69 @@ pub struct TagMatchingSrq<T, F> {
     _pd: Pd,
 }
 
+/// TM-SRQ with sparse Command QP table (only signaled WQEs tracked).
+pub type SparseTmSrq<T, U, F> = TagMatchingSrq<T, SparseWqeTable<T>, U, F>;
+
+/// TM-SRQ with dense Command QP table (all WQEs tracked).
+pub type DenseTmSrq<T, U, F> = TagMatchingSrq<T, DenseWqeTable<T>, U, F>;
+
 impl Context {
-    /// Create a Tag Matching SRQ.
+    /// Create a sparse Tag Matching SRQ (only signaled Command QP WQEs tracked).
     ///
     /// # Arguments
     /// * `pd` - Protection Domain
     /// * `cq` - Completion Queue for TM operation completions
     /// * `config` - TM-SRQ configuration
-    /// * `callback` - Callback for completions: `(Cqe, Option<T>)` where
-    ///   `Some(entry)` for Command QP completions, `None` for RX completions
+    /// * `callback` - Callback for completions receiving `TmSrqCompletion<T, U>`
     ///
     /// # Errors
     /// Returns an error if the TM-SRQ cannot be created.
-    pub fn create_tm_srq<T, F>(
+    pub fn create_sparse_tm_srq<T, U, F>(
         &self,
         pd: &Pd,
         cq: &Rc<CompletionQueue>,
         config: &TmSrqConfig,
         callback: F,
-    ) -> io::Result<Rc<RefCell<TagMatchingSrq<T, F>>>>
+    ) -> io::Result<Rc<RefCell<SparseTmSrq<T, U, F>>>>
     where
         T: 'static,
-        F: Fn(Cqe, Option<T>) + 'static,
+        U: 'static,
+        F: Fn(TmSrqCompletion<T, U>) + 'static,
     {
         unsafe {
-            let mut attr: mlx5_sys::ibv_srq_init_attr_ex = MaybeUninit::zeroed().assume_init();
-            attr.attr.max_wr = config.max_wr;
-            attr.attr.max_sge = config.max_sge;
-            attr.srq_type = mlx5_sys::ibv_srq_type_IBV_SRQT_TM;
-            attr.pd = pd.as_ptr();
-            attr.cq = cq.as_ptr();
-            attr.tm_cap.max_num_tags = config.max_num_tags;
-            attr.tm_cap.max_ops = config.max_ops;
-            attr.comp_mask = mlx5_sys::ibv_srq_init_attr_mask_IBV_SRQ_INIT_ATTR_TYPE
-                | mlx5_sys::ibv_srq_init_attr_mask_IBV_SRQ_INIT_ATTR_PD
-                | mlx5_sys::ibv_srq_init_attr_mask_IBV_SRQ_INIT_ATTR_CQ
-                | mlx5_sys::ibv_srq_init_attr_mask_IBV_SRQ_INIT_ATTR_TM;
+            // Create SRQ
+            let (srq_nn, wqe_cnt) = Self::create_tm_srq_raw(self, pd, cq, config)?;
 
-            let srq = mlx5_sys::ibv_create_srq_ex_ex(self.as_ptr(), &mut attr);
-            let srq_nn = NonNull::new(srq).ok_or_else(io::Error::last_os_error)?;
+            // Query SRQ info for direct access
+            let srq_info = query_srq_info(srq_nn)?;
+            let cmd_info = query_cmd_qp_info_inner(srq_nn)?;
 
             let tm_srq = TagMatchingSrq {
                 srq: srq_nn,
-                wqe_cnt: config.max_wr.next_power_of_two(),
+                wqe_cnt,
                 max_num_tags: config.max_num_tags as u16,
-                srq_state: None,
-                cmd_qp: None,
+                srq_state: Some(TmSrqState {
+                    buf: srq_info.buf,
+                    wqe_cnt,
+                    stride: srq_info.stride,
+                    head: Cell::new(0),
+                    dbrec: srq_info.dbrec,
+                    table: UnorderedWqeTable::new(wqe_cnt as u16),
+                }),
+                cmd_qp: Some(CmdQpState {
+                    qpn: cmd_info.qpn,
+                    sq_buf: cmd_info.sq_buf,
+                    sq_wqe_cnt: cmd_info.sq_wqe_cnt,
+                    pi: Cell::new(cmd_info.current_pi),
+                    ci: Cell::new(cmd_info.current_pi),
+                    dbrec: cmd_info.dbrec,
+                    bf_reg: cmd_info.bf_reg,
+                    bf_size: cmd_info.bf_size,
+                    bf_offset: Cell::new(0),
+                    last_wqe: Cell::new(None),
+                    table: SparseWqeTable::new(cmd_info.sq_wqe_cnt),
+                    _marker: std::marker::PhantomData,
+                }),
                 callback,
                 send_cq: Rc::downgrade(cq),
                 _pd: pd.clone(),
@@ -453,15 +656,112 @@ impl Context {
 
             let tm_srq_rc = Rc::new(RefCell::new(tm_srq));
 
-            // Register with CQ using Command QP's qpn (will be set after init_direct_access)
-            // For now, we'll register after init_direct_access is called
+            // Register with CQ
+            cq.register_queue(cmd_info.qpn, Rc::downgrade(&tm_srq_rc) as _);
 
             Ok(tm_srq_rc)
         }
     }
+
+    /// Create a dense Tag Matching SRQ (all Command QP WQEs tracked).
+    ///
+    /// # Arguments
+    /// * `pd` - Protection Domain
+    /// * `cq` - Completion Queue for TM operation completions
+    /// * `config` - TM-SRQ configuration
+    /// * `callback` - Callback for completions receiving `TmSrqCompletion<T, U>`
+    ///
+    /// # Errors
+    /// Returns an error if the TM-SRQ cannot be created.
+    pub fn create_dense_tm_srq<T, U, F>(
+        &self,
+        pd: &Pd,
+        cq: &Rc<CompletionQueue>,
+        config: &TmSrqConfig,
+        callback: F,
+    ) -> io::Result<Rc<RefCell<DenseTmSrq<T, U, F>>>>
+    where
+        T: 'static,
+        U: 'static,
+        F: Fn(TmSrqCompletion<T, U>) + 'static,
+    {
+        unsafe {
+            // Create SRQ
+            let (srq_nn, wqe_cnt) = Self::create_tm_srq_raw(self, pd, cq, config)?;
+
+            // Query SRQ info for direct access
+            let srq_info = query_srq_info(srq_nn)?;
+            let cmd_info = query_cmd_qp_info_inner(srq_nn)?;
+
+            let tm_srq = TagMatchingSrq {
+                srq: srq_nn,
+                wqe_cnt,
+                max_num_tags: config.max_num_tags as u16,
+                srq_state: Some(TmSrqState {
+                    buf: srq_info.buf,
+                    wqe_cnt,
+                    stride: srq_info.stride,
+                    head: Cell::new(0),
+                    dbrec: srq_info.dbrec,
+                    table: UnorderedWqeTable::new(wqe_cnt as u16),
+                }),
+                cmd_qp: Some(CmdQpState {
+                    qpn: cmd_info.qpn,
+                    sq_buf: cmd_info.sq_buf,
+                    sq_wqe_cnt: cmd_info.sq_wqe_cnt,
+                    pi: Cell::new(cmd_info.current_pi),
+                    ci: Cell::new(cmd_info.current_pi),
+                    dbrec: cmd_info.dbrec,
+                    bf_reg: cmd_info.bf_reg,
+                    bf_size: cmd_info.bf_size,
+                    bf_offset: Cell::new(0),
+                    last_wqe: Cell::new(None),
+                    table: DenseWqeTable::new(cmd_info.sq_wqe_cnt),
+                    _marker: std::marker::PhantomData,
+                }),
+                callback,
+                send_cq: Rc::downgrade(cq),
+                _pd: pd.clone(),
+            };
+
+            let tm_srq_rc = Rc::new(RefCell::new(tm_srq));
+
+            // Register with CQ
+            cq.register_queue(cmd_info.qpn, Rc::downgrade(&tm_srq_rc) as _);
+
+            Ok(tm_srq_rc)
+        }
+    }
+
+    /// Internal helper to create the raw SRQ.
+    unsafe fn create_tm_srq_raw(
+        &self,
+        pd: &Pd,
+        cq: &Rc<CompletionQueue>,
+        config: &TmSrqConfig,
+    ) -> io::Result<(NonNull<mlx5_sys::ibv_srq>, u32)> {
+        let mut attr: mlx5_sys::ibv_srq_init_attr_ex = MaybeUninit::zeroed().assume_init();
+        attr.attr.max_wr = config.max_wr;
+        attr.attr.max_sge = config.max_sge;
+        attr.srq_type = mlx5_sys::ibv_srq_type_IBV_SRQT_TM;
+        attr.pd = pd.as_ptr();
+        attr.cq = cq.as_ptr();
+        attr.tm_cap.max_num_tags = config.max_num_tags;
+        attr.tm_cap.max_ops = config.max_ops;
+        attr.comp_mask = mlx5_sys::ibv_srq_init_attr_mask_IBV_SRQ_INIT_ATTR_TYPE
+            | mlx5_sys::ibv_srq_init_attr_mask_IBV_SRQ_INIT_ATTR_PD
+            | mlx5_sys::ibv_srq_init_attr_mask_IBV_SRQ_INIT_ATTR_CQ
+            | mlx5_sys::ibv_srq_init_attr_mask_IBV_SRQ_INIT_ATTR_TM;
+
+        let srq = mlx5_sys::ibv_create_srq_ex_ex(self.as_ptr(), &mut attr);
+        let srq_nn = NonNull::new(srq).ok_or_else(io::Error::last_os_error)?;
+        let wqe_cnt = config.max_wr.next_power_of_two();
+
+        Ok((srq_nn, wqe_cnt))
+    }
 }
 
-impl<T, F> Drop for TagMatchingSrq<T, F> {
+impl<T, Tab, U, F> Drop for TagMatchingSrq<T, Tab, U, F> {
     fn drop(&mut self) {
         // Unregister from CQ
         if let Some(cmd_qp) = &self.cmd_qp {
@@ -476,116 +776,98 @@ impl<T, F> Drop for TagMatchingSrq<T, F> {
     }
 }
 
-impl<T, F> TagMatchingSrq<T, F> {
-    /// Query SRQ info using mlx5dv_init_obj.
-    fn query_srq_info(&self) -> io::Result<SrqInfo> {
-        unsafe {
-            let mut dv_srq: MaybeUninit<mlx5_sys::mlx5dv_srq> = MaybeUninit::zeroed();
-            let mut obj: MaybeUninit<mlx5_sys::mlx5dv_obj> = MaybeUninit::zeroed();
+/// Internal helper to query Command QP info (common code).
+struct CmdQpInfo {
+    qpn: u32,
+    sq_buf: *mut u8,
+    sq_wqe_cnt: u16,
+    current_pi: u16,
+    dbrec: *mut u32,
+    bf_reg: *mut u8,
+    bf_size: u32,
+}
 
-            let obj_ptr = obj.as_mut_ptr();
-            (*obj_ptr).srq.in_ = self.srq.as_ptr();
-            (*obj_ptr).srq.out = dv_srq.as_mut_ptr();
+/// Query SRQ info using mlx5dv_init_obj.
+fn query_srq_info(srq: NonNull<mlx5_sys::ibv_srq>) -> io::Result<SrqInfo> {
+    unsafe {
+        let mut dv_srq: MaybeUninit<mlx5_sys::mlx5dv_srq> = MaybeUninit::zeroed();
+        let mut obj: MaybeUninit<mlx5_sys::mlx5dv_obj> = MaybeUninit::zeroed();
 
-            let ret =
-                mlx5_sys::mlx5dv_init_obj(obj_ptr, mlx5_sys::mlx5dv_obj_type_MLX5DV_OBJ_SRQ as u64);
-            if ret != 0 {
-                return Err(io::Error::from_raw_os_error(-ret));
-            }
+        let obj_ptr = obj.as_mut_ptr();
+        (*obj_ptr).srq.in_ = srq.as_ptr();
+        (*obj_ptr).srq.out = dv_srq.as_mut_ptr();
 
-            let dv_srq = dv_srq.assume_init();
-
-            Ok(SrqInfo {
-                buf: dv_srq.buf as *mut u8,
-                dbrec: dv_srq.dbrec as *mut u32,
-                stride: dv_srq.stride,
-                srqn: dv_srq.srqn,
-            })
+        let ret =
+            mlx5_sys::mlx5dv_init_obj(obj_ptr, mlx5_sys::mlx5dv_obj_type_MLX5DV_OBJ_SRQ as u64);
+        if ret != 0 {
+            return Err(io::Error::from_raw_os_error(-ret));
         }
+
+        let dv_srq = dv_srq.assume_init();
+
+        Ok(SrqInfo {
+            buf: dv_srq.buf as *mut u8,
+            dbrec: dv_srq.dbrec as *mut u32,
+            stride: dv_srq.stride,
+            srqn: dv_srq.srqn,
+        })
     }
+}
 
-    /// Query Command QP info.
-    fn query_cmd_qp_info(&self) -> io::Result<CmdQpState<T>> {
-        unsafe {
-            // Get the internal Command QP from mlx5_srq structure
-            let cmd_qp_ptr = {
-                let ptr = (self.srq.as_ptr() as *const u8).offset(CMD_QP_OFFSET)
-                    as *const *mut mlx5_sys::ibv_qp;
-                *ptr
-            };
+fn query_cmd_qp_info_inner(srq: NonNull<mlx5_sys::ibv_srq>) -> io::Result<CmdQpInfo> {
+    unsafe {
+        // Get the internal Command QP from mlx5_srq structure
+        let cmd_qp_ptr = {
+            let ptr =
+                (srq.as_ptr() as *const u8).offset(CMD_QP_OFFSET) as *const *mut mlx5_sys::ibv_qp;
+            *ptr
+        };
 
-            if cmd_qp_ptr.is_null() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "TM-SRQ cmd_qp is null (TM not supported?)",
-                ));
-            }
-
-            let mut dv_qp: MaybeUninit<mlx5_sys::mlx5dv_qp> = MaybeUninit::zeroed();
-            let mut obj: MaybeUninit<mlx5_sys::mlx5dv_obj> = MaybeUninit::zeroed();
-
-            let obj_ptr = obj.as_mut_ptr();
-            (*obj_ptr).qp.in_ = cmd_qp_ptr;
-            (*obj_ptr).qp.out = dv_qp.as_mut_ptr();
-
-            let ret =
-                mlx5_sys::mlx5dv_init_obj(obj_ptr, mlx5_sys::mlx5dv_obj_type_MLX5DV_OBJ_QP as u64);
-            if ret != 0 {
-                return Err(io::Error::from_raw_os_error(-ret));
-            }
-
-            let dv_qp = dv_qp.assume_init();
-            let qpn = (*cmd_qp_ptr).qp_num;
-            let sq_wqe_cnt = dv_qp.sq.wqe_cnt as u16;
-
-            // Read current PI from doorbell record (dbrec[1] is SQ doorbell)
-            // The Command QP may have been used by rdma-core internally
-            let dbrec = dv_qp.dbrec as *mut u32;
-            let current_pi = u32::from_be(std::ptr::read_volatile(dbrec.add(1))) as u16;
-
-            Ok(CmdQpState {
-                qpn,
-                sq_buf: dv_qp.sq.buf as *mut u8,
-                sq_wqe_cnt,
-                pi: Cell::new(current_pi),
-                ci: Cell::new(current_pi), // Assume all previous WQEs completed
-                dbrec: dv_qp.dbrec as *mut u32,
-                bf_reg: dv_qp.bf.reg as *mut u8,
-                bf_size: dv_qp.bf.size,
-                bf_offset: Cell::new(0),
-                last_wqe: Cell::new(None),
-                table: SparseWqeTable::new(sq_wqe_cnt),
-            })
+        if cmd_qp_ptr.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "TM-SRQ cmd_qp is null (TM not supported?)",
+            ));
         }
+
+        let mut dv_qp: MaybeUninit<mlx5_sys::mlx5dv_qp> = MaybeUninit::zeroed();
+        let mut obj: MaybeUninit<mlx5_sys::mlx5dv_obj> = MaybeUninit::zeroed();
+
+        let obj_ptr = obj.as_mut_ptr();
+        (*obj_ptr).qp.in_ = cmd_qp_ptr;
+        (*obj_ptr).qp.out = dv_qp.as_mut_ptr();
+
+        let ret =
+            mlx5_sys::mlx5dv_init_obj(obj_ptr, mlx5_sys::mlx5dv_obj_type_MLX5DV_OBJ_QP as u64);
+        if ret != 0 {
+            return Err(io::Error::from_raw_os_error(-ret));
+        }
+
+        let dv_qp = dv_qp.assume_init();
+        let qpn = (*cmd_qp_ptr).qp_num;
+        let sq_wqe_cnt = dv_qp.sq.wqe_cnt as u16;
+
+        // Read current PI from doorbell record (dbrec[1] is SQ doorbell)
+        // The Command QP may have been used by rdma-core internally
+        let dbrec = dv_qp.dbrec as *mut u32;
+        let current_pi = u32::from_be(std::ptr::read_volatile(dbrec.add(1))) as u16;
+
+        Ok(CmdQpInfo {
+            qpn,
+            sq_buf: dv_qp.sq.buf as *mut u8,
+            sq_wqe_cnt,
+            current_pi,
+            dbrec: dv_qp.dbrec as *mut u32,
+            bf_reg: dv_qp.bf.reg as *mut u8,
+            bf_size: dv_qp.bf.size,
+        })
     }
+}
 
-    /// Initialize direct access for TM-SRQ (internal implementation).
-    fn init_direct_access_inner(&mut self) -> io::Result<u32> {
-        let srq_info = self.query_srq_info()?;
-        let cmd_qp = self.query_cmd_qp_info()?;
-        let qpn = cmd_qp.qpn;
-
-        self.srq_state = Some(TmSrqState {
-            buf: srq_info.buf,
-            wqe_cnt: self.wqe_cnt,
-            stride: srq_info.stride,
-            head: Cell::new(0),
-            dbrec: srq_info.dbrec,
-        });
-
-        self.cmd_qp = Some(cmd_qp);
-
-        Ok(qpn)
-    }
-
-    /// Get the Command QP number (for CQ registration).
-    pub(crate) fn cmd_qpn(&self) -> Option<u32> {
-        self.cmd_qp.as_ref().map(|cq| cq.qpn)
-    }
-
+impl<T, Tab, U, F> TagMatchingSrq<T, Tab, U, F> {
     /// Get the SRQ number.
     pub fn srqn(&self) -> io::Result<u32> {
-        self.query_srq_info().map(|info| info.srqn)
+        query_srq_info(self.srq).map(|info| info.srqn)
     }
 
     /// Get the maximum number of tags.
@@ -598,34 +880,69 @@ impl<T, F> TagMatchingSrq<T, F> {
         self.srq.as_ptr()
     }
 
-    fn cmd_qp(&self) -> io::Result<&CmdQpState<T>> {
-        self.cmd_qp
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "direct access not initialized"))
+    fn cmd_qp(&self) -> &CmdQpState<T, Tab> {
+        // Safe: srq_state is always Some after construction
+        self.cmd_qp.as_ref().expect("cmd_qp not initialized")
+    }
+
+    fn srq_state(&self) -> &TmSrqState<U> {
+        // Safe: srq_state is always Some after construction
+        self.srq_state.as_ref().expect("srq_state not initialized")
     }
 
     // =========================================================================
     // Unordered Receive WQE Operations (via SRQ)
     // =========================================================================
 
-    /// Post an unordered receive WQE for unexpected messages.
+    /// Get the number of available WQEBBs in the RQ.
+    pub fn rq_available_wqebbs(&self) -> u16 {
+        self.srq_state().table.available_wqebbs()
+    }
+
+    /// Get a WQE builder for RQ unordered receive operations.
     ///
+    /// Entry is required for completion tracking.
+    pub fn rq_wqe_builder(&self, entry: U) -> io::Result<RqWqeBuilder<'_, U>> {
+        let srq_state = self.srq_state();
+        let wqebb_start = srq_state
+            .table
+            .try_allocate_first()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "RQ full"))?;
+
+        let wqe_idx = srq_state.head.get();
+        let wqe_ptr = srq_state.get_wqe_ptr(wqe_idx);
+
+        // Clear Next Segment (16 bytes)
+        unsafe { std::ptr::write_bytes(wqe_ptr, 0, 16) };
+
+        Ok(RqWqeBuilder {
+            srq_state,
+            wqe_ptr,
+            wqe_idx,
+            wqebb_start,
+            wqebb_count: 1,
+            offset: 16, // Start after Next Segment
+            entry,
+        })
+    }
+
+    /// Post a simple unordered receive WQE with a single data segment.
+    ///
+    /// This is a convenience method for the common case.
     /// Call `ring_srq_doorbell()` after posting one or more receive WQEs.
-    ///
-    /// # Safety
-    /// - The buffer must be registered and valid
-    /// - Direct access must be initialized
-    pub unsafe fn post_unordered_recv(&self, addr: u64, len: u32, lkey: u32) {
-        if let Some(state) = self.srq_state.as_ref() {
-            state.post(addr, len, lkey);
-        }
+    pub fn post_unordered_recv(&self, addr: u64, len: u32, lkey: u32, entry: U) -> io::Result<()> {
+        self.rq_wqe_builder(entry)?.data_seg(addr, len, lkey)?.finish();
+        Ok(())
     }
 
     /// Ring the SRQ doorbell to submit receive WQEs.
     pub fn ring_srq_doorbell(&self) {
-        if let Some(state) = self.srq_state.as_ref() {
-            state.ring_doorbell();
-        }
+        self.srq_state().ring_doorbell();
+    }
+
+    /// Process an RQ completion (internal use by dispatch_cqe).
+    fn process_rq_completion(&self, wqe_idx: u16) -> Option<U> {
+        self.srq_state().process_completion(wqe_idx)
     }
 
     // =========================================================================
@@ -636,33 +953,33 @@ impl<T, F> TagMatchingSrq<T, F> {
     ///
     /// Based on pi - ci, but actual availability may be less due to gaps.
     pub fn cmd_optimistic_available(&self) -> u16 {
-        self.cmd_qp
-            .as_ref()
-            .map(|cq| cq.optimistic_available())
-            .unwrap_or(0)
+        self.cmd_qp().optimistic_available()
     }
 
+    /// Ring the Command QP doorbell to submit TM operations.
+    pub fn ring_cmd_doorbell(&self) {
+        self.cmd_qp().ring_doorbell();
+    }
+}
+
+// =============================================================================
+// Sparse-specific Command QP Methods
+// =============================================================================
+
+impl<T, U, F> TagMatchingSrq<T, SparseWqeTable<T>, U, F> {
     /// Scan the table to get exact available count (slower).
     pub fn cmd_exact_available(&self) -> u16 {
-        self.cmd_qp
-            .as_ref()
-            .map(|cq| cq.table.count_available())
-            .unwrap_or(0)
+        self.cmd_qp().table.count_available()
     }
 
     /// Check if a specific Command QP slot is available.
     pub fn cmd_is_slot_available(&self, idx: u16) -> bool {
-        self.cmd_qp
-            .as_ref()
-            .map(|cq| cq.table.is_available(idx))
-            .unwrap_or(false)
+        self.cmd_qp().table.is_available(idx)
     }
 
-    /// Get a WQE builder for Command QP tag operations.
-    ///
-    /// Entry is required (always signaled for Command QP).
-    pub fn cmd_wqe_builder(&self, entry: T) -> io::Result<CmdQpWqeBuilder<'_, T>> {
-        let cmd_qp = self.cmd_qp()?;
+    /// Get a WQE builder for Command QP tag operations (sparse mode).
+    pub fn cmd_wqe_builder(&self, entry: T) -> io::Result<CmdQpWqeBuilder<'_, T, SparseWqeTable<T>>> {
+        let cmd_qp = self.cmd_qp();
         if !cmd_qp.table.is_available(cmd_qp.pi.get()) {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "Command QP full"));
         }
@@ -677,58 +994,63 @@ impl<T, F> TagMatchingSrq<T, F> {
             offset: 0,
             ds_count: 0,
             entry,
+            signaled: false,
         })
     }
 
-    /// Ring the Command QP doorbell to submit TM operations.
-    pub fn ring_cmd_doorbell(&self) {
-        if let Some(cmd_qp) = self.cmd_qp.as_ref() {
-            cmd_qp.ring_doorbell();
-        }
-    }
-
-    /// Process a Command QP completion.
-    ///
-    /// Returns the entry that was stored at the given wqe_idx.
-    pub fn process_cmd_completion(&self, wqe_idx: u16) -> Option<T> {
-        self.cmd_qp
-            .as_ref()
-            .and_then(|cq| cq.process_completion(wqe_idx))
-    }
-}
-
-impl<T, F> TagMatchingSrq<T, F>
-where
-    T: 'static,
-    F: Fn(Cqe, Option<T>) + 'static,
-{
-    /// Initialize direct access for TM-SRQ and register with CQ.
-    ///
-    /// This initializes both the SRQ state for receive posting and the
-    /// Command QP state for tag operations. Also registers with the CQ
-    /// for automatic completion dispatch.
-    pub fn init_direct_access(this: &Rc<RefCell<Self>>) -> io::Result<()> {
-        let qpn = this.borrow_mut().init_direct_access_inner()?;
-
-        // Register with CQ
-        if let Some(cq) = this.borrow().send_cq.upgrade() {
-            cq.register_queue(qpn, Rc::downgrade(this) as _);
-        }
-
-        Ok(())
+    /// Process a Command QP completion (internal use by dispatch_cqe).
+    fn process_cmd_completion(&self, wqe_idx: u16) -> Option<T> {
+        self.cmd_qp().process_completion_sparse(wqe_idx)
     }
 }
 
 // =============================================================================
-// CompletionTarget Implementation
+// Dense-specific Command QP Methods
 // =============================================================================
 
-impl<T, F> CompletionTarget for TagMatchingSrq<T, F>
+impl<T, U, F> TagMatchingSrq<T, DenseWqeTable<T>, U, F> {
+    /// Scan the table to get exact available count (slower).
+    pub fn cmd_exact_available(&self) -> u16 {
+        self.cmd_qp().table.count_available()
+    }
+
+    /// Check if a specific Command QP slot is available.
+    pub fn cmd_is_slot_available(&self, idx: u16) -> bool {
+        self.cmd_qp().table.is_available(idx)
+    }
+
+    /// Get a WQE builder for Command QP tag operations (dense mode).
+    pub fn cmd_wqe_builder(&self, entry: T) -> io::Result<CmdQpWqeBuilder<'_, T, DenseWqeTable<T>>> {
+        let cmd_qp = self.cmd_qp();
+        if !cmd_qp.table.is_available(cmd_qp.pi.get()) {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Command QP full"));
+        }
+
+        let wqe_idx = cmd_qp.pi.get();
+        let wqe_ptr = cmd_qp.get_wqe_ptr(wqe_idx);
+
+        Ok(CmdQpWqeBuilder {
+            cmd_qp,
+            wqe_ptr,
+            wqe_idx,
+            offset: 0,
+            ds_count: 0,
+            entry,
+            signaled: false,
+        })
+    }
+}
+
+// =============================================================================
+// CompletionTarget Implementation (Sparse)
+// =============================================================================
+
+impl<T, U, F> CompletionTarget for SparseTmSrq<T, U, F>
 where
-    F: Fn(Cqe, Option<T>),
+    F: Fn(TmSrqCompletion<T, U>),
 {
     fn qpn(&self) -> u32 {
-        self.cmd_qp.as_ref().map(|cq| cq.qpn).unwrap_or(0)
+        self.cmd_qp().qpn
     }
 
     fn dispatch_cqe(&self, cqe: Cqe) {
@@ -737,25 +1059,78 @@ where
                 // Command QP completion (tag add/remove)
                 // TmFinish is the success opcode for TM operations
                 if let Some(entry) = self.process_cmd_completion(cqe.wqe_counter) {
-                    (self.callback)(cqe, Some(entry));
+                    (self.callback)(TmSrqCompletion::CmdQp(cqe, entry));
                 }
             }
             CqeOpcode::TmMatchContext => {
                 // Tag matching context match - incoming message matched a tag
                 // app_info contains the tag handle
-                (self.callback)(cqe, None);
+                (self.callback)(TmSrqCompletion::TagMatch(cqe));
             }
             CqeOpcode::RespSend
             | CqeOpcode::RespSendImm
             | CqeOpcode::RespSendInv
             | CqeOpcode::RespRdmaWriteImm => {
                 // RX queue completion (unordered receive)
-                (self.callback)(cqe, None);
+                if let Some(entry) = self.process_rq_completion(cqe.wqe_counter) {
+                    (self.callback)(TmSrqCompletion::Recv(cqe, entry));
+                }
             }
             CqeOpcode::ReqErr | CqeOpcode::RespErr => {
                 // Error completion - try to get entry if it's a Command QP error
                 let entry = self.process_cmd_completion(cqe.wqe_counter);
-                (self.callback)(cqe, entry);
+                (self.callback)(TmSrqCompletion::Error(cqe, entry));
+            }
+        }
+    }
+}
+
+// =============================================================================
+// CompletionTarget Implementation (Dense)
+// =============================================================================
+
+impl<T, U, F> CompletionTarget for DenseTmSrq<T, U, F>
+where
+    F: Fn(TmSrqCompletion<T, U>),
+{
+    fn qpn(&self) -> u32 {
+        self.cmd_qp().qpn
+    }
+
+    fn dispatch_cqe(&self, cqe: Cqe) {
+        match cqe.opcode {
+            CqeOpcode::Req | CqeOpcode::TmFinish => {
+                // Command QP completion (tag add/remove)
+                // For dense mode, we process all completions up to wqe_counter
+                // and invoke callback for each. However, since dispatch_cqe
+                // is called per-CQE, we emit a CmdQp completion for the signaled one.
+                // Note: In dense mode, unsignaled WQEs don't generate CQEs,
+                // so when we get a CQE, it's always signaled.
+                let cmd_qp = self.cmd_qp();
+                if let Some(entry) = cmd_qp.table.take(cqe.wqe_counter) {
+                    // Update ci
+                    cmd_qp.ci.set(cmd_qp.ci.get().wrapping_add(entry.ci_delta));
+                    (self.callback)(TmSrqCompletion::CmdQp(cqe, entry.data));
+                }
+            }
+            CqeOpcode::TmMatchContext => {
+                // Tag matching context match - incoming message matched a tag
+                // app_info contains the tag handle
+                (self.callback)(TmSrqCompletion::TagMatch(cqe));
+            }
+            CqeOpcode::RespSend
+            | CqeOpcode::RespSendImm
+            | CqeOpcode::RespSendInv
+            | CqeOpcode::RespRdmaWriteImm => {
+                // RX queue completion (unordered receive)
+                if let Some(entry) = self.process_rq_completion(cqe.wqe_counter) {
+                    (self.callback)(TmSrqCompletion::Recv(cqe, entry));
+                }
+            }
+            CqeOpcode::ReqErr | CqeOpcode::RespErr => {
+                // Error completion - for dense mode, just take the entry if present
+                let entry = self.cmd_qp().table.take(cqe.wqe_counter).map(|e| e.data);
+                (self.callback)(TmSrqCompletion::Error(cqe, entry));
             }
         }
     }
