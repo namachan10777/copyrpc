@@ -5,7 +5,7 @@
 use bitflags::bitflags;
 
 /// WQEBB (Work Queue Element Basic Block) size in bytes.
-pub const WQEBB_SIZE: usize = 64;
+pub(crate) const WQEBB_SIZE: usize = 64;
 
 // =============================================================================
 // WQE Segments
@@ -303,7 +303,7 @@ bitflags! {
 
 /// Calculate the number of WQEBBs for a WQE size.
 #[inline]
-pub fn calc_wqebb_cnt(wqe_size: usize) -> u16 {
+pub(crate) fn calc_wqebb_cnt(wqe_size: usize) -> u16 {
     wqe_size.div_ceil(WQEBB_SIZE) as u16
 }
 

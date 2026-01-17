@@ -58,15 +58,15 @@ use crate::CompletionTarget;
 ///
 /// Distinguishes between Command QP completions (tag operations) and
 /// RQ completions (unordered receive).
-pub enum TmSrqCompletion<T, U> {
+pub enum TmSrqCompletion<CmdEntry, RecvEntry> {
     /// Command QP completion (TAG_ADD/TAG_DEL).
-    CmdQp(Cqe, T),
+    CmdQp(Cqe, CmdEntry),
     /// RQ completion (unordered receive).
-    Recv(Cqe, U),
+    Recv(Cqe, RecvEntry),
     /// Tag match notification (no entry, use `cqe.app_info` for tag handle).
     TagMatch(Cqe),
     /// Error completion (entry if from Command QP).
-    Error(Cqe, Option<T>),
+    Error(Cqe, Option<CmdEntry>),
 }
 
 /// Offset from ibv_srq to cmd_qp pointer in mlx5_srq structure.
@@ -109,9 +109,9 @@ impl Default for TmSrqConfig {
 
 /// Command QP state for TM tag operations.
 ///
-/// Generic over `Tab` to support both sparse (signaled-only) and dense (all WQE)
+/// Generic over `TableType` to support both sparse (signaled-only) and dense (all WQE)
 /// completion modes, similar to the main Send Queue implementation.
-struct CmdQpState<T, Tab> {
+struct CmdQpState<Entry, TableType> {
     /// QP number.
     qpn: u32,
     /// Send queue buffer.
@@ -133,12 +133,12 @@ struct CmdQpState<T, Tab> {
     /// Last WQE pointer and size for doorbell.
     last_wqe: Cell<Option<(*mut u8, usize)>>,
     /// WQE table for tracking in-flight operations.
-    table: Tab,
+    table: TableType,
     /// Phantom for entry type.
-    _marker: std::marker::PhantomData<T>,
+    _marker: std::marker::PhantomData<Entry>,
 }
 
-impl<T, Tab> CmdQpState<T, Tab> {
+impl<Entry, TableType> CmdQpState<Entry, TableType> {
     fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
         let offset = ((idx & (self.sq_wqe_cnt - 1)) as usize) * WQEBB_SIZE;
         unsafe { self.sq_buf.add(offset) }
@@ -208,9 +208,9 @@ impl<T, Tab> CmdQpState<T, Tab> {
     }
 }
 
-impl<T> CmdQpState<T, SparseWqeTable<T>> {
+impl<Entry> CmdQpState<Entry, SparseWqeTable<Entry>> {
     /// Process a single completion (for sparse mode).
-    fn process_completion_sparse(&self, wqe_idx: u16) -> Option<T> {
+    fn process_completion_sparse(&self, wqe_idx: u16) -> Option<Entry> {
         let entry = self.table.take(wqe_idx)?;
         // For sparse tables, ci_delta is the accumulated PI value at completion
         self.ci.set(entry.ci_delta);
@@ -218,11 +218,11 @@ impl<T> CmdQpState<T, SparseWqeTable<T>> {
     }
 }
 
-impl<T> CmdQpState<T, DenseWqeTable<T>> {
+impl<Entry> CmdQpState<Entry, DenseWqeTable<Entry>> {
     /// Process all completions in range (for dense mode).
     fn process_completions_dense<F>(&self, new_ci: u16, mut callback: F)
     where
-        F: FnMut(u16, T),
+        F: FnMut(u16, Entry),
     {
         for (idx, entry) in self.table.take_range(self.ci.get(), new_ci) {
             callback(idx, entry.data);
@@ -632,7 +632,7 @@ impl Context {
                     wqe_cnt,
                     stride: srq_info.stride,
                     head: Cell::new(0),
-                    dbrec: srq_info.dbrec,
+                    dbrec: srq_info.doorbell_record,
                     table: UnorderedWqeTable::new(wqe_cnt as u16),
                 }),
                 cmd_qp: Some(CmdQpState {
@@ -702,7 +702,7 @@ impl Context {
                     wqe_cnt,
                     stride: srq_info.stride,
                     head: Cell::new(0),
-                    dbrec: srq_info.dbrec,
+                    dbrec: srq_info.doorbell_record,
                     table: UnorderedWqeTable::new(wqe_cnt as u16),
                 }),
                 cmd_qp: Some(CmdQpState {
@@ -807,9 +807,9 @@ fn query_srq_info(srq: NonNull<mlx5_sys::ibv_srq>) -> io::Result<SrqInfo> {
 
         Ok(SrqInfo {
             buf: dv_srq.buf as *mut u8,
-            dbrec: dv_srq.dbrec as *mut u32,
+            doorbell_record: dv_srq.dbrec as *mut u32,
             stride: dv_srq.stride,
-            srqn: dv_srq.srqn,
+            srq_number: dv_srq.srqn,
         })
     }
 }
@@ -866,8 +866,8 @@ fn query_cmd_qp_info_inner(srq: NonNull<mlx5_sys::ibv_srq>) -> io::Result<CmdQpI
 
 impl<T, Tab, U, F> TagMatchingSrq<T, Tab, U, F> {
     /// Get the SRQ number.
-    pub fn srqn(&self) -> io::Result<u32> {
-        query_srq_info(self.srq).map(|info| info.srqn)
+    pub fn srq_number(&self) -> io::Result<u32> {
+        query_srq_info(self.srq).map(|info| info.srq_number)
     }
 
     /// Get the maximum number of tags.

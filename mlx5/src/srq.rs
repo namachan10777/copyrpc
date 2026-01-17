@@ -34,11 +34,11 @@ pub struct SrqInfo {
     /// SRQ buffer pointer.
     pub buf: *mut u8,
     /// Doorbell record pointer.
-    pub dbrec: *mut u32,
+    pub doorbell_record: *mut u32,
     /// WQE stride (bytes per slot).
     pub stride: u32,
     /// SRQ number.
-    pub srqn: u32,
+    pub srq_number: u32,
 }
 
 // =============================================================================
@@ -178,14 +178,19 @@ impl Pd {
             };
 
             let srq = mlx5_sys::ibv_create_srq(self.as_ptr(), &attr as *const _ as *mut _);
-            NonNull::new(srq).map_or(Err(io::Error::last_os_error()), |srq| {
-                Ok(Srq(Rc::new(RefCell::new(SrqInner {
-                    srq,
-                    wqe_cnt: config.max_wr.next_power_of_two(),
-                    state: None,
-                    _pd: self.clone(),
-                }))))
-            })
+            let srq = NonNull::new(srq).ok_or_else(io::Error::last_os_error)?;
+
+            let result = Srq(Rc::new(RefCell::new(SrqInner {
+                srq,
+                wqe_cnt: config.max_wr.next_power_of_two(),
+                state: None,
+                _pd: self.clone(),
+            })));
+
+            // Auto-initialize direct access
+            result.init_direct_access_internal()?;
+
+            Ok(result)
         }
     }
 }
@@ -216,17 +221,22 @@ impl<T> Srq<T> {
 
             Ok(SrqInfo {
                 buf: dv_srq.buf as *mut u8,
-                dbrec: dv_srq.dbrec as *mut u32,
+                doorbell_record: dv_srq.dbrec as *mut u32,
                 stride: dv_srq.stride,
-                srqn: dv_srq.srqn,
+                srq_number: dv_srq.srqn,
             })
         }
     }
 
-    /// Initialize direct access for the SRQ.
-    ///
-    /// Call this before using recv_builder/ring_doorbell.
-    pub fn init_direct_access(&self) -> io::Result<()> {
+    /// Initialize direct access for the SRQ (internal implementation).
+    fn init_direct_access_internal(&self) -> io::Result<()> {
+        {
+            let inner = self.0.borrow();
+            if inner.state.is_some() {
+                return Ok(()); // Already initialized
+            }
+        }
+
         let info = self.query_info()?;
         let mut inner = self.0.borrow_mut();
         let wqe_cnt = inner.wqe_cnt;
@@ -237,16 +247,26 @@ impl<T> Srq<T> {
             stride: info.stride,
             pi: Cell::new(0),
             ci: Cell::new(0),
-            dbrec: info.dbrec,
+            dbrec: info.doorbell_record,
             table: (0..wqe_cnt).map(|_| Cell::new(None)).collect(),
         });
 
         Ok(())
     }
 
+    /// Initialize direct access for the SRQ.
+    ///
+    /// # Deprecated
+    /// Direct access is now auto-initialized at SRQ creation.
+    /// This method is kept for backwards compatibility and is a no-op if already initialized.
+    #[deprecated(note = "Direct access is now auto-initialized at creation")]
+    pub fn init_direct_access(&self) -> io::Result<()> {
+        self.init_direct_access_internal()
+    }
+
     /// Get the SRQ number.
-    pub fn srqn(&self) -> io::Result<u32> {
-        self.query_info().map(|info| info.srqn)
+    pub fn srq_number(&self) -> io::Result<u32> {
+        self.query_info().map(|info| info.srq_number)
     }
 
     /// Get a WQE builder for posting a receive.
