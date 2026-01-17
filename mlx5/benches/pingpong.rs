@@ -23,8 +23,8 @@ use mlx5::cq::{CompletionQueue, Cqe, CqeOpcode};
 use mlx5::device::{Context, DeviceList};
 use mlx5::pd::{AccessFlags, MemoryRegion, Pd};
 use mlx5::qp::{RcQp, RcQpConfig, RemoteQpInfo};
-use mlx5::wqe::{WqeFlags, WqeOpcode};
 use mlx5::post_send_wqe;
+use mlx5::wqe::{WqeFlags, WqeOpcode};
 
 // =============================================================================
 // Constants
@@ -722,7 +722,6 @@ fn run_lowlatency_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
 /// Throughput benchmark using post_send_wqe! macro.
 fn run_throughput_bench_post_send_wqe(client: &mut EndpointState, iters: u64, size: usize) -> Duration {
     let size = size.min(256) as u32;
-    let fm_ce_se = WqeFlags::COMPLETION.bits();
     let lkey = client.send_mr.lkey();
     let rkey = client.remote_rkey;
     let send_buf_addr = client.send_buf.addr();
@@ -731,20 +730,22 @@ fn run_throughput_bench_post_send_wqe(client: &mut EndpointState, iters: u64, si
     // Initial fill using post_send_wqe! macro
     {
         let qp = client.qp.borrow();
-        let mut last_ptr = std::ptr::null_mut();
-        let mut last_size = 0usize;
         for i in 0..QUEUE_DEPTH {
             let offset = (i * 256) as u64;
             let imm = i as u32;
-            let (_, ptr, sz) = post_send_wqe!(*qp, i as u64,
-                ctrl { opcode: WqeOpcode::RdmaWriteImm, fm_ce_se: fm_ce_se, imm: imm },
-                rdma { remote_addr: remote_addr + offset, rkey: rkey },
-                sge { addr: send_buf_addr + offset, len: size, lkey: lkey },
-            ).unwrap();
-            last_ptr = ptr;
-            last_size = sz;
+            post_send_wqe!{
+                qp: *qp,
+                write {
+                    entry: i as u64,
+                    imm: imm,
+                    remote_addr: remote_addr + offset,
+                    rkey: rkey,
+                    data: [
+                        sge { addr: send_buf_addr + offset, len: size, lkey: lkey },
+                    ],
+                },
+            }.unwrap();
         }
-        unsafe { qp.__sq_set_last_wqe(last_ptr, last_size); }
         qp.ring_sq_doorbell();
     }
 
@@ -788,21 +789,23 @@ fn run_throughput_bench_post_send_wqe(client: &mut EndpointState, iters: u64, si
 
         if to_send > 0 {
             let qp = client.qp.borrow();
-            let mut last_ptr = std::ptr::null_mut();
-            let mut last_size = 0usize;
             for i in 0..to_send {
                 let idx = rx_indices[i];
                 let offset = (idx * 256) as u64;
                 let imm = idx as u32;
-                let (_, ptr, sz) = post_send_wqe!(*qp, idx as u64,
-                    ctrl { opcode: WqeOpcode::RdmaWriteImm, fm_ce_se: fm_ce_se, imm: imm },
-                    rdma { remote_addr: remote_addr + offset, rkey: rkey },
-                    sge { addr: send_buf_addr + offset, len: size, lkey: lkey },
-                ).unwrap();
-                last_ptr = ptr;
-                last_size = sz;
+                post_send_wqe!{
+                    qp: *qp,
+                    write {
+                        entry: idx as u64,
+                        imm: imm,
+                        remote_addr: remote_addr + offset,
+                        rkey: rkey,
+                        data: [
+                            sge { addr: send_buf_addr + offset, len: size, lkey: lkey },
+                        ],
+                    },
+                }.unwrap();
             }
-            unsafe { qp.__sq_set_last_wqe(last_ptr, last_size); }
             inflight += to_send as u64;
         }
 
@@ -844,7 +847,6 @@ fn run_throughput_bench_post_send_wqe(client: &mut EndpointState, iters: u64, si
 /// Low-latency benchmark using post_send_wqe! macro with blueflame.
 fn run_lowlatency_bench_post_send_wqe(client: &mut EndpointState, iters: u64, size: usize) -> Duration {
     let size = size.min(256) as u32;
-    let fm_ce_se = WqeFlags::COMPLETION.bits();
     let lkey = client.send_mr.lkey();
     let rkey = client.remote_rkey;
     let send_buf_addr = client.send_buf.addr();
@@ -860,11 +862,19 @@ fn run_lowlatency_bench_post_send_wqe(client: &mut EndpointState, iters: u64, si
         // Post single WRITE+IMM with blueflame using post_send_wqe! macro
         {
             let qp = client.qp.borrow();
-            post_send_wqe!(*qp, idx as u64, blueflame,
-                ctrl { opcode: WqeOpcode::RdmaWriteImm, fm_ce_se: fm_ce_se, imm: imm },
-                rdma { remote_addr: remote_addr + offset, rkey: rkey },
-                sge { addr: send_buf_addr + offset, len: size, lkey: lkey },
-            ).unwrap();
+            post_send_wqe!{
+                qp: *qp,
+                write {
+                    entry: idx as u64,
+                    imm: imm,
+                    remote_addr: remote_addr + offset,
+                    rkey: rkey,
+                    data: [
+                        sge { addr: send_buf_addr + offset, len: size, lkey: lkey },
+                    ],
+                },
+                blueflame,
+            }.unwrap();
         }
 
         // Wait for completion

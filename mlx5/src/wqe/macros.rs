@@ -282,131 +282,181 @@ pub const fn wqebb_cnt(size: usize) -> u16 {
     ((size + 63) / 64) as u16
 }
 
-/// Post a send WQE with entry tracking.
+/// Post send WQEs with operation-based syntax.
 ///
-/// This is the primary macro for posting WQEs. It handles:
+/// This macro provides a high-level, safe interface for posting WQEs.
+/// It automatically handles:
 /// - SQ slot allocation
-/// - WQE construction from segments
+/// - WQE construction
 /// - PI advancement
-/// - Entry storage for completion callback
+/// - Entry storage
+/// - `__sq_set_last_wqe` (internal state management)
 ///
 /// # Syntax
 ///
-/// ## Single WQE
-///
 /// ```ignore
-/// // Without BlueFlame (batch mode - call ring_sq_doorbell() later)
-/// let (wqe_idx, ptr, size) = post_send_wqe!(qp, entry,
-///     ctrl { opcode: RdmaWriteImm, fm_ce_se: 0x08, imm: 0x1234 },
-///     rdma { remote_addr: addr, rkey: key },
-///     sge { addr: local, len: 64, lkey: lk },
-/// )?;
-/// // After batch:
-/// unsafe { qp.__sq_set_last_wqe(ptr, size); }
-/// qp.ring_sq_doorbell();
-///
-/// // With BlueFlame (low-latency single WQE)
-/// post_send_wqe!(qp, entry, blueflame,
-///     ctrl { opcode: RdmaWriteImm, fm_ce_se: 0x08, imm: 0x1234 },
-///     rdma { remote_addr: addr, rkey: key },
-///     sge { addr: local, len: 64, lkey: lk },
-/// )?;
+/// post_send_wqe!{
+///     qp: qp,
+///     write {
+///         entry: e0,
+///         imm: 0x1234,           // optional, omit for RDMA_WRITE without imm
+///         fm_ce_se: 0x08,        // optional, default = COMPLETION
+///         remote_addr: addr,
+///         rkey: key,
+///         data: [
+///             sge { addr: local, len: 64, lkey: lk },
+///         ],
+///     },
+///     send {
+///         entry: e1,
+///         fm_ce_se: 0x08,
+///         data: [
+///             sge { addr: buf, len: 128, lkey: lk },
+///             inline { data: &bytes },
+///         ],
+///     },
+///     blueflame,  // optional: use BlueFlame instead of doorbell
+/// }
 /// ```
 ///
-/// ## Multiple WQEs (compile-time loop unrolling)
+/// After calling this macro, call `qp.ring_sq_doorbell()` to submit
+/// (unless `blueflame` option is specified).
 ///
-/// ```ignore
-/// // Multiple WQEs without BlueFlame (batch mode)
-/// let (last_ptr, last_size) = post_send_wqe!(qp,
-///     [entry0; ctrl { opcode: RdmaWriteImm, fm_ce_se: 0x08, imm: 0 },
-///              rdma { remote_addr: addr0, rkey: key },
-///              sge { addr: local0, len: 64, lkey: lk }],
-///     [entry1; ctrl { opcode: RdmaWriteImm, fm_ce_se: 0x08, imm: 1 },
-///              rdma { remote_addr: addr1, rkey: key },
-///              sge { addr: local1, len: 64, lkey: lk }],
-/// )?;
-/// unsafe { qp.__sq_set_last_wqe(last_ptr, last_size); }
-/// qp.ring_sq_doorbell();
+/// # Supported Operations
+/// - `write { ... }` - RDMA WRITE (with optional `imm` for WRITE_IMM)
+/// - `send { ... }` - SEND
 ///
-/// // Multiple WQEs with BlueFlame
-/// post_send_wqe!(qp, blueflame,
-///     [entry0; ctrl { ... }, rdma { ... }, sge { ... }],
-///     [entry1; ctrl { ... }, rdma { ... }, sge { ... }],
-/// )?;
-/// ```
+/// # Data Segments
+/// - `sge { addr, len, lkey }` - Scatter/Gather Entry
+/// - `inline { data: &[u8] }` - Inline data (fixed 16B segment)
 ///
 /// # Returns
-/// - Single WQE: `Option<(u16, *mut u8, usize)>` - `Some((wqe_idx, ptr, size))`
-/// - Multiple WQEs: `Option<(*mut u8, usize)>` - `Some((last_ptr, last_size))`
-/// - `None` if SQ is full or not initialized.
-///
-/// # BlueFlame
-/// When `blueflame` option is specified, the WQE is immediately sent via BlueFlame
-/// register. This provides lowest latency but is only suitable for single WQE submission.
-/// The WQE size must fit within the BlueFlame buffer (typically 64 bytes).
+/// `Option<()>` - `Some(())` on success, `None` if SQ is full.
 #[macro_export]
 macro_rules! post_send_wqe {
     // =========================================================================
-    // Multiple WQEs with loop unrolling (compile-time expansion)
+    // Entry point - parse qp and operations
     // =========================================================================
 
-    // Multiple WQEs with BlueFlame
-    ($qp:expr, blueflame, $([$entry:expr; $($segs:tt)*]),+ $(,)? ) => {{
+    // Single write with blueflame
+    { qp: $qp:expr, write $body:tt, blueflame $(,)? } => {{
+        $crate::post_send_wqe!(@parse $qp, blueflame, write $body)
+    }};
+
+    // Single write without blueflame
+    { qp: $qp:expr, write $body:tt $(,)? } => {{
+        $crate::post_send_wqe!(@parse $qp, doorbell, write $body)
+    }};
+
+    // Single send with blueflame
+    { qp: $qp:expr, send $body:tt, blueflame $(,)? } => {{
+        $crate::post_send_wqe!(@parse $qp, blueflame, send $body)
+    }};
+
+    // Single send without blueflame
+    { qp: $qp:expr, send $body:tt $(,)? } => {{
+        $crate::post_send_wqe!(@parse $qp, doorbell, send $body)
+    }};
+
+    // Multiple operations with blueflame
+    { qp: $qp:expr, $($op:ident $body:tt),+ , blueflame $(,)? } => {{
+        $crate::post_send_wqe!(@emit_multi $qp, blueflame, $($op $body),+)
+    }};
+
+    // Multiple operations without blueflame
+    { qp: $qp:expr, $($op:ident $body:tt),+ $(,)? } => {{
+        $crate::post_send_wqe!(@emit_multi $qp, doorbell, $($op $body),+)
+    }};
+
+    // =========================================================================
+    // Parse operations
+    // =========================================================================
+
+    // Single write with imm
+    (@parse $qp:expr, $mode:ident,
+        write {
+            entry: $entry:expr,
+            imm: $imm:expr,
+            $(fm_ce_se: $fm:expr,)?
+            remote_addr: $raddr:expr,
+            rkey: $rkey:expr,
+            data: [ $($data:tt)* ] $(,)?
+        } $(,)?
+    ) => {{
+        let __fm_ce_se: u8 = $crate::post_send_wqe!(@fm_ce_se $($fm)?);
+        $crate::post_send_wqe!(@emit_single $qp, $mode, $entry,
+            ctrl { opcode: 0x09u8, fm_ce_se: __fm_ce_se, imm: $imm },
+            rdma { remote_addr: $raddr, rkey: $rkey },
+            $($data)*
+        )
+    }};
+
+    // Single write without imm
+    (@parse $qp:expr, $mode:ident,
+        write {
+            entry: $entry:expr,
+            $(fm_ce_se: $fm:expr,)?
+            remote_addr: $raddr:expr,
+            rkey: $rkey:expr,
+            data: [ $($data:tt)* ] $(,)?
+        } $(,)?
+    ) => {{
+        let __fm_ce_se: u8 = $crate::post_send_wqe!(@fm_ce_se $($fm)?);
+        $crate::post_send_wqe!(@emit_single $qp, $mode, $entry,
+            ctrl { opcode: 0x08u8, fm_ce_se: __fm_ce_se },
+            rdma { remote_addr: $raddr, rkey: $rkey },
+            $($data)*
+        )
+    }};
+
+    // Single send
+    (@parse $qp:expr, $mode:ident,
+        send {
+            entry: $entry:expr,
+            $(fm_ce_se: $fm:expr,)?
+            data: [ $($data:tt)* ] $(,)?
+        } $(,)?
+    ) => {{
+        let __fm_ce_se: u8 = $crate::post_send_wqe!(@fm_ce_se $($fm)?);
+        $crate::post_send_wqe!(@emit_single $qp, $mode, $entry,
+            ctrl { opcode: 0x0Au8, fm_ce_se: __fm_ce_se },
+            $($data)*
+        )
+    }};
+
+    // Multiple operations - collect and emit
+    (@parse $qp:expr, $mode:ident, $($op:ident $body:tt),+ $(,)? ) => {{
+        $crate::post_send_wqe!(@emit_multi $qp, $mode, $($op $body),+)
+    }};
+
+    // =========================================================================
+    // fm_ce_se helper - default to COMPLETION (0x08)
+    // =========================================================================
+
+    (@fm_ce_se) => { 0x08u8 };
+    (@fm_ce_se $fm:expr) => { $fm };
+
+    // =========================================================================
+    // Emit single WQE
+    // =========================================================================
+
+    (@emit_single $qp:expr, doorbell, $entry:expr, $($segs:tt)*) => {{
         #[allow(unused_unsafe)]
         unsafe {
-            '__post_wqe_block: {
-                let mut __last_ptr: *mut u8 = std::ptr::null_mut();
-                let mut __last_size: usize = 0;
-
-                $(
-                    let Some(__slot) = $qp.__sq_ptr() else {
-                        break '__post_wqe_block None;
-                    };
-                    let __size = $crate::wqe_write!(__slot.ptr, __slot.sqn, __slot.wqe_idx, $($segs)*);
-                    let __wqebb = $crate::wqe::wqebb_cnt(__size);
-                    $qp.__sq_advance_pi(__wqebb);
-                    $qp.__sq_store_entry(__slot.wqe_idx, $entry);
-                    __last_ptr = __slot.ptr;
-                    __last_size = __size;
-                )+
-
-                $qp.__sq_ring_blueflame(__last_ptr);
-                Some((__last_ptr, __last_size))
+            if let Some(__slot) = $qp.__sq_ptr() {
+                let __size = $crate::wqe_write!(__slot.ptr, __slot.sqn, __slot.wqe_idx, $($segs)*);
+                let __wqebb = $crate::wqe::wqebb_cnt(__size);
+                $qp.__sq_advance_pi(__wqebb);
+                $qp.__sq_store_entry(__slot.wqe_idx, $entry);
+                $qp.__sq_set_last_wqe(__slot.ptr, __size);
+                Some(())
+            } else {
+                None
             }
         }
     }};
 
-    // Multiple WQEs without BlueFlame (batch mode)
-    ($qp:expr, $([$entry:expr; $($segs:tt)*]),+ $(,)? ) => {{
-        #[allow(unused_unsafe)]
-        unsafe {
-            '__post_wqe_block: {
-                let mut __last_ptr: *mut u8 = std::ptr::null_mut();
-                let mut __last_size: usize = 0;
-
-                $(
-                    let Some(__slot) = $qp.__sq_ptr() else {
-                        break '__post_wqe_block None;
-                    };
-                    let __size = $crate::wqe_write!(__slot.ptr, __slot.sqn, __slot.wqe_idx, $($segs)*);
-                    let __wqebb = $crate::wqe::wqebb_cnt(__size);
-                    $qp.__sq_advance_pi(__wqebb);
-                    $qp.__sq_store_entry(__slot.wqe_idx, $entry);
-                    __last_ptr = __slot.ptr;
-                    __last_size = __size;
-                )+
-
-                Some((__last_ptr, __last_size))
-            }
-        }
-    }};
-
-    // =========================================================================
-    // Single WQE (original patterns)
-    // =========================================================================
-
-    // Single WQE with BlueFlame
-    ($qp:expr, $entry:expr, blueflame, $($segs:tt)* ) => {{
+    (@emit_single $qp:expr, blueflame, $entry:expr, $($segs:tt)*) => {{
         #[allow(unused_unsafe)]
         unsafe {
             if let Some(__slot) = $qp.__sq_ptr() {
@@ -415,26 +465,116 @@ macro_rules! post_send_wqe {
                 $qp.__sq_advance_pi(__wqebb);
                 $qp.__sq_store_entry(__slot.wqe_idx, $entry);
                 $qp.__sq_ring_blueflame(__slot.ptr);
-                Some((__slot.wqe_idx, __slot.ptr, __size))
+                Some(())
             } else {
                 None
             }
         }
     }};
 
-    // Single WQE without BlueFlame (batch mode)
-    ($qp:expr, $entry:expr, $($segs:tt)* ) => {{
+    // =========================================================================
+    // Emit multiple WQEs (loop unrolling)
+    // =========================================================================
+
+    (@emit_multi $qp:expr, doorbell, $($op:ident $body:tt),+) => {{
         #[allow(unused_unsafe)]
         unsafe {
-            if let Some(__slot) = $qp.__sq_ptr() {
-                let __size = $crate::wqe_write!(__slot.ptr, __slot.sqn, __slot.wqe_idx, $($segs)*);
-                let __wqebb = $crate::wqe::wqebb_cnt(__size);
-                $qp.__sq_advance_pi(__wqebb);
-                $qp.__sq_store_entry(__slot.wqe_idx, $entry);
-                Some((__slot.wqe_idx, __slot.ptr, __size))
-            } else {
-                None
+            '__post_wqe_block: {
+                let mut __last_ptr: *mut u8 = std::ptr::null_mut();
+                let mut __last_size: usize = 0;
+
+                $(
+                    let (__ptr, __size) = $crate::post_send_wqe!(@emit_one_inner $qp, $op $body)?;
+                    __last_ptr = __ptr;
+                    __last_size = __size;
+                )+
+
+                $qp.__sq_set_last_wqe(__last_ptr, __last_size);
+                Some(())
             }
+        }
+    }};
+
+    (@emit_multi $qp:expr, blueflame, $($op:ident $body:tt),+) => {{
+        #[allow(unused_unsafe)]
+        unsafe {
+            '__post_wqe_block: {
+                let mut __last_ptr: *mut u8 = std::ptr::null_mut();
+                #[allow(unused_variables)]
+                let mut __last_size: usize = 0;
+
+                $(
+                    let (__ptr, __size) = $crate::post_send_wqe!(@emit_one_inner $qp, $op $body)?;
+                    __last_ptr = __ptr;
+                    __last_size = __size;
+                )+
+
+                $qp.__sq_ring_blueflame(__last_ptr);
+                Some(())
+            }
+        }
+    }};
+
+    // =========================================================================
+    // Emit one WQE (inner, returns Option<(ptr, size)>)
+    // =========================================================================
+
+    // write with imm
+    (@emit_one_inner $qp:expr, write {
+        entry: $entry:expr,
+        imm: $imm:expr,
+        $(fm_ce_se: $fm:expr,)?
+        remote_addr: $raddr:expr,
+        rkey: $rkey:expr,
+        data: [ $($data:tt)* ] $(,)?
+    }) => {{
+        let __fm_ce_se: u8 = $crate::post_send_wqe!(@fm_ce_se $($fm)?);
+        $crate::post_send_wqe!(@emit_one_raw $qp, $entry,
+            ctrl { opcode: 0x09u8, fm_ce_se: __fm_ce_se, imm: $imm },
+            rdma { remote_addr: $raddr, rkey: $rkey },
+            $($data)*
+        )
+    }};
+
+    // write without imm
+    (@emit_one_inner $qp:expr, write {
+        entry: $entry:expr,
+        $(fm_ce_se: $fm:expr,)?
+        remote_addr: $raddr:expr,
+        rkey: $rkey:expr,
+        data: [ $($data:tt)* ] $(,)?
+    }) => {{
+        let __fm_ce_se: u8 = $crate::post_send_wqe!(@fm_ce_se $($fm)?);
+        $crate::post_send_wqe!(@emit_one_raw $qp, $entry,
+            ctrl { opcode: 0x08u8, fm_ce_se: __fm_ce_se },
+            rdma { remote_addr: $raddr, rkey: $rkey },
+            $($data)*
+        )
+    }};
+
+    // send
+    (@emit_one_inner $qp:expr, send {
+        entry: $entry:expr,
+        $(fm_ce_se: $fm:expr,)?
+        data: [ $($data:tt)* ] $(,)?
+    }) => {{
+        let __fm_ce_se: u8 = $crate::post_send_wqe!(@fm_ce_se $($fm)?);
+        $crate::post_send_wqe!(@emit_one_raw $qp, $entry,
+            ctrl { opcode: 0x0Au8, fm_ce_se: __fm_ce_se },
+            $($data)*
+        )
+    }};
+
+    // Raw emit helper
+    (@emit_one_raw $qp:expr, $entry:expr, $($segs:tt)*) => {{
+        if let Some(__slot) = $qp.__sq_ptr() {
+            let __size = $crate::wqe_write!(__slot.ptr, __slot.sqn, __slot.wqe_idx, $($segs)*);
+            let __wqebb = $crate::wqe::wqebb_cnt(__size);
+            $qp.__sq_advance_pi(__wqebb);
+            $qp.__sq_store_entry(__slot.wqe_idx, $entry);
+            Some((__slot.ptr, __size))
+        } else {
+            None
         }
     }};
 }
