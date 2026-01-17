@@ -24,7 +24,7 @@ use mlx5::device::{Context, DeviceList};
 use mlx5::pd::{AccessFlags, MemoryRegion, Pd};
 use mlx5::qp::{RcQp, RcQpConfig, RemoteQpInfo};
 use mlx5::wqe::{WqeFlags, WqeOpcode};
-use mlx5::{wqe_post_batch, wqe_post_bf};
+use mlx5::post_send_wqe;
 
 // =============================================================================
 // Constants
@@ -719,8 +719,8 @@ fn run_lowlatency_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
     start.elapsed()
 }
 
-/// Throughput benchmark using wqe_post_batch! macro.
-fn run_throughput_bench_wqe_tx(client: &mut EndpointState, iters: u64, size: usize) -> Duration {
+/// Throughput benchmark using post_send_wqe! macro.
+fn run_throughput_bench_post_send_wqe(client: &mut EndpointState, iters: u64, size: usize) -> Duration {
     let size = size.min(256) as u32;
     let fm_ce_se = WqeFlags::COMPLETION.bits();
     let lkey = client.send_mr.lkey();
@@ -728,7 +728,7 @@ fn run_throughput_bench_wqe_tx(client: &mut EndpointState, iters: u64, size: usi
     let send_buf_addr = client.send_buf.addr();
     let remote_addr = client.remote_addr;
 
-    // Initial fill using wqe_post_batch! macro
+    // Initial fill using post_send_wqe! macro
     {
         let qp = client.qp.borrow();
         let mut last_ptr = std::ptr::null_mut();
@@ -736,7 +736,7 @@ fn run_throughput_bench_wqe_tx(client: &mut EndpointState, iters: u64, size: usi
         for i in 0..QUEUE_DEPTH {
             let offset = (i * 256) as u64;
             let imm = i as u32;
-            let (_, ptr, sz) = wqe_post_batch!(*qp, i as u64,
+            let (_, ptr, sz) = post_send_wqe!(*qp, i as u64,
                 ctrl { opcode: WqeOpcode::RdmaWriteImm, fm_ce_se: fm_ce_se, imm: imm },
                 rdma { remote_addr: remote_addr + offset, rkey: rkey },
                 sge { addr: send_buf_addr + offset, len: size, lkey: lkey },
@@ -794,7 +794,7 @@ fn run_throughput_bench_wqe_tx(client: &mut EndpointState, iters: u64, size: usi
                 let idx = rx_indices[i];
                 let offset = (idx * 256) as u64;
                 let imm = idx as u32;
-                let (_, ptr, sz) = wqe_post_batch!(*qp, idx as u64,
+                let (_, ptr, sz) = post_send_wqe!(*qp, idx as u64,
                     ctrl { opcode: WqeOpcode::RdmaWriteImm, fm_ce_se: fm_ce_se, imm: imm },
                     rdma { remote_addr: remote_addr + offset, rkey: rkey },
                     sge { addr: send_buf_addr + offset, len: size, lkey: lkey },
@@ -841,8 +841,8 @@ fn run_throughput_bench_wqe_tx(client: &mut EndpointState, iters: u64, size: usi
     start.elapsed()
 }
 
-/// Low-latency benchmark using wqe_post_bf! macro.
-fn run_lowlatency_bench_wqe_tx(client: &mut EndpointState, iters: u64, size: usize) -> Duration {
+/// Low-latency benchmark using post_send_wqe! macro with blueflame.
+fn run_lowlatency_bench_post_send_wqe(client: &mut EndpointState, iters: u64, size: usize) -> Duration {
     let size = size.min(256) as u32;
     let fm_ce_se = WqeFlags::COMPLETION.bits();
     let lkey = client.send_mr.lkey();
@@ -857,10 +857,10 @@ fn run_lowlatency_bench_wqe_tx(client: &mut EndpointState, iters: u64, size: usi
         let offset = (idx * 256) as u64;
         let imm = idx as u32;
 
-        // Post single WRITE+IMM with blueflame using wqe_post_bf! macro
+        // Post single WRITE+IMM with blueflame using post_send_wqe! macro
         {
             let qp = client.qp.borrow();
-            wqe_post_bf!(*qp, idx as u64,
+            post_send_wqe!(*qp, idx as u64, blueflame,
                 ctrl { opcode: WqeOpcode::RdmaWriteImm, fm_ce_se: fm_ce_se, imm: imm },
                 rdma { remote_addr: remote_addr + offset, rkey: rkey },
                 sge { addr: send_buf_addr + offset, len: size, lkey: lkey },
@@ -931,13 +931,13 @@ fn pingpong_benchmarks(c: &mut Criterion) {
             },
         );
 
-        // wqe_tx! macro API
+        // post_send_wqe! macro API
         group.bench_with_input(
-            BenchmarkId::new("wqe_tx", size),
+            BenchmarkId::new("post_send_wqe", size),
             &size,
             |b, &size| {
                 b.iter_custom(|iters| {
-                    run_throughput_bench_wqe_tx(&mut client.borrow_mut(), iters, size)
+                    run_throughput_bench_post_send_wqe(&mut client.borrow_mut(), iters, size)
                 });
             },
         );
@@ -960,13 +960,13 @@ fn pingpong_benchmarks(c: &mut Criterion) {
             },
         );
 
-        // wqe_tx! macro API
+        // post_send_wqe! macro API
         group.bench_with_input(
-            BenchmarkId::new("wqe_tx", size),
+            BenchmarkId::new("post_send_wqe", size),
             &size,
             |b, &size| {
                 b.iter_custom(|iters| {
-                    run_lowlatency_bench_wqe_tx(&mut client.borrow_mut(), iters, size)
+                    run_lowlatency_bench_post_send_wqe(&mut client.borrow_mut(), iters, size)
                 });
             },
         );

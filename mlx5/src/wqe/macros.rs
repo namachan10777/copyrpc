@@ -282,99 +282,63 @@ pub const fn wqebb_cnt(size: usize) -> u16 {
     ((size + 63) / 64) as u16
 }
 
-/// High-level WQE posting macro that hides internal details.
+/// Post a send WQE with entry tracking.
 ///
-/// This macro handles slot allocation, WQE construction, PI advancement,
-/// and entry storage automatically.
+/// This is the primary macro for posting WQEs. It handles:
+/// - SQ slot allocation
+/// - WQE construction from segments
+/// - PI advancement
+/// - Entry storage for completion callback
 ///
 /// # Syntax
 ///
 /// ```ignore
-/// // Post WQE without doorbell (batch mode)
-/// wqe_post!(qp, entry,
+/// // Without BlueFlame (batch mode - call ring_sq_doorbell() later)
+/// let (wqe_idx, ptr, size) = post_send_wqe!(qp, entry,
 ///     ctrl { opcode: RdmaWriteImm, fm_ce_se: 0x08, imm: 0x1234 },
 ///     rdma { remote_addr: addr, rkey: key },
 ///     sge { addr: local, len: 64, lkey: lk },
-/// );
+/// )?;
+/// // After batch:
+/// unsafe { qp.__sq_set_last_wqe(ptr, size); }
+/// qp.ring_sq_doorbell();
+///
+/// // With BlueFlame (low-latency single WQE)
+/// post_send_wqe!(qp, entry, blueflame,
+///     ctrl { opcode: RdmaWriteImm, fm_ce_se: 0x08, imm: 0x1234 },
+///     rdma { remote_addr: addr, rkey: key },
+///     sge { addr: local, len: 64, lkey: lk },
+/// )?;
 /// ```
 ///
 /// # Returns
-/// Returns `Option<u16>` - `Some(wqe_idx)` on success, `None` if SQ is full.
-#[macro_export]
-macro_rules! wqe_post {
-    // Without doorbell (batch mode)
-    ($qp:expr, $entry:expr, $($segs:tt)* ) => {{
-        #[allow(unused_unsafe)]
-        unsafe {
-            if let Some(__slot) = $qp.__sq_ptr() {
-                let __size = $crate::wqe_write!(__slot.ptr, __slot.sqn, __slot.wqe_idx, $($segs)*);
-                let __wqebb = $crate::wqe::wqebb_cnt(__size);
-                $qp.__sq_advance_pi(__wqebb);
-                $qp.__sq_set_last_wqe(__slot.ptr, __size);
-                $qp.__sq_store_entry(__slot.wqe_idx, $entry);
-                Some(__slot.wqe_idx)
-            } else {
-                None
-            }
-        }
-    }};
-}
-
-/// High-level WQE posting macro with doorbell.
+/// Returns `Option<(u16, *mut u8, usize)>` - `Some((wqe_idx, ptr, size))` on success,
+/// `None` if SQ is full or not initialized.
 ///
-/// Same as `wqe_post!` but rings the doorbell after posting.
+/// # BlueFlame
+/// When `blueflame` option is specified, the WQE is immediately sent via BlueFlame
+/// register. This provides lowest latency but is only suitable for single WQE submission.
+/// The WQE size must fit within the BlueFlame buffer (typically 64 bytes).
 #[macro_export]
-macro_rules! wqe_post_doorbell {
-    ($qp:expr, $entry:expr, $($segs:tt)* ) => {{
+macro_rules! post_send_wqe {
+    // With BlueFlame - must be first to match before the general pattern
+    ($qp:expr, $entry:expr, blueflame, $($segs:tt)* ) => {{
         #[allow(unused_unsafe)]
         unsafe {
             if let Some(__slot) = $qp.__sq_ptr() {
                 let __size = $crate::wqe_write!(__slot.ptr, __slot.sqn, __slot.wqe_idx, $($segs)*);
                 let __wqebb = $crate::wqe::wqebb_cnt(__size);
                 $qp.__sq_advance_pi(__wqebb);
-                $qp.__sq_set_last_wqe(__slot.ptr, __size);
                 $qp.__sq_store_entry(__slot.wqe_idx, $entry);
-                $qp.ring_sq_doorbell();
-                Some(__slot.wqe_idx)
-            } else {
-                None
-            }
-        }
-    }};
-}
-
-/// High-level WQE posting macro with BlueFlame.
-///
-/// Same as `wqe_post!` but uses BlueFlame for low-latency submission.
-#[macro_export]
-macro_rules! wqe_post_bf {
-    ($qp:expr, $entry:expr, $($segs:tt)* ) => {{
-        #[allow(unused_unsafe)]
-        unsafe {
-            if let Some(__slot) = $qp.__sq_ptr() {
-                let __size = $crate::wqe_write!(__slot.ptr, __slot.sqn, __slot.wqe_idx, $($segs)*);
-                let __wqebb = $crate::wqe::wqebb_cnt(__size);
-                $qp.__sq_advance_pi(__wqebb);
                 $qp.__sq_ring_blueflame(__slot.ptr);
-                $qp.__sq_store_entry(__slot.wqe_idx, $entry);
-                Some(__slot.wqe_idx)
+                Some((__slot.wqe_idx, __slot.ptr, __size))
             } else {
                 None
             }
         }
     }};
-}
 
-/// Batch WQE posting - does NOT call `__sq_set_last_wqe`.
-///
-/// Use this for batching multiple WQEs. After the batch, call
-/// `qp.__sq_set_last_wqe()` once with the last WQE's ptr/size,
-/// then `qp.ring_sq_doorbell()`.
-///
-/// # Returns
-/// Returns `Option<(u16, *mut u8, usize)>` - `Some((wqe_idx, ptr, size))` on success.
-#[macro_export]
-macro_rules! wqe_post_batch {
+    // Without BlueFlame (batch mode)
     ($qp:expr, $entry:expr, $($segs:tt)* ) => {{
         #[allow(unused_unsafe)]
         unsafe {
@@ -387,153 +351,6 @@ macro_rules! wqe_post_batch {
             } else {
                 None
             }
-        }
-    }};
-}
-
-/// WQE transaction macro for posting one or more WQEs with optional doorbell.
-///
-/// # Syntax
-///
-/// ```ignore
-/// // Single WQE, no doorbell (call ring_sq_doorbell() manually later)
-/// wqe_tx!(qp,
-///     [ctrl { ... }, rdma { ... }, sge { ... }]
-/// );
-///
-/// // Single WQE with doorbell
-/// wqe_tx!(qp,
-///     [ctrl { ... }, rdma { ... }, sge { ... }],
-///     doorbell
-/// );
-///
-/// // Single WQE with BlueFlame (low latency)
-/// wqe_tx!(qp,
-///     [ctrl { ... }, rdma { ... }, sge { ... }],
-///     blueflame
-/// );
-///
-/// // Multiple WQEs with doorbell
-/// wqe_tx!(qp,
-///     [ctrl { ... }, rdma { ... }, sge { ... }],
-///     [ctrl { ... }, rdma { ... }, sge { ... }],
-///     doorbell
-/// );
-/// ```
-///
-/// # Safety
-/// This macro uses unsafe operations internally. The QP must have direct access initialized.
-///
-/// # Returns
-/// Returns `Option<()>` - `Some(())` on success, `None` if the SQ is full or not initialized.
-#[macro_export]
-macro_rules! wqe_tx {
-    // Single WQE, no doorbell
-    ($qp:expr, [$($segs:tt)*] $(,)?) => {{
-        #[allow(unused_unsafe)]
-        unsafe {
-            let slot = $qp.__sq_ptr()?;
-            let size = $crate::wqe_write!(slot.ptr, slot.sqn, slot.wqe_idx, $($segs)*);
-            let wqebb = $crate::wqe::wqebb_cnt(size);
-            $qp.__sq_advance_pi(wqebb);
-            $qp.__sq_set_last_wqe(slot.ptr, size);
-            Some(())
-        }
-    }};
-
-    // Single WQE with doorbell
-    ($qp:expr, [$($segs:tt)*], doorbell $(,)?) => {{
-        #[allow(unused_unsafe)]
-        unsafe {
-            let slot = $qp.__sq_ptr()?;
-            let size = $crate::wqe_write!(slot.ptr, slot.sqn, slot.wqe_idx, $($segs)*);
-            let wqebb = $crate::wqe::wqebb_cnt(size);
-            $qp.__sq_advance_pi(wqebb);
-            $qp.__sq_set_last_wqe(slot.ptr, size);
-            $qp.ring_sq_doorbell();
-            Some(())
-        }
-    }};
-
-    // Single WQE with blueflame
-    ($qp:expr, [$($segs:tt)*], blueflame $(,)?) => {{
-        #[allow(unused_unsafe)]
-        unsafe {
-            let slot = $qp.__sq_ptr()?;
-            let size = $crate::wqe_write!(slot.ptr, slot.sqn, slot.wqe_idx, $($segs)*);
-            let wqebb = $crate::wqe::wqebb_cnt(size);
-            $qp.__sq_advance_pi(wqebb);
-            $qp.__sq_ring_blueflame(slot.ptr);
-            Some(())
-        }
-    }};
-
-    // Multiple WQEs, no doorbell
-    ($qp:expr, $([$($segs:tt)*]),+ $(,)?) => {{
-        #[allow(unused_unsafe)]
-        unsafe {
-            let mut __last_ptr: *mut u8 = std::ptr::null_mut();
-            let mut __last_size: usize = 0;
-
-            $(
-                let slot = $qp.__sq_ptr()?;
-                let size = $crate::wqe_write!(slot.ptr, slot.sqn, slot.wqe_idx, $($segs)*);
-                let wqebb = $crate::wqe::wqebb_cnt(size);
-                $qp.__sq_advance_pi(wqebb);
-                __last_ptr = slot.ptr;
-                __last_size = size;
-            )+
-
-            $qp.__sq_set_last_wqe(__last_ptr, __last_size);
-            Some(())
-        }
-    }};
-
-    // Multiple WQEs with doorbell
-    ($qp:expr, $([$($segs:tt)*]),+, doorbell $(,)?) => {{
-        #[allow(unused_unsafe)]
-        unsafe {
-            let mut __last_ptr: *mut u8 = std::ptr::null_mut();
-            let mut __last_size: usize = 0;
-
-            $(
-                let slot = $qp.__sq_ptr()?;
-                let size = $crate::wqe_write!(slot.ptr, slot.sqn, slot.wqe_idx, $($segs)*);
-                let wqebb = $crate::wqe::wqebb_cnt(size);
-                $qp.__sq_advance_pi(wqebb);
-                __last_ptr = slot.ptr;
-                __last_size = size;
-            )+
-
-            $qp.__sq_set_last_wqe(__last_ptr, __last_size);
-            $qp.ring_sq_doorbell();
-            Some(())
-        }
-    }};
-
-    // Multiple WQEs with blueflame
-    // Note: BlueFlame only copies the first 64 bytes, so this only makes sense
-    // when total WQE size fits in the BF buffer.
-    ($qp:expr, $([$($segs:tt)*]),+, blueflame $(,)?) => {{
-        #[allow(unused_unsafe)]
-        unsafe {
-            let mut __first_ptr: *mut u8 = std::ptr::null_mut();
-            let mut __is_first = true;
-
-            $(
-                let slot = $qp.__sq_ptr()?;
-                let size = $crate::wqe_write!(slot.ptr, slot.sqn, slot.wqe_idx, $($segs)*);
-                let wqebb = $crate::wqe::wqebb_cnt(size);
-                $qp.__sq_advance_pi(wqebb);
-
-                if __is_first {
-                    __first_ptr = slot.ptr;
-                    __is_first = false;
-                }
-            )+
-
-            $qp.__sq_ring_blueflame(__first_ptr);
-            Some(())
         }
     }};
 }
