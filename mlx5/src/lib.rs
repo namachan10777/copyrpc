@@ -95,6 +95,12 @@ pub mod wqe;
 // Re-export CQE types
 pub use cq::{Cqe, CqeOpcode};
 
+// Re-export low-level SQ access types for wqe_tx! macro
+pub use qp::SqSlot;
+
+// Re-export WQE macro utilities
+pub use wqe::wqebb_cnt;
+
 /// Trait for queues that can receive completion notifications from a CQ.
 ///
 /// Implemented by RcQp, DenseRcQp, etc.

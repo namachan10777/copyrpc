@@ -24,6 +24,7 @@ use mlx5::device::{Context, DeviceList};
 use mlx5::pd::{AccessFlags, MemoryRegion, Pd};
 use mlx5::qp::{RcQp, RcQpConfig, RemoteQpInfo};
 use mlx5::wqe::{WqeFlags, WqeOpcode};
+use mlx5::{wqe_post_batch, wqe_post_bf};
 
 // =============================================================================
 // Constants
@@ -229,8 +230,8 @@ fn create_endpoint(
     let recv_cq = Rc::new(ctx.create_cq(256).ok()?);
 
     let config = RcQpConfig {
-        max_send_wr: 256,
-        max_recv_wr: 256,
+        max_send_wr: QUEUE_DEPTH as u32,
+        max_recv_wr: QUEUE_DEPTH as u32,
         max_send_sge: 1,
         max_recv_sge: 1,
         max_inline_data: 256,
@@ -718,6 +719,180 @@ fn run_lowlatency_bench(client: &mut EndpointState, iters: u64, size: usize) -> 
     start.elapsed()
 }
 
+/// Throughput benchmark using wqe_post_batch! macro.
+fn run_throughput_bench_wqe_tx(client: &mut EndpointState, iters: u64, size: usize) -> Duration {
+    let size = size.min(256) as u32;
+    let fm_ce_se = WqeFlags::COMPLETION.bits();
+    let lkey = client.send_mr.lkey();
+    let rkey = client.remote_rkey;
+    let send_buf_addr = client.send_buf.addr();
+    let remote_addr = client.remote_addr;
+
+    // Initial fill using wqe_post_batch! macro
+    {
+        let qp = client.qp.borrow();
+        let mut last_ptr = std::ptr::null_mut();
+        let mut last_size = 0usize;
+        for i in 0..QUEUE_DEPTH {
+            let offset = (i * 256) as u64;
+            let imm = i as u32;
+            let (_, ptr, sz) = wqe_post_batch!(*qp, i as u64,
+                ctrl { opcode: WqeOpcode::RdmaWriteImm, fm_ce_se: fm_ce_se, imm: imm },
+                rdma { remote_addr: remote_addr + offset, rkey: rkey },
+                sge { addr: send_buf_addr + offset, len: size, lkey: lkey },
+            ).unwrap();
+            last_ptr = ptr;
+            last_size = sz;
+        }
+        unsafe { qp.__sq_set_last_wqe(last_ptr, last_size); }
+        qp.ring_sq_doorbell();
+    }
+
+    let start = std::time::Instant::now();
+    let mut completed = 0u64;
+    let mut inflight = QUEUE_DEPTH as u64;
+
+    while completed < iters {
+        client.shared_state.reset();
+        client.recv_cq.poll();
+        client.recv_cq.flush();
+        let rx_count = client.shared_state.rx_count.get();
+
+        completed += rx_count as u64;
+        inflight -= rx_count as u64;
+
+        if rx_count == 0 {
+            continue;
+        }
+
+        client.send_cq.poll();
+        client.send_cq.flush();
+
+        let rx_indices = *client.shared_state.rx_indices.borrow();
+
+        {
+            let qp = client.qp.borrow();
+            for i in 0..rx_count {
+                let idx = rx_indices[i];
+                let offset = (idx * 256) as u64;
+                qp.recv_builder(idx as u64)
+                    .unwrap()
+                    .sge(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey())
+                    .finish();
+            }
+        }
+
+        let remaining = iters.saturating_sub(completed);
+        let can_send = (QUEUE_DEPTH as u64).saturating_sub(inflight).min(remaining) as usize;
+        let to_send = can_send.min(rx_count);
+
+        if to_send > 0 {
+            let qp = client.qp.borrow();
+            let mut last_ptr = std::ptr::null_mut();
+            let mut last_size = 0usize;
+            for i in 0..to_send {
+                let idx = rx_indices[i];
+                let offset = (idx * 256) as u64;
+                let imm = idx as u32;
+                let (_, ptr, sz) = wqe_post_batch!(*qp, idx as u64,
+                    ctrl { opcode: WqeOpcode::RdmaWriteImm, fm_ce_se: fm_ce_se, imm: imm },
+                    rdma { remote_addr: remote_addr + offset, rkey: rkey },
+                    sge { addr: send_buf_addr + offset, len: size, lkey: lkey },
+                ).unwrap();
+                last_ptr = ptr;
+                last_size = sz;
+            }
+            unsafe { qp.__sq_set_last_wqe(last_ptr, last_size); }
+            inflight += to_send as u64;
+        }
+
+        {
+            let qp = client.qp.borrow();
+            qp.ring_rq_doorbell();
+            if to_send > 0 {
+                qp.ring_sq_doorbell();
+            }
+        }
+    }
+
+    // Drain remaining
+    while inflight > 0 {
+        client.shared_state.reset();
+        client.recv_cq.poll();
+        client.recv_cq.flush();
+        let rx_count = client.shared_state.rx_count.get();
+        inflight -= rx_count as u64;
+
+        let rx_indices = *client.shared_state.rx_indices.borrow();
+        let qp = client.qp.borrow();
+        for i in 0..rx_count {
+            let idx = rx_indices[i];
+            let offset = (idx * 256) as u64;
+            qp.recv_builder(idx as u64)
+                .unwrap()
+                .sge(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey())
+                .finish();
+        }
+        client.send_cq.poll();
+        client.send_cq.flush();
+    }
+    client.qp.borrow().ring_rq_doorbell();
+
+    start.elapsed()
+}
+
+/// Low-latency benchmark using wqe_post_bf! macro.
+fn run_lowlatency_bench_wqe_tx(client: &mut EndpointState, iters: u64, size: usize) -> Duration {
+    let size = size.min(256) as u32;
+    let fm_ce_se = WqeFlags::COMPLETION.bits();
+    let lkey = client.send_mr.lkey();
+    let rkey = client.remote_rkey;
+    let send_buf_addr = client.send_buf.addr();
+    let remote_addr = client.remote_addr;
+
+    let start = std::time::Instant::now();
+
+    for i in 0..iters {
+        let idx = (i as usize) % QUEUE_DEPTH;
+        let offset = (idx * 256) as u64;
+        let imm = idx as u32;
+
+        // Post single WRITE+IMM with blueflame using wqe_post_bf! macro
+        {
+            let qp = client.qp.borrow();
+            wqe_post_bf!(*qp, idx as u64,
+                ctrl { opcode: WqeOpcode::RdmaWriteImm, fm_ce_se: fm_ce_se, imm: imm },
+                rdma { remote_addr: remote_addr + offset, rkey: rkey },
+                sge { addr: send_buf_addr + offset, len: size, lkey: lkey },
+            ).unwrap();
+        }
+
+        // Wait for completion
+        loop {
+            client.send_cq.poll();
+            client.send_cq.flush();
+
+            client.shared_state.reset();
+            client.recv_cq.poll();
+            client.recv_cq.flush();
+
+            if client.shared_state.rx_count.get() > 0 {
+                let recv_idx = client.shared_state.rx_indices.borrow()[0];
+                let offset = (recv_idx * 256) as u64;
+                let qp = client.qp.borrow();
+                qp.recv_builder(recv_idx as u64)
+                    .unwrap()
+                    .sge(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey())
+                    .finish();
+                qp.ring_rq_doorbell();
+                break;
+            }
+        }
+    }
+
+    start.elapsed()
+}
+
 // =============================================================================
 // Criterion Benchmarks
 // =============================================================================
@@ -747,28 +922,52 @@ fn pingpong_benchmarks(c: &mut Criterion) {
         group.measurement_time(Duration::from_secs(3));
         group.throughput(Throughput::Elements(1)); // Per operation throughput
 
+        // Original builder API
         group.bench_with_input(
-            BenchmarkId::new("write_imm_qd64", size),
+            BenchmarkId::new("builder", size),
             &size,
             |b, &size| {
                 b.iter_custom(|iters| run_throughput_bench(&mut client.borrow_mut(), iters, size));
             },
         );
 
+        // wqe_tx! macro API
+        group.bench_with_input(
+            BenchmarkId::new("wqe_tx", size),
+            &size,
+            |b, &size| {
+                b.iter_custom(|iters| {
+                    run_throughput_bench_wqe_tx(&mut client.borrow_mut(), iters, size)
+                });
+            },
+        );
+
         group.finish();
     }
 
-    // Low-latency benchmark: queue depth = 1, inline + blueflame
+    // Low-latency benchmark: queue depth = 1, blueflame
     {
         let mut group = c.benchmark_group("latency");
         group.sample_size(10);
         group.measurement_time(Duration::from_secs(1));
 
+        // Original builder API with inline data
         group.bench_with_input(
-            BenchmarkId::new("write_imm_inline_bf", size),
+            BenchmarkId::new("builder_inline", size),
             &size,
             |b, &size| {
                 b.iter_custom(|iters| run_lowlatency_bench(&mut client.borrow_mut(), iters, size));
+            },
+        );
+
+        // wqe_tx! macro API
+        group.bench_with_input(
+            BenchmarkId::new("wqe_tx", size),
+            &size,
+            |b, &size| {
+                b.iter_custom(|iters| {
+                    run_lowlatency_bench_wqe_tx(&mut client.borrow_mut(), iters, size)
+                });
             },
         );
 

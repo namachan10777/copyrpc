@@ -2,6 +2,10 @@
 //!
 //! Provides segment definitions, opcodes, WQE table, and traits shared across QP types.
 
+pub mod macros;
+
+pub use macros::wqebb_cnt;
+
 use bitflags::bitflags;
 
 /// WQEBB (Work Queue Element Basic Block) size in bytes.
@@ -36,14 +40,14 @@ impl CtrlSeg {
     ) {
         let opmod_idx_opcode = ((wqe_idx as u32) << 8) | (opcode as u32);
         let qpn_ds = (qpn << 8) | (ds_cnt as u32);
+        // Combine sig(0), dci_stream[15:8](0), dci_stream[7:0](0), fm_ce_se into single u32
+        // Layout in big-endian: [sig][stream_hi][stream_lo][fm_ce_se]
+        let sig_stream_fm = fm_ce_se as u32;
 
         let ptr32 = ptr as *mut u32;
         std::ptr::write_volatile(ptr32, opmod_idx_opcode.to_be());
         std::ptr::write_volatile(ptr32.add(1), qpn_ds.to_be());
-        std::ptr::write_volatile(ptr.add(8), 0); // signature
-        std::ptr::write_volatile(ptr.add(9), 0); // dci_stream[15:8]
-        std::ptr::write_volatile(ptr.add(10), 0); // dci_stream[7:0]
-        std::ptr::write_volatile(ptr.add(11), fm_ce_se);
+        std::ptr::write_volatile(ptr32.add(2), sig_stream_fm.to_be());
         std::ptr::write_volatile(ptr32.add(3), imm.to_be());
     }
 
@@ -494,4 +498,5 @@ impl<T> Iterator for DenseTakeRange<'_, T> {
         }
     }
 }
+
 

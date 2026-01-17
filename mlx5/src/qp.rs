@@ -1421,4 +1421,129 @@ impl<T, Tab, F> RcQpInner<T, Tab, F> {
             rq.ring_doorbell();
         }
     }
+
+    /// Get the Send Queue Number (SQN).
+    ///
+    /// Returns None if direct access is not initialized.
+    #[inline]
+    pub fn sqn(&self) -> Option<u32> {
+        self.sq.as_ref().map(|sq| sq.sqn)
+    }
+}
+
+// =============================================================================
+// Low-level SQ Access API for wqe_tx! macro
+// =============================================================================
+
+/// SQ slot information for direct WQE construction.
+///
+/// Contains the raw pointers and indices needed for constructing WQEs directly
+/// without using the builder pattern.
+#[derive(Debug, Clone, Copy)]
+pub struct SqSlot {
+    /// Pointer to the WQE buffer (64-byte aligned WQEBB).
+    pub ptr: *mut u8,
+    /// WQE index in the send queue.
+    pub wqe_idx: u16,
+    /// Send Queue Number.
+    pub sqn: u32,
+}
+
+impl<T, Tab, F> RcQpInner<T, Tab, F> {
+    /// Get a raw SQ slot for direct WQE construction.
+    ///
+    /// Returns `None` if the SQ is not initialized or full.
+    ///
+    /// # Safety
+    /// The caller must:
+    /// - Write a valid WQE to the returned pointer
+    /// - Call `__sq_advance_pi()` after writing the WQE
+    /// - Call `__sq_set_last_wqe()` or `__sq_ring_blueflame()` to notify the HCA
+    #[inline]
+    pub unsafe fn __sq_ptr(&self) -> Option<SqSlot> {
+        let sq = self.sq.as_ref()?;
+        if sq.available() == 0 {
+            return None;
+        }
+
+        let wqe_idx = sq.pi.get();
+        let ptr = sq.get_wqe_ptr(wqe_idx);
+
+        Some(SqSlot {
+            ptr,
+            wqe_idx,
+            sqn: sq.sqn,
+        })
+    }
+
+    /// Advance the SQ producer index.
+    ///
+    /// # Safety
+    /// The caller must have written a valid WQE to the SQ buffer before calling this.
+    #[inline]
+    pub unsafe fn __sq_advance_pi(&self, wqebb_cnt: u16) {
+        if let Some(sq) = self.sq.as_ref() {
+            sq.advance_pi(wqebb_cnt);
+        }
+    }
+
+    /// Set the last WQE pointer and size for doorbell.
+    ///
+    /// Call `ring_sq_doorbell()` after this to notify the HCA.
+    ///
+    /// # Safety
+    /// The caller must ensure `ptr` points to a valid WQE in the SQ buffer.
+    #[inline]
+    pub unsafe fn __sq_set_last_wqe(&self, ptr: *mut u8, size: usize) {
+        if let Some(sq) = self.sq.as_ref() {
+            sq.set_last_wqe(ptr, size);
+        }
+    }
+
+    /// Ring the BlueFlame doorbell for low-latency WQE submission.
+    ///
+    /// This combines the doorbell record update and BlueFlame copy in a single operation.
+    ///
+    /// # Safety
+    /// The caller must ensure `wqe_ptr` points to a valid WQE in the SQ buffer.
+    #[inline]
+    pub unsafe fn __sq_ring_blueflame(&self, wqe_ptr: *mut u8) {
+        if let Some(sq) = self.sq.as_ref() {
+            sq.ring_blueflame(wqe_ptr);
+        }
+    }
+
+    /// Get the BlueFlame buffer size.
+    ///
+    /// Returns 0 if BlueFlame is not available or SQ is not initialized.
+    #[inline]
+    pub fn __sq_bf_size(&self) -> u32 {
+        self.sq.as_ref().map(|sq| sq.bf_size).unwrap_or(0)
+    }
+}
+
+impl<T, F> RcQp<T, F> {
+    /// Store an entry in the sparse WQE table.
+    ///
+    /// # Safety
+    /// The caller must ensure `wqe_idx` corresponds to a valid pending WQE.
+    #[inline]
+    pub unsafe fn __sq_store_entry(&self, wqe_idx: u16, entry: T) {
+        if let Some(sq) = self.sq.as_ref() {
+            sq.table.store(wqe_idx, entry);
+        }
+    }
+}
+
+impl<T, F> DenseRcQp<T, F> {
+    /// Store an entry in the dense WQE table.
+    ///
+    /// # Safety
+    /// The caller must ensure `wqe_idx` corresponds to a valid pending WQE.
+    #[inline]
+    pub unsafe fn __sq_store_entry(&self, wqe_idx: u16, entry: T) {
+        if let Some(sq) = self.sq.as_ref() {
+            sq.table.store(wqe_idx, entry);
+        }
+    }
 }
