@@ -746,6 +746,67 @@ impl Context {
             })
         }
     }
+
+    /// Create an RC Queue Pair for use with MonoCq (no internal callback).
+    ///
+    /// The callback is stored on the MonoCq side, not the QP. This enables
+    /// the compiler to inline the callback when polling the MonoCq.
+    ///
+    /// # Arguments
+    /// * `pd` - Protection Domain
+    /// * `send_cq` - MonoCq for send completions
+    /// * `recv_cq` - MonoCq for receive completions
+    /// * `config` - QP configuration
+    ///
+    /// # Errors
+    /// Returns an error if the QP cannot be created.
+    pub fn create_rc_qp_for_mono_cq<T, Q, SF, RF>(
+        &self,
+        pd: &Pd,
+        send_cq: &crate::mono_cq::MonoCq<Q, SF>,
+        recv_cq: &crate::mono_cq::MonoCq<Q, RF>,
+        config: &RcQpConfig,
+    ) -> io::Result<Rc<RefCell<RcQpForMonoCq<T>>>>
+    where
+        Q: crate::mono_cq::CompletionSource,
+        SF: Fn(Cqe, Q::Entry),
+        RF: Fn(Cqe, Q::Entry),
+    {
+        unsafe {
+            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
+            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
+            qp_attr.send_cq = send_cq.as_ptr();
+            qp_attr.recv_cq = recv_cq.as_ptr();
+            qp_attr.cap.max_send_wr = config.max_send_wr;
+            qp_attr.cap.max_recv_wr = config.max_recv_wr;
+            qp_attr.cap.max_send_sge = config.max_send_sge;
+            qp_attr.cap.max_recv_sge = config.max_recv_sge;
+            qp_attr.cap.max_inline_data = config.max_inline_data;
+            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
+            qp_attr.pd = pd.as_ptr();
+
+            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
+            mlx5_attr.comp_mask =
+                mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS as u64;
+            mlx5_attr.create_flags =
+                mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
+
+            let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            NonNull::new(qp).map_or(Err(io::Error::last_os_error()), |qp| {
+                Ok(Rc::new(RefCell::new(RcQpInner {
+                    qp,
+                    state: Cell::new(QpState::Reset),
+                    sq: None,
+                    rq: None,
+                    callback: (),
+                    // Empty weak references - MonoCq handles unregistration via Weak upgrade failure
+                    send_cq: Weak::new(),
+                    recv_cq: Weak::new(),
+                    _pd: pd.clone(),
+                })))
+            })
+        }
+    }
 }
 
 impl<T, Tab, F> Drop for RcQpInner<T, Tab, F> {
@@ -1547,3 +1608,36 @@ impl<T, F> DenseRcQp<T, F> {
         }
     }
 }
+
+// =============================================================================
+// CompletionSource impl for RcQp (for use with MonoCq)
+// =============================================================================
+
+use crate::mono_cq::CompletionSource;
+
+impl<T> CompletionSource for RcQpInner<T, SparseWqeTable<T>, ()> {
+    type Entry = T;
+
+    fn qpn(&self) -> u32 {
+        RcQpInner::qpn(self)
+    }
+
+    fn process_cqe(&self, cqe: Cqe) -> Option<T> {
+        if cqe.opcode.is_responder() {
+            // RQ completion (responder)
+            self.rq.as_ref()?.process_completion(cqe.wqe_counter)
+        } else {
+            // SQ completion (requester)
+            self.sq.as_ref()?.process_completion_sparse(cqe.wqe_counter)
+        }
+    }
+}
+
+// =============================================================================
+// RcQp without callback for MonoCq
+// =============================================================================
+
+/// RcQp type for use with MonoCq (no internal callback).
+///
+/// This is an alias for `RcQp<T, ()>`. All methods from `RcQp` are available.
+pub type RcQpForMonoCq<T> = RcQpInner<T, SparseWqeTable<T>, ()>;

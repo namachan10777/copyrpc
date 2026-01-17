@@ -21,8 +21,9 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 
 use mlx5::cq::{CompletionQueue, Cqe, CqeOpcode};
 use mlx5::device::{Context, DeviceList};
+use mlx5::mono_cq::MonoCqRc;
 use mlx5::pd::{AccessFlags, MemoryRegion, Pd};
-use mlx5::qp::{RcQp, RcQpConfig, RemoteQpInfo};
+use mlx5::qp::{RcQp, RcQpConfig, RcQpForMonoCq, RemoteQpInfo};
 use mlx5::post_send_wqe_simd;
 use mlx5::post_send_wqe_template_mov;
 use mlx5::wqe::simd::RdmaWriteImmTemplate;
@@ -202,6 +203,40 @@ struct BenchmarkSetup {
 }
 
 // =============================================================================
+// MonoCq Endpoint State (for inlined callback benchmark)
+// =============================================================================
+
+/// Endpoint state using MonoCq for inlined callback dispatch.
+/// Generic over callback types to enable true inlining (no Box<dyn Fn>).
+struct MonoCqEndpointState<SF, RF>
+where
+    SF: Fn(Cqe, u64),
+    RF: Fn(Cqe, u64),
+{
+    qp: Rc<RefCell<RcQpForMonoCq<u64>>>,
+    send_cq: MonoCqRc<u64, SF>,
+    recv_cq: MonoCqRc<u64, RF>,
+    shared_state: SharedCqeState,
+    send_mr: MemoryRegion,
+    recv_mr: MemoryRegion,
+    send_buf: AlignedBuffer,
+    recv_buf: AlignedBuffer,
+    remote_addr: u64,
+    remote_rkey: u32,
+}
+
+struct MonoCqBenchmarkSetup<SF, RF>
+where
+    SF: Fn(Cqe, u64),
+    RF: Fn(Cqe, u64),
+{
+    client: MonoCqEndpointState<SF, RF>,
+    _server_handle: ServerHandle,
+    _pd: Rc<Pd>,
+    _ctx: Context,
+}
+
+// =============================================================================
 // Device/QP Setup Functions
 // =============================================================================
 
@@ -353,6 +388,146 @@ fn setup_benchmark() -> Option<BenchmarkSetup> {
     };
 
     Some(BenchmarkSetup {
+        client,
+        _server_handle: server_handle,
+        _pd: pd,
+        _ctx: ctx,
+    })
+}
+
+fn setup_mono_cq_benchmark() -> Option<
+    MonoCqBenchmarkSetup<
+        impl Fn(Cqe, u64),
+        impl Fn(Cqe, u64),
+    >,
+> {
+    let ctx = open_mlx5_device()?;
+    let port = 1u8;
+    let port_attr = ctx.query_port(port).ok()?;
+    let pd = Rc::new(ctx.alloc_pd().ok()?);
+
+    // Create shared state for callback
+    let shared_state = SharedCqeState::new();
+    let shared_state_for_recv = shared_state.clone();
+
+    // Create MonoCq callbacks directly (no Box<dyn Fn> - enables inlining)
+    let send_callback = move |_cqe: Cqe, _entry: u64| {
+        // SQ completions - no-op for this benchmark
+    };
+
+    let recv_callback = move |cqe: Cqe, _entry: u64| {
+        if cqe.opcode.is_responder() && cqe.syndrome == 0 {
+            shared_state_for_recv.push(&cqe);
+        }
+    };
+
+    // Create MonoCqs with concrete closure types
+    let send_cq = ctx.create_mono_cq(256, send_callback).ok()?;
+    let recv_cq = ctx.create_mono_cq(256, recv_callback).ok()?;
+
+    let config = RcQpConfig {
+        max_send_wr: QUEUE_DEPTH as u32,
+        max_recv_wr: QUEUE_DEPTH as u32,
+        max_send_sge: 1,
+        max_recv_sge: 1,
+        max_inline_data: 256,
+    };
+
+    // Create QP for MonoCq (no internal callback)
+    let qp = ctx
+        .create_rc_qp_for_mono_cq::<u64, _, _, _>(&pd, &send_cq, &recv_cq, &config)
+        .ok()?;
+
+    // Register QP with MonoCqs
+    send_cq.register(&qp);
+    recv_cq.register(&qp);
+
+    let send_buf = AlignedBuffer::new(BUFFER_SIZE);
+    let recv_buf = AlignedBuffer::new(BUFFER_SIZE);
+
+    let send_mr =
+        unsafe { pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }.ok()?;
+    let recv_mr =
+        unsafe { pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }.ok()?;
+
+    // Connection info
+    let client_info = ConnectionInfo {
+        qpn: qp.borrow().qpn(),
+        lid: port_attr.lid,
+        buf_addr: recv_buf.addr(),
+        rkey: recv_mr.rkey(),
+    };
+
+    // Channels for server communication
+    let (server_info_tx, server_info_rx): (Sender<ConnectionInfo>, Receiver<ConnectionInfo>) =
+        mpsc::channel();
+    let (client_info_tx, client_info_rx): (Sender<ConnectionInfo>, Receiver<ConnectionInfo>) =
+        mpsc::channel();
+    let server_ready = Arc::new(AtomicU32::new(0));
+    let server_ready_clone = server_ready.clone();
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let server_stop = stop_flag.clone();
+
+    // Start server thread (uses existing dynamic dispatch CQ)
+    let handle = thread::spawn(move || {
+        server_thread_main(
+            server_info_tx,
+            client_info_rx,
+            server_ready_clone,
+            server_stop,
+        );
+    });
+
+    client_info_tx.send(client_info).ok()?;
+    let server_info = server_info_rx.recv().ok()?;
+
+    while server_ready.load(Ordering::Acquire) == 0 {
+        std::hint::spin_loop();
+    }
+
+    // Connect client QP
+    let server_remote = RemoteQpInfo {
+        qpn: server_info.qpn,
+        psn: 0,
+        lid: server_info.lid,
+    };
+
+    let access = full_access().bits();
+    qp.borrow_mut()
+        .connect(&server_remote, port, 0, 4, 4, access)
+        .ok()?;
+
+    // Pre-post receives
+    for i in 0..QUEUE_DEPTH {
+        let offset = (i * 256) as u64;
+        qp.borrow()
+            .recv_builder(i as u64)
+            .unwrap()
+            .sge(recv_buf.addr() + offset, 256, recv_mr.lkey())
+            .finish();
+    }
+    qp.borrow().ring_rq_doorbell();
+
+    let client = MonoCqEndpointState {
+        qp,
+        send_cq,
+        recv_cq,
+        shared_state,
+        send_mr,
+        recv_mr,
+        send_buf,
+        recv_buf,
+        remote_addr: server_info.buf_addr,
+        remote_rkey: server_info.rkey,
+    };
+
+    let server_handle = ServerHandle {
+        stop_flag,
+        handle: Some(handle),
+    };
+
+    Some(MonoCqBenchmarkSetup {
         client,
         _server_handle: server_handle,
         _pd: pd,
@@ -566,7 +741,7 @@ fn run_throughput_bench_simd(client: &mut EndpointState, iters: u64, size: usize
                     write {
                         entry: i as u64,
                         imm: i as u32,
-                        fm_ce_se: 0x00,
+                        flags: WqeFlags::empty(),
                         remote_addr: remote_addr + offset,
                         rkey: rkey,
                         local_addr: send_buf_addr + offset,
@@ -583,7 +758,7 @@ fn run_throughput_bench_simd(client: &mut EndpointState, iters: u64, size: usize
                 write {
                     entry: i as u64,
                     imm: i as u32,
-                    fm_ce_se: 0x08,
+                    flags: WqeFlags::COMPLETION,
                     remote_addr: remote_addr + offset,
                     rkey: rkey,
                     local_addr: send_buf_addr + offset,
@@ -652,7 +827,7 @@ fn run_throughput_bench_simd(client: &mut EndpointState, iters: u64, size: usize
                         write {
                             entry: idx as u64,
                             imm: idx as u32,
-                            fm_ce_se: 0x00,
+                            flags: WqeFlags::empty(),
                             remote_addr: remote_addr + offset,
                             rkey: rkey,
                             local_addr: send_buf_addr + offset,
@@ -669,7 +844,7 @@ fn run_throughput_bench_simd(client: &mut EndpointState, iters: u64, size: usize
                     write {
                         entry: idx as u64,
                         imm: idx as u32,
-                        fm_ce_se: 0x08,
+                        flags: WqeFlags::COMPLETION,
                         remote_addr: remote_addr + offset,
                         rkey: rkey,
                         local_addr: send_buf_addr + offset,
@@ -689,7 +864,7 @@ fn run_throughput_bench_simd(client: &mut EndpointState, iters: u64, size: usize
                     write {
                         entry: idx as u64,
                         imm: idx as u32,
-                        fm_ce_se: 0x08,
+                        flags: WqeFlags::COMPLETION,
                         remote_addr: remote_addr + offset,
                         rkey: rkey,
                         local_addr: send_buf_addr + offset,
@@ -749,8 +924,8 @@ fn run_throughput_bench_template_mov(client: &mut EndpointState, iters: u64, siz
 
     // Create two templates: unsignaled and signaled
     let sqn = client.qp.borrow().sqn().unwrap();
-    let template_unsig = RdmaWriteImmTemplate::new(sqn, 0x00, rkey, lkey);
-    let template_sig = RdmaWriteImmTemplate::new(sqn, 0x08, rkey, lkey);
+    let template_unsig = RdmaWriteImmTemplate::new(sqn, WqeFlags::empty(), rkey, lkey);
+    let template_sig = RdmaWriteImmTemplate::new(sqn, WqeFlags::COMPLETION, rkey, lkey);
 
     // Initial fill - unrolled: 3 unsignaled + 1 signaled per batch
     {
@@ -948,7 +1123,7 @@ fn run_lowlatency_bench_simd(client: &mut EndpointState, iters: u64, size: usize
                 write {
                     entry: idx as u64,
                     imm: imm,
-                    fm_ce_se: 0x08,
+                    flags: WqeFlags::COMPLETION,
                     remote_addr: remote_addr + offset,
                     rkey: rkey,
                     local_addr: send_buf_addr + offset,
@@ -981,6 +1156,206 @@ fn run_lowlatency_bench_simd(client: &mut EndpointState, iters: u64, size: usize
             }
         }
     }
+
+    start.elapsed()
+}
+
+/// Throughput benchmark using MonoCq for inlined callback dispatch.
+fn run_throughput_bench_mono_cq<SF, RF>(client: &mut MonoCqEndpointState<SF, RF>, iters: u64, size: usize) -> Duration
+where
+    SF: Fn(Cqe, u64),
+    RF: Fn(Cqe, u64),
+{
+    let size = size.min(256) as u32;
+    let lkey = client.send_mr.lkey();
+    let rkey = client.remote_rkey;
+    let send_buf_addr = client.send_buf.addr();
+    let remote_addr = client.remote_addr;
+
+    // Initial fill - unrolled: 3 unsignaled + 1 signaled per batch
+    {
+        let qp = client.qp.borrow();
+        for batch in 0..(QUEUE_DEPTH / 4) {
+            let base = batch * 4;
+            // 3 unsignaled
+            for j in 0..3 {
+                let i = base + j;
+                let offset = (i * 256) as u64;
+                post_send_wqe_simd!{
+                    qp: *qp,
+                    write {
+                        entry: i as u64,
+                        imm: i as u32,
+                        flags: WqeFlags::empty(),
+                        remote_addr: remote_addr + offset,
+                        rkey: rkey,
+                        local_addr: send_buf_addr + offset,
+                        len: size,
+                        lkey: lkey,
+                    },
+                }.unwrap();
+            }
+            // 1 signaled
+            let i = base + 3;
+            let offset = (i * 256) as u64;
+            post_send_wqe_simd!{
+                qp: *qp,
+                write {
+                    entry: i as u64,
+                    imm: i as u32,
+                    flags: WqeFlags::COMPLETION,
+                    remote_addr: remote_addr + offset,
+                    rkey: rkey,
+                    local_addr: send_buf_addr + offset,
+                    len: size,
+                    lkey: lkey,
+                },
+            }.unwrap();
+        }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+        unsafe { std::arch::x86_64::_mm_sfence(); }
+        qp.ring_sq_doorbell();
+    }
+
+    let start = std::time::Instant::now();
+    let mut completed = 0u64;
+    let mut inflight = QUEUE_DEPTH as u64;
+
+    while completed < iters {
+        client.shared_state.reset();
+        // MonoCq poll - callback is inlined here
+        client.recv_cq.poll();
+        client.recv_cq.flush();
+        let rx_count = client.shared_state.rx_count.get();
+
+        completed += rx_count as u64;
+        inflight -= rx_count as u64;
+
+        if rx_count == 0 {
+            continue;
+        }
+
+        client.send_cq.poll();
+        client.send_cq.flush();
+
+        let rx_indices = *client.shared_state.rx_indices.borrow();
+
+        {
+            let qp = client.qp.borrow();
+            for i in 0..rx_count {
+                let idx = rx_indices[i];
+                let offset = (idx * 256) as u64;
+                qp.recv_builder(idx as u64)
+                    .unwrap()
+                    .sge(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey())
+                    .finish();
+            }
+        }
+
+        let remaining = iters.saturating_sub(completed);
+        let can_send = (QUEUE_DEPTH as u64).saturating_sub(inflight).min(remaining) as usize;
+        let to_send = can_send.min(rx_count);
+
+        if to_send > 0 {
+            let qp = client.qp.borrow();
+            let full_batches = to_send / 4;
+            let remainder = to_send % 4;
+
+            // Process full batches of 4: 3 unsignaled + 1 signaled
+            for batch in 0..full_batches {
+                let base = batch * 4;
+                // 3 unsignaled
+                for j in 0..3 {
+                    let idx = rx_indices[base + j];
+                    let offset = (idx * 256) as u64;
+                    post_send_wqe_simd!{
+                        qp: *qp,
+                        write {
+                            entry: idx as u64,
+                            imm: idx as u32,
+                            flags: WqeFlags::empty(),
+                            remote_addr: remote_addr + offset,
+                            rkey: rkey,
+                            local_addr: send_buf_addr + offset,
+                            len: size,
+                            lkey: lkey,
+                        },
+                    }.unwrap();
+                }
+                // 1 signaled
+                let idx = rx_indices[base + 3];
+                let offset = (idx * 256) as u64;
+                post_send_wqe_simd!{
+                    qp: *qp,
+                    write {
+                        entry: idx as u64,
+                        imm: idx as u32,
+                        flags: WqeFlags::COMPLETION,
+                        remote_addr: remote_addr + offset,
+                        rkey: rkey,
+                        local_addr: send_buf_addr + offset,
+                        len: size,
+                        lkey: lkey,
+                    },
+                }.unwrap();
+            }
+
+            // Handle remainder (all signaled to ensure completion)
+            let base = full_batches * 4;
+            for j in 0..remainder {
+                let idx = rx_indices[base + j];
+                let offset = (idx * 256) as u64;
+                post_send_wqe_simd!{
+                    qp: *qp,
+                    write {
+                        entry: idx as u64,
+                        imm: idx as u32,
+                        flags: WqeFlags::COMPLETION,
+                        remote_addr: remote_addr + offset,
+                        rkey: rkey,
+                        local_addr: send_buf_addr + offset,
+                        len: size,
+                        lkey: lkey,
+                    },
+                }.unwrap();
+            }
+
+            inflight += to_send as u64;
+        }
+
+        {
+            let qp = client.qp.borrow();
+            qp.ring_rq_doorbell();
+            if to_send > 0 {
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+                unsafe { std::arch::x86_64::_mm_sfence(); }
+                qp.ring_sq_doorbell();
+            }
+        }
+    }
+
+    // Drain remaining
+    while inflight > 0 {
+        client.shared_state.reset();
+        client.recv_cq.poll();
+        client.recv_cq.flush();
+        let rx_count = client.shared_state.rx_count.get();
+        inflight -= rx_count as u64;
+
+        let rx_indices = *client.shared_state.rx_indices.borrow();
+        let qp = client.qp.borrow();
+        for i in 0..rx_count {
+            let idx = rx_indices[i];
+            let offset = (idx * 256) as u64;
+            qp.recv_builder(idx as u64)
+                .unwrap()
+                .sge(client.recv_buf.addr() + offset, 256, client.recv_mr.lkey())
+                .finish();
+        }
+        client.send_cq.poll();
+        client.send_cq.flush();
+    }
+    client.qp.borrow().ring_rq_doorbell();
 
     start.elapsed()
 }
@@ -1082,5 +1457,64 @@ fn pingpong_benchmarks(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, pingpong_benchmarks);
+/// MonoCq benchmark - measures inlined callback dispatch performance.
+fn mono_cq_benchmarks(c: &mut Criterion) {
+    let setup = match setup_mono_cq_benchmark() {
+        Some(s) => s,
+        None => {
+            eprintln!("Skipping MonoCq benchmarks: no mlx5 device available");
+            return;
+        }
+    };
+
+    let _ctx = setup._ctx;
+    let _pd = setup._pd;
+    let client = RefCell::new(setup.client);
+    let mut server_handle = setup._server_handle;
+
+    let size = 32usize;
+
+    // MonoCq throughput benchmark: inlined callback dispatch
+    {
+        let mut group = c.benchmark_group("throughput_mono_cq");
+        group.sample_size(10);
+        group.measurement_time(Duration::from_secs(3));
+        group.throughput(Throughput::Elements(1));
+
+        group.bench_with_input(
+            BenchmarkId::new("simd", size),
+            &size,
+            |b, &size| {
+                b.iter_custom(|iters| {
+                    run_throughput_bench_mono_cq(&mut client.borrow_mut(), iters, size)
+                });
+            },
+        );
+
+        group.finish();
+    }
+
+    // Cleanup
+    server_handle.stop();
+
+    let client = client.into_inner();
+    loop {
+        let mut drained = false;
+        client.shared_state.reset();
+        client.recv_cq.poll();
+        if client.shared_state.rx_count.get() > 0 {
+            drained = true;
+        }
+        client.recv_cq.flush();
+        if client.send_cq.poll() > 0 {
+            drained = true;
+        }
+        client.send_cq.flush();
+        if !drained {
+            break;
+        }
+    }
+}
+
+criterion_group!(benches, pingpong_benchmarks, mono_cq_benchmarks);
 criterion_main!(benches);

@@ -84,6 +84,7 @@ mod barrier;
 pub mod cq;
 pub mod dc;
 pub mod device;
+pub mod mono_cq;
 pub mod pd;
 pub mod qp;
 pub mod srq;
@@ -100,6 +101,10 @@ pub use qp::SqSlot;
 
 // Re-export WQE macro utilities
 pub use wqe::wqebb_cnt;
+
+// Re-export MonoCq types for inlined callback dispatch
+pub use mono_cq::{CompletionSource, MonoCq, MonoCqRc};
+pub use qp::RcQpForMonoCq;
 
 /// Trait for queues that can receive completion notifications from a CQ.
 ///
