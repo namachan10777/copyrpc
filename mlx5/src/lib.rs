@@ -96,15 +96,12 @@ pub mod wqe;
 // Re-export CQE types
 pub use cq::{Cqe, CqeOpcode};
 
-// Re-export low-level SQ access types for wqe_tx! macro
-pub use qp::SqSlot;
-
-// Re-export WQE macro utilities
-pub use wqe::wqebb_cnt;
-
 // Re-export MonoCq types for inlined callback dispatch
 pub use mono_cq::{CompletionSource, MonoCq, MonoCqRc};
 pub use qp::RcQpForMonoCq;
+
+// Re-export TM-SRQ types
+pub use tm_srq::{RqWqeBuilder, TmSrqCompletion};
 
 /// Trait for queues that can receive completion notifications from a CQ.
 ///
