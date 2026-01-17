@@ -331,7 +331,7 @@ pub const fn wqebb_cnt(size: usize) -> u16 {
 /// - `inline { data: &[u8] }` - Inline data (fixed 16B segment)
 ///
 /// # Returns
-/// `Option<()>` - `Some(())` on success, `None` if SQ is full.
+/// `io::Result<()>` - `Ok(())` on success, `Err` if SQ is full or not initialized.
 #[macro_export]
 macro_rules! post_send_wqe {
     // =========================================================================
@@ -449,9 +449,9 @@ macro_rules! post_send_wqe {
                 $qp.__sq_advance_pi(__wqebb);
                 $qp.__sq_store_entry(__slot.wqe_idx, $entry);
                 $qp.__sq_set_last_wqe(__slot.ptr, __size);
-                Some(())
+                Ok(())
             } else {
-                None
+                Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "SQ full"))
             }
         }
     }};
@@ -465,9 +465,9 @@ macro_rules! post_send_wqe {
                 $qp.__sq_advance_pi(__wqebb);
                 $qp.__sq_store_entry(__slot.wqe_idx, $entry);
                 $qp.__sq_ring_blueflame(__slot.ptr);
-                Some(())
+                Ok(())
             } else {
-                None
+                Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "SQ full"))
             }
         }
     }};
@@ -479,7 +479,7 @@ macro_rules! post_send_wqe {
     (@emit_multi $qp:expr, doorbell, $($op:ident $body:tt),+) => {{
         #[allow(unused_unsafe)]
         unsafe {
-            '__post_wqe_block: {
+            (|| -> std::io::Result<()> {
                 let mut __last_ptr: *mut u8 = std::ptr::null_mut();
                 let mut __last_size: usize = 0;
 
@@ -490,15 +490,15 @@ macro_rules! post_send_wqe {
                 )+
 
                 $qp.__sq_set_last_wqe(__last_ptr, __last_size);
-                Some(())
-            }
+                Ok(())
+            })()
         }
     }};
 
     (@emit_multi $qp:expr, blueflame, $($op:ident $body:tt),+) => {{
         #[allow(unused_unsafe)]
         unsafe {
-            '__post_wqe_block: {
+            (|| -> std::io::Result<()> {
                 let mut __last_ptr: *mut u8 = std::ptr::null_mut();
                 #[allow(unused_variables)]
                 let mut __last_size: usize = 0;
@@ -510,13 +510,13 @@ macro_rules! post_send_wqe {
                 )+
 
                 $qp.__sq_ring_blueflame(__last_ptr);
-                Some(())
-            }
+                Ok(())
+            })()
         }
     }};
 
     // =========================================================================
-    // Emit one WQE (inner, returns Option<(ptr, size)>)
+    // Emit one WQE (inner, returns io::Result<(ptr, size)>)
     // =========================================================================
 
     // write with imm
@@ -565,16 +565,16 @@ macro_rules! post_send_wqe {
         )
     }};
 
-    // Raw emit helper
+    // Raw emit helper - returns io::Result<(ptr, size)>
     (@emit_one_raw $qp:expr, $entry:expr, $($segs:tt)*) => {{
         if let Some(__slot) = $qp.__sq_ptr() {
             let __size = $crate::wqe_write!(__slot.ptr, __slot.sqn, __slot.wqe_idx, $($segs)*);
             let __wqebb = $crate::wqe::wqebb_cnt(__size);
             $qp.__sq_advance_pi(__wqebb);
             $qp.__sq_store_entry(__slot.wqe_idx, $entry);
-            Some((__slot.ptr, __size))
+            Ok((__slot.ptr, __size))
         } else {
-            None
+            Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "SQ full"))
         }
     }};
 }
