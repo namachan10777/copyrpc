@@ -292,6 +292,8 @@ pub const fn wqebb_cnt(size: usize) -> u16 {
 ///
 /// # Syntax
 ///
+/// ## Single WQE
+///
 /// ```ignore
 /// // Without BlueFlame (batch mode - call ring_sq_doorbell() later)
 /// let (wqe_idx, ptr, size) = post_send_wqe!(qp, entry,
@@ -311,9 +313,32 @@ pub const fn wqebb_cnt(size: usize) -> u16 {
 /// )?;
 /// ```
 ///
+/// ## Multiple WQEs (compile-time loop unrolling)
+///
+/// ```ignore
+/// // Multiple WQEs without BlueFlame (batch mode)
+/// let (last_ptr, last_size) = post_send_wqe!(qp,
+///     [entry0; ctrl { opcode: RdmaWriteImm, fm_ce_se: 0x08, imm: 0 },
+///              rdma { remote_addr: addr0, rkey: key },
+///              sge { addr: local0, len: 64, lkey: lk }],
+///     [entry1; ctrl { opcode: RdmaWriteImm, fm_ce_se: 0x08, imm: 1 },
+///              rdma { remote_addr: addr1, rkey: key },
+///              sge { addr: local1, len: 64, lkey: lk }],
+/// )?;
+/// unsafe { qp.__sq_set_last_wqe(last_ptr, last_size); }
+/// qp.ring_sq_doorbell();
+///
+/// // Multiple WQEs with BlueFlame
+/// post_send_wqe!(qp, blueflame,
+///     [entry0; ctrl { ... }, rdma { ... }, sge { ... }],
+///     [entry1; ctrl { ... }, rdma { ... }, sge { ... }],
+/// )?;
+/// ```
+///
 /// # Returns
-/// Returns `Option<(u16, *mut u8, usize)>` - `Some((wqe_idx, ptr, size))` on success,
-/// `None` if SQ is full or not initialized.
+/// - Single WQE: `Option<(u16, *mut u8, usize)>` - `Some((wqe_idx, ptr, size))`
+/// - Multiple WQEs: `Option<(*mut u8, usize)>` - `Some((last_ptr, last_size))`
+/// - `None` if SQ is full or not initialized.
 ///
 /// # BlueFlame
 /// When `blueflame` option is specified, the WQE is immediately sent via BlueFlame
@@ -321,7 +346,66 @@ pub const fn wqebb_cnt(size: usize) -> u16 {
 /// The WQE size must fit within the BlueFlame buffer (typically 64 bytes).
 #[macro_export]
 macro_rules! post_send_wqe {
-    // With BlueFlame - must be first to match before the general pattern
+    // =========================================================================
+    // Multiple WQEs with loop unrolling (compile-time expansion)
+    // =========================================================================
+
+    // Multiple WQEs with BlueFlame
+    ($qp:expr, blueflame, $([$entry:expr; $($segs:tt)*]),+ $(,)? ) => {{
+        #[allow(unused_unsafe)]
+        unsafe {
+            '__post_wqe_block: {
+                let mut __last_ptr: *mut u8 = std::ptr::null_mut();
+                let mut __last_size: usize = 0;
+
+                $(
+                    let Some(__slot) = $qp.__sq_ptr() else {
+                        break '__post_wqe_block None;
+                    };
+                    let __size = $crate::wqe_write!(__slot.ptr, __slot.sqn, __slot.wqe_idx, $($segs)*);
+                    let __wqebb = $crate::wqe::wqebb_cnt(__size);
+                    $qp.__sq_advance_pi(__wqebb);
+                    $qp.__sq_store_entry(__slot.wqe_idx, $entry);
+                    __last_ptr = __slot.ptr;
+                    __last_size = __size;
+                )+
+
+                $qp.__sq_ring_blueflame(__last_ptr);
+                Some((__last_ptr, __last_size))
+            }
+        }
+    }};
+
+    // Multiple WQEs without BlueFlame (batch mode)
+    ($qp:expr, $([$entry:expr; $($segs:tt)*]),+ $(,)? ) => {{
+        #[allow(unused_unsafe)]
+        unsafe {
+            '__post_wqe_block: {
+                let mut __last_ptr: *mut u8 = std::ptr::null_mut();
+                let mut __last_size: usize = 0;
+
+                $(
+                    let Some(__slot) = $qp.__sq_ptr() else {
+                        break '__post_wqe_block None;
+                    };
+                    let __size = $crate::wqe_write!(__slot.ptr, __slot.sqn, __slot.wqe_idx, $($segs)*);
+                    let __wqebb = $crate::wqe::wqebb_cnt(__size);
+                    $qp.__sq_advance_pi(__wqebb);
+                    $qp.__sq_store_entry(__slot.wqe_idx, $entry);
+                    __last_ptr = __slot.ptr;
+                    __last_size = __size;
+                )+
+
+                Some((__last_ptr, __last_size))
+            }
+        }
+    }};
+
+    // =========================================================================
+    // Single WQE (original patterns)
+    // =========================================================================
+
+    // Single WQE with BlueFlame
     ($qp:expr, $entry:expr, blueflame, $($segs:tt)* ) => {{
         #[allow(unused_unsafe)]
         unsafe {
@@ -338,7 +422,7 @@ macro_rules! post_send_wqe {
         }
     }};
 
-    // Without BlueFlame (batch mode)
+    // Single WQE without BlueFlame (batch mode)
     ($qp:expr, $entry:expr, $($segs:tt)* ) => {{
         #[allow(unused_unsafe)]
         unsafe {
