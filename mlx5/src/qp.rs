@@ -569,11 +569,14 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType> {
 
     /// Finish the WQE construction (internal).
     #[inline]
-    fn finish_internal(self) -> io::Result<WqeHandle> {
+    fn finish_internal(mut self) -> io::Result<WqeHandle> {
         // Validate WQE structure - unlikely path is marked cold
         if self.opcode.is_none() || matches!(self.opcode, Some(WqeOpcode::RdmaWrite | WqeOpcode::RdmaWriteImm | WqeOpcode::RdmaRead | WqeOpcode::AtomicCs | WqeOpcode::AtomicFa) if self.offset < CtrlSeg::SIZE + RdmaSeg::SIZE) {
             self.validate()?;
         }
+
+        // Clear opcode to prevent Drop warning (finish() was properly called)
+        self.opcode = None;
 
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
@@ -605,11 +608,14 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType> {
     /// Use this for low-latency single WQE submission. The doorbell is issued
     /// immediately, so no need to call `ring_sq_doorbell()` afterwards.
     #[inline]
-    fn finish_internal_with_blueflame(self) -> io::Result<WqeHandle> {
+    fn finish_internal_with_blueflame(mut self) -> io::Result<WqeHandle> {
         // Validate WQE structure - unlikely path is marked cold
         if self.opcode.is_none() || matches!(self.opcode, Some(WqeOpcode::RdmaWrite | WqeOpcode::RdmaWriteImm | WqeOpcode::RdmaRead | WqeOpcode::AtomicCs | WqeOpcode::AtomicFa) if self.offset < CtrlSeg::SIZE + RdmaSeg::SIZE) {
             self.validate()?;
         }
+
+        // Clear opcode to prevent Drop warning (finish() was properly called)
+        self.opcode = None;
 
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);

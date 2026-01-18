@@ -481,11 +481,14 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
         Ok(())
     }
 
-    fn finish_internal(self) -> io::Result<WqeHandle> {
+    fn finish_internal(mut self) -> io::Result<WqeHandle> {
         // Validate WQE structure - unlikely path is marked cold
         if self.opcode.is_none() || self.offset < CtrlSeg::SIZE + UdAddressSeg::SIZE {
             self.validate()?;
         }
+
+        // Clear opcode to prevent Drop warning (finish() was properly called)
+        self.opcode = None;
 
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
@@ -512,11 +515,14 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
         })
     }
 
-    fn finish_internal_with_blueflame(self) -> io::Result<WqeHandle> {
+    fn finish_internal_with_blueflame(mut self) -> io::Result<WqeHandle> {
         // Validate WQE structure - unlikely path is marked cold
         if self.opcode.is_none() || self.offset < CtrlSeg::SIZE + UdAddressSeg::SIZE {
             self.validate()?;
         }
+
+        // Clear opcode to prevent Drop warning (finish() was properly called)
+        self.opcode = None;
 
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);

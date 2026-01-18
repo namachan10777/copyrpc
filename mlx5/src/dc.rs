@@ -371,11 +371,14 @@ impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType> {
     /// Finish the WQE construction (internal).
     ///
     /// Stores WQE info for later doorbell via `ring_sq_doorbell()`.
-    fn finish_internal(self) -> io::Result<WqeHandle> {
+    fn finish_internal(mut self) -> io::Result<WqeHandle> {
         // Validate WQE structure - unlikely path is marked cold
         if self.opcode.is_none() || self.offset < CtrlSeg::SIZE + AddressVector::SIZE {
             self.validate()?;
         }
+
+        // Clear opcode to prevent Drop warning (finish() was properly called)
+        self.opcode = None;
 
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
@@ -406,11 +409,14 @@ impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType> {
     ///
     /// Use this for low-latency single WQE submission. The doorbell is issued
     /// immediately, so no need to call `ring_sq_doorbell()` afterwards.
-    fn finish_internal_with_blueflame(self) -> io::Result<WqeHandle> {
+    fn finish_internal_with_blueflame(mut self) -> io::Result<WqeHandle> {
         // Validate WQE structure - unlikely path is marked cold
         if self.opcode.is_none() || self.offset < CtrlSeg::SIZE + AddressVector::SIZE {
             self.validate()?;
         }
+
+        // Clear opcode to prevent Drop warning (finish() was properly called)
+        self.opcode = None;
 
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);

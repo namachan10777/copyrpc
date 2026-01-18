@@ -1279,9 +1279,9 @@ fn test_rc_send_recv_pingpong() {
     let mr2 = unsafe { ctx.pd.register(buf2.as_ptr(), buf2.size(), full_access()) }.expect("MR2");
 
     let iterations = 10;
-    println!("Running {} ping-pong iterations...", iterations);
 
     for i in 0..iterations {
+
         // Reset opcode states
         recv2_opcode.set(None);
 
@@ -1291,16 +1291,16 @@ fn test_rc_send_recv_pingpong() {
             .map(|b| b.sge(buf2.addr(), 64, mr2.lkey()).finish());
         qp2.borrow().ring_rq_doorbell();
 
-        // QP1 sends
+        // QP1 sends (signaled to get CQE)
         qp1.borrow_mut()
             .wqe_builder(i as u64)
             .expect("wqe_builder")
-            .ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
+            .ctrl(WqeOpcode::Send, WqeFlags::COMPLETION, 0)
             .sge(buf1.addr(), 32, mr1.lkey())
             .finish_with_blueflame();
 
         // Wait for send completion
-        let _ = poll_cq_timeout(&send_cq, 5000).expect("send CQE");
+        let _ = poll_cq_timeout(&send_cq, 5000).expect("send CQE 1");
         send_cq.flush();
 
         // Wait for receive completion on recv_cq2
@@ -1327,16 +1327,16 @@ fn test_rc_send_recv_pingpong() {
             .map(|b| b.sge(buf1.addr(), 64, mr1.lkey()).finish());
         qp1.borrow().ring_rq_doorbell();
 
-        // QP2 sends back
+        // QP2 sends back (signaled to get CQE)
         qp2.borrow_mut()
             .wqe_builder(i as u64)
             .expect("wqe_builder")
-            .ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
+            .ctrl(WqeOpcode::Send, WqeFlags::COMPLETION, 0)
             .sge(buf2.addr(), 32, mr2.lkey())
             .finish_with_blueflame();
 
         // Wait for send completion
-        let _ = poll_cq_timeout(&send_cq, 5000).expect("send CQE");
+        let _ = poll_cq_timeout(&send_cq, 5000).expect("send CQE 2");
         send_cq.flush();
 
         // Wait for receive completion on recv_cq1
@@ -1354,8 +1354,6 @@ fn test_rc_send_recv_pingpong() {
         }
         assert_eq!(recv1_opcode.get().unwrap(), CqeOpcode::RespSend);
     }
-
-    println!("RC SEND/RECV ping-pong test passed! ({} iterations)", iterations);
 }
 
 // NOTE: test_rc_send_recv_with_recv_builder is temporarily disabled due to
