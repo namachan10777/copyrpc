@@ -419,6 +419,22 @@ impl Cqe {
     }
 }
 
+impl Default for Cqe {
+    fn default() -> Self {
+        Self {
+            opcode: CqeOpcode::Req,
+            wqe_counter: 0,
+            qp_num: 0,
+            byte_cnt: 0,
+            imm: 0,
+            syndrome: 0,
+            vendor_err: 0,
+            app_info: 0,
+            inline_data: [0u8; MAX_INLINE_SCATTER_SIZE],
+        }
+    }
+}
+
 // =============================================================================
 // CQ State
 // =============================================================================

@@ -2007,7 +2007,9 @@ mod tests {
         fn set_ci(&self, ci: u16) {
             self.ci.set(ci);
         }
+    }
 
+    impl MockSendQueue {
         fn advance_pi(&self, count: u16) {
             self.pi.set(self.pi.get().wrapping_add(count));
         }
@@ -2332,5 +2334,224 @@ mod tests {
 
         let entry = table.take(6).unwrap();
         assert_eq!(entry.ci_delta, 1); // 65537 wrapped to 1 in u16
+    }
+
+    // -------------------------------------------------------------------------
+    // Benchmark-like Throughput Pattern Tests
+    // -------------------------------------------------------------------------
+
+    /// Simulate the benchmark pattern: 3 unsignaled + 1 signaled per batch
+    #[test]
+    fn test_benchmark_pattern_sparse_table() {
+        const QUEUE_DEPTH: u16 = 64;
+        let sq = MockSendQueue::new(QUEUE_DEPTH);
+        let table = &sq.table;
+
+        // Initial fill: 16 batches of 4 WQEs (3 unsignaled + 1 signaled)
+        for batch in 0..(QUEUE_DEPTH / 4) {
+            let base = batch * 4;
+            // 3 unsignaled WQEs (no entry stored)
+            for j in 0..3 {
+                let _i = base + j;
+                // wqe_builder_unsignaled: just advance PI, no table store
+                sq.advance_pi(1);
+            }
+            // 1 signaled WQE (entry stored)
+            let i = base + 3;
+            let ci_delta = sq.pi.get().wrapping_add(1); // current PI + wqebb_cnt
+            table.store(i, i as u32, ci_delta);
+            sq.advance_pi(1);
+        }
+
+        // After initial fill: PI = 64, CI = 0, available = 0
+        assert_eq!(sq.pi.get(), QUEUE_DEPTH);
+        assert_eq!(sq.ci.get(), 0);
+        assert_eq!(sq.available(), 0);
+
+        // Simulate completions: complete all signaled WQEs
+        for batch in 0..(QUEUE_DEPTH / 4) {
+            let signaled_idx = batch * 4 + 3;
+            let entry = table.take(signaled_idx).unwrap();
+            // ci_delta should be the accumulated PI at that point
+            assert_eq!(entry.ci_delta, signaled_idx + 1);
+            sq.set_ci(entry.ci_delta);
+        }
+
+        // After all completions: CI should equal PI
+        assert_eq!(sq.ci.get(), QUEUE_DEPTH);
+        assert_eq!(sq.available(), QUEUE_DEPTH);
+    }
+
+    /// Test that available() correctly tracks slots after signaled completions
+    #[test]
+    fn test_available_after_signaled_completion() {
+        const QUEUE_DEPTH: u16 = 16;
+        let sq = MockSendQueue::new(QUEUE_DEPTH);
+        let table = &sq.table;
+
+        assert_eq!(sq.available(), QUEUE_DEPTH);
+
+        // Post 4 WQEs: 3 unsignaled + 1 signaled
+        for j in 0..3 {
+            sq.advance_pi(1);
+        }
+        // Signaled WQE at PI=3
+        let ci_delta = sq.pi.get().wrapping_add(1); // 3 + 1 = 4
+        table.store(3, 100, ci_delta);
+        sq.advance_pi(1);
+
+        assert_eq!(sq.pi.get(), 4);
+        assert_eq!(sq.ci.get(), 0);
+        assert_eq!(sq.available(), 12); // 16 - 4 = 12
+
+        // Complete the signaled WQE
+        let entry = table.take(3).unwrap();
+        assert_eq!(entry.ci_delta, 4);
+        sq.set_ci(entry.ci_delta);
+
+        // Now CI = 4, PI = 4, available = 16
+        assert_eq!(sq.ci.get(), 4);
+        assert_eq!(sq.available(), QUEUE_DEPTH);
+    }
+
+    /// Test continuous throughput pattern with reposting
+    #[test]
+    fn test_continuous_throughput_pattern() {
+        const QUEUE_DEPTH: u16 = 8;
+        let sq = MockSendQueue::new(QUEUE_DEPTH);
+        let table = &sq.table;
+
+        // Fill queue: 2 batches of 4 (8 total)
+        for batch in 0..2 {
+            let base = batch * 4;
+            for j in 0..3 {
+                sq.advance_pi(1);
+            }
+            let i = base + 3;
+            let ci_delta = sq.pi.get().wrapping_add(1);
+            table.store(i, i as u32, ci_delta);
+            sq.advance_pi(1);
+        }
+
+        assert_eq!(sq.pi.get(), 8);
+        assert_eq!(sq.available(), 0);
+
+        // Complete first batch (idx=3, ci_delta=4)
+        let entry = table.take(3).unwrap();
+        sq.set_ci(entry.ci_delta);
+        assert_eq!(sq.ci.get(), 4);
+        assert_eq!(sq.available(), 4);
+
+        // Repost 4 WQEs (3 unsignaled + 1 signaled)
+        for j in 0..3 {
+            sq.advance_pi(1);
+        }
+        let ci_delta = sq.pi.get().wrapping_add(1); // 11 + 1 = 12
+        table.store(11, 11, ci_delta);
+        sq.advance_pi(1);
+
+        assert_eq!(sq.pi.get(), 12);
+        assert_eq!(sq.available(), 0); // 8 - (12 - 4) = 0
+
+        // Complete second batch (idx=7, ci_delta=8)
+        let entry = table.take(7).unwrap();
+        sq.set_ci(entry.ci_delta);
+        assert_eq!(sq.ci.get(), 8);
+        assert_eq!(sq.available(), 4);
+    }
+
+    /// Test PI/CI wrapping in u16
+    #[test]
+    fn test_pi_ci_wrapping_throughput() {
+        const QUEUE_DEPTH: u16 = 8;
+        let sq = MockSendQueue::new(QUEUE_DEPTH);
+        let table = &sq.table;
+
+        // Set PI and CI near u16 max
+        sq.set_pi(65532);
+        sq.set_ci(65532);
+        assert_eq!(sq.available(), QUEUE_DEPTH);
+
+        // Post 8 WQEs (2 batches)
+        for _batch in 0..2 {
+            for _j in 0..3 {
+                sq.advance_pi(1);
+            }
+            let signaled_pi = sq.pi.get();
+            let ci_delta = signaled_pi.wrapping_add(1);
+            table.store(signaled_pi, signaled_pi as u32, ci_delta);
+            sq.advance_pi(1);
+        }
+
+        // PI wrapped: 65532 + 8 = 65540 -> wraps to 4
+        assert_eq!(sq.pi.get(), 4);
+        assert_eq!(sq.available(), 0); // 8 - (4 - 65532) = 8 - 8 = 0
+
+        // Complete first batch (signaled at PI=65535, ci_delta=0)
+        let entry = table.take(65535).unwrap();
+        assert_eq!(entry.ci_delta, 0); // 65535 + 1 wraps to 0
+        sq.set_ci(entry.ci_delta);
+        assert_eq!(sq.ci.get(), 0);
+        assert_eq!(sq.available(), 4); // 8 - (4 - 0) = 4
+    }
+
+    // -------------------------------------------------------------------------
+    // Server Pattern Bug Reproduction Test
+    // -------------------------------------------------------------------------
+
+    /// BUG: Server uses wqe_builder() (stores entry) with WqeFlags::empty() (no CQE).
+    /// This causes CI to never update, eventually filling the SQ.
+    #[test]
+    fn test_server_bug_wqe_builder_without_completion_flag() {
+        const QUEUE_DEPTH: u16 = 8;
+        let sq = MockSendQueue::new(QUEUE_DEPTH);
+        let table = &sq.table;
+
+        // Server pattern: wqe_builder() stores entry but WqeFlags::empty() means no CQE
+        // After QUEUE_DEPTH iterations, SQ becomes full and can't post more
+        for i in 0..QUEUE_DEPTH {
+            // Simulate wqe_builder(entry) - stores entry in table, advances PI
+            let ci_delta = sq.pi.get().wrapping_add(1);
+            table.store(i, i as u32, ci_delta);
+            sq.advance_pi(1);
+        }
+
+        // SQ is now full
+        assert_eq!(sq.pi.get(), QUEUE_DEPTH);
+        assert_eq!(sq.ci.get(), 0);
+        assert_eq!(sq.available(), 0);
+
+        // BUG: Without CQE, process_completion_sparse is never called,
+        // CI is never updated, and SQ stays full forever.
+        // The server would hang trying to post more WQEs.
+
+        // Verify the bug: entries are in the table but CI hasn't moved
+        for i in 0..QUEUE_DEPTH {
+            assert!(table.is_available(i) == false, "Entry {} should be stored", i);
+        }
+
+        // FIX: Server should use wqe_builder_unsignaled() for WqeFlags::empty() WQEs,
+        // or use WqeFlags::COMPLETION and process the CQEs.
+    }
+
+    /// Correct pattern: use wqe_builder_unsignaled() when not requesting completion
+    #[test]
+    fn test_correct_server_pattern_unsignaled() {
+        const QUEUE_DEPTH: u16 = 8;
+        let sq = MockSendQueue::new(QUEUE_DEPTH);
+
+        // Correct: wqe_builder_unsignaled() - no entry stored, just advances PI
+        for _i in 0..QUEUE_DEPTH {
+            sq.advance_pi(1);
+        }
+
+        // SQ is full but...
+        assert_eq!(sq.pi.get(), QUEUE_DEPTH);
+        assert_eq!(sq.ci.get(), 0);
+        assert_eq!(sq.available(), 0);
+
+        // We need some way to know completions happened to update CI.
+        // For unsignaled, we rely on a signaled WQE at intervals (every N WQEs)
+        // or use WqeFlags::COMPLETION on the last WQE of a batch.
     }
 }

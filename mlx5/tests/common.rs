@@ -141,16 +141,7 @@ pub fn poll_cq_timeout(cq: &CompletionQueue, timeout_ms: u64) -> Option<Cqe> {
             // CQE was dispatched to callback - for tests using noop_callback,
             // we just return a dummy CQE to indicate completion happened.
             // Tests that need actual CQE data should use the callback pattern directly.
-            return Some(Cqe {
-                opcode: mlx5::cq::CqeOpcode::Req,
-                wqe_counter: 0,
-                qp_num: 0,
-                byte_cnt: 0,
-                imm: 0,
-                syndrome: 0,
-                vendor_err: 0,
-                app_info: 0,
-            });
+            return Some(Cqe::default());
         }
         if start.elapsed() > timeout {
             return None;
@@ -183,16 +174,7 @@ pub fn poll_cq_batch(
         std::hint::spin_loop();
     }
     // Return dummy CQEs since actual CQEs were dispatched to callbacks
-    Ok((0..count).map(|_| Cqe {
-        opcode: mlx5::cq::CqeOpcode::Req,
-        wqe_counter: 0,
-        qp_num: 0,
-        byte_cnt: 0,
-        imm: 0,
-        syndrome: 0,
-        vendor_err: 0,
-        app_info: 0,
-    }).collect())
+    Ok((0..count).map(|_| Cqe::default()).collect())
 }
 
 /// Assert CQE is successful.

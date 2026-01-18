@@ -67,9 +67,9 @@ fn test_qp_destroy_after_remote_gone() {
 
     // Connect QP1 -> QP2
     let remote1 = RemoteQpInfo {
-        qpn: qp2.borrow().qpn(),
-        psn: 0,
-        lid: ctx2.port_attr.lid,
+        qp_number: qp2.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx2.port_attr.lid,
     };
     qp1.borrow_mut()
         .connect(&remote1, port, 0, 4, 4, access)
@@ -77,9 +77,9 @@ fn test_qp_destroy_after_remote_gone() {
 
     // Connect QP2 -> QP1
     let remote2 = RemoteQpInfo {
-        qpn: qp1.borrow().qpn(),
-        psn: 0,
-        lid: ctx1.port_attr.lid,
+        qp_number: qp1.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx1.port_attr.lid,
     };
     qp2.borrow_mut()
         .connect(&remote2, port, 0, 4, 4, access)
@@ -174,9 +174,9 @@ fn test_qp_destroy_multi_thread() {
 
         // Connect
         let client_remote = RemoteQpInfo {
-            qpn: client_qpn,
-            psn: 0,
-            lid: client_lid,
+            qp_number: client_qpn,
+            packet_sequence_number: 0,
+            local_identifier: client_lid,
         };
 
         let access = full_access().bits();
@@ -235,9 +235,9 @@ fn test_qp_destroy_multi_thread() {
 
     // Connect
     let server_remote = RemoteQpInfo {
-        qpn: server_qpn,
-        psn: 0,
-        lid: server_lid,
+        qp_number: server_qpn,
+        packet_sequence_number: 0,
+        local_identifier: server_lid,
     };
 
     let access = full_access().bits();
@@ -335,9 +335,9 @@ fn test_qp_destroy_after_data_transfer() {
 
         // Connect
         let client_remote = RemoteQpInfo {
-            qpn: client_qpn,
-            psn: 0,
-            lid: client_lid,
+            qp_number: client_qpn,
+            packet_sequence_number: 0,
+            local_identifier: client_lid,
         };
 
         let access = full_access().bits();
@@ -410,9 +410,9 @@ fn test_qp_destroy_after_data_transfer() {
 
     // Connect
     let server_remote = RemoteQpInfo {
-        qpn: server_qpn,
-        psn: 0,
-        lid: server_lid,
+        qp_number: server_qpn,
+        packet_sequence_number: 0,
+        local_identifier: server_lid,
     };
 
     let access = full_access().bits();
@@ -539,9 +539,9 @@ fn test_qp_destroy_after_actual_send_recv() {
 
         // Connect
         let client_remote = RemoteQpInfo {
-            qpn: client_qpn,
-            psn: 0,
-            lid: client_lid,
+            qp_number: client_qpn,
+            packet_sequence_number: 0,
+            local_identifier: client_lid,
         };
 
         let access = full_access().bits();
@@ -662,9 +662,9 @@ fn test_qp_destroy_after_actual_send_recv() {
 
     // Connect
     let server_remote = RemoteQpInfo {
-        qpn: server_qpn,
-        psn: 0,
-        lid: server_lid,
+        qp_number: server_qpn,
+        packet_sequence_number: 0,
+        local_identifier: server_lid,
     };
 
     let access = full_access().bits();

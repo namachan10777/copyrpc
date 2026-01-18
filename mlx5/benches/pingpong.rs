@@ -363,9 +363,9 @@ fn setup_mono_cq_benchmark() -> Option<
 
     // Connect client QP
     let server_remote = RemoteQpInfo {
-        qpn: server_info.qpn,
-        psn: 0,
-        lid: server_info.lid,
+        qp_number: server_info.qpn,
+        packet_sequence_number: 0,
+        local_identifier: server_info.lid,
     };
 
     let access = full_access().bits();
@@ -479,9 +479,9 @@ fn server_thread_main(
 
     // Connect server QP to client
     let client_remote = RemoteQpInfo {
-        qpn: client_info.qpn,
-        psn: 0,
-        lid: client_info.lid,
+        qp_number: client_info.qpn,
+        packet_sequence_number: 0,
+        local_identifier: client_info.lid,
     };
 
     let access = full_access().bits();

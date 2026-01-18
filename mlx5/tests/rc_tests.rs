@@ -66,14 +66,14 @@ fn create_rc_loopback_pair(ctx: &TestContext) -> RcLoopbackPair {
 
     // Connect QPs to each other
     let remote1 = RemoteQpInfo {
-        qpn: qp1.borrow().qpn(),
-        psn: 0,
-        lid: ctx.port_attr.lid,
+        qp_number: qp1.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
     };
     let remote2 = RemoteQpInfo {
-        qpn: qp2.borrow().qpn(),
-        psn: 0,
-        lid: ctx.port_attr.lid,
+        qp_number: qp2.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
     };
 
     let access = full_access().bits();
@@ -594,19 +594,19 @@ fn test_rc_send_recv_verbs() {
 
     // Connect QPs
     let remote1 = RemoteQpInfo {
-        qpn: qp1.borrow().qpn(),
-        psn: 0,
-        lid: ctx.port_attr.lid,
+        qp_number: qp1.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
     };
     let remote2 = RemoteQpInfo {
-        qpn: qp2.borrow().qpn(),
-        psn: 0,
-        lid: ctx.port_attr.lid,
+        qp_number: qp2.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
     };
 
     println!("[verbs] QP1 QPN: 0x{:x}", qp1.borrow().qpn());
     println!("[verbs] QP2 QPN: 0x{:x}", qp2.borrow().qpn());
-    println!("[verbs] remote1.qpn (QP1): 0x{:x}, remote2.qpn (QP2): 0x{:x}", remote1.qpn, remote2.qpn);
+    println!("[verbs] remote1.qp_number (QP1): 0x{:x}, remote2.qp_number (QP2): 0x{:x}", remote1.qp_number, remote2.qp_number);
 
     let access = full_access().bits();
     qp1.borrow_mut()
@@ -925,14 +925,14 @@ fn test_rc_send_recv() {
 
     // Connect QPs
     let remote1 = RemoteQpInfo {
-        qpn: qp1.borrow().qpn(),
-        psn: 0,
-        lid: ctx.port_attr.lid,
+        qp_number: qp1.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
     };
     let remote2 = RemoteQpInfo {
-        qpn: qp2.borrow().qpn(),
-        psn: 0,
-        lid: ctx.port_attr.lid,
+        qp_number: qp2.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
     };
 
     let access = full_access().bits();
@@ -1069,14 +1069,14 @@ fn test_rc_send_recv_pure_verbs() {
 
     // Connect QPs
     let remote1 = RemoteQpInfo {
-        qpn: qp1.borrow().qpn(),
-        psn: 0,
-        lid: ctx.port_attr.lid,
+        qp_number: qp1.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
     };
     let remote2 = RemoteQpInfo {
-        qpn: qp2.borrow().qpn(),
-        psn: 0,
-        lid: ctx.port_attr.lid,
+        qp_number: qp2.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
     };
 
     let access = full_access().bits();
@@ -1258,14 +1258,14 @@ fn test_rc_send_recv_pingpong() {
 
     // Connect QPs
     let remote1 = RemoteQpInfo {
-        qpn: qp1.borrow().qpn(),
-        psn: 0,
-        lid: ctx.port_attr.lid,
+        qp_number: qp1.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
     };
     let remote2 = RemoteQpInfo {
-        qpn: qp2.borrow().qpn(),
-        psn: 0,
-        lid: ctx.port_attr.lid,
+        qp_number: qp2.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
     };
 
     let access = full_access().bits();
