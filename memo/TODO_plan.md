@@ -9,7 +9,7 @@
 
 ---
 
-## 1) 可変長WQEが正しく構築可能か（inline + wrap around）
+## 1) 可変長WQEが正しく構築可能か（inline + wrap around） ✅ 完了
 
 ### 目的
 - InlineやSGE数によってWQEBB数が変動するWQEを正しく構築し、リング末尾の折り返しでも破綻しないことを保証する。
@@ -40,6 +40,12 @@
 ### 検証
 - CQEで返るwqe_counterが常にWQEの先頭を指し、WQEBB消費数と整合しているか。
 - `mlx5/tests/*`に「リング末尾+inline」ケースを追加。
+
+### 実装結果（2026-01-18）
+- NOP埋め方式（方式A）を採用
+- `slots_to_end()`, `post_nop()` を SendQueueState に追加
+- 公開API: `slots_to_ring_end()`, `post_nop_to_ring_end()` を RcQp/DCI/UD に追加
+- `finish_internal()` に `debug_assert` でラップアラウンド検出を追加
 
 ---
 
@@ -182,7 +188,7 @@
 
 ---
 
-## 8) ibverbs_sys削除（mlx5_sysのみ）
+## 8) ibverbs_sys削除（mlx5_sysのみ） ✅ 対応不要
 
 ### 目的
 - 依存を簡素化し、メンテコストを下げる。
@@ -196,6 +202,10 @@
 
 ### 検証
 - ビルド確認。
+
+### 調査結果（2026-01-18）
+- mlx5クレートは既にmlx5_sysのみに依存しており、ibverbs_sysへの依存は存在しない
+- 対応不要
 
 ---
 
@@ -222,7 +232,7 @@
 
 ---
 
-## 10) Inline CQE parse
+## 10) Inline CQE parse ✅ 完了
 
 ### 目的
 - Inline scatterされたCQEのpayloadを正しく読み出し、ユーザバッファに配置する。
@@ -241,9 +251,16 @@
 ### 検証
 - Inline受信時のdata一致テスト。
 
+### 実装結果（2026-01-18）
+- `CqeOpcode::InlineScatter32`, `InlineScatter64` を追加
+- `CqeOpcode::is_inline_scatter()` メソッドを追加
+- `Cqe` に `inline_data` フィールド（最大32バイト）を追加
+- `Cqe::inline_data()` アクセサメソッドを追加
+- TM-SRQ の `dispatch_cqe` で inline scatter オペコードをハンドリング
+
 ---
 
-## 11) CQE compressionパース
+## 11) CQE compressionパース ✅ 完了
 
 ### 目的
 - CQE圧縮形式を解釈して通常CQEとして扱えるようにする。
@@ -262,14 +279,23 @@
 ### 検証
 - 圧縮CQEをエミュレートするユニットテスト（可能なら）。
 
+### 実装結果（2026-01-18）
+- `MiniCqeFormat` 列挙型（Responder/Requester/ResponderCsum/L3L4Hash）を追加
+- `MiniCqe` 構造体とパース関数（responder/requester形式）を追加
+- `CompressedCqeHeader` 構造体を追加
+- `MiniCqeIterator` で mini CQE 配列を展開
+- `CqState` に `pending_mini_cqes` と `title_opcode` を追加
+- `try_next_cqe()` で圧縮CQE（opcode 0x0f）を検出し自動展開
+- 64バイトCQE形式で最大7個の mini CQE をサポート
+
 ---
 
 # 優先順位（TODOと同順）
 
-1. Inline WQEの折り返しを正しく実装
+1. ~~Inline WQEの折り返しを正しく実装~~ ✅ 完了
 2. WQE builderでのエラー
-3. CQE compression
-4. Inline CQE parse
+3. ~~CQE compression~~ ✅ 完了
+4. ~~Inline CQE parse~~ ✅ 完了
 5. API直交性や型制約の確認
 6. 拡張atomic
 7. DC Stream
