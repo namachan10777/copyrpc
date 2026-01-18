@@ -403,6 +403,8 @@ pub struct WqeBuilder<'a, Entry, TableType> {
     ds_count: u8,
     /// Whether SIGNALED flag is set
     signaled: bool,
+    /// Opcode set by ctrl() - used for validation in finish()
+    opcode: Option<WqeOpcode>,
 }
 
 impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType> {
@@ -429,6 +431,7 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType> {
         }
         self.offset = CtrlSeg::SIZE;
         self.ds_count = 1;
+        self.opcode = Some(opcode);
         self
     }
 
@@ -528,9 +531,50 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType> {
         self
     }
 
+    /// Validate the WQE structure based on opcode.
+    ///
+    /// Returns an error if required segments are missing.
+    #[cold]
+    fn validate(&self) -> io::Result<()> {
+        let Some(opcode) = self.opcode else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ctrl() must be called before finish()",
+            ));
+        };
+
+        match opcode {
+            WqeOpcode::RdmaWrite | WqeOpcode::RdmaWriteImm | WqeOpcode::RdmaRead => {
+                // RDMA operations require at least ctrl + rdma segments
+                if self.offset < CtrlSeg::SIZE + RdmaSeg::SIZE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "RDMA operations require rdma() segment",
+                    ));
+                }
+            }
+            WqeOpcode::AtomicCs | WqeOpcode::AtomicFa => {
+                // Atomic operations require ctrl + rdma + atomic + sge segments
+                if self.offset < CtrlSeg::SIZE + RdmaSeg::SIZE + AtomicSeg::SIZE + DataSeg::SIZE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Atomic operations require rdma(), atomic, and sge() segments",
+                    ));
+                }
+            }
+            _ => {} // Send, Nop, etc. have no additional requirements
+        }
+        Ok(())
+    }
+
     /// Finish the WQE construction (internal).
     #[inline]
-    fn finish_internal(self) -> WqeHandle {
+    fn finish_internal(self) -> io::Result<WqeHandle> {
+        // Validate WQE structure - unlikely path is marked cold
+        if self.opcode.is_none() || matches!(self.opcode, Some(WqeOpcode::RdmaWrite | WqeOpcode::RdmaWriteImm | WqeOpcode::RdmaRead | WqeOpcode::AtomicCs | WqeOpcode::AtomicFa) if self.offset < CtrlSeg::SIZE + RdmaSeg::SIZE) {
+            self.validate()?;
+        }
+
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
         }
@@ -550,10 +594,10 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType> {
         self.sq.advance_pi(wqebb_cnt);
         self.sq.set_last_wqe(self.wqe_ptr, self.offset);
 
-        WqeHandle {
+        Ok(WqeHandle {
             wqe_idx,
             size: self.offset,
-        }
+        })
     }
 
     /// Finish the WQE construction and immediately ring BlueFlame doorbell.
@@ -561,7 +605,12 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType> {
     /// Use this for low-latency single WQE submission. The doorbell is issued
     /// immediately, so no need to call `ring_sq_doorbell()` afterwards.
     #[inline]
-    fn finish_internal_with_blueflame(self) -> WqeHandle {
+    fn finish_internal_with_blueflame(self) -> io::Result<WqeHandle> {
+        // Validate WQE structure - unlikely path is marked cold
+        if self.opcode.is_none() || matches!(self.opcode, Some(WqeOpcode::RdmaWrite | WqeOpcode::RdmaWriteImm | WqeOpcode::RdmaRead | WqeOpcode::AtomicCs | WqeOpcode::AtomicFa) if self.offset < CtrlSeg::SIZE + RdmaSeg::SIZE) {
+            self.validate()?;
+        }
+
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
         }
@@ -582,9 +631,25 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType> {
         self.sq.advance_pi(wqebb_cnt);
         self.sq.ring_blueflame(wqe_ptr);
 
-        WqeHandle {
+        Ok(WqeHandle {
             wqe_idx,
             size: self.offset,
+        })
+    }
+}
+
+impl<Entry, TableType> Drop for WqeBuilder<'_, Entry, TableType> {
+    fn drop(&mut self) {
+        // finish() consumes self, so if Drop is called, finish() was not called.
+        // The PI has not been advanced, so no rollback is needed.
+        // Emit a warning in debug builds to help identify bugs.
+        #[cfg(debug_assertions)]
+        if self.opcode.is_some() {
+            // ctrl() was called but finish() was not
+            eprintln!(
+                "Warning: WqeBuilder dropped without calling finish() at wqe_idx={}",
+                self.wqe_idx
+            );
         }
     }
 }
@@ -870,19 +935,67 @@ impl Context {
                 mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
 
             let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
-            NonNull::new(qp).map_or(Err(io::Error::last_os_error()), |qp| {
-                Ok(Rc::new(RefCell::new(RcQpInner {
-                    qp,
-                    state: Cell::new(QpState::Reset),
-                    sq: None,
-                    rq: None,
-                    callback: (),
-                    // Empty weak references - MonoCq handles unregistration via Weak upgrade failure
-                    send_cq: Weak::new(),
-                    recv_cq: Weak::new(),
-                    _pd: pd.clone(),
-                })))
-            })
+            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
+
+            // Query QP info for direct access initialization
+            let mut dv_qp: MaybeUninit<mlx5_sys::mlx5dv_qp> = MaybeUninit::zeroed();
+            let mut obj: MaybeUninit<mlx5_sys::mlx5dv_obj> = MaybeUninit::zeroed();
+
+            let dv_qp_ptr = dv_qp.as_mut_ptr();
+            (*dv_qp_ptr).comp_mask =
+                mlx5_sys::mlx5dv_qp_comp_mask_MLX5DV_QP_MASK_RAW_QP_HANDLES as u64;
+
+            let obj_ptr = obj.as_mut_ptr();
+            (*obj_ptr).qp.in_ = qp.as_ptr();
+            (*obj_ptr).qp.out = dv_qp_ptr;
+
+            let ret =
+                mlx5_sys::mlx5dv_init_obj(obj_ptr, mlx5_sys::mlx5dv_obj_type_MLX5DV_OBJ_QP as u64);
+            if ret != 0 {
+                // Destroy QP on failure
+                mlx5_sys::ibv_destroy_qp(qp.as_ptr());
+                return Err(io::Error::from_raw_os_error(-ret));
+            }
+
+            let dv_qp = dv_qp.assume_init();
+            let qp_num = (*qp.as_ptr()).qp_num;
+            let sqn = if dv_qp.sqn != 0 { dv_qp.sqn } else { qp_num };
+
+            let sq_wqe_cnt = dv_qp.sq.wqe_cnt as u16;
+            let rq_wqe_cnt = dv_qp.rq.wqe_cnt;
+
+            Ok(Rc::new(RefCell::new(RcQpInner {
+                qp,
+                state: Cell::new(QpState::Reset),
+                sq: Some(SendQueueState {
+                    buf: dv_qp.sq.buf as *mut u8,
+                    wqe_cnt: sq_wqe_cnt,
+                    sqn,
+                    pi: Cell::new(0),
+                    ci: Cell::new(0),
+                    last_wqe: Cell::new(None),
+                    dbrec: dv_qp.dbrec as *mut u32,
+                    bf_reg: dv_qp.bf.reg as *mut u8,
+                    bf_size: dv_qp.bf.size,
+                    bf_offset: Cell::new(0),
+                    table: SparseWqeTable::new(sq_wqe_cnt),
+                    _marker: std::marker::PhantomData,
+                }),
+                rq: Some(ReceiveQueueState {
+                    buf: dv_qp.rq.buf as *mut u8,
+                    wqe_cnt: rq_wqe_cnt,
+                    stride: dv_qp.rq.stride,
+                    pi: Cell::new(0),
+                    ci: Cell::new(0),
+                    dbrec: dv_qp.dbrec as *mut u32,
+                    table: (0..rq_wqe_cnt).map(|_| Cell::new(None)).collect(),
+                }),
+                callback: (),
+                // Empty weak references - MonoCq handles unregistration via Weak upgrade failure
+                send_cq: Weak::new(),
+                recv_cq: Weak::new(),
+                _pd: pd.clone(),
+            })))
         }
     }
 }
@@ -1290,6 +1403,7 @@ impl<Entry, OnComplete> RcQp<Entry, OnComplete> {
                 offset: 0,
                 ds_count: 0,
                 signaled: true,
+                opcode: None,
             },
             entry: Some(entry),
         })
@@ -1315,6 +1429,7 @@ impl<Entry, OnComplete> RcQp<Entry, OnComplete> {
                 offset: 0,
                 ds_count: 0,
                 signaled: false,
+                opcode: None,
             },
             entry: None,
         })
@@ -1430,6 +1545,7 @@ impl<Entry, OnComplete> DenseRcQp<Entry, OnComplete> {
                 offset: 0,
                 ds_count: 0,
                 signaled,
+                opcode: None,
             },
             entry,
         })
@@ -1484,7 +1600,10 @@ impl<'a, T> SparseWqeBuilder<'a, T> {
     }
 
     /// Finish the WQE construction.
-    pub fn finish(self) -> WqeHandle {
+    ///
+    /// # Errors
+    /// Returns an error if required segments are missing for the opcode.
+    pub fn finish(self) -> io::Result<WqeHandle> {
         let wqe_idx = self.inner.wqe_idx;
 
         // Calculate ci_delta (accumulated PI value at completion) before advancing PI
@@ -1500,7 +1619,10 @@ impl<'a, T> SparseWqeBuilder<'a, T> {
     ///
     /// Use this for low-latency single WQE submission. No need to call
     /// `ring_sq_doorbell()` afterwards.
-    pub fn finish_with_blueflame(self) -> WqeHandle {
+    ///
+    /// # Errors
+    /// Returns an error if required segments are missing for the opcode.
+    pub fn finish_with_blueflame(self) -> io::Result<WqeHandle> {
         let wqe_idx = self.inner.wqe_idx;
 
         // Calculate ci_delta (accumulated PI value at completion) before advancing PI
@@ -1557,7 +1679,10 @@ impl<'a, T> DenseWqeBuilder<'a, T> {
     }
 
     /// Finish the WQE construction.
-    pub fn finish(self) -> WqeHandle {
+    ///
+    /// # Errors
+    /// Returns an error if required segments are missing for the opcode.
+    pub fn finish(self) -> io::Result<WqeHandle> {
         let wqe_idx = self.inner.wqe_idx;
         let wqebb_cnt = calc_wqebb_cnt(self.inner.offset);
         // For dense tables, ci_delta is the number of WQEBBs for this WQE
@@ -1569,7 +1694,10 @@ impl<'a, T> DenseWqeBuilder<'a, T> {
     ///
     /// Use this for low-latency single WQE submission. No need to call
     /// `ring_sq_doorbell()` afterwards.
-    pub fn finish_with_blueflame(self) -> WqeHandle {
+    ///
+    /// # Errors
+    /// Returns an error if required segments are missing for the opcode.
+    pub fn finish_with_blueflame(self) -> io::Result<WqeHandle> {
         let wqe_idx = self.inner.wqe_idx;
         let wqebb_cnt = calc_wqebb_cnt(self.inner.offset);
         // For dense tables, ci_delta is the number of WQEBBs for this WQE
@@ -1826,3 +1954,383 @@ impl<Entry> CompletionSource for RcQpInner<Entry, SparseWqeTable<Entry>, ()> {
 ///
 /// This is an alias for `RcQp<T, ()>`. All methods from `RcQp` are available.
 pub type RcQpForMonoCq<Entry> = RcQpInner<Entry, SparseWqeTable<Entry>, ()>;
+
+// =============================================================================
+// Unit Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wqe::{AtomicSeg, CtrlSeg, DataSeg, RdmaSeg, WQEBB_SIZE};
+
+    /// Mock SendQueueState for testing without hardware.
+    struct MockSendQueue {
+        buf: Vec<u8>,
+        wqe_cnt: u16,
+        sqn: u32,
+        pi: Cell<u16>,
+        ci: Cell<u16>,
+        table: SparseWqeTable<u32>,
+    }
+
+    impl MockSendQueue {
+        fn new(wqe_cnt: u16) -> Self {
+            let buf_size = (wqe_cnt as usize) * WQEBB_SIZE;
+            Self {
+                buf: vec![0u8; buf_size],
+                wqe_cnt,
+                sqn: 123,
+                pi: Cell::new(0),
+                ci: Cell::new(0),
+                table: SparseWqeTable::new(wqe_cnt),
+            }
+        }
+
+        fn available(&self) -> u16 {
+            self.wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
+        }
+
+        fn slots_to_end(&self) -> u16 {
+            self.wqe_cnt - (self.pi.get() & (self.wqe_cnt - 1))
+        }
+
+        fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
+            let offset = ((idx & (self.wqe_cnt - 1)) as usize) * WQEBB_SIZE;
+            unsafe { self.buf.as_ptr().add(offset) as *mut u8 }
+        }
+
+        fn set_pi(&self, pi: u16) {
+            self.pi.set(pi);
+        }
+
+        fn set_ci(&self, ci: u16) {
+            self.ci.set(ci);
+        }
+
+        fn advance_pi(&self, count: u16) {
+            self.pi.set(self.pi.get().wrapping_add(count));
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // slots_to_end Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_sq_slots_to_end_at_start() {
+        let sq = MockSendQueue::new(256);
+        sq.set_pi(0);
+        // PI=0 means we're at the start, slots_to_end should be wqe_cnt
+        assert_eq!(sq.slots_to_end(), 256);
+    }
+
+    #[test]
+    fn test_sq_slots_to_end_near_end() {
+        let sq = MockSendQueue::new(256);
+        sq.set_pi(254);
+        // PI=254, wqe_cnt=256, slots_to_end = 256 - (254 & 255) = 2
+        assert_eq!(sq.slots_to_end(), 2);
+    }
+
+    #[test]
+    fn test_sq_slots_to_end_at_wrap() {
+        let sq = MockSendQueue::new(256);
+        sq.set_pi(255);
+        // PI=255, slots_to_end = 256 - 255 = 1
+        assert_eq!(sq.slots_to_end(), 1);
+    }
+
+    #[test]
+    fn test_sq_slots_to_end_after_wrap() {
+        let sq = MockSendQueue::new(256);
+        sq.set_pi(256); // Wraps to 0
+        // PI=256 & 255 = 0, slots_to_end = 256 - 0 = 256
+        assert_eq!(sq.slots_to_end(), 256);
+    }
+
+    #[test]
+    fn test_sq_slots_to_end_small_queue() {
+        let sq = MockSendQueue::new(8);
+        sq.set_pi(5);
+        // PI=5, wqe_cnt=8, slots_to_end = 8 - 5 = 3
+        assert_eq!(sq.slots_to_end(), 3);
+    }
+
+    // -------------------------------------------------------------------------
+    // available Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_sq_available_empty() {
+        let sq = MockSendQueue::new(256);
+        sq.set_pi(0);
+        sq.set_ci(0);
+        assert_eq!(sq.available(), 256);
+    }
+
+    #[test]
+    fn test_sq_available_partial() {
+        let sq = MockSendQueue::new(256);
+        sq.set_pi(100);
+        sq.set_ci(50);
+        // available = 256 - (100 - 50) = 206
+        assert_eq!(sq.available(), 206);
+    }
+
+    #[test]
+    fn test_sq_available_full() {
+        let sq = MockSendQueue::new(256);
+        sq.set_pi(256);
+        sq.set_ci(0);
+        // available = 256 - 256 = 0
+        assert_eq!(sq.available(), 0);
+    }
+
+    #[test]
+    fn test_sq_available_wrap_around() {
+        let sq = MockSendQueue::new(256);
+        sq.set_pi(10);
+        sq.set_ci(65530); // u16 wrap around
+        // available = 256 - (10 - 65530) = 256 - (10 + 6) = 240 (wrapping arithmetic)
+        // 10 - 65530 wraps to 16 in u16, so available = 256 - 16 = 240
+        assert_eq!(sq.available(), 240);
+    }
+
+    // -------------------------------------------------------------------------
+    // PI Wrapping Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_sq_pi_wrapping_add() {
+        let sq = MockSendQueue::new(256);
+        sq.set_pi(65535);
+        sq.advance_pi(1);
+        // 65535 + 1 wraps to 0
+        assert_eq!(sq.pi.get(), 0);
+    }
+
+    #[test]
+    fn test_sq_pi_wrapping_add_multiple() {
+        let sq = MockSendQueue::new(256);
+        sq.set_pi(65530);
+        sq.advance_pi(10);
+        // 65530 + 10 = 65540 -> wraps to 4
+        assert_eq!(sq.pi.get(), 4);
+    }
+
+    // -------------------------------------------------------------------------
+    // get_wqe_ptr Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_sq_get_wqe_ptr_start() {
+        let sq = MockSendQueue::new(8);
+        let ptr0 = sq.get_wqe_ptr(0);
+        let ptr_base = sq.buf.as_ptr() as *mut u8;
+        assert_eq!(ptr0, ptr_base);
+    }
+
+    #[test]
+    fn test_sq_get_wqe_ptr_middle() {
+        let sq = MockSendQueue::new(8);
+        let ptr3 = sq.get_wqe_ptr(3);
+        let ptr_base = sq.buf.as_ptr() as *mut u8;
+        let expected = unsafe { ptr_base.add(3 * WQEBB_SIZE) };
+        assert_eq!(ptr3, expected);
+    }
+
+    #[test]
+    fn test_sq_get_wqe_ptr_wrap() {
+        let sq = MockSendQueue::new(8);
+        // idx=8 should wrap to idx=0
+        let ptr8 = sq.get_wqe_ptr(8);
+        let ptr0 = sq.get_wqe_ptr(0);
+        assert_eq!(ptr8, ptr0);
+    }
+
+    #[test]
+    fn test_sq_get_wqe_ptr_wrap_large_idx() {
+        let sq = MockSendQueue::new(8);
+        // idx=11 & 7 = 3
+        let ptr11 = sq.get_wqe_ptr(11);
+        let ptr3 = sq.get_wqe_ptr(3);
+        assert_eq!(ptr11, ptr3);
+    }
+
+    // -------------------------------------------------------------------------
+    // WQE Segment Size Validation
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_wqe_segment_sizes_fit_in_wqebb() {
+        // A typical RDMA WRITE WQE: ctrl + rdma + sge = 16 + 16 + 16 = 48 bytes
+        let rdma_write_size = CtrlSeg::SIZE + RdmaSeg::SIZE + DataSeg::SIZE;
+        assert_eq!(rdma_write_size, 48);
+        assert!(rdma_write_size <= WQEBB_SIZE);
+
+        // An atomic WQE: ctrl + rdma + atomic + sge = 16 + 16 + 16 + 16 = 64 bytes
+        let atomic_size = CtrlSeg::SIZE + RdmaSeg::SIZE + AtomicSeg::SIZE + DataSeg::SIZE;
+        assert_eq!(atomic_size, 64);
+        assert!(atomic_size <= WQEBB_SIZE);
+    }
+
+    // -------------------------------------------------------------------------
+    // WqeBuilder Validation Tests (structural validation)
+    // -------------------------------------------------------------------------
+
+    /// Test WQE offset calculations match expected segment sizes.
+    #[test]
+    fn test_wqe_offset_calculation_send() {
+        // SEND: ctrl(16) + sge(16) = 32 bytes
+        let expected_offset = CtrlSeg::SIZE + DataSeg::SIZE;
+        assert_eq!(expected_offset, 32);
+    }
+
+    #[test]
+    fn test_wqe_offset_calculation_rdma_write() {
+        // RDMA WRITE: ctrl(16) + rdma(16) + sge(16) = 48 bytes
+        let expected_offset = CtrlSeg::SIZE + RdmaSeg::SIZE + DataSeg::SIZE;
+        assert_eq!(expected_offset, 48);
+    }
+
+    #[test]
+    fn test_wqe_offset_calculation_rdma_write_inline() {
+        // RDMA WRITE with inline: ctrl(16) + rdma(16) + inline_header(4) + data(60) padded to 64
+        // inline_data rounds up to 16-byte boundary: (4 + 60 + 15) & !15 = 64
+        let inline_size = 60;
+        let padded_inline = (4 + inline_size + 15) & !15;
+        let expected_offset = CtrlSeg::SIZE + RdmaSeg::SIZE + padded_inline;
+        assert_eq!(expected_offset, 96); // 16 + 16 + 64 = 96
+    }
+
+    #[test]
+    fn test_wqe_offset_calculation_atomic_cas() {
+        // Atomic CAS: ctrl(16) + rdma(16) + atomic(16) + sge(16) = 64 bytes
+        let expected_offset = CtrlSeg::SIZE + RdmaSeg::SIZE + AtomicSeg::SIZE + DataSeg::SIZE;
+        assert_eq!(expected_offset, 64);
+    }
+
+    // -------------------------------------------------------------------------
+    // WQE Table Integration with SQ Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_sparse_table_with_sq_indices() {
+        let sq = MockSendQueue::new(8);
+        let table = &sq.table;
+
+        // Store at PI=0
+        sq.set_pi(0);
+        table.store(sq.pi.get(), 100, sq.pi.get().wrapping_add(1));
+
+        // Advance PI and store again
+        sq.advance_pi(1);
+        table.store(sq.pi.get(), 200, sq.pi.get().wrapping_add(1));
+
+        // Take entries
+        let entry0 = table.take(0).unwrap();
+        assert_eq!(entry0.data, 100);
+
+        let entry1 = table.take(1).unwrap();
+        assert_eq!(entry1.data, 200);
+    }
+
+    #[test]
+    fn test_sparse_table_wrap_around_with_sq() {
+        let sq = MockSendQueue::new(4);
+        let table = &sq.table;
+
+        // Fill up to PI=3
+        for i in 0..4 {
+            sq.set_pi(i);
+            table.store(sq.pi.get(), i as u32 * 10, sq.pi.get().wrapping_add(1));
+        }
+
+        // Wrap around: PI=4 -> idx=0
+        sq.set_pi(4);
+        table.store(sq.pi.get(), 400, sq.pi.get().wrapping_add(1));
+
+        // Take at wrapped index
+        let entry = table.take(4).unwrap();
+        assert_eq!(entry.data, 400);
+
+        // Original idx=0 should have been overwritten
+        assert!(table.take(0).is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // Boundary Condition Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_sq_boundary_small_queue() {
+        let sq = MockSendQueue::new(4);
+
+        // Test all positions
+        for i in 0u16..4 {
+            sq.set_pi(i);
+            assert_eq!(sq.slots_to_end(), 4 - i);
+        }
+    }
+
+    #[test]
+    fn test_sq_boundary_power_of_two_sizes() {
+        for &size in &[4u16, 8, 16, 32, 64, 128, 256] {
+            let sq = MockSendQueue::new(size);
+
+            // At start
+            sq.set_pi(0);
+            assert_eq!(sq.slots_to_end(), size);
+
+            // At end - 1
+            sq.set_pi(size - 1);
+            assert_eq!(sq.slots_to_end(), 1);
+
+            // At wrap point
+            sq.set_pi(size);
+            assert_eq!(sq.slots_to_end(), size);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // CI Delta Calculation Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_ci_delta_for_sparse_table() {
+        // For sparse tables, ci_delta is the accumulated PI value at completion
+        let sq = MockSendQueue::new(8);
+        let table = &sq.table;
+
+        // WQE at PI=0, size=1 WQEBB -> ci_delta should be 0+1=1
+        sq.set_pi(0);
+        let ci_delta = sq.pi.get().wrapping_add(1);
+        table.store(0, 42, ci_delta);
+
+        let entry = table.take(0).unwrap();
+        assert_eq!(entry.ci_delta, 1);
+
+        // WQE at PI=5, size=2 WQEBBs -> ci_delta should be 5+2=7
+        sq.set_pi(5);
+        let ci_delta = sq.pi.get().wrapping_add(2);
+        table.store(5, 99, ci_delta);
+
+        let entry = table.take(5).unwrap();
+        assert_eq!(entry.ci_delta, 7);
+    }
+
+    #[test]
+    fn test_ci_delta_wrapping() {
+        let sq = MockSendQueue::new(8);
+        let table = &sq.table;
+
+        // WQE at PI=65534, size=3 WQEBBs -> ci_delta = 65534 + 3 = 65537 -> wraps to 1
+        sq.set_pi(65534);
+        let ci_delta = sq.pi.get().wrapping_add(3);
+        table.store(6, 123, ci_delta); // 65534 & 7 = 6
+
+        let entry = table.take(6).unwrap();
+        assert_eq!(entry.ci_delta, 1); // 65537 wrapped to 1 in u16
+    }
+}

@@ -387,6 +387,8 @@ pub struct UdWqeBuilder<'a, Entry, TableType> {
     offset: usize,
     ds_count: u8,
     signaled: bool,
+    /// Opcode set by ctrl() - used for validation in finish()
+    opcode: Option<WqeOpcode>,
 }
 
 impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
@@ -410,6 +412,7 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
         }
         self.offset = CtrlSeg::SIZE;
         self.ds_count = 1;
+        self.opcode = Some(opcode);
         self
     }
 
@@ -456,7 +459,34 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
         self
     }
 
-    fn finish_internal(self) -> WqeHandle {
+    /// Validate the WQE structure based on opcode.
+    ///
+    /// Returns an error if required segments are missing.
+    #[cold]
+    fn validate(&self) -> io::Result<()> {
+        if self.opcode.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ctrl() must be called before finish()",
+            ));
+        }
+
+        // UD operations require address vector segment
+        if self.offset < CtrlSeg::SIZE + UdAddressSeg::SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "UD operations require ud_av() segment",
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish_internal(self) -> io::Result<WqeHandle> {
+        // Validate WQE structure - unlikely path is marked cold
+        if self.opcode.is_none() || self.offset < CtrlSeg::SIZE + UdAddressSeg::SIZE {
+            self.validate()?;
+        }
+
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
         }
@@ -476,13 +506,18 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
         self.sq.advance_pi(wqebb_cnt);
         self.sq.set_last_wqe(self.wqe_ptr, self.offset);
 
-        WqeHandle {
+        Ok(WqeHandle {
             wqe_idx,
             size: self.offset,
-        }
+        })
     }
 
-    fn finish_internal_with_blueflame(self) -> WqeHandle {
+    fn finish_internal_with_blueflame(self) -> io::Result<WqeHandle> {
+        // Validate WQE structure - unlikely path is marked cold
+        if self.opcode.is_none() || self.offset < CtrlSeg::SIZE + UdAddressSeg::SIZE {
+            self.validate()?;
+        }
+
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
         }
@@ -503,9 +538,25 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
         self.sq.advance_pi(wqebb_cnt);
         self.sq.ring_blueflame(wqe_ptr);
 
-        WqeHandle {
+        Ok(WqeHandle {
             wqe_idx,
             size: self.offset,
+        })
+    }
+}
+
+impl<Entry, TableType> Drop for UdWqeBuilder<'_, Entry, TableType> {
+    fn drop(&mut self) {
+        // finish() consumes self, so if Drop is called, finish() was not called.
+        // The PI has not been advanced, so no rollback is needed.
+        // Emit a warning in debug builds to help identify bugs.
+        #[cfg(debug_assertions)]
+        if self.opcode.is_some() {
+            // ctrl() was called but finish() was not
+            eprintln!(
+                "Warning: UdWqeBuilder dropped without calling finish() at wqe_idx={}",
+                self.wqe_idx
+            );
         }
     }
 }
@@ -552,7 +603,10 @@ impl<'a, Entry> SparseUdWqeBuilder<'a, Entry> {
     }
 
     /// Finish the WQE construction.
-    pub fn finish(self) -> WqeHandle {
+    ///
+    /// # Errors
+    /// Returns an error if required segments are missing for the opcode.
+    pub fn finish(self) -> io::Result<WqeHandle> {
         let wqe_idx = self.inner.wqe_idx;
 
         // Calculate ci_delta (accumulated PI value at completion) before advancing PI
@@ -565,7 +619,10 @@ impl<'a, Entry> SparseUdWqeBuilder<'a, Entry> {
     }
 
     /// Finish the WQE construction with BlueFlame doorbell.
-    pub fn finish_with_blueflame(self) -> WqeHandle {
+    ///
+    /// # Errors
+    /// Returns an error if required segments are missing for the opcode.
+    pub fn finish_with_blueflame(self) -> io::Result<WqeHandle> {
         let wqe_idx = self.inner.wqe_idx;
 
         // Calculate ci_delta (accumulated PI value at completion) before advancing PI
@@ -616,7 +673,10 @@ impl<'a, Entry> DenseUdWqeBuilder<'a, Entry> {
     }
 
     /// Finish the WQE construction.
-    pub fn finish(self) -> WqeHandle {
+    ///
+    /// # Errors
+    /// Returns an error if required segments are missing for the opcode.
+    pub fn finish(self) -> io::Result<WqeHandle> {
         let wqe_idx = self.inner.wqe_idx;
         let wqebb_cnt = calc_wqebb_cnt(self.inner.offset);
         // For dense tables, ci_delta is the number of WQEBBs for this WQE
@@ -625,7 +685,10 @@ impl<'a, Entry> DenseUdWqeBuilder<'a, Entry> {
     }
 
     /// Finish the WQE construction with BlueFlame doorbell.
-    pub fn finish_with_blueflame(self) -> WqeHandle {
+    ///
+    /// # Errors
+    /// Returns an error if required segments are missing for the opcode.
+    pub fn finish_with_blueflame(self) -> io::Result<WqeHandle> {
         let wqe_idx = self.inner.wqe_idx;
         let wqebb_cnt = calc_wqebb_cnt(self.inner.offset);
         // For dense tables, ci_delta is the number of WQEBBs for this WQE
@@ -1126,6 +1189,7 @@ impl<Entry, OnComplete> UdQpSparseWqeTable<Entry, OnComplete> {
                 offset: 0,
                 ds_count: 0,
                 signaled: true,
+                opcode: None,
             },
             entry: Some(entry),
         })
@@ -1149,6 +1213,7 @@ impl<Entry, OnComplete> UdQpSparseWqeTable<Entry, OnComplete> {
                 offset: 0,
                 ds_count: 0,
                 signaled: false,
+                opcode: None,
             },
             entry: None,
         })
@@ -1231,6 +1296,7 @@ impl<Entry, OnComplete> UdQpDenseWqeTable<Entry, OnComplete> {
                 offset: 0,
                 ds_count: 0,
                 signaled,
+                opcode: None,
             },
             entry,
         })
@@ -1298,5 +1364,296 @@ where
                 });
             }
         }
+    }
+}
+
+// =============================================================================
+// Unit Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wqe::{CtrlSeg, DataSeg, WQEBB_SIZE, calc_wqebb_cnt};
+
+    /// Mock UD SendQueueState for testing without hardware.
+    struct MockUdSendQueue {
+        buf: Vec<u8>,
+        wqe_cnt: u16,
+        sqn: u32,
+        pi: Cell<u16>,
+        ci: Cell<u16>,
+        table: SparseWqeTable<u32>,
+    }
+
+    impl MockUdSendQueue {
+        fn new(wqe_cnt: u16) -> Self {
+            let buf_size = (wqe_cnt as usize) * WQEBB_SIZE;
+            Self {
+                buf: vec![0u8; buf_size],
+                wqe_cnt,
+                sqn: 789,
+                pi: Cell::new(0),
+                ci: Cell::new(0),
+                table: SparseWqeTable::new(wqe_cnt),
+            }
+        }
+
+        fn available(&self) -> u16 {
+            self.wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
+        }
+
+        fn slots_to_end(&self) -> u16 {
+            self.wqe_cnt - (self.pi.get() & (self.wqe_cnt - 1))
+        }
+
+        fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
+            let offset = ((idx & (self.wqe_cnt - 1)) as usize) * WQEBB_SIZE;
+            unsafe { self.buf.as_ptr().add(offset) as *mut u8 }
+        }
+
+        fn set_pi(&self, pi: u16) {
+            self.pi.set(pi);
+        }
+
+        fn set_ci(&self, ci: u16) {
+            self.ci.set(ci);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // UD Address Segment Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_ud_address_seg_size() {
+        assert_eq!(UdAddressSeg::SIZE, 48);
+        // ud_av() adds 3 DS (48 bytes = 3 * 16)
+        assert_eq!(UdAddressSeg::SIZE / 16, 3);
+    }
+
+    #[test]
+    fn test_ud_wqe_size_send() {
+        // UD SEND: ctrl(16) + ud_av(48) + sge(16) = 80 bytes = 2 WQEBBs
+        let send_size = CtrlSeg::SIZE + UdAddressSeg::SIZE + DataSeg::SIZE;
+        assert_eq!(send_size, 80);
+        assert!(send_size > WQEBB_SIZE);
+    }
+
+    #[test]
+    fn test_ud_wqe_minimum_size() {
+        // Minimum UD WQE: ctrl + ud_av (no data)
+        let min_size = CtrlSeg::SIZE + UdAddressSeg::SIZE;
+        assert_eq!(min_size, 64);
+    }
+
+    // -------------------------------------------------------------------------
+    // UD slots_to_end Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_ud_slots_to_end_at_start() {
+        let sq = MockUdSendQueue::new(64);
+        sq.set_pi(0);
+        assert_eq!(sq.slots_to_end(), 64);
+    }
+
+    #[test]
+    fn test_ud_slots_to_end_near_end() {
+        let sq = MockUdSendQueue::new(64);
+        sq.set_pi(62);
+        assert_eq!(sq.slots_to_end(), 2);
+    }
+
+    #[test]
+    fn test_ud_slots_to_end_insufficient_for_ud_wqe() {
+        let sq = MockUdSendQueue::new(64);
+        sq.set_pi(63);
+        // PI=63, only 1 slot to end, but UD WQE needs at least 2 WQEBBs
+        assert_eq!(sq.slots_to_end(), 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // UD available Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_ud_available_empty() {
+        let sq = MockUdSendQueue::new(64);
+        sq.set_pi(0);
+        sq.set_ci(0);
+        assert_eq!(sq.available(), 64);
+    }
+
+    #[test]
+    fn test_ud_available_partial() {
+        let sq = MockUdSendQueue::new(64);
+        sq.set_pi(30);
+        sq.set_ci(10);
+        assert_eq!(sq.available(), 44);
+    }
+
+    #[test]
+    fn test_ud_available_full() {
+        let sq = MockUdSendQueue::new(64);
+        sq.set_pi(64);
+        sq.set_ci(0);
+        assert_eq!(sq.available(), 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // UD WQE Validation Structural Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_ud_wqe_requires_minimum_offset_for_send() {
+        // UD SEND requires at least ctrl + ud_av
+        let min_offset = CtrlSeg::SIZE + UdAddressSeg::SIZE;
+        assert_eq!(min_offset, 64);
+    }
+
+    #[test]
+    fn test_ud_extended_av_flag() {
+        // MLX5_EXTENDED_UD_AV flag is bit 31
+        const MLX5_EXTENDED_UD_AV: u32 = 0x8000_0000;
+        let qpn = 0x00123456;
+        let dqp = (qpn & 0x00FF_FFFF) | MLX5_EXTENDED_UD_AV;
+        assert_eq!(dqp, 0x80123456);
+        assert!(dqp & MLX5_EXTENDED_UD_AV != 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // UD WQE Offset Calculation Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_ud_wqe_offset_send_with_sge() {
+        // UD SEND with SGE: ctrl(16) + ud_av(48) + sge(16) = 80 bytes
+        let total = CtrlSeg::SIZE + UdAddressSeg::SIZE + DataSeg::SIZE;
+        assert_eq!(total, 80);
+        assert_eq!(calc_wqebb_cnt(total), 2);
+    }
+
+    #[test]
+    fn test_ud_wqe_offset_send_with_inline() {
+        // UD SEND with inline: ctrl(16) + ud_av(48) + inline_header(4) + data
+        let inline_size = 32;
+        let padded_inline = (4 + inline_size + 15) & !15;
+        let total = CtrlSeg::SIZE + UdAddressSeg::SIZE + padded_inline;
+        assert_eq!(total, 112); // 16 + 48 + 48 = 112
+        assert_eq!(calc_wqebb_cnt(total), 2);
+    }
+
+    #[test]
+    fn test_ud_wqe_offset_multiple_sge() {
+        // UD SEND with 2 SGEs: ctrl(16) + ud_av(48) + sge(16) + sge(16) = 96 bytes
+        let total = CtrlSeg::SIZE + UdAddressSeg::SIZE + DataSeg::SIZE * 2;
+        assert_eq!(total, 96);
+        assert_eq!(calc_wqebb_cnt(total), 2);
+    }
+
+    // -------------------------------------------------------------------------
+    // UD Table Integration Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_ud_sparse_table_store_take() {
+        let sq = MockUdSendQueue::new(8);
+        let table = &sq.table;
+
+        table.store(0, 100, 2);
+        let entry = table.take(0).unwrap();
+        assert_eq!(entry.data, 100);
+        assert_eq!(entry.ci_delta, 2);
+    }
+
+    #[test]
+    fn test_ud_sparse_table_wrap_around() {
+        let sq = MockUdSendQueue::new(4);
+        let table = &sq.table;
+
+        // Store at PI=3
+        table.store(3, 300, 5);
+
+        // Wrap around: PI=4 -> idx=0
+        table.store(4, 400, 6);
+
+        let entry = table.take(4).unwrap();
+        assert_eq!(entry.data, 400);
+    }
+
+    // -------------------------------------------------------------------------
+    // UD-specific Boundary Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_ud_wqebb_count_for_typical_wqes() {
+        // SEND: 80 bytes -> 2 WQEBBs
+        let send_size = CtrlSeg::SIZE + UdAddressSeg::SIZE + DataSeg::SIZE;
+        assert_eq!(calc_wqebb_cnt(send_size), 2);
+
+        // SEND with large inline: ctrl(16) + ud_av(48) + inline(64) = 128 -> 2 WQEBBs
+        let inline_send_size = CtrlSeg::SIZE + UdAddressSeg::SIZE + 64;
+        assert_eq!(calc_wqebb_cnt(inline_send_size), 2);
+
+        // SEND with very large inline: 192 bytes -> 3 WQEBBs
+        assert_eq!(calc_wqebb_cnt(192), 3);
+    }
+
+    #[test]
+    fn test_ud_slots_required_near_ring_end() {
+        let sq = MockUdSendQueue::new(8);
+
+        // At PI=6, slots_to_end = 2, which is enough for a typical UD WQE
+        sq.set_pi(6);
+        assert_eq!(sq.slots_to_end(), 2);
+
+        // At PI=7, slots_to_end = 1, not enough for UD WQE
+        sq.set_pi(7);
+        assert_eq!(sq.slots_to_end(), 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // UD Address Segment Write Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_ud_address_seg_write_raw() {
+        let mut buf = [0u8; 64];
+        let ptr = buf.as_mut_ptr();
+
+        unsafe {
+            UdAddressSeg::write_raw(ptr, 0x123456, 0x11111111, 0x5678);
+        }
+
+        // Verify Q_Key at offset 0 (big-endian)
+        let qkey = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        assert_eq!(qkey, 0x11111111);
+
+        // Verify remote QPN with MLX5_EXTENDED_UD_AV at offset 8
+        let dqp = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        assert_eq!(dqp, 0x80123456); // 0x123456 | 0x80000000
+
+        // Verify DLID at offset 14 (big-endian)
+        let dlid = u16::from_be_bytes([buf[14], buf[15]]);
+        assert_eq!(dlid, 0x5678);
+    }
+
+    // -------------------------------------------------------------------------
+    // UD RQ Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_ud_rq_wqe_stride() {
+        // UD RQ WQE stride includes space for GRH (40 bytes) + data
+        // Typical stride: 16 bytes for SGE
+        let sge_size = DataSeg::SIZE;
+        assert_eq!(sge_size, 16);
+    }
+
+    #[test]
+    fn test_ud_mlx5_invalid_lkey() {
+        // MLX5_INVALID_LKEY is used as sentinel in RQ
+        assert_eq!(MLX5_INVALID_LKEY, 0x100);
     }
 }

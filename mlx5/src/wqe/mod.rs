@@ -718,4 +718,221 @@ impl<T> UnorderedWqeTable<T> {
     }
 }
 
+// =============================================================================
+// Unit Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // Segment Size Constants
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_wqebb_size() {
+        assert_eq!(WQEBB_SIZE, 64);
+    }
+
+    #[test]
+    fn test_ctrl_seg_size() {
+        assert_eq!(CtrlSeg::SIZE, 16);
+    }
+
+    #[test]
+    fn test_rdma_seg_size() {
+        assert_eq!(RdmaSeg::SIZE, 16);
+    }
+
+    #[test]
+    fn test_data_seg_size() {
+        assert_eq!(DataSeg::SIZE, 16);
+    }
+
+    #[test]
+    fn test_atomic_seg_size() {
+        assert_eq!(AtomicSeg::SIZE, 16);
+    }
+
+    #[test]
+    fn test_address_vector_size() {
+        assert_eq!(AddressVector::SIZE, 48);
+    }
+
+    #[test]
+    fn test_tm_seg_size() {
+        assert_eq!(TmSeg::SIZE, 32);
+    }
+
+    // -------------------------------------------------------------------------
+    // calc_wqebb_cnt
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_calc_wqebb_cnt_single() {
+        // 64 bytes or less -> 1 WQEBB
+        assert_eq!(calc_wqebb_cnt(1), 1);
+        assert_eq!(calc_wqebb_cnt(16), 1);
+        assert_eq!(calc_wqebb_cnt(64), 1);
+    }
+
+    #[test]
+    fn test_calc_wqebb_cnt_multiple() {
+        // 65 bytes -> 2 WQEBBs
+        assert_eq!(calc_wqebb_cnt(65), 2);
+        assert_eq!(calc_wqebb_cnt(128), 2);
+        // 129 bytes -> 3 WQEBBs
+        assert_eq!(calc_wqebb_cnt(129), 3);
+        assert_eq!(calc_wqebb_cnt(192), 3);
+        // 193 bytes -> 4 WQEBBs
+        assert_eq!(calc_wqebb_cnt(193), 4);
+        assert_eq!(calc_wqebb_cnt(256), 4);
+    }
+
+    #[test]
+    fn test_calc_wqebb_cnt_boundary() {
+        // Exact boundaries
+        assert_eq!(calc_wqebb_cnt(63), 1);
+        assert_eq!(calc_wqebb_cnt(64), 1);
+        assert_eq!(calc_wqebb_cnt(127), 2);
+        assert_eq!(calc_wqebb_cnt(128), 2);
+    }
+
+    // -------------------------------------------------------------------------
+    // WQE Tables
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_sparse_wqe_table_store_and_take() {
+        let table = SparseWqeTable::<u32>::new(8);
+        table.store(0, 42, 1);
+        let entry = table.take(0);
+        assert!(entry.is_some());
+        let entry = entry.unwrap();
+        assert_eq!(entry.data, 42);
+        assert_eq!(entry.ci_delta, 1);
+        // Should be None after take
+        assert!(table.take(0).is_none());
+    }
+
+    #[test]
+    fn test_sparse_wqe_table_wrap_around() {
+        let table = SparseWqeTable::<u32>::new(4);
+        // Store at indices that wrap around
+        table.store(4, 100, 1); // 4 & 3 = 0
+        table.store(5, 101, 2); // 5 & 3 = 1
+        let entry0 = table.take(0);
+        assert!(entry0.is_some());
+        assert_eq!(entry0.unwrap().data, 100);
+        let entry1 = table.take(1);
+        assert!(entry1.is_some());
+        assert_eq!(entry1.unwrap().data, 101);
+    }
+
+    #[test]
+    fn test_sparse_wqe_table_is_available() {
+        let table = SparseWqeTable::<u32>::new(4);
+        assert!(table.is_available(0));
+        table.store(0, 42, 1);
+        assert!(!table.is_available(0));
+        table.take(0);
+        assert!(table.is_available(0));
+    }
+
+    #[test]
+    fn test_dense_wqe_table_store_and_take() {
+        let table = DenseWqeTable::<u32>::new(8);
+        table.store(0, 42, 1);
+        let entry = table.take(0);
+        assert!(entry.is_some());
+        let entry = entry.unwrap();
+        assert_eq!(entry.data, 42);
+        assert_eq!(entry.ci_delta, 1);
+        // Should be None after take
+        assert!(table.take(0).is_none());
+    }
+
+    #[test]
+    fn test_dense_wqe_table_take_range() {
+        let table = DenseWqeTable::<u32>::new(8);
+        // Store entries at indices 1, 2, 3
+        table.store(1, 10, 1);
+        table.store(2, 20, 1);
+        table.store(3, 30, 1);
+
+        // Take range from old_ci=0 to new_ci=3 (exclusive old_ci, inclusive new_ci)
+        let entries: Vec<_> = table.take_range(0, 3).collect();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].0, 1);
+        assert_eq!(entries[0].1.data, 10);
+        assert_eq!(entries[1].0, 2);
+        assert_eq!(entries[1].1.data, 20);
+        assert_eq!(entries[2].0, 3);
+        assert_eq!(entries[2].1.data, 30);
+
+        // All entries should be taken now
+        assert!(table.take(1).is_none());
+        assert!(table.take(2).is_none());
+        assert!(table.take(3).is_none());
+    }
+
+    #[test]
+    fn test_dense_wqe_table_take_range_wrap_around() {
+        let table = DenseWqeTable::<u32>::new(4);
+        // Store entries at indices 3, 4 (index 4 wraps to slot 0)
+        table.store(3, 30, 1);
+        table.store(4, 40, 1); // 4 & 3 = 0, wraps around to slot 0
+
+        // Take range from old_ci=2 to new_ci=4 (PI wrapping)
+        // This iterates from index 3 to 4 (inclusive)
+        let entries: Vec<_> = table.take_range(2, 4).collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, 3);
+        assert_eq!(entries[0].1.data, 30);
+        // Index 4 (which maps to slot 0 via masking)
+        assert_eq!(entries[1].0, 4);
+        assert_eq!(entries[1].1.data, 40);
+    }
+
+    #[test]
+    fn test_unordered_wqe_table_allocate_and_release() {
+        let table = UnorderedWqeTable::<u32>::new(8);
+        assert_eq!(table.available_wqebbs(), 8);
+
+        // Allocate first WQEBB
+        let start = table.try_allocate_first();
+        assert!(start.is_some());
+        assert_eq!(table.available_wqebbs(), 7);
+
+        // Extend allocation
+        let extended = table.try_extend(start.unwrap(), 1);
+        assert!(extended);
+        assert_eq!(table.available_wqebbs(), 6);
+
+        // Store entry
+        table.store(start.unwrap(), start.unwrap(), 2, 42);
+
+        // Take entry (releases WQEBBs)
+        let data = table.take(start.unwrap());
+        assert_eq!(data, Some(42));
+        assert_eq!(table.available_wqebbs(), 8);
+    }
+
+    #[test]
+    fn test_unordered_wqe_table_full() {
+        let table = UnorderedWqeTable::<u32>::new(4);
+
+        // Allocate all WQEBBs
+        for _ in 0..4 {
+            let idx = table.try_allocate_first();
+            assert!(idx.is_some());
+        }
+
+        // Should fail to allocate more
+        assert!(table.try_allocate_first().is_none());
+        assert_eq!(table.available_wqebbs(), 0);
+    }
+}
+
 

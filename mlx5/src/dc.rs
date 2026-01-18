@@ -242,6 +242,8 @@ pub struct DciWqeBuilder<'a, Entry, TableType> {
     ds_count: u8,
     /// Whether SIGNALED flag is set
     signaled: bool,
+    /// Opcode set by ctrl() - used for validation in finish()
+    opcode: Option<WqeOpcode>,
 }
 
 impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType> {
@@ -267,6 +269,7 @@ impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType> {
         }
         self.offset = CtrlSeg::SIZE;
         self.ds_count = 1;
+        self.opcode = Some(opcode);
         self
     }
 
@@ -330,10 +333,50 @@ impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType> {
         (self, slice)
     }
 
+    /// Validate the WQE structure based on opcode.
+    ///
+    /// Returns an error if required segments are missing.
+    #[cold]
+    fn validate(&self) -> io::Result<()> {
+        let Some(opcode) = self.opcode else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ctrl() must be called before finish()",
+            ));
+        };
+
+        match opcode {
+            WqeOpcode::RdmaWrite | WqeOpcode::RdmaWriteImm | WqeOpcode::RdmaRead => {
+                // DC RDMA operations require at least ctrl + av + rdma segments
+                if self.offset < CtrlSeg::SIZE + AddressVector::SIZE + RdmaSeg::SIZE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "DC RDMA operations require av() and rdma() segments",
+                    ));
+                }
+            }
+            _ => {
+                // All DC operations require address vector
+                if self.offset < CtrlSeg::SIZE + AddressVector::SIZE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "DC operations require av() segment",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Finish the WQE construction (internal).
     ///
     /// Stores WQE info for later doorbell via `ring_sq_doorbell()`.
-    fn finish_internal(self) -> WqeHandle {
+    fn finish_internal(self) -> io::Result<WqeHandle> {
+        // Validate WQE structure - unlikely path is marked cold
+        if self.opcode.is_none() || self.offset < CtrlSeg::SIZE + AddressVector::SIZE {
+            self.validate()?;
+        }
+
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
         }
@@ -353,17 +396,22 @@ impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType> {
         self.sq.advance_pi(wqebb_cnt);
         self.sq.set_last_wqe(self.wqe_ptr, self.offset);
 
-        WqeHandle {
+        Ok(WqeHandle {
             wqe_idx,
             size: self.offset,
-        }
+        })
     }
 
     /// Finish the WQE construction and immediately ring BlueFlame doorbell.
     ///
     /// Use this for low-latency single WQE submission. The doorbell is issued
     /// immediately, so no need to call `ring_sq_doorbell()` afterwards.
-    fn finish_internal_with_blueflame(self) -> WqeHandle {
+    fn finish_internal_with_blueflame(self) -> io::Result<WqeHandle> {
+        // Validate WQE structure - unlikely path is marked cold
+        if self.opcode.is_none() || self.offset < CtrlSeg::SIZE + AddressVector::SIZE {
+            self.validate()?;
+        }
+
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
         }
@@ -384,9 +432,25 @@ impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType> {
         self.sq.advance_pi(wqebb_cnt);
         self.sq.ring_blueflame(wqe_ptr);
 
-        WqeHandle {
+        Ok(WqeHandle {
             wqe_idx,
             size: self.offset,
+        })
+    }
+}
+
+impl<Entry, TableType> Drop for DciWqeBuilder<'_, Entry, TableType> {
+    fn drop(&mut self) {
+        // finish() consumes self, so if Drop is called, finish() was not called.
+        // The PI has not been advanced, so no rollback is needed.
+        // Emit a warning in debug builds to help identify bugs.
+        #[cfg(debug_assertions)]
+        if self.opcode.is_some() {
+            // ctrl() was called but finish() was not
+            eprintln!(
+                "Warning: DciWqeBuilder dropped without calling finish() at wqe_idx={}",
+                self.wqe_idx
+            );
         }
     }
 }
@@ -435,7 +499,10 @@ impl<'a, Entry> SparseDciWqeBuilder<'a, Entry> {
     /// Finish the WQE construction.
     ///
     /// The doorbell will be issued when `ring_sq_doorbell()` is called.
-    pub fn finish(self) -> WqeHandle {
+    ///
+    /// # Errors
+    /// Returns an error if required segments are missing for the opcode.
+    pub fn finish(self) -> io::Result<WqeHandle> {
         let wqe_idx = self.inner.wqe_idx;
 
         // Calculate ci_delta (accumulated PI value at completion) before advancing PI
@@ -451,7 +518,10 @@ impl<'a, Entry> SparseDciWqeBuilder<'a, Entry> {
     ///
     /// Use this for low-latency single WQE submission. No need to call
     /// `ring_sq_doorbell()` afterwards.
-    pub fn finish_with_blueflame(self) -> WqeHandle {
+    ///
+    /// # Errors
+    /// Returns an error if required segments are missing for the opcode.
+    pub fn finish_with_blueflame(self) -> io::Result<WqeHandle> {
         let wqe_idx = self.inner.wqe_idx;
 
         // Calculate ci_delta (accumulated PI value at completion) before advancing PI
@@ -502,7 +572,10 @@ impl<'a, Entry> DenseDciWqeBuilder<'a, Entry> {
     }
 
     /// Finish the WQE construction.
-    pub fn finish(self) -> WqeHandle {
+    ///
+    /// # Errors
+    /// Returns an error if required segments are missing for the opcode.
+    pub fn finish(self) -> io::Result<WqeHandle> {
         let wqe_idx = self.inner.wqe_idx;
         let wqebb_cnt = calc_wqebb_cnt(self.inner.offset);
         // For dense tables, ci_delta is the number of WQEBBs for this WQE
@@ -514,7 +587,10 @@ impl<'a, Entry> DenseDciWqeBuilder<'a, Entry> {
     ///
     /// Use this for low-latency single WQE submission. No need to call
     /// `ring_sq_doorbell()` afterwards.
-    pub fn finish_with_blueflame(self) -> WqeHandle {
+    ///
+    /// # Errors
+    /// Returns an error if required segments are missing for the opcode.
+    pub fn finish_with_blueflame(self) -> io::Result<WqeHandle> {
         let wqe_idx = self.inner.wqe_idx;
         let wqebb_cnt = calc_wqebb_cnt(self.inner.offset);
         // For dense tables, ci_delta is the number of WQEBBs for this WQE
@@ -1045,6 +1121,7 @@ impl<Entry, OnComplete> DciSparseWqeTable<Entry, OnComplete> {
                 offset: 0,
                 ds_count: 0,
                 signaled: true,
+                opcode: None,
             },
             entry: Some(entry),
         })
@@ -1070,6 +1147,7 @@ impl<Entry, OnComplete> DciSparseWqeTable<Entry, OnComplete> {
                 offset: 0,
                 ds_count: 0,
                 signaled: false,
+                opcode: None,
             },
             entry: None,
         })
@@ -1144,6 +1222,7 @@ impl<Entry, OnComplete> DciDenseWqeTable<Entry, OnComplete> {
                 offset: 0,
                 ds_count: 0,
                 signaled,
+                opcode: None,
             },
             entry,
         })
@@ -1392,5 +1471,253 @@ impl<T> Dct<T> {
     /// * `wqe_idx` - WQE index from the CQE (wqe_counter field)
     pub fn process_recv_completion(&self, wqe_idx: u16) -> Option<T> {
         self.srq.process_recv_completion(wqe_idx)
+    }
+}
+
+// =============================================================================
+// Unit Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wqe::{AddressVector, CtrlSeg, DataSeg, RdmaSeg, WQEBB_SIZE};
+
+    /// Mock DCI SendQueueState for testing without hardware.
+    struct MockDciSendQueue {
+        buf: Vec<u8>,
+        wqe_cnt: u16,
+        sqn: u32,
+        pi: Cell<u16>,
+        ci: Cell<u16>,
+        table: SparseWqeTable<u32>,
+    }
+
+    impl MockDciSendQueue {
+        fn new(wqe_cnt: u16) -> Self {
+            let buf_size = (wqe_cnt as usize) * WQEBB_SIZE;
+            Self {
+                buf: vec![0u8; buf_size],
+                wqe_cnt,
+                sqn: 456,
+                pi: Cell::new(0),
+                ci: Cell::new(0),
+                table: SparseWqeTable::new(wqe_cnt),
+            }
+        }
+
+        fn available(&self) -> u16 {
+            self.wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
+        }
+
+        fn slots_to_end(&self) -> u16 {
+            self.wqe_cnt - (self.pi.get() & (self.wqe_cnt - 1))
+        }
+
+        fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
+            let offset = ((idx & (self.wqe_cnt - 1)) as usize) * WQEBB_SIZE;
+            unsafe { self.buf.as_ptr().add(offset) as *mut u8 }
+        }
+
+        fn set_pi(&self, pi: u16) {
+            self.pi.set(pi);
+        }
+
+        fn set_ci(&self, ci: u16) {
+            self.ci.set(ci);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // DCI WQE Segment Size Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_dci_wqe_size_send() {
+        // DCI SEND: ctrl(16) + av(48) + sge(16) = 80 bytes = 2 WQEBBs
+        let send_size = CtrlSeg::SIZE + AddressVector::SIZE + DataSeg::SIZE;
+        assert_eq!(send_size, 80);
+        assert!(send_size > WQEBB_SIZE); // Requires 2 WQEBBs
+    }
+
+    #[test]
+    fn test_dci_wqe_size_rdma_write() {
+        // DCI RDMA WRITE: ctrl(16) + av(48) + rdma(16) + sge(16) = 96 bytes = 2 WQEBBs
+        let rdma_write_size = CtrlSeg::SIZE + AddressVector::SIZE + RdmaSeg::SIZE + DataSeg::SIZE;
+        assert_eq!(rdma_write_size, 96);
+    }
+
+    #[test]
+    fn test_av_segment_size() {
+        // AddressVector is 48 bytes
+        assert_eq!(AddressVector::SIZE, 48);
+        // av() adds 3 DS (48 bytes = 3 * 16)
+        assert_eq!(AddressVector::SIZE / 16, 3);
+    }
+
+    // -------------------------------------------------------------------------
+    // DCI slots_to_end Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_dci_slots_to_end_at_start() {
+        let sq = MockDciSendQueue::new(64);
+        sq.set_pi(0);
+        assert_eq!(sq.slots_to_end(), 64);
+    }
+
+    #[test]
+    fn test_dci_slots_to_end_near_end() {
+        let sq = MockDciSendQueue::new(64);
+        sq.set_pi(62);
+        // PI=62, wqe_cnt=64, slots_to_end = 64 - 62 = 2
+        assert_eq!(sq.slots_to_end(), 2);
+    }
+
+    #[test]
+    fn test_dci_slots_to_end_insufficient_for_dc_wqe() {
+        let sq = MockDciSendQueue::new(64);
+        sq.set_pi(63);
+        // PI=63, only 1 slot to end, but DC WQE needs at least 2 WQEBBs
+        assert_eq!(sq.slots_to_end(), 1);
+        // This would require post_nop_to_ring_end() before posting a DC WQE
+    }
+
+    // -------------------------------------------------------------------------
+    // DCI available Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_dci_available_empty() {
+        let sq = MockDciSendQueue::new(64);
+        sq.set_pi(0);
+        sq.set_ci(0);
+        assert_eq!(sq.available(), 64);
+    }
+
+    #[test]
+    fn test_dci_available_partial() {
+        let sq = MockDciSendQueue::new(64);
+        sq.set_pi(30);
+        sq.set_ci(10);
+        // available = 64 - (30 - 10) = 44
+        assert_eq!(sq.available(), 44);
+    }
+
+    #[test]
+    fn test_dci_available_for_dc_wqe() {
+        let sq = MockDciSendQueue::new(64);
+        sq.set_pi(62);
+        sq.set_ci(0);
+        // available = 64 - 62 = 2 (just enough for one 2-WQEBB DC WQE)
+        assert_eq!(sq.available(), 2);
+    }
+
+    // -------------------------------------------------------------------------
+    // DCI WQE Offset Calculation Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_dci_wqe_offset_send_with_inline() {
+        // DCI SEND with inline: ctrl(16) + av(48) + inline_header(4) + data
+        let inline_size = 32;
+        let padded_inline = (4 + inline_size + 15) & !15; // 48, rounds up to 48
+        let total = CtrlSeg::SIZE + AddressVector::SIZE + padded_inline;
+        assert_eq!(total, 112); // 16 + 48 + 48 = 112
+    }
+
+    #[test]
+    fn test_dci_wqe_minimum_size() {
+        // Minimum DCI WQE: ctrl + av (no data)
+        let min_size = CtrlSeg::SIZE + AddressVector::SIZE;
+        assert_eq!(min_size, 64); // Exactly 1 WQEBB
+    }
+
+    // -------------------------------------------------------------------------
+    // DCI Table Integration Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_dci_sparse_table_store_take() {
+        let sq = MockDciSendQueue::new(8);
+        let table = &sq.table;
+
+        // Store entry at PI=0
+        table.store(0, 100, 2); // 2 WQEBBs for DC WQE
+
+        let entry = table.take(0).unwrap();
+        assert_eq!(entry.data, 100);
+        assert_eq!(entry.ci_delta, 2);
+    }
+
+    #[test]
+    fn test_dci_sparse_table_wrap_around() {
+        let sq = MockDciSendQueue::new(4);
+        let table = &sq.table;
+
+        // Store at PI=3
+        table.store(3, 300, 5); // ci_delta = 3 + 2 = 5
+
+        // Wrap around: PI=4 -> idx=0
+        table.store(4, 400, 6);
+
+        let entry = table.take(4).unwrap();
+        assert_eq!(entry.data, 400);
+    }
+
+    // -------------------------------------------------------------------------
+    // DC WQE Validation Structural Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_dci_wqe_requires_minimum_offset_for_send() {
+        // DCI SEND requires at least ctrl + av
+        let min_offset = CtrlSeg::SIZE + AddressVector::SIZE;
+        assert_eq!(min_offset, 64);
+    }
+
+    #[test]
+    fn test_dci_wqe_requires_minimum_offset_for_rdma() {
+        // DCI RDMA requires at least ctrl + av + rdma
+        let min_offset = CtrlSeg::SIZE + AddressVector::SIZE + RdmaSeg::SIZE;
+        assert_eq!(min_offset, 80);
+    }
+
+    // -------------------------------------------------------------------------
+    // DC-specific Boundary Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_dci_wqebb_count_for_typical_wqes() {
+        use crate::wqe::calc_wqebb_cnt;
+
+        // SEND: 80 bytes -> 2 WQEBBs
+        let send_size = CtrlSeg::SIZE + AddressVector::SIZE + DataSeg::SIZE;
+        assert_eq!(calc_wqebb_cnt(send_size), 2);
+
+        // RDMA WRITE: 96 bytes -> 2 WQEBBs
+        let rdma_size = CtrlSeg::SIZE + AddressVector::SIZE + RdmaSeg::SIZE + DataSeg::SIZE;
+        assert_eq!(calc_wqebb_cnt(rdma_size), 2);
+
+        // SEND with large inline: ctrl(16) + av(48) + inline(64) = 128 -> 2 WQEBBs
+        let inline_send_size = CtrlSeg::SIZE + AddressVector::SIZE + 64;
+        assert_eq!(calc_wqebb_cnt(inline_send_size), 2);
+
+        // SEND with very large inline: 192 bytes -> 3 WQEBBs
+        assert_eq!(calc_wqebb_cnt(192), 3);
+    }
+
+    #[test]
+    fn test_dci_slots_required_near_ring_end() {
+        let sq = MockDciSendQueue::new(8);
+
+        // At PI=6, slots_to_end = 2, which is enough for a typical DC WQE
+        sq.set_pi(6);
+        assert_eq!(sq.slots_to_end(), 2);
+
+        // At PI=7, slots_to_end = 1, not enough for DC WQE
+        sq.set_pi(7);
+        assert_eq!(sq.slots_to_end(), 1);
+        // Would need post_nop_to_ring_end() here
     }
 }
