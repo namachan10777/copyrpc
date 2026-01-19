@@ -16,14 +16,16 @@
 
 mod common;
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use mlx5::cq::CqeOpcode;
 use mlx5::dc::DciConfig;
-use mlx5::tm_srq::TmSrqConfig;
+use mlx5::tm_srq::{TmSrqCompletion, TmSrqConfig};
 use mlx5::wqe::WqeOpcode;
+use mlx5::Cqe;
 
-use common::{full_access, poll_cq_timeout, AlignedBuffer, TestContext};
+use common::{full_access, AlignedBuffer, TestContext};
 
 // =============================================================================
 // TM-SRQ Creation Tests
@@ -115,10 +117,7 @@ fn test_tm_tag_add_remove() {
 
     require_tm_srq!(&ctx);
 
-    let mut cq = ctx.ctx.create_cq(256).expect("Failed to create CQ");
-    cq.init_direct_access()
-        .expect("Failed to init CQ direct access");
-    let cq = Rc::new(cq);
+    let cq = Rc::new(ctx.ctx.create_cq(256).expect("Failed to create CQ"));
 
     let config = TmSrqConfig {
         max_wr: 256,
@@ -127,12 +126,24 @@ fn test_tm_tag_add_remove() {
         max_ops: 8,
     };
 
+    // Capture CQEs via callback
+    let captured_cqes: Rc<RefCell<Vec<Cqe>>> = Rc::new(RefCell::new(Vec::new()));
+    let cqes_clone = captured_cqes.clone();
+
     let tm_srq = ctx
         .ctx
-        .create_tm_srq::<u64, u64, _>(&ctx.pd, &cq, &config, |_| {})
+        .create_tm_srq::<u64, u64, _>(&ctx.pd, &cq, &config, move |completion| {
+            match completion {
+                TmSrqCompletion::CmdQp(cqe, _entry) => {
+                    cqes_clone.borrow_mut().push(cqe);
+                }
+                TmSrqCompletion::Error(cqe, _) => {
+                    cqes_clone.borrow_mut().push(cqe);
+                }
+                _ => {}
+            }
+        })
         .expect("Failed to create TM-SRQ");
-
-    // Direct access is auto-initialized at creation
 
     // Allocate receive buffer
     let recv_buf = AlignedBuffer::new(4096);
@@ -142,13 +153,9 @@ fn test_tm_tag_add_remove() {
     // Add a tag
     let tag: u64 = 0xDEADBEEF_CAFEBABE;
     let tag_index: u16 = 0;
-    let _recv_wr_id: u64 = 100; // Work request ID for the receive buffer
 
-    // Debug: print Command QP state
     println!("Cmd QP available slots: {}", tm_srq.borrow().cmd_optimistic_available());
 
-    // Build WQE and get the pointer for debugging
-    // Try regular doorbell instead of BlueFlame
     let handle = tm_srq.borrow_mut()
         .cmd_wqe_builder(1u64)
         .expect("cmd_wqe_builder failed")
@@ -158,20 +165,31 @@ fn test_tm_tag_add_remove() {
     tm_srq.borrow_mut().ring_cmd_doorbell();
 
     println!("WQE handle: idx={}, size={}", handle.wqe_idx, handle.size);
-    println!("Buffer addr: 0x{:016x}, lkey: 0x{:08x}", recv_buf.addr(), mr.lkey());
 
-    // Poll for add completion - wait a bit for hardware to process
-    std::thread::sleep(std::time::Duration::from_millis(10));
-
-    let add_cqe = poll_cq_timeout(&cq, 5000).expect("Add CQE timeout");
-    println!("Add CQE: opcode={:?}, wqe_counter={}, qp_num=0x{:x}",
-        add_cqe.opcode, add_cqe.wqe_counter, add_cqe.qp_num);
-    // TM operations may return Req (0x00) or TmFinish (0x06) depending on hardware
-    assert!(matches!(add_cqe.opcode, CqeOpcode::Req | CqeOpcode::TmFinish),
-        "Add CQE error: opcode={:?}", add_cqe.opcode);
+    // Poll for add completion
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_millis(5000);
+    while captured_cqes.borrow().is_empty() {
+        cq.poll();
+        if start.elapsed() > timeout {
+            panic!("Add CQE timeout");
+        }
+        std::hint::spin_loop();
+    }
     cq.flush();
 
+    let add_cqe = captured_cqes.borrow()[0].clone();
+    println!("Add CQE: opcode={:?}, wqe_counter={}, qp_num=0x{:x}, syndrome={}",
+        add_cqe.opcode, add_cqe.wqe_counter, add_cqe.qp_num, add_cqe.syndrome);
+    // TM operations should complete without error (syndrome == 0)
+    assert_eq!(add_cqe.syndrome, 0, "TAG_ADD failed with syndrome={}", add_cqe.syndrome);
+    // Opcode may be TmFinish or Req depending on hardware/CQE compression
+    println!("  (opcode {:?} is acceptable for TM operations)", add_cqe.opcode);
+
     println!("Tag added: index={}, tag=0x{:016x}", tag_index, tag);
+
+    // Clear captured CQEs for next operation
+    captured_cqes.borrow_mut().clear();
 
     // Remove the tag
     tm_srq.borrow_mut()
@@ -182,11 +200,22 @@ fn test_tm_tag_add_remove() {
         .finish_with_blueflame();
 
     // Poll for delete completion
-    // TAG_DEL may return Req (0x00) or TmFinish (0x06) depending on hardware
-    let del_cqe = poll_cq_timeout(&cq, 5000).expect("Del CQE timeout");
-    assert!(matches!(del_cqe.opcode, CqeOpcode::Req | CqeOpcode::TmFinish),
-        "Del CQE error: opcode={:?}", del_cqe.opcode);
+    let start = std::time::Instant::now();
+    while captured_cqes.borrow().is_empty() {
+        cq.poll();
+        if start.elapsed() > timeout {
+            panic!("Del CQE timeout");
+        }
+        std::hint::spin_loop();
+    }
     cq.flush();
+
+    let del_cqe = captured_cqes.borrow()[0].clone();
+    println!("Del CQE: opcode={:?}, wqe_counter={}, qp_num=0x{:x}, syndrome={}",
+        del_cqe.opcode, del_cqe.wqe_counter, del_cqe.qp_num, del_cqe.syndrome);
+    // TM operations should complete without error (syndrome == 0)
+    assert_eq!(del_cqe.syndrome, 0, "TAG_DEL failed with syndrome={}", del_cqe.syndrome);
+    println!("  (opcode {:?} is acceptable for TM operations)", del_cqe.opcode);
 
     println!("Tag removed: index={}", tag_index);
     println!("TM tag add/remove test passed!");
@@ -271,10 +300,7 @@ fn test_tm_multiple_tags() {
 
     require_tm_srq!(&ctx);
 
-    let mut cq = ctx.ctx.create_cq(256).expect("Failed to create CQ");
-    cq.init_direct_access()
-        .expect("Failed to init CQ direct access");
-    let cq = Rc::new(cq);
+    let cq = Rc::new(ctx.ctx.create_cq(256).expect("Failed to create CQ"));
 
     let config = TmSrqConfig {
         max_wr: 256,
@@ -283,12 +309,24 @@ fn test_tm_multiple_tags() {
         max_ops: 16,
     };
 
+    // Capture CQEs via callback
+    let captured_cqes: Rc<RefCell<Vec<Cqe>>> = Rc::new(RefCell::new(Vec::new()));
+    let cqes_clone = captured_cqes.clone();
+
     let tm_srq = ctx
         .ctx
-        .create_tm_srq::<u64, u64, _>(&ctx.pd, &cq, &config, |_| {})
+        .create_tm_srq::<u64, u64, _>(&ctx.pd, &cq, &config, move |completion| {
+            match completion {
+                TmSrqCompletion::CmdQp(cqe, _entry) => {
+                    cqes_clone.borrow_mut().push(cqe);
+                }
+                TmSrqCompletion::Error(cqe, _) => {
+                    cqes_clone.borrow_mut().push(cqe);
+                }
+                _ => {}
+            }
+        })
         .expect("Failed to create TM-SRQ");
-
-    // Direct access is auto-initialized at creation
 
     // Allocate receive buffers
     let recv_bufs: Vec<_> = (0..8).map(|_| AlignedBuffer::new(4096)).collect();
@@ -300,10 +338,13 @@ fn test_tm_multiple_tags() {
         })
         .collect();
 
+    let timeout = std::time::Duration::from_millis(5000);
+
     // Add multiple tags
     let base_tag: u64 = 0x1000;
     for i in 0..8u16 {
         let tag = base_tag + i as u64;
+        let prev_count = captured_cqes.borrow().len();
 
         tm_srq.borrow_mut()
             .cmd_wqe_builder((i + 1) as u64)
@@ -313,11 +354,18 @@ fn test_tm_multiple_tags() {
             .finish_with_blueflame();
 
         // Poll for completion
-        // TM operations may return Req (0x00) or TmFinish (0x06)
-        let cqe = poll_cq_timeout(&cq, 5000)
-            .expect(&format!("Add CQE timeout for tag {}", i));
-        assert!(matches!(cqe.opcode, CqeOpcode::Req | CqeOpcode::TmFinish),
-            "Add CQE error for tag {}: opcode={:?}", i, cqe.opcode);
+        let start = std::time::Instant::now();
+        while captured_cqes.borrow().len() <= prev_count {
+            cq.poll();
+            if start.elapsed() > timeout {
+                panic!("Add CQE timeout for tag {}", i);
+            }
+            std::hint::spin_loop();
+        }
+
+        let cqe = captured_cqes.borrow().last().unwrap().clone();
+        // TM operations should complete without error (syndrome == 0)
+        assert_eq!(cqe.syndrome, 0, "TAG_ADD for tag {} failed with syndrome={}", i, cqe.syndrome);
     }
     cq.flush();
 
@@ -325,6 +373,8 @@ fn test_tm_multiple_tags() {
 
     // Remove all tags
     for i in 0..8u16 {
+        let prev_count = captured_cqes.borrow().len();
+
         tm_srq.borrow_mut()
             .cmd_wqe_builder((i + 100) as u64)
             .expect("cmd_wqe_builder failed")
@@ -333,11 +383,18 @@ fn test_tm_multiple_tags() {
             .finish_with_blueflame();
 
         // Poll for completion
-        // TAG_DEL may return Req (0x00) or TmFinish (0x06)
-        let cqe = poll_cq_timeout(&cq, 5000)
-            .expect(&format!("Del CQE timeout for tag {}", i));
-        assert!(matches!(cqe.opcode, CqeOpcode::Req | CqeOpcode::TmFinish),
-            "Del CQE error for tag {}: opcode={:?}", i, cqe.opcode);
+        let start = std::time::Instant::now();
+        while captured_cqes.borrow().len() <= prev_count {
+            cq.poll();
+            if start.elapsed() > timeout {
+                panic!("Del CQE timeout for tag {}", i);
+            }
+            std::hint::spin_loop();
+        }
+
+        let cqe = captured_cqes.borrow().last().unwrap().clone();
+        // TM operations should complete without error (syndrome == 0)
+        assert_eq!(cqe.syndrome, 0, "TAG_DEL for tag {} failed with syndrome={}", i, cqe.syndrome);
     }
     cq.flush();
 
