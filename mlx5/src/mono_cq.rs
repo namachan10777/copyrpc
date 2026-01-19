@@ -29,8 +29,6 @@
 //! ```
 
 use std::cell::{Cell, RefCell, UnsafeCell};
-use std::collections::HashMap;
-use std::hash::BuildHasherDefault;
 use std::ptr::NonNull;
 use std::rc::{Rc, Weak};
 use std::{io, mem::MaybeUninit};
@@ -93,11 +91,9 @@ struct MonoCqState {
 // MonoCq
 // =============================================================================
 
-/// Queue map type using rapidhash for fast lookups.
-type MonoQueueMap<Q> = HashMap<u32, Weak<RefCell<Q>>, BuildHasherDefault<rapidhash::RapidHasher>>;
-
-/// Cached queue lookup result.
-type CachedMonoQueue<Q> = Option<(u32, Rc<RefCell<Q>>)>;
+/// Direct queue lookup vector using QPN offset.
+/// QPNs are monotonically increasing, so we use base_qpn + offset mapping.
+type MonoQueueVec<Q> = Vec<Option<Weak<RefCell<Q>>>>;
 
 /// Monomorphic Completion Queue with inlined callback dispatch.
 ///
@@ -123,9 +119,11 @@ where
     state: MonoCqState,
     callback: F,
     /// Registered queues for completion dispatch.
-    queues: RefCell<MonoQueueMap<Q>>,
-    /// Cache for last looked up queue to avoid HashMap lookup.
-    last_queue_cache: UnsafeCell<CachedMonoQueue<Q>>,
+    /// Uses direct indexing: queues[qpn - base_qpn]
+    queues: RefCell<MonoQueueVec<Q>>,
+    /// Base QPN for offset calculation (first registered QP).
+    /// QPNs are monotonically increasing machine-wide.
+    base_qpn: Cell<u32>,
     /// Keep the context alive while this CQ exists.
     _ctx: Context,
 }
@@ -231,13 +229,19 @@ impl Context {
 
                 if cq_ex.is_null() {
                     // Fallback to standard CQ if compression not supported
-                    (mlx5_sys::ibv_create_cq_ex_ex(self.as_ptr(), &mut attr), false)
+                    (
+                        mlx5_sys::ibv_create_cq_ex_ex(self.as_ptr(), &mut attr),
+                        false,
+                    )
                 } else {
                     (cq_ex, true)
                 }
             } else {
                 // Standard CQ without compression (for TX or when compression not needed)
-                (mlx5_sys::ibv_create_cq_ex_ex(self.as_ptr(), &mut attr), false)
+                (
+                    mlx5_sys::ibv_create_cq_ex_ex(self.as_ptr(), &mut attr),
+                    false,
+                )
             };
 
             if cq_ex.is_null() {
@@ -291,8 +295,8 @@ impl Context {
                     cqe_compression,
                 },
                 callback,
-                queues: RefCell::new(HashMap::with_hasher(BuildHasherDefault::default())),
-                last_queue_cache: UnsafeCell::new(None),
+                queues: RefCell::new(Vec::new()),
+                base_qpn: Cell::new(u32::MAX),
                 _ctx: self.clone(),
             })
         }
@@ -311,48 +315,56 @@ where
 
     /// Register a queue for completion dispatch.
     ///
-    /// The queue must implement `CompletionSource` with the same entry type.
+    /// The queue must implement `CompletionSource` with same entry type.
     pub fn register(&self, qp: &Rc<RefCell<Q>>) {
         let qpn = qp.borrow().qpn();
-        self.queues.borrow_mut().insert(qpn, Rc::downgrade(qp));
+        let base_qpn = self.base_qpn.get();
+
+        let mut queues = self.queues.borrow_mut();
+
+        let offset = if base_qpn == u32::MAX {
+            self.base_qpn.set(qpn);
+            0
+        } else if qpn >= base_qpn {
+            qpn - base_qpn
+        } else {
+            eprintln!("Warning: QPN {} is less than base QPN {}", qpn, base_qpn);
+            0
+        } as usize;
+
+        if offset >= queues.len() {
+            queues.resize(offset + 1, None);
+        }
+
+        queues[offset] = Some(Rc::downgrade(qp));
     }
 
     /// Unregister a queue.
     pub fn unregister(&self, qpn: u32) {
-        self.queues.borrow_mut().remove(&qpn);
-        // Invalidate cache if it was for this QPN
-        let cache = unsafe { &mut *self.last_queue_cache.get() };
-        if let Some((cached_qpn, _)) = cache.as_ref() {
-            if *cached_qpn == qpn {
-                *cache = None;
+        let base_qpn = self.base_qpn.get();
+        if qpn >= base_qpn {
+            let mut queues = self.queues.borrow_mut();
+            let offset = (qpn - base_qpn) as usize;
+            if offset < queues.len() {
+                queues[offset] = None;
             }
         }
     }
 
-    /// Find queue by QPN.
+    /// Find queue by QPN using direct indexing.
     #[inline]
     fn find_queue(&self, qpn: u32) -> Option<Rc<RefCell<Q>>> {
-        // Fast path: check cache
-        {
-            let cache = unsafe { &*self.last_queue_cache.get() };
-            if let Some((cached_qpn, cached_rc)) = cache.as_ref() {
-                if *cached_qpn == qpn {
-                    return Some(cached_rc.clone());
-                }
-            }
+        let base_qpn = self.base_qpn.get();
+        if qpn < base_qpn {
+            return None;
         }
 
-        // Slow path: HashMap lookup
-        let result = self.queues.borrow().get(&qpn).and_then(|w| w.upgrade());
+        let offset = (qpn - base_qpn) as usize;
+        let queues = self.queues.borrow();
 
-        // Update cache
-        if let Some(ref rc) = result {
-            unsafe {
-                *self.last_queue_cache.get() = Some((qpn, rc.clone()));
-            }
-        }
-
-        result
+        queues
+            .get(offset)
+            .and_then(|w| w.as_ref().and_then(|weak| weak.upgrade()))
     }
 
     /// Poll for completions and dispatch to registered queues with inlined callback.
