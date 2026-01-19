@@ -498,6 +498,7 @@ impl<'a, U> RqWqeBuilder<'a, U> {
 pub struct TagMatchingSrq<T, Tab, U, F> {
     srq: NonNull<mlx5_sys::ibv_srq>,
     /// Number of WQE slots (power of 2).
+    #[allow(dead_code)]
     wqe_cnt: u32,
     /// Maximum number of tags.
     max_num_tags: u16,

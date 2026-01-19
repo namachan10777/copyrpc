@@ -288,6 +288,7 @@ impl Drop for AddressHandle {
 
 impl AddressHandle {
     /// Get the raw ibv_ah pointer.
+    #[allow(dead_code)]
     pub(crate) fn as_ptr(&self) -> *mut mlx5_sys::ibv_ah {
         self.ah.as_ptr()
     }

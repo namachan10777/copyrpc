@@ -333,7 +333,7 @@ pub fn is_tm_srq_supported(ctx: &TestContext) -> bool {
     eprintln!("  TM-SRQ check: trying config: max_wr={}, max_num_tags={}, max_ops={}",
               config.max_wr, config.max_num_tags, config.max_ops);
 
-    match ctx.ctx.create_sparse_tm_srq::<u64, u64, _>(&ctx.pd, &cq, &config, |_| {}) {
+    match ctx.ctx.create_tm_srq::<u64, u64, _>(&ctx.pd, &cq, &config, |_| {}) {
         Ok(_) => {
             eprintln!("  TM-SRQ check: creation succeeded");
             true
