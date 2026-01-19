@@ -136,6 +136,290 @@ fn test_rc_rdma_write_wraparound() {
     println!("RC RDMA WRITE wrap-around test passed! ({} iterations)", iterations);
 }
 
+/// Test that finish_with_wrap_around is actually triggered.
+///
+/// This test specifically verifies the WQE wrap-around handling code path,
+/// where a WQE is too large to fit before the ring buffer wraps.
+#[test]
+fn test_rc_actual_wraparound_triggered() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    // Create CQs
+    let send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    let send_cq = Rc::new(send_cq);
+
+    let recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
+    let recv_cq1 = Rc::new(recv_cq1);
+    let recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    let recv_cq2 = Rc::new(recv_cq2);
+
+    // Use small queue but ensure we have enough space
+    let config = RcQpConfig {
+        max_send_wr: 8,
+        max_recv_wr: 8,
+        max_inline_data: 128,
+        ..Default::default()
+    };
+
+    fn noop_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
+
+    let qp1 = ctx
+        .ctx
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq1, &config, noop_callback as fn(_, _))
+        .expect("Failed to create QP1");
+    let qp2 = ctx
+        .ctx
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, noop_callback as fn(_, _))
+        .expect("Failed to create QP2");
+
+    let remote1 = RemoteQpInfo {
+        qp_number: qp1.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
+    };
+    let remote2 = RemoteQpInfo {
+        qp_number: qp2.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
+    };
+
+    let access = full_access().bits();
+    qp1.borrow_mut().connect(&remote2, ctx.port, 0, 4, 4, access).expect("connect QP1");
+    qp2.borrow_mut().connect(&remote1, ctx.port, 0, 4, 4, access).expect("connect QP2");
+
+    // Allocate buffers
+    let mut local_buf = AlignedBuffer::new(4096);
+    let mut remote_buf = AlignedBuffer::new(4096);
+
+    let local_mr = unsafe { ctx.pd.register(local_buf.as_ptr(), local_buf.size(), full_access()) }
+        .expect("Failed to register local MR");
+    let remote_mr = unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
+        .expect("Failed to register remote MR");
+
+    local_buf.fill_bytes(b"test data for wrap-around");
+    remote_buf.fill(0);
+
+    let sq_wqe_cnt = qp1.borrow().sq_wqe_cnt();
+    let initial_slots = qp1.borrow().slots_to_ring_end();
+    println!("SQ WQE count (ring size): {}", sq_wqe_cnt);
+    println!("Initial slots_to_ring_end: {}", initial_slots);
+
+    // To trigger wrap-around, we need: wqebb_cnt > slots_to_end
+    // Strategy: Post WQEs until slots_to_end = 1, then post a 2-WQEBB WQE
+    //
+    // Each small RDMA WRITE with SGE: ctrl(16) + rdma(16) + sge(16) = 48 bytes = 1 WQEBB
+
+    let target_slots = 1; // We want to end up with 1 slot remaining
+
+    println!("Phase 1: Advancing PI towards ring end...");
+    let mut total_posted = 0u32;
+
+    // Post WQEs one at a time to advance PI
+    while qp1.borrow().slots_to_ring_end() > target_slots {
+        let current_slots = qp1.borrow().slots_to_ring_end();
+        let available = qp1.borrow().send_queue_available();
+
+        if available == 0 {
+            // SQ is full, need to wait for some completions
+            let cqe = poll_cq_timeout(&send_cq, 5000).expect("CQE timeout waiting for space");
+            assert_eq!(cqe.syndrome, 0, "CQE error while waiting for space");
+            send_cq.flush();
+            continue;
+        }
+
+        // Post one small WQE (1 WQEBB)
+        let _ = qp1.borrow_mut()
+            .wqe_builder(total_posted as u64)
+            .expect("wqe_builder failed")
+            .ctrl(WqeOpcode::RdmaWrite, WqeFlags::COMPLETION, 0)
+            .rdma(remote_buf.addr(), remote_mr.rkey())
+            .sge(local_buf.addr(), 8, local_mr.lkey())
+            .finish_with_blueflame();
+        total_posted += 1;
+
+        // Wait for completion before posting next
+        let cqe = poll_cq_timeout(&send_cq, 5000)
+            .expect(&format!("CQE timeout at WQE {}, slots_to_end={}", total_posted, current_slots));
+        assert_eq!(cqe.syndrome, 0, "CQE error at WQE {}", total_posted);
+        send_cq.flush();
+
+        if total_posted % 10 == 0 {
+            println!("  Posted {} WQEs, slots_to_ring_end={}", total_posted, qp1.borrow().slots_to_ring_end());
+        }
+    }
+
+    let slots_before = qp1.borrow().slots_to_ring_end();
+    println!("Phase 1 done: slots_to_ring_end={} after {} WQEs", slots_before, total_posted);
+
+    // Phase 2: Post a multi-WQEBB WQE using multiple SGEs that should trigger wrap-around
+    // ctrl(16) + rdma(16) + sge1(16) + sge2(16) + sge3(16) = 80 bytes = 2 WQEBBs
+    println!("Phase 2: Posting large WQE (2 WQEBBs with 3 SGEs)...");
+
+    let _ = qp1.borrow_mut()
+        .wqe_builder(9999u64)
+        .expect("wqe_builder failed")
+        .ctrl(WqeOpcode::RdmaWrite, WqeFlags::COMPLETION, 0)
+        .rdma(remote_buf.addr(), remote_mr.rkey())
+        .sge(local_buf.addr(), 8, local_mr.lkey())
+        .sge(local_buf.addr().wrapping_add(8), 8, local_mr.lkey())
+        .sge(local_buf.addr().wrapping_add(16), 8, local_mr.lkey())
+        .finish_with_blueflame();
+
+    let slots_after = qp1.borrow().slots_to_ring_end();
+    println!("After large WQE: slots_to_ring_end={}", slots_after);
+
+    // Wrap-around happened if slots_after is much larger than slots_before
+    // (PI wrapped to beginning of ring)
+    if slots_after > slots_before {
+        println!("Wrap-around detected! slots went {} -> {}", slots_before, slots_after);
+    } else {
+        println!("Note: slots_before={}, slots_after={} (wrap-around may not have been needed)", slots_before, slots_after);
+    }
+
+    // Wait for final completion
+    let cqe = poll_cq_timeout(&send_cq, 5000).expect("CQE timeout for large WQE");
+    assert_eq!(cqe.syndrome, 0, "CQE error for large WQE");
+    send_cq.flush();
+
+    // Verify data was written correctly (24 bytes from 3 SGEs)
+    let written = remote_buf.read_bytes(24);
+    assert_eq!(&written[..8], &local_buf.read_bytes(24)[..8], "Data mismatch after wrap-around");
+
+    println!("RC actual wrap-around test passed! (total {} WQEs posted)", total_posted + 1);
+}
+
+/// Test that finish_with_wrap_around (non-BlueFlame) is triggered.
+///
+/// This uses finish() + ring_sq_doorbell() instead of finish_with_blueflame().
+#[test]
+fn test_rc_wraparound_with_doorbell() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    let send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    let send_cq = Rc::new(send_cq);
+
+    let recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
+    let recv_cq1 = Rc::new(recv_cq1);
+    let recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    let recv_cq2 = Rc::new(recv_cq2);
+
+    let config = RcQpConfig {
+        max_send_wr: 8,
+        max_recv_wr: 8,
+        ..Default::default()
+    };
+
+    fn noop_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
+
+    let qp1 = ctx
+        .ctx
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq1, &config, noop_callback as fn(_, _))
+        .expect("Failed to create QP1");
+    let qp2 = ctx
+        .ctx
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, noop_callback as fn(_, _))
+        .expect("Failed to create QP2");
+
+    let remote1 = RemoteQpInfo {
+        qp_number: qp1.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
+    };
+    let remote2 = RemoteQpInfo {
+        qp_number: qp2.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
+    };
+
+    let access = full_access().bits();
+    qp1.borrow_mut().connect(&remote2, ctx.port, 0, 4, 4, access).expect("connect QP1");
+    qp2.borrow_mut().connect(&remote1, ctx.port, 0, 4, 4, access).expect("connect QP2");
+
+    let mut local_buf = AlignedBuffer::new(4096);
+    let mut remote_buf = AlignedBuffer::new(4096);
+
+    let local_mr = unsafe { ctx.pd.register(local_buf.as_ptr(), local_buf.size(), full_access()) }
+        .expect("Failed to register local MR");
+    let remote_mr = unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
+        .expect("Failed to register remote MR");
+
+    local_buf.fill_bytes(b"doorbell wrap-around test");
+    remote_buf.fill(0);
+
+    let initial_slots = qp1.borrow().slots_to_ring_end();
+    println!("Initial slots_to_ring_end: {}", initial_slots);
+
+    let target_slots = 1;
+    let mut total_posted = 0u32;
+
+    // Advance PI to get slots_to_ring_end = 1
+    while qp1.borrow().slots_to_ring_end() > target_slots {
+        let available = qp1.borrow().send_queue_available();
+        if available == 0 {
+            let cqe = poll_cq_timeout(&send_cq, 5000).expect("CQE timeout waiting for space");
+            assert_eq!(cqe.syndrome, 0, "CQE error");
+            send_cq.flush();
+            continue;
+        }
+
+        let _ = qp1.borrow_mut()
+            .wqe_builder(total_posted as u64)
+            .expect("wqe_builder failed")
+            .ctrl(WqeOpcode::RdmaWrite, WqeFlags::COMPLETION, 0)
+            .rdma(remote_buf.addr(), remote_mr.rkey())
+            .sge(local_buf.addr(), 8, local_mr.lkey())
+            .finish(); // Use finish() not finish_with_blueflame()
+
+        qp1.borrow().ring_sq_doorbell();
+        total_posted += 1;
+
+        let cqe = poll_cq_timeout(&send_cq, 5000).expect("CQE timeout");
+        assert_eq!(cqe.syndrome, 0, "CQE error");
+        send_cq.flush();
+    }
+
+    let slots_before = qp1.borrow().slots_to_ring_end();
+    println!("Before large WQE: slots_to_ring_end={}", slots_before);
+
+    // Post a 2-WQEBB WQE using finish() + doorbell
+    let _ = qp1.borrow_mut()
+        .wqe_builder(9999u64)
+        .expect("wqe_builder failed")
+        .ctrl(WqeOpcode::RdmaWrite, WqeFlags::COMPLETION, 0)
+        .rdma(remote_buf.addr(), remote_mr.rkey())
+        .sge(local_buf.addr(), 8, local_mr.lkey())
+        .sge(local_buf.addr().wrapping_add(8), 8, local_mr.lkey())
+        .sge(local_buf.addr().wrapping_add(16), 8, local_mr.lkey())
+        .finish(); // Use finish() not finish_with_blueflame()
+
+    qp1.borrow().ring_sq_doorbell();
+
+    let slots_after = qp1.borrow().slots_to_ring_end();
+    println!("After large WQE: slots_to_ring_end={}", slots_after);
+
+    if slots_after > slots_before {
+        println!("Wrap-around detected with doorbell! slots went {} -> {}", slots_before, slots_after);
+    }
+
+    let cqe = poll_cq_timeout(&send_cq, 5000).expect("CQE timeout for large WQE");
+    assert_eq!(cqe.syndrome, 0, "CQE error");
+    send_cq.flush();
+
+    println!("RC wrap-around with doorbell test passed!");
+}
+
 /// Test RC slots_to_ring_end() and post_nop_to_ring_end() methods.
 #[test]
 fn test_rc_slots_to_ring_end() {

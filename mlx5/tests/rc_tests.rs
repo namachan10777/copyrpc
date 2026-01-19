@@ -1360,3 +1360,267 @@ fn test_rc_send_recv_pingpong() {
 // a pre-existing issue with RefCell borrow conflicts when QP's Drop
 // implementation attempts to unregister from a shared CQ that is still borrowed.
 // This is an existing library design issue, not related to the RQ tracking changes.
+
+// =============================================================================
+// Additional Method Coverage Tests
+// =============================================================================
+
+/// Test inline_data for inline data writes without SGE.
+#[test]
+fn test_rc_inline_data() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    let pair = create_rc_loopback_pair(&ctx);
+    let qp1 = &pair.qp1;
+
+    let mut remote_buf = AlignedBuffer::new(4096);
+    let remote_mr =
+        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
+            .expect("Failed to register remote MR");
+
+    remote_buf.fill(0xAA);
+
+    // Use inline_data - data is embedded directly in WQE
+    let test_data = b"inline_data test!";
+
+    qp1.borrow_mut()
+        .wqe_builder(1u64)
+        .expect("wqe_builder failed")
+        .ctrl(WqeOpcode::RdmaWrite, WqeFlags::COMPLETION, 0)
+        .rdma(remote_buf.addr(), remote_mr.rkey())
+        .inline_data(test_data)
+        .finish_with_blueflame()
+        .expect("finish failed");
+
+    // Wait for completion
+    let _ = poll_cq_timeout(&pair.send_cq, 5000).expect("CQE timeout");
+    pair.send_cq.flush();
+
+    // Verify data
+    let written = remote_buf.read_bytes(test_data.len());
+    assert_eq!(&written[..], test_data, "Data mismatch with inline_data");
+
+    println!("RC inline_data test passed!");
+}
+
+/// Test post_nop_to_ring_end to fill remaining slots with NOP WQEs.
+#[test]
+fn test_rc_post_nop_to_ring_end() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    // Use small queue to make wrap-around happen quickly
+    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    send_cq
+        .init_direct_access()
+        .expect("Failed to init send CQ");
+    let send_cq = Rc::new(send_cq);
+
+    let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
+    recv_cq1.init_direct_access().expect("Failed to init recv CQ1");
+    let recv_cq1 = Rc::new(recv_cq1);
+    let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    recv_cq2.init_direct_access().expect("Failed to init recv CQ2");
+    let recv_cq2 = Rc::new(recv_cq2);
+
+    let config = RcQpConfig {
+        max_send_wr: 8, // Small queue
+        max_recv_wr: 8,
+        ..Default::default()
+    };
+
+    fn noop_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
+
+    let qp1 = ctx
+        .ctx
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq1, &config, noop_callback as fn(_, _))
+        .expect("Failed to create QP1");
+    let qp2 = ctx
+        .ctx
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, noop_callback as fn(_, _))
+        .expect("Failed to create QP2");
+
+    let remote1 = RemoteQpInfo {
+        qp_number: qp1.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
+    };
+    let remote2 = RemoteQpInfo {
+        qp_number: qp2.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
+    };
+
+    let access = full_access().bits();
+    qp1.borrow_mut()
+        .connect(&remote2, ctx.port, 0, 4, 4, access)
+        .expect("connect QP1");
+    qp2.borrow_mut()
+        .connect(&remote1, ctx.port, 0, 4, 4, access)
+        .expect("connect QP2");
+
+    // Post a few WQEs to advance PI
+    let mut local_buf = AlignedBuffer::new(4096);
+    let mut remote_buf = AlignedBuffer::new(4096);
+    let local_mr =
+        unsafe { ctx.pd.register(local_buf.as_ptr(), local_buf.size(), full_access()) }
+            .expect("Failed to register local MR");
+    let remote_mr =
+        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
+            .expect("Failed to register remote MR");
+
+    local_buf.fill_bytes(b"test");
+
+    for i in 0..3 {
+        qp1.borrow_mut()
+            .wqe_builder(i as u64)
+            .expect("wqe_builder failed")
+            .ctrl(WqeOpcode::RdmaWrite, WqeFlags::COMPLETION, 0)
+            .rdma(remote_buf.addr(), remote_mr.rkey())
+            .sge(local_buf.addr(), 4, local_mr.lkey())
+            .finish_with_blueflame()
+            .expect("finish failed");
+
+        let _ = poll_cq_timeout(&send_cq, 5000).expect("CQE timeout");
+        send_cq.flush();
+    }
+
+    let slots_before = qp1.borrow().slots_to_ring_end();
+    println!("Slots to ring end before NOP: {}", slots_before);
+
+    // Post NOP WQEs to fill remaining slots
+    qp1.borrow().post_nop_to_ring_end().expect("post_nop_to_ring_end failed");
+
+    let slots_after = qp1.borrow().slots_to_ring_end();
+    println!("Slots to ring end after NOP: {}", slots_after);
+
+    // After posting NOPs, we should be at the ring end (or wrapped)
+    // The slots_to_ring_end should be reset after wrap-around
+    assert!(
+        slots_after >= slots_before || slots_after == qp1.borrow().sq_available() as u16,
+        "NOP should have filled or wrapped the ring"
+    );
+
+    println!("RC post_nop_to_ring_end test passed!");
+}
+
+/// Test wqe_builder_unsignaled for posting WQEs without completion notification.
+#[test]
+fn test_rc_wqe_builder_unsignaled() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    let pair = create_rc_loopback_pair(&ctx);
+    let qp1 = &pair.qp1;
+
+    let mut local_buf = AlignedBuffer::new(4096);
+    let mut remote_buf = AlignedBuffer::new(4096);
+
+    let local_mr =
+        unsafe { ctx.pd.register(local_buf.as_ptr(), local_buf.size(), full_access()) }
+            .expect("Failed to register local MR");
+    let remote_mr =
+        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
+            .expect("Failed to register remote MR");
+
+    let test_data = b"unsignaled test";
+    local_buf.fill_bytes(test_data);
+    remote_buf.fill(0);
+
+    // Post unsignaled WQE (no CQE will be generated)
+    qp1.borrow_mut()
+        .wqe_builder_unsignaled()
+        .expect("wqe_builder_unsignaled failed")
+        .ctrl(WqeOpcode::RdmaWrite, WqeFlags::empty(), 0)
+        .rdma(remote_buf.addr(), remote_mr.rkey())
+        .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
+        .finish_with_blueflame()
+        .expect("finish failed");
+
+    // Post a signaled WQE to ensure the unsignaled one completed
+    qp1.borrow_mut()
+        .wqe_builder(1u64)
+        .expect("wqe_builder failed")
+        .ctrl(WqeOpcode::RdmaWrite, WqeFlags::COMPLETION, 0)
+        .rdma(remote_buf.addr(), remote_mr.rkey())
+        .sge(local_buf.addr(), 1, local_mr.lkey())
+        .finish_with_blueflame()
+        .expect("finish failed");
+
+    // Wait for the signaled completion (implies unsignaled completed too)
+    let _ = poll_cq_timeout(&pair.send_cq, 5000).expect("CQE timeout");
+    pair.send_cq.flush();
+
+    // Verify data was written by the unsignaled WQE
+    let written = remote_buf.read_bytes(test_data.len());
+    assert_eq!(&written[..], test_data, "Data mismatch with unsignaled WQE");
+
+    println!("RC wqe_builder_unsignaled test passed!");
+}
+
+/// Test sq_wqe_cnt and rq_wqe_cnt methods.
+#[test]
+fn test_rc_wqe_cnt_methods() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    let config = RcQpConfig {
+        max_send_wr: 64,
+        max_recv_wr: 32,
+        ..Default::default()
+    };
+
+    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    send_cq.init_direct_access().expect("Failed to init send CQ");
+    let send_cq = Rc::new(send_cq);
+    let mut recv_cq = ctx.ctx.create_cq(256).expect("Failed to create recv CQ");
+    recv_cq.init_direct_access().expect("Failed to init recv CQ");
+    let recv_cq = Rc::new(recv_cq);
+
+    fn noop_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
+
+    let qp = ctx
+        .ctx
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq, &config, noop_callback as fn(_, _))
+        .expect("Failed to create QP");
+
+    // Check initial WQE counts
+    let sq_cnt = qp.borrow().sq_wqe_cnt();
+    let rq_cnt = qp.borrow().rq_wqe_cnt();
+
+    println!("SQ WQE count: {}", sq_cnt);
+    println!("RQ WQE count: {}", rq_cnt);
+
+    // Counts should be at least the requested sizes (may be rounded up to power of 2)
+    assert!(sq_cnt >= 64, "SQ WQE count should be at least 64");
+    assert!(rq_cnt >= 32, "RQ WQE count should be at least 32");
+
+    // Test send_queue_available (alias for sq_available)
+    let available = qp.borrow().send_queue_available();
+    let sq_available = qp.borrow().sq_available();
+    assert_eq!(available, sq_available, "send_queue_available should equal sq_available");
+    println!("send_queue_available: {}", available);
+
+    println!("RC wqe_cnt methods test passed!");
+}

@@ -413,3 +413,184 @@ fn test_dc_multiple_dci() {
     println!("DC multiple DCI test passed!");
     println!("  {} DCIs wrote to single DCT", num_dcis);
 }
+
+// =============================================================================
+// Additional DC Method Coverage Tests
+// =============================================================================
+
+/// Test DC inline_data for inline data writes without SGE.
+#[test]
+fn test_dc_inline_data() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    require_dct!(&ctx);
+
+    let mut dci_cq = ctx.ctx.create_cq(256).expect("Failed to create DCI CQ");
+    dci_cq
+        .init_direct_access()
+        .expect("Failed to init DCI CQ direct access");
+    let dci_cq = Rc::new(dci_cq);
+
+    let dct_cq = ctx.ctx.create_cq(256).expect("Failed to create DCT CQ");
+
+    let srq_config = SrqConfig {
+        max_wr: 128,
+        max_sge: 1,
+    };
+    let srq: mlx5::srq::Srq<()> = ctx
+        .pd
+        .create_srq(&srq_config)
+        .expect("Failed to create SRQ");
+
+    let dci_config = DciConfig::default();
+    let dci = ctx
+        .ctx
+        .create_dci::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
+        .expect("Failed to create DCI");
+    dci.borrow_mut()
+        .activate(ctx.port, 0, 4)
+        .expect("Failed to activate DCI");
+
+    let dc_key: u64 = 0xABCDEF01;
+    let dct_config = DctConfig { dc_key };
+    let mut dct = ctx
+        .ctx
+        .create_dct(&ctx.pd, &srq, &dct_cq, &dct_config)
+        .expect("Failed to create DCT");
+    let access = full_access().bits();
+    dct.activate(ctx.port, access, 4)
+        .expect("Failed to activate DCT");
+
+    let dctn = dct.dctn();
+    let dlid = ctx.port_attr.lid;
+
+    let mut remote_buf = AlignedBuffer::new(4096);
+    let remote_mr =
+        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
+            .expect("Failed to register remote MR");
+
+    remote_buf.fill(0xBB);
+
+    // Use inline_data - data is embedded directly in WQE
+    let test_data = b"DC inline_data test!";
+
+    dci.borrow_mut()
+        .wqe_builder(1u64)
+        .expect("wqe_builder failed")
+        .ctrl(WqeOpcode::RdmaWrite, WqeFlags::COMPLETION, 0)
+        .av(dc_key, dctn, dlid)
+        .rdma(remote_buf.addr(), remote_mr.rkey())
+        .inline_data(test_data)
+        .finish_with_blueflame()
+        .expect("finish failed");
+
+    let cqe = poll_cq_timeout(&dci_cq, 5000).expect("CQE timeout");
+    assert_eq!(cqe.syndrome, 0, "CQE error: syndrome={}", cqe.syndrome);
+    dci_cq.flush();
+
+    let written = remote_buf.read_bytes(test_data.len());
+    assert_eq!(&written[..], test_data, "Data mismatch with inline_data");
+
+    println!("DC inline_data test passed!");
+}
+
+/// Test DC post_nop_to_ring_end to fill remaining slots with NOP WQEs.
+#[test]
+fn test_dc_post_nop_to_ring_end() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    require_dct!(&ctx);
+
+    let mut dci_cq = ctx.ctx.create_cq(256).expect("Failed to create DCI CQ");
+    dci_cq
+        .init_direct_access()
+        .expect("Failed to init DCI CQ direct access");
+    let dci_cq = Rc::new(dci_cq);
+
+    let dct_cq = ctx.ctx.create_cq(256).expect("Failed to create DCT CQ");
+
+    let srq_config = SrqConfig {
+        max_wr: 128,
+        max_sge: 1,
+    };
+    let srq: mlx5::srq::Srq<()> = ctx
+        .pd
+        .create_srq(&srq_config)
+        .expect("Failed to create SRQ");
+
+    // Use small queue to make wrap-around happen quickly
+    let dci_config = DciConfig {
+        max_send_wr: 8,
+        ..Default::default()
+    };
+    let dci = ctx
+        .ctx
+        .create_dci::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
+        .expect("Failed to create DCI");
+    dci.borrow_mut()
+        .activate(ctx.port, 0, 4)
+        .expect("Failed to activate DCI");
+
+    let dc_key: u64 = 0x11223344;
+    let dct_config = DctConfig { dc_key };
+    let mut dct = ctx
+        .ctx
+        .create_dct(&ctx.pd, &srq, &dct_cq, &dct_config)
+        .expect("Failed to create DCT");
+    let access = full_access().bits();
+    dct.activate(ctx.port, access, 4)
+        .expect("Failed to activate DCT");
+
+    let dctn = dct.dctn();
+    let dlid = ctx.port_attr.lid;
+
+    let mut local_buf = AlignedBuffer::new(4096);
+    let remote_buf = AlignedBuffer::new(4096);
+    let local_mr =
+        unsafe { ctx.pd.register(local_buf.as_ptr(), local_buf.size(), full_access()) }
+            .expect("Failed to register local MR");
+    let remote_mr =
+        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
+            .expect("Failed to register remote MR");
+
+    local_buf.fill_bytes(b"test");
+
+    // Post a few WQEs to advance PI
+    for i in 0..3 {
+        dci.borrow_mut()
+            .wqe_builder(i as u64)
+            .expect("wqe_builder failed")
+            .ctrl(WqeOpcode::RdmaWrite, WqeFlags::COMPLETION, 0)
+            .av(dc_key, dctn, dlid)
+            .rdma(remote_buf.addr(), remote_mr.rkey())
+            .sge(local_buf.addr(), 4, local_mr.lkey())
+            .finish_with_blueflame()
+            .expect("finish failed");
+
+        let _ = poll_cq_timeout(&dci_cq, 5000).expect("CQE timeout");
+        dci_cq.flush();
+    }
+
+    let slots_before = dci.borrow().slots_to_ring_end();
+    println!("Slots to ring end before NOP: {}", slots_before);
+
+    // Post NOP WQEs to fill remaining slots
+    dci.borrow().post_nop_to_ring_end().expect("post_nop_to_ring_end failed");
+
+    let slots_after = dci.borrow().slots_to_ring_end();
+    println!("Slots to ring end after NOP: {}", slots_after);
+
+    println!("DC post_nop_to_ring_end test passed!");
+}

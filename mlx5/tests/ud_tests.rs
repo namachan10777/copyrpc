@@ -498,3 +498,116 @@ fn test_ud_multiple_destinations() {
     println!("UD multiple destinations test passed!");
     println!("  Single sender sent to {} receivers", num_receivers);
 }
+
+// =============================================================================
+// Additional UD Method Coverage Tests
+// =============================================================================
+
+/// Test UD post_nop_to_ring_end to fill remaining slots with NOP WQEs.
+#[test]
+fn test_ud_post_nop_to_ring_end() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    send_cq
+        .init_direct_access()
+        .expect("Failed to init send CQ direct access");
+    let send_cq = Rc::new(send_cq);
+
+    let mut recv_cq = ctx.ctx.create_cq(256).expect("Failed to create recv CQ");
+    recv_cq
+        .init_direct_access()
+        .expect("Failed to init recv CQ direct access");
+    let recv_cq = Rc::new(recv_cq);
+
+    let qkey: u32 = 0x33333333;
+
+    // Use small queue to make wrap-around happen quickly
+    let config = UdQpConfig {
+        qkey,
+        max_send_wr: 8,
+        max_recv_wr: 128,
+        ..Default::default()
+    };
+
+    let sender = ctx
+        .ctx
+        .create_ud_qp::<u64, _>(&ctx.pd, &send_cq, &recv_cq, &config, |_cqe, _entry| {})
+        .expect("Failed to create sender QP");
+    sender
+        .borrow_mut()
+        .activate(ctx.port, 0)
+        .expect("Failed to activate sender");
+
+    let receiver = ctx
+        .ctx
+        .create_ud_qp::<u64, _>(&ctx.pd, &send_cq, &recv_cq, &config, |_cqe, _entry| {})
+        .expect("Failed to create receiver QP");
+    receiver
+        .borrow_mut()
+        .activate(ctx.port, 0)
+        .expect("Failed to activate receiver");
+
+    let mut send_buf = AlignedBuffer::new(4096);
+    let mut recv_buf = AlignedBuffer::new(4096);
+
+    let send_mr = unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }
+        .expect("Failed to register send MR");
+    let recv_mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
+        .expect("Failed to register recv MR");
+
+    let remote_info = RemoteUdQpInfo {
+        qpn: receiver.borrow().qpn(),
+        qkey,
+        lid: ctx.port_attr.lid,
+    };
+    let ah = ctx.pd.create_ah(ctx.port, &remote_info).expect("Failed to create AH");
+
+    let test_data = b"test";
+    send_buf.fill_bytes(test_data);
+
+    // Post a few WQEs to advance PI
+    for i in 0..3 {
+        // Post receive
+        recv_buf.fill(0);
+        receiver
+            .borrow()
+            .recv_builder(i as u64)
+            .expect("recv_builder failed")
+            .sge(recv_buf.addr(), 256 + GRH_SIZE as u32, recv_mr.lkey())
+            .finish();
+        receiver.borrow().ring_rq_doorbell();
+
+        sender
+            .borrow_mut()
+            .wqe_builder(i as u64)
+            .expect("wqe_builder failed")
+            .ctrl(WqeOpcode::Send, WqeFlags::COMPLETION, 0)
+            .ud_av(&ah, qkey)
+            .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
+            .finish_with_blueflame()
+            .expect("finish failed");
+
+        let _ = poll_cq_timeout(&send_cq, 5000).expect("Send CQE timeout");
+        send_cq.flush();
+        let _ = poll_cq_timeout(&recv_cq, 5000).expect("Recv CQE timeout");
+        recv_cq.flush();
+    }
+
+    let slots_before = sender.borrow().slots_to_ring_end();
+    println!("Slots to ring end before NOP: {}", slots_before);
+
+    // Post NOP WQEs to fill remaining slots
+    sender.borrow().post_nop_to_ring_end().expect("post_nop_to_ring_end failed");
+
+    let slots_after = sender.borrow().slots_to_ring_end();
+    println!("Slots to ring end after NOP: {}", slots_after);
+
+    println!("UD post_nop_to_ring_end test passed!");
+}
