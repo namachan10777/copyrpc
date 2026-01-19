@@ -327,14 +327,13 @@ pub(crate) fn calc_wqebb_cnt(wqe_size: usize) -> u16 {
 
 /// WQE table entry: user data + CI management data.
 ///
-/// The `ci_delta` field is interpreted differently by sparse vs dense tables:
-/// - **Sparse**: `ci_delta` = accumulated PI value at signaled WQE completion (use `ci.set(ci_delta)`)
-/// - **Dense**: `ci_delta` = number of WQEBBs for this WQE (use `ci += ci_delta`)
+/// The `ci_delta` field stores the accumulated PI value at signaled WQE completion.
+/// When processing completions, use `ci.set(ci_delta)` to update the consumer index.
 #[derive(Debug, Clone, Copy)]
 pub struct WqeEntry<T> {
     /// User-provided entry data.
     pub data: T,
-    /// CI delta value for correct CI management.
+    /// Accumulated PI value for correct CI management.
     pub ci_delta: u16,
 }
 
@@ -352,29 +351,31 @@ pub struct WqeHandle {
 }
 
 // =============================================================================
-// WQE Table (Sparse - for signaled-only completion)
+// WQE Table (Ordered - for in-order signaled completion)
 // =============================================================================
 
 use std::cell::Cell;
 
-/// Sparse WQE table for tracking signaled operations only.
+/// Ordered WQE table for tracking signaled operations with in-order completion.
 ///
 /// Only signaled WQEs have entries stored. When a CQE arrives, only the
 /// single entry at that wqe_idx is retrieved (no draining).
 ///
-/// Also used for unordered queues where entries track slot availability.
+/// This table is used for Send Queue completion tracking where completions
+/// arrive in order. The `ci_delta` field stores the accumulated PI value
+/// at the time of signaled WQE completion.
 ///
 /// Uses `Cell<Option<WqeEntry<T>>>` for interior mutability, allowing safe access
 /// without requiring `RefCell` or mutable borrows.
 ///
 /// The table size must be a power of 2 for fast modulo via bit masking.
-pub struct SparseWqeTable<T> {
+pub struct OrderedWqeTable<T> {
     entries: Box<[Cell<Option<WqeEntry<T>>>]>,
     mask: u16,
 }
 
-impl<T> SparseWqeTable<T> {
-    /// Create a new sparse WQE table with the given capacity.
+impl<T> OrderedWqeTable<T> {
+    /// Create a new ordered WQE table with the given capacity.
     ///
     /// # Arguments
     /// * `wqe_cnt` - Number of entries (must be power of 2)
@@ -392,8 +393,8 @@ impl<T> SparseWqeTable<T> {
 
     /// Store an entry at the given index with CI delta.
     ///
-    /// For sparse tables, `ci_delta` should be the accumulated PI value
-    /// at the time of signaled WQE completion.
+    /// The `ci_delta` should be the accumulated PI value at the time of
+    /// signaled WQE completion.
     #[inline]
     pub fn store(&self, idx: u16, entry: T, ci_delta: u16) {
         let slot = (idx & self.mask) as usize;
@@ -424,8 +425,6 @@ impl<T> SparseWqeTable<T> {
     }
 
     /// Count available slots by scanning the table.
-    ///
-    /// For unordered queues where gaps may exist.
     pub fn count_available(&self) -> u16 {
         self.entries
             .iter()
@@ -436,138 +435,6 @@ impl<T> SparseWqeTable<T> {
                 is_none
             })
             .count() as u16
-    }
-}
-
-// =============================================================================
-// WQE Table (Dense - for all-entry callback)
-// =============================================================================
-
-/// Dense WQE table for tracking all WQE operations.
-///
-/// Every WQE must have an entry. When a signaled CQE arrives, all entries
-/// from old_ci to new_ci are drained and passed to the callback.
-///
-/// Uses `Cell<Option<WqeEntry<T>>>` for interior mutability, allowing safe access
-/// without requiring `RefCell` or mutable borrows. This is critical for
-/// allowing callbacks to post new WQEs while completion processing is
-/// in progress.
-///
-/// The table size must be a power of 2 for fast modulo via bit masking.
-pub struct DenseWqeTable<T> {
-    entries: Box<[Cell<Option<WqeEntry<T>>>]>,
-    mask: u16,
-}
-
-impl<T> DenseWqeTable<T> {
-    /// Create a new dense WQE table with the given capacity.
-    ///
-    /// # Arguments
-    /// * `wqe_cnt` - Number of entries (must be power of 2)
-    pub fn new(wqe_cnt: u16) -> Self {
-        debug_assert!(wqe_cnt.is_power_of_two(), "wqe_cnt must be power of 2");
-        let entries = (0..wqe_cnt)
-            .map(|_| Cell::new(None))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        Self {
-            entries,
-            mask: wqe_cnt - 1,
-        }
-    }
-
-    /// Store an entry at the given index with CI delta.
-    ///
-    /// For dense tables, `ci_delta` should be the number of WQEBBs
-    /// consumed by this WQE.
-    #[inline]
-    pub fn store(&self, idx: u16, entry: T, ci_delta: u16) {
-        let slot = (idx & self.mask) as usize;
-        self.entries[slot].set(Some(WqeEntry {
-            data: entry,
-            ci_delta,
-        }));
-    }
-
-    /// Take the entry at the given index.
-    ///
-    /// Returns `WqeEntry<T>` containing both user data and CI delta.
-    #[inline]
-    pub fn take(&self, idx: u16) -> Option<WqeEntry<T>> {
-        let slot = (idx & self.mask) as usize;
-        self.entries[slot].take()
-    }
-
-    /// Take all entries from old_ci (exclusive) to new_ci (inclusive).
-    ///
-    /// Unlike the previous mutable iterator approach, this method takes `&self`
-    /// and collects entries upfront, so no borrow is held during callback
-    /// invocation.
-    ///
-    /// All slots in range are expected to have entries (dense table invariant).
-    pub fn take_range(&self, old_ci: u16, new_ci: u16) -> impl Iterator<Item = (u16, WqeEntry<T>)> + '_ {
-        DenseTakeRange {
-            table: self,
-            current: old_ci.wrapping_add(1),
-            end: new_ci.wrapping_add(1),
-        }
-    }
-
-    /// Check if a specific slot is available (empty).
-    ///
-    /// For dense tables, a slot is available if it contains None
-    /// (the entry has been consumed or never stored).
-    #[inline]
-    pub fn is_available(&self, idx: u16) -> bool {
-        let slot = (idx & self.mask) as usize;
-        // Temporarily take and put back to check (Cell::get requires Copy)
-        let val = self.entries[slot].take();
-        let is_none = val.is_none();
-        self.entries[slot].set(val);
-        is_none
-    }
-
-    /// Count available (empty) slots in the table.
-    ///
-    /// This scans all entries, so it's slower than optimistic availability
-    /// calculation based on pi-ci.
-    pub fn count_available(&self) -> u16 {
-        let mut count = 0u16;
-        for entry in self.entries.iter() {
-            // Temporarily take and put back to check
-            let val = entry.take();
-            if val.is_none() {
-                count += 1;
-            }
-            entry.set(val);
-        }
-        count
-    }
-}
-
-/// Iterator that takes entries from a dense WQE table range.
-///
-/// This iterator only holds a shared reference to the table, allowing
-/// callbacks to safely access the table through other references.
-pub struct DenseTakeRange<'a, T> {
-    table: &'a DenseWqeTable<T>,
-    current: u16,
-    end: u16,
-}
-
-impl<T> Iterator for DenseTakeRange<'_, T> {
-    type Item = (u16, WqeEntry<T>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current != self.end {
-            let idx = self.current;
-            self.current = self.current.wrapping_add(1);
-            // Take the entry using Cell::take (interior mutability)
-            // Dense table guarantees all entries in range are present
-            self.table.take(idx).map(|entry| (idx, entry))
-        } else {
-            None
-        }
     }
 }
 
@@ -818,8 +685,8 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_sparse_wqe_table_store_and_take() {
-        let table = SparseWqeTable::<u32>::new(8);
+    fn test_ordered_wqe_table_store_and_take() {
+        let table = OrderedWqeTable::<u32>::new(8);
         table.store(0, 42, 1);
         let entry = table.take(0);
         assert!(entry.is_some());
@@ -831,8 +698,8 @@ mod tests {
     }
 
     #[test]
-    fn test_sparse_wqe_table_wrap_around() {
-        let table = SparseWqeTable::<u32>::new(4);
+    fn test_ordered_wqe_table_wrap_around() {
+        let table = OrderedWqeTable::<u32>::new(4);
         // Store at indices that wrap around
         table.store(4, 100, 1); // 4 & 3 = 0
         table.store(5, 101, 2); // 5 & 3 = 1
@@ -845,68 +712,13 @@ mod tests {
     }
 
     #[test]
-    fn test_sparse_wqe_table_is_available() {
-        let table = SparseWqeTable::<u32>::new(4);
+    fn test_ordered_wqe_table_is_available() {
+        let table = OrderedWqeTable::<u32>::new(4);
         assert!(table.is_available(0));
         table.store(0, 42, 1);
         assert!(!table.is_available(0));
         table.take(0);
         assert!(table.is_available(0));
-    }
-
-    #[test]
-    fn test_dense_wqe_table_store_and_take() {
-        let table = DenseWqeTable::<u32>::new(8);
-        table.store(0, 42, 1);
-        let entry = table.take(0);
-        assert!(entry.is_some());
-        let entry = entry.unwrap();
-        assert_eq!(entry.data, 42);
-        assert_eq!(entry.ci_delta, 1);
-        // Should be None after take
-        assert!(table.take(0).is_none());
-    }
-
-    #[test]
-    fn test_dense_wqe_table_take_range() {
-        let table = DenseWqeTable::<u32>::new(8);
-        // Store entries at indices 1, 2, 3
-        table.store(1, 10, 1);
-        table.store(2, 20, 1);
-        table.store(3, 30, 1);
-
-        // Take range from old_ci=0 to new_ci=3 (exclusive old_ci, inclusive new_ci)
-        let entries: Vec<_> = table.take_range(0, 3).collect();
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].0, 1);
-        assert_eq!(entries[0].1.data, 10);
-        assert_eq!(entries[1].0, 2);
-        assert_eq!(entries[1].1.data, 20);
-        assert_eq!(entries[2].0, 3);
-        assert_eq!(entries[2].1.data, 30);
-
-        // All entries should be taken now
-        assert!(table.take(1).is_none());
-        assert!(table.take(2).is_none());
-        assert!(table.take(3).is_none());
-    }
-
-    #[test]
-    fn test_dense_wqe_table_take_range_wrap_around() {
-        let table = DenseWqeTable::<u32>::new(4);
-        // Store entries at indices 3, 4 (index 4 wraps to slot 0)
-        table.store(3, 30, 1);
-        table.store(4, 40, 1); // 4 & 3 = 0, wraps around to slot 0
-
-        // Take range from old_ci=2 to new_ci=4 (PI wrapping)
-        // This iterates from index 3 to 4 (inclusive)
-        let entries: Vec<_> = table.take_range(2, 4).collect();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].0, 3);
-        assert_eq!(entries[0].1.data, 30);
-        // Index 4 (which maps to slot 0 via masking)
-        assert_eq!(entries[1].0, 4);
-        assert_eq!(entries[1].1.data, 40);
     }
 
     #[test]

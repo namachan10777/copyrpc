@@ -45,8 +45,7 @@ use crate::device::Context;
 use crate::pd::Pd;
 use crate::srq::SrqInfo;
 use crate::wqe::{
-    CtrlSeg, DataSeg, DenseWqeTable, SparseWqeTable, TmSeg, UnorderedWqeTable, WQEBB_SIZE,
-    WqeHandle, WqeOpcode,
+    CtrlSeg, DataSeg, OrderedWqeTable, TmSeg, UnorderedWqeTable, WQEBB_SIZE, WqeHandle, WqeOpcode,
 };
 use crate::CompletionTarget;
 
@@ -208,28 +207,13 @@ impl<Entry, TableType> CmdQpState<Entry, TableType> {
     }
 }
 
-impl<Entry> CmdQpState<Entry, SparseWqeTable<Entry>> {
-    /// Process a single completion (for sparse mode).
-    fn process_completion_sparse(&self, wqe_idx: u16) -> Option<Entry> {
+impl<Entry> CmdQpState<Entry, OrderedWqeTable<Entry>> {
+    /// Process a single completion.
+    fn process_completion(&self, wqe_idx: u16) -> Option<Entry> {
         let entry = self.table.take(wqe_idx)?;
-        // For sparse tables, ci_delta is the accumulated PI value at completion
+        // ci_delta is the accumulated PI value at completion
         self.ci.set(entry.ci_delta);
         Some(entry.data)
-    }
-}
-
-impl<Entry> CmdQpState<Entry, DenseWqeTable<Entry>> {
-    /// Process all completions in range (for dense mode).
-    fn process_completions_dense<F>(&self, new_ci: u16, mut callback: F)
-    where
-        F: FnMut(u16, Entry),
-    {
-        for (idx, entry) in self.table.take_range(self.ci.get(), new_ci) {
-            callback(idx, entry.data);
-            // For dense tables, ci_delta is accumulated PI value at completion.
-            // This handles NOP gaps correctly (NOPs have no entries but PI is advanced).
-            self.ci.set(entry.ci_delta);
-        }
     }
 }
 
@@ -330,7 +314,7 @@ impl<'a, T, Tab> CmdQpWqeBuilder<'a, T, Tab> {
 
 }
 
-impl<'a, T> CmdQpWqeBuilder<'a, T, SparseWqeTable<T>> {
+impl<'a, T> CmdQpWqeBuilder<'a, T, OrderedWqeTable<T>> {
     /// Finish the WQE construction (sparse mode).
     ///
     /// The entry is stored only if signaled is true.
@@ -381,64 +365,6 @@ impl<'a, T> CmdQpWqeBuilder<'a, T, SparseWqeTable<T>> {
             let ci_delta = cmd_qp.pi.get().wrapping_add(1);
             cmd_qp.table.store(wqe_idx, entry, ci_delta);
         }
-
-        // Inline finish_internal_with_blueflame logic
-        unsafe {
-            std::ptr::write_volatile(wqe_ptr.add(7), ds_count);
-        }
-        cmd_qp.advance_pi(1);
-        cmd_qp.ring_blueflame(wqe_ptr);
-
-        WqeHandle {
-            wqe_idx,
-            size: offset,
-        }
-    }
-}
-
-impl<'a, T> CmdQpWqeBuilder<'a, T, DenseWqeTable<T>> {
-    /// Finish the WQE construction (dense mode).
-    ///
-    /// The entry is always stored regardless of signaled flag.
-    /// The doorbell will be issued when `ring_cmd_doorbell()` is called.
-    pub fn finish(self) -> WqeHandle {
-        // Extract all fields before any moves
-        let wqe_idx = self.wqe_idx;
-        let wqe_ptr = self.wqe_ptr;
-        let ds_count = self.ds_count;
-        let offset = self.offset;
-        let cmd_qp = self.cmd_qp;
-        let entry = self.entry;
-
-        // For dense tables, always store the entry
-        // ci_delta is the number of WQEBBs (always 1 for Command QP)
-        cmd_qp.table.store(wqe_idx, entry, 1);
-
-        // Inline finish_internal logic
-        unsafe {
-            std::ptr::write_volatile(wqe_ptr.add(7), ds_count);
-        }
-        cmd_qp.advance_pi(1);
-        cmd_qp.set_last_wqe(wqe_ptr, offset);
-
-        WqeHandle {
-            wqe_idx,
-            size: offset,
-        }
-    }
-
-    /// Finish the WQE construction and immediately ring BlueFlame doorbell.
-    pub fn finish_with_blueflame(self) -> WqeHandle {
-        // Extract all fields before any moves
-        let wqe_idx = self.wqe_idx;
-        let wqe_ptr = self.wqe_ptr;
-        let ds_count = self.ds_count;
-        let offset = self.offset;
-        let cmd_qp = self.cmd_qp;
-        let entry = self.entry;
-
-        // For dense tables, always store the entry
-        cmd_qp.table.store(wqe_idx, entry, 1);
 
         // Inline finish_internal_with_blueflame logic
         unsafe {
@@ -566,7 +492,7 @@ impl<'a, U> RqWqeBuilder<'a, U> {
 ///
 /// # Type Parameters
 /// * `T` - Entry type for Command QP operations (TAG_ADD/TAG_DEL)
-/// * `Tab` - WQE table type for Command QP (SparseWqeTable or DenseWqeTable)
+/// * `Tab` - WQE table type for Command QP (OrderedWqeTable)
 /// * `U` - Entry type for RQ operations (unordered receive)
 /// * `F` - Callback function type receiving `TmSrqCompletion<T, U>`
 pub struct TagMatchingSrq<T, Tab, U, F> {
@@ -587,14 +513,13 @@ pub struct TagMatchingSrq<T, Tab, U, F> {
     _pd: Pd,
 }
 
-/// TM-SRQ with sparse Command QP table (only signaled WQEs tracked).
-pub type SparseTmSrq<T, U, F> = TagMatchingSrq<T, SparseWqeTable<T>, U, F>;
-
-/// TM-SRQ with dense Command QP table (all WQEs tracked).
-pub type DenseTmSrq<T, U, F> = TagMatchingSrq<T, DenseWqeTable<T>, U, F>;
+/// Tag Matching SRQ with ordered Command QP table (only signaled WQEs tracked).
+pub type TmSrq<T, U, F> = TagMatchingSrq<T, OrderedWqeTable<T>, U, F>;
 
 impl Context {
-    /// Create a sparse Tag Matching SRQ (only signaled Command QP WQEs tracked).
+    /// Create a Tag Matching SRQ.
+    ///
+    /// Only signaled Command QP WQEs are tracked for completion handling.
     ///
     /// # Arguments
     /// * `pd` - Protection Domain
@@ -604,13 +529,13 @@ impl Context {
     ///
     /// # Errors
     /// Returns an error if the TM-SRQ cannot be created.
-    pub fn create_sparse_tm_srq<T, U, F>(
+    pub fn create_tm_srq<T, U, F>(
         &self,
         pd: &Pd,
         cq: &Rc<CompletionQueue>,
         config: &TmSrqConfig,
         callback: F,
-    ) -> io::Result<Rc<RefCell<SparseTmSrq<T, U, F>>>>
+    ) -> io::Result<Rc<RefCell<TmSrq<T, U, F>>>>
     where
         T: 'static,
         U: 'static,
@@ -647,77 +572,7 @@ impl Context {
                     bf_size: cmd_info.bf_size,
                     bf_offset: Cell::new(0),
                     last_wqe: Cell::new(None),
-                    table: SparseWqeTable::new(cmd_info.sq_wqe_cnt),
-                    _marker: std::marker::PhantomData,
-                }),
-                callback,
-                send_cq: Rc::downgrade(cq),
-                _pd: pd.clone(),
-            };
-
-            let tm_srq_rc = Rc::new(RefCell::new(tm_srq));
-
-            // Register with CQ
-            cq.register_queue(cmd_info.qpn, Rc::downgrade(&tm_srq_rc) as _);
-
-            Ok(tm_srq_rc)
-        }
-    }
-
-    /// Create a dense Tag Matching SRQ (all Command QP WQEs tracked).
-    ///
-    /// # Arguments
-    /// * `pd` - Protection Domain
-    /// * `cq` - Completion Queue for TM operation completions
-    /// * `config` - TM-SRQ configuration
-    /// * `callback` - Callback for completions receiving `TmSrqCompletion<T, U>`
-    ///
-    /// # Errors
-    /// Returns an error if the TM-SRQ cannot be created.
-    pub fn create_dense_tm_srq<T, U, F>(
-        &self,
-        pd: &Pd,
-        cq: &Rc<CompletionQueue>,
-        config: &TmSrqConfig,
-        callback: F,
-    ) -> io::Result<Rc<RefCell<DenseTmSrq<T, U, F>>>>
-    where
-        T: 'static,
-        U: 'static,
-        F: Fn(TmSrqCompletion<T, U>) + 'static,
-    {
-        unsafe {
-            // Create SRQ
-            let (srq_nn, wqe_cnt) = Self::create_tm_srq_raw(self, pd, cq, config)?;
-
-            // Query SRQ info for direct access
-            let srq_info = query_srq_info(srq_nn)?;
-            let cmd_info = query_cmd_qp_info_inner(srq_nn)?;
-
-            let tm_srq = TagMatchingSrq {
-                srq: srq_nn,
-                wqe_cnt,
-                max_num_tags: config.max_num_tags as u16,
-                srq_state: Some(TmSrqState {
-                    buf: srq_info.buf,
-                    wqe_cnt,
-                    stride: srq_info.stride,
-                    head: Cell::new(0),
-                    dbrec: srq_info.doorbell_record,
-                    table: UnorderedWqeTable::new(wqe_cnt as u16),
-                }),
-                cmd_qp: Some(CmdQpState {
-                    qpn: cmd_info.qpn,
-                    sq_buf: cmd_info.sq_buf,
-                    sq_wqe_cnt: cmd_info.sq_wqe_cnt,
-                    pi: Cell::new(cmd_info.current_pi),
-                    ci: Cell::new(cmd_info.current_pi),
-                    dbrec: cmd_info.dbrec,
-                    bf_reg: cmd_info.bf_reg,
-                    bf_size: cmd_info.bf_size,
-                    bf_offset: Cell::new(0),
-                    last_wqe: Cell::new(None),
-                    table: DenseWqeTable::new(cmd_info.sq_wqe_cnt),
+                    table: OrderedWqeTable::new(cmd_info.sq_wqe_cnt),
                     _marker: std::marker::PhantomData,
                 }),
                 callback,
@@ -964,10 +819,10 @@ impl<T, Tab, U, F> TagMatchingSrq<T, Tab, U, F> {
 }
 
 // =============================================================================
-// Sparse-specific Command QP Methods
+// Command QP Methods
 // =============================================================================
 
-impl<T, U, F> TagMatchingSrq<T, SparseWqeTable<T>, U, F> {
+impl<T, U, F> TagMatchingSrq<T, OrderedWqeTable<T>, U, F> {
     /// Scan the table to get exact available count (slower).
     pub fn cmd_exact_available(&self) -> u16 {
         self.cmd_qp().table.count_available()
@@ -979,7 +834,7 @@ impl<T, U, F> TagMatchingSrq<T, SparseWqeTable<T>, U, F> {
     }
 
     /// Get a WQE builder for Command QP tag operations (sparse mode).
-    pub fn cmd_wqe_builder(&self, entry: T) -> io::Result<CmdQpWqeBuilder<'_, T, SparseWqeTable<T>>> {
+    pub fn cmd_wqe_builder(&self, entry: T) -> io::Result<CmdQpWqeBuilder<'_, T, OrderedWqeTable<T>>> {
         let cmd_qp = self.cmd_qp();
         if !cmd_qp.table.is_available(cmd_qp.pi.get()) {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "Command QP full"));
@@ -1001,52 +856,15 @@ impl<T, U, F> TagMatchingSrq<T, SparseWqeTable<T>, U, F> {
 
     /// Process a Command QP completion (internal use by dispatch_cqe).
     fn process_cmd_completion(&self, wqe_idx: u16) -> Option<T> {
-        self.cmd_qp().process_completion_sparse(wqe_idx)
+        self.cmd_qp().process_completion(wqe_idx)
     }
 }
 
 // =============================================================================
-// Dense-specific Command QP Methods
+// CompletionTarget Implementation
 // =============================================================================
 
-impl<T, U, F> TagMatchingSrq<T, DenseWqeTable<T>, U, F> {
-    /// Scan the table to get exact available count (slower).
-    pub fn cmd_exact_available(&self) -> u16 {
-        self.cmd_qp().table.count_available()
-    }
-
-    /// Check if a specific Command QP slot is available.
-    pub fn cmd_is_slot_available(&self, idx: u16) -> bool {
-        self.cmd_qp().table.is_available(idx)
-    }
-
-    /// Get a WQE builder for Command QP tag operations (dense mode).
-    pub fn cmd_wqe_builder(&self, entry: T) -> io::Result<CmdQpWqeBuilder<'_, T, DenseWqeTable<T>>> {
-        let cmd_qp = self.cmd_qp();
-        if !cmd_qp.table.is_available(cmd_qp.pi.get()) {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Command QP full"));
-        }
-
-        let wqe_idx = cmd_qp.pi.get();
-        let wqe_ptr = cmd_qp.get_wqe_ptr(wqe_idx);
-
-        Ok(CmdQpWqeBuilder {
-            cmd_qp,
-            wqe_ptr,
-            wqe_idx,
-            offset: 0,
-            ds_count: 0,
-            entry,
-            signaled: false,
-        })
-    }
-}
-
-// =============================================================================
-// CompletionTarget Implementation (Sparse)
-// =============================================================================
-
-impl<T, U, F> CompletionTarget for SparseTmSrq<T, U, F>
+impl<T, U, F> CompletionTarget for TmSrq<T, U, F>
 where
     F: Fn(TmSrqCompletion<T, U>),
 {
@@ -1089,56 +907,3 @@ where
     }
 }
 
-// =============================================================================
-// CompletionTarget Implementation (Dense)
-// =============================================================================
-
-impl<T, U, F> CompletionTarget for DenseTmSrq<T, U, F>
-where
-    F: Fn(TmSrqCompletion<T, U>),
-{
-    fn qpn(&self) -> u32 {
-        self.cmd_qp().qpn
-    }
-
-    fn dispatch_cqe(&self, cqe: Cqe) {
-        match cqe.opcode {
-            CqeOpcode::Req | CqeOpcode::TmFinish => {
-                // Command QP completion (tag add/remove)
-                // For dense mode, we process all completions up to wqe_counter
-                // and invoke callback for each. However, since dispatch_cqe
-                // is called per-CQE, we emit a CmdQp completion for the signaled one.
-                // Note: In dense mode, unsignaled WQEs don't generate CQEs,
-                // so when we get a CQE, it's always signaled.
-                let cmd_qp = self.cmd_qp();
-                if let Some(entry) = cmd_qp.table.take(cqe.wqe_counter) {
-                    // Update ci
-                    cmd_qp.ci.set(cmd_qp.ci.get().wrapping_add(entry.ci_delta));
-                    (self.callback)(TmSrqCompletion::CmdQp(cqe, entry.data));
-                }
-            }
-            CqeOpcode::TmMatchContext => {
-                // Tag matching context match - incoming message matched a tag
-                // app_info contains the tag handle
-                (self.callback)(TmSrqCompletion::TagMatch(cqe));
-            }
-            CqeOpcode::RespSend
-            | CqeOpcode::RespSendImm
-            | CqeOpcode::RespSendInv
-            | CqeOpcode::RespRdmaWriteImm
-            | CqeOpcode::InlineScatter32
-            | CqeOpcode::InlineScatter64 => {
-                // RX queue completion (unordered receive)
-                // InlineScatter opcodes indicate data is inlined in the CQE
-                if let Some(entry) = self.process_rq_completion(cqe.wqe_counter) {
-                    (self.callback)(TmSrqCompletion::Recv(cqe, entry));
-                }
-            }
-            CqeOpcode::ReqErr | CqeOpcode::RespErr => {
-                // Error completion - for dense mode, just take the entry if present
-                let entry = self.cmd_qp().table.take(cqe.wqe_counter).map(|e| e.data);
-                (self.callback)(TmSrqCompletion::Error(cqe, entry));
-            }
-        }
-    }
-}

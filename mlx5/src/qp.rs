@@ -11,8 +11,8 @@ use crate::cq::{CompletionQueue, Cqe};
 use crate::device::Context;
 use crate::pd::Pd;
 use crate::wqe::{
-    AtomicSeg, CtrlSeg, DataSeg, DenseWqeTable, InlineHeader, RdmaSeg, SparseWqeTable, WQEBB_SIZE,
-    WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
+    AtomicSeg, CtrlSeg, DataSeg, InlineHeader, OrderedWqeTable, RdmaSeg, WQEBB_SIZE, WqeFlags,
+    WqeHandle, WqeOpcode, calc_wqebb_cnt,
 };
 use crate::CompletionTarget;
 
@@ -95,8 +95,8 @@ pub(crate) struct QpInfo {
 
 /// Send Queue state for direct WQE posting.
 ///
-/// Generic over the table type `TableType` which determines dense vs sparse behavior.
-/// Both table types use interior mutability (Cell) so no RefCell wrapper is needed.
+/// Generic over the table type `TableType`.
+/// Uses interior mutability (Cell) so no RefCell wrapper is needed.
 pub(crate) struct SendQueueState<Entry, TableType> {
     /// SQ buffer base address
     buf: *mut u8,
@@ -248,31 +248,13 @@ impl<Entry, TableType> SendQueueState<Entry, TableType> {
     }
 }
 
-impl<Entry> SendQueueState<Entry, SparseWqeTable<Entry>> {
+impl<Entry> SendQueueState<Entry, OrderedWqeTable<Entry>> {
     #[inline]
-    fn process_completion_sparse(&self, wqe_idx: u16) -> Option<Entry> {
+    fn process_completion(&self, wqe_idx: u16) -> Option<Entry> {
         let entry = self.table.take(wqe_idx)?;
-        // For sparse tables, ci_delta is the accumulated PI value at completion
+        // ci_delta is the accumulated PI value at completion
         self.ci.set(entry.ci_delta);
         Some(entry.data)
-    }
-}
-
-impl<Entry> SendQueueState<Entry, DenseWqeTable<Entry>> {
-    #[inline]
-    fn process_completions_dense<F>(&self, new_ci: u16, mut callback: F)
-    where
-        F: FnMut(u16, Entry),
-    {
-        // Use take_range which only holds a shared reference to the table.
-        // This allows callbacks to safely access the QP (e.g., post new WQEs)
-        // without causing a RefCell borrow conflict.
-        for (idx, entry) in self.table.take_range(self.ci.get(), new_ci) {
-            callback(idx, entry.data);
-            // For dense tables, ci_delta is accumulated PI value at completion.
-            // This handles NOP gaps correctly (NOPs have no entries but PI is advanced).
-            self.ci.set(entry.ci_delta);
-        }
     }
 }
 
@@ -284,7 +266,7 @@ impl<Entry> SendQueueState<Entry, DenseWqeTable<Entry>> {
 ///
 /// Generic over `Entry`, the entry type stored in the WQE table.
 /// Unlike SQ, all RQ WQEs generate completions (all signaled),
-/// so we use a simple table without sparse/dense distinction.
+/// so we use a simple table.
 ///
 /// Uses `Cell<Option<Entry>>` for interior mutability, allowing safe access
 /// without requiring `RefCell` or mutable borrows.
@@ -677,36 +659,21 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType> {
 // RC QP
 // =============================================================================
 
-/// RC (Reliable Connection) Queue Pair with sparse WQE table.
+/// RC (Reliable Connection) Queue Pair.
 ///
-/// Only signaled WQEs have entries stored. Use this when you only need
-/// to track completions for signaled WQEs.
+/// Only signaled WQEs have entries stored in the WQE table.
 ///
 /// Type parameters:
 /// - `Entry`: Entry type stored in the WQE table
 /// - `OnComplete`: Completion callback type `Fn(Cqe, Entry)`
-///
-/// For tracking all WQEs, use `DenseRcQp` instead.
-pub type RcQp<Entry, OnComplete> = RcQpInner<Entry, SparseWqeTable<Entry>, OnComplete>;
-
-/// RC (Reliable Connection) Queue Pair with dense WQE table.
-///
-/// Every WQE must have an entry stored. Use this when you need to track
-/// all completions, including unsignaled WQEs.
-///
-/// Type parameters:
-/// - `Entry`: Entry type stored in the WQE table
-/// - `OnComplete`: Completion callback type `Fn(Option<Cqe>, Entry)`
-///
-/// For tracking only signaled WQEs, use `RcQp` instead.
-pub type DenseRcQp<Entry, OnComplete> = RcQpInner<Entry, DenseWqeTable<Entry>, OnComplete>;
+pub type RcQp<Entry, OnComplete> = RcQpInner<Entry, OrderedWqeTable<Entry>, OnComplete>;
 
 /// RC (Reliable Connection) Queue Pair (internal implementation).
 ///
 /// Created using mlx5dv_create_qp for direct hardware access.
 ///
 /// Type parameter `Entry` is the entry type stored in the WQE table (used for both SQ and RQ).
-/// Type parameter `TableType` determines sparse vs dense table behavior for the SQ.
+/// Type parameter `TableType` determines the WQE table behavior for the SQ.
 /// Type parameter `OnComplete` is the completion callback type.
 pub struct RcQpInner<Entry, TableType, OnComplete> {
     qp: NonNull<mlx5_sys::ibv_qp>,
@@ -723,10 +690,11 @@ pub struct RcQpInner<Entry, TableType, OnComplete> {
 }
 
 impl Context {
-    /// Create an RC Queue Pair with sparse WQE table using mlx5dv_create_qp.
+    /// Create an RC Queue Pair using mlx5dv_create_qp.
     ///
-    /// Only signaled WQEs have entries stored. The callback is invoked for each
-    /// completion with the CQE and the entry stored at WQE submission.
+    /// Only signaled WQEs have entries stored in the WQE table.
+    /// The callback is invoked for each completion with the CQE and
+    /// the entry stored at WQE submission.
     ///
     /// # Arguments
     /// * `pd` - Protection Domain
@@ -753,46 +721,6 @@ impl Context {
         OnComplete: Fn(Cqe, Entry) + 'static,
     {
         let qp = self.create_rc_qp_raw(pd, send_cq, recv_cq, config, callback)?;
-        let qp_rc = Rc::new(RefCell::new(qp));
-        let qpn = qp_rc.borrow().qpn();
-
-        // Register this QP with both CQs for completion dispatch
-        send_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-        recv_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-
-        Ok(qp_rc)
-    }
-
-    /// Create an RC Queue Pair with dense WQE table using mlx5dv_create_qp.
-    ///
-    /// Every WQE must have an entry stored. The callback is invoked for each
-    /// completion: `Some(Cqe)` for signaled WQEs, `None` for unsignaled ones.
-    ///
-    /// # Arguments
-    /// * `pd` - Protection Domain
-    /// * `send_cq` - Completion Queue for send completions (wrapped in Rc for shared ownership)
-    /// * `recv_cq` - Completion Queue for receive completions (wrapped in Rc for shared ownership)
-    /// * `config` - QP configuration
-    /// * `callback` - Completion callback `Fn(Option<Cqe>, Entry)` called for each completion
-    ///
-    /// # Errors
-    /// Returns an error if the QP cannot be created.
-    ///
-    /// # Note
-    /// The send_cq must have `init_direct_access()` called before this function.
-    pub fn create_dense_rc_qp<Entry, OnComplete>(
-        &self,
-        pd: &Pd,
-        send_cq: &Rc<CompletionQueue>,
-        recv_cq: &Rc<CompletionQueue>,
-        config: &RcQpConfig,
-        callback: OnComplete,
-    ) -> io::Result<Rc<RefCell<DenseRcQp<Entry, OnComplete>>>>
-    where
-        Entry: 'static,
-        OnComplete: Fn(Option<Cqe>, Entry) + 'static,
-    {
-        let qp = self.create_dense_rc_qp_raw(pd, send_cq, recv_cq, config, callback)?;
         let qp_rc = Rc::new(RefCell::new(qp));
         let qpn = qp_rc.borrow().qpn();
 
@@ -851,59 +779,6 @@ impl Context {
 
             // Auto-initialize direct access
             RcQp::<Entry, OnComplete>::init_direct_access_internal(&mut result)?;
-
-            Ok(result)
-        }
-    }
-
-    fn create_dense_rc_qp_raw<Entry, OnComplete>(
-        &self,
-        pd: &Pd,
-        send_cq: &Rc<CompletionQueue>,
-        recv_cq: &Rc<CompletionQueue>,
-        config: &RcQpConfig,
-        callback: OnComplete,
-    ) -> io::Result<DenseRcQp<Entry, OnComplete>>
-    where
-        OnComplete: Fn(Option<Cqe>, Entry),
-    {
-        unsafe {
-            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
-            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
-            qp_attr.send_cq = send_cq.as_ptr();
-            qp_attr.recv_cq = recv_cq.as_ptr();
-            qp_attr.cap.max_send_wr = config.max_send_wr;
-            qp_attr.cap.max_recv_wr = config.max_recv_wr;
-            qp_attr.cap.max_send_sge = config.max_send_sge;
-            qp_attr.cap.max_recv_sge = config.max_recv_sge;
-            qp_attr.cap.max_inline_data = config.max_inline_data;
-            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
-            qp_attr.pd = pd.as_ptr();
-
-            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
-            // Disable scatter to CQE to ensure received data goes to the receive buffer,
-            // not inline in the CQE. This is required for direct CQ polling to work correctly.
-            mlx5_attr.comp_mask =
-                mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS as u64;
-            mlx5_attr.create_flags =
-                mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
-
-            let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
-            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
-
-            let mut result = RcQpInner {
-                qp,
-                state: Cell::new(QpState::Reset),
-                sq: None,
-                rq: None,
-                callback,
-                send_cq: Rc::downgrade(send_cq),
-                recv_cq: Rc::downgrade(recv_cq),
-                _pd: pd.clone(),
-            };
-
-            // Auto-initialize direct access
-            DenseRcQp::<Entry, OnComplete>::init_direct_access_internal(&mut result)?;
 
             Ok(result)
         }
@@ -997,7 +872,7 @@ impl Context {
                     bf_reg: dv_qp.bf.reg as *mut u8,
                     bf_size: dv_qp.bf.size,
                     bf_offset: Cell::new(0),
-                    table: SparseWqeTable::new(sq_wqe_cnt),
+                    table: OrderedWqeTable::new(sq_wqe_cnt),
                     _marker: std::marker::PhantomData,
                 }),
                 rq: Some(ReceiveQueueState {
@@ -1336,7 +1211,7 @@ impl<Entry, OnComplete> RcQp<Entry, OnComplete> {
             bf_reg: info.bf_reg,
             bf_size: info.bf_size,
             bf_offset: Cell::new(0),
-            table: SparseWqeTable::new(wqe_cnt),
+            table: OrderedWqeTable::new(wqe_cnt),
             _marker: std::marker::PhantomData,
         });
 
@@ -1405,7 +1280,7 @@ impl<Entry, OnComplete> RcQp<Entry, OnComplete> {
     /// Get a WQE builder for zero-copy WQE construction (signaled).
     ///
     /// The entry will be stored and returned via callback on completion.
-    pub fn wqe_builder(&self, entry: Entry) -> io::Result<SparseWqeBuilder<'_, Entry>> {
+    pub fn wqe_builder(&self, entry: Entry) -> io::Result<RcQpWqeBuilder<'_, Entry>> {
         let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -1414,7 +1289,7 @@ impl<Entry, OnComplete> RcQp<Entry, OnComplete> {
         let wqe_idx = sq.pi.get();
         let wqe_ptr = sq.get_wqe_ptr(wqe_idx);
 
-        Ok(SparseWqeBuilder {
+        Ok(RcQpWqeBuilder {
             inner: WqeBuilder {
                 sq,
                 wqe_ptr,
@@ -1430,7 +1305,7 @@ impl<Entry, OnComplete> RcQp<Entry, OnComplete> {
     /// Get a WQE builder for zero-copy WQE construction (unsignaled).
     ///
     /// No entry is stored and no completion callback will be invoked.
-    pub fn wqe_builder_unsignaled(&self) -> io::Result<SparseWqeBuilder<'_, Entry>> {
+    pub fn wqe_builder_unsignaled(&self) -> io::Result<RcQpWqeBuilder<'_, Entry>> {
         let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -1439,7 +1314,7 @@ impl<Entry, OnComplete> RcQp<Entry, OnComplete> {
         let wqe_idx = sq.pi.get();
         let wqe_ptr = sq.get_wqe_ptr(wqe_idx);
 
-        Ok(SparseWqeBuilder {
+        Ok(RcQpWqeBuilder {
             inner: WqeBuilder {
                 sq,
                 wqe_ptr,
@@ -1453,132 +1328,17 @@ impl<Entry, OnComplete> RcQp<Entry, OnComplete> {
     }
 }
 
-impl<Entry, OnComplete> DenseRcQp<Entry, OnComplete> {
-    /// Initialize direct queue access (internal implementation).
-    fn init_direct_access_internal(&mut self) -> io::Result<()> {
-        if self.sq.is_some() {
-            return Ok(()); // Already initialized
-        }
-
-        let info = self.query_info()?;
-        let wqe_cnt = info.sq_wqe_cnt as u16;
-
-        self.sq = Some(SendQueueState {
-            buf: info.sq_buf,
-            wqe_cnt,
-            sqn: info.sqn,
-            pi: Cell::new(0),
-            ci: Cell::new(0),
-            last_wqe: Cell::new(None),
-            dbrec: info.dbrec,
-            bf_reg: info.bf_reg,
-            bf_size: info.bf_size,
-            bf_offset: Cell::new(0),
-            table: DenseWqeTable::new(wqe_cnt),
-            _marker: std::marker::PhantomData,
-        });
-
-        let rq_wqe_cnt = info.rq_wqe_cnt;
-        self.rq = Some(ReceiveQueueState {
-            buf: info.rq_buf,
-            wqe_cnt: rq_wqe_cnt,
-            stride: info.rq_stride,
-            pi: Cell::new(0),
-            ci: Cell::new(0),
-            dbrec: info.dbrec,
-            table: (0..rq_wqe_cnt).map(|_| Cell::new(None)).collect(),
-        });
-
-        Ok(())
-    }
-
-    /// Initialize direct queue access.
-    ///
-    /// # Deprecated
-    /// Direct access is now auto-initialized at QP creation.
-    /// This method is kept for backwards compatibility and is a no-op if already initialized.
-    #[deprecated(note = "Direct access is now auto-initialized at creation")]
-    pub fn init_direct_access(&mut self) -> io::Result<()> {
-        self.init_direct_access_internal()
-    }
-
-    /// Connect to a remote QP.
-    ///
-    /// Transitions the QP through RESET -> INIT -> RTR -> RTS.
-    /// Direct queue access is auto-initialized at creation time.
-    pub fn connect(
-        &mut self,
-        remote: &RemoteQpInfo,
-        port: u8,
-        local_psn: u32,
-        max_rd_atomic: u8,
-        max_dest_rd_atomic: u8,
-        access_flags: u32,
-    ) -> io::Result<()> {
-        self.modify_to_init(port, access_flags)?;
-        self.modify_to_rtr(remote, port, max_dest_rd_atomic)?;
-        self.modify_to_rts(local_psn, max_rd_atomic)?;
-        Ok(())
-    }
-
-    /// Get a receive WQE builder for zero-copy WQE construction.
-    ///
-    /// The entry will be stored and returned via callback on RQ completion.
-    pub fn recv_builder(&self, entry: Entry) -> io::Result<RecvWqeBuilder<'_, Entry>> {
-        let rq = self.rq.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "direct access not initialized")
-        })?;
-        if rq.available() == 0 {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "RQ full"));
-        }
-
-        let wqe_idx = rq.pi.get();
-        Ok(RecvWqeBuilder {
-            rq,
-            entry,
-            wqe_idx,
-        })
-    }
-
-    /// Get a WQE builder for zero-copy WQE construction.
-    ///
-    /// Every WQE must have an entry. The signaled flag controls whether
-    /// a CQE is generated. The callback receives `Some(Cqe)` for signaled
-    /// WQEs and `None` for unsignaled ones.
-    pub fn wqe_builder(&self, entry: Entry, signaled: bool) -> io::Result<DenseWqeBuilder<'_, Entry>> {
-        let sq = self.sq()?;
-        if sq.available() == 0 {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
-        }
-
-        let wqe_idx = sq.pi.get();
-        let wqe_ptr = sq.get_wqe_ptr(wqe_idx);
-
-        Ok(DenseWqeBuilder {
-            inner: WqeBuilder {
-                sq,
-                wqe_ptr,
-                wqe_idx,
-                offset: 0,
-                ds_count: 0,
-                signaled,
-            },
-            entry,
-        })
-    }
-}
-
 // =============================================================================
-// Sparse WQE Builder finish
+// RC QP WQE Builder
 // =============================================================================
 
-/// Sparse WQE builder that stores entry on finish.
-pub struct SparseWqeBuilder<'a, T> {
-    inner: WqeBuilder<'a, T, SparseWqeTable<T>>,
+/// WQE builder for RC QP that stores entry on finish.
+pub struct RcQpWqeBuilder<'a, T> {
+    inner: WqeBuilder<'a, T, OrderedWqeTable<T>>,
     entry: Option<T>,
 }
 
-impl<'a, T> SparseWqeBuilder<'a, T> {
+impl<'a, T> RcQpWqeBuilder<'a, T> {
     /// Write the control segment.
     pub fn ctrl(mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) -> Self {
         self.inner = self.inner.ctrl(opcode, flags, imm);
@@ -1655,97 +1415,12 @@ impl<'a, T> SparseWqeBuilder<'a, T> {
         if let Some(entry) = entry {
             sq.table.store(handle.wqe_idx, entry, sq.pi.get());
         }
-        Ok(handle)
-    }
-}
-
-/// Dense WQE builder that stores entry on finish.
-pub struct DenseWqeBuilder<'a, T> {
-    inner: WqeBuilder<'a, T, DenseWqeTable<T>>,
-    entry: T,
-}
-
-impl<'a, T> DenseWqeBuilder<'a, T> {
-    /// Write the control segment.
-    pub fn ctrl(mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) -> Self {
-        self.inner = self.inner.ctrl(opcode, flags, imm);
-        self
-    }
-
-    /// Add an RDMA segment.
-    pub fn rdma(mut self, remote_addr: u64, rkey: u32) -> Self {
-        self.inner = self.inner.rdma(remote_addr, rkey);
-        self
-    }
-
-    /// Add a data segment.
-    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
-        self.inner = self.inner.sge(addr, len, lkey);
-        self
-    }
-
-    /// Add inline data.
-    pub fn inline_data(mut self, data: &[u8]) -> Self {
-        self.inner = self.inner.inline_data(data);
-        self
-    }
-
-    /// Add an atomic Compare-and-Swap segment.
-    pub fn atomic_cas(mut self, swap: u64, compare: u64) -> Self {
-        self.inner = self.inner.atomic_cas(swap, compare);
-        self
-    }
-
-    /// Add an atomic Fetch-and-Add segment.
-    pub fn atomic_fa(mut self, add_value: u64) -> Self {
-        self.inner = self.inner.atomic_fa(add_value);
-        self
-    }
-
-    /// Finish the WQE construction.
-    ///
-    /// # Errors
-    /// Returns an error if required segments are missing for the opcode.
-    pub fn finish(self) -> io::Result<WqeHandle> {
-        // Keep reference to sq before consuming self.inner
-        let sq = self.inner.sq;
-        let entry = self.entry;
-
-        // finish_internal may relocate WQE due to wrap-around
-        let handle = self.inner.finish_internal()?;
-
-        // Store entry using actual wqe_idx (after possible wrap-around)
-        // For dense tables, ci_delta is the number of WQEBBs for this WQE
-        let wqebb_cnt = calc_wqebb_cnt(handle.size);
-        sq.table.store(handle.wqe_idx, entry, wqebb_cnt);
-        Ok(handle)
-    }
-
-    /// Finish the WQE construction and immediately ring BlueFlame doorbell.
-    ///
-    /// Use this for low-latency single WQE submission. No need to call
-    /// `ring_sq_doorbell()` afterwards.
-    ///
-    /// # Errors
-    /// Returns an error if required segments are missing for the opcode.
-    pub fn finish_with_blueflame(self) -> io::Result<WqeHandle> {
-        // Keep reference to sq before consuming self.inner
-        let sq = self.inner.sq;
-        let entry = self.entry;
-
-        // finish_internal may relocate WQE due to wrap-around
-        let handle = self.inner.finish_internal_with_blueflame()?;
-
-        // Store entry using actual wqe_idx (after possible wrap-around)
-        // For dense tables, ci_delta is the number of WQEBBs for this WQE
-        let wqebb_cnt = calc_wqebb_cnt(handle.size);
-        sq.table.store(handle.wqe_idx, entry, wqebb_cnt);
         Ok(handle)
     }
 }
 
 // =============================================================================
-// CompletionTarget impl for RcQp (Sparse)
+// CompletionTarget impl for RcQp
 // =============================================================================
 
 impl<Entry, OnComplete> CompletionTarget for RcQp<Entry, OnComplete>
@@ -1767,46 +1442,9 @@ where
         } else {
             // SQ completion (requester)
             if let Some(sq) = self.sq.as_ref() {
-                if let Some(entry) = sq.process_completion_sparse(cqe.wqe_counter) {
+                if let Some(entry) = sq.process_completion(cqe.wqe_counter) {
                     (self.callback)(cqe, entry);
                 }
-            }
-        }
-    }
-}
-
-// =============================================================================
-// CompletionTarget impl for DenseRcQp
-// =============================================================================
-
-impl<Entry, OnComplete> CompletionTarget for DenseRcQp<Entry, OnComplete>
-where
-    OnComplete: Fn(Option<Cqe>, Entry),
-{
-    fn qpn(&self) -> u32 {
-        RcQpInner::qpn(self)
-    }
-
-    fn dispatch_cqe(&self, cqe: Cqe) {
-        if cqe.opcode.is_responder() {
-            // RQ completion (responder) - all RQ WQEs are signaled
-            if let Some(rq) = self.rq.as_ref() {
-                if let Some(entry) = rq.process_completion(cqe.wqe_counter) {
-                    (self.callback)(Some(cqe), entry);
-                }
-            }
-        } else {
-            // SQ completion (requester)
-            if let Some(sq) = self.sq.as_ref() {
-                let signaled_idx = cqe.wqe_counter;
-                sq.process_completions_dense(signaled_idx, |idx, entry| {
-                    let cqe_opt = if idx == signaled_idx {
-                        Some(cqe)
-                    } else {
-                        None
-                    };
-                    (self.callback)(cqe_opt, entry);
-                });
             }
         }
     }
@@ -1925,30 +1563,12 @@ impl<Entry, TableType, OnComplete> RcQpInner<Entry, TableType, OnComplete> {
 }
 
 impl<Entry, OnComplete> RcQp<Entry, OnComplete> {
-    /// Store an entry in the sparse WQE table.
+    /// Store an entry in the WQE table.
     ///
     /// # Arguments
     /// * `wqe_idx` - WQE index
     /// * `entry` - User data to store
     /// * `ci_delta` - Accumulated PI value at completion (for correct CI update)
-    ///
-    /// # Safety
-    /// The caller must ensure `wqe_idx` corresponds to a valid pending WQE.
-    #[inline]
-    pub unsafe fn __sq_store_entry(&self, wqe_idx: u16, entry: Entry, ci_delta: u16) {
-        if let Some(sq) = self.sq.as_ref() {
-            sq.table.store(wqe_idx, entry, ci_delta);
-        }
-    }
-}
-
-impl<Entry, OnComplete> DenseRcQp<Entry, OnComplete> {
-    /// Store an entry in the dense WQE table.
-    ///
-    /// # Arguments
-    /// * `wqe_idx` - WQE index
-    /// * `entry` - User data to store
-    /// * `ci_delta` - Number of WQEBBs for this WQE
     ///
     /// # Safety
     /// The caller must ensure `wqe_idx` corresponds to a valid pending WQE.
@@ -1966,7 +1586,7 @@ impl<Entry, OnComplete> DenseRcQp<Entry, OnComplete> {
 
 use crate::mono_cq::CompletionSource;
 
-impl<Entry> CompletionSource for RcQpInner<Entry, SparseWqeTable<Entry>, ()> {
+impl<Entry> CompletionSource for RcQpInner<Entry, OrderedWqeTable<Entry>, ()> {
     type Entry = Entry;
 
     fn qpn(&self) -> u32 {
@@ -1979,7 +1599,7 @@ impl<Entry> CompletionSource for RcQpInner<Entry, SparseWqeTable<Entry>, ()> {
             self.rq.as_ref()?.process_completion(cqe.wqe_counter)
         } else {
             // SQ completion (requester)
-            self.sq.as_ref()?.process_completion_sparse(cqe.wqe_counter)
+            self.sq.as_ref()?.process_completion(cqe.wqe_counter)
         }
     }
 }
@@ -1991,7 +1611,7 @@ impl<Entry> CompletionSource for RcQpInner<Entry, SparseWqeTable<Entry>, ()> {
 /// RcQp type for use with MonoCq (no internal callback).
 ///
 /// This is an alias for `RcQp<T, ()>`. All methods from `RcQp` are available.
-pub type RcQpForMonoCq<Entry> = RcQpInner<Entry, SparseWqeTable<Entry>, ()>;
+pub type RcQpForMonoCq<Entry> = RcQpInner<Entry, OrderedWqeTable<Entry>, ()>;
 
 // =============================================================================
 // Unit Tests
@@ -2009,7 +1629,7 @@ mod tests {
         sqn: u32,
         pi: Cell<u16>,
         ci: Cell<u16>,
-        table: SparseWqeTable<u32>,
+        table: OrderedWqeTable<u32>,
     }
 
     impl MockSendQueue {
@@ -2021,7 +1641,7 @@ mod tests {
                 sqn: 123,
                 pi: Cell::new(0),
                 ci: Cell::new(0),
-                table: SparseWqeTable::new(wqe_cnt),
+                table: OrderedWqeTable::new(wqe_cnt),
             }
         }
 
@@ -2256,7 +1876,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_sparse_table_with_sq_indices() {
+    fn test_ordered_table_with_sq_indices() {
         let sq = MockSendQueue::new(8);
         let table = &sq.table;
 
@@ -2277,7 +1897,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sparse_table_wrap_around_with_sq() {
+    fn test_ordered_table_wrap_around_with_sq() {
         let sq = MockSendQueue::new(4);
         let table = &sq.table;
 
@@ -2338,8 +1958,8 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_ci_delta_for_sparse_table() {
-        // For sparse tables, ci_delta is the accumulated PI value at completion
+    fn test_ci_delta_for_ordered_table() {
+        // ci_delta is the accumulated PI value at completion
         let sq = MockSendQueue::new(8);
         let table = &sq.table;
 
@@ -2559,7 +2179,7 @@ mod tests {
         assert_eq!(sq.ci.get(), 0);
         assert_eq!(sq.available(), 0);
 
-        // BUG: Without CQE, process_completion_sparse is never called,
+        // BUG: Without CQE, process_completion is never called,
         // CI is never updated, and SQ stays full forever.
         // The server would hang trying to post more WQEs.
 

@@ -55,7 +55,7 @@
 //! This design:
 //! - Eliminates the need to manually track outstanding requests
 //! - Ensures entries are automatically associated with completions
-//! - Supports both signaled and unsignaled operations (via dense/sparse tables)
+//! - Supports both signaled and unsignaled operations
 //!
 //! ### QPN to Queue Mapping
 //!
@@ -105,7 +105,7 @@ pub use tm_srq::{RqWqeBuilder, TmSrqCompletion};
 
 /// Trait for queues that can receive completion notifications from a CQ.
 ///
-/// Implemented by RcQp, DenseRcQp, etc.
+/// Implemented by RcQp, UdQp, Dci, TmSrq, etc.
 pub trait CompletionTarget {
     /// Get the QP number.
     fn qpn(&self) -> u32;

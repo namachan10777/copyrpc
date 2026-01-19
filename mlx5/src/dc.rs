@@ -14,8 +14,8 @@ use crate::pd::Pd;
 use crate::qp::QpInfo;
 use crate::srq::Srq;
 use crate::wqe::{
-    AddressVector, CtrlSeg, DataSeg, DenseWqeTable, InlineHeader, RdmaSeg, SparseWqeTable,
-    WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
+    AddressVector, CtrlSeg, DataSeg, InlineHeader, OrderedWqeTable, RdmaSeg, WQEBB_SIZE, WqeFlags,
+    WqeHandle, WqeOpcode, calc_wqebb_cnt,
 };
 use crate::CompletionTarget;
 
@@ -202,29 +202,12 @@ impl<Entry, TableType> DciSendQueueState<Entry, TableType> {
     }
 }
 
-impl<Entry> DciSendQueueState<Entry, SparseWqeTable<Entry>> {
-    fn process_completion_sparse(&self, wqe_idx: u16) -> Option<Entry> {
+impl<Entry> DciSendQueueState<Entry, OrderedWqeTable<Entry>> {
+    fn process_completion(&self, wqe_idx: u16) -> Option<Entry> {
         let entry = self.table.take(wqe_idx)?;
-        // For sparse tables, ci_delta is the accumulated PI value at completion
+        // ci_delta is the accumulated PI value at completion
         self.ci.set(entry.ci_delta);
         Some(entry.data)
-    }
-}
-
-impl<Entry> DciSendQueueState<Entry, DenseWqeTable<Entry>> {
-    fn process_completions_dense<F>(&self, new_ci: u16, mut callback: F)
-    where
-        F: FnMut(u16, Entry),
-    {
-        // Use take_range which only holds a shared reference to the table.
-        // This allows callbacks to safely access the DCI (e.g., post new WQEs)
-        // without causing a RefCell borrow conflict.
-        for (idx, entry) in self.table.take_range(self.ci.get(), new_ci) {
-            callback(idx, entry.data);
-            // For dense tables, ci_delta is accumulated PI value at completion.
-            // This handles NOP gaps correctly (NOPs have no entries but PI is advanced).
-            self.ci.set(entry.ci_delta);
-        }
     }
 }
 
@@ -472,16 +455,16 @@ impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType> {
 }
 
 // =============================================================================
-// Sparse/Dense DCI WQE Builders
+// DCI Public WQE Builder
 // =============================================================================
 
-/// Sparse DCI WQE builder that stores entry on finish.
-pub struct SparseDciWqeBuilder<'a, Entry> {
-    inner: DciWqeBuilder<'a, Entry, SparseWqeTable<Entry>>,
+/// WQE builder for DCI that stores entry on finish.
+pub struct DciPublicWqeBuilder<'a, Entry> {
+    inner: DciWqeBuilder<'a, Entry, OrderedWqeTable<Entry>>,
     entry: Option<Entry>,
 }
 
-impl<'a, Entry> SparseDciWqeBuilder<'a, Entry> {
+impl<'a, Entry> DciPublicWqeBuilder<'a, Entry> {
     /// Write the control segment.
     pub fn ctrl(mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) -> Self {
         self.inner = self.inner.ctrl(opcode, flags, imm);
@@ -558,112 +541,12 @@ impl<'a, Entry> SparseDciWqeBuilder<'a, Entry> {
     }
 }
 
-/// Dense DCI WQE builder that stores entry on finish.
-pub struct DenseDciWqeBuilder<'a, Entry> {
-    inner: DciWqeBuilder<'a, Entry, DenseWqeTable<Entry>>,
-    entry: Entry,
-}
-
-impl<'a, Entry> DenseDciWqeBuilder<'a, Entry> {
-    /// Write the control segment.
-    pub fn ctrl(mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) -> Self {
-        self.inner = self.inner.ctrl(opcode, flags, imm);
-        self
-    }
-
-    /// Add an address vector.
-    pub fn av(mut self, dc_key: u64, dctn: u32, dlid: u16) -> Self {
-        self.inner = self.inner.av(dc_key, dctn, dlid);
-        self
-    }
-
-    /// Add an RDMA segment.
-    pub fn rdma(mut self, remote_addr: u64, rkey: u32) -> Self {
-        self.inner = self.inner.rdma(remote_addr, rkey);
-        self
-    }
-
-    /// Add a data segment.
-    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
-        self.inner = self.inner.sge(addr, len, lkey);
-        self
-    }
-
-    /// Add inline data.
-    pub fn inline_data(mut self, data: &[u8]) -> Self {
-        self.inner = self.inner.inline_data(data);
-        self
-    }
-
-    /// Finish the WQE construction.
-    ///
-    /// # Errors
-    /// Returns an error if required segments are missing for the opcode.
-    pub fn finish(self) -> io::Result<WqeHandle> {
-        // Keep reference to sq before consuming self.inner
-        let sq = self.inner.sq;
-        let entry = self.entry;
-
-        // finish_internal may relocate WQE due to wrap-around
-        let handle = self.inner.finish_internal()?;
-
-        // Store entry using actual wqe_idx (after possible wrap-around)
-        // For dense tables, ci_delta is the number of WQEBBs for this WQE
-        let wqebb_cnt = calc_wqebb_cnt(handle.size);
-        sq.table.store(handle.wqe_idx, entry, wqebb_cnt);
-        Ok(handle)
-    }
-
-    /// Finish the WQE construction and immediately ring BlueFlame doorbell.
-    ///
-    /// Use this for low-latency single WQE submission. No need to call
-    /// `ring_sq_doorbell()` afterwards.
-    ///
-    /// # Errors
-    /// Returns an error if required segments are missing for the opcode.
-    pub fn finish_with_blueflame(self) -> io::Result<WqeHandle> {
-        // Keep reference to sq before consuming self.inner
-        let sq = self.inner.sq;
-        let entry = self.entry;
-
-        // finish_internal may relocate WQE due to wrap-around
-        let handle = self.inner.finish_internal_with_blueflame()?;
-
-        // Store entry using actual wqe_idx (after possible wrap-around)
-        // For dense tables, ci_delta is the number of WQEBBs for this WQE
-        let wqebb_cnt = calc_wqebb_cnt(handle.size);
-        sq.table.store(handle.wqe_idx, entry, wqebb_cnt);
-        Ok(handle)
-    }
-}
-
 // =============================================================================
 // DCI
 // =============================================================================
 
-/// DCI with sparse WQE table.
-///
-/// Only signaled WQEs have entries stored. Use this when you only need
-/// to track completions for signaled WQEs.
-///
-/// Type parameters:
-/// - `Entry`: Entry type stored in the WQE table
-/// - `OnComplete`: Completion callback type `Fn(Cqe, Entry)`
-///
-/// For tracking all WQEs, use `DciDenseWqeTable` instead.
-pub type DciSparseWqeTable<Entry, OnComplete> = Dci<Entry, SparseWqeTable<Entry>, OnComplete>;
-
-/// DCI with dense WQE table.
-///
-/// Every WQE must have an entry stored. Use this when you need to track
-/// all completions, including unsignaled WQEs.
-///
-/// Type parameters:
-/// - `Entry`: Entry type stored in the WQE table
-/// - `OnComplete`: Completion callback type `Fn(Option<Cqe>, Entry)`
-///
-/// For tracking only signaled WQEs, use `DciSparseWqeTable` instead.
-pub type DciDenseWqeTable<Entry, OnComplete> = Dci<Entry, DenseWqeTable<Entry>, OnComplete>;
+/// Type alias for DCI with ordered WQE table.
+pub type DciWithTable<Entry, OnComplete> = Dci<Entry, OrderedWqeTable<Entry>, OnComplete>;
 
 /// DC Initiator (DCI).
 ///
@@ -687,14 +570,14 @@ pub struct Dci<Entry, TableType, OnComplete> {
 }
 
 impl Context {
-    /// Create a DCI (DC Initiator) with sparse WQE table using mlx5dv_create_qp.
+    /// Create a DCI (DC Initiator) using mlx5dv_create_qp.
     ///
-    /// Only signaled WQEs have entries stored. The callback is invoked for each
-    /// completion with the CQE and the entry stored at WQE submission.
+    /// Only signaled WQEs have entries stored in the WQE table.
+    /// The callback is invoked for each completion with the CQE and the entry.
     ///
     /// # Arguments
     /// * `pd` - Protection Domain
-    /// * `send_cq` - Completion Queue for send completions (will be modified to register this DCI)
+    /// * `send_cq` - Completion Queue for send completions
     /// * `config` - DCI configuration
     /// * `callback` - Completion callback `Fn(Cqe, Entry)` called for each signaled completion
     ///
@@ -703,55 +586,18 @@ impl Context {
     ///
     /// # Note
     /// The send_cq must have `init_direct_access()` called before this function.
-    pub fn create_dci_sparse<Entry, OnComplete>(
+    pub fn create_dci<Entry, OnComplete>(
         &self,
         pd: &Pd,
         send_cq: &Rc<CompletionQueue>,
         config: &DciConfig,
         callback: OnComplete,
-    ) -> io::Result<Rc<RefCell<DciSparseWqeTable<Entry, OnComplete>>>>
+    ) -> io::Result<Rc<RefCell<DciWithTable<Entry, OnComplete>>>>
     where
         Entry: 'static,
         OnComplete: Fn(Cqe, Entry) + 'static,
     {
         let dci = self.create_dci_raw(pd, send_cq, config, callback)?;
-        let dci_rc = Rc::new(RefCell::new(dci));
-        let qpn = dci_rc.borrow().qpn();
-
-        // Register this DCI with the CQ for completion dispatch
-        send_cq.register_queue(qpn, Rc::downgrade(&dci_rc) as _);
-
-        Ok(dci_rc)
-    }
-
-    /// Create a DCI (DC Initiator) with dense WQE table using mlx5dv_create_qp.
-    ///
-    /// Every WQE must have an entry stored. The callback is invoked for each
-    /// completion: `Some(Cqe)` for signaled WQEs, `None` for unsignaled ones.
-    ///
-    /// # Arguments
-    /// * `pd` - Protection Domain
-    /// * `send_cq` - Completion Queue for send completions (will be modified to register this DCI)
-    /// * `config` - DCI configuration
-    /// * `callback` - Completion callback `Fn(Option<Cqe>, Entry)` called for each completion
-    ///
-    /// # Errors
-    /// Returns an error if the DCI cannot be created.
-    ///
-    /// # Note
-    /// The send_cq must have `init_direct_access()` called before this function.
-    pub fn create_dci_dense<Entry, OnComplete>(
-        &self,
-        pd: &Pd,
-        send_cq: &Rc<CompletionQueue>,
-        config: &DciConfig,
-        callback: OnComplete,
-    ) -> io::Result<Rc<RefCell<DciDenseWqeTable<Entry, OnComplete>>>>
-    where
-        Entry: 'static,
-        OnComplete: Fn(Option<Cqe>, Entry) + 'static,
-    {
-        let dci = self.create_dci_dense_raw(pd, send_cq, config, callback)?;
         let dci_rc = Rc::new(RefCell::new(dci));
         let qpn = dci_rc.borrow().qpn();
 
@@ -767,7 +613,7 @@ impl Context {
         send_cq: &Rc<CompletionQueue>,
         config: &DciConfig,
         callback: OnComplete,
-    ) -> io::Result<DciSparseWqeTable<Entry, OnComplete>>
+    ) -> io::Result<DciWithTable<Entry, OnComplete>>
     where
         OnComplete: Fn(Cqe, Entry),
     {
@@ -812,64 +658,7 @@ impl Context {
             };
 
             // Auto-initialize direct access
-            DciSparseWqeTable::<Entry, OnComplete>::init_direct_access_internal(&mut result)?;
-
-            Ok(result)
-        }
-    }
-
-    fn create_dci_dense_raw<Entry, OnComplete>(
-        &self,
-        pd: &Pd,
-        send_cq: &Rc<CompletionQueue>,
-        config: &DciConfig,
-        callback: OnComplete,
-    ) -> io::Result<DciDenseWqeTable<Entry, OnComplete>>
-    where
-        OnComplete: Fn(Option<Cqe>, Entry),
-    {
-        unsafe {
-            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
-            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_DRIVER;
-            qp_attr.send_cq = send_cq.as_ptr();
-            qp_attr.recv_cq = send_cq.as_ptr();
-            qp_attr.cap.max_send_wr = config.max_send_wr;
-            qp_attr.cap.max_recv_wr = 0;
-            qp_attr.cap.max_send_sge = config.max_send_sge;
-            qp_attr.cap.max_recv_sge = 0;
-            qp_attr.cap.max_inline_data = config.max_inline_data;
-            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
-            qp_attr.pd = pd.as_ptr();
-
-            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
-            mlx5_attr.comp_mask =
-                mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_DC as u64;
-            mlx5_attr.dc_init_attr.dc_type = mlx5_sys::mlx5dv_dc_type_MLX5DV_DCTYPE_DCI;
-            mlx5_attr
-                .dc_init_attr
-                .__bindgen_anon_1
-                .dci_streams
-                .log_num_concurent = 0;
-            mlx5_attr
-                .dc_init_attr
-                .__bindgen_anon_1
-                .dci_streams
-                .log_num_errored = 0;
-
-            let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
-            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
-
-            let mut result = Dci {
-                qp,
-                state: Cell::new(DcQpState::Reset),
-                sq: None,
-                callback,
-                send_cq: Rc::downgrade(send_cq),
-                _pd: pd.clone(),
-            };
-
-            // Auto-initialize direct access
-            DciDenseWqeTable::<Entry, OnComplete>::init_direct_access_internal(&mut result)?;
+            DciWithTable::<Entry, OnComplete>::init_direct_access_internal(&mut result)?;
 
             Ok(result)
         }
@@ -1092,7 +881,7 @@ impl<Entry, TableType, OnComplete> Dci<Entry, TableType, OnComplete> {
     }
 }
 
-impl<Entry, OnComplete> DciSparseWqeTable<Entry, OnComplete> {
+impl<Entry, OnComplete> DciWithTable<Entry, OnComplete> {
     /// Initialize direct queue access (internal implementation).
     fn init_direct_access_internal(&mut self) -> io::Result<()> {
         if self.sq.is_some() {
@@ -1113,7 +902,7 @@ impl<Entry, OnComplete> DciSparseWqeTable<Entry, OnComplete> {
             bf_reg: info.bf_reg,
             bf_size: info.bf_size,
             bf_offset: Cell::new(0),
-            table: SparseWqeTable::new(wqe_cnt),
+            table: OrderedWqeTable::new(wqe_cnt),
             _marker: PhantomData,
         });
 
@@ -1142,7 +931,7 @@ impl<Entry, OnComplete> DciSparseWqeTable<Entry, OnComplete> {
     /// Get a WQE builder for zero-copy WQE construction (signaled).
     ///
     /// The entry will be stored and returned via callback on completion.
-    pub fn wqe_builder(&self, entry: Entry) -> io::Result<SparseDciWqeBuilder<'_, Entry>> {
+    pub fn wqe_builder(&self, entry: Entry) -> io::Result<DciPublicWqeBuilder<'_, Entry>> {
         let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -1151,7 +940,7 @@ impl<Entry, OnComplete> DciSparseWqeTable<Entry, OnComplete> {
         let wqe_idx = sq.pi.get();
         let wqe_ptr = sq.get_wqe_ptr(wqe_idx);
 
-        Ok(SparseDciWqeBuilder {
+        Ok(DciPublicWqeBuilder {
             inner: DciWqeBuilder {
                 sq,
                 wqe_ptr,
@@ -1167,7 +956,7 @@ impl<Entry, OnComplete> DciSparseWqeTable<Entry, OnComplete> {
     /// Get a WQE builder for zero-copy WQE construction (unsignaled).
     ///
     /// No entry is stored and no completion callback will be invoked.
-    pub fn wqe_builder_unsignaled(&self) -> io::Result<SparseDciWqeBuilder<'_, Entry>> {
+    pub fn wqe_builder_unsignaled(&self) -> io::Result<DciPublicWqeBuilder<'_, Entry>> {
         let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -1176,7 +965,7 @@ impl<Entry, OnComplete> DciSparseWqeTable<Entry, OnComplete> {
         let wqe_idx = sq.pi.get();
         let wqe_ptr = sq.get_wqe_ptr(wqe_idx);
 
-        Ok(SparseDciWqeBuilder {
+        Ok(DciPublicWqeBuilder {
             inner: DciWqeBuilder {
                 sq,
                 wqe_ptr,
@@ -1190,85 +979,12 @@ impl<Entry, OnComplete> DciSparseWqeTable<Entry, OnComplete> {
     }
 }
 
-impl<Entry, OnComplete> DciDenseWqeTable<Entry, OnComplete> {
-    /// Initialize direct queue access (internal implementation).
-    fn init_direct_access_internal(&mut self) -> io::Result<()> {
-        if self.sq.is_some() {
-            return Ok(()); // Already initialized
-        }
-
-        let info = self.query_info()?;
-        let wqe_cnt = info.sq_wqe_cnt as u16;
-
-        self.sq = Some(DciSendQueueState {
-            buf: info.sq_buf,
-            wqe_cnt,
-            sqn: info.sqn,
-            pi: Cell::new(0),
-            ci: Cell::new(0),
-            last_wqe: Cell::new(None),
-            dbrec: info.dbrec,
-            bf_reg: info.bf_reg,
-            bf_size: info.bf_size,
-            bf_offset: Cell::new(0),
-            table: DenseWqeTable::new(wqe_cnt),
-            _marker: PhantomData,
-        });
-
-        Ok(())
-    }
-
-    /// Initialize direct queue access.
-    ///
-    /// # Deprecated
-    /// Direct access is now auto-initialized at DCI creation.
-    /// This method is kept for backwards compatibility and is a no-op if already initialized.
-    #[deprecated(note = "Direct access is now auto-initialized at creation")]
-    pub fn init_direct_access(&mut self) -> io::Result<()> {
-        self.init_direct_access_internal()
-    }
-
-    /// Activate DCI (transition to RTS).
-    /// Direct queue access is auto-initialized at creation time.
-    pub fn activate(&mut self, port: u8, local_psn: u32, max_rd_atomic: u8) -> io::Result<()> {
-        self.modify_to_init(port)?;
-        self.modify_to_rtr(port)?;
-        self.modify_to_rts(local_psn, max_rd_atomic)?;
-        Ok(())
-    }
-
-    /// Get a WQE builder for zero-copy WQE construction.
-    ///
-    /// Every WQE must have an entry. The signaled flag controls whether
-    /// a CQE is generated.
-    pub fn wqe_builder(&self, entry: Entry, signaled: bool) -> io::Result<DenseDciWqeBuilder<'_, Entry>> {
-        let sq = self.sq()?;
-        if sq.available() == 0 {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
-        }
-
-        let wqe_idx = sq.pi.get();
-        let wqe_ptr = sq.get_wqe_ptr(wqe_idx);
-
-        Ok(DenseDciWqeBuilder {
-            inner: DciWqeBuilder {
-                sq,
-                wqe_ptr,
-                wqe_idx,
-                offset: 0,
-                ds_count: 0,
-                signaled,
-            },
-            entry,
-        })
-    }
-}
 
 // =============================================================================
-// CompletionTarget impl for DciSparseWqeTable
+// CompletionTarget impl for DciWithTable
 // =============================================================================
 
-impl<Entry, OnComplete> CompletionTarget for DciSparseWqeTable<Entry, OnComplete>
+impl<Entry, OnComplete> CompletionTarget for DciWithTable<Entry, OnComplete>
 where
     OnComplete: Fn(Cqe, Entry),
 {
@@ -1278,36 +994,9 @@ where
 
     fn dispatch_cqe(&self, cqe: Cqe) {
         if let Some(sq) = self.sq.as_ref() {
-            if let Some(entry) = sq.process_completion_sparse(cqe.wqe_counter) {
+            if let Some(entry) = sq.process_completion(cqe.wqe_counter) {
                 (self.callback)(cqe, entry);
             }
-        }
-    }
-}
-
-// =============================================================================
-// CompletionTarget impl for DciDenseWqeTable
-// =============================================================================
-
-impl<Entry, OnComplete> CompletionTarget for DciDenseWqeTable<Entry, OnComplete>
-where
-    OnComplete: Fn(Option<Cqe>, Entry),
-{
-    fn qpn(&self) -> u32 {
-        Dci::qpn(self)
-    }
-
-    fn dispatch_cqe(&self, cqe: Cqe) {
-        if let Some(sq) = self.sq.as_ref() {
-            let signaled_idx = cqe.wqe_counter;
-            sq.process_completions_dense(signaled_idx, |idx, entry| {
-                let cqe_opt = if idx == signaled_idx {
-                    Some(cqe)
-                } else {
-                    None
-                };
-                (self.callback)(cqe_opt, entry);
-            });
         }
     }
 }
@@ -1525,7 +1214,7 @@ mod tests {
         sqn: u32,
         pi: Cell<u16>,
         ci: Cell<u16>,
-        table: SparseWqeTable<u32>,
+        table: OrderedWqeTable<u32>,
     }
 
     impl MockDciSendQueue {
@@ -1537,7 +1226,7 @@ mod tests {
                 sqn: 456,
                 pi: Cell::new(0),
                 ci: Cell::new(0),
-                table: SparseWqeTable::new(wqe_cnt),
+                table: OrderedWqeTable::new(wqe_cnt),
             }
         }
 

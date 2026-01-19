@@ -18,8 +18,8 @@ use crate::device::Context;
 use crate::pd::{AddressHandle, Pd};
 use crate::qp::QpInfo;
 use crate::wqe::{
-    CtrlSeg, DataSeg, DenseWqeTable, InlineHeader, SparseWqeTable, WQEBB_SIZE, WqeFlags, WqeHandle,
-    WqeOpcode, calc_wqebb_cnt,
+    CtrlSeg, DataSeg, InlineHeader, OrderedWqeTable, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode,
+    calc_wqebb_cnt,
 };
 use crate::CompletionTarget;
 
@@ -175,29 +175,12 @@ impl<Entry, TableType> UdSendQueueState<Entry, TableType> {
     }
 }
 
-impl<Entry> UdSendQueueState<Entry, SparseWqeTable<Entry>> {
-    fn process_completion_sparse(&self, wqe_idx: u16) -> Option<Entry> {
+impl<Entry> UdSendQueueState<Entry, OrderedWqeTable<Entry>> {
+    fn process_completion(&self, wqe_idx: u16) -> Option<Entry> {
         let entry = self.table.take(wqe_idx)?;
-        // For sparse tables, ci_delta is the accumulated PI value at completion
+        // ci_delta is the accumulated PI value at completion
         self.ci.set(entry.ci_delta);
         Some(entry.data)
-    }
-}
-
-impl<Entry> UdSendQueueState<Entry, DenseWqeTable<Entry>> {
-    fn process_completions_dense<F>(&self, new_ci: u16, mut callback: F)
-    where
-        F: FnMut(u16, Entry),
-    {
-        // Use take_range which only holds a shared reference to the table.
-        // This allows callbacks to safely access the QP (e.g., post new WQEs)
-        // without causing a RefCell borrow conflict.
-        for (idx, entry) in self.table.take_range(self.ci.get(), new_ci) {
-            callback(idx, entry.data);
-            // For dense tables, ci_delta is accumulated PI value at completion.
-            // This handles NOP gaps correctly (NOPs have no entries but PI is advanced).
-            self.ci.set(entry.ci_delta);
-        }
     }
 }
 
@@ -598,16 +581,16 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
 }
 
 // =============================================================================
-// Sparse/Dense UD WQE Builders
+// UD QP WQE Builder
 // =============================================================================
 
-/// Sparse UD WQE builder that stores entry on finish.
-pub struct SparseUdWqeBuilder<'a, Entry> {
-    inner: UdWqeBuilder<'a, Entry, SparseWqeTable<Entry>>,
+/// WQE builder for UD QP that stores entry on finish.
+pub struct UdQpWqeBuilder<'a, Entry> {
+    inner: UdWqeBuilder<'a, Entry, OrderedWqeTable<Entry>>,
     entry: Option<Entry>,
 }
 
-impl<'a, Entry> SparseUdWqeBuilder<'a, Entry> {
+impl<'a, Entry> UdQpWqeBuilder<'a, Entry> {
     /// Write the control segment.
     pub fn ctrl(mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) -> Self {
         self.inner = self.inner.ctrl(opcode, flags, imm);
@@ -675,82 +658,6 @@ impl<'a, Entry> SparseUdWqeBuilder<'a, Entry> {
         if let Some(entry) = entry {
             sq.table.store(handle.wqe_idx, entry, sq.pi.get());
         }
-        Ok(handle)
-    }
-}
-
-/// Dense UD WQE builder that stores entry on finish.
-pub struct DenseUdWqeBuilder<'a, Entry> {
-    inner: UdWqeBuilder<'a, Entry, DenseWqeTable<Entry>>,
-    entry: Entry,
-}
-
-impl<'a, Entry> DenseUdWqeBuilder<'a, Entry> {
-    /// Write the control segment.
-    pub fn ctrl(mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) -> Self {
-        self.inner = self.inner.ctrl(opcode, flags, imm);
-        self
-    }
-
-    /// Add UD address segment.
-    pub fn ud_av(mut self, ah: &AddressHandle, qkey: u32) -> Self {
-        self.inner = self.inner.ud_av(ah, qkey);
-        self
-    }
-
-    /// Add UD address segment using raw values.
-    pub fn ud_av_raw(mut self, remote_qpn: u32, qkey: u32, dlid: u16) -> Self {
-        self.inner = self.inner.ud_av_raw(remote_qpn, qkey, dlid);
-        self
-    }
-
-    /// Add a data segment.
-    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
-        self.inner = self.inner.sge(addr, len, lkey);
-        self
-    }
-
-    /// Add inline data.
-    pub fn inline_data(mut self, data: &[u8]) -> Self {
-        self.inner = self.inner.inline_data(data);
-        self
-    }
-
-    /// Finish the WQE construction.
-    ///
-    /// # Errors
-    /// Returns an error if required segments are missing for the opcode.
-    pub fn finish(self) -> io::Result<WqeHandle> {
-        // Keep reference to sq before consuming self.inner
-        let sq = self.inner.sq;
-        let entry = self.entry;
-
-        // finish_internal may relocate WQE due to wrap-around
-        let handle = self.inner.finish_internal()?;
-
-        // Store entry using actual wqe_idx (after possible wrap-around)
-        // For dense tables, ci_delta is the number of WQEBBs for this WQE
-        let wqebb_cnt = calc_wqebb_cnt(handle.size);
-        sq.table.store(handle.wqe_idx, entry, wqebb_cnt);
-        Ok(handle)
-    }
-
-    /// Finish the WQE construction with BlueFlame doorbell.
-    ///
-    /// # Errors
-    /// Returns an error if required segments are missing for the opcode.
-    pub fn finish_with_blueflame(self) -> io::Result<WqeHandle> {
-        // Keep reference to sq before consuming self.inner
-        let sq = self.inner.sq;
-        let entry = self.entry;
-
-        // finish_internal may relocate WQE due to wrap-around
-        let handle = self.inner.finish_internal_with_blueflame()?;
-
-        // Store entry using actual wqe_idx (after possible wrap-around)
-        // For dense tables, ci_delta is the number of WQEBBs for this WQE
-        let wqebb_cnt = calc_wqebb_cnt(handle.size);
-        sq.table.store(handle.wqe_idx, entry, wqebb_cnt);
         Ok(handle)
     }
 }
@@ -759,11 +666,8 @@ impl<'a, Entry> DenseUdWqeBuilder<'a, Entry> {
 // UD QP
 // =============================================================================
 
-/// UD QP with sparse WQE table.
-pub type UdQpSparseWqeTable<Entry, OnComplete> = UdQp<Entry, SparseWqeTable<Entry>, OnComplete>;
-
-/// UD QP with dense WQE table.
-pub type UdQpDenseWqeTable<Entry, OnComplete> = UdQp<Entry, DenseWqeTable<Entry>, OnComplete>;
+/// Type alias for UD QP with ordered WQE table.
+pub type UdQpWithTable<Entry, OnComplete> = UdQp<Entry, OrderedWqeTable<Entry>, OnComplete>;
 
 /// UD (Unreliable Datagram) Queue Pair.
 ///
@@ -771,7 +675,7 @@ pub type UdQpDenseWqeTable<Entry, OnComplete> = UdQp<Entry, DenseWqeTable<Entry>
 /// specifying the destination via an Address Handle.
 ///
 /// Type parameter `Entry` is the entry type stored in both SQ and RQ WQE tables.
-/// Type parameter `TableType` determines sparse vs dense table behavior.
+/// Type parameter `TableType` determines WQE table behavior.
 /// Type parameter `OnComplete` is the completion callback type.
 pub struct UdQp<Entry, TableType, OnComplete> {
     qp: NonNull<mlx5_sys::ibv_qp>,
@@ -789,53 +693,25 @@ pub struct UdQp<Entry, TableType, OnComplete> {
 }
 
 impl Context {
-    /// Create a UD QP with sparse WQE table.
+    /// Create a UD QP.
     ///
-    /// Only signaled WQEs have entries stored.
+    /// Only signaled WQEs have entries stored in the WQE table.
     ///
     /// # Note
     /// The send_cq must have `init_direct_access()` called before this function.
-    pub fn create_ud_qp_sparse<Entry, OnComplete>(
+    pub fn create_ud_qp<Entry, OnComplete>(
         &self,
         pd: &Pd,
         send_cq: &Rc<CompletionQueue>,
         recv_cq: &Rc<CompletionQueue>,
         config: &UdQpConfig,
         callback: OnComplete,
-    ) -> io::Result<Rc<RefCell<UdQpSparseWqeTable<Entry, OnComplete>>>>
+    ) -> io::Result<Rc<RefCell<UdQpWithTable<Entry, OnComplete>>>>
     where
         Entry: 'static,
         OnComplete: Fn(Cqe, Entry) + 'static,
     {
         let qp = self.create_ud_qp_raw(pd, send_cq, recv_cq, config, callback)?;
-        let qp_rc = Rc::new(RefCell::new(qp));
-        let qpn = qp_rc.borrow().qpn();
-
-        send_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-        recv_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-
-        Ok(qp_rc)
-    }
-
-    /// Create a UD QP with dense WQE table.
-    ///
-    /// Every WQE must have an entry stored.
-    ///
-    /// # Note
-    /// The send_cq must have `init_direct_access()` called before this function.
-    pub fn create_ud_qp_dense<Entry, OnComplete>(
-        &self,
-        pd: &Pd,
-        send_cq: &Rc<CompletionQueue>,
-        recv_cq: &Rc<CompletionQueue>,
-        config: &UdQpConfig,
-        callback: OnComplete,
-    ) -> io::Result<Rc<RefCell<UdQpDenseWqeTable<Entry, OnComplete>>>>
-    where
-        Entry: 'static,
-        OnComplete: Fn(Option<Cqe>, Entry) + 'static,
-    {
-        let qp = self.create_ud_qp_dense_raw(pd, send_cq, recv_cq, config, callback)?;
         let qp_rc = Rc::new(RefCell::new(qp));
         let qpn = qp_rc.borrow().qpn();
 
@@ -852,7 +728,7 @@ impl Context {
         recv_cq: &Rc<CompletionQueue>,
         config: &UdQpConfig,
         callback: OnComplete,
-    ) -> io::Result<UdQpSparseWqeTable<Entry, OnComplete>>
+    ) -> io::Result<UdQpWithTable<Entry, OnComplete>>
     where
         OnComplete: Fn(Cqe, Entry),
     {
@@ -887,55 +763,7 @@ impl Context {
             };
 
             // Auto-initialize direct access
-            UdQpSparseWqeTable::<Entry, OnComplete>::init_direct_access_internal(&mut result)?;
-
-            Ok(result)
-        }
-    }
-
-    fn create_ud_qp_dense_raw<Entry, OnComplete>(
-        &self,
-        pd: &Pd,
-        send_cq: &Rc<CompletionQueue>,
-        recv_cq: &Rc<CompletionQueue>,
-        config: &UdQpConfig,
-        callback: OnComplete,
-    ) -> io::Result<UdQpDenseWqeTable<Entry, OnComplete>>
-    where
-        OnComplete: Fn(Option<Cqe>, Entry),
-    {
-        unsafe {
-            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
-            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_UD;
-            qp_attr.send_cq = send_cq.as_ptr();
-            qp_attr.recv_cq = recv_cq.as_ptr();
-            qp_attr.cap.max_send_wr = config.max_send_wr;
-            qp_attr.cap.max_recv_wr = config.max_recv_wr;
-            qp_attr.cap.max_send_sge = config.max_send_sge;
-            qp_attr.cap.max_recv_sge = config.max_recv_sge;
-            qp_attr.cap.max_inline_data = config.max_inline_data;
-            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
-            qp_attr.pd = pd.as_ptr();
-
-            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
-
-            let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
-            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
-
-            let mut result = UdQp {
-                qp,
-                state: Cell::new(UdQpState::Reset),
-                qkey: config.qkey,
-                sq: None,
-                rq: None,
-                callback,
-                send_cq: Rc::downgrade(send_cq),
-                recv_cq: Rc::downgrade(recv_cq),
-                _pd: pd.clone(),
-            };
-
-            // Auto-initialize direct access
-            UdQpDenseWqeTable::<Entry, OnComplete>::init_direct_access_internal(&mut result)?;
+            UdQpWithTable::<Entry, OnComplete>::init_direct_access_internal(&mut result)?;
 
             Ok(result)
         }
@@ -1171,7 +999,7 @@ impl<Entry, TableType, OnComplete> UdQp<Entry, TableType, OnComplete> {
     }
 }
 
-impl<Entry, OnComplete> UdQpSparseWqeTable<Entry, OnComplete> {
+impl<Entry, OnComplete> UdQpWithTable<Entry, OnComplete> {
     /// Initialize direct queue access (internal implementation).
     fn init_direct_access_internal(&mut self) -> io::Result<()> {
         if self.sq.is_some() {
@@ -1192,7 +1020,7 @@ impl<Entry, OnComplete> UdQpSparseWqeTable<Entry, OnComplete> {
             bf_reg: info.bf_reg,
             bf_size: info.bf_size,
             bf_offset: Cell::new(0),
-            table: SparseWqeTable::new(wqe_cnt),
+            table: OrderedWqeTable::new(wqe_cnt),
             _marker: PhantomData,
         });
 
@@ -1230,7 +1058,7 @@ impl<Entry, OnComplete> UdQpSparseWqeTable<Entry, OnComplete> {
     }
 
     /// Get a WQE builder for signaled operations.
-    pub fn wqe_builder(&self, entry: Entry) -> io::Result<SparseUdWqeBuilder<'_, Entry>> {
+    pub fn wqe_builder(&self, entry: Entry) -> io::Result<UdQpWqeBuilder<'_, Entry>> {
         let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -1239,7 +1067,7 @@ impl<Entry, OnComplete> UdQpSparseWqeTable<Entry, OnComplete> {
         let wqe_idx = sq.pi.get();
         let wqe_ptr = sq.get_wqe_ptr(wqe_idx);
 
-        Ok(SparseUdWqeBuilder {
+        Ok(UdQpWqeBuilder {
             inner: UdWqeBuilder {
                 sq,
                 wqe_ptr,
@@ -1253,7 +1081,7 @@ impl<Entry, OnComplete> UdQpSparseWqeTable<Entry, OnComplete> {
     }
 
     /// Get a WQE builder for unsignaled operations.
-    pub fn wqe_builder_unsignaled(&self) -> io::Result<SparseUdWqeBuilder<'_, Entry>> {
+    pub fn wqe_builder_unsignaled(&self) -> io::Result<UdQpWqeBuilder<'_, Entry>> {
         let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -1262,7 +1090,7 @@ impl<Entry, OnComplete> UdQpSparseWqeTable<Entry, OnComplete> {
         let wqe_idx = sq.pi.get();
         let wqe_ptr = sq.get_wqe_ptr(wqe_idx);
 
-        Ok(SparseUdWqeBuilder {
+        Ok(UdQpWqeBuilder {
             inner: UdWqeBuilder {
                 sq,
                 wqe_ptr,
@@ -1276,93 +1104,11 @@ impl<Entry, OnComplete> UdQpSparseWqeTable<Entry, OnComplete> {
     }
 }
 
-impl<Entry, OnComplete> UdQpDenseWqeTable<Entry, OnComplete> {
-    /// Initialize direct queue access (internal implementation).
-    fn init_direct_access_internal(&mut self) -> io::Result<()> {
-        if self.sq.is_some() {
-            return Ok(()); // Already initialized
-        }
-
-        let info = self.query_info()?;
-        let wqe_cnt = info.sq_wqe_cnt as u16;
-
-        self.sq = Some(UdSendQueueState {
-            buf: info.sq_buf,
-            wqe_cnt,
-            sqn: info.sqn,
-            pi: Cell::new(0),
-            ci: Cell::new(0),
-            last_wqe: Cell::new(None),
-            dbrec: info.dbrec,
-            bf_reg: info.bf_reg,
-            bf_size: info.bf_size,
-            bf_offset: Cell::new(0),
-            table: DenseWqeTable::new(wqe_cnt),
-            _marker: PhantomData,
-        });
-
-        let rq_wqe_cnt = info.rq_wqe_cnt as u16;
-        self.rq = Some(UdRecvQueueState {
-            buf: info.rq_buf,
-            wqe_cnt: rq_wqe_cnt,
-            stride: info.rq_stride,
-            pi: Cell::new(0),
-            ci: Cell::new(0),
-            dbrec: info.dbrec,
-            table: (0..rq_wqe_cnt).map(|_| Cell::new(None)).collect(),
-        });
-
-        Ok(())
-    }
-
-    /// Initialize direct queue access.
-    ///
-    /// # Deprecated
-    /// Direct access is now auto-initialized at QP creation.
-    /// This method is kept for backwards compatibility and is a no-op if already initialized.
-    #[deprecated(note = "Direct access is now auto-initialized at creation")]
-    pub fn init_direct_access(&mut self) -> io::Result<()> {
-        self.init_direct_access_internal()
-    }
-
-    /// Activate UD QP (transition to RTS).
-    /// Direct queue access is auto-initialized at creation time.
-    pub fn activate(&mut self, port: u8, sq_psn: u32) -> io::Result<()> {
-        self.modify_to_init(port, 0)?;
-        self.modify_to_rtr()?;
-        self.modify_to_rts(sq_psn)?;
-        Ok(())
-    }
-
-    /// Get a WQE builder.
-    pub fn wqe_builder(&self, entry: Entry, signaled: bool) -> io::Result<DenseUdWqeBuilder<'_, Entry>> {
-        let sq = self.sq()?;
-        if sq.available() == 0 {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
-        }
-
-        let wqe_idx = sq.pi.get();
-        let wqe_ptr = sq.get_wqe_ptr(wqe_idx);
-
-        Ok(DenseUdWqeBuilder {
-            inner: UdWqeBuilder {
-                sq,
-                wqe_ptr,
-                wqe_idx,
-                offset: 0,
-                ds_count: 0,
-                signaled,
-            },
-            entry,
-        })
-    }
-}
-
 // =============================================================================
 // CompletionTarget Implementation
 // =============================================================================
 
-impl<Entry, OnComplete> CompletionTarget for UdQpSparseWqeTable<Entry, OnComplete>
+impl<Entry, OnComplete> CompletionTarget for UdQpWithTable<Entry, OnComplete>
 where
     OnComplete: Fn(Cqe, Entry),
 {
@@ -1381,42 +1127,9 @@ where
         } else {
             // SQ completion (requester)
             if let Some(sq) = self.sq.as_ref() {
-                if let Some(entry) = sq.process_completion_sparse(cqe.wqe_counter) {
+                if let Some(entry) = sq.process_completion(cqe.wqe_counter) {
                     (self.callback)(cqe, entry);
                 }
-            }
-        }
-    }
-}
-
-impl<Entry, OnComplete> CompletionTarget for UdQpDenseWqeTable<Entry, OnComplete>
-where
-    OnComplete: Fn(Option<Cqe>, Entry),
-{
-    fn qpn(&self) -> u32 {
-        UdQp::qpn(self)
-    }
-
-    fn dispatch_cqe(&self, cqe: Cqe) {
-        if cqe.opcode.is_responder() {
-            // RQ completion (responder) - all RQ WQEs are signaled
-            if let Some(rq) = self.rq.as_ref() {
-                if let Some(entry) = rq.process_completion(cqe.wqe_counter) {
-                    (self.callback)(Some(cqe), entry);
-                }
-            }
-        } else {
-            // SQ completion (requester)
-            if let Some(sq) = self.sq.as_ref() {
-                let signaled_idx = cqe.wqe_counter;
-                sq.process_completions_dense(signaled_idx, |idx, entry| {
-                    let cqe_opt = if idx == signaled_idx {
-                        Some(cqe)
-                    } else {
-                        None
-                    };
-                    (self.callback)(cqe_opt, entry);
-                });
             }
         }
     }
@@ -1438,7 +1151,7 @@ mod tests {
         sqn: u32,
         pi: Cell<u16>,
         ci: Cell<u16>,
-        table: SparseWqeTable<u32>,
+        table: OrderedWqeTable<u32>,
     }
 
     impl MockUdSendQueue {
@@ -1450,7 +1163,7 @@ mod tests {
                 sqn: 789,
                 pi: Cell::new(0),
                 ci: Cell::new(0),
-                table: SparseWqeTable::new(wqe_cnt),
+                table: OrderedWqeTable::new(wqe_cnt),
             }
         }
 
@@ -1612,7 +1325,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_ud_sparse_table_store_take() {
+    fn test_ud_ordered_table_store_take() {
         let sq = MockUdSendQueue::new(8);
         let table = &sq.table;
 
@@ -1623,7 +1336,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ud_sparse_table_wrap_around() {
+    fn test_ud_ordered_table_wrap_around() {
         let sq = MockUdSendQueue::new(4);
         let table = &sq.table;
 
