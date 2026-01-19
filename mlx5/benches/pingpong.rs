@@ -19,11 +19,11 @@ use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
-use mlx5::cq::{CompletionQueue, Cqe, CqeOpcode};
+use mlx5::cq::{Cqe, CqeOpcode};
 use mlx5::device::{Context, DeviceList};
 use mlx5::mono_cq::MonoCqRc;
 use mlx5::pd::{AccessFlags, MemoryRegion, Pd};
-use mlx5::qp::{RcQp, RcQpConfig, RcQpForMonoCq, RemoteQpInfo};
+use mlx5::qp::{RcQpConfig, RcQpForMonoCq, RemoteQpInfo};
 use mlx5::wqe::{WqeFlags, WqeOpcode};
 
 // =============================================================================
@@ -144,15 +144,6 @@ impl SharedCqeState {
     }
 }
 
-/// Callback that collects responder CQEs into shared state.
-fn make_callback(state: SharedCqeState) -> impl Fn(Cqe, u64) {
-    move |cqe: Cqe, _entry: u64| {
-        if cqe.opcode.is_responder() && cqe.syndrome == 0 {
-            state.push(&cqe);
-        }
-    }
-}
-
 struct ServerHandle {
     stop_flag: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -221,53 +212,6 @@ fn open_mlx5_device() -> Option<Context> {
     }
     None
 }
-
-type ServerCallback = Box<dyn Fn(Cqe, u64)>;
-type ServerQp = RcQp<u64, ServerCallback>;
-
-/// Create endpoint for server thread (uses dynamic dispatch CQ).
-fn create_server_endpoint(
-    ctx: &Context,
-    pd: &Rc<Pd>,
-) -> Option<(
-    Rc<RefCell<ServerQp>>,
-    Rc<CompletionQueue>,
-    Rc<CompletionQueue>,
-    SharedCqeState,
-    AlignedBuffer,
-    AlignedBuffer,
-    MemoryRegion,
-    MemoryRegion,
-)> {
-    let send_cq = Rc::new(ctx.create_cq(QUEUE_DEPTH as i32).ok()?);
-    let recv_cq = Rc::new(ctx.create_cq(QUEUE_DEPTH as i32).ok()?);
-
-    let config = RcQpConfig {
-        max_send_wr: QUEUE_DEPTH as u32,
-        max_recv_wr: QUEUE_DEPTH as u32,
-        max_send_sge: 1,
-        max_recv_sge: 1,
-        max_inline_data: 256,
-    };
-
-    let shared_state = SharedCqeState::new();
-    let callback: ServerCallback = Box::new(make_callback(shared_state.clone()));
-
-    let qp = ctx
-        .create_rc_qp(pd, &send_cq, &recv_cq, &config, callback)
-        .ok()?;
-
-    let send_buf = AlignedBuffer::new(BUFFER_SIZE);
-    let recv_buf = AlignedBuffer::new(BUFFER_SIZE);
-
-    let send_mr =
-        unsafe { pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }.ok()?;
-    let recv_mr =
-        unsafe { pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }.ok()?;
-
-    Some((qp, send_cq, recv_cq, shared_state, send_buf, recv_buf, send_mr, recv_mr))
-}
-
 
 
 fn setup_mono_cq_benchmark() -> Option<
@@ -411,8 +355,42 @@ fn setup_mono_cq_benchmark() -> Option<
 }
 
 // =============================================================================
-// Server Thread
+// Server Thread (using MonoCq for inlined callback dispatch)
 // =============================================================================
+
+/// Server-side shared state (non-Rc version for thread safety).
+struct ServerSharedState {
+    rx_count: Cell<usize>,
+    rx_indices: RefCell<[usize; QUEUE_DEPTH]>,
+    rx_sizes: RefCell<[u32; QUEUE_DEPTH]>,
+    rx_is_write_imm: RefCell<[bool; QUEUE_DEPTH]>,
+}
+
+impl ServerSharedState {
+    fn new() -> Self {
+        Self {
+            rx_count: Cell::new(0),
+            rx_indices: RefCell::new([0; QUEUE_DEPTH]),
+            rx_sizes: RefCell::new([0; QUEUE_DEPTH]),
+            rx_is_write_imm: RefCell::new([false; QUEUE_DEPTH]),
+        }
+    }
+
+    fn reset(&self) {
+        self.rx_count.set(0);
+    }
+
+    fn push(&self, cqe: &Cqe) {
+        let count = self.rx_count.get();
+        if count < QUEUE_DEPTH {
+            let idx = (cqe.imm as usize) % QUEUE_DEPTH;
+            self.rx_indices.borrow_mut()[count] = idx;
+            self.rx_sizes.borrow_mut()[count] = cqe.byte_cnt.min(256);
+            self.rx_is_write_imm.borrow_mut()[count] = matches!(cqe.opcode, CqeOpcode::RespRdmaWriteImm);
+            self.rx_count.set(count + 1);
+        }
+    }
+}
 
 fn server_thread_main(
     info_tx: Sender<ConnectionInfo>,
@@ -446,15 +424,77 @@ fn server_thread_main(
         }
     });
 
-    // Create server endpoint (uses dynamic dispatch CQ - server performance not critical)
-    let (qp, send_cq, recv_cq, shared_state, send_buf, recv_buf, send_mr, recv_mr) =
-        match create_server_endpoint(&ctx, &pd) {
-            Some(e) => e,
-            None => {
-                eprintln!("Server: Failed to create endpoint");
-                return;
-            }
-        };
+    // Create server endpoint using MonoCq (inlined callback dispatch)
+    let shared_state = Rc::new(ServerSharedState::new());
+    let shared_state_for_recv = shared_state.clone();
+
+    // Create MonoCq callbacks (no Box<dyn Fn> - enables inlining)
+    let send_callback = move |_cqe: Cqe, _entry: u64| {
+        // SQ completions - no-op for server
+    };
+
+    let recv_callback = move |cqe: Cqe, _entry: u64| {
+        if cqe.opcode.is_responder() && cqe.syndrome == 0 {
+            shared_state_for_recv.push(&cqe);
+        }
+    };
+
+    // Create MonoCqs
+    let send_cq = match ctx.create_mono_cq(QUEUE_DEPTH as i32, send_callback) {
+        Ok(cq) => cq,
+        Err(_) => {
+            eprintln!("Server: Failed to create send CQ");
+            return;
+        }
+    };
+
+    let recv_cq = match ctx.create_mono_cq(QUEUE_DEPTH as i32, recv_callback) {
+        Ok(cq) => cq,
+        Err(_) => {
+            eprintln!("Server: Failed to create recv CQ");
+            return;
+        }
+    };
+
+    let config = RcQpConfig {
+        max_send_wr: QUEUE_DEPTH as u32,
+        max_recv_wr: QUEUE_DEPTH as u32,
+        max_send_sge: 1,
+        max_recv_sge: 1,
+        max_inline_data: 256,
+    };
+
+    // Create QP for MonoCq
+    let qp = match ctx.create_rc_qp_for_mono_cq::<u64, _, _, _>(&pd, &send_cq, &recv_cq, &config) {
+        Ok(q) => q,
+        Err(_) => {
+            eprintln!("Server: Failed to create QP");
+            return;
+        }
+    };
+
+    // Register QP with MonoCqs
+    send_cq.register(&qp);
+    recv_cq.register(&qp);
+
+    let send_buf = AlignedBuffer::new(BUFFER_SIZE);
+    let recv_buf = AlignedBuffer::new(BUFFER_SIZE);
+
+    let send_mr = match unsafe { pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) } {
+        Ok(mr) => mr,
+        Err(_) => {
+            eprintln!("Server: Failed to register send MR");
+            return;
+        }
+    };
+
+    let recv_mr = match unsafe { pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) } {
+        Ok(mr) => mr,
+        Err(_) => {
+            eprintln!("Server: Failed to register recv MR");
+            return;
+        }
+    };
 
     // Send server info to client
     let server_info = ConnectionInfo {
@@ -561,7 +601,7 @@ fn server_thread_main(
 
                 if rx_is_write_imm[i] {
                     // Echo with WRITE+IMM
-                    qp_ref
+                    let _ = qp_ref
                         .wqe_builder(idx as u64)
                         .unwrap()
                         .ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), idx as u32)
@@ -570,7 +610,7 @@ fn server_thread_main(
                         .finish();
                 } else {
                     // Echo with SEND
-                    qp_ref
+                    let _ = qp_ref
                         .wqe_builder(idx as u64)
                         .unwrap()
                         .ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)

@@ -35,7 +35,7 @@ use std::ptr::NonNull;
 use std::rc::{Rc, Weak};
 use std::{io, mem::MaybeUninit};
 
-use crate::cq::Cqe;
+use crate::cq::{Cqe, CqeOpcode, MiniCqeIterator};
 use crate::device::Context;
 
 // =============================================================================
@@ -79,6 +79,10 @@ struct MonoCqState {
     dbrec: *mut u32,
     /// Consumer index
     ci: Cell<u32>,
+    /// Pending mini CQE iterator for compressed CQE expansion.
+    pending_mini_cqes: UnsafeCell<Option<MiniCqeIterator>>,
+    /// Title CQE opcode for compressed CQE expansion.
+    title_opcode: Cell<CqeOpcode>,
 }
 
 // =============================================================================
@@ -211,6 +215,8 @@ impl Context {
                     cqe_size: dv_cq.cqe_size,
                     dbrec: dv_cq.dbrec as *mut u32,
                     ci: Cell::new(0),
+                    pending_mini_cqes: UnsafeCell::new(None),
+                    title_opcode: Cell::new(CqeOpcode::Req),
                 },
                 callback,
                 queues: RefCell::new(HashMap::with_hasher(BuildHasherDefault::default())),
@@ -324,9 +330,27 @@ where
     }
 
     /// Try to get the next CQE.
+    ///
+    /// This method handles both regular CQEs and compressed CQEs. When a compressed
+    /// CQE is encountered, it expands the mini CQE array and returns each mini CQE
+    /// as a full Cqe on subsequent calls.
     #[inline]
     fn try_next_cqe(&self, prefetch_next: bool) -> Option<Cqe> {
         let state = &self.state;
+
+        // First, check if we have pending mini CQEs from a compressed CQE
+        // Safety: Single-threaded access guaranteed by Rc (not Send).
+        let pending = unsafe { &mut *state.pending_mini_cqes.get() };
+        if let Some(iter) = pending {
+            if let Some(cqe) = iter.next() {
+                // If no more mini CQEs, clear the pending state
+                if !iter.has_more() {
+                    *pending = None;
+                }
+                return Some(cqe);
+            }
+            *pending = None;
+        }
 
         let ci = state.ci.get();
         let cqe_mask = state.cqe_cnt - 1;
@@ -339,12 +363,42 @@ where
         let sw_owner = ((ci >> state.cqe_cnt_log2) & 1) as u8;
         let hw_owner = op_own & 1;
 
-        // Check owner bit and invalid opcode
-        if sw_owner != hw_owner || (op_own >> 4) == 0x0f {
+        // Check owner bit first
+        if sw_owner != hw_owner {
             return None;
         }
 
-        // Prefetch next CQE slot if requested
+        let opcode_raw = op_own >> 4;
+
+        // Check for compressed CQE (opcode 0x0f is the compression marker)
+        if opcode_raw == 0x0f {
+            // After validating ownership, we need a load barrier
+            udma_from_device_barrier!();
+
+            // Create mini CQE iterator using the title opcode from previous CQE
+            let title_opcode = state.title_opcode.get();
+            let mut iter = unsafe { MiniCqeIterator::new(cqe_ptr, title_opcode) };
+
+            state.ci.set(ci.wrapping_add(1));
+
+            // Get the first mini CQE
+            if let Some(cqe) = iter.next() {
+                // Store remaining mini CQEs for subsequent calls
+                if iter.has_more() {
+                    *pending = Some(iter);
+                }
+                return Some(cqe);
+            }
+            // Empty compressed CQE (shouldn't happen, but handle gracefully)
+            return None;
+        }
+
+        // Check for invalid/reserved opcode
+        if CqeOpcode::from_u8(opcode_raw).is_none() {
+            return None;
+        }
+
+        // Prefetch next CQE slot if requested (for batch processing).
         if prefetch_next {
             let next_idx = (idx + 1) & cqe_mask;
             let next_cqe_ptr = unsafe { state.buf.add((next_idx as usize) * cqe_size) };
@@ -355,6 +409,10 @@ where
         udma_from_device_barrier!();
 
         let cqe = unsafe { Cqe::from_ptr(cqe_ptr) };
+
+        // Save the opcode as title opcode for potential compressed CQE following
+        state.title_opcode.set(cqe.opcode);
+
         state.ci.set(ci.wrapping_add(1));
 
         Some(cqe)

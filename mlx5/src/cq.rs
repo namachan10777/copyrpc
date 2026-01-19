@@ -244,7 +244,7 @@ impl MiniCqeIterator {
 }
 
 impl CqeOpcode {
-    fn from_u8(v: u8) -> Option<Self> {
+    pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             0x00 => Some(Self::Req),
             0x01 => Some(Self::RespRdmaWriteImm),
