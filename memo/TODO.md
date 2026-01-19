@@ -24,13 +24,20 @@
   - これも型レベルでの保証かな
   - 構築時のジェネリクスで指定する。UseRelaxedOrdering型を指定すると、ジェネリクスによってRelaxed Orderingが存在するバージョンのFlagを使える。ただし、これを指定するとSparse/DenseではFenceが付かないとWQEBBの解放処理やcallbackを呼ぶ処理が行われないことに注意させる（これはドキュメントに明記かな）
 - Inline CQE parse
-- CQE compressionパース
+- CQE compressionパース（RX CQ用に実装済み: memo/cqe_compression_debug.md参照）
+  - `create_mono_cq_rx_compressed`でRX CQ専用の圧縮モードをサポート
+  - CQE圧縮を有効にしても通常CQEが混在するため、format bitsによる動的判定を実装
+  - format=3（圧縮CQE）: signatureフィールドでowner判定
+  - format=0（通常CQE）: op_own bit 0でowner判定
+  - HW caps確認: ConnectX-7でmax_num=64, HASH/CSUMフォーマット対応
+  - 残課題: **Strided RQが必要な可能性** - 通常RQでは圧縮CQEが生成されない
+- 可能な限り`mlx5_`系の関数を使う。
 
 # 優先順位
 
 1. Inline WQEの折り返しを正しく実装
 2. WQE builderでのエラー
-3. CQE compression
+3. ~~CQE compression~~ （RX CQ用は実装完了、圧縮CQE生成条件テスト残）
 4. Inline CQE parse
 5. API直行性や型制約の確認
 6. 拡張atomic

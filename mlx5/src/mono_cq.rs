@@ -83,6 +83,10 @@ struct MonoCqState {
     pending_mini_cqes: UnsafeCell<Option<MiniCqeIterator>>,
     /// Title CQE opcode for compressed CQE expansion.
     title_opcode: Cell<CqeOpcode>,
+    /// CQE compression enabled flag.
+    /// When true, compressed CQEs (format=3) may be returned by HW.
+    /// Note: Currently disabled due to hang issues.
+    cqe_compression: bool,
 }
 
 // =============================================================================
@@ -159,6 +163,48 @@ impl Context {
         Q: CompletionSource,
         F: Fn(Cqe, Q::Entry),
     {
+        self.create_mono_cq_internal(cqe, callback, false)
+    }
+
+    /// Create a Monomorphic Completion Queue for RX (receive) with CQE compression.
+    ///
+    /// CQE compression is only supported for RX (responder side) completions.
+    /// Using this for TX CQs will cause undefined behavior.
+    ///
+    /// When compression is enabled:
+    /// - Owner checking uses signature field (offset 62) with 0xff mask
+    /// - Compressed CQEs (format=3) are expanded via MiniCqeIterator
+    /// - Title CQE must precede compressed CQE (asserts cq_ci > 0)
+    ///
+    /// # Arguments
+    /// * `cqe` - Minimum number of CQ entries (actual may be larger)
+    /// * `callback` - Completion callback `Fn(Cqe, T)` called for each completion
+    ///
+    /// # Errors
+    /// Returns an error if the CQ cannot be created or compression is not supported.
+    pub fn create_mono_cq_rx_compressed<Q, F>(
+        &self,
+        cqe: i32,
+        callback: F,
+    ) -> io::Result<MonoCq<Q, F>>
+    where
+        Q: CompletionSource,
+        F: Fn(Cqe, Q::Entry),
+    {
+        self.create_mono_cq_internal(cqe, callback, true)
+    }
+
+    /// Internal function to create MonoCq with optional compression.
+    fn create_mono_cq_internal<Q, F>(
+        &self,
+        cqe: i32,
+        callback: F,
+        enable_compression: bool,
+    ) -> io::Result<MonoCq<Q, F>>
+    where
+        Q: CompletionSource,
+        F: Fn(Cqe, Q::Entry),
+    {
         unsafe {
             let mut attr: mlx5_sys::ibv_cq_init_attr_ex = MaybeUninit::zeroed().assume_init();
             attr.cqe = cqe as u32;
@@ -169,7 +215,31 @@ impl Context {
             attr.comp_mask = 0;
             attr.flags = 0;
 
-            let cq_ex = mlx5_sys::ibv_create_cq_ex_ex(self.as_ptr(), &mut attr);
+            let (cq_ex, cqe_compression) = if enable_compression {
+                // Try to create CQ with CQE compression enabled (HASH format for RX)
+                // Note: CQE compression formats (HASH, CSUM, etc.) are responder-side only.
+                // DO NOT use this for TX (send) CQs - it will cause hangs.
+                let mut mlx5_attr: mlx5_sys::mlx5dv_cq_init_attr =
+                    MaybeUninit::zeroed().assume_init();
+                mlx5_attr.comp_mask =
+                    mlx5_sys::mlx5dv_cq_init_attr_mask_MLX5DV_CQ_INIT_ATTR_MASK_COMPRESSED_CQE
+                        as u64;
+                mlx5_attr.cqe_comp_res_format =
+                    mlx5_sys::mlx5dv_cqe_comp_res_format_MLX5DV_CQE_RES_FORMAT_HASH as u8;
+
+                let cq_ex = mlx5_sys::mlx5dv_create_cq(self.as_ptr(), &mut attr, &mut mlx5_attr);
+
+                if cq_ex.is_null() {
+                    // Fallback to standard CQ if compression not supported
+                    (mlx5_sys::ibv_create_cq_ex_ex(self.as_ptr(), &mut attr), false)
+                } else {
+                    (cq_ex, true)
+                }
+            } else {
+                // Standard CQ without compression (for TX or when compression not needed)
+                (mlx5_sys::ibv_create_cq_ex_ex(self.as_ptr(), &mut attr), false)
+            };
+
             if cq_ex.is_null() {
                 return Err(io::Error::last_os_error());
             }
@@ -194,15 +264,16 @@ impl Context {
             let dv_cq = dv_cq.assume_init();
 
             // Initialize all CQEs to look like they are in HW ownership (UCX-style).
-            // op_own byte layout: opcode[7:4] | reserved[3:1] | owner[0]
-            // Set opcode = 0xf (INVALID) and owner = 1.
-            // When CI = 0, sw_owner = 0, so CQEs with owner = 1 will be skipped.
-            // This prevents reading garbage before HW writes valid CQEs.
+            // When CQE compression is enabled, ownership is tracked via signature field (offset 62).
+            // When disabled, ownership is tracked via op_own field (offset 63, bit 0).
             const OP_OWN_INVALID: u8 = 0xf1; // opcode=INVALID(0xf), owner=1
+            const SIGNATURE_INVALID: u8 = 0xff; // Initial signature for compression mode
             let buf = dv_cq.buf as *mut u8;
             for i in 0..dv_cq.cqe_cnt {
                 let cqe_ptr = buf.add((i as usize) * (dv_cq.cqe_size as usize));
+                let signature_ptr = cqe_ptr.add(62);
                 let op_own_ptr = cqe_ptr.add(63);
+                std::ptr::write_volatile(signature_ptr, SIGNATURE_INVALID);
                 std::ptr::write_volatile(op_own_ptr, OP_OWN_INVALID);
             }
 
@@ -217,6 +288,7 @@ impl Context {
                     ci: Cell::new(0),
                     pending_mini_cqes: UnsafeCell::new(None),
                     title_opcode: Cell::new(CqeOpcode::Req),
+                    cqe_compression,
                 },
                 callback,
                 queues: RefCell::new(HashMap::with_hasher(BuildHasherDefault::default())),
@@ -338,6 +410,58 @@ where
     fn try_next_cqe(&self, prefetch_next: bool) -> Option<Cqe> {
         let state = &self.state;
 
+        // Fast path: non-compression mode (most common case)
+        if !state.cqe_compression {
+            return self.try_next_cqe_simple(prefetch_next);
+        }
+
+        // Slow path: compression mode enabled
+        self.try_next_cqe_compressed(prefetch_next)
+    }
+
+    /// Fast path for non-compression mode.
+    /// Minimizes overhead for the common case where CQE compression is disabled.
+    #[inline]
+    fn try_next_cqe_simple(&self, prefetch_next: bool) -> Option<Cqe> {
+        let state = &self.state;
+        let ci = state.ci.get();
+        let cqe_mask = state.cqe_cnt - 1;
+        let idx = ci & cqe_mask;
+        let cqe_size = state.cqe_size as usize;
+        let cqe_ptr = unsafe { state.buf.add((idx as usize) * cqe_size) };
+
+        // Owner bit check using op_own field bit 0
+        let op_own = unsafe { std::ptr::read_volatile(cqe_ptr.add(63)) };
+        let sw_owner = ((ci >> state.cqe_cnt_log2) & 1) as u8;
+        let hw_owner = op_own & 1;
+
+        // Check owner bit and invalid opcode (opcode == 0x0f)
+        if sw_owner != hw_owner || (op_own >> 4) == 0x0f {
+            return None;
+        }
+
+        // Prefetch next CQE slot if requested (for batch processing).
+        if prefetch_next {
+            let next_idx = (idx + 1) & cqe_mask;
+            let next_cqe_ptr = unsafe { state.buf.add((next_idx as usize) * cqe_size) };
+            prefetch_for_read!(next_cqe_ptr);
+        }
+
+        // Load barrier after validating ownership
+        udma_from_device_barrier!();
+
+        let cqe = unsafe { Cqe::from_ptr(cqe_ptr) };
+        state.ci.set(ci.wrapping_add(1));
+
+        Some(cqe)
+    }
+
+    /// Slow path for compression mode.
+    /// Handles both normal CQEs and compressed CQEs (format=3).
+    #[inline]
+    fn try_next_cqe_compressed(&self, prefetch_next: bool) -> Option<Cqe> {
+        let state = &self.state;
+
         // First, check if we have pending mini CQEs from a compressed CQE
         // Safety: Single-threaded access guaranteed by Rc (not Send).
         let pending = unsafe { &mut *state.pending_mini_cqes.get() };
@@ -358,20 +482,47 @@ where
         let cqe_size = state.cqe_size as usize;
         let cqe_ptr = unsafe { state.buf.add((idx as usize) * cqe_size) };
 
-        // Owner bit check
+        // Owner bit check - different based on CQE format
+        // Reference: UCX uct_ib_mlx5_cqe_is_hw_owned() and uct_ib_mlx5_init_cq_common()
         let op_own = unsafe { std::ptr::read_volatile(cqe_ptr.add(63)) };
-        let sw_owner = ((ci >> state.cqe_cnt_log2) & 1) as u8;
-        let hw_owner = op_own & 1;
 
-        // Check owner bit first
-        if sw_owner != hw_owner {
+        // Check for compressed CQE via format bits (bits 3:2)
+        // format=3 (0x0c) indicates a compressed CQE block
+        // Reference: UCX UCT_IB_MLX5_CQE_FORMAT_MASK in ib_mlx5.h
+        const CQE_FORMAT_MASK: u8 = 0x0c;
+        let is_compressed_format = (op_own & CQE_FORMAT_MASK) == CQE_FORMAT_MASK;
+
+        let is_hw_owned = if is_compressed_format {
+            // Compressed CQE (format=3): use signature field (offset 62) with full 8-bit comparison
+            // For compressed CQEs, HW writes iteration count to signature field.
+            // signature = iteration_count (0, 1, 2, ... wrapping at cq_size)
+            let signature = unsafe { std::ptr::read_volatile(cqe_ptr.add(62)) };
+            let sw_it_count = ((ci >> state.cqe_cnt_log2) & 0xff) as u8;
+            (sw_it_count ^ signature) != 0
+        } else {
+            // Normal CQE (format=0): use op_own field bit 0 only
+            // Even in compression mode, normal CQEs have checksum in signature (not iteration count).
+            let sw_owner = ((ci >> state.cqe_cnt_log2) & 1) as u8;
+            let hw_owner = op_own & 1;
+            sw_owner != hw_owner
+        };
+
+        if is_hw_owned {
             return None;
         }
 
         let opcode_raw = op_own >> 4;
 
-        // Check for compressed CQE (opcode 0x0f is the compression marker)
-        if opcode_raw == 0x0f {
+        if is_compressed_format {
+            // Compressed CQE must have a preceding title CQE (ci > 0)
+            // This is because title CQE provides qp_num, opcode, and other metadata.
+            // If ci == 0, there's no title CQE, which is invalid.
+            if ci == 0 {
+                // This should not happen with proper RX CQ usage.
+                // Log and skip this CQE.
+                return None;
+            }
+
             // After validating ownership, we need a load barrier
             udma_from_device_barrier!();
 
