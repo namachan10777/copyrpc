@@ -194,8 +194,9 @@ impl<Entry> UdSendQueueState<Entry, DenseWqeTable<Entry>> {
         // without causing a RefCell borrow conflict.
         for (idx, entry) in self.table.take_range(self.ci.get(), new_ci) {
             callback(idx, entry.data);
-            // For dense tables, ci_delta is the number of WQEBBs for this WQE
-            self.ci.set(self.ci.get().wrapping_add(entry.ci_delta));
+            // For dense tables, ci_delta is accumulated PI value at completion.
+            // This handles NOP gaps correctly (NOPs have no entries but PI is advanced).
+            self.ci.set(entry.ci_delta);
         }
     }
 }
@@ -459,18 +460,66 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
     /// Finish the WQE construction (internal).
     #[inline]
     fn finish_internal(self) -> io::Result<WqeHandle> {
+        let wqebb_cnt = calc_wqebb_cnt(self.offset);
+        let slots_to_end = self.sq.slots_to_end();
+
+        // Check for wrap-around
+        if wqebb_cnt > slots_to_end && slots_to_end < self.sq.wqe_cnt {
+            return self.finish_with_wrap_around(wqebb_cnt, slots_to_end);
+        }
+
+        // Normal path - no wrap-around
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
         }
 
-        let wqebb_cnt = calc_wqebb_cnt(self.offset);
         let wqe_idx = self.wqe_idx;
-
         self.sq.advance_pi(wqebb_cnt);
         self.sq.set_last_wqe(self.wqe_ptr, self.offset);
 
         Ok(WqeHandle {
             wqe_idx,
+            size: self.offset,
+        })
+    }
+
+    /// Handle WQE wrap-around by inserting NOP and relocating WQE.
+    #[cold]
+    fn finish_with_wrap_around(self, wqebb_cnt: u16, slots_to_end: u16) -> io::Result<WqeHandle> {
+        // Check if we have enough space for NOP + WQE
+        let total_needed = slots_to_end + wqebb_cnt;
+        if self.sq.available() < total_needed {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+
+        // 1. Copy current WQE to temp buffer (max 4 WQEBB = 256 bytes)
+        let mut temp_buf = [0u8; 256];
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.wqe_ptr, temp_buf.as_mut_ptr(), self.offset);
+        }
+
+        // 2. Post NOP to fill until ring end
+        unsafe {
+            self.sq.post_nop(slots_to_end);
+        }
+
+        // 3. Get new WQE position at ring start
+        let new_wqe_idx = self.sq.pi.get();
+        let new_wqe_ptr = self.sq.get_wqe_ptr(new_wqe_idx);
+
+        // 4. Copy WQE to new position and update wqe_idx in ctrl segment
+        unsafe {
+            std::ptr::copy_nonoverlapping(temp_buf.as_ptr(), new_wqe_ptr, self.offset);
+            CtrlSeg::update_wqe_idx(new_wqe_ptr, new_wqe_idx);
+            CtrlSeg::update_ds_cnt(new_wqe_ptr, self.ds_count);
+        }
+
+        // 5. Update PI and set last WQE
+        self.sq.advance_pi(wqebb_cnt);
+        self.sq.set_last_wqe(new_wqe_ptr, self.offset);
+
+        Ok(WqeHandle {
+            wqe_idx: new_wqe_idx,
             size: self.offset,
         })
     }
@@ -481,11 +530,19 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
     /// immediately, so no need to call `ring_sq_doorbell()` afterwards.
     #[inline]
     fn finish_internal_with_blueflame(self) -> io::Result<WqeHandle> {
+        let wqebb_cnt = calc_wqebb_cnt(self.offset);
+        let slots_to_end = self.sq.slots_to_end();
+
+        // Check for wrap-around
+        if wqebb_cnt > slots_to_end && slots_to_end < self.sq.wqe_cnt {
+            return self.finish_with_wrap_around_blueflame(wqebb_cnt, slots_to_end);
+        }
+
+        // Normal path - no wrap-around
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
         }
 
-        let wqebb_cnt = calc_wqebb_cnt(self.offset);
         let wqe_idx = self.wqe_idx;
         let wqe_ptr = self.wqe_ptr;
 
@@ -494,6 +551,47 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
 
         Ok(WqeHandle {
             wqe_idx,
+            size: self.offset,
+        })
+    }
+
+    /// Handle WQE wrap-around with BlueFlame doorbell.
+    #[cold]
+    fn finish_with_wrap_around_blueflame(self, wqebb_cnt: u16, slots_to_end: u16) -> io::Result<WqeHandle> {
+        // Check if we have enough space for NOP + WQE
+        let total_needed = slots_to_end + wqebb_cnt;
+        if self.sq.available() < total_needed {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+
+        // 1. Copy current WQE to temp buffer (max 4 WQEBB = 256 bytes)
+        let mut temp_buf = [0u8; 256];
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.wqe_ptr, temp_buf.as_mut_ptr(), self.offset);
+        }
+
+        // 2. Post NOP to fill until ring end
+        unsafe {
+            self.sq.post_nop(slots_to_end);
+        }
+
+        // 3. Get new WQE position at ring start
+        let new_wqe_idx = self.sq.pi.get();
+        let new_wqe_ptr = self.sq.get_wqe_ptr(new_wqe_idx);
+
+        // 4. Copy WQE to new position and update wqe_idx in ctrl segment
+        unsafe {
+            std::ptr::copy_nonoverlapping(temp_buf.as_ptr(), new_wqe_ptr, self.offset);
+            CtrlSeg::update_wqe_idx(new_wqe_ptr, new_wqe_idx);
+            CtrlSeg::update_ds_cnt(new_wqe_ptr, self.ds_count);
+        }
+
+        // 5. Update PI and ring BlueFlame
+        self.sq.advance_pi(wqebb_cnt);
+        self.sq.ring_blueflame(new_wqe_ptr);
+
+        Ok(WqeHandle {
+            wqe_idx: new_wqe_idx,
             size: self.offset,
         })
     }
@@ -545,15 +643,19 @@ impl<'a, Entry> SparseUdWqeBuilder<'a, Entry> {
     /// # Errors
     /// Returns an error if required segments are missing for the opcode.
     pub fn finish(self) -> io::Result<WqeHandle> {
-        let wqe_idx = self.inner.wqe_idx;
+        // Keep reference to sq before consuming self.inner
+        let sq = self.inner.sq;
+        let entry = self.entry;
 
-        // Calculate ci_delta (accumulated PI value at completion) before advancing PI
-        if let Some(entry) = self.entry {
-            let wqebb_cnt = calc_wqebb_cnt(self.inner.offset);
-            let ci_delta = self.inner.sq.pi.get().wrapping_add(wqebb_cnt);
-            self.inner.sq.table.store(wqe_idx, entry, ci_delta);
+        // finish_internal may relocate WQE due to wrap-around
+        let handle = self.inner.finish_internal()?;
+
+        // Store entry using actual wqe_idx (after possible wrap-around)
+        // ci_delta = accumulated PI value at completion (PI is already advanced)
+        if let Some(entry) = entry {
+            sq.table.store(handle.wqe_idx, entry, sq.pi.get());
         }
-        self.inner.finish_internal()
+        Ok(handle)
     }
 
     /// Finish the WQE construction with BlueFlame doorbell.
@@ -561,15 +663,19 @@ impl<'a, Entry> SparseUdWqeBuilder<'a, Entry> {
     /// # Errors
     /// Returns an error if required segments are missing for the opcode.
     pub fn finish_with_blueflame(self) -> io::Result<WqeHandle> {
-        let wqe_idx = self.inner.wqe_idx;
+        // Keep reference to sq before consuming self.inner
+        let sq = self.inner.sq;
+        let entry = self.entry;
 
-        // Calculate ci_delta (accumulated PI value at completion) before advancing PI
-        if let Some(entry) = self.entry {
-            let wqebb_cnt = calc_wqebb_cnt(self.inner.offset);
-            let ci_delta = self.inner.sq.pi.get().wrapping_add(wqebb_cnt);
-            self.inner.sq.table.store(wqe_idx, entry, ci_delta);
+        // finish_internal may relocate WQE due to wrap-around
+        let handle = self.inner.finish_internal_with_blueflame()?;
+
+        // Store entry using actual wqe_idx (after possible wrap-around)
+        // ci_delta = accumulated PI value at completion (PI is already advanced)
+        if let Some(entry) = entry {
+            sq.table.store(handle.wqe_idx, entry, sq.pi.get());
         }
-        self.inner.finish_internal_with_blueflame()
+        Ok(handle)
     }
 }
 
@@ -615,11 +721,18 @@ impl<'a, Entry> DenseUdWqeBuilder<'a, Entry> {
     /// # Errors
     /// Returns an error if required segments are missing for the opcode.
     pub fn finish(self) -> io::Result<WqeHandle> {
-        let wqe_idx = self.inner.wqe_idx;
-        let wqebb_cnt = calc_wqebb_cnt(self.inner.offset);
+        // Keep reference to sq before consuming self.inner
+        let sq = self.inner.sq;
+        let entry = self.entry;
+
+        // finish_internal may relocate WQE due to wrap-around
+        let handle = self.inner.finish_internal()?;
+
+        // Store entry using actual wqe_idx (after possible wrap-around)
         // For dense tables, ci_delta is the number of WQEBBs for this WQE
-        self.inner.sq.table.store(wqe_idx, self.entry, wqebb_cnt);
-        self.inner.finish_internal()
+        let wqebb_cnt = calc_wqebb_cnt(handle.size);
+        sq.table.store(handle.wqe_idx, entry, wqebb_cnt);
+        Ok(handle)
     }
 
     /// Finish the WQE construction with BlueFlame doorbell.
@@ -627,11 +740,18 @@ impl<'a, Entry> DenseUdWqeBuilder<'a, Entry> {
     /// # Errors
     /// Returns an error if required segments are missing for the opcode.
     pub fn finish_with_blueflame(self) -> io::Result<WqeHandle> {
-        let wqe_idx = self.inner.wqe_idx;
-        let wqebb_cnt = calc_wqebb_cnt(self.inner.offset);
+        // Keep reference to sq before consuming self.inner
+        let sq = self.inner.sq;
+        let entry = self.entry;
+
+        // finish_internal may relocate WQE due to wrap-around
+        let handle = self.inner.finish_internal_with_blueflame()?;
+
+        // Store entry using actual wqe_idx (after possible wrap-around)
         // For dense tables, ci_delta is the number of WQEBBs for this WQE
-        self.inner.sq.table.store(wqe_idx, self.entry, wqebb_cnt);
-        self.inner.finish_internal_with_blueflame()
+        let wqebb_cnt = calc_wqebb_cnt(handle.size);
+        sq.table.store(handle.wqe_idx, entry, wqebb_cnt);
+        Ok(handle)
     }
 }
 

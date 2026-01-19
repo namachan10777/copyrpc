@@ -55,6 +55,20 @@ impl CtrlSeg {
     pub unsafe fn update_ds_cnt(ptr: *mut u8, ds_cnt: u8) {
         std::ptr::write_volatile(ptr.add(7), ds_cnt);
     }
+
+    /// Update the WQE index in the control segment.
+    ///
+    /// Used when relocating a WQE due to ring wrap-around.
+    ///
+    /// # Safety
+    /// The pointer must point to a valid control segment.
+    #[inline]
+    pub unsafe fn update_wqe_idx(ptr: *mut u8, wqe_idx: u16) {
+        // wqe_idx is stored at bytes 1-2 in big-endian format
+        // Layout: [0][wqe_idx_hi][wqe_idx_lo][opcode]
+        std::ptr::write_volatile(ptr.add(1), (wqe_idx >> 8) as u8);
+        std::ptr::write_volatile(ptr.add(2), wqe_idx as u8);
+    }
 }
 
 /// RDMA Segment (16 bytes).

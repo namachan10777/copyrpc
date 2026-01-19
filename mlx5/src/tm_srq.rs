@@ -226,8 +226,9 @@ impl<Entry> CmdQpState<Entry, DenseWqeTable<Entry>> {
     {
         for (idx, entry) in self.table.take_range(self.ci.get(), new_ci) {
             callback(idx, entry.data);
-            // For dense tables, ci_delta is the number of WQEBBs for this WQE
-            self.ci.set(self.ci.get().wrapping_add(entry.ci_delta));
+            // For dense tables, ci_delta is accumulated PI value at completion.
+            // This handles NOP gaps correctly (NOPs have no entries but PI is advanced).
+            self.ci.set(entry.ci_delta);
         }
     }
 }
