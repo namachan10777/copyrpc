@@ -19,7 +19,7 @@ use mlx5::dc::{DciConfig, DctConfig};
 use mlx5::srq::SrqConfig;
 use mlx5::wqe::{WqeFlags, WqeOpcode};
 
-use common::{full_access, poll_cq_timeout, AlignedBuffer, TestContext};
+use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
 // =============================================================================
 // SRQ Creation Tests
@@ -96,8 +96,11 @@ fn test_srq_post_recv() {
 
     // Allocate receive buffer
     let recv_buf = AlignedBuffer::new(4096);
-    let mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
-        .expect("Failed to register MR");
+    let mr = unsafe {
+        ctx.pd
+            .register(recv_buf.as_ptr(), recv_buf.size(), full_access())
+    }
+    .expect("Failed to register MR");
 
     // Post multiple receive buffers using recv_builder
     for i in 0..10 {
@@ -158,8 +161,11 @@ fn test_srq_with_dct_send() {
 
     // Create receive buffer and post to SRQ
     let recv_buf = AlignedBuffer::new(4096);
-    let recv_mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
-        .expect("Failed to register recv MR");
+    let recv_mr = unsafe {
+        ctx.pd
+            .register(recv_buf.as_ptr(), recv_buf.size(), full_access())
+    }
+    .expect("Failed to register recv MR");
 
     srq.recv_builder(0u64)
         .expect("recv_builder failed")
@@ -193,8 +199,11 @@ fn test_srq_with_dct_send() {
 
     // Prepare send data
     let mut send_buf = AlignedBuffer::new(4096);
-    let send_mr = unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }
-        .expect("Failed to register send MR");
+    let send_mr = unsafe {
+        ctx.pd
+            .register(send_buf.as_ptr(), send_buf.size(), full_access())
+    }
+    .expect("Failed to register send MR");
 
     let test_data = b"DC SEND via SRQ test!";
     send_buf.fill_bytes(test_data);
@@ -229,11 +238,7 @@ fn test_srq_with_dct_send() {
     // Verify received data
     // SRQ receive: data starts at beginning of buffer (no GRH prepended)
     let received = recv_buf.read_bytes(test_data.len());
-    assert_eq!(
-        received.as_slice(),
-        test_data,
-        "Received data mismatch"
-    );
+    assert_eq!(received.as_slice(), test_data, "Received data mismatch");
 
     println!("SRQ with DCT SEND test passed!");
     println!("  Sent {} bytes via DC SEND", test_data.len());
@@ -329,8 +334,11 @@ fn test_srq_shared_by_multiple_dcts() {
 
     // Prepare send buffer
     let mut send_buf = AlignedBuffer::new(4096);
-    let send_mr = unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }
-        .expect("Failed to register send MR");
+    let send_mr = unsafe {
+        ctx.pd
+            .register(send_buf.as_ptr(), send_buf.size(), full_access())
+    }
+    .expect("Failed to register send MR");
 
     let dlid = ctx.port_attr.lid;
 
@@ -348,8 +356,8 @@ fn test_srq_shared_by_multiple_dcts() {
             .finish_with_blueflame();
 
         // Poll send completion
-        let send_cqe = poll_cq_timeout(&dci_cq, 5000)
-            .expect(&format!("Send CQE timeout for DCT {}", i));
+        let send_cqe =
+            poll_cq_timeout(&dci_cq, 5000).expect(&format!("Send CQE timeout for DCT {}", i));
         assert_eq!(
             send_cqe.syndrome, 0,
             "Send CQE error for DCT {}: syndrome={}",
@@ -357,8 +365,8 @@ fn test_srq_shared_by_multiple_dcts() {
         );
 
         // Poll receive completion
-        let recv_cqe = poll_cq_timeout(&dct_cq, 5000)
-            .expect(&format!("Recv CQE timeout for DCT {}", i));
+        let recv_cqe =
+            poll_cq_timeout(&dct_cq, 5000).expect(&format!("Recv CQE timeout for DCT {}", i));
         assert_eq!(
             recv_cqe.syndrome, 0,
             "Recv CQE error for DCT {}: syndrome={}",

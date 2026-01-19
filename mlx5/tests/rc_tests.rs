@@ -19,7 +19,7 @@ use std::rc::Rc;
 use mlx5::qp::{QpState, RcQpConfig, RemoteQpInfo};
 use mlx5::wqe::{WqeFlags, WqeOpcode};
 
-use common::{full_access, poll_cq_timeout, AlignedBuffer, TestContext};
+use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
 /// Result type for create_rc_loopback_pair
 ///
@@ -44,10 +44,14 @@ fn create_rc_loopback_pair(ctx: &TestContext) -> RcLoopbackPair {
         .expect("Failed to init send CQ direct access");
     let send_cq = Rc::new(send_cq);
     let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
-    recv_cq1.init_direct_access().expect("Failed to init recv CQ1 direct access");
+    recv_cq1
+        .init_direct_access()
+        .expect("Failed to init recv CQ1 direct access");
     let recv_cq1 = Rc::new(recv_cq1);
     let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
-    recv_cq2.init_direct_access().expect("Failed to init recv CQ2 direct access");
+    recv_cq2
+        .init_direct_access()
+        .expect("Failed to init recv CQ2 direct access");
     let recv_cq2 = Rc::new(recv_cq2);
 
     let config = RcQpConfig::default();
@@ -56,12 +60,24 @@ fn create_rc_loopback_pair(ctx: &TestContext) -> RcLoopbackPair {
 
     let qp1 = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq1, &config, noop_callback as fn(_, _))
+        .create_rc_qp(
+            &ctx.pd,
+            &send_cq,
+            &recv_cq1,
+            &config,
+            noop_callback as fn(_, _),
+        )
         .expect("Failed to create QP1");
 
     let qp2 = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, noop_callback as fn(_, _))
+        .create_rc_qp(
+            &ctx.pd,
+            &send_cq,
+            &recv_cq2,
+            &config,
+            noop_callback as fn(_, _),
+        )
         .expect("Failed to create QP2");
 
     // Connect QPs to each other
@@ -142,11 +158,16 @@ fn test_rc_rdma_write() {
     let remote_buf = AlignedBuffer::new(4096);
 
     // Register memory regions
-    let local_mr = unsafe { ctx.pd.register(local_buf.as_ptr(), local_buf.size(), full_access()) }
-        .expect("Failed to register local MR");
-    let remote_mr =
-        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
-            .expect("Failed to register remote MR");
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
 
     // Prepare test data
     let test_data = b"RDMA WRITE test data - one-sided write operation!";
@@ -214,11 +235,16 @@ fn test_rc_rdma_read() {
     let mut remote_buf = AlignedBuffer::new(4096);
 
     // Register memory regions
-    let local_mr = unsafe { ctx.pd.register(local_buf.as_ptr(), local_buf.size(), full_access()) }
-        .expect("Failed to register local MR");
-    let remote_mr =
-        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
-            .expect("Failed to register remote MR");
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
 
     // Prepare remote data (this is what we will READ)
     let test_data = b"RDMA READ test - reading remote data via one-sided operation!";
@@ -269,11 +295,16 @@ fn test_rc_atomic_cas_success() {
     let mut remote_buf = AlignedBuffer::new(4096);
 
     // Register memory regions
-    let local_mr = unsafe { ctx.pd.register(local_buf.as_ptr(), local_buf.size(), full_access()) }
-        .expect("Failed to register local MR");
-    let remote_mr =
-        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
-            .expect("Failed to register remote MR");
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
 
     // Set initial values
     let initial_value: u64 = 0x1234_5678_9ABC_DEF0;
@@ -340,11 +371,16 @@ fn test_rc_atomic_cas_failure() {
     let mut remote_buf = AlignedBuffer::new(4096);
 
     // Register memory regions
-    let local_mr = unsafe { ctx.pd.register(local_buf.as_ptr(), local_buf.size(), full_access()) }
-        .expect("Failed to register local MR");
-    let remote_mr =
-        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
-            .expect("Failed to register remote MR");
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
 
     // Set initial values
     let initial_value: u64 = 0x1234_5678_9ABC_DEF0;
@@ -409,11 +445,16 @@ fn test_rc_atomic_fa() {
     let mut remote_buf = AlignedBuffer::new(4096);
 
     // Register memory regions
-    let local_mr = unsafe { ctx.pd.register(local_buf.as_ptr(), local_buf.size(), full_access()) }
-        .expect("Failed to register local MR");
-    let remote_mr =
-        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
-            .expect("Failed to register remote MR");
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
 
     // Set initial values
     let initial_value: u64 = 100;
@@ -489,11 +530,16 @@ fn test_rc_rdma_write_imm() {
     let mut remote_buf = AlignedBuffer::new(4096);
 
     // Register memory regions
-    let local_mr = unsafe { ctx.pd.register(local_buf.as_ptr(), local_buf.size(), full_access()) }
-        .expect("Failed to register local MR");
-    let remote_mr =
-        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
-            .expect("Failed to register remote MR");
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
 
     // Prepare test data
     let test_data = b"RDMA WRITE IMM test data!";
@@ -501,8 +547,11 @@ fn test_rc_rdma_write_imm() {
 
     // QP2 posts a receive (needed for WRITE+IMM)
     let recv_buf = AlignedBuffer::new(4096);
-    let recv_mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
-        .expect("Failed to register recv MR");
+    let recv_mr = unsafe {
+        ctx.pd
+            .register(recv_buf.as_ptr(), recv_buf.size(), full_access())
+    }
+    .expect("Failed to register recv MR");
 
     qp2.borrow()
         .recv_builder(0u64)
@@ -513,7 +562,9 @@ fn test_rc_rdma_write_imm() {
 
     // Create a separate recv CQ for QP2
     let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
-    recv_cq2.init_direct_access().expect("Failed to init recv CQ2");
+    recv_cq2
+        .init_direct_access()
+        .expect("Failed to init recv CQ2");
 
     // Note: The recv_cq is internal to RcLoopbackPair, we need to check the pair's recv_cq
     // Actually in our setup, qp2's recv CQ is _recv_cq2 which is private
@@ -538,7 +589,11 @@ fn test_rc_rdma_write_imm() {
         cqe.opcode, cqe.syndrome, cqe.wqe_counter
     );
     assert_eq!(cqe.syndrome, 0, "Send CQE error");
-    assert_eq!(cqe.opcode, CqeOpcode::Req, "Expected Req opcode for send completion");
+    assert_eq!(
+        cqe.opcode,
+        CqeOpcode::Req,
+        "Expected Req opcode for send completion"
+    );
     send_cq.flush();
 
     // Verify data was written
@@ -568,14 +623,20 @@ fn test_rc_send_recv_verbs() {
 
     // Create QPs with separate recv CQs that we can access
     let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
-    send_cq.init_direct_access().expect("Failed to init send CQ");
+    send_cq
+        .init_direct_access()
+        .expect("Failed to init send CQ");
     let send_cq = Rc::new(send_cq);
 
     let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
-    recv_cq1.init_direct_access().expect("Failed to init recv CQ1");
+    recv_cq1
+        .init_direct_access()
+        .expect("Failed to init recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
     let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
-    recv_cq2.init_direct_access().expect("Failed to init recv CQ2");
+    recv_cq2
+        .init_direct_access()
+        .expect("Failed to init recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     let config = mlx5::qp::RcQpConfig::default();
@@ -584,12 +645,24 @@ fn test_rc_send_recv_verbs() {
 
     let qp1 = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq1, &config, noop_callback as fn(_, _))
+        .create_rc_qp(
+            &ctx.pd,
+            &send_cq,
+            &recv_cq1,
+            &config,
+            noop_callback as fn(_, _),
+        )
         .expect("Failed to create QP1");
 
     let qp2 = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, noop_callback as fn(_, _))
+        .create_rc_qp(
+            &ctx.pd,
+            &send_cq,
+            &recv_cq2,
+            &config,
+            noop_callback as fn(_, _),
+        )
         .expect("Failed to create QP2");
 
     // Connect QPs
@@ -606,7 +679,10 @@ fn test_rc_send_recv_verbs() {
 
     println!("[verbs] QP1 QPN: 0x{:x}", qp1.borrow().qpn());
     println!("[verbs] QP2 QPN: 0x{:x}", qp2.borrow().qpn());
-    println!("[verbs] remote1.qp_number (QP1): 0x{:x}, remote2.qp_number (QP2): 0x{:x}", remote1.qp_number, remote2.qp_number);
+    println!(
+        "[verbs] remote1.qp_number (QP1): 0x{:x}, remote2.qp_number (QP2): 0x{:x}",
+        remote1.qp_number, remote2.qp_number
+    );
 
     let access = full_access().bits();
     qp1.borrow_mut()
@@ -615,8 +691,14 @@ fn test_rc_send_recv_verbs() {
     qp2.borrow_mut()
         .connect(&remote1, ctx.port, 0, 4, 4, access)
         .expect("Failed to connect QP2");
-    println!("[verbs] QP1 state after connect: {:?}", qp1.borrow().state());
-    println!("[verbs] QP2 state after connect: {:?}", qp2.borrow().state());
+    println!(
+        "[verbs] QP1 state after connect: {:?}",
+        qp1.borrow().state()
+    );
+    println!(
+        "[verbs] QP2 state after connect: {:?}",
+        qp2.borrow().state()
+    );
 
     // Allocate buffers
     let mut send_buf = AlignedBuffer::new(4096);
@@ -626,17 +708,26 @@ fn test_rc_send_recv_verbs() {
     unsafe {
         let ret = libc::mlock(recv_buf.as_ptr() as *const libc::c_void, recv_buf.size());
         if ret != 0 {
-            println!("[verbs] WARNING: mlock failed: {}", std::io::Error::last_os_error());
+            println!(
+                "[verbs] WARNING: mlock failed: {}",
+                std::io::Error::last_os_error()
+            );
         } else {
             println!("[verbs] mlock succeeded for recv_buf");
         }
     }
 
     // Register memory regions
-    let send_mr = unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }
-        .expect("Failed to register send MR");
-    let recv_mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
-        .expect("Failed to register recv MR");
+    let send_mr = unsafe {
+        ctx.pd
+            .register(send_buf.as_ptr(), send_buf.size(), full_access())
+    }
+    .expect("Failed to register send MR");
+    let recv_mr = unsafe {
+        ctx.pd
+            .register(recv_buf.as_ptr(), recv_buf.size(), full_access())
+    }
+    .expect("Failed to register recv MR");
 
     // Prepare test data
     let test_data = b"Hello RDMA SEND/RECV via verbs!";
@@ -663,8 +754,10 @@ fn test_rc_send_recv_verbs() {
             mlx5_sys::ibv_qp_attr_mask_IBV_QP_CAP as i32,
             &mut init_attr,
         );
-        println!("[verbs] QP2 cap: max_recv_wr={}, max_recv_sge={}",
-                 init_attr.cap.max_recv_wr, init_attr.cap.max_recv_sge);
+        println!(
+            "[verbs] QP2 cap: max_recv_wr={}, max_recv_sge={}",
+            init_attr.cap.max_recv_wr, init_attr.cap.max_recv_sge
+        );
 
         // Query mlx5dv info to see RQ buffer
         let mut dv_qp: std::mem::MaybeUninit<mlx5_sys::mlx5dv_qp> = std::mem::MaybeUninit::zeroed();
@@ -677,25 +770,35 @@ fn test_rc_send_recv_verbs() {
         (*obj_ptr).qp.in_ = qp2.borrow().as_ptr();
         (*obj_ptr).qp.out = dv_qp_ptr;
 
-        let ret = mlx5_sys::mlx5dv_init_obj(obj_ptr, mlx5_sys::mlx5dv_obj_type_MLX5DV_OBJ_QP as u64);
+        let ret =
+            mlx5_sys::mlx5dv_init_obj(obj_ptr, mlx5_sys::mlx5dv_obj_type_MLX5DV_OBJ_QP as u64);
         if ret == 0 {
             let dv_qp = dv_qp.assume_init();
-            println!("[verbs] QP2 RQ: buf={:p}, wqe_cnt={}, stride={}, dbrec={:p}",
-                     dv_qp.rq.buf, dv_qp.rq.wqe_cnt, dv_qp.rq.stride, dv_qp.dbrec);
-            println!("[verbs] QP2 SQ: buf={:p}, wqe_cnt={}, stride={}, dbrec={:p}",
-                     dv_qp.sq.buf, dv_qp.sq.wqe_cnt, dv_qp.sq.stride, dv_qp.dbrec);
+            println!(
+                "[verbs] QP2 RQ: buf={:p}, wqe_cnt={}, stride={}, dbrec={:p}",
+                dv_qp.rq.buf, dv_qp.rq.wqe_cnt, dv_qp.rq.stride, dv_qp.dbrec
+            );
+            println!(
+                "[verbs] QP2 SQ: buf={:p}, wqe_cnt={}, stride={}, dbrec={:p}",
+                dv_qp.sq.buf, dv_qp.sq.wqe_cnt, dv_qp.sq.stride, dv_qp.dbrec
+            );
         }
     }
 
     // Use ibv_post_recv via verbs API
     unsafe {
         // First get the RQ buffer address so we can inspect it after posting
-        let mut dv_qp2: std::mem::MaybeUninit<mlx5_sys::mlx5dv_qp> = std::mem::MaybeUninit::zeroed();
+        let mut dv_qp2: std::mem::MaybeUninit<mlx5_sys::mlx5dv_qp> =
+            std::mem::MaybeUninit::zeroed();
         let mut obj2: std::mem::MaybeUninit<mlx5_sys::mlx5dv_obj> = std::mem::MaybeUninit::zeroed();
-        (*dv_qp2.as_mut_ptr()).comp_mask = mlx5_sys::mlx5dv_qp_comp_mask_MLX5DV_QP_MASK_RAW_QP_HANDLES as u64;
+        (*dv_qp2.as_mut_ptr()).comp_mask =
+            mlx5_sys::mlx5dv_qp_comp_mask_MLX5DV_QP_MASK_RAW_QP_HANDLES as u64;
         (*obj2.as_mut_ptr()).qp.in_ = qp2.borrow().as_ptr();
         (*obj2.as_mut_ptr()).qp.out = dv_qp2.as_mut_ptr();
-        mlx5_sys::mlx5dv_init_obj(obj2.as_mut_ptr(), mlx5_sys::mlx5dv_obj_type_MLX5DV_OBJ_QP as u64);
+        mlx5_sys::mlx5dv_init_obj(
+            obj2.as_mut_ptr(),
+            mlx5_sys::mlx5dv_obj_type_MLX5DV_OBJ_QP as u64,
+        );
         let dv_qp2_val = dv_qp2.assume_init();
         let rq_buf = dv_qp2_val.rq.buf as *mut u8;
         let rq_stride = dv_qp2_val.rq.stride;
@@ -710,8 +813,10 @@ fn test_rc_send_recv_verbs() {
         sge.length = 256;
         sge.lkey = recv_mr.lkey();
 
-        println!("[verbs] SGE before post: addr=0x{:x}, len={}, lkey=0x{:x}",
-                 sge.addr, sge.length, sge.lkey);
+        println!(
+            "[verbs] SGE before post: addr=0x{:x}, len={}, lkey=0x{:x}",
+            sge.addr, sge.length, sge.lkey
+        );
 
         let mut recv_wr: mlx5_sys::ibv_recv_wr = std::mem::zeroed();
         recv_wr.wr_id = 1;
@@ -720,11 +825,7 @@ fn test_rc_send_recv_verbs() {
         recv_wr.num_sge = 1;
 
         let mut bad_wr: *mut mlx5_sys::ibv_recv_wr = std::ptr::null_mut();
-        let ret = mlx5_sys::ibv_post_recv_ex(
-            qp2.borrow().as_ptr(),
-            &mut recv_wr,
-            &mut bad_wr,
-        );
+        let ret = mlx5_sys::ibv_post_recv_ex(qp2.borrow().as_ptr(), &mut recv_wr, &mut bad_wr);
         assert_eq!(ret, 0, "ibv_post_recv failed: {}", ret);
 
         // Read doorbell record after posting
@@ -737,10 +838,14 @@ fn test_rc_send_recv_verbs() {
         let byte_cnt = u32::from_be(std::ptr::read(wqe_ptr as *const u32));
         let lkey_val = u32::from_be(std::ptr::read(wqe_ptr.add(4) as *const u32));
         let addr_val = u64::from_be(std::ptr::read(wqe_ptr.add(8) as *const u64));
-        println!("[verbs] RQ WQE[0] after post: byte_cnt={}, lkey=0x{:x}, addr=0x{:x}",
-                 byte_cnt, lkey_val, addr_val);
-        println!("[verbs] RQ WQE[0] raw 64 bytes: {:?}",
-                 std::slice::from_raw_parts(wqe_ptr, std::cmp::min(64, rq_stride as usize)));
+        println!(
+            "[verbs] RQ WQE[0] after post: byte_cnt={}, lkey=0x{:x}, addr=0x{:x}",
+            byte_cnt, lkey_val, addr_val
+        );
+        println!(
+            "[verbs] RQ WQE[0] raw 64 bytes: {:?}",
+            std::slice::from_raw_parts(wqe_ptr, std::cmp::min(64, rq_stride as usize))
+        );
     }
 
     // QP1 sends data using ibv_post_send (to verify if BlueFlame is the issue)
@@ -759,11 +864,7 @@ fn test_rc_send_recv_verbs() {
         send_wr.send_flags = mlx5_sys::ibv_send_flags_IBV_SEND_SIGNALED;
 
         let mut bad_wr: *mut mlx5_sys::ibv_send_wr = std::ptr::null_mut();
-        let ret = mlx5_sys::ibv_post_send_ex(
-            qp1.borrow().as_ptr(),
-            &mut send_wr,
-            &mut bad_wr,
-        );
+        let ret = mlx5_sys::ibv_post_send_ex(qp1.borrow().as_ptr(), &mut send_wr, &mut bad_wr);
         assert_eq!(ret, 0, "ibv_post_send failed: {}", ret);
     }
 
@@ -774,8 +875,15 @@ fn test_rc_send_recv_verbs() {
         loop {
             let ret = mlx5_sys::ibv_poll_cq_ex(send_cq.as_ptr(), 1, &mut wc);
             if ret > 0 {
-                println!("[verbs] Send WC: status={}, opcode={}, wr_id={}", wc.status, wc.opcode, wc.wr_id);
-                assert_eq!(wc.status, mlx5_sys::ibv_wc_status_IBV_WC_SUCCESS, "Send WC error");
+                println!(
+                    "[verbs] Send WC: status={}, opcode={}, wr_id={}",
+                    wc.status, wc.opcode, wc.wr_id
+                );
+                assert_eq!(
+                    wc.status,
+                    mlx5_sys::ibv_wc_status_IBV_WC_SUCCESS,
+                    "Send WC error"
+                );
                 break;
             }
             if start.elapsed().as_millis() > 5000 {
@@ -793,9 +901,16 @@ fn test_rc_send_recv_verbs() {
         loop {
             let ret = mlx5_sys::ibv_poll_cq_ex((*recv_cq2).as_ptr(), 1, &mut wc);
             if ret > 0 {
-                println!("[verbs] Recv WC: status={}, opcode={}, byte_len={}, wr_id={}", wc.status, wc.opcode, wc.byte_len, wc.wr_id);
+                println!(
+                    "[verbs] Recv WC: status={}, opcode={}, byte_len={}, wr_id={}",
+                    wc.status, wc.opcode, wc.byte_len, wc.wr_id
+                );
                 recv_byte_len = wc.byte_len;
-                assert_eq!(wc.status, mlx5_sys::ibv_wc_status_IBV_WC_SUCCESS, "Recv WC error");
+                assert_eq!(
+                    wc.status,
+                    mlx5_sys::ibv_wc_status_IBV_WC_SUCCESS,
+                    "Recv WC error"
+                );
                 break;
             }
             if start.elapsed().as_millis() > 5000 {
@@ -815,7 +930,10 @@ fn test_rc_send_recv_verbs() {
     for i in 0..64 {
         mr_first_bytes[i] = unsafe { std::ptr::read_volatile(mr_addr.add(i)) };
     }
-    println!("[verbs] First 64 bytes via MR addr (volatile): {:?}", mr_first_bytes.to_vec());
+    println!(
+        "[verbs] First 64 bytes via MR addr (volatile): {:?}",
+        mr_first_bytes.to_vec()
+    );
 
     // Debug: Read first 64 bytes to see what's there
     let first_bytes = recv_buf.read_bytes(64);
@@ -835,7 +953,9 @@ fn test_rc_send_recv_verbs() {
         // Check how much of the buffer is still 0xBB
         let mut bb_count = 0;
         for b in &full_buf {
-            if *b == 0xBB { bb_count += 1; }
+            if *b == 0xBB {
+                bb_count += 1;
+            }
         }
         println!("[verbs] 0xBB bytes in buffer: {}/4096", bb_count);
 
@@ -846,7 +966,11 @@ fn test_rc_send_recv_verbs() {
                 if i < 4090 {
                     // Found something, show context
                     let end = std::cmp::min(i + 50, 4096);
-                    println!("[verbs] Context around offset {}: {:?}", i, &full_buf[i..end]);
+                    println!(
+                        "[verbs] Context around offset {}: {:?}",
+                        i,
+                        &full_buf[i..end]
+                    );
                 }
                 break;
             }
@@ -856,12 +980,19 @@ fn test_rc_send_recv_verbs() {
     // Also check if the data is in the MR header region (maybe GRH?)
     // For IB, receives may have a 40-byte GRH (Global Routing Header) prefix
     if full_buf.len() > 40 {
-        println!("[verbs] Bytes at offset 40: {:?}", &full_buf[40..std::cmp::min(72, full_buf.len())]);
+        println!(
+            "[verbs] Bytes at offset 40: {:?}",
+            &full_buf[40..std::cmp::min(72, full_buf.len())]
+        );
     }
 
     // Verify data
     let received = recv_buf.read_bytes(test_data.len());
-    assert_eq!(&received[..], test_data, "SEND/RECV via verbs data mismatch");
+    assert_eq!(
+        &received[..],
+        test_data,
+        "SEND/RECV via verbs data mismatch"
+    );
 
     println!("RC SEND/RECV via verbs test passed!");
 }
@@ -887,10 +1018,14 @@ fn test_rc_send_recv() {
     let send_cq = Rc::new(send_cq);
 
     let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
-    recv_cq1.init_direct_access().expect("Failed to init recv CQ1");
+    recv_cq1
+        .init_direct_access()
+        .expect("Failed to init recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
     let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
-    recv_cq2.init_direct_access().expect("Failed to init recv CQ2");
+    recv_cq2
+        .init_direct_access()
+        .expect("Failed to init recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     // Shared state to capture recv CQE info
@@ -915,7 +1050,13 @@ fn test_rc_send_recv() {
 
     let qp1 = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq1, &config, noop_callback as fn(_, _))
+        .create_rc_qp(
+            &ctx.pd,
+            &send_cq,
+            &recv_cq1,
+            &config,
+            noop_callback as fn(_, _),
+        )
         .expect("Failed to create QP1");
 
     let qp2 = ctx
@@ -948,10 +1089,16 @@ fn test_rc_send_recv() {
     let mut recv_buf = AlignedBuffer::new(4096);
 
     // Register memory regions
-    let send_mr = unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }
-        .expect("Failed to register send MR");
-    let recv_mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
-        .expect("Failed to register recv MR");
+    let send_mr = unsafe {
+        ctx.pd
+            .register(send_buf.as_ptr(), send_buf.size(), full_access())
+    }
+    .expect("Failed to register send MR");
+    let recv_mr = unsafe {
+        ctx.pd
+            .register(recv_buf.as_ptr(), recv_buf.size(), full_access())
+    }
+    .expect("Failed to register recv MR");
 
     // Prepare test data
     let test_data = b"Hello RDMA SEND/RECV!";
@@ -1011,7 +1158,11 @@ fn test_rc_send_recv() {
     );
     assert_eq!(recv_syndrome, 0, "Recv CQE error");
     assert_eq!(recv_cqe_op, CqeOpcode::RespSend, "Expected RespSend opcode");
-    assert_eq!(recv_byte_cnt as usize, test_data.len(), "Byte count mismatch");
+    assert_eq!(
+        recv_byte_cnt as usize,
+        test_data.len(),
+        "Byte count mismatch"
+    );
 
     // Debug: Read first 32 bytes to see what's there
     let first_bytes = recv_buf.read_bytes(32);
@@ -1043,13 +1194,19 @@ fn test_rc_send_recv_pure_verbs() {
 
     // Create CQs
     let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
-    send_cq.init_direct_access().expect("Failed to init send CQ");
+    send_cq
+        .init_direct_access()
+        .expect("Failed to init send CQ");
     let send_cq = Rc::new(send_cq);
     let mut recv_cq1_raw = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
-    recv_cq1_raw.init_direct_access().expect("Failed to init recv CQ1");
+    recv_cq1_raw
+        .init_direct_access()
+        .expect("Failed to init recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1_raw);
     let mut recv_cq2_raw = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
-    recv_cq2_raw.init_direct_access().expect("Failed to init recv CQ2");
+    recv_cq2_raw
+        .init_direct_access()
+        .expect("Failed to init recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2_raw);
 
     let config = mlx5::qp::RcQpConfig::default();
@@ -1059,12 +1216,24 @@ fn test_rc_send_recv_pure_verbs() {
     // Create QPs
     let qp1 = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq1, &config, noop_callback as fn(_, _))
+        .create_rc_qp(
+            &ctx.pd,
+            &send_cq,
+            &recv_cq1,
+            &config,
+            noop_callback as fn(_, _),
+        )
         .expect("Failed to create QP1");
 
     let qp2 = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, noop_callback as fn(_, _))
+        .create_rc_qp(
+            &ctx.pd,
+            &send_cq,
+            &recv_cq2,
+            &config,
+            noop_callback as fn(_, _),
+        )
         .expect("Failed to create QP2");
 
     // Connect QPs
@@ -1087,23 +1256,37 @@ fn test_rc_send_recv_pure_verbs() {
         .connect(&remote1, ctx.port, 0, 4, 4, access)
         .expect("Failed to connect QP2");
 
-    println!("[pure_verbs] QP1 QPN: 0x{:x}, QP2 QPN: 0x{:x}", qp1.borrow().qpn(), qp2.borrow().qpn());
+    println!(
+        "[pure_verbs] QP1 QPN: 0x{:x}, QP2 QPN: 0x{:x}",
+        qp1.borrow().qpn(),
+        qp2.borrow().qpn()
+    );
 
     // Allocate and register buffers
     let mut send_buf = AlignedBuffer::new(4096);
     let mut recv_buf = AlignedBuffer::new(4096);
 
-    let send_mr = unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }
-        .expect("Failed to register send MR");
-    let recv_mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
-        .expect("Failed to register recv MR");
+    let send_mr = unsafe {
+        ctx.pd
+            .register(send_buf.as_ptr(), send_buf.size(), full_access())
+    }
+    .expect("Failed to register send MR");
+    let recv_mr = unsafe {
+        ctx.pd
+            .register(recv_buf.as_ptr(), recv_buf.size(), full_access())
+    }
+    .expect("Failed to register recv MR");
 
     // Prepare test data
     let test_data = b"Test data for pure verbs!";
     send_buf.fill_bytes(test_data);
     recv_buf.fill(0xCC);
 
-    println!("[pure_verbs] recv_buf addr: 0x{:x}, lkey: 0x{:x}", recv_buf.addr(), recv_mr.lkey());
+    println!(
+        "[pure_verbs] recv_buf addr: 0x{:x}, lkey: 0x{:x}",
+        recv_buf.addr(),
+        recv_mr.lkey()
+    );
 
     // Post receive using ibv_post_recv
     unsafe {
@@ -1119,11 +1302,7 @@ fn test_rc_send_recv_pure_verbs() {
         recv_wr.num_sge = 1;
 
         let mut bad_wr: *mut mlx5_sys::ibv_recv_wr = std::ptr::null_mut();
-        let ret = mlx5_sys::ibv_post_recv_ex(
-            qp2.borrow().as_ptr(),
-            &mut recv_wr,
-            &mut bad_wr,
-        );
+        let ret = mlx5_sys::ibv_post_recv_ex(qp2.borrow().as_ptr(), &mut recv_wr, &mut bad_wr);
         assert_eq!(ret, 0, "ibv_post_recv failed: {}", ret);
     }
 
@@ -1143,11 +1322,7 @@ fn test_rc_send_recv_pure_verbs() {
         send_wr.send_flags = mlx5_sys::ibv_send_flags_IBV_SEND_SIGNALED;
 
         let mut bad_wr: *mut mlx5_sys::ibv_send_wr = std::ptr::null_mut();
-        let ret = mlx5_sys::ibv_post_send_ex(
-            qp1.borrow().as_ptr(),
-            &mut send_wr,
-            &mut bad_wr,
-        );
+        let ret = mlx5_sys::ibv_post_send_ex(qp1.borrow().as_ptr(), &mut send_wr, &mut bad_wr);
         assert_eq!(ret, 0, "ibv_post_send failed: {}", ret);
     }
 
@@ -1158,8 +1333,15 @@ fn test_rc_send_recv_pure_verbs() {
         loop {
             let ret = mlx5_sys::ibv_poll_cq_ex(send_cq.as_ptr(), 1, &mut wc);
             if ret > 0 {
-                println!("[pure_verbs] Send WC: status={}, opcode={}, wr_id={}", wc.status, wc.opcode, wc.wr_id);
-                assert_eq!(wc.status, mlx5_sys::ibv_wc_status_IBV_WC_SUCCESS, "Send WC error");
+                println!(
+                    "[pure_verbs] Send WC: status={}, opcode={}, wr_id={}",
+                    wc.status, wc.opcode, wc.wr_id
+                );
+                assert_eq!(
+                    wc.status,
+                    mlx5_sys::ibv_wc_status_IBV_WC_SUCCESS,
+                    "Send WC error"
+                );
                 break;
             }
             if start.elapsed().as_millis() > 5000 {
@@ -1176,8 +1358,15 @@ fn test_rc_send_recv_pure_verbs() {
         loop {
             let ret = mlx5_sys::ibv_poll_cq_ex((*recv_cq2).as_ptr(), 1, &mut wc);
             if ret > 0 {
-                println!("[pure_verbs] Recv WC: status={}, opcode={}, byte_len={}, wr_id={}", wc.status, wc.opcode, wc.byte_len, wc.wr_id);
-                assert_eq!(wc.status, mlx5_sys::ibv_wc_status_IBV_WC_SUCCESS, "Recv WC error");
+                println!(
+                    "[pure_verbs] Recv WC: status={}, opcode={}, byte_len={}, wr_id={}",
+                    wc.status, wc.opcode, wc.byte_len, wc.wr_id
+                );
+                assert_eq!(
+                    wc.status,
+                    mlx5_sys::ibv_wc_status_IBV_WC_SUCCESS,
+                    "Recv WC error"
+                );
                 break;
             }
             if start.elapsed().as_millis() > 5000 {
@@ -1190,15 +1379,25 @@ fn test_rc_send_recv_pure_verbs() {
     // Check buffer
     std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
     let received = recv_buf.read_bytes(test_data.len());
-    println!("[pure_verbs] First {} bytes: {:?}", test_data.len(), received);
+    println!(
+        "[pure_verbs] First {} bytes: {:?}",
+        test_data.len(),
+        received
+    );
 
     let mut cc_count = 0;
     for b in recv_buf.read_bytes(4096) {
-        if b == 0xCC { cc_count += 1; }
+        if b == 0xCC {
+            cc_count += 1;
+        }
     }
     println!("[pure_verbs] 0xCC bytes remaining: {}/4096", cc_count);
 
-    assert_eq!(&received[..], test_data, "Pure verbs SEND/RECV data mismatch");
+    assert_eq!(
+        &received[..],
+        test_data,
+        "Pure verbs SEND/RECV data mismatch"
+    );
     println!("[pure_verbs] Test passed!");
 }
 
@@ -1223,14 +1422,20 @@ fn test_rc_send_recv_pingpong() {
 
     // Create QPs with separate recv CQs
     let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
-    send_cq.init_direct_access().expect("Failed to init send CQ");
+    send_cq
+        .init_direct_access()
+        .expect("Failed to init send CQ");
     let send_cq = Rc::new(send_cq);
 
     let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
-    recv_cq1.init_direct_access().expect("Failed to init recv CQ1");
+    recv_cq1
+        .init_direct_access()
+        .expect("Failed to init recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
     let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
-    recv_cq2.init_direct_access().expect("Failed to init recv CQ2");
+    recv_cq2
+        .init_direct_access()
+        .expect("Failed to init recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     let config = mlx5::qp::RcQpConfig {
@@ -1269,8 +1474,12 @@ fn test_rc_send_recv_pingpong() {
     };
 
     let access = full_access().bits();
-    qp1.borrow_mut().connect(&remote2, ctx.port, 0, 4, 4, access).expect("connect QP1");
-    qp2.borrow_mut().connect(&remote1, ctx.port, 0, 4, 4, access).expect("connect QP2");
+    qp1.borrow_mut()
+        .connect(&remote2, ctx.port, 0, 4, 4, access)
+        .expect("connect QP1");
+    qp2.borrow_mut()
+        .connect(&remote1, ctx.port, 0, 4, 4, access)
+        .expect("connect QP2");
 
     // Buffers
     let buf1 = AlignedBuffer::new(4096);
@@ -1281,12 +1490,12 @@ fn test_rc_send_recv_pingpong() {
     let iterations = 10;
 
     for i in 0..iterations {
-
         // Reset opcode states
         recv2_opcode.set(None);
 
         // QP2 posts receive
-        let _ = qp2.borrow()
+        let _ = qp2
+            .borrow()
             .recv_builder(i as u64)
             .map(|b| b.sge(buf2.addr(), 64, mr2.lkey()).finish());
         qp2.borrow().ring_rq_doorbell();
@@ -1322,7 +1531,8 @@ fn test_rc_send_recv_pingpong() {
         recv1_opcode.set(None);
 
         // QP1 posts receive
-        let _ = qp1.borrow()
+        let _ = qp1
+            .borrow()
             .recv_builder(i as u64)
             .map(|b| b.sge(buf1.addr(), 64, mr1.lkey()).finish());
         qp1.borrow().ring_rq_doorbell();
@@ -1380,9 +1590,11 @@ fn test_rc_inline_data() {
     let qp1 = &pair.qp1;
 
     let mut remote_buf = AlignedBuffer::new(4096);
-    let remote_mr =
-        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
-            .expect("Failed to register remote MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
 
     remote_buf.fill(0xAA);
 
@@ -1428,10 +1640,14 @@ fn test_rc_post_nop_to_ring_end() {
     let send_cq = Rc::new(send_cq);
 
     let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
-    recv_cq1.init_direct_access().expect("Failed to init recv CQ1");
+    recv_cq1
+        .init_direct_access()
+        .expect("Failed to init recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
     let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
-    recv_cq2.init_direct_access().expect("Failed to init recv CQ2");
+    recv_cq2
+        .init_direct_access()
+        .expect("Failed to init recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     let config = RcQpConfig {
@@ -1444,11 +1660,23 @@ fn test_rc_post_nop_to_ring_end() {
 
     let qp1 = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq1, &config, noop_callback as fn(_, _))
+        .create_rc_qp(
+            &ctx.pd,
+            &send_cq,
+            &recv_cq1,
+            &config,
+            noop_callback as fn(_, _),
+        )
         .expect("Failed to create QP1");
     let qp2 = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, noop_callback as fn(_, _))
+        .create_rc_qp(
+            &ctx.pd,
+            &send_cq,
+            &recv_cq2,
+            &config,
+            noop_callback as fn(_, _),
+        )
         .expect("Failed to create QP2");
 
     let remote1 = RemoteQpInfo {
@@ -1473,12 +1701,16 @@ fn test_rc_post_nop_to_ring_end() {
     // Post a few WQEs to advance PI
     let mut local_buf = AlignedBuffer::new(4096);
     let mut remote_buf = AlignedBuffer::new(4096);
-    let local_mr =
-        unsafe { ctx.pd.register(local_buf.as_ptr(), local_buf.size(), full_access()) }
-            .expect("Failed to register local MR");
-    let remote_mr =
-        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
-            .expect("Failed to register remote MR");
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
 
     local_buf.fill_bytes(b"test");
 
@@ -1500,7 +1732,9 @@ fn test_rc_post_nop_to_ring_end() {
     println!("Slots to ring end before NOP: {}", slots_before);
 
     // Post NOP WQEs to fill remaining slots
-    qp1.borrow().post_nop_to_ring_end().expect("post_nop_to_ring_end failed");
+    qp1.borrow()
+        .post_nop_to_ring_end()
+        .expect("post_nop_to_ring_end failed");
 
     let slots_after = qp1.borrow().slots_to_ring_end();
     println!("Slots to ring end after NOP: {}", slots_after);
@@ -1532,12 +1766,16 @@ fn test_rc_wqe_builder_unsignaled() {
     let mut local_buf = AlignedBuffer::new(4096);
     let mut remote_buf = AlignedBuffer::new(4096);
 
-    let local_mr =
-        unsafe { ctx.pd.register(local_buf.as_ptr(), local_buf.size(), full_access()) }
-            .expect("Failed to register local MR");
-    let remote_mr =
-        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
-            .expect("Failed to register remote MR");
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
 
     let test_data = b"unsignaled test";
     local_buf.fill_bytes(test_data);
@@ -1592,17 +1830,27 @@ fn test_rc_wqe_cnt_methods() {
     };
 
     let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
-    send_cq.init_direct_access().expect("Failed to init send CQ");
+    send_cq
+        .init_direct_access()
+        .expect("Failed to init send CQ");
     let send_cq = Rc::new(send_cq);
     let mut recv_cq = ctx.ctx.create_cq(256).expect("Failed to create recv CQ");
-    recv_cq.init_direct_access().expect("Failed to init recv CQ");
+    recv_cq
+        .init_direct_access()
+        .expect("Failed to init recv CQ");
     let recv_cq = Rc::new(recv_cq);
 
     fn noop_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
 
     let qp = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq, &config, noop_callback as fn(_, _))
+        .create_rc_qp(
+            &ctx.pd,
+            &send_cq,
+            &recv_cq,
+            &config,
+            noop_callback as fn(_, _),
+        )
         .expect("Failed to create QP");
 
     // Check initial WQE counts
@@ -1619,7 +1867,10 @@ fn test_rc_wqe_cnt_methods() {
     // Test send_queue_available (alias for sq_available)
     let available = qp.borrow().send_queue_available();
     let sq_available = qp.borrow().sq_available();
-    assert_eq!(available, sq_available, "send_queue_available should equal sq_available");
+    assert_eq!(
+        available, sq_available,
+        "send_queue_available should equal sq_available"
+    );
     println!("send_queue_available: {}", available);
 
     println!("RC wqe_cnt methods test passed!");

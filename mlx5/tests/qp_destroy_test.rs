@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{full_access, TestContext};
+use common::{TestContext, full_access};
 use mlx5::qp::{RcQpConfig, RemoteQpInfo};
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -47,7 +47,13 @@ fn test_qp_destroy_after_remote_gone() {
     let recv_cq1 = Rc::new(recv_cq1);
     let qp1 = ctx1
         .ctx
-        .create_rc_qp(&ctx1.pd, &send_cq1, &recv_cq1, &config, noop_callback as fn(_, _))
+        .create_rc_qp(
+            &ctx1.pd,
+            &send_cq1,
+            &recv_cq1,
+            &config,
+            noop_callback as fn(_, _),
+        )
         .expect("create qp1");
 
     // Create QP2 on context 2 (separate send and recv CQs)
@@ -59,7 +65,13 @@ fn test_qp_destroy_after_remote_gone() {
     let recv_cq2 = Rc::new(recv_cq2);
     let qp2 = ctx2
         .ctx
-        .create_rc_qp(&ctx2.pd, &send_cq2, &recv_cq2, &config, noop_callback as fn(_, _))
+        .create_rc_qp(
+            &ctx2.pd,
+            &send_cq2,
+            &recv_cq2,
+            &config,
+            noop_callback as fn(_, _),
+        )
         .expect("create qp2");
 
     let access = full_access().bits();
@@ -126,7 +138,10 @@ fn test_qp_destroy_after_remote_gone() {
 /// Test QP destruction with separate threads (like the benchmark).
 #[test]
 fn test_qp_destroy_multi_thread() {
-    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_flag_clone = Arc::clone(&stop_flag);
@@ -163,7 +178,13 @@ fn test_qp_destroy_multi_thread() {
         let recv_cq = Rc::new(recv_cq);
         let qp = ctx
             .ctx
-            .create_rc_qp(&ctx.pd, &send_cq, &recv_cq, &config, noop_callback as fn(_, _))
+            .create_rc_qp(
+                &ctx.pd,
+                &send_cq,
+                &recv_cq,
+                &config,
+                noop_callback as fn(_, _),
+            )
             .expect("create qp");
 
         // Send server info
@@ -224,7 +245,13 @@ fn test_qp_destroy_multi_thread() {
     let recv_cq = Rc::new(recv_cq);
     let qp = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq, &config, noop_callback as fn(_, _))
+        .create_rc_qp(
+            &ctx.pd,
+            &send_cq,
+            &recv_cq,
+            &config,
+            noop_callback as fn(_, _),
+        )
         .expect("create qp");
 
     // Receive server info
@@ -280,7 +307,10 @@ fn test_qp_destroy_multi_thread() {
 /// Test QP destruction after actual data transfer.
 #[test]
 fn test_qp_destroy_after_data_transfer() {
-    use std::sync::{Arc, atomic::{AtomicBool, AtomicU32, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    };
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_flag_clone = Arc::clone(&stop_flag);
@@ -319,16 +349,23 @@ fn test_qp_destroy_after_data_transfer() {
         let recv_cq = Rc::new(recv_cq);
         let qp = ctx
             .ctx
-            .create_rc_qp(&ctx.pd, &send_cq, &recv_cq, &config, noop_callback as fn(_, _))
+            .create_rc_qp(
+                &ctx.pd,
+                &send_cq,
+                &recv_cq,
+                &config,
+                noop_callback as fn(_, _),
+            )
             .expect("create qp");
 
         // Allocate buffer and MR
         let buf = common::AlignedBuffer::new(4096);
-        let mr = unsafe { ctx.pd.register(buf.as_ptr(), buf.size(), full_access()) }
-            .expect("reg_mr");
+        let mr =
+            unsafe { ctx.pd.register(buf.as_ptr(), buf.size(), full_access()) }.expect("reg_mr");
 
         // Send server info
-        tx1.send((qp.borrow().qpn(), ctx.port_attr.lid, buf.addr(), mr.rkey())).unwrap();
+        tx1.send((qp.borrow().qpn(), ctx.port_attr.lid, buf.addr(), mr.rkey()))
+            .unwrap();
 
         // Receive client info
         let (client_qpn, client_lid, _client_buf, _client_rkey) = rx2.recv().unwrap();
@@ -347,7 +384,8 @@ fn test_qp_destroy_after_data_transfer() {
 
         // Pre-post receives
         for i in 0..32 {
-            let _ = qp.borrow()
+            let _ = qp
+                .borrow()
                 .recv_builder(i as u64)
                 .map(|b| b.sge(buf.addr() + (i * 64) as u64, 64, mr.lkey()).finish());
         }
@@ -394,19 +432,25 @@ fn test_qp_destroy_after_data_transfer() {
     let recv_cq = Rc::new(recv_cq);
     let qp = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq, &config, noop_callback as fn(_, _))
+        .create_rc_qp(
+            &ctx.pd,
+            &send_cq,
+            &recv_cq,
+            &config,
+            noop_callback as fn(_, _),
+        )
         .expect("create qp");
 
     // Allocate buffer and MR
     let buf = common::AlignedBuffer::new(4096);
-    let mr = unsafe { ctx.pd.register(buf.as_ptr(), buf.size(), full_access()) }
-        .expect("reg_mr");
+    let mr = unsafe { ctx.pd.register(buf.as_ptr(), buf.size(), full_access()) }.expect("reg_mr");
 
     // Receive server info
     let (server_qpn, server_lid, _server_buf, _server_rkey) = rx1.recv().unwrap();
 
     // Send client info
-    tx2.send((qp.borrow().qpn(), ctx.port_attr.lid, buf.addr(), mr.rkey())).unwrap();
+    tx2.send((qp.borrow().qpn(), ctx.port_attr.lid, buf.addr(), mr.rkey()))
+        .unwrap();
 
     // Connect
     let server_remote = RemoteQpInfo {
@@ -422,7 +466,8 @@ fn test_qp_destroy_after_data_transfer() {
 
     // Pre-post receives
     for i in 0..32 {
-        let _ = qp.borrow()
+        let _ = qp
+            .borrow()
             .recv_builder(i as u64)
             .map(|b| b.sge(buf.addr() + (i * 64) as u64, 64, mr.lkey()).finish());
     }
@@ -467,9 +512,12 @@ fn test_qp_destroy_after_data_transfer() {
 /// This mimics the benchmark's behavior more closely.
 #[test]
 fn test_qp_destroy_after_actual_send_recv() {
-    use std::cell::Cell;
-    use std::sync::{Arc, atomic::{AtomicBool, AtomicU32, Ordering}};
     use mlx5::wqe::{WqeFlags, WqeOpcode};
+    use std::cell::Cell;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    };
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_flag_clone = Arc::clone(&stop_flag);
@@ -528,8 +576,8 @@ fn test_qp_destroy_after_actual_send_recv() {
 
         // Allocate buffer and MR
         let buf = common::AlignedBuffer::new(4096);
-        let mr = unsafe { ctx.pd.register(buf.as_ptr(), buf.size(), full_access()) }
-            .expect("reg_mr");
+        let mr =
+            unsafe { ctx.pd.register(buf.as_ptr(), buf.size(), full_access()) }.expect("reg_mr");
 
         // Send server info
         tx1.send((qp.borrow().qpn(), ctx.port_attr.lid)).unwrap();
@@ -551,7 +599,8 @@ fn test_qp_destroy_after_actual_send_recv() {
 
         // Pre-post receives
         for i in 0..32 {
-            let _ = qp.borrow()
+            let _ = qp
+                .borrow()
                 .recv_builder(i as u64)
                 .map(|b| b.sge(buf.addr() + (i * 64) as u64, 64, mr.lkey()).finish());
         }
@@ -587,7 +636,8 @@ fn test_qp_destroy_after_actual_send_recv() {
                 });
 
                 // Repost recv
-                let _ = qp.borrow()
+                let _ = qp
+                    .borrow()
                     .recv_builder(idx as u64)
                     .map(|b| b.sge(buf.addr() + offset, 64, mr.lkey()).finish());
                 qp.borrow().ring_rq_doorbell();
@@ -651,8 +701,7 @@ fn test_qp_destroy_after_actual_send_recv() {
 
     // Allocate buffer and MR
     let buf = common::AlignedBuffer::new(4096);
-    let mr = unsafe { ctx.pd.register(buf.as_ptr(), buf.size(), full_access()) }
-        .expect("reg_mr");
+    let mr = unsafe { ctx.pd.register(buf.as_ptr(), buf.size(), full_access()) }.expect("reg_mr");
 
     // Receive server info
     let (server_qpn, server_lid) = rx1.recv().unwrap();
@@ -674,7 +723,8 @@ fn test_qp_destroy_after_actual_send_recv() {
 
     // Pre-post receives
     for i in 0..32 {
-        let _ = qp.borrow()
+        let _ = qp
+            .borrow()
             .recv_builder(i as u64)
             .map(|b| b.sge(buf.addr() + (i * 64) as u64, 64, mr.lkey()).finish());
     }
@@ -727,7 +777,8 @@ fn test_qp_destroy_after_actual_send_recv() {
             let offset = (idx * 64) as u64;
 
             // Repost recv
-            let _ = qp.borrow()
+            let _ = qp
+                .borrow()
                 .recv_builder(idx as u64)
                 .map(|b| b.sge(buf.addr() + offset, 64, mr.lkey()).finish());
             qp.borrow().ring_rq_doorbell();

@@ -13,6 +13,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::{io, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
+use crate::CompletionTarget;
 use crate::cq::{CompletionQueue, Cqe};
 use crate::device::Context;
 use crate::pd::{AddressHandle, Pd};
@@ -21,7 +22,6 @@ use crate::wqe::{
     CtrlSeg, DataSeg, InlineHeader, OrderedWqeTable, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode,
     calc_wqebb_cnt,
 };
-use crate::CompletionTarget;
 
 // =============================================================================
 // UD Configuration
@@ -541,7 +541,11 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
 
     /// Handle WQE wrap-around with BlueFlame doorbell.
     #[cold]
-    fn finish_with_wrap_around_blueflame(self, wqebb_cnt: u16, slots_to_end: u16) -> io::Result<WqeHandle> {
+    fn finish_with_wrap_around_blueflame(
+        self,
+        wqebb_cnt: u16,
+        slots_to_end: u16,
+    ) -> io::Result<WqeHandle> {
         // Check if we have enough space for NOP + WQE
         let total_needed = slots_to_end + wqebb_cnt;
         if self.sq.available() < total_needed {
@@ -906,8 +910,8 @@ impl<Entry, TableType, OnComplete> UdQp<Entry, TableType, OnComplete> {
             attr.qp_state = mlx5_sys::ibv_qp_state_IBV_QPS_RTS;
             attr.sq_psn = sq_psn;
 
-            let mask = mlx5_sys::ibv_qp_attr_mask_IBV_QP_STATE
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_SQ_PSN;
+            let mask =
+                mlx5_sys::ibv_qp_attr_mask_IBV_QP_STATE | mlx5_sys::ibv_qp_attr_mask_IBV_QP_SQ_PSN;
 
             let ret = mlx5_sys::ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask as i32);
             if ret != 0 {
@@ -992,11 +996,7 @@ impl<Entry, TableType, OnComplete> UdQp<Entry, TableType, OnComplete> {
         }
 
         let wqe_idx = rq.pi.get();
-        Ok(UdRecvWqeBuilder {
-            rq,
-            entry,
-            wqe_idx,
-        })
+        Ok(UdRecvWqeBuilder { rq, entry, wqe_idx })
     }
 }
 

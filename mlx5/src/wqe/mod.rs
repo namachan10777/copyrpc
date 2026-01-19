@@ -760,5 +760,3 @@ mod tests {
         assert_eq!(table.available_wqebbs(), 0);
     }
 }
-
-

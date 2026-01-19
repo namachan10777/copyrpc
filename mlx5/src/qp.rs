@@ -7,6 +7,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::{io, mem::MaybeUninit, ptr::NonNull};
 
+use crate::CompletionTarget;
 use crate::cq::{CompletionQueue, Cqe};
 use crate::device::Context;
 use crate::pd::Pd;
@@ -14,7 +15,6 @@ use crate::wqe::{
     AtomicSeg, CtrlSeg, DataSeg, InlineHeader, OrderedWqeTable, RdmaSeg, WQEBB_SIZE, WqeFlags,
     WqeHandle, WqeOpcode, calc_wqebb_cnt,
 };
-use crate::CompletionTarget;
 
 /// RC QP configuration.
 #[derive(Debug, Clone)]
@@ -616,7 +616,11 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType> {
 
     /// Handle WQE wrap-around with BlueFlame doorbell.
     #[cold]
-    fn finish_with_wrap_around_blueflame(self, wqebb_cnt: u16, slots_to_end: u16) -> io::Result<WqeHandle> {
+    fn finish_with_wrap_around_blueflame(
+        self,
+        wqebb_cnt: u16,
+        slots_to_end: u16,
+    ) -> io::Result<WqeHandle> {
         // Check if we have enough space for NOP + WQE
         let total_needed = slots_to_end + wqebb_cnt;
         if self.sq.available() < total_needed {
@@ -1263,19 +1267,16 @@ impl<Entry, OnComplete> RcQp<Entry, OnComplete> {
     ///
     /// The entry will be stored and returned via callback on RQ completion.
     pub fn recv_builder(&self, entry: Entry) -> io::Result<RecvWqeBuilder<'_, Entry>> {
-        let rq = self.rq.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "direct access not initialized")
-        })?;
+        let rq = self
+            .rq
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "direct access not initialized"))?;
         if rq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "RQ full"));
         }
 
         let wqe_idx = rq.pi.get();
-        Ok(RecvWqeBuilder {
-            rq,
-            entry,
-            wqe_idx,
-        })
+        Ok(RecvWqeBuilder { rq, entry, wqe_idx })
     }
 
     /// Get a WQE builder for zero-copy WQE construction (signaled).

@@ -21,7 +21,7 @@ use mlx5::pd::RemoteUdQpInfo;
 use mlx5::ud::{UdQpConfig, UdQpState};
 use mlx5::wqe::{WqeFlags, WqeOpcode};
 
-use common::{full_access, poll_cq_timeout, AlignedBuffer, TestContext};
+use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
 /// Size of GRH (Global Route Header) prepended to UD receives.
 const GRH_SIZE: usize = 40;
@@ -40,9 +40,7 @@ fn test_ud_creation() {
         }
     };
 
-    let send_cq = Rc::new(
-        ctx.ctx.create_cq(256).expect("Failed to create send CQ"),
-    );
+    let send_cq = Rc::new(ctx.ctx.create_cq(256).expect("Failed to create send CQ"));
     let recv_cq = Rc::new(ctx.ctx.create_cq(256).expect("Failed to create recv CQ"));
 
     let config = UdQpConfig {
@@ -70,9 +68,7 @@ fn test_ud_activate() {
         }
     };
 
-    let send_cq = Rc::new(
-        ctx.ctx.create_cq(256).expect("Failed to create send CQ"),
-    );
+    let send_cq = Rc::new(ctx.ctx.create_cq(256).expect("Failed to create send CQ"));
     let recv_cq = Rc::new(ctx.ctx.create_cq(256).expect("Failed to create recv CQ"));
 
     let config = UdQpConfig {
@@ -133,8 +129,7 @@ fn test_ud_send_recv() {
     };
     let sender = ctx
         .ctx
-        .create_ud_qp::<u64, _>(&ctx.pd, &send_cq, &recv_cq, &send_config, |_cqe, _entry| {
-        })
+        .create_ud_qp::<u64, _>(&ctx.pd, &send_cq, &recv_cq, &send_config, |_cqe, _entry| {})
         .expect("Failed to create sender QP");
     sender
         .borrow_mut()
@@ -148,8 +143,7 @@ fn test_ud_send_recv() {
     };
     let receiver = ctx
         .ctx
-        .create_ud_qp::<u64, _>(&ctx.pd, &send_cq, &recv_cq, &recv_config, |_cqe, _entry| {
-        })
+        .create_ud_qp::<u64, _>(&ctx.pd, &send_cq, &recv_cq, &recv_config, |_cqe, _entry| {})
         .expect("Failed to create receiver QP");
     receiver
         .borrow_mut()
@@ -161,10 +155,16 @@ fn test_ud_send_recv() {
     let mut recv_buf = AlignedBuffer::new(4096);
 
     // Register memory regions
-    let send_mr = unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }
-        .expect("Failed to register send MR");
-    let recv_mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
-        .expect("Failed to register recv MR");
+    let send_mr = unsafe {
+        ctx.pd
+            .register(send_buf.as_ptr(), send_buf.size(), full_access())
+    }
+    .expect("Failed to register send MR");
+    let recv_mr = unsafe {
+        ctx.pd
+            .register(recv_buf.as_ptr(), recv_buf.size(), full_access())
+    }
+    .expect("Failed to register recv MR");
 
     // Post receive (must include space for GRH)
     let recv_len = 256 + GRH_SIZE as u32;
@@ -221,15 +221,14 @@ fn test_ud_send_recv() {
 
     // Verify received data (skip GRH)
     let received = recv_buf.read_bytes(GRH_SIZE + test_data.len());
-    assert_eq!(
-        &received[GRH_SIZE..],
-        test_data,
-        "UD SEND data mismatch"
-    );
+    assert_eq!(&received[GRH_SIZE..], test_data, "UD SEND data mismatch");
 
     println!("UD SEND/RECV test passed!");
     println!("  Sent {} bytes", test_data.len());
-    println!("  Received {} bytes (including {} byte GRH)", recv_cqe.byte_cnt, GRH_SIZE);
+    println!(
+        "  Received {} bytes (including {} byte GRH)",
+        recv_cqe.byte_cnt, GRH_SIZE
+    );
 }
 
 // =============================================================================
@@ -268,8 +267,7 @@ fn test_ud_send_raw_av() {
     };
     let sender = ctx
         .ctx
-        .create_ud_qp::<u64, _>(&ctx.pd, &send_cq, &recv_cq, &send_config, |_cqe, _entry| {
-        })
+        .create_ud_qp::<u64, _>(&ctx.pd, &send_cq, &recv_cq, &send_config, |_cqe, _entry| {})
         .expect("Failed to create sender QP");
     sender
         .borrow_mut()
@@ -283,8 +281,7 @@ fn test_ud_send_raw_av() {
     };
     let receiver = ctx
         .ctx
-        .create_ud_qp::<u64, _>(&ctx.pd, &send_cq, &recv_cq, &recv_config, |_cqe, _entry| {
-        })
+        .create_ud_qp::<u64, _>(&ctx.pd, &send_cq, &recv_cq, &recv_config, |_cqe, _entry| {})
         .expect("Failed to create receiver QP");
     receiver
         .borrow_mut()
@@ -296,10 +293,16 @@ fn test_ud_send_raw_av() {
     let mut recv_buf = AlignedBuffer::new(4096);
 
     // Register memory regions
-    let send_mr = unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }
-        .expect("Failed to register send MR");
-    let recv_mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
-        .expect("Failed to register recv MR");
+    let send_mr = unsafe {
+        ctx.pd
+            .register(send_buf.as_ptr(), send_buf.size(), full_access())
+    }
+    .expect("Failed to register send MR");
+    let recv_mr = unsafe {
+        ctx.pd
+            .register(recv_buf.as_ptr(), recv_buf.size(), full_access())
+    }
+    .expect("Failed to register recv MR");
 
     // Post receive
     let recv_len = 256 + GRH_SIZE as u32;
@@ -417,9 +420,11 @@ fn test_ud_multiple_destinations() {
             .expect(&format!("Failed to activate receiver {}", i));
 
         let recv_buf = AlignedBuffer::new(4096);
-        let recv_mr =
-            unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
-                .expect("Failed to register recv MR");
+        let recv_mr = unsafe {
+            ctx.pd
+                .register(recv_buf.as_ptr(), recv_buf.size(), full_access())
+        }
+        .expect("Failed to register recv MR");
 
         // Post receive
         receiver
@@ -437,8 +442,11 @@ fn test_ud_multiple_destinations() {
 
     // Send buffer
     let mut send_buf = AlignedBuffer::new(4096);
-    let send_mr = unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }
-        .expect("Failed to register send MR");
+    let send_mr = unsafe {
+        ctx.pd
+            .register(send_buf.as_ptr(), send_buf.size(), full_access())
+    }
+    .expect("Failed to register send MR");
 
     // Send to each receiver
     for (i, receiver) in receivers.iter().enumerate() {
@@ -465,8 +473,8 @@ fn test_ud_multiple_destinations() {
             .finish_with_blueflame();
 
         // Poll send CQ
-        let send_cqe = poll_cq_timeout(&cq, 5000)
-            .expect(&format!("Send CQE timeout for receiver {}", i));
+        let send_cqe =
+            poll_cq_timeout(&cq, 5000).expect(&format!("Send CQE timeout for receiver {}", i));
         assert_eq!(
             send_cqe.syndrome, 0,
             "Send CQE error for receiver {}: syndrome={}",
@@ -474,8 +482,8 @@ fn test_ud_multiple_destinations() {
         );
 
         // Poll recv CQ
-        let recv_cqe = poll_cq_timeout(&recv_cq, 5000)
-            .expect(&format!("Recv CQE timeout for receiver {}", i));
+        let recv_cqe =
+            poll_cq_timeout(&recv_cq, 5000).expect(&format!("Recv CQE timeout for receiver {}", i));
         assert_eq!(
             recv_cqe.syndrome, 0,
             "Recv CQE error for receiver {}: syndrome={}",
@@ -557,17 +565,26 @@ fn test_ud_post_nop_to_ring_end() {
     let mut send_buf = AlignedBuffer::new(4096);
     let mut recv_buf = AlignedBuffer::new(4096);
 
-    let send_mr = unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }
-        .expect("Failed to register send MR");
-    let recv_mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
-        .expect("Failed to register recv MR");
+    let send_mr = unsafe {
+        ctx.pd
+            .register(send_buf.as_ptr(), send_buf.size(), full_access())
+    }
+    .expect("Failed to register send MR");
+    let recv_mr = unsafe {
+        ctx.pd
+            .register(recv_buf.as_ptr(), recv_buf.size(), full_access())
+    }
+    .expect("Failed to register recv MR");
 
     let remote_info = RemoteUdQpInfo {
         qpn: receiver.borrow().qpn(),
         qkey,
         lid: ctx.port_attr.lid,
     };
-    let ah = ctx.pd.create_ah(ctx.port, &remote_info).expect("Failed to create AH");
+    let ah = ctx
+        .pd
+        .create_ah(ctx.port, &remote_info)
+        .expect("Failed to create AH");
 
     let test_data = b"test";
     send_buf.fill_bytes(test_data);
@@ -604,7 +621,10 @@ fn test_ud_post_nop_to_ring_end() {
     println!("Slots to ring end before NOP: {}", slots_before);
 
     // Post NOP WQEs to fill remaining slots
-    sender.borrow().post_nop_to_ring_end().expect("post_nop_to_ring_end failed");
+    sender
+        .borrow()
+        .post_nop_to_ring_end()
+        .expect("post_nop_to_ring_end failed");
 
     let slots_after = sender.borrow().slots_to_ring_end();
     println!("Slots to ring end after NOP: {}", slots_after);

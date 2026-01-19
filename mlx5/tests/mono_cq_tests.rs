@@ -12,7 +12,7 @@ use mlx5::cq::Cqe;
 use mlx5::qp::{RcQpConfig, RcQpForMonoCq, RemoteQpInfo};
 use mlx5::wqe::{WqeFlags, WqeOpcode};
 
-use common::{full_access, AlignedBuffer, TestContext};
+use common::{AlignedBuffer, TestContext, full_access};
 
 /// Test MonoCq creation and basic properties.
 #[test]
@@ -33,7 +33,10 @@ fn test_mono_cq_creation() {
         .expect("Failed to create MonoCq");
 
     // Verify as_ptr returns non-null
-    assert!(!mono_cq.as_ptr().is_null(), "MonoCq as_ptr should not be null");
+    assert!(
+        !mono_cq.as_ptr().is_null(),
+        "MonoCq as_ptr should not be null"
+    );
 
     println!("MonoCq creation test passed!");
 }
@@ -128,12 +131,16 @@ fn test_mono_cq_with_rc_qp() {
     let mut local_buf = AlignedBuffer::new(4096);
     let mut remote_buf = AlignedBuffer::new(4096);
 
-    let local_mr =
-        unsafe { ctx.pd.register(local_buf.as_ptr(), local_buf.size(), full_access()) }
-            .expect("Failed to register local MR");
-    let remote_mr =
-        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
-            .expect("Failed to register remote MR");
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
 
     let test_data = b"MonoCq test data";
     local_buf.fill_bytes(test_data);
@@ -297,12 +304,16 @@ fn test_mono_cq_multiple_completions() {
     let mut local_buf = AlignedBuffer::new(4096);
     let remote_buf = AlignedBuffer::new(4096);
 
-    let local_mr =
-        unsafe { ctx.pd.register(local_buf.as_ptr(), local_buf.size(), full_access()) }
-            .expect("Failed to register local MR");
-    let remote_mr =
-        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
-            .expect("Failed to register remote MR");
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
 
     let test_data = b"Multi completion test";
     local_buf.fill_bytes(test_data);
@@ -441,12 +452,16 @@ fn test_mono_cq_high_load() {
     let mut local_buf = AlignedBuffer::new(64 * 1024);
     let remote_buf = AlignedBuffer::new(64 * 1024);
 
-    let local_mr =
-        unsafe { ctx.pd.register(local_buf.as_ptr(), local_buf.size(), full_access()) }
-            .expect("Failed to register local MR");
-    let remote_mr =
-        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
-            .expect("Failed to register remote MR");
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
 
     local_buf.fill(0xAB);
 
@@ -586,12 +601,16 @@ fn test_mono_cq_recv_rdma_write_imm() {
     let mut send_buf = AlignedBuffer::new(4096);
     let mut recv_buf = AlignedBuffer::new(4096);
 
-    let send_mr =
-        unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }
-            .expect("Failed to register send MR");
-    let recv_mr =
-        unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
-            .expect("Failed to register recv MR");
+    let send_mr = unsafe {
+        ctx.pd
+            .register(send_buf.as_ptr(), send_buf.size(), full_access())
+    }
+    .expect("Failed to register send MR");
+    let recv_mr = unsafe {
+        ctx.pd
+            .register(recv_buf.as_ptr(), recv_buf.size(), full_access())
+    }
+    .expect("Failed to register recv MR");
 
     send_buf.fill(0xCD);
     recv_buf.fill(0);
@@ -652,7 +671,11 @@ fn test_mono_cq_recv_rdma_write_imm() {
 
     // Verify recv completions have correct IMM data
     let recv_comps = recv_completions.borrow();
-    assert_eq!(recv_comps.len(), num_ops, "Should have all recv completions");
+    assert_eq!(
+        recv_comps.len(),
+        num_ops,
+        "Should have all recv completions"
+    );
 
     for (imm, entry) in recv_comps.iter() {
         println!("Recv completion: entry={}, imm={}", entry, imm);
@@ -762,10 +785,8 @@ fn test_mono_cq_bidirectional_pingpong() {
     let mut buf1 = AlignedBuffer::new(16 * 1024);
     let mut buf2 = AlignedBuffer::new(16 * 1024);
 
-    let mr1 = unsafe { ctx.pd.register(buf1.as_ptr(), buf1.size(), full_access()) }
-        .expect("mr1");
-    let mr2 = unsafe { ctx.pd.register(buf2.as_ptr(), buf2.size(), full_access()) }
-        .expect("mr2");
+    let mr1 = unsafe { ctx.pd.register(buf1.as_ptr(), buf1.size(), full_access()) }.expect("mr1");
+    let mr2 = unsafe { ctx.pd.register(buf2.as_ptr(), buf2.size(), full_access()) }.expect("mr2");
 
     buf1.fill(0x11);
     buf2.fill(0x22);
@@ -1094,12 +1115,16 @@ fn test_mono_cq_rx_compression() {
     let mut send_buf = AlignedBuffer::new(4096);
     let mut recv_buf = AlignedBuffer::new(4096);
 
-    let send_mr =
-        unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }
-            .expect("Failed to register send MR");
-    let recv_mr =
-        unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
-            .expect("Failed to register recv MR");
+    let send_mr = unsafe {
+        ctx.pd
+            .register(send_buf.as_ptr(), send_buf.size(), full_access())
+    }
+    .expect("Failed to register send MR");
+    let recv_mr = unsafe {
+        ctx.pd
+            .register(recv_buf.as_ptr(), recv_buf.size(), full_access())
+    }
+    .expect("Failed to register recv MR");
 
     send_buf.fill(0xCD);
     recv_buf.fill(0);
@@ -1118,7 +1143,10 @@ fn test_mono_cq_rx_compression() {
     }
     qp1.borrow().ring_rq_doorbell();
 
-    println!("Testing RX CQ compression with {} RDMA WRITE IMM operations...", num_ops);
+    println!(
+        "Testing RX CQ compression with {} RDMA WRITE IMM operations...",
+        num_ops
+    );
 
     // QP2 sends RDMA WRITE IMM to QP1 (this generates RX completions on QP1)
     for i in 0..num_ops {
@@ -1219,7 +1247,10 @@ fn test_rx_compression_benchmark() {
         let elapsed = {
             let recv_cq = ctx
                 .ctx
-                .create_mono_cq_rx_compressed::<RcQpForMonoCq<u64>, _>(NUM_OPS as i32 * 2, recv_callback)
+                .create_mono_cq_rx_compressed::<RcQpForMonoCq<u64>, _>(
+                    NUM_OPS as i32 * 2,
+                    recv_callback,
+                )
                 .expect("Failed to create recv MonoCq with compression");
 
             run_benchmark_inner(&ctx, recv_cq, &recv_completions, NUM_OPS, CHUNK_SIZE)
@@ -1231,17 +1262,31 @@ fn test_rx_compression_benchmark() {
     }
 
     // Skip first iteration (warmup) and calculate averages
-    let non_comp_avg: std::time::Duration = non_comp_times[1..].iter().sum::<std::time::Duration>() / (ITERATIONS - 1);
-    let comp_avg: std::time::Duration = comp_times[1..].iter().sum::<std::time::Duration>() / (ITERATIONS - 1);
+    let non_comp_avg: std::time::Duration =
+        non_comp_times[1..].iter().sum::<std::time::Duration>() / (ITERATIONS - 1);
+    let comp_avg: std::time::Duration =
+        comp_times[1..].iter().sum::<std::time::Duration>() / (ITERATIONS - 1);
 
     let non_comp_throughput = NUM_OPS as f64 / non_comp_avg.as_secs_f64() / 1_000_000.0;
     let comp_throughput = NUM_OPS as f64 / comp_avg.as_secs_f64() / 1_000_000.0;
 
     println!();
-    println!("Results (average of {} iterations, excluding warmup):", ITERATIONS - 1);
-    println!("  Non-compression: {:?} ({:.2} Mops/s)", non_comp_avg, non_comp_throughput);
-    println!("  Compression:     {:?} ({:.2} Mops/s)", comp_avg, comp_throughput);
-    println!("  Overhead:        {:.1}%", (comp_avg.as_nanos() as f64 / non_comp_avg.as_nanos() as f64 - 1.0) * 100.0);
+    println!(
+        "Results (average of {} iterations, excluding warmup):",
+        ITERATIONS - 1
+    );
+    println!(
+        "  Non-compression: {:?} ({:.2} Mops/s)",
+        non_comp_avg, non_comp_throughput
+    );
+    println!(
+        "  Compression:     {:?} ({:.2} Mops/s)",
+        comp_avg, comp_throughput
+    );
+    println!(
+        "  Overhead:        {:.1}%",
+        (comp_avg.as_nanos() as f64 / non_comp_avg.as_nanos() as f64 - 1.0) * 100.0
+    );
 }
 
 fn run_benchmark_inner<F>(
@@ -1310,12 +1355,16 @@ where
     let mut send_buf = AlignedBuffer::new((num_ops * chunk_size) as usize);
     let mut recv_buf = AlignedBuffer::new((num_ops * chunk_size) as usize);
 
-    let send_mr =
-        unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }
-            .expect("Failed to register send MR");
-    let recv_mr =
-        unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
-            .expect("Failed to register recv MR");
+    let send_mr = unsafe {
+        ctx.pd
+            .register(send_buf.as_ptr(), send_buf.size(), full_access())
+    }
+    .expect("Failed to register send MR");
+    let recv_mr = unsafe {
+        ctx.pd
+            .register(recv_buf.as_ptr(), recv_buf.size(), full_access())
+    }
+    .expect("Failed to register recv MR");
 
     send_buf.fill(0xCD);
     recv_buf.fill(0);
@@ -1347,7 +1396,6 @@ where
             .finish();
     }
     qp2.borrow().ring_sq_doorbell();
-
 
     // Measure poll time
     let start = std::time::Instant::now();

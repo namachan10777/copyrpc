@@ -167,8 +167,7 @@ pub fn poll_cq_batch(
         if start.elapsed() > timeout {
             return Err(format!(
                 "Timeout: got {} of {} completions",
-                completions_count,
-                count
+                completions_count, count
             ));
         }
         std::hint::spin_loop();
@@ -271,7 +270,11 @@ pub fn is_dct_supported(ctx: &TestContext) -> bool {
     match dct.modify_to_init(ctx.port, access) {
         Ok(_) => eprintln!("  DCT check: INIT succeeded"),
         Err(e) => {
-            eprintln!("  DCT check: INIT failed: {} (raw: {:?})", e, e.raw_os_error());
+            eprintln!(
+                "  DCT check: INIT failed: {} (raw: {:?})",
+                e,
+                e.raw_os_error()
+            );
             return false;
         }
     }
@@ -282,7 +285,11 @@ pub fn is_dct_supported(ctx: &TestContext) -> bool {
             true
         }
         Err(e) => {
-            eprintln!("  DCT check: RTR failed: {} (raw: {:?})", e, e.raw_os_error());
+            eprintln!(
+                "  DCT check: RTR failed: {} (raw: {:?})",
+                e,
+                e.raw_os_error()
+            );
             false
         }
     }
@@ -293,8 +300,8 @@ pub fn is_dct_supported(ctx: &TestContext) -> bool {
 /// TM-SRQ creation requires kernel driver support that may not be available
 /// on all systems. Returns true if TM-SRQ can be created.
 pub fn is_tm_srq_supported(ctx: &TestContext) -> bool {
-    use std::rc::Rc;
     use mlx5::tm_srq::TmSrqConfig;
+    use std::rc::Rc;
 
     // First check device TM capabilities
     match ctx.ctx.query_tm_caps() {
@@ -325,21 +332,30 @@ pub fn is_tm_srq_supported(ctx: &TestContext) -> bool {
 
     // Use power of 2 for max_wr and reasonable values for TM params
     let config = TmSrqConfig {
-        max_wr: 256,  // Must be power of 2 for SRQ
+        max_wr: 256, // Must be power of 2 for SRQ
         max_sge: 1,
-        max_num_tags: 64,  // Within device max of 127
+        max_num_tags: 64, // Within device max of 127
         max_ops: 16,
     };
-    eprintln!("  TM-SRQ check: trying config: max_wr={}, max_num_tags={}, max_ops={}",
-              config.max_wr, config.max_num_tags, config.max_ops);
+    eprintln!(
+        "  TM-SRQ check: trying config: max_wr={}, max_num_tags={}, max_ops={}",
+        config.max_wr, config.max_num_tags, config.max_ops
+    );
 
-    match ctx.ctx.create_tm_srq::<u64, u64, _>(&ctx.pd, &cq, &config, |_| {}) {
+    match ctx
+        .ctx
+        .create_tm_srq::<u64, u64, _>(&ctx.pd, &cq, &config, |_| {})
+    {
         Ok(_) => {
             eprintln!("  TM-SRQ check: creation succeeded");
             true
         }
         Err(e) => {
-            eprintln!("  TM-SRQ check: creation failed: {} (raw: {:?})", e, e.raw_os_error());
+            eprintln!(
+                "  TM-SRQ check: creation failed: {} (raw: {:?})",
+                e,
+                e.raw_os_error()
+            );
             false
         }
     }
@@ -361,7 +377,9 @@ macro_rules! require_dct {
 macro_rules! require_tm_srq {
     ($ctx:expr) => {{
         if !$crate::common::is_tm_srq_supported($ctx) {
-            eprintln!("Skipping test: TM-SRQ not supported via verbs API (kernel/driver limitation)");
+            eprintln!(
+                "Skipping test: TM-SRQ not supported via verbs API (kernel/driver limitation)"
+            );
             return;
         }
     }};

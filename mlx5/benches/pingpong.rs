@@ -11,13 +11,13 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use mlx5::cq::{Cqe, CqeOpcode};
 use mlx5::device::{Context, DeviceList};
@@ -138,7 +138,8 @@ impl SharedCqeState {
             let idx = (cqe.imm as usize) % QUEUE_DEPTH;
             self.rx_indices.borrow_mut()[count] = idx;
             self.rx_sizes.borrow_mut()[count] = cqe.byte_cnt.min(256);
-            self.rx_is_write_imm.borrow_mut()[count] = matches!(cqe.opcode, CqeOpcode::RespRdmaWriteImm);
+            self.rx_is_write_imm.borrow_mut()[count] =
+                matches!(cqe.opcode, CqeOpcode::RespRdmaWriteImm);
             self.rx_count.set(count + 1);
         }
     }
@@ -163,7 +164,6 @@ impl Drop for ServerHandle {
         self.stop();
     }
 }
-
 
 // =============================================================================
 // MonoCq Endpoint State (for inlined callback benchmark)
@@ -213,13 +213,7 @@ fn open_mlx5_device() -> Option<Context> {
     None
 }
 
-
-fn setup_mono_cq_benchmark() -> Option<
-    MonoCqBenchmarkSetup<
-        impl Fn(Cqe, u64),
-        impl Fn(Cqe, u64),
-    >,
-> {
+fn setup_mono_cq_benchmark() -> Option<MonoCqBenchmarkSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u64)>> {
     let ctx = open_mlx5_device()?;
     let port = 1u8;
     let port_attr = ctx.query_port(port).ok()?;
@@ -264,10 +258,8 @@ fn setup_mono_cq_benchmark() -> Option<
     let send_buf = AlignedBuffer::new(BUFFER_SIZE);
     let recv_buf = AlignedBuffer::new(BUFFER_SIZE);
 
-    let send_mr =
-        unsafe { pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }.ok()?;
-    let recv_mr =
-        unsafe { pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }.ok()?;
+    let send_mr = unsafe { pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }.ok()?;
+    let recv_mr = unsafe { pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }.ok()?;
 
     // Connection info
     let client_info = ConnectionInfo {
@@ -386,7 +378,8 @@ impl ServerSharedState {
             let idx = (cqe.imm as usize) % QUEUE_DEPTH;
             self.rx_indices.borrow_mut()[count] = idx;
             self.rx_sizes.borrow_mut()[count] = cqe.byte_cnt.min(256);
-            self.rx_is_write_imm.borrow_mut()[count] = matches!(cqe.opcode, CqeOpcode::RespRdmaWriteImm);
+            self.rx_is_write_imm.borrow_mut()[count] =
+                matches!(cqe.opcode, CqeOpcode::RespRdmaWriteImm);
             self.rx_count.set(count + 1);
         }
     }
@@ -634,7 +627,11 @@ fn server_thread_main(
 // =============================================================================
 
 /// Throughput benchmark using MonoCq with builder API for inlined callback dispatch.
-fn run_throughput_bench_mono_cq<SF, RF>(client: &mut MonoCqEndpointState<SF, RF>, iters: u64, size: usize) -> Duration
+fn run_throughput_bench_mono_cq<SF, RF>(
+    client: &mut MonoCqEndpointState<SF, RF>,
+    iters: u64,
+    size: usize,
+) -> Duration
 where
     SF: Fn(Cqe, u64),
     RF: Fn(Cqe, u64),
@@ -791,9 +788,12 @@ where
 // Criterion Benchmarks
 // =============================================================================
 
-
 /// Low-latency benchmark using MonoCq with builder + blueflame.
-fn run_lowlatency_bench_mono_cq<SF, RF>(client: &mut MonoCqEndpointState<SF, RF>, iters: u64, size: usize) -> Duration
+fn run_lowlatency_bench_mono_cq<SF, RF>(
+    client: &mut MonoCqEndpointState<SF, RF>,
+    iters: u64,
+    size: usize,
+) -> Duration
 where
     SF: Fn(Cqe, u64),
     RF: Fn(Cqe, u64),
@@ -872,15 +872,11 @@ fn benchmarks(c: &mut Criterion) {
         group.measurement_time(Duration::from_secs(3));
         group.throughput(Throughput::Elements(1));
 
-        group.bench_with_input(
-            BenchmarkId::new("builder", size),
-            &size,
-            |b, &size| {
-                b.iter_custom(|iters| {
-                    run_throughput_bench_mono_cq(&mut client.borrow_mut(), iters, size)
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("builder", size), &size, |b, &size| {
+            b.iter_custom(|iters| {
+                run_throughput_bench_mono_cq(&mut client.borrow_mut(), iters, size)
+            });
+        });
 
         group.finish();
     }
@@ -891,15 +887,11 @@ fn benchmarks(c: &mut Criterion) {
         group.sample_size(10);
         group.measurement_time(Duration::from_secs(1));
 
-        group.bench_with_input(
-            BenchmarkId::new("blueflame", size),
-            &size,
-            |b, &size| {
-                b.iter_custom(|iters| {
-                    run_lowlatency_bench_mono_cq(&mut client.borrow_mut(), iters, size)
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("blueflame", size), &size, |b, &size| {
+            b.iter_custom(|iters| {
+                run_lowlatency_bench_mono_cq(&mut client.borrow_mut(), iters, size)
+            });
+        });
 
         group.finish();
     }

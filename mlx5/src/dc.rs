@@ -8,6 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::{io, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
+use crate::CompletionTarget;
 use crate::cq::{CompletionQueue, Cqe};
 use crate::device::Context;
 use crate::pd::Pd;
@@ -17,7 +18,6 @@ use crate::wqe::{
     AddressVector, CtrlSeg, DataSeg, InlineHeader, OrderedWqeTable, RdmaSeg, WQEBB_SIZE, WqeFlags,
     WqeHandle, WqeOpcode, calc_wqebb_cnt,
 };
-use crate::CompletionTarget;
 
 /// DCI configuration.
 #[derive(Debug, Clone)]
@@ -414,7 +414,11 @@ impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType> {
 
     /// Handle WQE wrap-around with BlueFlame doorbell.
     #[cold]
-    fn finish_with_wrap_around_blueflame(self, wqebb_cnt: u16, slots_to_end: u16) -> io::Result<WqeHandle> {
+    fn finish_with_wrap_around_blueflame(
+        self,
+        wqebb_cnt: u16,
+        slots_to_end: u16,
+    ) -> io::Result<WqeHandle> {
         // Check if we have enough space for NOP + WQE
         let total_needed = slots_to_end + wqebb_cnt;
         if self.sq.available() < total_needed {
@@ -981,7 +985,6 @@ impl<Entry, OnComplete> DciWithTable<Entry, OnComplete> {
     }
 }
 
-
 // =============================================================================
 // CompletionTarget impl for DciWithTable
 // =============================================================================
@@ -1164,12 +1167,7 @@ impl<T> Dct<T> {
     /// Activate DCT (transition to RTR).
     ///
     /// DCT does not need RTS state, RTR is sufficient for receiving.
-    pub fn activate(
-        &mut self,
-        port: u8,
-        access_flags: u32,
-        min_rnr_timer: u8,
-    ) -> io::Result<()> {
+    pub fn activate(&mut self, port: u8, access_flags: u32, min_rnr_timer: u8) -> io::Result<()> {
         self.modify_to_init(port, access_flags)?;
         self.modify_to_rtr(port, min_rnr_timer)?;
         Ok(())

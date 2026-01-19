@@ -131,7 +131,12 @@ pub unsafe fn ibv_query_device_ex_ex(
     if vctx.is_null() {
         -1
     } else if let Some(query_fn) = (*vctx).query_device_ex {
-        query_fn(context, input, attr, std::mem::size_of::<ibv_device_attr_ex>())
+        query_fn(
+            context,
+            input,
+            attr,
+            std::mem::size_of::<ibv_device_attr_ex>(),
+        )
     } else {
         -1
     }

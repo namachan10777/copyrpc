@@ -19,13 +19,13 @@ mod common;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use mlx5::Cqe;
 use mlx5::cq::CqeOpcode;
 use mlx5::dc::DciConfig;
 use mlx5::tm_srq::{TmSrqCompletion, TmSrqConfig};
 use mlx5::wqe::WqeOpcode;
-use mlx5::Cqe;
 
-use common::{full_access, AlignedBuffer, TestContext};
+use common::{AlignedBuffer, TestContext, full_access};
 
 // =============================================================================
 // TM-SRQ Creation Tests
@@ -43,9 +43,7 @@ fn test_tm_srq_creation() {
 
     require_tm_srq!(&ctx);
 
-    let cq = Rc::new(
-        ctx.ctx.create_cq(256).expect("Failed to create CQ"),
-    );
+    let cq = Rc::new(ctx.ctx.create_cq(256).expect("Failed to create CQ"));
 
     let config = TmSrqConfig {
         max_wr: 256,
@@ -98,7 +96,10 @@ fn test_tm_srq_direct_access() {
 
     // Direct access is auto-initialized at creation
     println!("TM-SRQ direct access test passed!");
-    println!("  Command QP available: {}", tm_srq.borrow().cmd_optimistic_available());
+    println!(
+        "  Command QP available: {}",
+        tm_srq.borrow().cmd_optimistic_available()
+    );
 }
 
 // =============================================================================
@@ -132,31 +133,36 @@ fn test_tm_tag_add_remove() {
 
     let tm_srq = ctx
         .ctx
-        .create_tm_srq::<u64, u64, _>(&ctx.pd, &cq, &config, move |completion| {
-            match completion {
-                TmSrqCompletion::CmdQp(cqe, _entry) => {
-                    cqes_clone.borrow_mut().push(cqe);
-                }
-                TmSrqCompletion::Error(cqe, _) => {
-                    cqes_clone.borrow_mut().push(cqe);
-                }
-                _ => {}
+        .create_tm_srq::<u64, u64, _>(&ctx.pd, &cq, &config, move |completion| match completion {
+            TmSrqCompletion::CmdQp(cqe, _entry) => {
+                cqes_clone.borrow_mut().push(cqe);
             }
+            TmSrqCompletion::Error(cqe, _) => {
+                cqes_clone.borrow_mut().push(cqe);
+            }
+            _ => {}
         })
         .expect("Failed to create TM-SRQ");
 
     // Allocate receive buffer
     let recv_buf = AlignedBuffer::new(4096);
-    let mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
-        .expect("Failed to register MR");
+    let mr = unsafe {
+        ctx.pd
+            .register(recv_buf.as_ptr(), recv_buf.size(), full_access())
+    }
+    .expect("Failed to register MR");
 
     // Add a tag
     let tag: u64 = 0xDEADBEEF_CAFEBABE;
     let tag_index: u16 = 0;
 
-    println!("Cmd QP available slots: {}", tm_srq.borrow().cmd_optimistic_available());
+    println!(
+        "Cmd QP available slots: {}",
+        tm_srq.borrow().cmd_optimistic_available()
+    );
 
-    let handle = tm_srq.borrow_mut()
+    let handle = tm_srq
+        .borrow_mut()
         .cmd_wqe_builder(1u64)
         .expect("cmd_wqe_builder failed")
         .ctrl(WqeOpcode::TagMatching, 0)
@@ -179,12 +185,21 @@ fn test_tm_tag_add_remove() {
     cq.flush();
 
     let add_cqe = captured_cqes.borrow()[0].clone();
-    println!("Add CQE: opcode={:?}, wqe_counter={}, qp_num=0x{:x}, syndrome={}",
-        add_cqe.opcode, add_cqe.wqe_counter, add_cqe.qp_num, add_cqe.syndrome);
+    println!(
+        "Add CQE: opcode={:?}, wqe_counter={}, qp_num=0x{:x}, syndrome={}",
+        add_cqe.opcode, add_cqe.wqe_counter, add_cqe.qp_num, add_cqe.syndrome
+    );
     // TM operations should complete without error (syndrome == 0)
-    assert_eq!(add_cqe.syndrome, 0, "TAG_ADD failed with syndrome={}", add_cqe.syndrome);
+    assert_eq!(
+        add_cqe.syndrome, 0,
+        "TAG_ADD failed with syndrome={}",
+        add_cqe.syndrome
+    );
     // Opcode may be TmFinish or Req depending on hardware/CQE compression
-    println!("  (opcode {:?} is acceptable for TM operations)", add_cqe.opcode);
+    println!(
+        "  (opcode {:?} is acceptable for TM operations)",
+        add_cqe.opcode
+    );
 
     println!("Tag added: index={}, tag=0x{:016x}", tag_index, tag);
 
@@ -192,7 +207,8 @@ fn test_tm_tag_add_remove() {
     captured_cqes.borrow_mut().clear();
 
     // Remove the tag
-    tm_srq.borrow_mut()
+    tm_srq
+        .borrow_mut()
         .cmd_wqe_builder(2u64)
         .expect("cmd_wqe_builder failed")
         .ctrl(WqeOpcode::TagMatching, 0)
@@ -211,11 +227,20 @@ fn test_tm_tag_add_remove() {
     cq.flush();
 
     let del_cqe = captured_cqes.borrow()[0].clone();
-    println!("Del CQE: opcode={:?}, wqe_counter={}, qp_num=0x{:x}, syndrome={}",
-        del_cqe.opcode, del_cqe.wqe_counter, del_cqe.qp_num, del_cqe.syndrome);
+    println!(
+        "Del CQE: opcode={:?}, wqe_counter={}, qp_num=0x{:x}, syndrome={}",
+        del_cqe.opcode, del_cqe.wqe_counter, del_cqe.qp_num, del_cqe.syndrome
+    );
     // TM operations should complete without error (syndrome == 0)
-    assert_eq!(del_cqe.syndrome, 0, "TAG_DEL failed with syndrome={}", del_cqe.syndrome);
-    println!("  (opcode {:?} is acceptable for TM operations)", del_cqe.opcode);
+    assert_eq!(
+        del_cqe.syndrome, 0,
+        "TAG_DEL failed with syndrome={}",
+        del_cqe.syndrome
+    );
+    println!(
+        "  (opcode {:?} is acceptable for TM operations)",
+        del_cqe.opcode
+    );
 
     println!("Tag removed: index={}", tag_index);
     println!("TM tag add/remove test passed!");
@@ -315,16 +340,14 @@ fn test_tm_multiple_tags() {
 
     let tm_srq = ctx
         .ctx
-        .create_tm_srq::<u64, u64, _>(&ctx.pd, &cq, &config, move |completion| {
-            match completion {
-                TmSrqCompletion::CmdQp(cqe, _entry) => {
-                    cqes_clone.borrow_mut().push(cqe);
-                }
-                TmSrqCompletion::Error(cqe, _) => {
-                    cqes_clone.borrow_mut().push(cqe);
-                }
-                _ => {}
+        .create_tm_srq::<u64, u64, _>(&ctx.pd, &cq, &config, move |completion| match completion {
+            TmSrqCompletion::CmdQp(cqe, _entry) => {
+                cqes_clone.borrow_mut().push(cqe);
             }
+            TmSrqCompletion::Error(cqe, _) => {
+                cqes_clone.borrow_mut().push(cqe);
+            }
+            _ => {}
         })
         .expect("Failed to create TM-SRQ");
 
@@ -346,11 +369,19 @@ fn test_tm_multiple_tags() {
         let tag = base_tag + i as u64;
         let prev_count = captured_cqes.borrow().len();
 
-        tm_srq.borrow_mut()
+        tm_srq
+            .borrow_mut()
             .cmd_wqe_builder((i + 1) as u64)
             .expect("cmd_wqe_builder failed")
             .ctrl(WqeOpcode::TagMatching, 0)
-            .tag_add(i, tag, recv_bufs[i as usize].addr(), 256, mrs[i as usize].lkey(), true)
+            .tag_add(
+                i,
+                tag,
+                recv_bufs[i as usize].addr(),
+                256,
+                mrs[i as usize].lkey(),
+                true,
+            )
             .finish_with_blueflame();
 
         // Poll for completion
@@ -365,7 +396,11 @@ fn test_tm_multiple_tags() {
 
         let cqe = captured_cqes.borrow().last().unwrap().clone();
         // TM operations should complete without error (syndrome == 0)
-        assert_eq!(cqe.syndrome, 0, "TAG_ADD for tag {} failed with syndrome={}", i, cqe.syndrome);
+        assert_eq!(
+            cqe.syndrome, 0,
+            "TAG_ADD for tag {} failed with syndrome={}",
+            i, cqe.syndrome
+        );
     }
     cq.flush();
 
@@ -375,7 +410,8 @@ fn test_tm_multiple_tags() {
     for i in 0..8u16 {
         let prev_count = captured_cqes.borrow().len();
 
-        tm_srq.borrow_mut()
+        tm_srq
+            .borrow_mut()
             .cmd_wqe_builder((i + 100) as u64)
             .expect("cmd_wqe_builder failed")
             .ctrl(WqeOpcode::TagMatching, 0)
@@ -394,7 +430,11 @@ fn test_tm_multiple_tags() {
 
         let cqe = captured_cqes.borrow().last().unwrap().clone();
         // TM operations should complete without error (syndrome == 0)
-        assert_eq!(cqe.syndrome, 0, "TAG_DEL for tag {} failed with syndrome={}", i, cqe.syndrome);
+        assert_eq!(
+            cqe.syndrome, 0,
+            "TAG_DEL for tag {} failed with syndrome={}",
+            i, cqe.syndrome
+        );
     }
     cq.flush();
 
@@ -439,13 +479,17 @@ fn test_tm_unordered_recv() {
 
     // Allocate receive buffer for unexpected messages
     let recv_buf = AlignedBuffer::new(4096);
-    let mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
-        .expect("Failed to register MR");
+    let mr = unsafe {
+        ctx.pd
+            .register(recv_buf.as_ptr(), recv_buf.size(), full_access())
+    }
+    .expect("Failed to register MR");
 
     // Post unordered receives (for unexpected messages)
     for i in 0..10u64 {
         let offset = i * 256;
-        tm_srq.borrow_mut()
+        tm_srq
+            .borrow_mut()
             .post_unordered_recv(recv_buf.addr() + offset, 256, mr.lkey(), i)
             .expect("post_unordered_recv failed");
     }
@@ -492,8 +536,11 @@ fn test_tm_tag_via_verbs_api() {
 
     // Allocate receive buffer
     let recv_buf = AlignedBuffer::new(4096);
-    let mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
-        .expect("Failed to register MR");
+    let mr = unsafe {
+        ctx.pd
+            .register(recv_buf.as_ptr(), recv_buf.size(), full_access())
+    }
+    .expect("Failed to register MR");
 
     // Prepare SGE for the tag add operation
     let mut sge = mlx5_sys::ibv_sge {
@@ -521,15 +568,15 @@ fn test_tm_tag_via_verbs_api() {
     // Post TAG_ADD via verbs API
     let mut bad_wr: *mut mlx5_sys::ibv_ops_wr = std::ptr::null_mut();
     let ret = unsafe {
-        mlx5_sys::ibv_post_srq_ops_ex(
-            tm_srq.borrow().as_ptr(),
-            add_wr.as_mut_ptr(),
-            &mut bad_wr,
-        )
+        mlx5_sys::ibv_post_srq_ops_ex(tm_srq.borrow().as_ptr(), add_wr.as_mut_ptr(), &mut bad_wr)
     };
 
     if ret != 0 {
-        eprintln!("ibv_post_srq_ops failed: {} (errno: {})", ret, std::io::Error::last_os_error());
+        eprintln!(
+            "ibv_post_srq_ops failed: {} (errno: {})",
+            ret,
+            std::io::Error::last_os_error()
+        );
         panic!("ibv_post_srq_ops failed");
     }
 
@@ -541,10 +588,15 @@ fn test_tm_tag_via_verbs_api() {
         let ret = unsafe { mlx5_sys::ibv_poll_cq_ex(cq.as_ptr(), 1, wc.as_mut_ptr()) };
         if ret > 0 {
             let wc = unsafe { wc.assume_init() };
-            println!("WC: status={}, opcode={}, vendor_err=0x{:x}, wr_id={}",
-                     wc.status, wc.opcode, wc.vendor_err, wc.wr_id);
+            println!(
+                "WC: status={}, opcode={}, vendor_err=0x{:x}, wr_id={}",
+                wc.status, wc.opcode, wc.vendor_err, wc.wr_id
+            );
             if wc.status != 0 {
-                panic!("TAG_ADD failed: status={}, vendor_err=0x{:x}", wc.status, wc.vendor_err);
+                panic!(
+                    "TAG_ADD failed: status={}, vendor_err=0x{:x}",
+                    wc.status, wc.vendor_err
+                );
             }
             found = true;
             break;
@@ -557,7 +609,10 @@ fn test_tm_tag_via_verbs_api() {
 
     // Get handle for delete operation
     let handle = unsafe { (*add_wr.as_ptr()).tm.handle };
-    println!("Tag added via verbs API: handle={}, tag=0x{:016x}", handle, tag);
+    println!(
+        "Tag added via verbs API: handle={}, tag=0x{:016x}",
+        handle, tag
+    );
 
     // Prepare TAG_DEL work request
     let mut del_wr: MaybeUninit<mlx5_sys::ibv_ops_wr> = MaybeUninit::zeroed();
@@ -572,15 +627,15 @@ fn test_tm_tag_via_verbs_api() {
 
     // Post TAG_DEL via verbs API
     let ret = unsafe {
-        mlx5_sys::ibv_post_srq_ops_ex(
-            tm_srq.borrow().as_ptr(),
-            del_wr.as_mut_ptr(),
-            &mut bad_wr,
-        )
+        mlx5_sys::ibv_post_srq_ops_ex(tm_srq.borrow().as_ptr(), del_wr.as_mut_ptr(), &mut bad_wr)
     };
 
     if ret != 0 {
-        eprintln!("ibv_post_srq_ops (del) failed: {} (errno: {})", ret, std::io::Error::last_os_error());
+        eprintln!(
+            "ibv_post_srq_ops (del) failed: {} (errno: {})",
+            ret,
+            std::io::Error::last_os_error()
+        );
         panic!("ibv_post_srq_ops (del) failed");
     }
 
@@ -591,10 +646,15 @@ fn test_tm_tag_via_verbs_api() {
         let ret = unsafe { mlx5_sys::ibv_poll_cq_ex(cq.as_ptr(), 1, wc2.as_mut_ptr()) };
         if ret > 0 {
             let wc = unsafe { wc2.assume_init() };
-            println!("Del WC: status={}, opcode={}, vendor_err=0x{:x}, wr_id={}",
-                     wc.status, wc.opcode, wc.vendor_err, wc.wr_id);
+            println!(
+                "Del WC: status={}, opcode={}, vendor_err=0x{:x}, wr_id={}",
+                wc.status, wc.opcode, wc.vendor_err, wc.wr_id
+            );
             if wc.status != 0 {
-                panic!("TAG_DEL failed: status={}, vendor_err=0x{:x}", wc.status, wc.vendor_err);
+                panic!(
+                    "TAG_DEL failed: status={}, vendor_err=0x{:x}",
+                    wc.status, wc.vendor_err
+                );
             }
             found2 = true;
             break;

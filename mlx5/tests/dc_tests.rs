@@ -22,7 +22,7 @@ use mlx5::dc::{DciConfig, DctConfig};
 use mlx5::srq::SrqConfig;
 use mlx5::wqe::{WqeFlags, WqeOpcode};
 
-use common::{full_access, poll_cq_timeout, AlignedBuffer, TestContext};
+use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
 // =============================================================================
 // DC Creation Tests
@@ -41,9 +41,7 @@ fn test_dc_creation() {
     require_dct!(&ctx);
 
     // Create CQ for DCI
-    let dci_cq = Rc::new(
-        ctx.ctx.create_cq(256).expect("Failed to create DCI CQ"),
-    );
+    let dci_cq = Rc::new(ctx.ctx.create_cq(256).expect("Failed to create DCI CQ"));
 
     // Create CQ for DCT (receives go to SRQ completion)
     let dct_cq = ctx.ctx.create_cq(256).expect("Failed to create DCT CQ");
@@ -154,11 +152,16 @@ fn test_dc_rdma_write() {
     let mut remote_buf = AlignedBuffer::new(4096);
 
     // Register memory regions
-    let local_mr = unsafe { ctx.pd.register(local_buf.as_ptr(), local_buf.size(), full_access()) }
-        .expect("Failed to register local MR");
-    let remote_mr =
-        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
-            .expect("Failed to register remote MR");
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
 
     // Prepare test data
     let test_data = b"DC RDMA WRITE test - connectionless one-sided write!";
@@ -253,11 +256,16 @@ fn test_dc_rdma_read() {
     let mut remote_buf = AlignedBuffer::new(4096);
 
     // Register memory regions
-    let local_mr = unsafe { ctx.pd.register(local_buf.as_ptr(), local_buf.size(), full_access()) }
-        .expect("Failed to register local MR");
-    let remote_mr =
-        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
-            .expect("Failed to register remote MR");
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
 
     // Prepare remote data (this is what we will READ)
     let test_data = b"DC RDMA READ test - connectionless one-sided read!";
@@ -361,9 +369,11 @@ fn test_dc_multiple_dci() {
         .iter()
         .map(|buf| unsafe { ctx.pd.register(buf.as_ptr(), buf.size(), full_access()) }.unwrap())
         .collect();
-    let remote_mr =
-        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
-            .expect("Failed to register remote MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
 
     // Each DCI writes to a different offset in the remote buffer
     for (i, dci) in dcis.iter().enumerate() {
@@ -385,8 +395,7 @@ fn test_dc_multiple_dci() {
             .finish_with_blueflame();
 
         // Poll for this DCI's completion
-        let cqe = poll_cq_timeout(&dci_cq, 5000)
-            .expect(&format!("CQE timeout for DCI {}", i));
+        let cqe = poll_cq_timeout(&dci_cq, 5000).expect(&format!("CQE timeout for DCI {}", i));
         assert_eq!(
             cqe.syndrome, 0,
             "CQE error for DCI {}: syndrome={}",
@@ -400,14 +409,8 @@ fn test_dc_multiple_dci() {
         let expected = format!("Data from DCI {}", i);
         let offset = i * 64;
         let written_ptr = unsafe { remote_buf.as_ptr().add(offset) };
-        let written =
-            unsafe { std::slice::from_raw_parts(written_ptr, expected.len()) };
-        assert_eq!(
-            written,
-            expected.as_bytes(),
-            "Data mismatch for DCI {}",
-            i
-        );
+        let written = unsafe { std::slice::from_raw_parts(written_ptr, expected.len()) };
+        assert_eq!(written, expected.as_bytes(), "Data mismatch for DCI {}", i);
     }
 
     println!("DC multiple DCI test passed!");
@@ -471,9 +474,11 @@ fn test_dc_inline_data() {
     let dlid = ctx.port_attr.lid;
 
     let mut remote_buf = AlignedBuffer::new(4096);
-    let remote_mr =
-        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
-            .expect("Failed to register remote MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
 
     remote_buf.fill(0xBB);
 
@@ -558,12 +563,16 @@ fn test_dc_post_nop_to_ring_end() {
 
     let mut local_buf = AlignedBuffer::new(4096);
     let remote_buf = AlignedBuffer::new(4096);
-    let local_mr =
-        unsafe { ctx.pd.register(local_buf.as_ptr(), local_buf.size(), full_access()) }
-            .expect("Failed to register local MR");
-    let remote_mr =
-        unsafe { ctx.pd.register(remote_buf.as_ptr(), remote_buf.size(), full_access()) }
-            .expect("Failed to register remote MR");
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
 
     local_buf.fill_bytes(b"test");
 
@@ -587,7 +596,9 @@ fn test_dc_post_nop_to_ring_end() {
     println!("Slots to ring end before NOP: {}", slots_before);
 
     // Post NOP WQEs to fill remaining slots
-    dci.borrow().post_nop_to_ring_end().expect("post_nop_to_ring_end failed");
+    dci.borrow()
+        .post_nop_to_ring_end()
+        .expect("post_nop_to_ring_end failed");
 
     let slots_after = dci.borrow().slots_to_ring_end();
     println!("Slots to ring end after NOP: {}", slots_after);

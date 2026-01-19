@@ -170,18 +170,17 @@ impl Context {
             let mut attrs: MaybeUninit<crate::types::Mlx5DeviceAttr> = MaybeUninit::zeroed();
             // Set comp_mask to request all optional fields
             let attrs_ptr = attrs.as_mut_ptr() as *mut mlx5_sys::mlx5dv_context;
-            (*attrs_ptr).comp_mask = (mlx5_sys::mlx5dv_context_comp_mask_MLX5DV_CONTEXT_MASK_CQE_COMPRESION
-                | mlx5_sys::mlx5dv_context_comp_mask_MLX5DV_CONTEXT_MASK_SWP
-                | mlx5_sys::mlx5dv_context_comp_mask_MLX5DV_CONTEXT_MASK_STRIDING_RQ
-                | mlx5_sys::mlx5dv_context_comp_mask_MLX5DV_CONTEXT_MASK_TUNNEL_OFFLOADS
-                | mlx5_sys::mlx5dv_context_comp_mask_MLX5DV_CONTEXT_MASK_DYN_BFREGS
-                | mlx5_sys::mlx5dv_context_comp_mask_MLX5DV_CONTEXT_MASK_CLOCK_INFO_UPDATE
-                | mlx5_sys::mlx5dv_context_comp_mask_MLX5DV_CONTEXT_MASK_DC_ODP_CAPS
-                | mlx5_sys::mlx5dv_context_comp_mask_MLX5DV_CONTEXT_MASK_DCI_STREAMS) as u64;
-            let ret = mlx5_sys::mlx5dv_query_device(
-                self.as_ptr(),
-                attrs_ptr,
-            );
+            (*attrs_ptr).comp_mask =
+                (mlx5_sys::mlx5dv_context_comp_mask_MLX5DV_CONTEXT_MASK_CQE_COMPRESION
+                    | mlx5_sys::mlx5dv_context_comp_mask_MLX5DV_CONTEXT_MASK_SWP
+                    | mlx5_sys::mlx5dv_context_comp_mask_MLX5DV_CONTEXT_MASK_STRIDING_RQ
+                    | mlx5_sys::mlx5dv_context_comp_mask_MLX5DV_CONTEXT_MASK_TUNNEL_OFFLOADS
+                    | mlx5_sys::mlx5dv_context_comp_mask_MLX5DV_CONTEXT_MASK_DYN_BFREGS
+                    | mlx5_sys::mlx5dv_context_comp_mask_MLX5DV_CONTEXT_MASK_CLOCK_INFO_UPDATE
+                    | mlx5_sys::mlx5dv_context_comp_mask_MLX5DV_CONTEXT_MASK_DC_ODP_CAPS
+                    | mlx5_sys::mlx5dv_context_comp_mask_MLX5DV_CONTEXT_MASK_DCI_STREAMS)
+                    as u64;
+            let ret = mlx5_sys::mlx5dv_query_device(self.as_ptr(), attrs_ptr);
             if ret != 0 {
                 return Err(io::Error::from_raw_os_error(-ret));
             }

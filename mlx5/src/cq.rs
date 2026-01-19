@@ -148,8 +148,7 @@ impl CompressedCqeHeader {
     /// - offset 63: op_own (1B) - opcode[7:4]=0x0f (compression marker), owner[0]
     #[inline]
     pub unsafe fn from_ptr(ptr: *const u8, title_opcode: CqeOpcode) -> Self {
-        let qp_num =
-            u32::from_be(std::ptr::read_volatile(ptr.add(56) as *const u32)) & 0x00FF_FFFF;
+        let qp_num = u32::from_be(std::ptr::read_volatile(ptr.add(56) as *const u32)) & 0x00FF_FFFF;
         let base_wqe_counter = u16::from_be(std::ptr::read_volatile(ptr.add(60) as *const u16));
         let mini_cqe_cnt = std::ptr::read_volatile(ptr.add(62));
 
@@ -209,9 +208,14 @@ impl MiniCqeIterator {
         let cqe = unsafe {
             let mini_ptr = self.mini_cqe_ptr.add((self.current as usize) * 8);
             let mini = match self.header.format {
-                MiniCqeFormat::Responder | MiniCqeFormat::ResponderCsum | MiniCqeFormat::L3L4Hash => {
+                MiniCqeFormat::Responder
+                | MiniCqeFormat::ResponderCsum
+                | MiniCqeFormat::L3L4Hash => {
                     // For responder format, wqe_counter is computed from base + offset
-                    let wqe_counter = self.header.base_wqe_counter.wrapping_add(self.current as u16);
+                    let wqe_counter = self
+                        .header
+                        .base_wqe_counter
+                        .wrapping_add(self.current as u16);
                     MiniCqe::from_ptr_responder(mini_ptr, wqe_counter)
                 }
                 MiniCqeFormat::Requester => {

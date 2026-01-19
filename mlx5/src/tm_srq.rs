@@ -40,6 +40,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::{io, mem::MaybeUninit, ptr::NonNull};
 
+use crate::CompletionTarget;
 use crate::cq::{CompletionQueue, Cqe, CqeOpcode};
 use crate::device::Context;
 use crate::pd::Pd;
@@ -47,7 +48,6 @@ use crate::srq::SrqInfo;
 use crate::wqe::{
     CtrlSeg, DataSeg, OrderedWqeTable, TmSeg, UnorderedWqeTable, WQEBB_SIZE, WqeHandle, WqeOpcode,
 };
-use crate::CompletionTarget;
 
 // =============================================================================
 // TM-SRQ Completion Types
@@ -311,7 +311,6 @@ impl<'a, T, Tab> CmdQpWqeBuilder<'a, T, Tab> {
         self.signaled = signaled;
         self
     }
-
 }
 
 impl<'a, T> CmdQpWqeBuilder<'a, T, OrderedWqeTable<T>> {
@@ -445,7 +444,11 @@ impl<'a, U> RqWqeBuilder<'a, U> {
 
         // Extend allocation if we need more WQEBBs
         while self.wqebb_count < required_wqebbs {
-            if !self.srq_state.table.try_extend(self.wqebb_start, self.wqebb_count) {
+            if !self
+                .srq_state
+                .table
+                .try_extend(self.wqebb_start, self.wqebb_count)
+            {
                 // Extension failed, rollback
                 self.srq_state
                     .table
@@ -788,7 +791,9 @@ impl<T, Tab, U, F> TagMatchingSrq<T, Tab, U, F> {
     /// This is a convenience method for the common case.
     /// Call `ring_srq_doorbell()` after posting one or more receive WQEs.
     pub fn post_unordered_recv(&self, addr: u64, len: u32, lkey: u32, entry: U) -> io::Result<()> {
-        self.rq_wqe_builder(entry)?.data_seg(addr, len, lkey)?.finish();
+        self.rq_wqe_builder(entry)?
+            .data_seg(addr, len, lkey)?
+            .finish();
         Ok(())
     }
 
@@ -835,7 +840,10 @@ impl<T, U, F> TagMatchingSrq<T, OrderedWqeTable<T>, U, F> {
     }
 
     /// Get a WQE builder for Command QP tag operations (sparse mode).
-    pub fn cmd_wqe_builder(&self, entry: T) -> io::Result<CmdQpWqeBuilder<'_, T, OrderedWqeTable<T>>> {
+    pub fn cmd_wqe_builder(
+        &self,
+        entry: T,
+    ) -> io::Result<CmdQpWqeBuilder<'_, T, OrderedWqeTable<T>>> {
         let cmd_qp = self.cmd_qp();
         if !cmd_qp.table.is_available(cmd_qp.pi.get()) {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "Command QP full"));
@@ -907,4 +915,3 @@ where
         }
     }
 }
-

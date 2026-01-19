@@ -278,9 +278,10 @@ impl<T> Srq<T> {
     /// Returns `WouldBlock` if the SRQ is full.
     pub fn recv_builder(&self, entry: T) -> io::Result<SrqRecvWqeBuilder<'_, T>> {
         let inner = self.0.borrow();
-        let state = inner.state.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "direct access not initialized")
-        })?;
+        let state = inner
+            .state
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "direct access not initialized"))?;
 
         if state.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SRQ full"));
