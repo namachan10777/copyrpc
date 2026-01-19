@@ -539,17 +539,17 @@ impl Context {
 
             let dv_cq = dv_cq.assume_init();
 
-            // Initialize all CQE owner bits to 1 (invalid) to prevent reading garbage.
-            // The owner bit is at byte 63 of each CQE, bit 0.
-            // When CI = 0, sw_owner = 0, so valid CQEs should have owner = 0.
-            // By setting all owner bits to 1 initially, no garbage CQEs will be consumed.
+            // Initialize all CQEs to look like they are in HW ownership (UCX-style).
+            // op_own byte layout: opcode[7:4] | reserved[3:1] | owner[0]
+            // Set opcode = 0xf (INVALID) and owner = 1.
+            // When CI = 0, sw_owner = 0, so CQEs with owner = 1 will be skipped.
+            // This prevents reading garbage before HW writes valid CQEs.
+            const OP_OWN_INVALID: u8 = 0xf1; // opcode=INVALID(0xf), owner=1
             let buf = dv_cq.buf as *mut u8;
             for i in 0..dv_cq.cqe_cnt {
                 let cqe_ptr = buf.add((i as usize) * (dv_cq.cqe_size as usize));
-                let owner_ptr = cqe_ptr.add(63);
-                // Set owner bit to 1 (keep opcode bits unchanged, set bit 0 = 1)
-                let current = std::ptr::read_volatile(owner_ptr);
-                std::ptr::write_volatile(owner_ptr, current | 1);
+                let op_own_ptr = cqe_ptr.add(63);
+                std::ptr::write_volatile(op_own_ptr, OP_OWN_INVALID);
             }
 
             Ok(CompletionQueue {

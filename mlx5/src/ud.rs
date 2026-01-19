@@ -387,8 +387,6 @@ pub struct UdWqeBuilder<'a, Entry, TableType> {
     offset: usize,
     ds_count: u8,
     signaled: bool,
-    /// Opcode set by ctrl() - used for validation in finish()
-    opcode: Option<WqeOpcode>,
 }
 
 impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
@@ -412,7 +410,6 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
         }
         self.offset = CtrlSeg::SIZE;
         self.ds_count = 1;
-        self.opcode = Some(opcode);
         self
     }
 
@@ -459,52 +456,15 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
         self
     }
 
-    /// Validate the WQE structure based on opcode.
-    ///
-    /// Returns an error if required segments are missing.
-    #[cold]
-    fn validate(&self) -> io::Result<()> {
-        if self.opcode.is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "ctrl() must be called before finish()",
-            ));
-        }
-
-        // UD operations require address vector segment
-        if self.offset < CtrlSeg::SIZE + UdAddressSeg::SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "UD operations require ud_av() segment",
-            ));
-        }
-        Ok(())
-    }
-
-    fn finish_internal(mut self) -> io::Result<WqeHandle> {
-        // Validate WQE structure - unlikely path is marked cold
-        if self.opcode.is_none() || self.offset < CtrlSeg::SIZE + UdAddressSeg::SIZE {
-            self.validate()?;
-        }
-
-        // Clear opcode to prevent Drop warning (finish() was properly called)
-        self.opcode = None;
-
+    /// Finish the WQE construction (internal).
+    #[inline]
+    fn finish_internal(self) -> io::Result<WqeHandle> {
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
         }
 
         let wqebb_cnt = calc_wqebb_cnt(self.offset);
         let wqe_idx = self.wqe_idx;
-
-        // Check for ring wrap-around: WQE must not cross the ring boundary
-        debug_assert!(
-            wqebb_cnt <= self.sq.slots_to_end(),
-            "WQE wrap-around detected: WQE requires {} WQEBBs but only {} slots to ring end. \
-             Call post_nop_to_ring_end() before building large WQEs near ring boundary.",
-            wqebb_cnt,
-            self.sq.slots_to_end()
-        );
 
         self.sq.advance_pi(wqebb_cnt);
         self.sq.set_last_wqe(self.wqe_ptr, self.offset);
@@ -515,15 +475,12 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
         })
     }
 
-    fn finish_internal_with_blueflame(mut self) -> io::Result<WqeHandle> {
-        // Validate WQE structure - unlikely path is marked cold
-        if self.opcode.is_none() || self.offset < CtrlSeg::SIZE + UdAddressSeg::SIZE {
-            self.validate()?;
-        }
-
-        // Clear opcode to prevent Drop warning (finish() was properly called)
-        self.opcode = None;
-
+    /// Finish the WQE construction and immediately ring BlueFlame doorbell.
+    ///
+    /// Use this for low-latency single WQE submission. The doorbell is issued
+    /// immediately, so no need to call `ring_sq_doorbell()` afterwards.
+    #[inline]
+    fn finish_internal_with_blueflame(self) -> io::Result<WqeHandle> {
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
         }
@@ -532,15 +489,6 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
         let wqe_idx = self.wqe_idx;
         let wqe_ptr = self.wqe_ptr;
 
-        // Check for ring wrap-around: WQE must not cross the ring boundary
-        debug_assert!(
-            wqebb_cnt <= self.sq.slots_to_end(),
-            "WQE wrap-around detected: WQE requires {} WQEBBs but only {} slots to ring end. \
-             Call post_nop_to_ring_end() before building large WQEs near ring boundary.",
-            wqebb_cnt,
-            self.sq.slots_to_end()
-        );
-
         self.sq.advance_pi(wqebb_cnt);
         self.sq.ring_blueflame(wqe_ptr);
 
@@ -548,22 +496,6 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
             wqe_idx,
             size: self.offset,
         })
-    }
-}
-
-impl<Entry, TableType> Drop for UdWqeBuilder<'_, Entry, TableType> {
-    fn drop(&mut self) {
-        // finish() consumes self, so if Drop is called, finish() was not called.
-        // The PI has not been advanced, so no rollback is needed.
-        // Emit a warning in debug builds to help identify bugs.
-        #[cfg(debug_assertions)]
-        if self.opcode.is_some() {
-            // ctrl() was called but finish() was not
-            eprintln!(
-                "Warning: UdWqeBuilder dropped without calling finish() at wqe_idx={}",
-                self.wqe_idx
-            );
-        }
     }
 }
 
@@ -1195,7 +1127,6 @@ impl<Entry, OnComplete> UdQpSparseWqeTable<Entry, OnComplete> {
                 offset: 0,
                 ds_count: 0,
                 signaled: true,
-                opcode: None,
             },
             entry: Some(entry),
         })
@@ -1219,7 +1150,6 @@ impl<Entry, OnComplete> UdQpSparseWqeTable<Entry, OnComplete> {
                 offset: 0,
                 ds_count: 0,
                 signaled: false,
-                opcode: None,
             },
             entry: None,
         })
@@ -1302,7 +1232,6 @@ impl<Entry, OnComplete> UdQpDenseWqeTable<Entry, OnComplete> {
                 offset: 0,
                 ds_count: 0,
                 signaled,
-                opcode: None,
             },
             entry,
         })

@@ -189,6 +189,19 @@ impl Context {
 
             let dv_cq = dv_cq.assume_init();
 
+            // Initialize all CQEs to look like they are in HW ownership (UCX-style).
+            // op_own byte layout: opcode[7:4] | reserved[3:1] | owner[0]
+            // Set opcode = 0xf (INVALID) and owner = 1.
+            // When CI = 0, sw_owner = 0, so CQEs with owner = 1 will be skipped.
+            // This prevents reading garbage before HW writes valid CQEs.
+            const OP_OWN_INVALID: u8 = 0xf1; // opcode=INVALID(0xf), owner=1
+            let buf = dv_cq.buf as *mut u8;
+            for i in 0..dv_cq.cqe_cnt {
+                let cqe_ptr = buf.add((i as usize) * (dv_cq.cqe_size as usize));
+                let op_own_ptr = cqe_ptr.add(63);
+                std::ptr::write_volatile(op_own_ptr, OP_OWN_INVALID);
+            }
+
             Ok(MonoCq {
                 cq: NonNull::new(cq_ptr).unwrap(),
                 state: MonoCqState {

@@ -242,8 +242,6 @@ pub struct DciWqeBuilder<'a, Entry, TableType> {
     ds_count: u8,
     /// Whether SIGNALED flag is set
     signaled: bool,
-    /// Opcode set by ctrl() - used for validation in finish()
-    opcode: Option<WqeOpcode>,
 }
 
 impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType> {
@@ -269,7 +267,6 @@ impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType> {
         }
         self.offset = CtrlSeg::SIZE;
         self.ds_count = 1;
-        self.opcode = Some(opcode);
         self
     }
 
@@ -333,68 +330,15 @@ impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType> {
         (self, slice)
     }
 
-    /// Validate the WQE structure based on opcode.
-    ///
-    /// Returns an error if required segments are missing.
-    #[cold]
-    fn validate(&self) -> io::Result<()> {
-        let Some(opcode) = self.opcode else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "ctrl() must be called before finish()",
-            ));
-        };
-
-        match opcode {
-            WqeOpcode::RdmaWrite | WqeOpcode::RdmaWriteImm | WqeOpcode::RdmaRead => {
-                // DC RDMA operations require at least ctrl + av + rdma segments
-                if self.offset < CtrlSeg::SIZE + AddressVector::SIZE + RdmaSeg::SIZE {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "DC RDMA operations require av() and rdma() segments",
-                    ));
-                }
-            }
-            _ => {
-                // All DC operations require address vector
-                if self.offset < CtrlSeg::SIZE + AddressVector::SIZE {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "DC operations require av() segment",
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Finish the WQE construction (internal).
-    ///
-    /// Stores WQE info for later doorbell via `ring_sq_doorbell()`.
-    fn finish_internal(mut self) -> io::Result<WqeHandle> {
-        // Validate WQE structure - unlikely path is marked cold
-        if self.opcode.is_none() || self.offset < CtrlSeg::SIZE + AddressVector::SIZE {
-            self.validate()?;
-        }
-
-        // Clear opcode to prevent Drop warning (finish() was properly called)
-        self.opcode = None;
-
+    #[inline]
+    fn finish_internal(self) -> io::Result<WqeHandle> {
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
         }
 
         let wqebb_cnt = calc_wqebb_cnt(self.offset);
         let wqe_idx = self.wqe_idx;
-
-        // Check for ring wrap-around: WQE must not cross the ring boundary
-        debug_assert!(
-            wqebb_cnt <= self.sq.slots_to_end(),
-            "WQE wrap-around detected: WQE requires {} WQEBBs but only {} slots to ring end. \
-             Call post_nop_to_ring_end() before building large WQEs near ring boundary.",
-            wqebb_cnt,
-            self.sq.slots_to_end()
-        );
 
         self.sq.advance_pi(wqebb_cnt);
         self.sq.set_last_wqe(self.wqe_ptr, self.offset);
@@ -409,15 +353,8 @@ impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType> {
     ///
     /// Use this for low-latency single WQE submission. The doorbell is issued
     /// immediately, so no need to call `ring_sq_doorbell()` afterwards.
-    fn finish_internal_with_blueflame(mut self) -> io::Result<WqeHandle> {
-        // Validate WQE structure - unlikely path is marked cold
-        if self.opcode.is_none() || self.offset < CtrlSeg::SIZE + AddressVector::SIZE {
-            self.validate()?;
-        }
-
-        // Clear opcode to prevent Drop warning (finish() was properly called)
-        self.opcode = None;
-
+    #[inline]
+    fn finish_internal_with_blueflame(self) -> io::Result<WqeHandle> {
         unsafe {
             CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
         }
@@ -426,15 +363,6 @@ impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType> {
         let wqe_idx = self.wqe_idx;
         let wqe_ptr = self.wqe_ptr;
 
-        // Check for ring wrap-around: WQE must not cross the ring boundary
-        debug_assert!(
-            wqebb_cnt <= self.sq.slots_to_end(),
-            "WQE wrap-around detected: WQE requires {} WQEBBs but only {} slots to ring end. \
-             Call post_nop_to_ring_end() before building large WQEs near ring boundary.",
-            wqebb_cnt,
-            self.sq.slots_to_end()
-        );
-
         self.sq.advance_pi(wqebb_cnt);
         self.sq.ring_blueflame(wqe_ptr);
 
@@ -442,22 +370,6 @@ impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType> {
             wqe_idx,
             size: self.offset,
         })
-    }
-}
-
-impl<Entry, TableType> Drop for DciWqeBuilder<'_, Entry, TableType> {
-    fn drop(&mut self) {
-        // finish() consumes self, so if Drop is called, finish() was not called.
-        // The PI has not been advanced, so no rollback is needed.
-        // Emit a warning in debug builds to help identify bugs.
-        #[cfg(debug_assertions)]
-        if self.opcode.is_some() {
-            // ctrl() was called but finish() was not
-            eprintln!(
-                "Warning: DciWqeBuilder dropped without calling finish() at wqe_idx={}",
-                self.wqe_idx
-            );
-        }
     }
 }
 
@@ -1127,7 +1039,6 @@ impl<Entry, OnComplete> DciSparseWqeTable<Entry, OnComplete> {
                 offset: 0,
                 ds_count: 0,
                 signaled: true,
-                opcode: None,
             },
             entry: Some(entry),
         })
@@ -1153,7 +1064,6 @@ impl<Entry, OnComplete> DciSparseWqeTable<Entry, OnComplete> {
                 offset: 0,
                 ds_count: 0,
                 signaled: false,
-                opcode: None,
             },
             entry: None,
         })
@@ -1228,7 +1138,6 @@ impl<Entry, OnComplete> DciDenseWqeTable<Entry, OnComplete> {
                 offset: 0,
                 ds_count: 0,
                 signaled,
-                opcode: None,
             },
             entry,
         })
