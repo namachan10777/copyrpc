@@ -62,7 +62,7 @@ fn test_dc_creation() {
     let dci_config = DciConfig::default();
     let dci = ctx
         .ctx
-        .create_dci_sparse::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
+        .create_dci::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
         .expect("Failed to create DCI");
 
     // Activate DCI
@@ -128,7 +128,7 @@ fn test_dc_rdma_write() {
     let dci_config = DciConfig::default();
     let dci = ctx
         .ctx
-        .create_dci_sparse::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
+        .create_dci::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
         .expect("Failed to create DCI");
     dci.borrow_mut()
         .activate(ctx.port, 0, 4)
@@ -227,7 +227,7 @@ fn test_dc_rdma_read() {
     let dci_config = DciConfig::default();
     let dci = ctx
         .ctx
-        .create_dci_sparse::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
+        .create_dci::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
         .expect("Failed to create DCI");
     dci.borrow_mut()
         .activate(ctx.port, 0, 4)
@@ -330,7 +330,7 @@ fn test_dc_multiple_dci() {
     for i in 0..num_dcis {
         let dci = ctx
             .ctx
-            .create_dci_sparse::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
+            .create_dci::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
             .expect(&format!("Failed to create DCI {}", i));
         dci.borrow_mut()
             .activate(ctx.port, 0, 4)

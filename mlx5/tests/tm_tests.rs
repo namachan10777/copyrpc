@@ -54,10 +54,10 @@ fn test_tm_srq_creation() {
 
     let tm_srq = ctx
         .ctx
-        .create_tm_srq::<u64, _>(&ctx.pd, &cq, &config, |_cqe, _entry| {})
+        .create_tm_srq::<u64, u64, _>(&ctx.pd, &cq, &config, |_| {})
         .expect("Failed to create TM-SRQ");
 
-    let srqn = tm_srq.borrow().srqn().expect("Failed to get SRQN");
+    let srqn = tm_srq.borrow().srq_number().expect("Failed to get SRQN");
     let max_tags = tm_srq.borrow().max_num_tags();
 
     println!("TM-SRQ creation test passed!");
@@ -91,13 +91,10 @@ fn test_tm_srq_direct_access() {
 
     let tm_srq = ctx
         .ctx
-        .create_tm_srq::<u64, _>(&ctx.pd, &cq, &config, |_cqe, _entry| {})
+        .create_tm_srq::<u64, u64, _>(&ctx.pd, &cq, &config, |_| {})
         .expect("Failed to create TM-SRQ");
 
-    // Initialize direct access
-    mlx5::tm_srq::TagMatchingSrq::init_direct_access(&tm_srq)
-        .expect("Failed to init TM-SRQ direct access");
-
+    // Direct access is auto-initialized at creation
     println!("TM-SRQ direct access test passed!");
     println!("  Command QP available: {}", tm_srq.borrow().cmd_optimistic_available());
 }
@@ -132,11 +129,10 @@ fn test_tm_tag_add_remove() {
 
     let tm_srq = ctx
         .ctx
-        .create_tm_srq::<u64, _>(&ctx.pd, &cq, &config, |_cqe, _entry| {})
+        .create_tm_srq::<u64, u64, _>(&ctx.pd, &cq, &config, |_| {})
         .expect("Failed to create TM-SRQ");
 
-    mlx5::tm_srq::TagMatchingSrq::init_direct_access(&tm_srq)
-        .expect("Failed to init TM-SRQ direct access");
+    // Direct access is auto-initialized at creation
 
     // Allocate receive buffer
     let recv_buf = AlignedBuffer::new(4096);
@@ -157,7 +153,7 @@ fn test_tm_tag_add_remove() {
         .cmd_wqe_builder(1u64)
         .expect("cmd_wqe_builder failed")
         .ctrl(WqeOpcode::TagMatching, 0)
-        .tag_add(tag_index, tag, recv_buf.addr(), 256, mr.lkey())
+        .tag_add(tag_index, tag, recv_buf.addr(), 256, mr.lkey(), true)
         .finish();
     tm_srq.borrow_mut().ring_cmd_doorbell();
 
@@ -181,7 +177,7 @@ fn test_tm_tag_add_remove() {
         .cmd_wqe_builder(2u64)
         .expect("cmd_wqe_builder failed")
         .ctrl(WqeOpcode::TagMatching, 0)
-        .tag_del(tag_index)
+        .tag_del(tag_index, true)
         .finish_with_blueflame();
 
     // Poll for delete completion
@@ -235,17 +231,16 @@ fn test_tm_tag_matching_with_dc() {
 
     let tm_srq = ctx
         .ctx
-        .create_tm_srq::<u64, _>(&ctx.pd, &tm_cq, &tm_config, |_cqe, _entry| {})
+        .create_tm_srq::<u64, u64, _>(&ctx.pd, &tm_cq, &tm_config, |_| {})
         .expect("Failed to create TM-SRQ");
 
-    mlx5::tm_srq::TagMatchingSrq::init_direct_access(&tm_srq)
-        .expect("Failed to init TM-SRQ direct access");
+    // Direct access is auto-initialized at creation
 
     // Create and activate DCI
     let dci_config = DciConfig::default();
     let dci = ctx
         .ctx
-        .create_dci_sparse::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
+        .create_dci::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
         .expect("Failed to create DCI");
     dci.borrow_mut()
         .activate(ctx.port, 0, 4)
@@ -289,11 +284,10 @@ fn test_tm_multiple_tags() {
 
     let tm_srq = ctx
         .ctx
-        .create_tm_srq::<u64, _>(&ctx.pd, &cq, &config, |_cqe, _entry| {})
+        .create_tm_srq::<u64, u64, _>(&ctx.pd, &cq, &config, |_| {})
         .expect("Failed to create TM-SRQ");
 
-    mlx5::tm_srq::TagMatchingSrq::init_direct_access(&tm_srq)
-        .expect("Failed to init TM-SRQ direct access");
+    // Direct access is auto-initialized at creation
 
     // Allocate receive buffers
     let recv_bufs: Vec<_> = (0..8).map(|_| AlignedBuffer::new(4096)).collect();
@@ -314,7 +308,7 @@ fn test_tm_multiple_tags() {
             .cmd_wqe_builder((i + 1) as u64)
             .expect("cmd_wqe_builder failed")
             .ctrl(WqeOpcode::TagMatching, 0)
-            .tag_add(i, tag, recv_bufs[i as usize].addr(), 256, mrs[i as usize].lkey())
+            .tag_add(i, tag, recv_bufs[i as usize].addr(), 256, mrs[i as usize].lkey(), true)
             .finish_with_blueflame();
 
         // Poll for completion
@@ -334,7 +328,7 @@ fn test_tm_multiple_tags() {
             .cmd_wqe_builder((i + 100) as u64)
             .expect("cmd_wqe_builder failed")
             .ctrl(WqeOpcode::TagMatching, 0)
-            .tag_del(i)
+            .tag_del(i, true)
             .finish_with_blueflame();
 
         // Poll for completion
@@ -380,11 +374,10 @@ fn test_tm_unordered_recv() {
 
     let tm_srq = ctx
         .ctx
-        .create_tm_srq::<u64, _>(&ctx.pd, &cq, &config, |_cqe, _entry| {})
+        .create_tm_srq::<u64, u64, _>(&ctx.pd, &cq, &config, |_| {})
         .expect("Failed to create TM-SRQ");
 
-    mlx5::tm_srq::TagMatchingSrq::init_direct_access(&tm_srq)
-        .expect("Failed to init TM-SRQ direct access");
+    // Direct access is auto-initialized at creation
 
     // Allocate receive buffer for unexpected messages
     let recv_buf = AlignedBuffer::new(4096);
@@ -392,12 +385,11 @@ fn test_tm_unordered_recv() {
         .expect("Failed to register MR");
 
     // Post unordered receives (for unexpected messages)
-    for i in 0..10 {
+    for i in 0..10u64 {
         let offset = i * 256;
-        unsafe {
-            tm_srq.borrow_mut()
-                .post_unordered_recv(recv_buf.addr() + offset, 256, mr.lkey());
-        }
+        tm_srq.borrow_mut()
+            .post_unordered_recv(recv_buf.addr() + offset, 256, mr.lkey(), i)
+            .expect("post_unordered_recv failed");
     }
     tm_srq.borrow_mut().ring_srq_doorbell();
 
@@ -437,7 +429,7 @@ fn test_tm_tag_via_verbs_api() {
 
     let tm_srq = ctx
         .ctx
-        .create_tm_srq::<u64, _>(&ctx.pd, &cq, &config, |_cqe, _entry| {})
+        .create_tm_srq::<u64, u64, _>(&ctx.pd, &cq, &config, |_| {})
         .expect("Failed to create TM-SRQ");
 
     // Allocate receive buffer

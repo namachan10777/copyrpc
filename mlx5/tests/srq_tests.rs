@@ -42,7 +42,7 @@ fn test_srq_creation() {
 
     let srq: mlx5::srq::Srq<u64> = ctx.pd.create_srq(&config).expect("Failed to create SRQ");
 
-    let srqn = srq.srqn().expect("Failed to get SRQN");
+    let srqn = srq.srq_number().expect("Failed to get SRQN");
     println!("SRQ creation test passed!");
     println!("  SRQN: 0x{:x}", srqn);
 }
@@ -171,7 +171,7 @@ fn test_srq_with_dct_send() {
     let dci_config = DciConfig::default();
     let dci = ctx
         .ctx
-        .create_dci_sparse::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
+        .create_dci::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
         .expect("Failed to create DCI");
     dci.borrow_mut()
         .activate(ctx.port, 0, 4)
@@ -304,7 +304,7 @@ fn test_srq_shared_by_multiple_dcts() {
     let dci_config = DciConfig::default();
     let dci = ctx
         .ctx
-        .create_dci_sparse::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
+        .create_dci::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
         .expect("Failed to create DCI");
     dci.borrow_mut()
         .activate(ctx.port, 0, 4)
