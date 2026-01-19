@@ -212,6 +212,11 @@ impl MemoryRegion {
     pub fn len(&self) -> usize {
         unsafe { (*self.mr.as_ptr()).length }
     }
+
+    /// Returns true if the memory region is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 // =============================================================================

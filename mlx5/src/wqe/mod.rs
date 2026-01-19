@@ -485,7 +485,7 @@ impl<T> UnorderedWqeTable<T> {
             .map(|_| Cell::new(None))
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let bitmap_len = (wqebb_cnt as usize + 63) / 64;
+        let bitmap_len = (wqebb_cnt as usize).div_ceil(64);
         let bitmap = (0..bitmap_len)
             .map(|_| Cell::new(0u64))
             .collect::<Vec<_>>()

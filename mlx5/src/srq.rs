@@ -221,7 +221,7 @@ impl<T> Srq<T> {
 
             Ok(SrqInfo {
                 buf: dv_srq.buf as *mut u8,
-                doorbell_record: dv_srq.dbrec as *mut u32,
+                doorbell_record: dv_srq.dbrec,
                 stride: dv_srq.stride,
                 srq_number: dv_srq.srqn,
             })
@@ -281,7 +281,7 @@ impl<T> Srq<T> {
         let state = inner
             .state
             .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "direct access not initialized"))?;
+            .ok_or_else(|| io::Error::other("direct access not initialized"))?;
 
         if state.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SRQ full"));

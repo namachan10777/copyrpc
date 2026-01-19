@@ -288,7 +288,7 @@ impl Context {
                     cqe_cnt: dv_cq.cqe_cnt,
                     cqe_cnt_log2: dv_cq.cqe_cnt.trailing_zeros(),
                     cqe_size: dv_cq.cqe_size,
-                    dbrec: dv_cq.dbrec as *mut u32,
+                    dbrec: dv_cq.dbrec,
                     ci: Cell::new(0),
                     pending_mini_cqes: UnsafeCell::new(None),
                     title_opcode: Cell::new(CqeOpcode::Req),
@@ -478,7 +478,7 @@ where
         // Safety: Single-threaded access guaranteed by Rc (not Send).
         let pending = unsafe { &mut *state.pending_mini_cqes.get() };
         if let Some(iter) = pending {
-            if let Some(cqe) = iter.next() {
+            if let Some(cqe) = iter.next_mini_cqe() {
                 // If no more mini CQEs, clear the pending state
                 if !iter.has_more() {
                     *pending = None;
@@ -545,7 +545,7 @@ where
             state.ci.set(ci.wrapping_add(1));
 
             // Get the first mini CQE
-            if let Some(cqe) = iter.next() {
+            if let Some(cqe) = iter.next_mini_cqe() {
                 // Store remaining mini CQEs for subsequent calls
                 if iter.has_more() {
                     *pending = Some(iter);
@@ -557,9 +557,7 @@ where
         }
 
         // Check for invalid/reserved opcode
-        if CqeOpcode::from_u8(opcode_raw).is_none() {
-            return None;
-        }
+        CqeOpcode::from_u8(opcode_raw)?;
 
         // Prefetch next CQE slot if requested (for batch processing).
         if prefetch_next {

@@ -354,7 +354,8 @@ impl<'a, Entry> RecvWqeBuilder<'a, Entry> {
                 let sentinel_ptr = wqe_ptr.add(DataSeg::SIZE);
                 let ptr32 = sentinel_ptr as *mut u32;
                 std::ptr::write_volatile(ptr32, 0u32); // byte_count = 0
-                std::ptr::write_volatile(ptr32.add(1), MLX5_INVALID_LKEY.to_be()); // lkey = invalid
+                std::ptr::write_volatile(ptr32.add(1), MLX5_INVALID_LKEY.to_be());
+                // lkey = invalid
             }
         }
         self
@@ -873,7 +874,7 @@ impl Context {
                     pi: Cell::new(0),
                     ci: Cell::new(0),
                     last_wqe: Cell::new(None),
-                    dbrec: dv_qp.dbrec as *mut u32,
+                    dbrec: dv_qp.dbrec,
                     bf_reg: dv_qp.bf.reg as *mut u8,
                     bf_size: dv_qp.bf.size,
                     bf_offset: Cell::new(0),
@@ -886,7 +887,7 @@ impl Context {
                     stride: dv_qp.rq.stride,
                     pi: Cell::new(0),
                     ci: Cell::new(0),
-                    dbrec: dv_qp.dbrec as *mut u32,
+                    dbrec: dv_qp.dbrec,
                     table: (0..rq_wqe_cnt).map(|_| Cell::new(None)).collect(),
                 }),
                 callback: (),
@@ -956,7 +957,7 @@ impl<Entry, TableType, OnComplete> RcQpInner<Entry, TableType, OnComplete> {
             let sqn = if dv_qp.sqn != 0 { dv_qp.sqn } else { qp_num };
 
             Ok(QpInfo {
-                dbrec: dv_qp.dbrec as *mut u32,
+                dbrec: dv_qp.dbrec,
                 sq_buf: dv_qp.sq.buf as *mut u8,
                 sq_wqe_cnt: dv_qp.sq.wqe_cnt,
                 sq_stride: dv_qp.sq.stride,
@@ -1106,7 +1107,7 @@ impl<Entry, TableType, OnComplete> RcQpInner<Entry, TableType, OnComplete> {
     fn sq(&self) -> io::Result<&SendQueueState<Entry, TableType>> {
         self.sq
             .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "direct access not initialized"))
+            .ok_or_else(|| io::Error::other("direct access not initialized"))
     }
 
     /// Get the number of available WQE slots in the send queue.
@@ -1270,7 +1271,7 @@ impl<Entry, OnComplete> RcQp<Entry, OnComplete> {
         let rq = self
             .rq
             .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "direct access not initialized"))?;
+            .ok_or_else(|| io::Error::other("direct access not initialized"))?;
         if rq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "RQ full"));
         }
@@ -1436,17 +1437,17 @@ where
     fn dispatch_cqe(&self, cqe: Cqe) {
         if cqe.opcode.is_responder() {
             // RQ completion (responder)
-            if let Some(rq) = self.rq.as_ref() {
-                if let Some(entry) = rq.process_completion(cqe.wqe_counter) {
-                    (self.callback)(cqe, entry);
-                }
+            if let Some(rq) = self.rq.as_ref()
+                && let Some(entry) = rq.process_completion(cqe.wqe_counter)
+            {
+                (self.callback)(cqe, entry);
             }
         } else {
             // SQ completion (requester)
-            if let Some(sq) = self.sq.as_ref() {
-                if let Some(entry) = sq.process_completion(cqe.wqe_counter) {
-                    (self.callback)(cqe, entry);
-                }
+            if let Some(sq) = self.sq.as_ref()
+                && let Some(entry) = sq.process_completion(cqe.wqe_counter)
+            {
+                (self.callback)(cqe, entry);
             }
         }
     }

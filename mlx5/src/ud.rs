@@ -826,7 +826,7 @@ impl<Entry, TableType, OnComplete> UdQp<Entry, TableType, OnComplete> {
             let sqn = if dv_qp.sqn != 0 { dv_qp.sqn } else { qp_num };
 
             Ok(QpInfo {
-                dbrec: dv_qp.dbrec as *mut u32,
+                dbrec: dv_qp.dbrec,
                 sq_buf: dv_qp.sq.buf as *mut u8,
                 sq_wqe_cnt: dv_qp.sq.wqe_cnt,
                 sq_stride: dv_qp.sq.stride,
@@ -926,13 +926,13 @@ impl<Entry, TableType, OnComplete> UdQp<Entry, TableType, OnComplete> {
     fn sq(&self) -> io::Result<&UdSendQueueState<Entry, TableType>> {
         self.sq
             .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "direct access not initialized"))
+            .ok_or_else(|| io::Error::other("direct access not initialized"))
     }
 
     fn rq(&self) -> io::Result<&UdRecvQueueState<Entry>> {
         self.rq
             .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "direct access not initialized"))
+            .ok_or_else(|| io::Error::other("direct access not initialized"))
     }
 
     /// Ring the receive queue doorbell.
@@ -1120,17 +1120,17 @@ where
     fn dispatch_cqe(&self, cqe: Cqe) {
         if cqe.opcode.is_responder() {
             // RQ completion (responder)
-            if let Some(rq) = self.rq.as_ref() {
-                if let Some(entry) = rq.process_completion(cqe.wqe_counter) {
-                    (self.callback)(cqe, entry);
-                }
+            if let Some(rq) = self.rq.as_ref()
+                && let Some(entry) = rq.process_completion(cqe.wqe_counter)
+            {
+                (self.callback)(cqe, entry);
             }
         } else {
             // SQ completion (requester)
-            if let Some(sq) = self.sq.as_ref() {
-                if let Some(entry) = sq.process_completion(cqe.wqe_counter) {
-                    (self.callback)(cqe, entry);
-                }
+            if let Some(sq) = self.sq.as_ref()
+                && let Some(entry) = sq.process_completion(cqe.wqe_counter)
+            {
+                (self.callback)(cqe, entry);
             }
         }
     }

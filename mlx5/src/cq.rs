@@ -200,7 +200,7 @@ impl MiniCqeIterator {
     }
 
     /// Get the next mini CQE as a full Cqe.
-    pub fn next(&mut self) -> Option<Cqe> {
+    pub fn next_mini_cqe(&mut self) -> Option<Cqe> {
         if self.current >= self.header.count {
             return None;
         }
@@ -563,7 +563,7 @@ impl Context {
                     cqe_cnt: dv_cq.cqe_cnt,
                     cqe_cnt_log2: dv_cq.cqe_cnt.trailing_zeros(),
                     cqe_size: dv_cq.cqe_size,
-                    dbrec: dv_cq.dbrec as *mut u32,
+                    dbrec: dv_cq.dbrec,
                     ci: Cell::new(0),
                     pending_mini_cqes: UnsafeCell::new(None),
                     title_opcode: Cell::new(CqeOpcode::Req),
@@ -615,10 +615,10 @@ impl CompletionQueue {
         // Safety: Single-threaded access guaranteed by Rc (not Send).
         // unregister_queue is only called during QP drop, not from dispatch_cqe.
         let cache = unsafe { &mut *self.last_queue_cache.get() };
-        if let Some((cached_qpn, _)) = cache.as_ref() {
-            if *cached_qpn == qpn {
-                *cache = None;
-            }
+        if let Some((cached_qpn, _)) = cache.as_ref()
+            && *cached_qpn == qpn
+        {
+            *cache = None;
         }
     }
 
@@ -632,10 +632,10 @@ impl CompletionQueue {
         // we create a mutable reference below.
         {
             let cache = unsafe { &*self.last_queue_cache.get() };
-            if let Some((cached_qpn, cached_rc)) = cache.as_ref() {
-                if *cached_qpn == qpn {
-                    return Some(cached_rc.clone());
-                }
+            if let Some((cached_qpn, cached_rc)) = cache.as_ref()
+                && *cached_qpn == qpn
+            {
+                return Some(cached_rc.clone());
             }
         }
 
@@ -708,7 +708,7 @@ impl CompletionQueue {
         // Safety: Single-threaded access guaranteed by Rc (not Send).
         let pending = unsafe { &mut *state.pending_mini_cqes.get() };
         if let Some(iter) = pending {
-            if let Some(cqe) = iter.next() {
+            if let Some(cqe) = iter.next_mini_cqe() {
                 // If no more mini CQEs, clear the pending state
                 if !iter.has_more() {
                     *pending = None;
@@ -748,7 +748,7 @@ impl CompletionQueue {
             state.ci.set(ci.wrapping_add(1));
 
             // Get the first mini CQE
-            if let Some(cqe) = iter.next() {
+            if let Some(cqe) = iter.next_mini_cqe() {
                 // Store remaining mini CQEs for subsequent calls
                 if iter.has_more() {
                     *pending = Some(iter);
@@ -761,9 +761,7 @@ impl CompletionQueue {
 
         // Check for invalid/reserved opcode (0x0f was already handled as compression)
         // Other invalid opcodes should be treated as errors
-        if CqeOpcode::from_u8(opcode_raw).is_none() {
-            return None;
-        }
+        CqeOpcode::from_u8(opcode_raw)?;
 
         // Prefetch next CQE slot if requested (for batch processing).
         // This overlaps prefetch with CQE parsing below.

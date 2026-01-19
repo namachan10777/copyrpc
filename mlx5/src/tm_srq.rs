@@ -624,10 +624,10 @@ impl Context {
 impl<T, Tab, U, F> Drop for TagMatchingSrq<T, Tab, U, F> {
     fn drop(&mut self) {
         // Unregister from CQ
-        if let Some(cmd_qp) = &self.cmd_qp {
-            if let Some(cq) = self.send_cq.upgrade() {
-                cq.unregister_queue(cmd_qp.qpn);
-            }
+        if let Some(cmd_qp) = &self.cmd_qp
+            && let Some(cq) = self.send_cq.upgrade()
+        {
+            cq.unregister_queue(cmd_qp.qpn);
         }
 
         unsafe {
@@ -667,7 +667,7 @@ fn query_srq_info(srq: NonNull<mlx5_sys::ibv_srq>) -> io::Result<SrqInfo> {
 
         Ok(SrqInfo {
             buf: dv_srq.buf as *mut u8,
-            doorbell_record: dv_srq.dbrec as *mut u32,
+            doorbell_record: dv_srq.dbrec,
             stride: dv_srq.stride,
             srq_number: dv_srq.srqn,
         })
@@ -684,8 +684,7 @@ fn query_cmd_qp_info_inner(srq: NonNull<mlx5_sys::ibv_srq>) -> io::Result<CmdQpI
         };
 
         if cmd_qp_ptr.is_null() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "TM-SRQ cmd_qp is null (TM not supported?)",
             ));
         }
@@ -709,15 +708,14 @@ fn query_cmd_qp_info_inner(srq: NonNull<mlx5_sys::ibv_srq>) -> io::Result<CmdQpI
 
         // Read current PI from doorbell record (dbrec[1] is SQ doorbell)
         // The Command QP may have been used by rdma-core internally
-        let dbrec = dv_qp.dbrec as *mut u32;
-        let current_pi = u32::from_be(std::ptr::read_volatile(dbrec.add(1))) as u16;
+        let current_pi = u32::from_be(std::ptr::read_volatile(dv_qp.dbrec.add(1))) as u16;
 
         Ok(CmdQpInfo {
             qpn,
             sq_buf: dv_qp.sq.buf as *mut u8,
             sq_wqe_cnt,
             current_pi,
-            dbrec: dv_qp.dbrec as *mut u32,
+            dbrec: dv_qp.dbrec,
             bf_reg: dv_qp.bf.reg as *mut u8,
             bf_size: dv_qp.bf.size,
         })
