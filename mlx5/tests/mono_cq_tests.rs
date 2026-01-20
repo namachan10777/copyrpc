@@ -8,7 +8,7 @@ mod common;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use mlx5::cq::Cqe;
+use mlx5::cq::{CqConfig, Cqe};
 use mlx5::qp::{RcQpConfig, RcQpForMonoCq, RemoteQpInfo};
 use mlx5::wqe::{WqeFlags, WqeOpcode};
 
@@ -1062,9 +1062,13 @@ fn test_mono_cq_rx_compression() {
         .expect("Failed to create send MonoCq");
 
     // RX CQ with compression enabled
+    let rx_config = CqConfig {
+        enable_compression: true,
+        ..Default::default()
+    };
     let recv_cq = ctx
         .ctx
-        .create_mono_cq_rx_compressed::<RcQpForMonoCq<u64>, _>(256, recv_callback)
+        .create_mono_cq_with_config::<RcQpForMonoCq<u64>, _>(256, recv_callback, &rx_config)
         .expect("Failed to create recv MonoCq with compression");
 
     // Dummy CQs for qp2 (sender side)
@@ -1189,6 +1193,11 @@ fn test_mono_cq_rx_compression() {
         recv_completions.get(),
         start.elapsed()
     );
+    println!(
+        "  Compression enabled: {}, Compressed CQEs detected: {}",
+        recv_cq.is_compression_enabled(),
+        recv_cq.compressed_cqe_count()
+    );
 }
 
 /// Benchmark comparison: RX CQ compression vs non-compression mode.
@@ -1245,11 +1254,16 @@ fn test_rx_compression_benchmark() {
         };
 
         let elapsed = {
+            let rx_config = CqConfig {
+                enable_compression: true,
+                ..Default::default()
+            };
             let recv_cq = ctx
                 .ctx
-                .create_mono_cq_rx_compressed::<RcQpForMonoCq<u64>, _>(
+                .create_mono_cq_with_config::<RcQpForMonoCq<u64>, _>(
                     NUM_OPS as i32 * 2,
                     recv_callback,
+                    &rx_config,
                 )
                 .expect("Failed to create recv MonoCq with compression");
 

@@ -166,6 +166,26 @@ pub unsafe fn ibv_create_cq_ex_ex(
     }
 }
 
+/// Modify CQ attributes (moderation settings).
+///
+/// Uses the extended verbs API to modify CQ moderation parameters.
+/// Returns 0 on success, -1 on failure.
+#[inline]
+pub unsafe fn ibv_modify_cq_ex(
+    cq: *mut ibv_cq,
+    attr: *mut ibv_modify_cq_attr,
+) -> ::std::os::raw::c_int {
+    let vctx = verbs_get_ctx((*cq).context);
+    if vctx.is_null() {
+        return -1;
+    }
+    if let Some(modify_cq_fn) = (*vctx).modify_cq {
+        modify_cq_fn(cq, attr)
+    } else {
+        -1
+    }
+}
+
 /// Inner packed struct for mlx5_wqe_ctrl_seg.
 /// Rust doesn't support both packed and aligned attributes simultaneously,
 /// so we use this inner struct with packed layout and wrap it in an aligned outer struct.

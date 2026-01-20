@@ -33,7 +33,7 @@ use std::ptr::NonNull;
 use std::rc::{Rc, Weak};
 use std::{io, mem::MaybeUninit};
 
-use crate::cq::{Cqe, CqeOpcode, MiniCqeIterator};
+use crate::cq::{CqConfig, CqModeration, CqeSize, Cqe, CqeOpcode, MiniCqeIterator};
 use crate::device::Context;
 
 // =============================================================================
@@ -85,6 +85,8 @@ struct MonoCqState {
     /// When true, compressed CQEs (format=3) may be returned by HW.
     /// Note: Currently disabled due to hang issues.
     cqe_compression: bool,
+    /// Counter for compressed CQEs detected (for debugging/monitoring).
+    compressed_cqe_count: Cell<u64>,
 }
 
 // =============================================================================
@@ -161,43 +163,48 @@ impl Context {
         Q: CompletionSource,
         F: Fn(Cqe, Q::Entry),
     {
-        self.create_mono_cq_internal(cqe, callback, false)
+        self.create_mono_cq_with_config(cqe, callback, &CqConfig::default())
     }
 
-    /// Create a Monomorphic Completion Queue for RX (receive) with CQE compression.
+    /// Create a Monomorphic Completion Queue with custom configuration.
     ///
-    /// CQE compression is only supported for RX (responder side) completions.
-    /// Using this for TX CQs will cause undefined behavior.
-    ///
-    /// When compression is enabled:
-    /// - Owner checking uses signature field (offset 62) with 0xff mask
-    /// - Compressed CQEs (format=3) are expanded via MiniCqeIterator
-    /// - Title CQE must precede compressed CQE (asserts cq_ci > 0)
+    /// Uses `mlx5dv_create_cq` to enable MLX5-specific features like CQE size
+    /// and CQE compression.
     ///
     /// # Arguments
     /// * `cqe` - Minimum number of CQ entries (actual may be larger)
     /// * `callback` - Completion callback `Fn(Cqe, T)` called for each completion
+    /// * `config` - CQ configuration options (CQE size, compression, etc.)
+    ///
+    /// # CQE Compression
+    /// When `config.enable_compression` is true:
+    /// - CQE compression is only valid for RX (responder side) completions
+    /// - Using compression for TX CQs will cause undefined behavior
+    /// - Owner checking uses signature field (offset 62) with 0xff mask
+    /// - Compressed CQEs (format=3) are expanded via MiniCqeIterator
+    /// - Note: Actual compressed CQEs may only be generated with Strided RQ (MPRQ)
     ///
     /// # Errors
-    /// Returns an error if the CQ cannot be created or compression is not supported.
-    pub fn create_mono_cq_rx_compressed<Q, F>(
+    /// Returns an error if the CQ cannot be created.
+    pub fn create_mono_cq_with_config<Q, F>(
         &self,
         cqe: i32,
         callback: F,
+        config: &CqConfig,
     ) -> io::Result<MonoCq<Q, F>>
     where
         Q: CompletionSource,
         F: Fn(Cqe, Q::Entry),
     {
-        self.create_mono_cq_internal(cqe, callback, true)
+        self.create_mono_cq_internal(cqe, callback, config)
     }
 
-    /// Internal function to create MonoCq with optional compression.
+    /// Internal function to create MonoCq with config.
     fn create_mono_cq_internal<Q, F>(
         &self,
         cqe: i32,
         callback: F,
-        enable_compression: bool,
+        config: &CqConfig,
     ) -> io::Result<MonoCq<Q, F>>
     where
         Q: CompletionSource,
@@ -213,31 +220,45 @@ impl Context {
             attr.comp_mask = 0;
             attr.flags = 0;
 
-            let (cq_ex, cqe_compression) = if enable_compression {
-                // Try to create CQ with CQE compression enabled (HASH format for RX)
-                // Note: CQE compression formats (HASH, CSUM, etc.) are responder-side only.
-                // DO NOT use this for TX (send) CQs - it will cause hangs.
+            let enable_compression = config.enable_compression;
+            let use_custom_cqe_size = config.cqe_size != CqeSize::Size64;
+
+            let (cq_ex, cqe_compression) = if enable_compression || use_custom_cqe_size {
+                // Use mlx5dv_create_cq for MLX5-specific features
                 let mut mlx5_attr: mlx5_sys::mlx5dv_cq_init_attr =
                     MaybeUninit::zeroed().assume_init();
+
+                // Set CQE size
                 mlx5_attr.comp_mask =
-                    mlx5_sys::mlx5dv_cq_init_attr_mask_MLX5DV_CQ_INIT_ATTR_MASK_COMPRESSED_CQE
-                        as u64;
-                mlx5_attr.cqe_comp_res_format =
-                    mlx5_sys::mlx5dv_cqe_comp_res_format_MLX5DV_CQE_RES_FORMAT_HASH as u8;
+                    mlx5_sys::mlx5dv_cq_init_attr_mask_MLX5DV_CQ_INIT_ATTR_MASK_CQE_SIZE as u64;
+                mlx5_attr.cqe_size = config.cqe_size as u16;
+
+                // Enable compression if requested
+                // Note: CQE compression formats (HASH, CSUM, etc.) are responder-side only.
+                // DO NOT use this for TX (send) CQs - it will cause hangs.
+                if enable_compression {
+                    mlx5_attr.comp_mask |=
+                        mlx5_sys::mlx5dv_cq_init_attr_mask_MLX5DV_CQ_INIT_ATTR_MASK_COMPRESSED_CQE
+                            as u64;
+                    mlx5_attr.cqe_comp_res_format =
+                        mlx5_sys::mlx5dv_cqe_comp_res_format_MLX5DV_CQE_RES_FORMAT_HASH as u8;
+                }
 
                 let cq_ex = mlx5_sys::mlx5dv_create_cq(self.as_ptr(), &mut attr, &mut mlx5_attr);
 
-                if cq_ex.is_null() {
+                if cq_ex.is_null() && enable_compression {
                     // Fallback to standard CQ if compression not supported
                     (
                         mlx5_sys::ibv_create_cq_ex_ex(self.as_ptr(), &mut attr),
                         false,
                     )
+                } else if cq_ex.is_null() {
+                    return Err(io::Error::last_os_error());
                 } else {
-                    (cq_ex, true)
+                    (cq_ex, enable_compression)
                 }
             } else {
-                // Standard CQ without compression (for TX or when compression not needed)
+                // Standard CQ without compression or custom CQE size
                 (
                     mlx5_sys::ibv_create_cq_ex_ex(self.as_ptr(), &mut attr),
                     false,
@@ -293,6 +314,7 @@ impl Context {
                     pending_mini_cqes: UnsafeCell::new(None),
                     title_opcode: Cell::new(CqeOpcode::Req),
                     cqe_compression,
+                    compressed_cqe_count: Cell::new(0),
                 },
                 callback,
                 queues: RefCell::new(Vec::new()),
@@ -311,6 +333,19 @@ where
     /// Get the raw ibv_cq pointer.
     pub fn as_ptr(&self) -> *mut mlx5_sys::ibv_cq {
         self.cq.as_ptr()
+    }
+
+    /// Check if CQE compression is enabled for this CQ.
+    pub fn is_compression_enabled(&self) -> bool {
+        self.state.cqe_compression
+    }
+
+    /// Get the number of compressed CQEs detected.
+    ///
+    /// This counter is incremented each time a compressed CQE (format=3)
+    /// is processed. Useful for debugging and monitoring.
+    pub fn compressed_cqe_count(&self) -> u64 {
+        self.state.compressed_cqe_count.get()
     }
 
     /// Register a queue for completion dispatch.
@@ -410,6 +445,35 @@ where
                 self.state.dbrec,
                 (self.state.ci.get() & 0x00FF_FFFF).to_be(),
             );
+        }
+    }
+
+    /// Set CQ moderation parameters.
+    ///
+    /// Moderation reduces interrupt overhead by batching completions.
+    /// The CQ will generate an interrupt when either threshold is reached:
+    /// - `cq_count` CQEs have been generated, or
+    /// - `cq_period` microseconds have elapsed since the first CQE
+    ///
+    /// # Arguments
+    /// * `moderation` - Moderation settings (count and period thresholds)
+    ///
+    /// # Errors
+    /// Returns an error if the moderation settings cannot be applied.
+    pub fn set_moderation(&self, moderation: CqModeration) -> io::Result<()> {
+        unsafe {
+            let mut attr: mlx5_sys::ibv_modify_cq_attr = MaybeUninit::zeroed().assume_init();
+            // IBV_CQ_ATTR_MODERATE = 1 (from libibverbs)
+            const IBV_CQ_ATTR_MODERATE: u32 = 1;
+            attr.attr_mask = IBV_CQ_ATTR_MODERATE;
+            attr.moderate.cq_count = moderation.cq_count;
+            attr.moderate.cq_period = moderation.cq_period;
+
+            let ret = mlx5_sys::ibv_modify_cq_ex(self.cq.as_ptr(), &mut attr);
+            if ret != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
         }
     }
 
@@ -534,6 +598,11 @@ where
                 // Log and skip this CQE.
                 return None;
             }
+
+            // Increment compressed CQE counter
+            state
+                .compressed_cqe_count
+                .set(state.compressed_cqe_count.get() + 1);
 
             // After validating ownership, we need a load barrier
             udma_from_device_barrier!();

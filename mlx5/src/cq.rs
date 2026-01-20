@@ -13,6 +13,49 @@ use crate::CompletionTarget;
 use crate::device::Context;
 
 // =============================================================================
+// CQ Configuration Types
+// =============================================================================
+
+/// CQE size configuration.
+///
+/// Determines the size of Completion Queue Entries (CQEs).
+/// - `Size64`: 64-byte CQEs (default, supports up to 32 bytes inline scatter data)
+/// - `Size128`: 128-byte CQEs (supports up to 64 bytes inline scatter data)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CqeSize {
+    #[default]
+    Size64 = 64,
+    Size128 = 128,
+}
+
+/// CQ creation configuration.
+#[derive(Debug, Clone, Default)]
+pub struct CqConfig {
+    /// CQE size (64 or 128 bytes)
+    pub cqe_size: CqeSize,
+    /// Enable CQE compression for RX (receive) completions.
+    ///
+    /// CQE compression is only valid for RX (responder side) completions.
+    /// Using this for TX CQs will cause undefined behavior.
+    ///
+    /// Note: Actual compressed CQEs (format=3) may only be generated
+    /// with Strided RQ (MPRQ) configurations.
+    pub enable_compression: bool,
+}
+
+/// CQ moderation settings for interrupt coalescing.
+///
+/// Moderation reduces interrupt overhead by batching completions.
+/// The CQ will generate an interrupt when either threshold is reached.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CqModeration {
+    /// CQE count threshold (generate interrupt after this many CQEs)
+    pub cq_count: u16,
+    /// Time period in microseconds (generate interrupt after this time)
+    pub cq_period: u16,
+}
+
+// =============================================================================
 // CQE Types
 // =============================================================================
 
@@ -588,6 +631,87 @@ impl Context {
             })
         }
     }
+
+    /// Create a Completion Queue with custom configuration.
+    ///
+    /// Uses `mlx5dv_create_cq` to enable MLX5-specific features like CQE size.
+    ///
+    /// # Arguments
+    /// * `cqe` - Minimum number of CQ entries (actual may be larger)
+    /// * `config` - CQ configuration options
+    ///
+    /// # Errors
+    /// Returns an error if the CQ cannot be created.
+    pub fn create_cq_with_config(&self, cqe: i32, config: &CqConfig) -> io::Result<CompletionQueue> {
+        unsafe {
+            let mut attr: mlx5_sys::ibv_cq_init_attr_ex = MaybeUninit::zeroed().assume_init();
+            attr.cqe = cqe as u32;
+            attr.cq_context = std::ptr::null_mut();
+            attr.channel = std::ptr::null_mut();
+            attr.comp_vector = 0;
+            attr.wc_flags = 0;
+            attr.comp_mask = 0;
+            attr.flags = 0;
+
+            let mut mlx5_attr: mlx5_sys::mlx5dv_cq_init_attr = MaybeUninit::zeroed().assume_init();
+            mlx5_attr.comp_mask =
+                mlx5_sys::mlx5dv_cq_init_attr_mask_MLX5DV_CQ_INIT_ATTR_MASK_CQE_SIZE as u64;
+            mlx5_attr.cqe_size = config.cqe_size as u16;
+
+            let cq_ex = mlx5_sys::mlx5dv_create_cq(self.as_ptr(), &mut attr, &mut mlx5_attr);
+            if cq_ex.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+
+            // ibv_cq_ex can be cast to ibv_cq (first fields are identical)
+            let cq_ptr = cq_ex as *mut mlx5_sys::ibv_cq;
+
+            // Initialize direct verbs access immediately
+            let mut dv_cq: MaybeUninit<mlx5_sys::mlx5dv_cq> = MaybeUninit::zeroed();
+            let mut obj: MaybeUninit<mlx5_sys::mlx5dv_obj> = MaybeUninit::zeroed();
+
+            let obj_ptr = obj.as_mut_ptr();
+            (*obj_ptr).cq.in_ = cq_ptr;
+            (*obj_ptr).cq.out = dv_cq.as_mut_ptr();
+
+            let ret =
+                mlx5_sys::mlx5dv_init_obj(obj_ptr, mlx5_sys::mlx5dv_obj_type_MLX5DV_OBJ_CQ as u64);
+            if ret != 0 {
+                mlx5_sys::ibv_destroy_cq(cq_ptr);
+                return Err(io::Error::from_raw_os_error(-ret));
+            }
+
+            let dv_cq = dv_cq.assume_init();
+
+            // Initialize all CQEs to look like they are in HW ownership (UCX-style).
+            // op_own byte layout: opcode[7:4] | reserved[3:1] | owner[0]
+            // Set opcode = 0xf (INVALID) and owner = 1.
+            const OP_OWN_INVALID: u8 = 0xf1; // opcode=INVALID(0xf), owner=1
+            let buf = dv_cq.buf as *mut u8;
+            for i in 0..dv_cq.cqe_cnt {
+                let cqe_ptr = buf.add((i as usize) * (dv_cq.cqe_size as usize));
+                let op_own_ptr = cqe_ptr.add(63);
+                std::ptr::write_volatile(op_own_ptr, OP_OWN_INVALID);
+            }
+
+            Ok(CompletionQueue {
+                cq: NonNull::new(cq_ptr).unwrap(),
+                state: CqState {
+                    buf: dv_cq.buf as *mut u8,
+                    cqe_cnt: dv_cq.cqe_cnt,
+                    cqe_cnt_log2: dv_cq.cqe_cnt.trailing_zeros(),
+                    cqe_size: dv_cq.cqe_size,
+                    dbrec: dv_cq.dbrec,
+                    ci: Cell::new(0),
+                    pending_mini_cqes: UnsafeCell::new(None),
+                    title_opcode: Cell::new(CqeOpcode::Req),
+                },
+                queues: RefCell::new(HashMap::with_hasher(BuildHasherDefault::default())),
+                last_queue_cache: UnsafeCell::new(None),
+                _ctx: self.clone(),
+            })
+        }
+    }
 }
 
 impl Drop for CompletionQueue {
@@ -704,6 +828,35 @@ impl CompletionQueue {
                 self.state.dbrec,
                 (self.state.ci.get() & 0x00FF_FFFF).to_be(),
             );
+        }
+    }
+
+    /// Set CQ moderation parameters.
+    ///
+    /// Moderation reduces interrupt overhead by batching completions.
+    /// The CQ will generate an interrupt when either threshold is reached:
+    /// - `cq_count` CQEs have been generated, or
+    /// - `cq_period` microseconds have elapsed since the first CQE
+    ///
+    /// # Arguments
+    /// * `moderation` - Moderation settings (count and period thresholds)
+    ///
+    /// # Errors
+    /// Returns an error if the moderation settings cannot be applied.
+    pub fn set_moderation(&self, moderation: CqModeration) -> io::Result<()> {
+        unsafe {
+            let mut attr: mlx5_sys::ibv_modify_cq_attr = MaybeUninit::zeroed().assume_init();
+            // IBV_CQ_ATTR_MODERATE = 1 (from libibverbs)
+            const IBV_CQ_ATTR_MODERATE: u32 = 1;
+            attr.attr_mask = IBV_CQ_ATTR_MODERATE;
+            attr.moderate.cq_count = moderation.cq_count;
+            attr.moderate.cq_period = moderation.cq_period;
+
+            let ret = mlx5_sys::ibv_modify_cq_ex(self.cq.as_ptr(), &mut attr);
+            if ret != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
         }
     }
 

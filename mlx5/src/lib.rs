@@ -93,8 +93,8 @@ pub mod types;
 pub mod ud;
 pub mod wqe;
 
-// Re-export CQE types
-pub use cq::{Cqe, CqeOpcode};
+// Re-export CQ and CQE types
+pub use cq::{CqConfig, CqModeration, CqeSize, Cqe, CqeOpcode};
 
 // Re-export MonoCq types for inlined callback dispatch
 pub use mono_cq::{CompletionSource, MonoCq, MonoCqRc};
