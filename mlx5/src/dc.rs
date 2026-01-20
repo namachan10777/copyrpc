@@ -134,6 +134,7 @@ impl<Entry, TableType> DciSendQueueState<Entry, TableType> {
         let ds_count = (nop_wqebb_cnt as u8) * 4;
         CtrlSeg::write(
             wqe_ptr,
+            0, // opmod = 0 for NOP
             WqeOpcode::Nop as u8,
             wqe_idx,
             self.sqn,
@@ -235,6 +236,7 @@ impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType> {
         unsafe {
             CtrlSeg::write(
                 self.wqe_ptr,
+                0, // opmod = 0 for normal operations
                 opcode as u8,
                 self.wqe_idx,
                 self.sq.sqn,

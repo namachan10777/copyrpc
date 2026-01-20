@@ -238,12 +238,13 @@ impl<'a, T, Tab> CmdQpWqeBuilder<'a, T, Tab> {
     ///
     /// This must be the first segment in every WQE.
     /// For TM operations, CQ_UPDATE (0x08) must be set in addition to TM segment flags.
-    pub fn ctrl(mut self, opcode: WqeOpcode, imm: u32) -> Self {
+    pub fn ctrl(mut self, opcode: WqeOpcode, imm: u32, opmod: u8) -> Self {
         // MLX5_WQE_CTRL_CQ_UPDATE = 0x08 - required for TM operations
         const CQ_UPDATE: u8 = 0x08;
         unsafe {
             CtrlSeg::write(
                 self.wqe_ptr,
+                opmod, // NEW: pass opmod parameter
                 opcode as u8,
                 self.wqe_idx,
                 self.cmd_qp.qpn,

@@ -27,6 +27,7 @@ impl CtrlSeg {
     #[inline]
     pub unsafe fn write(
         ptr: *mut u8,
+        opmod: u8,
         opcode: u8,
         wqe_idx: u16,
         qpn: u32,
@@ -34,7 +35,7 @@ impl CtrlSeg {
         fm_ce_se: u8,
         imm: u32,
     ) {
-        let opmod_idx_opcode = ((wqe_idx as u32) << 8) | (opcode as u32);
+        let opmod_idx_opcode = ((opmod as u32) << 24) | ((wqe_idx as u32) << 8) | (opcode as u32);
         let qpn_ds = (qpn << 8) | (ds_cnt as u32);
         // Combine sig(0), dci_stream[15:8](0), dci_stream[7:0](0), fm_ce_se into single u32
         // Layout in big-endian: [sig][stream_hi][stream_lo][fm_ce_se]
@@ -209,6 +210,86 @@ impl AtomicSeg {
     }
 }
 
+/// Masked Atomic Segment for 32-bit operations (16 bytes).
+pub struct MaskedAtomicSeg32;
+
+impl MaskedAtomicSeg32 {
+    pub const SIZE: usize = 16;
+
+    /// Write masked Compare-and-Swap segment (32-bit).
+    ///
+    /// # Safety
+    /// The pointer must point to at least 16 bytes of writable memory.
+    #[inline]
+    pub unsafe fn write_cas(
+        ptr: *mut u8,
+        swap: u32,
+        compare: u32,
+        swap_mask: u32,
+        compare_mask: u32,
+    ) {
+        let ptr32 = ptr as *mut u32;
+        std::ptr::write_volatile(ptr32, swap.to_be());
+        std::ptr::write_volatile(ptr32.add(1), compare.to_be());
+        std::ptr::write_volatile(ptr32.add(2), swap_mask.to_be());
+        std::ptr::write_volatile(ptr32.add(3), compare_mask.to_be());
+    }
+
+    /// Write masked Fetch-and-Add segment (32-bit).
+    ///
+    /// # Safety
+    /// The pointer must point to at least 16 bytes of writable memory.
+    #[inline]
+    pub unsafe fn write_fa(ptr: *mut u8, add: u32, field_mask: u32) {
+        let ptr32 = ptr as *mut u32;
+        std::ptr::write_volatile(ptr32, add.to_be());
+        std::ptr::write_volatile(ptr32.add(1), field_mask.to_be());
+        std::ptr::write_volatile(ptr32.add(2), 0u32.to_be());
+        std::ptr::write_volatile(ptr32.add(3), 0u32.to_be());
+    }
+}
+
+/// Masked Atomic Segment for 64-bit operations.
+pub struct MaskedAtomicSeg64;
+
+impl MaskedAtomicSeg64 {
+    pub const SIZE_CAS: usize = 32;
+    pub const SIZE_FA: usize = 16;
+
+    /// Write masked Compare-and-Swap segment (64-bit, 2 segments).
+    ///
+    /// # Safety
+    /// The pointers must point to at least 32 bytes of writable memory.
+    #[inline]
+    pub unsafe fn write_cas(
+        ptr1: *mut u8,
+        ptr2: *mut u8,
+        swap: u64,
+        compare: u64,
+        swap_mask: u64,
+        compare_mask: u64,
+    ) {
+        let ptr64_1 = ptr1 as *mut u64;
+        std::ptr::write_volatile(ptr64_1, swap.to_be());
+        std::ptr::write_volatile(ptr64_1.add(1), compare.to_be());
+
+        let ptr64_2 = ptr2 as *mut u64;
+        std::ptr::write_volatile(ptr64_2, swap_mask.to_be());
+        std::ptr::write_volatile(ptr64_2.add(1), compare_mask.to_be());
+    }
+
+    /// Write masked Fetch-and-Add segment (64-bit, 1 segment).
+    ///
+    /// # Safety
+    /// The pointer must point to at least 16 bytes of writable memory.
+    #[inline]
+    pub unsafe fn write_fa(ptr: *mut u8, add: u64, field_mask: u64) {
+        let ptr64 = ptr as *mut u64;
+        std::ptr::write_volatile(ptr64, add.to_be());
+        std::ptr::write_volatile(ptr64.add(1), field_mask.to_be());
+    }
+}
+
 /// Tag Matching Segment (32 bytes).
 ///
 /// Used for TM operations (TAG_ADD, TAG_DEL) via Command QP.
@@ -299,6 +380,8 @@ pub enum WqeOpcode {
     RdmaRead = 0x10,
     AtomicCs = 0x11,
     AtomicFa = 0x12,
+    AtomicMaskedCs = 0x14,
+    AtomicMaskedFa = 0x15,
     TagMatching = 0x28,
 }
 

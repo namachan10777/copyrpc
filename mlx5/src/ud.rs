@@ -132,6 +132,7 @@ impl<Entry, TableType> UdSendQueueState<Entry, TableType> {
         let ds_count = (nop_wqebb_cnt as u8) * 4;
         CtrlSeg::write(
             wqe_ptr,
+            0, // opmod = 0 for NOP
             WqeOpcode::Nop as u8,
             wqe_idx,
             self.sqn,
@@ -376,7 +377,7 @@ pub struct UdWqeBuilder<'a, Entry, TableType> {
 
 impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
     /// Write the control segment.
-    pub fn ctrl(mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) -> Self {
+    pub fn ctrl(mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32, opmod: u8) -> Self {
         let flags = if self.signaled {
             flags | WqeFlags::COMPLETION
         } else {
@@ -385,6 +386,7 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
         unsafe {
             CtrlSeg::write(
                 self.wqe_ptr,
+                opmod, // NEW: pass opmod parameter
                 opcode as u8,
                 self.wqe_idx,
                 self.sq.sqn,
@@ -598,7 +600,7 @@ pub struct UdQpWqeBuilder<'a, Entry> {
 impl<'a, Entry> UdQpWqeBuilder<'a, Entry> {
     /// Write the control segment.
     pub fn ctrl(mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) -> Self {
-        self.inner = self.inner.ctrl(opcode, flags, imm);
+        self.inner = self.inner.ctrl(opcode, flags, imm, 0);
         self
     }
 

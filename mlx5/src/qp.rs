@@ -12,8 +12,8 @@ use crate::cq::{CompletionQueue, Cqe};
 use crate::device::Context;
 use crate::pd::Pd;
 use crate::wqe::{
-    AtomicSeg, CtrlSeg, DataSeg, InlineHeader, OrderedWqeTable, RdmaSeg, WQEBB_SIZE, WqeFlags,
-    WqeHandle, WqeOpcode, calc_wqebb_cnt,
+    AtomicSeg, CtrlSeg, DataSeg, InlineHeader, MaskedAtomicSeg32, MaskedAtomicSeg64,
+    OrderedWqeTable, RdmaSeg, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
 };
 
 /// RC QP configuration.
@@ -29,6 +29,9 @@ pub struct RcQpConfig {
     pub max_recv_sge: u32,
     /// Maximum inline data size.
     pub max_inline_data: u32,
+    /// Enable scatter-to-CQE for small received data.
+    /// When enabled, received data ≤32 bytes is placed directly in CQE.
+    pub enable_scatter_to_cqe: bool,
 }
 
 impl Default for RcQpConfig {
@@ -39,6 +42,7 @@ impl Default for RcQpConfig {
             max_send_sge: 4,
             max_recv_sge: 4,
             max_inline_data: 64,
+            enable_scatter_to_cqe: false,
         }
     }
 }
@@ -178,12 +182,13 @@ impl<Entry, TableType> SendQueueState<Entry, TableType> {
         let ds_count = (nop_wqebb_cnt as u8) * 4;
         CtrlSeg::write(
             wqe_ptr,
+            0, // opmod = 0 for NOP
             WqeOpcode::Nop as u8,
             wqe_idx,
             self.sqn,
             ds_count,
-            0, // No flags for NOP
-            0, // No immediate data
+            0,
+            0,
         );
 
         self.advance_pi(nop_wqebb_cnt);
@@ -404,10 +409,11 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType> {
         unsafe {
             CtrlSeg::write(
                 self.wqe_ptr,
+                0, // opmod = 0 for normal operations
                 opcode as u8,
                 self.wqe_idx,
                 self.sq.sqn,
-                0,
+                0, // ds_count will be updated in finish
                 flags.bits(),
                 imm,
             );
@@ -513,10 +519,159 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType> {
         self
     }
 
-    /// Finish the WQE construction (internal).
+    /// Set control segment with custom opmod (for masked atomics).
     ///
-    /// If the WQE would wrap around the ring boundary, automatically inserts
-    /// a NOP WQE to fill the remaining slots and relocates the WQE to the
+    /// # Arguments
+    /// * `opcode` - WQE opcode
+    /// * `flags` - WQE flags (completion, fence, solicited)
+    /// * `imm` - Immediate data value
+    /// * `opmod` - Operation mode (0=normal, 2=32-bit extended atomic, 3=64-bit extended atomic)
+    pub fn ctrl_with_opmod(
+        mut self,
+        opcode: WqeOpcode,
+        flags: WqeFlags,
+        imm: u32,
+        opmod: u8,
+    ) -> Self {
+        let fm_ce_se = if self.signaled {
+            (flags | WqeFlags::COMPLETION | WqeFlags::FENCE).bits()
+        } else {
+            (flags | WqeFlags::FENCE).bits()
+        };
+
+        unsafe {
+            CtrlSeg::write(
+                self.wqe_ptr,
+                opmod,
+                opcode as u8,
+                self.wqe_idx,
+                self.sq.sqn,
+                0, // ds_count will be updated in finish
+                fm_ce_se,
+                imm,
+            );
+        }
+        self.offset = CtrlSeg::SIZE;
+        self.ds_count = 1;
+        self
+    }
+
+    /// Masked Compare-and-Swap (64-bit, 2 segments).
+    ///
+    /// Atomically compares masked fields of a 64-bit value at `remote_addr`
+    /// and replaces them with `swap` if masked fields match `compare`.
+    ///
+    /// WQE structure:
+    /// - Control segment (ctrl_with_opmod)
+    /// - RDMA segment (rdma)
+    /// - Masked atomic segment 1 (MaskedAtomicSeg64) - swap/compare
+    /// - Masked atomic segment 2 (MaskedAtomicSeg64) - swap_mask/compare_mask
+    /// - Data segment (sge)
+    ///
+    /// # Safety
+    /// `opmod` must be 0x09 (64-bit extended atomic).
+    pub fn masked_cas64(
+        mut self,
+        swap: u64,
+        compare: u64,
+        swap_mask: u64,
+        compare_mask: u64,
+    ) -> Self {
+        unsafe {
+            let ptr1 = self.wqe_ptr.add(self.offset);
+            let ptr2 = self
+                .wqe_ptr
+                .add(self.offset + MaskedAtomicSeg64::SIZE_CAS / 2);
+
+            MaskedAtomicSeg64::write_cas(ptr1, ptr2, swap, compare, swap_mask, compare_mask);
+        }
+        self.offset += MaskedAtomicSeg64::SIZE_CAS;
+        self.ds_count += 2;
+        self
+    }
+
+    /// Masked Fetch-and-Add (64-bit, 1 segment).
+    ///
+    /// Atomically adds `add_value` to masked fields of a 64-bit value
+    /// at `remote_addr` and returns the original value.
+    ///
+    /// WQE structure:
+    /// - Control segment (ctrl_with_opmod)
+    /// - RDMA segment (rdma)
+    /// - Masked atomic segment (MaskedAtomicSeg64) - add/field_mask
+    /// - Data segment (sge)
+    ///
+    /// # Safety
+    /// `opmod` must be 0x09 (64-bit extended atomic).
+    pub fn masked_fa64(mut self, add: u64, field_mask: u64) -> Self {
+        unsafe {
+            MaskedAtomicSeg64::write_fa(self.wqe_ptr.add(self.offset), add, field_mask);
+        }
+        self.offset += MaskedAtomicSeg64::SIZE_FA;
+        self.ds_count += 1;
+        self
+    }
+
+    /// Masked Compare-and-Swap (32-bit, 1 segment).
+    ///
+    /// Atomically compares masked fields of a 32-bit value at `remote_addr`
+    /// and replaces them with `swap` if masked fields match `compare`.
+    ///
+    /// WQE structure:
+    /// - Control segment (ctrl_with_opmod)
+    /// - RDMA segment (rdma)
+    /// - Masked atomic segment (MaskedAtomicSeg32)
+    /// - Data segment (sge)
+    ///
+    /// # Safety
+    /// `opmod` must be 0x08 (32-bit extended atomic).
+    pub fn masked_cas32(
+        mut self,
+        swap: u32,
+        compare: u32,
+        swap_mask: u32,
+        compare_mask: u32,
+    ) -> Self {
+        unsafe {
+            MaskedAtomicSeg32::write_cas(
+                self.wqe_ptr.add(self.offset),
+                swap,
+                compare,
+                swap_mask,
+                compare_mask,
+            );
+        }
+        self.offset += MaskedAtomicSeg32::SIZE;
+        self.ds_count += 1;
+        self
+    }
+
+    /// Masked Fetch-and-Add (32-bit, 1 segment).
+    ///
+    /// Atomically adds `add_value` to masked fields of a 32-bit value
+    /// at `remote_addr` and returns the original value.
+    ///
+    /// WQE structure:
+    /// - Control segment (ctrl_with_opmod)
+    /// - RDMA segment (rdma)
+    /// - Masked atomic segment (MaskedAtomicSeg32)
+    /// - Data segment (sge)
+    ///
+    /// # Safety
+    /// `opmod` must be 0x08 (32-bit extended atomic).
+    pub fn masked_fa32(mut self, add: u32, field_mask: u32) -> Self {
+        unsafe {
+            MaskedAtomicSeg32::write_fa(self.wqe_ptr.add(self.offset), add, field_mask);
+        }
+        self.offset += MaskedAtomicSeg32::SIZE;
+        self.ds_count += 1;
+        self
+    }
+
+    /// Finish a WQE construction (internal).
+    ///
+    /// If a WQE would wrap around ring boundary, automatically inserts
+    /// a NOP WQE to fill in remaining slots and relocates the WQE to
     /// ring start.
     #[inline]
     fn finish_internal(self) -> io::Result<WqeHandle> {
@@ -762,12 +917,15 @@ impl Context {
             qp_attr.pd = pd.as_ptr();
 
             let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
-            // Disable scatter to CQE to ensure received data goes to the receive buffer,
-            // not inline in the CQE. This is required for direct CQ polling to work correctly.
-            mlx5_attr.comp_mask =
-                mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS as u64;
-            mlx5_attr.create_flags =
-                mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
+            // Optionally disable scatter to CQE. When disabled, received data goes to the
+            // receive buffer instead of being inlined in the CQE.
+            if !config.enable_scatter_to_cqe {
+                mlx5_attr.comp_mask =
+                    mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS
+                        as u64;
+                mlx5_attr.create_flags =
+                    mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
+            }
 
             let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
             let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
@@ -829,10 +987,15 @@ impl Context {
             qp_attr.pd = pd.as_ptr();
 
             let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
-            mlx5_attr.comp_mask =
-                mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS as u64;
-            mlx5_attr.create_flags =
-                mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
+            // Optionally disable scatter to CQE. When disabled, received data goes to the
+            // receive buffer instead of being inlined in the CQE.
+            if !config.enable_scatter_to_cqe {
+                mlx5_attr.comp_mask =
+                    mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS
+                        as u64;
+                mlx5_attr.create_flags =
+                    mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
+            }
 
             let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
             let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
