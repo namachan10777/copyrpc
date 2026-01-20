@@ -165,7 +165,7 @@ fn test_tm_tag_add_remove() {
         .borrow_mut()
         .cmd_wqe_builder(1u64)
         .expect("cmd_wqe_builder failed")
-        .ctrl(WqeOpcode::TagMatching, 0)
+        .ctrl_tag_matching(0)
         .tag_add(tag_index, tag, recv_buf.addr(), 256, mr.lkey(), true)
         .finish();
     tm_srq.borrow_mut().ring_cmd_doorbell();
@@ -211,7 +211,7 @@ fn test_tm_tag_add_remove() {
         .borrow_mut()
         .cmd_wqe_builder(2u64)
         .expect("cmd_wqe_builder failed")
-        .ctrl(WqeOpcode::TagMatching, 0)
+        .ctrl_tag_matching(0)
         .tag_del(tag_index, true)
         .finish_with_blueflame();
 
@@ -373,7 +373,7 @@ fn test_tm_multiple_tags() {
             .borrow_mut()
             .cmd_wqe_builder((i + 1) as u64)
             .expect("cmd_wqe_builder failed")
-            .ctrl(WqeOpcode::TagMatching, 0)
+            .ctrl_tag_matching(0)
             .tag_add(
                 i,
                 tag,
@@ -414,7 +414,7 @@ fn test_tm_multiple_tags() {
             .borrow_mut()
             .cmd_wqe_builder((i + 100) as u64)
             .expect("cmd_wqe_builder failed")
-            .ctrl(WqeOpcode::TagMatching, 0)
+            .ctrl_tag_matching(0)
             .tag_del(i, true)
             .finish_with_blueflame();
 

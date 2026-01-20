@@ -12,8 +12,9 @@ use crate::cq::{CompletionQueue, Cqe};
 use crate::device::Context;
 use crate::pd::Pd;
 use crate::wqe::{
-    AtomicSeg, CtrlSeg, DataSeg, InlineHeader, MaskedAtomicSeg32, MaskedAtomicSeg64,
-    OrderedWqeTable, RdmaSeg, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
+    AtomicSeg, CtrlSeg, DataSeg, HasData, InlineHeader, Init, MaskedAtomicSeg32, MaskedAtomicSeg64,
+    NeedsAtomic, NeedsData, NeedsRdma, NeedsRdmaThenAtomic, OrderedWqeTable, RdmaSeg, WQEBB_SIZE,
+    WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
 };
 
 /// RC QP configuration.
@@ -382,10 +383,12 @@ impl<'a, Entry> RecvWqeBuilder<'a, Entry> {
 // WQE Builder
 // =============================================================================
 
-/// Zero-copy WQE builder for RC QP.
+/// Zero-copy WQE builder for RC QP with type-state safety.
 ///
 /// Writes segments directly to the SQ buffer without intermediate copies.
-pub struct WqeBuilder<'a, Entry, TableType> {
+/// The `State` type parameter tracks the current builder state, ensuring
+/// that only valid segment sequences can be constructed.
+pub struct WqeBuilder<'a, Entry, TableType, State> {
     sq: &'a SendQueueState<Entry, TableType>,
     wqe_ptr: *mut u8,
     wqe_idx: u16,
@@ -393,14 +396,31 @@ pub struct WqeBuilder<'a, Entry, TableType> {
     ds_count: u8,
     /// Whether SIGNALED flag is set
     signaled: bool,
+    _state: std::marker::PhantomData<State>,
 }
 
-impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType> {
-    /// Write the control segment.
-    ///
-    /// This must be the first segment in every WQE.
+// =============================================================================
+// WQE Builder Type-State Implementations
+// =============================================================================
+
+/// Helper to transition builder state.
+impl<'a, Entry, TableType, State> WqeBuilder<'a, Entry, TableType, State> {
     #[inline]
-    pub fn ctrl(mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) -> Self {
+    fn transition<NewState>(self) -> WqeBuilder<'a, Entry, TableType, NewState> {
+        WqeBuilder {
+            sq: self.sq,
+            wqe_ptr: self.wqe_ptr,
+            wqe_idx: self.wqe_idx,
+            offset: self.offset,
+            ds_count: self.ds_count,
+            signaled: self.signaled,
+            _state: std::marker::PhantomData,
+        }
+    }
+
+    /// Write control segment (internal helper).
+    #[inline]
+    fn write_ctrl(&mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) {
         let flags = if self.signaled {
             flags | WqeFlags::COMPLETION
         } else {
@@ -420,119 +440,11 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType> {
         }
         self.offset = CtrlSeg::SIZE;
         self.ds_count = 1;
-        self
     }
 
-    /// Add an RDMA segment (for WRITE/READ).
+    /// Write control segment with custom opmod (internal helper).
     #[inline]
-    pub fn rdma(mut self, remote_addr: u64, rkey: u32) -> Self {
-        unsafe {
-            RdmaSeg::write(self.wqe_ptr.add(self.offset), remote_addr, rkey);
-        }
-        self.offset += RdmaSeg::SIZE;
-        self.ds_count += 1;
-        self
-    }
-
-    /// Add a data segment (SGE).
-    #[inline]
-    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
-        unsafe {
-            DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
-        }
-        self.offset += DataSeg::SIZE;
-        self.ds_count += 1;
-        self
-    }
-
-    /// Add inline data.
-    #[inline]
-    pub fn inline_data(mut self, data: &[u8]) -> Self {
-        let padded_size = unsafe {
-            let ptr = self.wqe_ptr.add(self.offset);
-            let size = InlineHeader::write(ptr, data.len() as u32);
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
-            size
-        };
-        self.offset += padded_size;
-        self.ds_count += (padded_size / 16) as u8;
-        self
-    }
-
-    /// Get a mutable slice for inline data (zero-copy).
-    ///
-    /// Returns the builder and a slice that can be written to directly.
-    #[inline]
-    pub fn inline_slice(mut self, len: usize) -> (Self, &'a mut [u8]) {
-        let padded_size = unsafe {
-            let ptr = self.wqe_ptr.add(self.offset);
-            InlineHeader::write(ptr, len as u32)
-        };
-        let data_ptr = unsafe { self.wqe_ptr.add(self.offset + 4) };
-        let slice = unsafe { std::slice::from_raw_parts_mut(data_ptr, len) };
-        self.offset += padded_size;
-        self.ds_count += (padded_size / 16) as u8;
-        (self, slice)
-    }
-
-    /// Add an atomic Compare-and-Swap segment.
-    ///
-    /// The CAS operation atomically compares the 8-byte value at `remote_addr`
-    /// (specified in the preceding RDMA segment) with `compare`. If equal,
-    /// replaces it with `swap`. The original value is written to the local
-    /// buffer (specified in the following data segment).
-    ///
-    /// WQE structure for atomic CAS:
-    /// - Control segment (ctrl)
-    /// - RDMA segment (rdma) - specifies remote address and rkey
-    /// - Atomic segment (atomic_cas) - specifies swap and compare values
-    /// - Data segment (sge) - specifies local buffer for result
-    #[inline]
-    pub fn atomic_cas(mut self, swap: u64, compare: u64) -> Self {
-        unsafe {
-            AtomicSeg::write_cas(self.wqe_ptr.add(self.offset), swap, compare);
-        }
-        self.offset += AtomicSeg::SIZE;
-        self.ds_count += 1;
-        self
-    }
-
-    /// Add an atomic Fetch-and-Add segment.
-    ///
-    /// The FA operation atomically adds `add_value` to the 8-byte value at
-    /// `remote_addr` (specified in the preceding RDMA segment). The original
-    /// value is written to the local buffer (specified in the following data
-    /// segment).
-    ///
-    /// WQE structure for atomic FA:
-    /// - Control segment (ctrl)
-    /// - RDMA segment (rdma) - specifies remote address and rkey
-    /// - Atomic segment (atomic_fa) - specifies add value
-    /// - Data segment (sge) - specifies local buffer for result
-    #[inline]
-    pub fn atomic_fa(mut self, add_value: u64) -> Self {
-        unsafe {
-            AtomicSeg::write_fa(self.wqe_ptr.add(self.offset), add_value);
-        }
-        self.offset += AtomicSeg::SIZE;
-        self.ds_count += 1;
-        self
-    }
-
-    /// Set control segment with custom opmod (for masked atomics).
-    ///
-    /// # Arguments
-    /// * `opcode` - WQE opcode
-    /// * `flags` - WQE flags (completion, fence, solicited)
-    /// * `imm` - Immediate data value
-    /// * `opmod` - Operation mode (0=normal, 2=32-bit extended atomic, 3=64-bit extended atomic)
-    pub fn ctrl_with_opmod(
-        mut self,
-        opcode: WqeOpcode,
-        flags: WqeFlags,
-        imm: u32,
-        opmod: u8,
-    ) -> Self {
+    fn write_ctrl_with_opmod(&mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32, opmod: u8) {
         let fm_ce_se = if self.signaled {
             (flags | WqeFlags::COMPLETION | WqeFlags::FENCE).bits()
         } else {
@@ -553,30 +465,233 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType> {
         }
         self.offset = CtrlSeg::SIZE;
         self.ds_count = 1;
-        self
+    }
+}
+
+/// Init state: control segment methods.
+impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, Init> {
+    // -------------------------------------------------------------------------
+    // Send operations → NeedsData
+    // -------------------------------------------------------------------------
+
+    /// Write control segment for SEND operation.
+    #[inline]
+    pub fn ctrl_send(
+        mut self,
+        flags: WqeFlags,
+    ) -> WqeBuilder<'a, Entry, TableType, NeedsData> {
+        self.write_ctrl(WqeOpcode::Send, flags, 0);
+        self.transition()
+    }
+
+    /// Write control segment for SEND with immediate data.
+    #[inline]
+    pub fn ctrl_send_imm(
+        mut self,
+        flags: WqeFlags,
+        imm: u32,
+    ) -> WqeBuilder<'a, Entry, TableType, NeedsData> {
+        self.write_ctrl(WqeOpcode::SendImm, flags, imm);
+        self.transition()
+    }
+
+    /// Write control segment for SEND with invalidate.
+    #[inline]
+    pub fn ctrl_send_inval(
+        mut self,
+        flags: WqeFlags,
+        inv_rkey: u32,
+    ) -> WqeBuilder<'a, Entry, TableType, NeedsData> {
+        self.write_ctrl(WqeOpcode::SendInval, flags, inv_rkey);
+        self.transition()
+    }
+
+    // -------------------------------------------------------------------------
+    // RDMA operations → NeedsRdma
+    // -------------------------------------------------------------------------
+
+    /// Write control segment for RDMA WRITE operation.
+    #[inline]
+    pub fn ctrl_rdma_write(
+        mut self,
+        flags: WqeFlags,
+    ) -> WqeBuilder<'a, Entry, TableType, NeedsRdma> {
+        self.write_ctrl(WqeOpcode::RdmaWrite, flags, 0);
+        self.transition()
+    }
+
+    /// Write control segment for RDMA WRITE with immediate data.
+    #[inline]
+    pub fn ctrl_rdma_write_imm(
+        mut self,
+        flags: WqeFlags,
+        imm: u32,
+    ) -> WqeBuilder<'a, Entry, TableType, NeedsRdma> {
+        self.write_ctrl(WqeOpcode::RdmaWriteImm, flags, imm);
+        self.transition()
+    }
+
+    /// Write control segment for RDMA READ operation.
+    #[inline]
+    pub fn ctrl_rdma_read(
+        mut self,
+        flags: WqeFlags,
+    ) -> WqeBuilder<'a, Entry, TableType, NeedsRdma> {
+        self.write_ctrl(WqeOpcode::RdmaRead, flags, 0);
+        self.transition()
+    }
+
+    // -------------------------------------------------------------------------
+    // Atomic operations → NeedsRdmaThenAtomic
+    // -------------------------------------------------------------------------
+
+    /// Write control segment for Atomic Compare-and-Swap operation.
+    #[inline]
+    pub fn ctrl_atomic_cas(
+        mut self,
+        flags: WqeFlags,
+    ) -> WqeBuilder<'a, Entry, TableType, NeedsRdmaThenAtomic> {
+        self.write_ctrl(WqeOpcode::AtomicCs, flags, 0);
+        self.transition()
+    }
+
+    /// Write control segment for Atomic Fetch-and-Add operation.
+    #[inline]
+    pub fn ctrl_atomic_fa(
+        mut self,
+        flags: WqeFlags,
+    ) -> WqeBuilder<'a, Entry, TableType, NeedsRdmaThenAtomic> {
+        self.write_ctrl(WqeOpcode::AtomicFa, flags, 0);
+        self.transition()
+    }
+
+    /// Write control segment for Masked Atomic Compare-and-Swap (32-bit).
+    #[inline]
+    pub fn ctrl_masked_atomic_cas32(
+        mut self,
+        flags: WqeFlags,
+    ) -> WqeBuilder<'a, Entry, TableType, NeedsRdmaThenAtomic> {
+        // opmod = 0x08 for 32-bit extended atomic
+        self.write_ctrl_with_opmod(WqeOpcode::AtomicMaskedCs, flags, 0, 0x08);
+        self.transition()
+    }
+
+    /// Write control segment for Masked Atomic Fetch-and-Add (32-bit).
+    #[inline]
+    pub fn ctrl_masked_atomic_fa32(
+        mut self,
+        flags: WqeFlags,
+    ) -> WqeBuilder<'a, Entry, TableType, NeedsRdmaThenAtomic> {
+        // opmod = 0x08 for 32-bit extended atomic
+        self.write_ctrl_with_opmod(WqeOpcode::AtomicMaskedFa, flags, 0, 0x08);
+        self.transition()
+    }
+
+    /// Write control segment for Masked Atomic Compare-and-Swap (64-bit).
+    #[inline]
+    pub fn ctrl_masked_atomic_cas64(
+        mut self,
+        flags: WqeFlags,
+    ) -> WqeBuilder<'a, Entry, TableType, NeedsRdmaThenAtomic> {
+        // opmod = 0x09 for 64-bit extended atomic
+        self.write_ctrl_with_opmod(WqeOpcode::AtomicMaskedCs, flags, 0, 0x09);
+        self.transition()
+    }
+
+    /// Write control segment for Masked Atomic Fetch-and-Add (64-bit).
+    #[inline]
+    pub fn ctrl_masked_atomic_fa64(
+        mut self,
+        flags: WqeFlags,
+    ) -> WqeBuilder<'a, Entry, TableType, NeedsRdmaThenAtomic> {
+        // opmod = 0x09 for 64-bit extended atomic
+        self.write_ctrl_with_opmod(WqeOpcode::AtomicMaskedFa, flags, 0, 0x09);
+        self.transition()
+    }
+
+    // -------------------------------------------------------------------------
+    // NOP → HasData (finish immediately available)
+    // -------------------------------------------------------------------------
+
+    /// Write control segment for NOP operation.
+    #[inline]
+    pub fn ctrl_nop(mut self, flags: WqeFlags) -> WqeBuilder<'a, Entry, TableType, HasData> {
+        self.write_ctrl(WqeOpcode::Nop, flags, 0);
+        self.transition()
+    }
+}
+
+/// NeedsRdma state: RDMA segment required.
+impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, NeedsRdma> {
+    /// Add an RDMA segment specifying remote address and rkey.
+    #[inline]
+    pub fn rdma(mut self, remote_addr: u64, rkey: u32) -> WqeBuilder<'a, Entry, TableType, NeedsData> {
+        unsafe {
+            RdmaSeg::write(self.wqe_ptr.add(self.offset), remote_addr, rkey);
+        }
+        self.offset += RdmaSeg::SIZE;
+        self.ds_count += 1;
+        self.transition()
+    }
+}
+
+/// NeedsRdmaThenAtomic state: RDMA segment required, then atomic segment.
+impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, NeedsRdmaThenAtomic> {
+    /// Add an RDMA segment specifying remote address and rkey.
+    #[inline]
+    pub fn rdma(mut self, remote_addr: u64, rkey: u32) -> WqeBuilder<'a, Entry, TableType, NeedsAtomic> {
+        unsafe {
+            RdmaSeg::write(self.wqe_ptr.add(self.offset), remote_addr, rkey);
+        }
+        self.offset += RdmaSeg::SIZE;
+        self.ds_count += 1;
+        self.transition()
+    }
+}
+
+/// NeedsAtomic state: atomic segment required.
+impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, NeedsAtomic> {
+    /// Add an atomic Compare-and-Swap segment.
+    ///
+    /// The CAS operation atomically compares the 8-byte value at `remote_addr`
+    /// (specified in the preceding RDMA segment) with `compare`. If equal,
+    /// replaces it with `swap`. The original value is written to the local
+    /// buffer (specified in the following data segment).
+    #[inline]
+    pub fn atomic_cas(mut self, swap: u64, compare: u64) -> WqeBuilder<'a, Entry, TableType, NeedsData> {
+        unsafe {
+            AtomicSeg::write_cas(self.wqe_ptr.add(self.offset), swap, compare);
+        }
+        self.offset += AtomicSeg::SIZE;
+        self.ds_count += 1;
+        self.transition()
+    }
+
+    /// Add an atomic Fetch-and-Add segment.
+    ///
+    /// The FA operation atomically adds `add_value` to the 8-byte value at
+    /// `remote_addr` (specified in the preceding RDMA segment). The original
+    /// value is written to the local buffer (specified in the following data
+    /// segment).
+    #[inline]
+    pub fn atomic_fa(mut self, add_value: u64) -> WqeBuilder<'a, Entry, TableType, NeedsData> {
+        unsafe {
+            AtomicSeg::write_fa(self.wqe_ptr.add(self.offset), add_value);
+        }
+        self.offset += AtomicSeg::SIZE;
+        self.ds_count += 1;
+        self.transition()
     }
 
     /// Masked Compare-and-Swap (64-bit, 2 segments).
-    ///
-    /// Atomically compares masked fields of a 64-bit value at `remote_addr`
-    /// and replaces them with `swap` if masked fields match `compare`.
-    ///
-    /// WQE structure:
-    /// - Control segment (ctrl_with_opmod)
-    /// - RDMA segment (rdma)
-    /// - Masked atomic segment 1 (MaskedAtomicSeg64) - swap/compare
-    /// - Masked atomic segment 2 (MaskedAtomicSeg64) - swap_mask/compare_mask
-    /// - Data segment (sge)
-    ///
-    /// # Safety
-    /// `opmod` must be 0x09 (64-bit extended atomic).
+    #[inline]
     pub fn masked_cas64(
         mut self,
         swap: u64,
         compare: u64,
         swap_mask: u64,
         compare_mask: u64,
-    ) -> Self {
+    ) -> WqeBuilder<'a, Entry, TableType, NeedsData> {
         unsafe {
             let ptr1 = self.wqe_ptr.add(self.offset);
             let ptr2 = self
@@ -587,51 +702,29 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType> {
         }
         self.offset += MaskedAtomicSeg64::SIZE_CAS;
         self.ds_count += 2;
-        self
+        self.transition()
     }
 
     /// Masked Fetch-and-Add (64-bit, 1 segment).
-    ///
-    /// Atomically adds `add_value` to masked fields of a 64-bit value
-    /// at `remote_addr` and returns the original value.
-    ///
-    /// WQE structure:
-    /// - Control segment (ctrl_with_opmod)
-    /// - RDMA segment (rdma)
-    /// - Masked atomic segment (MaskedAtomicSeg64) - add/field_mask
-    /// - Data segment (sge)
-    ///
-    /// # Safety
-    /// `opmod` must be 0x09 (64-bit extended atomic).
-    pub fn masked_fa64(mut self, add: u64, field_mask: u64) -> Self {
+    #[inline]
+    pub fn masked_fa64(mut self, add: u64, field_mask: u64) -> WqeBuilder<'a, Entry, TableType, NeedsData> {
         unsafe {
             MaskedAtomicSeg64::write_fa(self.wqe_ptr.add(self.offset), add, field_mask);
         }
         self.offset += MaskedAtomicSeg64::SIZE_FA;
         self.ds_count += 1;
-        self
+        self.transition()
     }
 
     /// Masked Compare-and-Swap (32-bit, 1 segment).
-    ///
-    /// Atomically compares masked fields of a 32-bit value at `remote_addr`
-    /// and replaces them with `swap` if masked fields match `compare`.
-    ///
-    /// WQE structure:
-    /// - Control segment (ctrl_with_opmod)
-    /// - RDMA segment (rdma)
-    /// - Masked atomic segment (MaskedAtomicSeg32)
-    /// - Data segment (sge)
-    ///
-    /// # Safety
-    /// `opmod` must be 0x08 (32-bit extended atomic).
+    #[inline]
     pub fn masked_cas32(
         mut self,
         swap: u32,
         compare: u32,
         swap_mask: u32,
         compare_mask: u32,
-    ) -> Self {
+    ) -> WqeBuilder<'a, Entry, TableType, NeedsData> {
         unsafe {
             MaskedAtomicSeg32::write_cas(
                 self.wqe_ptr.add(self.offset),
@@ -643,27 +736,74 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType> {
         }
         self.offset += MaskedAtomicSeg32::SIZE;
         self.ds_count += 1;
-        self
+        self.transition()
     }
 
     /// Masked Fetch-and-Add (32-bit, 1 segment).
-    ///
-    /// Atomically adds `add_value` to masked fields of a 32-bit value
-    /// at `remote_addr` and returns the original value.
-    ///
-    /// WQE structure:
-    /// - Control segment (ctrl_with_opmod)
-    /// - RDMA segment (rdma)
-    /// - Masked atomic segment (MaskedAtomicSeg32)
-    /// - Data segment (sge)
-    ///
-    /// # Safety
-    /// `opmod` must be 0x08 (32-bit extended atomic).
-    pub fn masked_fa32(mut self, add: u32, field_mask: u32) -> Self {
+    #[inline]
+    pub fn masked_fa32(mut self, add: u32, field_mask: u32) -> WqeBuilder<'a, Entry, TableType, NeedsData> {
         unsafe {
             MaskedAtomicSeg32::write_fa(self.wqe_ptr.add(self.offset), add, field_mask);
         }
         self.offset += MaskedAtomicSeg32::SIZE;
+        self.ds_count += 1;
+        self.transition()
+    }
+}
+
+/// NeedsData state: data segment (SGE or inline) required.
+impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, NeedsData> {
+    /// Add a data segment (SGE).
+    #[inline]
+    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> WqeBuilder<'a, Entry, TableType, HasData> {
+        unsafe {
+            DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
+        }
+        self.offset += DataSeg::SIZE;
+        self.ds_count += 1;
+        self.transition()
+    }
+
+    /// Add inline data.
+    #[inline]
+    pub fn inline_data(mut self, data: &[u8]) -> WqeBuilder<'a, Entry, TableType, HasData> {
+        let padded_size = unsafe {
+            let ptr = self.wqe_ptr.add(self.offset);
+            let size = InlineHeader::write(ptr, data.len() as u32);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
+            size
+        };
+        self.offset += padded_size;
+        self.ds_count += (padded_size / 16) as u8;
+        self.transition()
+    }
+
+    /// Get a mutable slice for inline data (zero-copy).
+    ///
+    /// Returns the builder and a slice that can be written to directly.
+    #[inline]
+    pub fn inline_slice(mut self, len: usize) -> (WqeBuilder<'a, Entry, TableType, HasData>, &'a mut [u8]) {
+        let padded_size = unsafe {
+            let ptr = self.wqe_ptr.add(self.offset);
+            InlineHeader::write(ptr, len as u32)
+        };
+        let data_ptr = unsafe { self.wqe_ptr.add(self.offset + 4) };
+        let slice = unsafe { std::slice::from_raw_parts_mut(data_ptr, len) };
+        self.offset += padded_size;
+        self.ds_count += (padded_size / 16) as u8;
+        (self.transition(), slice)
+    }
+}
+
+/// HasData state: additional SGEs and finish methods available.
+impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, HasData> {
+    /// Add another data segment (SGE).
+    #[inline]
+    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
+        unsafe {
+            DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
+        }
+        self.offset += DataSeg::SIZE;
         self.ds_count += 1;
         self
     }
@@ -674,7 +814,7 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType> {
     /// a NOP WQE to fill in remaining slots and relocates the WQE to
     /// ring start.
     #[inline]
-    fn finish_internal(self) -> io::Result<WqeHandle> {
+    pub(crate) fn finish_internal(self) -> io::Result<WqeHandle> {
         let wqebb_cnt = calc_wqebb_cnt(self.offset);
         let slots_to_end = self.sq.slots_to_end();
 
@@ -744,7 +884,7 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType> {
     /// Use this for low-latency single WQE submission. The doorbell is issued
     /// immediately, so no need to call `ring_sq_doorbell()` afterwards.
     #[inline]
-    fn finish_internal_with_blueflame(self) -> io::Result<WqeHandle> {
+    pub(crate) fn finish_internal_with_blueflame(self) -> io::Result<WqeHandle> {
         let wqebb_cnt = calc_wqebb_cnt(self.offset);
         let slots_to_end = self.sq.slots_to_end();
 
@@ -1446,7 +1586,8 @@ impl<Entry, OnComplete> RcQp<Entry, OnComplete> {
     /// Get a WQE builder for zero-copy WQE construction (signaled).
     ///
     /// The entry will be stored and returned via callback on completion.
-    pub fn wqe_builder(&self, entry: Entry) -> io::Result<RcQpWqeBuilder<'_, Entry>> {
+    /// Returns a builder in `Init` state.
+    pub fn wqe_builder(&self, entry: Entry) -> io::Result<RcQpWqeBuilder<'_, Entry, Init>> {
         let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -1463,6 +1604,7 @@ impl<Entry, OnComplete> RcQp<Entry, OnComplete> {
                 offset: 0,
                 ds_count: 0,
                 signaled: true,
+                _state: std::marker::PhantomData,
             },
             entry: Some(entry),
         })
@@ -1471,7 +1613,8 @@ impl<Entry, OnComplete> RcQp<Entry, OnComplete> {
     /// Get a WQE builder for zero-copy WQE construction (unsignaled).
     ///
     /// No entry is stored and no completion callback will be invoked.
-    pub fn wqe_builder_unsignaled(&self) -> io::Result<RcQpWqeBuilder<'_, Entry>> {
+    /// Returns a builder in `Init` state.
+    pub fn wqe_builder_unsignaled(&self) -> io::Result<RcQpWqeBuilder<'_, Entry, Init>> {
         let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -1488,6 +1631,7 @@ impl<Entry, OnComplete> RcQp<Entry, OnComplete> {
                 offset: 0,
                 ds_count: 0,
                 signaled: false,
+                _state: std::marker::PhantomData,
             },
             entry: None,
         })
@@ -1495,56 +1639,243 @@ impl<Entry, OnComplete> RcQp<Entry, OnComplete> {
 }
 
 // =============================================================================
-// RC QP WQE Builder
+// RC QP WQE Builder (Type-State)
 // =============================================================================
 
 /// WQE builder for RC QP that stores entry on finish.
-pub struct RcQpWqeBuilder<'a, T> {
-    inner: WqeBuilder<'a, T, OrderedWqeTable<T>>,
+///
+/// The `State` type parameter tracks the builder state, ensuring only valid
+/// segment sequences can be constructed at compile time.
+pub struct RcQpWqeBuilder<'a, T, State> {
+    inner: WqeBuilder<'a, T, OrderedWqeTable<T>, State>,
     entry: Option<T>,
 }
 
-impl<'a, T> RcQpWqeBuilder<'a, T> {
-    /// Write the control segment.
-    pub fn ctrl(mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) -> Self {
-        self.inner = self.inner.ctrl(opcode, flags, imm);
-        self
+/// Init state: control segment methods.
+impl<'a, T> RcQpWqeBuilder<'a, T, Init> {
+    // -------------------------------------------------------------------------
+    // Send operations → NeedsData
+    // -------------------------------------------------------------------------
+
+    /// Write control segment for SEND operation.
+    #[inline]
+    pub fn ctrl_send(self, flags: WqeFlags) -> RcQpWqeBuilder<'a, T, NeedsData> {
+        let inner = self.inner.ctrl_send(flags);
+        RcQpWqeBuilder { inner, entry: self.entry }
     }
 
-    /// Add an RDMA segment.
-    pub fn rdma(mut self, remote_addr: u64, rkey: u32) -> Self {
-        self.inner = self.inner.rdma(remote_addr, rkey);
-        self
+    /// Write control segment for SEND with immediate data.
+    #[inline]
+    pub fn ctrl_send_imm(self, flags: WqeFlags, imm: u32) -> RcQpWqeBuilder<'a, T, NeedsData> {
+        let inner = self.inner.ctrl_send_imm(flags, imm);
+        RcQpWqeBuilder { inner, entry: self.entry }
     }
 
-    /// Add a data segment.
-    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
-        self.inner = self.inner.sge(addr, len, lkey);
-        self
+    /// Write control segment for SEND with invalidate.
+    #[inline]
+    pub fn ctrl_send_inval(self, flags: WqeFlags, inv_rkey: u32) -> RcQpWqeBuilder<'a, T, NeedsData> {
+        let inner = self.inner.ctrl_send_inval(flags, inv_rkey);
+        RcQpWqeBuilder { inner, entry: self.entry }
     }
 
-    /// Add inline data.
-    pub fn inline_data(mut self, data: &[u8]) -> Self {
-        self.inner = self.inner.inline_data(data);
-        self
+    // -------------------------------------------------------------------------
+    // RDMA operations → NeedsRdma
+    // -------------------------------------------------------------------------
+
+    /// Write control segment for RDMA WRITE operation.
+    #[inline]
+    pub fn ctrl_rdma_write(self, flags: WqeFlags) -> RcQpWqeBuilder<'a, T, NeedsRdma> {
+        let inner = self.inner.ctrl_rdma_write(flags);
+        RcQpWqeBuilder { inner, entry: self.entry }
     }
 
+    /// Write control segment for RDMA WRITE with immediate data.
+    #[inline]
+    pub fn ctrl_rdma_write_imm(self, flags: WqeFlags, imm: u32) -> RcQpWqeBuilder<'a, T, NeedsRdma> {
+        let inner = self.inner.ctrl_rdma_write_imm(flags, imm);
+        RcQpWqeBuilder { inner, entry: self.entry }
+    }
+
+    /// Write control segment for RDMA READ operation.
+    #[inline]
+    pub fn ctrl_rdma_read(self, flags: WqeFlags) -> RcQpWqeBuilder<'a, T, NeedsRdma> {
+        let inner = self.inner.ctrl_rdma_read(flags);
+        RcQpWqeBuilder { inner, entry: self.entry }
+    }
+
+    // -------------------------------------------------------------------------
+    // Atomic operations → NeedsRdmaThenAtomic
+    // -------------------------------------------------------------------------
+
+    /// Write control segment for Atomic Compare-and-Swap operation.
+    #[inline]
+    pub fn ctrl_atomic_cas(self, flags: WqeFlags) -> RcQpWqeBuilder<'a, T, NeedsRdmaThenAtomic> {
+        let inner = self.inner.ctrl_atomic_cas(flags);
+        RcQpWqeBuilder { inner, entry: self.entry }
+    }
+
+    /// Write control segment for Atomic Fetch-and-Add operation.
+    #[inline]
+    pub fn ctrl_atomic_fa(self, flags: WqeFlags) -> RcQpWqeBuilder<'a, T, NeedsRdmaThenAtomic> {
+        let inner = self.inner.ctrl_atomic_fa(flags);
+        RcQpWqeBuilder { inner, entry: self.entry }
+    }
+
+    /// Write control segment for Masked Atomic Compare-and-Swap (32-bit).
+    #[inline]
+    pub fn ctrl_masked_atomic_cas32(self, flags: WqeFlags) -> RcQpWqeBuilder<'a, T, NeedsRdmaThenAtomic> {
+        let inner = self.inner.ctrl_masked_atomic_cas32(flags);
+        RcQpWqeBuilder { inner, entry: self.entry }
+    }
+
+    /// Write control segment for Masked Atomic Fetch-and-Add (32-bit).
+    #[inline]
+    pub fn ctrl_masked_atomic_fa32(self, flags: WqeFlags) -> RcQpWqeBuilder<'a, T, NeedsRdmaThenAtomic> {
+        let inner = self.inner.ctrl_masked_atomic_fa32(flags);
+        RcQpWqeBuilder { inner, entry: self.entry }
+    }
+
+    /// Write control segment for Masked Atomic Compare-and-Swap (64-bit).
+    #[inline]
+    pub fn ctrl_masked_atomic_cas64(self, flags: WqeFlags) -> RcQpWqeBuilder<'a, T, NeedsRdmaThenAtomic> {
+        let inner = self.inner.ctrl_masked_atomic_cas64(flags);
+        RcQpWqeBuilder { inner, entry: self.entry }
+    }
+
+    /// Write control segment for Masked Atomic Fetch-and-Add (64-bit).
+    #[inline]
+    pub fn ctrl_masked_atomic_fa64(self, flags: WqeFlags) -> RcQpWqeBuilder<'a, T, NeedsRdmaThenAtomic> {
+        let inner = self.inner.ctrl_masked_atomic_fa64(flags);
+        RcQpWqeBuilder { inner, entry: self.entry }
+    }
+
+    // -------------------------------------------------------------------------
+    // NOP → HasData
+    // -------------------------------------------------------------------------
+
+    /// Write control segment for NOP operation.
+    #[inline]
+    pub fn ctrl_nop(self, flags: WqeFlags) -> RcQpWqeBuilder<'a, T, HasData> {
+        let inner = self.inner.ctrl_nop(flags);
+        RcQpWqeBuilder { inner, entry: self.entry }
+    }
+}
+
+/// NeedsRdma state: RDMA segment required.
+impl<'a, T> RcQpWqeBuilder<'a, T, NeedsRdma> {
+    /// Add an RDMA segment specifying remote address and rkey.
+    #[inline]
+    pub fn rdma(self, remote_addr: u64, rkey: u32) -> RcQpWqeBuilder<'a, T, NeedsData> {
+        let inner = self.inner.rdma(remote_addr, rkey);
+        RcQpWqeBuilder { inner, entry: self.entry }
+    }
+}
+
+/// NeedsRdmaThenAtomic state: RDMA segment required, then atomic segment.
+impl<'a, T> RcQpWqeBuilder<'a, T, NeedsRdmaThenAtomic> {
+    /// Add an RDMA segment specifying remote address and rkey.
+    #[inline]
+    pub fn rdma(self, remote_addr: u64, rkey: u32) -> RcQpWqeBuilder<'a, T, NeedsAtomic> {
+        let inner = self.inner.rdma(remote_addr, rkey);
+        RcQpWqeBuilder { inner, entry: self.entry }
+    }
+}
+
+/// NeedsAtomic state: atomic segment required.
+impl<'a, T> RcQpWqeBuilder<'a, T, NeedsAtomic> {
     /// Add an atomic Compare-and-Swap segment.
-    pub fn atomic_cas(mut self, swap: u64, compare: u64) -> Self {
-        self.inner = self.inner.atomic_cas(swap, compare);
-        self
+    #[inline]
+    pub fn atomic_cas(self, swap: u64, compare: u64) -> RcQpWqeBuilder<'a, T, NeedsData> {
+        let inner = self.inner.atomic_cas(swap, compare);
+        RcQpWqeBuilder { inner, entry: self.entry }
     }
 
     /// Add an atomic Fetch-and-Add segment.
-    pub fn atomic_fa(mut self, add_value: u64) -> Self {
-        self.inner = self.inner.atomic_fa(add_value);
-        self
+    #[inline]
+    pub fn atomic_fa(self, add_value: u64) -> RcQpWqeBuilder<'a, T, NeedsData> {
+        let inner = self.inner.atomic_fa(add_value);
+        RcQpWqeBuilder { inner, entry: self.entry }
+    }
+
+    /// Masked Compare-and-Swap (64-bit).
+    #[inline]
+    pub fn masked_cas64(
+        self,
+        swap: u64,
+        compare: u64,
+        swap_mask: u64,
+        compare_mask: u64,
+    ) -> RcQpWqeBuilder<'a, T, NeedsData> {
+        let inner = self.inner.masked_cas64(swap, compare, swap_mask, compare_mask);
+        RcQpWqeBuilder { inner, entry: self.entry }
+    }
+
+    /// Masked Fetch-and-Add (64-bit).
+    #[inline]
+    pub fn masked_fa64(self, add: u64, field_mask: u64) -> RcQpWqeBuilder<'a, T, NeedsData> {
+        let inner = self.inner.masked_fa64(add, field_mask);
+        RcQpWqeBuilder { inner, entry: self.entry }
+    }
+
+    /// Masked Compare-and-Swap (32-bit).
+    #[inline]
+    pub fn masked_cas32(
+        self,
+        swap: u32,
+        compare: u32,
+        swap_mask: u32,
+        compare_mask: u32,
+    ) -> RcQpWqeBuilder<'a, T, NeedsData> {
+        let inner = self.inner.masked_cas32(swap, compare, swap_mask, compare_mask);
+        RcQpWqeBuilder { inner, entry: self.entry }
+    }
+
+    /// Masked Fetch-and-Add (32-bit).
+    #[inline]
+    pub fn masked_fa32(self, add: u32, field_mask: u32) -> RcQpWqeBuilder<'a, T, NeedsData> {
+        let inner = self.inner.masked_fa32(add, field_mask);
+        RcQpWqeBuilder { inner, entry: self.entry }
+    }
+}
+
+/// NeedsData state: data segment (SGE or inline) required.
+impl<'a, T> RcQpWqeBuilder<'a, T, NeedsData> {
+    /// Add a data segment (SGE).
+    #[inline]
+    pub fn sge(self, addr: u64, len: u32, lkey: u32) -> RcQpWqeBuilder<'a, T, HasData> {
+        let inner = self.inner.sge(addr, len, lkey);
+        RcQpWqeBuilder { inner, entry: self.entry }
+    }
+
+    /// Add inline data.
+    #[inline]
+    pub fn inline_data(self, data: &[u8]) -> RcQpWqeBuilder<'a, T, HasData> {
+        let inner = self.inner.inline_data(data);
+        RcQpWqeBuilder { inner, entry: self.entry }
+    }
+
+    /// Get a mutable slice for inline data (zero-copy).
+    #[inline]
+    pub fn inline_slice(self, len: usize) -> (RcQpWqeBuilder<'a, T, HasData>, &'a mut [u8]) {
+        let (inner, slice) = self.inner.inline_slice(len);
+        (RcQpWqeBuilder { inner, entry: self.entry }, slice)
+    }
+}
+
+/// HasData state: additional SGEs and finish methods available.
+impl<'a, T> RcQpWqeBuilder<'a, T, HasData> {
+    /// Add another data segment (SGE).
+    #[inline]
+    pub fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
+        let inner = self.inner.sge(addr, len, lkey);
+        RcQpWqeBuilder { inner, entry: self.entry }
     }
 
     /// Finish the WQE construction.
     ///
     /// # Errors
-    /// Returns an error if required segments are missing for the opcode.
+    /// Returns an error if WQE wrap-around fails due to SQ being full.
+    #[inline]
     pub fn finish(self) -> io::Result<WqeHandle> {
         // Keep reference to sq before consuming self.inner
         let sq = self.inner.sq;
@@ -1567,7 +1898,8 @@ impl<'a, T> RcQpWqeBuilder<'a, T> {
     /// `ring_sq_doorbell()` afterwards.
     ///
     /// # Errors
-    /// Returns an error if required segments are missing for the opcode.
+    /// Returns an error if WQE wrap-around fails due to SQ being full.
+    #[inline]
     pub fn finish_with_blueflame(self) -> io::Result<WqeHandle> {
         // Keep reference to sq before consuming self.inner
         let sq = self.inner.sq;

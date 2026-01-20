@@ -196,7 +196,7 @@ fn test_ud_send_recv() {
         .borrow_mut()
         .wqe_builder(1u64)
         .expect("wqe_builder failed")
-        .ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
+        .ctrl_send(WqeFlags::empty())
         .ud_av(&ah, qkey)
         .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
         .finish_with_blueflame();
@@ -327,7 +327,7 @@ fn test_ud_send_raw_av() {
         .borrow_mut()
         .wqe_builder(1u64)
         .expect("wqe_builder failed")
-        .ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
+        .ctrl_send(WqeFlags::empty())
         .ud_av_raw(remote_qpn, qkey, dlid)
         .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
         .finish_with_blueflame();
@@ -467,7 +467,7 @@ fn test_ud_multiple_destinations() {
             .borrow_mut()
             .wqe_builder((i + 1) as u64)
             .expect("wqe_builder failed")
-            .ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
+            .ctrl_send(WqeFlags::empty())
             .ud_av(&ah, qkey)
             .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
             .finish_with_blueflame();
@@ -605,7 +605,7 @@ fn test_ud_post_nop_to_ring_end() {
             .borrow_mut()
             .wqe_builder(i as u64)
             .expect("wqe_builder failed")
-            .ctrl(WqeOpcode::Send, WqeFlags::COMPLETION, 0)
+            .ctrl_send(WqeFlags::COMPLETION)
             .ud_av(&ah, qkey)
             .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
             .finish_with_blueflame()

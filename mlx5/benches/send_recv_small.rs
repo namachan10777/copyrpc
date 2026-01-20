@@ -468,14 +468,14 @@ fn server_thread_main(
                     let _ = qp_ref
                         .wqe_builder(idx as u64)
                         .unwrap()
-                        .ctrl(WqeOpcode::Send, WqeFlags::COMPLETION, 0)
+                        .ctrl_send(WqeFlags::COMPLETION)
                         .inline_data(&echo_data)
                         .finish();
                 } else {
                     let _ = qp_ref
                         .wqe_builder_unsignaled()
                         .unwrap()
-                        .ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
+                        .ctrl_send(WqeFlags::empty())
                         .inline_data(&echo_data)
                         .finish();
                 }
@@ -521,7 +521,7 @@ where
             let _ = qp
                 .wqe_builder(idx as u64)
                 .unwrap()
-                .ctrl(WqeOpcode::Send, WqeFlags::COMPLETION, 0)
+                .ctrl_send(WqeFlags::COMPLETION)
                 .inline_data(&send_data)
                 .finish();
             qp.ring_sq_doorbell();
@@ -586,7 +586,7 @@ where
                 let _ = qp
                     .wqe_builder_unsignaled()
                     .unwrap()
-                    .ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
+                    .ctrl_send(WqeFlags::empty())
                     .inline_data(&send_data)
                     .finish();
             }
@@ -595,7 +595,7 @@ where
             let _ = qp
                 .wqe_builder(idx as u64)
                 .unwrap()
-                .ctrl(WqeOpcode::Send, WqeFlags::COMPLETION, 0)
+                .ctrl_send(WqeFlags::COMPLETION)
                 .inline_data(&send_data)
                 .finish();
         }
@@ -606,7 +606,7 @@ where
             let _ = qp
                 .wqe_builder(idx as u64)
                 .unwrap()
-                .ctrl(WqeOpcode::Send, WqeFlags::COMPLETION, 0)
+                .ctrl_send(WqeFlags::COMPLETION)
                 .inline_data(&send_data)
                 .finish();
         }
@@ -667,7 +667,7 @@ where
                     let _ = qp
                         .wqe_builder_unsignaled()
                         .unwrap()
-                        .ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
+                        .ctrl_send(WqeFlags::empty())
                         .inline_data(&send_data)
                         .finish();
                 }
@@ -675,7 +675,7 @@ where
                 let _ = qp
                     .wqe_builder(batch as u64)
                     .unwrap()
-                    .ctrl(WqeOpcode::Send, WqeFlags::COMPLETION, 0)
+                    .ctrl_send(WqeFlags::COMPLETION)
                     .inline_data(&send_data)
                     .finish();
             }
@@ -685,7 +685,7 @@ where
                 let _ = qp
                     .wqe_builder(j as u64)
                     .unwrap()
-                    .ctrl(WqeOpcode::Send, WqeFlags::COMPLETION, 0)
+                    .ctrl_send(WqeFlags::COMPLETION)
                     .inline_data(&send_data)
                     .finish();
             }

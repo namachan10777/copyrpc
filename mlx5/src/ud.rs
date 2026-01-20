@@ -19,8 +19,8 @@ use crate::device::Context;
 use crate::pd::{AddressHandle, Pd};
 use crate::qp::QpInfo;
 use crate::wqe::{
-    CtrlSeg, DataSeg, InlineHeader, OrderedWqeTable, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode,
-    calc_wqebb_cnt,
+    CtrlSeg, DataSeg, HasData, InlineHeader, Init, NeedsData, OrderedWqeTable, UdNeedsAddr,
+    WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
 };
 
 // =============================================================================
@@ -362,22 +362,39 @@ impl UdAddressSeg {
 }
 
 // =============================================================================
-// UD WQE Builder
+// UD WQE Builder (Type-State)
 // =============================================================================
 
-/// Zero-copy WQE builder for UD QP.
-pub struct UdWqeBuilder<'a, Entry, TableType> {
+/// Zero-copy WQE builder for UD QP with type-state safety.
+///
+/// The `State` type parameter tracks the current builder state.
+pub struct UdWqeBuilder<'a, Entry, TableType, State> {
     sq: &'a UdSendQueueState<Entry, TableType>,
     wqe_ptr: *mut u8,
     wqe_idx: u16,
     offset: usize,
     ds_count: u8,
     signaled: bool,
+    _state: PhantomData<State>,
 }
 
-impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
-    /// Write the control segment.
-    pub fn ctrl(mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32, opmod: u8) -> Self {
+impl<'a, Entry, TableType, State> UdWqeBuilder<'a, Entry, TableType, State> {
+    #[inline]
+    fn transition<NewState>(self) -> UdWqeBuilder<'a, Entry, TableType, NewState> {
+        UdWqeBuilder {
+            sq: self.sq,
+            wqe_ptr: self.wqe_ptr,
+            wqe_idx: self.wqe_idx,
+            offset: self.offset,
+            ds_count: self.ds_count,
+            signaled: self.signaled,
+            _state: PhantomData,
+        }
+    }
+
+    /// Write control segment (internal helper).
+    #[inline]
+    fn write_ctrl(&mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) {
         let flags = if self.signaled {
             flags | WqeFlags::COMPLETION
         } else {
@@ -386,7 +403,7 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
         unsafe {
             CtrlSeg::write(
                 self.wqe_ptr,
-                opmod, // NEW: pass opmod parameter
+                0, // opmod = 0 for normal operations
                 opcode as u8,
                 self.wqe_idx,
                 self.sq.sqn,
@@ -397,30 +414,94 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
         }
         self.offset = CtrlSeg::SIZE;
         self.ds_count = 1;
-        self
+    }
+}
+
+/// Init state: control segment methods.
+impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType, Init> {
+    // -------------------------------------------------------------------------
+    // Send operations → UdNeedsAddr<NeedsData>
+    // -------------------------------------------------------------------------
+
+    /// Write control segment for SEND operation.
+    #[inline]
+    pub fn ctrl_send(
+        mut self,
+        flags: WqeFlags,
+    ) -> UdWqeBuilder<'a, Entry, TableType, UdNeedsAddr<NeedsData>> {
+        self.write_ctrl(WqeOpcode::Send, flags, 0);
+        self.transition()
     }
 
+    /// Write control segment for SEND with immediate data.
+    #[inline]
+    pub fn ctrl_send_imm(
+        mut self,
+        flags: WqeFlags,
+        imm: u32,
+    ) -> UdWqeBuilder<'a, Entry, TableType, UdNeedsAddr<NeedsData>> {
+        self.write_ctrl(WqeOpcode::SendImm, flags, imm);
+        self.transition()
+    }
+}
+
+/// UdNeedsAddr<Next> state: UD address segment required.
+impl<'a, Entry, TableType, Next> UdWqeBuilder<'a, Entry, TableType, UdNeedsAddr<Next>> {
     /// Add UD address segment using an Address Handle.
-    pub fn ud_av(mut self, ah: &AddressHandle, qkey: u32) -> Self {
+    #[inline]
+    pub fn ud_av(mut self, ah: &AddressHandle, qkey: u32) -> UdWqeBuilder<'a, Entry, TableType, Next> {
         unsafe {
             UdAddressSeg::write(self.wqe_ptr.add(self.offset), ah, qkey);
         }
         self.offset += UdAddressSeg::SIZE;
         self.ds_count += 3; // 48 bytes = 3 DS
-        self
+        self.transition()
     }
 
     /// Add UD address segment using raw values.
-    pub fn ud_av_raw(mut self, remote_qpn: u32, qkey: u32, dlid: u16) -> Self {
+    #[inline]
+    pub fn ud_av_raw(mut self, remote_qpn: u32, qkey: u32, dlid: u16) -> UdWqeBuilder<'a, Entry, TableType, Next> {
         unsafe {
             UdAddressSeg::write_raw(self.wqe_ptr.add(self.offset), remote_qpn, qkey, dlid);
         }
         self.offset += UdAddressSeg::SIZE;
         self.ds_count += 3;
-        self
+        self.transition()
+    }
+}
+
+/// NeedsData state: data segment (SGE or inline) required.
+impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType, NeedsData> {
+    /// Add a data segment (SGE).
+    #[inline]
+    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> UdWqeBuilder<'a, Entry, TableType, HasData> {
+        unsafe {
+            DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
+        }
+        self.offset += DataSeg::SIZE;
+        self.ds_count += 1;
+        self.transition()
     }
 
-    /// Add a data segment (SGE).
+    /// Add inline data.
+    #[inline]
+    pub fn inline_data(mut self, data: &[u8]) -> UdWqeBuilder<'a, Entry, TableType, HasData> {
+        let padded_size = unsafe {
+            let ptr = self.wqe_ptr.add(self.offset);
+            let size = InlineHeader::write(ptr, data.len() as u32);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
+            size
+        };
+        self.offset += padded_size;
+        self.ds_count += (padded_size / 16) as u8;
+        self.transition()
+    }
+}
+
+/// HasData state: additional SGEs and finish methods available.
+impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType, HasData> {
+    /// Add another data segment (SGE).
+    #[inline]
     pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
         unsafe {
             DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
@@ -430,22 +511,9 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
         self
     }
 
-    /// Add inline data.
-    pub fn inline_data(mut self, data: &[u8]) -> Self {
-        let padded_size = unsafe {
-            let ptr = self.wqe_ptr.add(self.offset);
-            let size = InlineHeader::write(ptr, data.len() as u32);
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
-            size
-        };
-        self.offset += padded_size;
-        self.ds_count += (padded_size / 16) as u8;
-        self
-    }
-
     /// Finish the WQE construction (internal).
     #[inline]
-    fn finish_internal(self) -> io::Result<WqeHandle> {
+    pub(crate) fn finish_internal(self) -> io::Result<WqeHandle> {
         let wqebb_cnt = calc_wqebb_cnt(self.offset);
         let slots_to_end = self.sq.slots_to_end();
 
@@ -511,11 +579,8 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
     }
 
     /// Finish the WQE construction and immediately ring BlueFlame doorbell.
-    ///
-    /// Use this for low-latency single WQE submission. The doorbell is issued
-    /// immediately, so no need to call `ring_sq_doorbell()` afterwards.
     #[inline]
-    fn finish_internal_with_blueflame(self) -> io::Result<WqeHandle> {
+    pub(crate) fn finish_internal_with_blueflame(self) -> io::Result<WqeHandle> {
         let wqebb_cnt = calc_wqebb_cnt(self.offset);
         let slots_to_end = self.sq.slots_to_end();
 
@@ -588,50 +653,87 @@ impl<'a, Entry, TableType> UdWqeBuilder<'a, Entry, TableType> {
 }
 
 // =============================================================================
-// UD QP WQE Builder
+// UD QP WQE Builder (Type-State)
 // =============================================================================
 
 /// WQE builder for UD QP that stores entry on finish.
-pub struct UdQpWqeBuilder<'a, Entry> {
-    inner: UdWqeBuilder<'a, Entry, OrderedWqeTable<Entry>>,
+///
+/// The `State` type parameter tracks the builder state, ensuring only valid
+/// segment sequences can be constructed at compile time.
+pub struct UdQpWqeBuilder<'a, Entry, State> {
+    inner: UdWqeBuilder<'a, Entry, OrderedWqeTable<Entry>, State>,
     entry: Option<Entry>,
 }
 
-impl<'a, Entry> UdQpWqeBuilder<'a, Entry> {
-    /// Write the control segment.
-    pub fn ctrl(mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) -> Self {
-        self.inner = self.inner.ctrl(opcode, flags, imm, 0);
-        self
+/// Init state: control segment methods.
+impl<'a, Entry> UdQpWqeBuilder<'a, Entry, Init> {
+    // -------------------------------------------------------------------------
+    // Send operations → UdNeedsAddr<NeedsData>
+    // -------------------------------------------------------------------------
+
+    /// Write control segment for SEND operation.
+    #[inline]
+    pub fn ctrl_send(self, flags: WqeFlags) -> UdQpWqeBuilder<'a, Entry, UdNeedsAddr<NeedsData>> {
+        let inner = self.inner.ctrl_send(flags);
+        UdQpWqeBuilder { inner, entry: self.entry }
     }
 
+    /// Write control segment for SEND with immediate data.
+    #[inline]
+    pub fn ctrl_send_imm(self, flags: WqeFlags, imm: u32) -> UdQpWqeBuilder<'a, Entry, UdNeedsAddr<NeedsData>> {
+        let inner = self.inner.ctrl_send_imm(flags, imm);
+        UdQpWqeBuilder { inner, entry: self.entry }
+    }
+}
+
+/// UdNeedsAddr<Next> state: UD address segment required.
+impl<'a, Entry, Next> UdQpWqeBuilder<'a, Entry, UdNeedsAddr<Next>> {
     /// Add UD address segment.
-    pub fn ud_av(mut self, ah: &AddressHandle, qkey: u32) -> Self {
-        self.inner = self.inner.ud_av(ah, qkey);
-        self
+    #[inline]
+    pub fn ud_av(self, ah: &AddressHandle, qkey: u32) -> UdQpWqeBuilder<'a, Entry, Next> {
+        let inner = self.inner.ud_av(ah, qkey);
+        UdQpWqeBuilder { inner, entry: self.entry }
     }
 
     /// Add UD address segment using raw values.
-    pub fn ud_av_raw(mut self, remote_qpn: u32, qkey: u32, dlid: u16) -> Self {
-        self.inner = self.inner.ud_av_raw(remote_qpn, qkey, dlid);
-        self
+    #[inline]
+    pub fn ud_av_raw(self, remote_qpn: u32, qkey: u32, dlid: u16) -> UdQpWqeBuilder<'a, Entry, Next> {
+        let inner = self.inner.ud_av_raw(remote_qpn, qkey, dlid);
+        UdQpWqeBuilder { inner, entry: self.entry }
     }
+}
 
-    /// Add a data segment.
-    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
-        self.inner = self.inner.sge(addr, len, lkey);
-        self
+/// NeedsData state: data segment (SGE or inline) required.
+impl<'a, Entry> UdQpWqeBuilder<'a, Entry, NeedsData> {
+    /// Add a data segment (SGE).
+    #[inline]
+    pub fn sge(self, addr: u64, len: u32, lkey: u32) -> UdQpWqeBuilder<'a, Entry, HasData> {
+        let inner = self.inner.sge(addr, len, lkey);
+        UdQpWqeBuilder { inner, entry: self.entry }
     }
 
     /// Add inline data.
-    pub fn inline_data(mut self, data: &[u8]) -> Self {
-        self.inner = self.inner.inline_data(data);
-        self
+    #[inline]
+    pub fn inline_data(self, data: &[u8]) -> UdQpWqeBuilder<'a, Entry, HasData> {
+        let inner = self.inner.inline_data(data);
+        UdQpWqeBuilder { inner, entry: self.entry }
+    }
+}
+
+/// HasData state: additional SGEs and finish methods available.
+impl<'a, Entry> UdQpWqeBuilder<'a, Entry, HasData> {
+    /// Add another data segment (SGE).
+    #[inline]
+    pub fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
+        let inner = self.inner.sge(addr, len, lkey);
+        UdQpWqeBuilder { inner, entry: self.entry }
     }
 
     /// Finish the WQE construction.
     ///
     /// # Errors
-    /// Returns an error if required segments are missing for the opcode.
+    /// Returns an error if WQE wrap-around fails due to SQ being full.
+    #[inline]
     pub fn finish(self) -> io::Result<WqeHandle> {
         // Keep reference to sq before consuming self.inner
         let sq = self.inner.sq;
@@ -651,7 +753,8 @@ impl<'a, Entry> UdQpWqeBuilder<'a, Entry> {
     /// Finish the WQE construction with BlueFlame doorbell.
     ///
     /// # Errors
-    /// Returns an error if required segments are missing for the opcode.
+    /// Returns an error if WQE wrap-around fails due to SQ being full.
+    #[inline]
     pub fn finish_with_blueflame(self) -> io::Result<WqeHandle> {
         // Keep reference to sq before consuming self.inner
         let sq = self.inner.sq;
@@ -1061,7 +1164,7 @@ impl<Entry, OnComplete> UdQpWithTable<Entry, OnComplete> {
     }
 
     /// Get a WQE builder for signaled operations.
-    pub fn wqe_builder(&self, entry: Entry) -> io::Result<UdQpWqeBuilder<'_, Entry>> {
+    pub fn wqe_builder(&self, entry: Entry) -> io::Result<UdQpWqeBuilder<'_, Entry, Init>> {
         let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -1078,13 +1181,14 @@ impl<Entry, OnComplete> UdQpWithTable<Entry, OnComplete> {
                 offset: 0,
                 ds_count: 0,
                 signaled: true,
+                _state: PhantomData,
             },
             entry: Some(entry),
         })
     }
 
     /// Get a WQE builder for unsignaled operations.
-    pub fn wqe_builder_unsignaled(&self) -> io::Result<UdQpWqeBuilder<'_, Entry>> {
+    pub fn wqe_builder_unsignaled(&self) -> io::Result<UdQpWqeBuilder<'_, Entry, Init>> {
         let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -1101,6 +1205,7 @@ impl<Entry, OnComplete> UdQpWithTable<Entry, OnComplete> {
                 offset: 0,
                 ds_count: 0,
                 signaled: false,
+                _state: PhantomData,
             },
             entry: None,
         })

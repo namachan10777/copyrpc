@@ -212,7 +212,7 @@ fn test_srq_with_dct_send() {
     dci.borrow_mut()
         .wqe_builder(1u64)
         .expect("wqe_builder failed")
-        .ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
+        .ctrl_send(WqeFlags::empty())
         .av(dc_key, dctn, dlid)
         .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
         .finish_with_blueflame();
@@ -350,7 +350,7 @@ fn test_srq_shared_by_multiple_dcts() {
         dci.borrow_mut()
             .wqe_builder((i + 1) as u64)
             .expect("wqe_builder failed")
-            .ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
+            .ctrl_send(WqeFlags::empty())
             .av(dct.dc_key(), dct.dctn(), dlid)
             .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
             .finish_with_blueflame();

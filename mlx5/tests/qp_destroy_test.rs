@@ -636,7 +636,7 @@ fn test_qp_destroy_after_actual_send_recv() {
                 let offset = (idx * 64) as u64;
 
                 let _ = qp.borrow_mut().wqe_builder(idx as u64).map(|b| {
-                    b.ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
+                    b.ctrl_send(WqeFlags::empty())
                         .sge(buf.addr() + offset, 32, mr.lkey())
                         .finish_with_blueflame()
                 });
@@ -753,7 +753,7 @@ fn test_qp_destroy_after_actual_send_recv() {
     for i in 0..32.min(target) as usize {
         let offset = (i * 64) as u64;
         let _ = qp.borrow_mut().wqe_builder(i as u64).map(|b| {
-            b.ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
+            b.ctrl_send(WqeFlags::empty())
                 .sge(buf.addr() + offset, 32, mr.lkey())
                 .finish()
         });
@@ -793,7 +793,7 @@ fn test_qp_destroy_after_actual_send_recv() {
             // Send more if needed
             if sent < target {
                 let _ = qp.borrow_mut().wqe_builder(idx as u64).map(|b| {
-                    b.ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
+                    b.ctrl_send(WqeFlags::empty())
                         .sge(buf.addr() + offset, 32, mr.lkey())
                         .finish_with_blueflame()
                 });

@@ -153,7 +153,7 @@ fn test_scatter_to_cqe_diagnostic() {
             .borrow_mut()
             .wqe_builder(i as u64)
             .expect("wqe_builder failed")
-            .ctrl(WqeOpcode::Send, WqeFlags::COMPLETION, 0)
+            .ctrl_send(WqeFlags::COMPLETION)
             .sge(send_buf.addr(), size as u32, send_mr.lkey())
             .finish();
         qp1.borrow().ring_sq_doorbell();
@@ -343,7 +343,7 @@ fn test_scatter_to_cqe_disabled() {
             .borrow_mut()
             .wqe_builder(i as u64)
             .expect("wqe_builder failed")
-            .ctrl(WqeOpcode::Send, WqeFlags::COMPLETION, 0)
+            .ctrl_send(WqeFlags::COMPLETION)
             .inline_data(&test_data)
             .finish();
         qp1.borrow().ring_sq_doorbell();
@@ -500,7 +500,7 @@ fn test_small_inline_wraparound() {
                 .borrow_mut()
                 .wqe_builder((size * 100 + i) as u64)
                 .expect("wqe_builder failed")
-                .ctrl(WqeOpcode::Send, WqeFlags::COMPLETION, 0)
+                .ctrl_send(WqeFlags::COMPLETION)
                 .inline_data(&test_data)
                 .finish();
             qp1.borrow().ring_sq_doorbell();

@@ -244,6 +244,7 @@ fn setup_mono_cq_benchmark() -> Option<MonoCqBenchmarkSetup<impl Fn(Cqe, u64), i
         max_send_sge: 1,
         max_recv_sge: 1,
         max_inline_data: 256,
+        enable_scatter_to_cqe: false,
     };
 
     // Create QP for MonoCq (no internal callback)
@@ -455,6 +456,7 @@ fn server_thread_main(
         max_send_sge: 1,
         max_recv_sge: 1,
         max_inline_data: 256,
+        enable_scatter_to_cqe: false,
     };
 
     // Create QP for MonoCq
@@ -597,7 +599,7 @@ fn server_thread_main(
                     let _ = qp_ref
                         .wqe_builder(idx as u64)
                         .unwrap()
-                        .ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), idx as u32)
+                        .ctrl_rdma_write_imm(WqeFlags::empty(), idx as u32)
                         .rdma(remote_addr + offset, remote_rkey)
                         .sge(send_buf.addr() + offset, size, send_mr.lkey())
                         .finish();
@@ -606,7 +608,7 @@ fn server_thread_main(
                     let _ = qp_ref
                         .wqe_builder(idx as u64)
                         .unwrap()
-                        .ctrl(WqeOpcode::Send, WqeFlags::empty(), 0)
+                        .ctrl_send(WqeFlags::empty())
                         .sge(send_buf.addr() + offset, size, send_mr.lkey())
                         .finish();
                 }
@@ -652,7 +654,7 @@ where
                 let offset = (i * 256) as u64;
                 qp.wqe_builder_unsignaled()
                     .unwrap()
-                    .ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), i as u32)
+                    .ctrl_rdma_write_imm(WqeFlags::empty(), i as u32)
                     .rdma(remote_addr + offset, rkey)
                     .sge(send_buf_addr + offset, size, lkey)
                     .finish();
@@ -661,7 +663,7 @@ where
             let offset = (i * 256) as u64;
             qp.wqe_builder(i as u64)
                 .unwrap()
-                .ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::COMPLETION, i as u32)
+                .ctrl_rdma_write_imm(WqeFlags::COMPLETION, i as u32)
                 .rdma(remote_addr + offset, rkey)
                 .sge(send_buf_addr + offset, size, lkey)
                 .finish();
@@ -719,7 +721,7 @@ where
                     let offset = (idx * 256) as u64;
                     qp.wqe_builder_unsignaled()
                         .unwrap()
-                        .ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::empty(), idx as u32)
+                        .ctrl_rdma_write_imm(WqeFlags::empty(), idx as u32)
                         .rdma(remote_addr + offset, rkey)
                         .sge(send_buf_addr + offset, size, lkey)
                         .finish();
@@ -728,7 +730,7 @@ where
                 let offset = (idx * 256) as u64;
                 qp.wqe_builder(idx as u64)
                     .unwrap()
-                    .ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::COMPLETION, idx as u32)
+                    .ctrl_rdma_write_imm(WqeFlags::COMPLETION, idx as u32)
                     .rdma(remote_addr + offset, rkey)
                     .sge(send_buf_addr + offset, size, lkey)
                     .finish();
@@ -740,7 +742,7 @@ where
                 let offset = (idx * 256) as u64;
                 qp.wqe_builder(idx as u64)
                     .unwrap()
-                    .ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::COMPLETION, idx as u32)
+                    .ctrl_rdma_write_imm(WqeFlags::COMPLETION, idx as u32)
                     .rdma(remote_addr + offset, rkey)
                     .sge(send_buf_addr + offset, size, lkey)
                     .finish();
@@ -816,7 +818,7 @@ where
             let qp = client.qp.borrow();
             qp.wqe_builder(idx as u64)
                 .unwrap()
-                .ctrl(WqeOpcode::RdmaWriteImm, WqeFlags::COMPLETION, imm)
+                .ctrl_rdma_write_imm(WqeFlags::COMPLETION, imm)
                 .rdma(remote_addr + offset, rkey)
                 .sge(send_buf_addr + offset, size, lkey)
                 .finish_with_blueflame();

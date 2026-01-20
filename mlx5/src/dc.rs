@@ -15,8 +15,8 @@ use crate::pd::Pd;
 use crate::qp::QpInfo;
 use crate::srq::Srq;
 use crate::wqe::{
-    AddressVector, CtrlSeg, DataSeg, InlineHeader, OrderedWqeTable, RdmaSeg, WQEBB_SIZE, WqeFlags,
-    WqeHandle, WqeOpcode, calc_wqebb_cnt,
+    AddressVector, CtrlSeg, DataSeg, DcNeedsAv, HasData, InlineHeader, Init, NeedsData, NeedsRdma,
+    OrderedWqeTable, RdmaSeg, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
 };
 
 /// DCI configuration.
@@ -207,13 +207,14 @@ impl<Entry> DciSendQueueState<Entry, OrderedWqeTable<Entry>> {
 }
 
 // =============================================================================
-// DCI WQE Builder
+// DCI WQE Builder (Type-State)
 // =============================================================================
 
-/// Zero-copy WQE builder for DCI (internal implementation).
+/// Zero-copy WQE builder for DCI with type-state safety.
 ///
-/// Similar to WqeBuilder but has Address Vector segment for DC operations.
-pub struct DciWqeBuilder<'a, Entry, TableType> {
+/// Similar to WqeBuilder but requires Address Vector segment for DC operations.
+/// The `State` type parameter tracks the current builder state.
+pub struct DciWqeBuilder<'a, Entry, TableType, State> {
     sq: &'a DciSendQueueState<Entry, TableType>,
     wqe_ptr: *mut u8,
     wqe_idx: u16,
@@ -221,13 +222,26 @@ pub struct DciWqeBuilder<'a, Entry, TableType> {
     ds_count: u8,
     /// Whether SIGNALED flag is set
     signaled: bool,
+    _state: PhantomData<State>,
 }
 
-impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType> {
-    /// Write the control segment.
-    ///
-    /// This must be the first segment in every WQE.
-    pub fn ctrl(mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) -> Self {
+impl<'a, Entry, TableType, State> DciWqeBuilder<'a, Entry, TableType, State> {
+    #[inline]
+    fn transition<NewState>(self) -> DciWqeBuilder<'a, Entry, TableType, NewState> {
+        DciWqeBuilder {
+            sq: self.sq,
+            wqe_ptr: self.wqe_ptr,
+            wqe_idx: self.wqe_idx,
+            offset: self.offset,
+            ds_count: self.ds_count,
+            signaled: self.signaled,
+            _state: PhantomData,
+        }
+    }
+
+    /// Write control segment (internal helper).
+    #[inline]
+    fn write_ctrl(&mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) {
         let flags = if self.signaled {
             flags | WqeFlags::COMPLETION
         } else {
@@ -247,32 +261,148 @@ impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType> {
         }
         self.offset = CtrlSeg::SIZE;
         self.ds_count = 1;
-        self
+    }
+}
+
+/// Init state: control segment methods.
+impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType, Init> {
+    // -------------------------------------------------------------------------
+    // Send operations → DcNeedsAv<NeedsData>
+    // -------------------------------------------------------------------------
+
+    /// Write control segment for SEND operation.
+    #[inline]
+    pub fn ctrl_send(
+        mut self,
+        flags: WqeFlags,
+    ) -> DciWqeBuilder<'a, Entry, TableType, DcNeedsAv<NeedsData>> {
+        self.write_ctrl(WqeOpcode::Send, flags, 0);
+        self.transition()
     }
 
+    /// Write control segment for SEND with immediate data.
+    #[inline]
+    pub fn ctrl_send_imm(
+        mut self,
+        flags: WqeFlags,
+        imm: u32,
+    ) -> DciWqeBuilder<'a, Entry, TableType, DcNeedsAv<NeedsData>> {
+        self.write_ctrl(WqeOpcode::SendImm, flags, imm);
+        self.transition()
+    }
+
+    // -------------------------------------------------------------------------
+    // RDMA operations → DcNeedsAv<NeedsRdma>
+    // -------------------------------------------------------------------------
+
+    /// Write control segment for RDMA WRITE operation.
+    #[inline]
+    pub fn ctrl_rdma_write(
+        mut self,
+        flags: WqeFlags,
+    ) -> DciWqeBuilder<'a, Entry, TableType, DcNeedsAv<NeedsRdma>> {
+        self.write_ctrl(WqeOpcode::RdmaWrite, flags, 0);
+        self.transition()
+    }
+
+    /// Write control segment for RDMA WRITE with immediate data.
+    #[inline]
+    pub fn ctrl_rdma_write_imm(
+        mut self,
+        flags: WqeFlags,
+        imm: u32,
+    ) -> DciWqeBuilder<'a, Entry, TableType, DcNeedsAv<NeedsRdma>> {
+        self.write_ctrl(WqeOpcode::RdmaWriteImm, flags, imm);
+        self.transition()
+    }
+
+    /// Write control segment for RDMA READ operation.
+    #[inline]
+    pub fn ctrl_rdma_read(
+        mut self,
+        flags: WqeFlags,
+    ) -> DciWqeBuilder<'a, Entry, TableType, DcNeedsAv<NeedsRdma>> {
+        self.write_ctrl(WqeOpcode::RdmaRead, flags, 0);
+        self.transition()
+    }
+}
+
+/// DcNeedsAv<Next> state: AV segment required.
+impl<'a, Entry, TableType, Next> DciWqeBuilder<'a, Entry, TableType, DcNeedsAv<Next>> {
     /// Add an address vector (required for DC operations).
     ///
     /// This segment specifies the destination DCT.
-    pub fn av(mut self, dc_key: u64, dctn: u32, dlid: u16) -> Self {
+    #[inline]
+    pub fn av(mut self, dc_key: u64, dctn: u32, dlid: u16) -> DciWqeBuilder<'a, Entry, TableType, Next> {
         unsafe {
             AddressVector::write(self.wqe_ptr.add(self.offset), dc_key, dctn, dlid);
         }
         self.offset += AddressVector::SIZE;
         self.ds_count += 3; // AV = 48 bytes = 3 DS
-        self
+        self.transition()
     }
+}
 
-    /// Add an RDMA segment (for WRITE/READ).
-    pub fn rdma(mut self, remote_addr: u64, rkey: u32) -> Self {
+/// NeedsRdma state: RDMA segment required.
+impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType, NeedsRdma> {
+    /// Add an RDMA segment specifying remote address and rkey.
+    #[inline]
+    pub fn rdma(mut self, remote_addr: u64, rkey: u32) -> DciWqeBuilder<'a, Entry, TableType, NeedsData> {
         unsafe {
             RdmaSeg::write(self.wqe_ptr.add(self.offset), remote_addr, rkey);
         }
         self.offset += RdmaSeg::SIZE;
         self.ds_count += 1;
-        self
+        self.transition()
+    }
+}
+
+/// NeedsData state: data segment (SGE or inline) required.
+impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType, NeedsData> {
+    /// Add a data segment (SGE).
+    #[inline]
+    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> DciWqeBuilder<'a, Entry, TableType, HasData> {
+        unsafe {
+            DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
+        }
+        self.offset += DataSeg::SIZE;
+        self.ds_count += 1;
+        self.transition()
     }
 
-    /// Add a data segment (SGE).
+    /// Add inline data.
+    #[inline]
+    pub fn inline_data(mut self, data: &[u8]) -> DciWqeBuilder<'a, Entry, TableType, HasData> {
+        let padded_size = unsafe {
+            let ptr = self.wqe_ptr.add(self.offset);
+            let size = InlineHeader::write(ptr, data.len() as u32);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
+            size
+        };
+        self.offset += padded_size;
+        self.ds_count += (padded_size / 16) as u8;
+        self.transition()
+    }
+
+    /// Get a mutable slice for inline data (zero-copy).
+    #[inline]
+    pub fn inline_slice(mut self, len: usize) -> (DciWqeBuilder<'a, Entry, TableType, HasData>, &'a mut [u8]) {
+        let padded_size = unsafe {
+            let ptr = self.wqe_ptr.add(self.offset);
+            InlineHeader::write(ptr, len as u32)
+        };
+        let data_ptr = unsafe { self.wqe_ptr.add(self.offset + 4) };
+        let slice = unsafe { std::slice::from_raw_parts_mut(data_ptr, len) };
+        self.offset += padded_size;
+        self.ds_count += (padded_size / 16) as u8;
+        (self.transition(), slice)
+    }
+}
+
+/// HasData state: additional SGEs and finish methods available.
+impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType, HasData> {
+    /// Add another data segment (SGE).
+    #[inline]
     pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
         unsafe {
             DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
@@ -282,37 +412,9 @@ impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType> {
         self
     }
 
-    /// Add inline data.
-    pub fn inline_data(mut self, data: &[u8]) -> Self {
-        let padded_size = unsafe {
-            let ptr = self.wqe_ptr.add(self.offset);
-            let size = InlineHeader::write(ptr, data.len() as u32);
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
-            size
-        };
-        self.offset += padded_size;
-        self.ds_count += (padded_size / 16) as u8;
-        self
-    }
-
-    /// Get a mutable slice for inline data (zero-copy).
-    ///
-    /// Returns the builder and a slice that can be written to directly.
-    pub fn inline_slice(mut self, len: usize) -> (Self, &'a mut [u8]) {
-        let padded_size = unsafe {
-            let ptr = self.wqe_ptr.add(self.offset);
-            InlineHeader::write(ptr, len as u32)
-        };
-        let data_ptr = unsafe { self.wqe_ptr.add(self.offset + 4) };
-        let slice = unsafe { std::slice::from_raw_parts_mut(data_ptr, len) };
-        self.offset += padded_size;
-        self.ds_count += (padded_size / 16) as u8;
-        (self, slice)
-    }
-
     /// Finish the WQE construction (internal).
     #[inline]
-    fn finish_internal(self) -> io::Result<WqeHandle> {
+    pub(crate) fn finish_internal(self) -> io::Result<WqeHandle> {
         let wqebb_cnt = calc_wqebb_cnt(self.offset);
         let slots_to_end = self.sq.slots_to_end();
 
@@ -378,11 +480,8 @@ impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType> {
     }
 
     /// Finish the WQE construction and immediately ring BlueFlame doorbell.
-    ///
-    /// Use this for low-latency single WQE submission. The doorbell is issued
-    /// immediately, so no need to call `ring_sq_doorbell()` afterwards.
     #[inline]
-    fn finish_internal_with_blueflame(self) -> io::Result<WqeHandle> {
+    pub(crate) fn finish_internal_with_blueflame(self) -> io::Result<WqeHandle> {
         let wqebb_cnt = calc_wqebb_cnt(self.offset);
         let slots_to_end = self.sq.slots_to_end();
 
@@ -455,44 +554,115 @@ impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType> {
 }
 
 // =============================================================================
-// DCI Public WQE Builder
+// DCI Public WQE Builder (Type-State)
 // =============================================================================
 
 /// WQE builder for DCI that stores entry on finish.
-pub struct DciPublicWqeBuilder<'a, Entry> {
-    inner: DciWqeBuilder<'a, Entry, OrderedWqeTable<Entry>>,
+///
+/// The `State` type parameter tracks the builder state, ensuring only valid
+/// segment sequences can be constructed at compile time.
+pub struct DciPublicWqeBuilder<'a, Entry, State> {
+    inner: DciWqeBuilder<'a, Entry, OrderedWqeTable<Entry>, State>,
     entry: Option<Entry>,
 }
 
-impl<'a, Entry> DciPublicWqeBuilder<'a, Entry> {
-    /// Write the control segment.
-    pub fn ctrl(mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) -> Self {
-        self.inner = self.inner.ctrl(opcode, flags, imm);
-        self
+/// Init state: control segment methods.
+impl<'a, Entry> DciPublicWqeBuilder<'a, Entry, Init> {
+    // -------------------------------------------------------------------------
+    // Send operations → DcNeedsAv<NeedsData>
+    // -------------------------------------------------------------------------
+
+    /// Write control segment for SEND operation.
+    #[inline]
+    pub fn ctrl_send(self, flags: WqeFlags) -> DciPublicWqeBuilder<'a, Entry, DcNeedsAv<NeedsData>> {
+        let inner = self.inner.ctrl_send(flags);
+        DciPublicWqeBuilder { inner, entry: self.entry }
     }
 
+    /// Write control segment for SEND with immediate data.
+    #[inline]
+    pub fn ctrl_send_imm(self, flags: WqeFlags, imm: u32) -> DciPublicWqeBuilder<'a, Entry, DcNeedsAv<NeedsData>> {
+        let inner = self.inner.ctrl_send_imm(flags, imm);
+        DciPublicWqeBuilder { inner, entry: self.entry }
+    }
+
+    // -------------------------------------------------------------------------
+    // RDMA operations → DcNeedsAv<NeedsRdma>
+    // -------------------------------------------------------------------------
+
+    /// Write control segment for RDMA WRITE operation.
+    #[inline]
+    pub fn ctrl_rdma_write(self, flags: WqeFlags) -> DciPublicWqeBuilder<'a, Entry, DcNeedsAv<NeedsRdma>> {
+        let inner = self.inner.ctrl_rdma_write(flags);
+        DciPublicWqeBuilder { inner, entry: self.entry }
+    }
+
+    /// Write control segment for RDMA WRITE with immediate data.
+    #[inline]
+    pub fn ctrl_rdma_write_imm(self, flags: WqeFlags, imm: u32) -> DciPublicWqeBuilder<'a, Entry, DcNeedsAv<NeedsRdma>> {
+        let inner = self.inner.ctrl_rdma_write_imm(flags, imm);
+        DciPublicWqeBuilder { inner, entry: self.entry }
+    }
+
+    /// Write control segment for RDMA READ operation.
+    #[inline]
+    pub fn ctrl_rdma_read(self, flags: WqeFlags) -> DciPublicWqeBuilder<'a, Entry, DcNeedsAv<NeedsRdma>> {
+        let inner = self.inner.ctrl_rdma_read(flags);
+        DciPublicWqeBuilder { inner, entry: self.entry }
+    }
+}
+
+/// DcNeedsAv<Next> state: AV segment required.
+impl<'a, Entry, Next> DciPublicWqeBuilder<'a, Entry, DcNeedsAv<Next>> {
     /// Add an address vector.
-    pub fn av(mut self, dc_key: u64, dctn: u32, dlid: u16) -> Self {
-        self.inner = self.inner.av(dc_key, dctn, dlid);
-        self
+    #[inline]
+    pub fn av(self, dc_key: u64, dctn: u32, dlid: u16) -> DciPublicWqeBuilder<'a, Entry, Next> {
+        let inner = self.inner.av(dc_key, dctn, dlid);
+        DciPublicWqeBuilder { inner, entry: self.entry }
     }
+}
 
-    /// Add an RDMA segment.
-    pub fn rdma(mut self, remote_addr: u64, rkey: u32) -> Self {
-        self.inner = self.inner.rdma(remote_addr, rkey);
-        self
+/// NeedsRdma state: RDMA segment required.
+impl<'a, Entry> DciPublicWqeBuilder<'a, Entry, NeedsRdma> {
+    /// Add an RDMA segment specifying remote address and rkey.
+    #[inline]
+    pub fn rdma(self, remote_addr: u64, rkey: u32) -> DciPublicWqeBuilder<'a, Entry, NeedsData> {
+        let inner = self.inner.rdma(remote_addr, rkey);
+        DciPublicWqeBuilder { inner, entry: self.entry }
     }
+}
 
-    /// Add a data segment.
-    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
-        self.inner = self.inner.sge(addr, len, lkey);
-        self
+/// NeedsData state: data segment (SGE or inline) required.
+impl<'a, Entry> DciPublicWqeBuilder<'a, Entry, NeedsData> {
+    /// Add a data segment (SGE).
+    #[inline]
+    pub fn sge(self, addr: u64, len: u32, lkey: u32) -> DciPublicWqeBuilder<'a, Entry, HasData> {
+        let inner = self.inner.sge(addr, len, lkey);
+        DciPublicWqeBuilder { inner, entry: self.entry }
     }
 
     /// Add inline data.
-    pub fn inline_data(mut self, data: &[u8]) -> Self {
-        self.inner = self.inner.inline_data(data);
-        self
+    #[inline]
+    pub fn inline_data(self, data: &[u8]) -> DciPublicWqeBuilder<'a, Entry, HasData> {
+        let inner = self.inner.inline_data(data);
+        DciPublicWqeBuilder { inner, entry: self.entry }
+    }
+
+    /// Get a mutable slice for inline data (zero-copy).
+    #[inline]
+    pub fn inline_slice(self, len: usize) -> (DciPublicWqeBuilder<'a, Entry, HasData>, &'a mut [u8]) {
+        let (inner, slice) = self.inner.inline_slice(len);
+        (DciPublicWqeBuilder { inner, entry: self.entry }, slice)
+    }
+}
+
+/// HasData state: additional SGEs and finish methods available.
+impl<'a, Entry> DciPublicWqeBuilder<'a, Entry, HasData> {
+    /// Add another data segment (SGE).
+    #[inline]
+    pub fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
+        let inner = self.inner.sge(addr, len, lkey);
+        DciPublicWqeBuilder { inner, entry: self.entry }
     }
 
     /// Finish the WQE construction.
@@ -500,7 +670,8 @@ impl<'a, Entry> DciPublicWqeBuilder<'a, Entry> {
     /// The doorbell will be issued when `ring_sq_doorbell()` is called.
     ///
     /// # Errors
-    /// Returns an error if required segments are missing for the opcode.
+    /// Returns an error if WQE wrap-around fails due to SQ being full.
+    #[inline]
     pub fn finish(self) -> io::Result<WqeHandle> {
         // Keep reference to sq before consuming self.inner
         let sq = self.inner.sq;
@@ -523,7 +694,8 @@ impl<'a, Entry> DciPublicWqeBuilder<'a, Entry> {
     /// `ring_sq_doorbell()` afterwards.
     ///
     /// # Errors
-    /// Returns an error if required segments are missing for the opcode.
+    /// Returns an error if WQE wrap-around fails due to SQ being full.
+    #[inline]
     pub fn finish_with_blueflame(self) -> io::Result<WqeHandle> {
         // Keep reference to sq before consuming self.inner
         let sq = self.inner.sq;
@@ -933,7 +1105,8 @@ impl<Entry, OnComplete> DciWithTable<Entry, OnComplete> {
     /// Get a WQE builder for zero-copy WQE construction (signaled).
     ///
     /// The entry will be stored and returned via callback on completion.
-    pub fn wqe_builder(&self, entry: Entry) -> io::Result<DciPublicWqeBuilder<'_, Entry>> {
+    /// Returns a builder in `Init` state.
+    pub fn wqe_builder(&self, entry: Entry) -> io::Result<DciPublicWqeBuilder<'_, Entry, Init>> {
         let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -950,6 +1123,7 @@ impl<Entry, OnComplete> DciWithTable<Entry, OnComplete> {
                 offset: 0,
                 ds_count: 0,
                 signaled: true,
+                _state: PhantomData,
             },
             entry: Some(entry),
         })
@@ -958,7 +1132,8 @@ impl<Entry, OnComplete> DciWithTable<Entry, OnComplete> {
     /// Get a WQE builder for zero-copy WQE construction (unsignaled).
     ///
     /// No entry is stored and no completion callback will be invoked.
-    pub fn wqe_builder_unsignaled(&self) -> io::Result<DciPublicWqeBuilder<'_, Entry>> {
+    /// Returns a builder in `Init` state.
+    pub fn wqe_builder_unsignaled(&self) -> io::Result<DciPublicWqeBuilder<'_, Entry, Init>> {
         let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -975,6 +1150,7 @@ impl<Entry, OnComplete> DciWithTable<Entry, OnComplete> {
                 offset: 0,
                 ds_count: 0,
                 signaled: false,
+                _state: PhantomData,
             },
             entry: None,
         })
