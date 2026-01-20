@@ -1,9 +1,12 @@
-- 可変長でのWQEが本当に正しく構築可能か
-  - inlineみたいなやつだね
-  - wrap aroundもある
-  - Builderパターンだと書き始めた時にどれくらいWQEBB使うかわからないのでちょっと複雑
-- WQE builderでフィールドが足りない時にエラーが出るかどうか
-  - sge/inlineのデータ以外は関数一発で作ってもいいかも。builderで柔軟に構築したいのはsge/inlineが本命だし
+- ~~可変長でのWQEが本当に正しく構築可能か~~
+  - ~~inlineみたいなやつだね~~
+  - ~~wrap aroundもある~~
+  - ~~Builderパターンだと書き始めた時にどれくらいWQEBB使うかわからないのでちょっと複雑~~
+  - **実装済み**: NOPで埋めてリング先頭にWQEを再配置する方式 (`finish_with_wrap_around`)
+  - **テスト追加**: `test_rc_inline_wraparound`, `test_rc_inline_variable_size_wraparound`
+- ~~WQE builderでフィールドが足りない時にエラーが出るかどうか~~
+  - ~~sge/inlineのデータ以外は関数一発で作ってもいいかも。builderで柔軟に構築したいのはsge/inlineが本命だし~~
+  - **実装済み**: 型状態パターンでコンパイル時にエラー (`ctrl_send`, `ctrl_rdma_write`, etc.)
 - DC Stream実装
   - 他のSend系とか異なり、Unorderedなので実装が異なる
 - WQE tableとSQ/RQは実は若干直行している。APIもそのようにするべき
@@ -35,8 +38,8 @@
 
 # 優先順位
 
-1. Inline WQEの折り返しを正しく実装
-2. WQE builderでのエラー
+1. ~~Inline WQEの折り返しを正しく実装~~ ✅ 実装・テスト済み
+2. ~~WQE builderでのエラー~~ ✅ 型状態パターンで実装済み
 3. ~~CQE compression~~ （RX CQ用は実装完了、圧縮CQE生成条件テスト残）
 4. Inline CQE parse
 5. API直行性や型制約の確認

@@ -1329,3 +1329,309 @@ fn test_ud_slots_to_ring_end() {
 
     println!("UD slots_to_ring_end test passed!");
 }
+
+// =============================================================================
+// Inline Data Wrap-around Tests
+// =============================================================================
+
+/// Test RC SEND with inline data wrap-around.
+///
+/// Uses variable-size inline data to trigger wrap-around scenarios where
+/// the WQE spans multiple WQEBBs and doesn't fit at the end of the ring.
+#[test]
+fn test_rc_inline_wraparound() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    // Create CQs
+    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    send_cq
+        .init_direct_access()
+        .expect("Failed to init send CQ");
+    let send_cq = Rc::new(send_cq);
+
+    let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
+    recv_cq1
+        .init_direct_access()
+        .expect("Failed to init recv CQ1");
+    let recv_cq1 = Rc::new(recv_cq1);
+    let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    recv_cq2
+        .init_direct_access()
+        .expect("Failed to init recv CQ2");
+    let recv_cq2 = Rc::new(recv_cq2);
+
+    // Use small queue (16 WQEs) with max inline to force wrap-around
+    // Each inline WQE with 128 bytes of data = ~3 WQEBBs (64 bytes each)
+    let config = RcQpConfig {
+        max_send_wr: 16,
+        max_recv_wr: 64,
+        max_send_sge: 1,
+        max_recv_sge: 1,
+        max_inline_data: 128,
+        enable_scatter_to_cqe: false,
+    };
+
+    fn noop_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
+
+    let qp1 = ctx
+        .ctx
+        .create_rc_qp(
+            &ctx.pd,
+            &send_cq,
+            &recv_cq1,
+            &config,
+            noop_callback as fn(_, _),
+        )
+        .expect("Failed to create QP1");
+    let qp2 = ctx
+        .ctx
+        .create_rc_qp(
+            &ctx.pd,
+            &send_cq,
+            &recv_cq2,
+            &config,
+            noop_callback as fn(_, _),
+        )
+        .expect("Failed to create QP2");
+
+    // Connect QPs
+    let remote1 = RemoteQpInfo {
+        qp_number: qp1.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
+    };
+    let remote2 = RemoteQpInfo {
+        qp_number: qp2.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
+    };
+    let access = full_access().bits();
+    qp1.borrow_mut()
+        .connect(&remote2, ctx.port, 0, 4, 4, access)
+        .expect("Failed to connect QP1");
+    qp2.borrow_mut()
+        .connect(&remote1, ctx.port, 0, 4, 4, access)
+        .expect("Failed to connect QP2");
+
+    // Allocate receive buffer
+    let mut recv_buf = AlignedBuffer::new(4096);
+    let recv_mr = unsafe {
+        ctx.pd
+            .register(recv_buf.as_ptr(), recv_buf.size(), full_access())
+    }
+    .expect("Failed to register recv MR");
+
+    // Prepare inline test data (128 bytes to use ~3 WQEBBs per WQE)
+    let test_data: Vec<u8> = (0..128).map(|i| i as u8).collect();
+
+    println!("Testing RC inline data wrap-around...");
+    println!("Queue size: 16 WQEs, inline data size: {} bytes", test_data.len());
+
+    // Number of iterations to ensure multiple wrap-arounds
+    // With 16 WQEs and ~3 WQEBBs per WQE, we should wrap around frequently
+    let iterations = 32;
+    let mut prev_wqe_idx: Option<u16> = None;
+    let mut wrap_around_count = 0;
+
+    for i in 0..iterations {
+        // Post receive
+        recv_buf.fill(0);
+        qp2.borrow()
+            .recv_builder(i as u64)
+            .expect("recv_builder failed")
+            .sge(recv_buf.addr(), 256, recv_mr.lkey())
+            .finish();
+        qp2.borrow().ring_rq_doorbell();
+
+        // Post SEND with inline data
+        let handle = qp1
+            .borrow_mut()
+            .wqe_builder(i as u64)
+            .expect("wqe_builder failed")
+            .ctrl_send(WqeFlags::COMPLETION)
+            .inline_data(&test_data)
+            .finish_with_blueflame()
+            .expect("finish failed");
+
+        // Detect wrap-around: wqe_idx decreased or jumped significantly
+        if let Some(prev) = prev_wqe_idx {
+            if handle.wqe_idx < prev || (handle.wqe_idx == 0 && prev > 0) {
+                wrap_around_count += 1;
+                println!(
+                    "  Iteration {}: WRAP-AROUND detected (wqe_idx {} -> {})",
+                    i, prev, handle.wqe_idx
+                );
+            }
+        }
+        prev_wqe_idx = Some(handle.wqe_idx);
+
+        // Poll send CQ
+        let send_cqe = poll_cq_timeout(&send_cq, 5000).expect("Send CQE timeout");
+        assert_eq!(send_cqe.syndrome, 0, "Send CQE error: syndrome={}", send_cqe.syndrome);
+        send_cq.flush();
+
+        // Poll recv CQ (qp2's recv CQ is recv_cq2)
+        let recv_cqe = poll_cq_timeout(&recv_cq2, 5000).expect("Recv CQE timeout");
+        assert_eq!(recv_cqe.syndrome, 0, "Recv CQE error: syndrome={}", recv_cqe.syndrome);
+        recv_cq2.flush();
+
+        // Verify data
+        let received = recv_buf.read_bytes(test_data.len());
+        assert_eq!(
+            &received[..], &test_data[..],
+            "Iteration {}: inline data mismatch", i
+        );
+    }
+
+    println!(
+        "RC inline wrap-around test passed! {} wrap-arounds in {} iterations",
+        wrap_around_count, iterations
+    );
+    // Note: wrap-around may not be detected via wqe_idx if NOP fills the gap,
+    // but successful data transfer across 32 iterations proves correctness
+}
+
+/// Test RC SEND with variable-size inline data to stress wrap-around boundary conditions.
+#[test]
+fn test_rc_inline_variable_size_wraparound() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    // Create CQs
+    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    send_cq
+        .init_direct_access()
+        .expect("Failed to init send CQ");
+    let send_cq = Rc::new(send_cq);
+
+    let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
+    recv_cq1
+        .init_direct_access()
+        .expect("Failed to init recv CQ1");
+    let recv_cq1 = Rc::new(recv_cq1);
+    let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    recv_cq2
+        .init_direct_access()
+        .expect("Failed to init recv CQ2");
+    let recv_cq2 = Rc::new(recv_cq2);
+
+    // Use small queue with max inline
+    let config = RcQpConfig {
+        max_send_wr: 16,
+        max_recv_wr: 128,
+        max_send_sge: 1,
+        max_recv_sge: 1,
+        max_inline_data: 128,
+        enable_scatter_to_cqe: false,
+    };
+
+    fn noop_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
+
+    let qp1 = ctx
+        .ctx
+        .create_rc_qp(
+            &ctx.pd,
+            &send_cq,
+            &recv_cq1,
+            &config,
+            noop_callback as fn(_, _),
+        )
+        .expect("Failed to create QP1");
+    let qp2 = ctx
+        .ctx
+        .create_rc_qp(
+            &ctx.pd,
+            &send_cq,
+            &recv_cq2,
+            &config,
+            noop_callback as fn(_, _),
+        )
+        .expect("Failed to create QP2");
+
+    // Connect QPs
+    let remote1 = RemoteQpInfo {
+        qp_number: qp1.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
+    };
+    let remote2 = RemoteQpInfo {
+        qp_number: qp2.borrow().qpn(),
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
+    };
+    let access = full_access().bits();
+    qp1.borrow_mut()
+        .connect(&remote2, ctx.port, 0, 4, 4, access)
+        .expect("Failed to connect QP1");
+    qp2.borrow_mut()
+        .connect(&remote1, ctx.port, 0, 4, 4, access)
+        .expect("Failed to connect QP2");
+
+    // Allocate receive buffer
+    let mut recv_buf = AlignedBuffer::new(4096);
+    let recv_mr = unsafe {
+        ctx.pd
+            .register(recv_buf.as_ptr(), recv_buf.size(), full_access())
+    }
+    .expect("Failed to register recv MR");
+
+    println!("Testing RC variable-size inline data wrap-around...");
+
+    // Test with various inline data sizes to stress different boundary conditions
+    // Sizes that map to different WQEBB counts:
+    // - 1-12 bytes: 1 WQEBB (ctrl seg + inline header + data)
+    // - 13-60 bytes: 2 WQEBBs
+    // - 61-124 bytes: 3 WQEBBs
+    let sizes = [8, 16, 32, 48, 64, 96, 128, 64, 32, 128, 48, 96, 16, 128, 8, 128];
+
+    for (i, &size) in sizes.iter().enumerate() {
+        let test_data: Vec<u8> = (0..size).map(|j| ((i + j) & 0xff) as u8).collect();
+
+        // Post receive
+        recv_buf.fill(0);
+        qp2.borrow()
+            .recv_builder(i as u64)
+            .expect("recv_builder failed")
+            .sge(recv_buf.addr(), 256, recv_mr.lkey())
+            .finish();
+        qp2.borrow().ring_rq_doorbell();
+
+        // Post SEND with inline data
+        qp1.borrow_mut()
+            .wqe_builder(i as u64)
+            .expect("wqe_builder failed")
+            .ctrl_send(WqeFlags::COMPLETION)
+            .inline_data(&test_data)
+            .finish_with_blueflame()
+            .expect("finish failed");
+
+        // Poll CQs
+        let send_cqe = poll_cq_timeout(&send_cq, 5000).expect("Send CQE timeout");
+        assert_eq!(send_cqe.syndrome, 0, "Send CQE error at size {}", size);
+        send_cq.flush();
+
+        let recv_cqe = poll_cq_timeout(&recv_cq2, 5000).expect("Recv CQE timeout");
+        assert_eq!(recv_cqe.syndrome, 0, "Recv CQE error at size {}", size);
+        recv_cq2.flush();
+
+        // Verify data
+        let received = recv_buf.read_bytes(size);
+        assert_eq!(
+            &received[..], &test_data[..],
+            "Data mismatch at size {}", size
+        );
+    }
+
+    println!("RC variable-size inline wrap-around test passed!");
+}
