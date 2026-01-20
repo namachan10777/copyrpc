@@ -3,6 +3,8 @@
 //! These types are layout-compatible with the corresponding mlx5_sys types,
 //! allowing safe pointer casting while providing documented field access.
 
+use std::net::{Ipv4Addr, Ipv6Addr};
+
 use bitflags::bitflags;
 
 /// Logical port state.
@@ -490,6 +492,182 @@ pub struct Mlx5DeviceAttr {
     pub reg_c0: RegC0,
     /// Out-of-order receive WRs capabilities per QP type.
     pub ooo_recv_wrs_caps: OooRecvWrsCaps,
+}
+
+// =============================================================================
+// GID and GRH Types for RoCE
+// =============================================================================
+
+/// GID (Global Identifier) - 128-bit address for RoCE.
+///
+/// In RoCE v2, the GID is derived from the IP address:
+/// - For IPv4: Uses IPv4-mapped IPv6 format (::ffff:x.x.x.x)
+/// - For IPv6: Uses the IPv6 address directly
+///
+/// # NOTE: RoCE support is untested (IB-only hardware environment)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Gid {
+    /// Raw 128-bit GID value in network byte order
+    pub raw: [u8; 16],
+}
+
+impl Gid {
+    /// Create a new GID with all zeros.
+    pub const fn zero() -> Self {
+        Self { raw: [0u8; 16] }
+    }
+
+    /// Create a GID from raw bytes.
+    pub const fn from_raw(raw: [u8; 16]) -> Self {
+        Self { raw }
+    }
+
+    /// Create a GID from an IPv4 address (IPv4-mapped IPv6 format).
+    ///
+    /// The resulting GID is in the format: ::ffff:a.b.c.d
+    /// where a.b.c.d is the IPv4 address.
+    ///
+    /// # NOTE: RoCE support is untested
+    pub fn from_ipv4(ip: Ipv4Addr) -> Self {
+        let octets = ip.octets();
+        let raw = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ::
+            0x00, 0x00, 0xff, 0xff, // ffff
+            octets[0], octets[1], octets[2], octets[3], // a.b.c.d
+        ];
+        Self { raw }
+    }
+
+    /// Create a GID from an IPv6 address.
+    ///
+    /// # NOTE: RoCE support is untested
+    pub fn from_ipv6(ip: Ipv6Addr) -> Self {
+        Self {
+            raw: ip.octets(),
+        }
+    }
+
+    /// Check if this GID is an IPv4-mapped address.
+    pub fn is_ipv4_mapped(&self) -> bool {
+        self.raw[0..10] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            && self.raw[10] == 0xff
+            && self.raw[11] == 0xff
+    }
+
+    /// Extract IPv4 address if this is an IPv4-mapped GID.
+    pub fn to_ipv4(&self) -> Option<Ipv4Addr> {
+        if self.is_ipv4_mapped() {
+            Some(Ipv4Addr::new(
+                self.raw[12],
+                self.raw[13],
+                self.raw[14],
+                self.raw[15],
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Convert to IPv6 address.
+    pub fn to_ipv6(&self) -> Ipv6Addr {
+        Ipv6Addr::from(self.raw)
+    }
+}
+
+impl From<Ipv4Addr> for Gid {
+    fn from(ip: Ipv4Addr) -> Self {
+        Self::from_ipv4(ip)
+    }
+}
+
+impl From<Ipv6Addr> for Gid {
+    fn from(ip: Ipv6Addr) -> Self {
+        Self::from_ipv6(ip)
+    }
+}
+
+impl From<[u8; 16]> for Gid {
+    fn from(raw: [u8; 16]) -> Self {
+        Self { raw }
+    }
+}
+
+/// GRH (Global Route Header) attributes for RoCE addressing.
+///
+/// Contains the routing information needed for RoCE v2 communication.
+/// In RoCE v2, the GRH fields are mapped to IP/UDP headers:
+/// - dgid → Destination IP address
+/// - sgid_index → Source GID table index (determines source IP)
+/// - flow_label → IPv6 flow label (used for ECMP load balancing)
+/// - traffic_class → IPv6 traffic class / IPv4 DSCP
+/// - hop_limit → IPv6 hop limit / IPv4 TTL
+///
+/// # NOTE: RoCE support is untested (IB-only hardware environment)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrhAttr {
+    /// Destination GID (remote node's GID, derived from IP address)
+    pub dgid: Gid,
+    /// Source GID table index (local GID to use as source address)
+    pub sgid_index: u8,
+    /// Flow label for ECMP (Equal-Cost Multi-Path) routing.
+    /// Only the lower 20 bits are used.
+    pub flow_label: u32,
+    /// Traffic class (QoS) - mapped to DSCP for IPv4, traffic class for IPv6
+    pub traffic_class: u8,
+    /// Hop limit (TTL) - number of router hops before packet is discarded
+    pub hop_limit: u8,
+}
+
+impl Default for GrhAttr {
+    fn default() -> Self {
+        Self {
+            dgid: Gid::zero(),
+            sgid_index: 0,
+            flow_label: 0,
+            traffic_class: 0,
+            hop_limit: 64, // Default TTL
+        }
+    }
+}
+
+impl GrhAttr {
+    /// Create a new GRH attributes with the specified destination GID.
+    ///
+    /// Uses default values for other fields:
+    /// - sgid_index: 0 (first GID in local table)
+    /// - flow_label: 0 (no ECMP hashing)
+    /// - traffic_class: 0 (default QoS)
+    /// - hop_limit: 64 (standard TTL)
+    ///
+    /// # NOTE: RoCE support is untested
+    pub fn new(dgid: Gid, sgid_index: u8) -> Self {
+        Self {
+            dgid,
+            sgid_index,
+            ..Default::default()
+        }
+    }
+
+    /// Set the flow label for ECMP load balancing.
+    ///
+    /// The flow label is used by network switches to perform hash-based
+    /// load balancing across multiple paths. Only the lower 20 bits are used.
+    pub fn with_flow_label(mut self, flow_label: u32) -> Self {
+        self.flow_label = flow_label & 0xFFFFF;
+        self
+    }
+
+    /// Set the traffic class for QoS.
+    pub fn with_traffic_class(mut self, traffic_class: u8) -> Self {
+        self.traffic_class = traffic_class;
+        self
+    }
+
+    /// Set the hop limit (TTL).
+    pub fn with_hop_limit(mut self, hop_limit: u8) -> Self {
+        self.hop_limit = hop_limit;
+        self
+    }
 }
 
 #[cfg(test)]

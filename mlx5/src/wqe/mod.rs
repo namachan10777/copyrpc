@@ -4,6 +4,8 @@
 
 use bitflags::bitflags;
 
+use crate::types::GrhAttr;
+
 /// WQEBB (Work Queue Element Basic Block) size in bytes.
 pub(crate) const WQEBB_SIZE: usize = 64;
 
@@ -146,12 +148,14 @@ impl AddressVector {
     /// Size of the address vector in bytes.
     pub const SIZE: usize = 48;
 
-    /// Write the address vector to the given pointer.
+    /// Write the address vector for InfiniBand transport.
+    ///
+    /// Uses LID-based addressing (is_global = 0).
     ///
     /// # Safety
     /// The pointer must point to at least 48 bytes of writable memory.
     #[inline]
-    pub unsafe fn write(ptr: *mut u8, dc_key: u64, dctn: u32, dlid: u16) {
+    pub unsafe fn write_ib(ptr: *mut u8, dc_key: u64, dctn: u32, dlid: u16) {
         let ptr64 = ptr as *mut u64;
         let ptr32 = ptr.add(8) as *mut u32;
         let ptr16 = ptr.add(14) as *mut u16;
@@ -159,10 +163,96 @@ impl AddressVector {
         std::ptr::write_volatile(ptr64, dc_key.to_be());
         let dqp_dct = 0x8000_0000 | (dctn & 0x00FF_FFFF);
         std::ptr::write_volatile(ptr32, dqp_dct.to_be());
+        // rlid: byte 12-13 (16-bit)
         std::ptr::write_volatile(ptr.add(12), 0);
         std::ptr::write_volatile(ptr.add(13), 0);
+        // stat_rate, sl, fl, mlid: byte 14-15
         std::ptr::write_volatile(ptr16, dlid.to_be());
+        // Rest of AV (grh fields): zero for IB
         std::ptr::write_bytes(ptr.add(16), 0, 32);
+    }
+
+    /// Write the address vector for RoCE transport.
+    ///
+    /// Uses GID-based addressing (is_global = 1).
+    ///
+    /// # NOTE: RoCE support is untested (IB-only hardware environment)
+    ///
+    /// # Safety
+    /// The pointer must point to at least 48 bytes of writable memory.
+    ///
+    /// Address Vector layout (48 bytes):
+    /// - offset 0-7: dc_key (8B)
+    /// - offset 8-11: dqp_dct (4B) - bit 31 = ext, bits 23:0 = DCT number
+    /// - offset 12-13: rlid (2B) - not used for RoCE
+    /// - offset 14: stat_rate[3:0], sl[7:4] (1B)
+    /// - offset 15: fl[0], mlid[7:1] (1B)
+    /// - offset 16-19: fl_mlid + grh_gid_fl[3:0] (4B)
+    /// - offset 20: reserved (1B)
+    /// - offset 21: grh_hop_limit (1B)
+    /// - offset 22: grh_traffic_class (1B)
+    /// - offset 23: grh_sgid_index (1B)
+    /// - offset 24-39: grh_dgid (16B)
+    /// - offset 40-47: reserved (8B)
+    #[inline]
+    pub unsafe fn write_roce(ptr: *mut u8, dc_key: u64, dctn: u32, grh: &GrhAttr) {
+        let ptr64 = ptr as *mut u64;
+        let ptr32 = ptr.add(8) as *mut u32;
+
+        // dc_key at offset 0
+        std::ptr::write_volatile(ptr64, dc_key.to_be());
+
+        // dqp_dct at offset 8: bit 31 = 1 (ext), bits 23:0 = DCT number
+        let dqp_dct = 0x8000_0000 | (dctn & 0x00FF_FFFF);
+        std::ptr::write_volatile(ptr32, dqp_dct.to_be());
+
+        // rlid at offset 12-13 (not used for RoCE, set to 0)
+        std::ptr::write_volatile(ptr.add(12) as *mut u16, 0u16);
+
+        // sl at offset 14 upper nibble (bits 7:4), stat_rate at lower nibble (bits 3:0)
+        // For RoCE, set stat_rate = 0 (auto), sl = 0
+        std::ptr::write_volatile(ptr.add(14), 0u8);
+
+        // fl (1 bit), mlid (7 bits) at offset 15
+        // fl = 1 means flow_label is valid
+        let fl_mlid = if grh.flow_label != 0 { 0x80u8 } else { 0x00u8 };
+        std::ptr::write_volatile(ptr.add(15), fl_mlid);
+
+        // GRH section starts at offset 16
+        // grh_gid_fl at offset 16-19: is_global (bit 31) | flow_label (bits 19:0)
+        let grh_gid_fl = 0x8000_0000 | (grh.flow_label & 0x000F_FFFF);
+        std::ptr::write_volatile(ptr.add(16) as *mut u32, grh_gid_fl.to_be());
+
+        // reserved at offset 20
+        std::ptr::write_volatile(ptr.add(20), 0u8);
+
+        // hop_limit at offset 21
+        std::ptr::write_volatile(ptr.add(21), grh.hop_limit);
+
+        // traffic_class at offset 22
+        std::ptr::write_volatile(ptr.add(22), grh.traffic_class);
+
+        // sgid_index at offset 23
+        std::ptr::write_volatile(ptr.add(23), grh.sgid_index);
+
+        // dgid at offset 24-39 (16 bytes)
+        std::ptr::copy_nonoverlapping(grh.dgid.raw.as_ptr(), ptr.add(24), 16);
+
+        // Reserved at offset 40-47 (8 bytes)
+        std::ptr::write_bytes(ptr.add(40), 0, 8);
+    }
+
+    /// Write the address vector to the given pointer.
+    ///
+    /// This is an alias for [`write_ib`] for backward compatibility.
+    /// New code should use [`write_ib`] or [`write_roce`] directly.
+    ///
+    /// # Safety
+    /// The pointer must point to at least 48 bytes of writable memory.
+    #[inline]
+    #[deprecated(note = "Use write_ib() or write_roce() instead")]
+    pub unsafe fn write(ptr: *mut u8, dc_key: u64, dctn: u32, dlid: u16) {
+        Self::write_ib(ptr, dc_key, dctn, dlid)
     }
 }
 

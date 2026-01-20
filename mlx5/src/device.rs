@@ -5,6 +5,8 @@
 use std::rc::Rc;
 use std::{io, mem::MaybeUninit, ops::Deref, ptr::NonNull};
 
+use crate::types::{Gid, LinkLayer};
+
 /// An RDMA device.
 ///
 /// Represents a single InfiniBand or RoCE device in the system.
@@ -214,6 +216,69 @@ impl Context {
             }
             Ok(attrs.assume_init())
         }
+    }
+
+    /// Query GID (Global Identifier) for a port.
+    ///
+    /// GIDs are used for RoCE addressing. Each port has a GID table containing
+    /// multiple GIDs (typically one per IP address configured on the port).
+    ///
+    /// # Arguments
+    /// * `port_num` - Port number (1-based)
+    /// * `index` - GID table index (0-based)
+    ///
+    /// # Returns
+    /// The GID at the specified index, or an error if the query fails.
+    ///
+    /// # NOTE: RoCE support is untested (IB-only hardware environment)
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Query the first GID on port 1
+    /// let gid = ctx.query_gid(1, 0)?;
+    /// println!("GID: {:?}", gid);
+    /// ```
+    pub fn query_gid(&self, port_num: u8, index: u8) -> io::Result<Gid> {
+        unsafe {
+            let mut gid: MaybeUninit<mlx5_sys::ibv_gid> = MaybeUninit::zeroed();
+            let ret = mlx5_sys::ibv_query_gid(
+                self.as_ptr(),
+                port_num,
+                index as i32,
+                gid.as_mut_ptr(),
+            );
+            if ret != 0 {
+                return Err(io::Error::from_raw_os_error(-ret));
+            }
+            let gid = gid.assume_init();
+            Ok(Gid::from_raw(gid.raw))
+        }
+    }
+
+    /// Check if the port is using RoCE (Ethernet link layer).
+    ///
+    /// # Arguments
+    /// * `port_num` - Port number (1-based)
+    ///
+    /// # Returns
+    /// `true` if the port is using Ethernet (RoCE), `false` otherwise.
+    ///
+    /// # NOTE: RoCE support is untested (IB-only hardware environment)
+    pub fn is_roce(&self, port_num: u8) -> io::Result<bool> {
+        let port_attr = self.query_port(port_num)?;
+        Ok(LinkLayer::from(port_attr.link_layer) == LinkLayer::Ethernet)
+    }
+
+    /// Check if the port is using InfiniBand link layer.
+    ///
+    /// # Arguments
+    /// * `port_num` - Port number (1-based)
+    ///
+    /// # Returns
+    /// `true` if the port is using InfiniBand, `false` otherwise.
+    pub fn is_infiniband(&self, port_num: u8) -> io::Result<bool> {
+        let port_attr = self.query_port(port_num)?;
+        Ok(LinkLayer::from(port_attr.link_layer) == LinkLayer::InfiniBand)
     }
 
     /// Query extended device attributes including TM (Tag Matching) capabilities.

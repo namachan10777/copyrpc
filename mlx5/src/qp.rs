@@ -11,6 +11,7 @@ use crate::CompletionTarget;
 use crate::cq::{CompletionQueue, Cqe};
 use crate::device::Context;
 use crate::pd::Pd;
+use crate::transport::{IbRemoteQpInfo, RoCERemoteQpInfo};
 use crate::wqe::{
     AtomicSeg, CtrlSeg, DataSeg, HasData, InlineHeader, Init, MaskedAtomicSeg32, MaskedAtomicSeg64,
     NeedsAtomic, NeedsData, NeedsRdma, NeedsRdmaThenAtomic, OrderedWqeTable, RdmaSeg, WQEBB_SIZE,
@@ -58,16 +59,13 @@ pub enum QpState {
     Error,
 }
 
-/// Remote QP information for connection.
-#[derive(Debug, Clone)]
-pub struct RemoteQpInfo {
-    /// Remote QP number.
-    pub qp_number: u32,
-    /// Remote packet sequence number.
-    pub packet_sequence_number: u32,
-    /// Remote LID (Local Identifier).
-    pub local_identifier: u16,
-}
+/// Remote QP information for connection (InfiniBand).
+///
+/// This is an alias for [`IbRemoteQpInfo`] for backward compatibility.
+/// New code should use [`IbRemoteQpInfo`] directly.
+///
+/// For RoCE, use [`crate::transport::RoCERemoteQpInfo`] instead.
+pub type RemoteQpInfo = IbRemoteQpInfo;
 
 /// QP internal info obtained from mlx5dv_init_obj.
 #[derive(Debug)]
@@ -1351,6 +1349,67 @@ impl<Entry, TableType, OnComplete> RcQpInner<Entry, TableType, OnComplete> {
         Ok(())
     }
 
+    /// Transition QP from INIT to RTR (Ready to Receive) for RoCE transport.
+    ///
+    /// Uses GID-based addressing (is_global = 1) instead of LID-based addressing.
+    ///
+    /// # NOTE: RoCE support is untested (IB-only hardware environment)
+    pub fn modify_to_rtr_roce(
+        &mut self,
+        remote: &RoCERemoteQpInfo,
+        port: u8,
+        max_dest_rd_atomic: u8,
+    ) -> io::Result<()> {
+        if self.state.get() != QpState::Init {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "QP must be in INIT state",
+            ));
+        }
+
+        unsafe {
+            let mut attr: mlx5_sys::ibv_qp_attr = MaybeUninit::zeroed().assume_init();
+            attr.qp_state = mlx5_sys::ibv_qp_state_IBV_QPS_RTR;
+            attr.path_mtu = mlx5_sys::ibv_mtu_IBV_MTU_4096;
+            attr.dest_qp_num = remote.qp_number;
+            attr.rq_psn = remote.packet_sequence_number;
+            attr.max_dest_rd_atomic = max_dest_rd_atomic;
+            attr.min_rnr_timer = 12;
+
+            // RoCE: use GRH (Global Route Header)
+            attr.ah_attr.is_global = 1;
+            attr.ah_attr.port_num = port;
+            attr.ah_attr.dlid = 0; // Not used for RoCE
+
+            // GRH configuration
+            attr.ah_attr.grh.dgid.raw = remote.grh.dgid.raw;
+            attr.ah_attr.grh.sgid_index = remote.grh.sgid_index;
+            attr.ah_attr.grh.flow_label = remote.grh.flow_label;
+            attr.ah_attr.grh.traffic_class = remote.grh.traffic_class;
+            attr.ah_attr.grh.hop_limit = remote.grh.hop_limit;
+
+            // Service level and source path bits
+            attr.ah_attr.sl = 0;
+            attr.ah_attr.src_path_bits = 0;
+
+            let mask = mlx5_sys::ibv_qp_attr_mask_IBV_QP_STATE
+                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_AV
+                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_PATH_MTU
+                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_DEST_QPN
+                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_RQ_PSN
+                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_MAX_DEST_RD_ATOMIC
+                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_MIN_RNR_TIMER;
+
+            let ret = mlx5_sys::ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask as i32);
+            if ret != 0 {
+                return Err(io::Error::from_raw_os_error(ret));
+            }
+        }
+
+        self.state.set(QpState::Rtr);
+        Ok(())
+    }
+
     /// Transition QP from RTR to RTS (Ready to Send).
     pub fn modify_to_rts(&mut self, local_psn: u32, max_rd_atomic: u8) -> io::Result<()> {
         if self.state.get() != QpState::Rtr {
@@ -1563,6 +1622,27 @@ impl<Entry, OnComplete> RcQp<Entry, OnComplete> {
     ) -> io::Result<()> {
         self.modify_to_init(port, access_flags)?;
         self.modify_to_rtr(remote, port, max_dest_rd_atomic)?;
+        self.modify_to_rts(local_psn, max_rd_atomic)?;
+        Ok(())
+    }
+
+    /// Connect to a remote QP over RoCE.
+    ///
+    /// Transitions the QP through RESET -> INIT -> RTR -> RTS.
+    /// Uses GID-based addressing instead of LID-based addressing.
+    ///
+    /// # NOTE: RoCE support is untested (IB-only hardware environment)
+    pub fn connect_roce(
+        &mut self,
+        remote: &RoCERemoteQpInfo,
+        port: u8,
+        local_psn: u32,
+        max_rd_atomic: u8,
+        max_dest_rd_atomic: u8,
+        access_flags: u32,
+    ) -> io::Result<()> {
+        self.modify_to_init(port, access_flags)?;
+        self.modify_to_rtr_roce(remote, port, max_dest_rd_atomic)?;
         self.modify_to_rts(local_psn, max_rd_atomic)?;
         Ok(())
     }

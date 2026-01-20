@@ -53,6 +53,9 @@ pub struct CqConfig {
     /// CQE compression is only valid for RX (responder side) completions.
     /// Using this for TX CQs will cause undefined behavior.
     ///
+    /// Note: Actual compressed CQEs (format=3) may only be generated
+    /// with Strided RQ (MPRQ) configurations.
+    ///
     /// Requires `MLX5DV_CONTEXT_FLAGS_CQE_128B_COMP` device capability.
     pub compression_format: Option<CqeCompressionFormat>,
 }

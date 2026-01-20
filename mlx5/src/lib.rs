@@ -89,12 +89,13 @@ pub mod pd;
 pub mod qp;
 pub mod srq;
 pub mod tm_srq;
+pub mod transport;
 pub mod types;
 pub mod ud;
 pub mod wqe;
 
 // Re-export CQ and CQE types
-pub use cq::{CqConfig, CqModeration, CqeCompressionFormat, CqeSize, Cqe, CqeOpcode};
+pub use cq::{CqConfig, CqeCompressionFormat, CqModeration, CqeSize, Cqe, CqeOpcode};
 
 // Re-export MonoCq types for inlined callback dispatch
 pub use mono_cq::{CompletionSource, MonoCq, MonoCqRc};
@@ -102,6 +103,12 @@ pub use qp::RcQpForMonoCq;
 
 // Re-export TM-SRQ types
 pub use tm_srq::{RqWqeBuilder, TmSrqCompletion};
+
+// Re-export transport types for IB/RoCE distinction
+pub use transport::{InfiniBand, RoCE, Transport, IbRemoteQpInfo, RoCERemoteQpInfo, IbRemoteDctInfo, RoCERemoteDctInfo};
+
+// Re-export GID/GRH types for RoCE
+pub use types::{Gid, GrhAttr};
 
 /// Trait for queues that can receive completion notifications from a CQ.
 ///

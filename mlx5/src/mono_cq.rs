@@ -33,7 +33,7 @@ use std::ptr::NonNull;
 use std::rc::{Rc, Weak};
 use std::{io, mem::MaybeUninit};
 
-use crate::cq::{CqConfig, CqModeration, CqeCompressionFormat, CqeSize, Cqe, CqeOpcode, MiniCqeIterator};
+use crate::cq::{CqConfig, CqModeration, CqeCompressionFormat, CqeOpcode, CqeSize, Cqe, MiniCqeIterator};
 use crate::device::Context;
 
 // =============================================================================
@@ -83,7 +83,6 @@ struct MonoCqState {
     title_opcode: Cell<CqeOpcode>,
     /// CQE compression enabled flag.
     /// When true, compressed CQEs (format=3) may be returned by HW.
-    /// Note: Currently disabled due to hang issues.
     cqe_compression: bool,
     /// Counter for compressed CQEs detected (for debugging/monitoring).
     compressed_cqe_count: Cell<u64>,
@@ -177,11 +176,12 @@ impl Context {
     /// * `config` - CQ configuration options (CQE size, compression, etc.)
     ///
     /// # CQE Compression
-    /// When `config.compression_format` is `Some(format)`:
+    /// When `config.compression_format` is Some:
     /// - CQE compression is only valid for RX (responder side) completions
     /// - Using compression for TX CQs will cause undefined behavior
     /// - Owner checking uses signature field (offset 62) with 0xff mask
     /// - Compressed CQEs (format=3) are expanded via MiniCqeIterator
+    /// - Note: Actual compressed CQEs may only be generated with Strided RQ (MPRQ)
     ///
     /// # Errors
     /// Returns an error if the CQ cannot be created.
@@ -306,9 +306,6 @@ impl Context {
             // Initialize all CQEs to look like they are in HW ownership (UCX-style).
             // When CQE compression is enabled, ownership is tracked via signature field (offset 62).
             // When disabled, ownership is tracked via op_own field (offset 63, bit 0).
-            //
-            // For 128-byte CQEs, the CQE64 structure is in the second half (offset 64-127).
-            // For 64-byte CQEs, it's at the beginning.
             const OP_OWN_INVALID: u8 = 0xf1; // opcode=INVALID(0xf), owner=1
             const SIGNATURE_INVALID: u8 = 0xff; // Initial signature for compression mode
             let buf = dv_cq.buf as *mut u8;
@@ -366,75 +363,6 @@ where
     /// is processed. Useful for debugging and monitoring.
     pub fn compressed_cqe_count(&self) -> u64 {
         self.state.compressed_cqe_count.get()
-    }
-
-    /// Debug: Peek at the raw CQE bytes at the current consumer index.
-    ///
-    /// Returns (op_own, signature, format_bits) tuple for debugging CQE compression.
-    /// - op_own: byte at offset 63
-    /// - signature: byte at offset 62
-    /// - format_bits: bits [3:2] of op_own (0=normal, 3=compressed)
-    #[doc(hidden)]
-    pub fn debug_peek_cqe(&self) -> (u8, u8, u8) {
-        let state = &self.state;
-        let ci = state.ci.get();
-        let cqe_mask = state.cqe_cnt - 1;
-        let idx = ci & cqe_mask;
-        let cqe_size = state.cqe_size as usize;
-        let cqe_ptr = unsafe { state.buf.add((idx as usize) * cqe_size) };
-
-        let op_own = unsafe { std::ptr::read_volatile(cqe_ptr.add(63)) };
-        let signature = unsafe { std::ptr::read_volatile(cqe_ptr.add(62)) };
-        let format_bits = (op_own >> 2) & 0x3;
-
-        (op_own, signature, format_bits)
-    }
-
-    /// Debug: Dump raw CQE bytes at current consumer index.
-    /// Returns hex string of the CQE data for detailed debugging.
-    #[doc(hidden)]
-    pub fn debug_dump_cqe(&self) -> String {
-        let state = &self.state;
-        let ci = state.ci.get();
-        let cqe_mask = state.cqe_cnt - 1;
-        let idx = ci & cqe_mask;
-        let cqe_size = state.cqe_size as usize;
-        let cqe_ptr = unsafe { state.buf.add((idx as usize) * cqe_size) };
-
-        let mut result = format!("ci={}, idx={}, cqe_size={}\n", ci, idx, cqe_size);
-
-        unsafe {
-            // Dump bytes 56-63 (standard CQE tail) and 120-127 (for 128B CQE)
-            result.push_str("  offset 56-63: ");
-            for i in 56..64 {
-                result.push_str(&format!("{:02x} ", std::ptr::read_volatile(cqe_ptr.add(i))));
-            }
-            result.push('\n');
-
-            if cqe_size == 128 {
-                result.push_str("  offset 120-127: ");
-                for i in 120..128 {
-                    result.push_str(&format!("{:02x} ", std::ptr::read_volatile(cqe_ptr.add(i))));
-                }
-                result.push('\n');
-            }
-
-            // Show sw/hw owner for both interpretations
-            let sw_owner = ((ci >> state.cqe_cnt_log2) & 1) as u8;
-            let op_own_63 = std::ptr::read_volatile(cqe_ptr.add(63));
-            let hw_owner_63 = op_own_63 & 1;
-            result.push_str(&format!("  sw_owner={}, op_own@63=0x{:02x}, hw_owner@63={}\n",
-                sw_owner, op_own_63, hw_owner_63));
-
-            if cqe_size == 128 {
-                let op_own_127 = std::ptr::read_volatile(cqe_ptr.add(127));
-                let hw_owner_127 = op_own_127 & 1;
-                result.push_str(&format!("  op_own@127=0x{:02x}, hw_owner@127={}\n",
-                    op_own_127, hw_owner_127));
-            }
-        }
-
-        result
     }
 
     /// Register a queue for completion dispatch.

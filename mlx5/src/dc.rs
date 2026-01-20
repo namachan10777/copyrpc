@@ -14,6 +14,8 @@ use crate::device::Context;
 use crate::pd::Pd;
 use crate::qp::QpInfo;
 use crate::srq::Srq;
+use crate::transport::IbRemoteDctInfo;
+use crate::types::GrhAttr;
 use crate::wqe::{
     AddressVector, CtrlSeg, DataSeg, DcNeedsAv, HasData, InlineHeader, Init, NeedsData, NeedsRdma,
     OrderedWqeTable, RdmaSeg, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
@@ -57,16 +59,13 @@ pub enum DcQpState {
     Error,
 }
 
-/// Remote DCT information for sending.
-#[derive(Debug, Clone, Copy)]
-pub struct RemoteDctInfo {
-    /// DCT number.
-    pub dct_number: u32,
-    /// DC key.
-    pub dc_key: u64,
-    /// Remote LID (Local Identifier).
-    pub local_identifier: u16,
-}
+/// Remote DCT information for sending (InfiniBand).
+///
+/// This is an alias for [`IbRemoteDctInfo`] for backward compatibility.
+/// New code should use [`IbRemoteDctInfo`] directly.
+///
+/// For RoCE, use [`crate::transport::RoCERemoteDctInfo`] instead.
+pub type RemoteDctInfo = IbRemoteDctInfo;
 
 // =============================================================================
 // DCI Send Queue State
@@ -329,17 +328,42 @@ impl<'a, Entry, TableType> DciWqeBuilder<'a, Entry, TableType, Init> {
 
 /// DcNeedsAv<Next> state: AV segment required.
 impl<'a, Entry, TableType, Next> DciWqeBuilder<'a, Entry, TableType, DcNeedsAv<Next>> {
-    /// Add an address vector (required for DC operations).
+    /// Add an address vector for InfiniBand transport.
     ///
-    /// This segment specifies the destination DCT.
+    /// This segment specifies the destination DCT using LID-based addressing.
     #[inline]
-    pub fn av(mut self, dc_key: u64, dctn: u32, dlid: u16) -> DciWqeBuilder<'a, Entry, TableType, Next> {
+    pub fn av_ib(mut self, dc_key: u64, dctn: u32, dlid: u16) -> DciWqeBuilder<'a, Entry, TableType, Next> {
         unsafe {
-            AddressVector::write(self.wqe_ptr.add(self.offset), dc_key, dctn, dlid);
+            AddressVector::write_ib(self.wqe_ptr.add(self.offset), dc_key, dctn, dlid);
         }
         self.offset += AddressVector::SIZE;
         self.ds_count += 3; // AV = 48 bytes = 3 DS
         self.transition()
+    }
+
+    /// Add an address vector for RoCE transport.
+    ///
+    /// This segment specifies the destination DCT using GID-based addressing.
+    ///
+    /// # NOTE: RoCE support is untested (IB-only hardware environment)
+    #[inline]
+    pub fn av_roce(mut self, dc_key: u64, dctn: u32, grh: &GrhAttr) -> DciWqeBuilder<'a, Entry, TableType, Next> {
+        unsafe {
+            AddressVector::write_roce(self.wqe_ptr.add(self.offset), dc_key, dctn, grh);
+        }
+        self.offset += AddressVector::SIZE;
+        self.ds_count += 3; // AV = 48 bytes = 3 DS
+        self.transition()
+    }
+
+    /// Add an address vector (required for DC operations).
+    ///
+    /// This is an alias for [`av_ib`] for backward compatibility.
+    /// New code should use [`av_ib`] or [`av_roce`] directly.
+    #[inline]
+    #[deprecated(note = "Use av_ib() or av_roce() instead")]
+    pub fn av(self, dc_key: u64, dctn: u32, dlid: u16) -> DciWqeBuilder<'a, Entry, TableType, Next> {
+        self.av_ib(dc_key, dctn, dlid)
     }
 }
 
@@ -614,11 +638,29 @@ impl<'a, Entry> DciPublicWqeBuilder<'a, Entry, Init> {
 
 /// DcNeedsAv<Next> state: AV segment required.
 impl<'a, Entry, Next> DciPublicWqeBuilder<'a, Entry, DcNeedsAv<Next>> {
-    /// Add an address vector.
+    /// Add an address vector for InfiniBand transport.
     #[inline]
-    pub fn av(self, dc_key: u64, dctn: u32, dlid: u16) -> DciPublicWqeBuilder<'a, Entry, Next> {
-        let inner = self.inner.av(dc_key, dctn, dlid);
+    pub fn av_ib(self, dc_key: u64, dctn: u32, dlid: u16) -> DciPublicWqeBuilder<'a, Entry, Next> {
+        let inner = self.inner.av_ib(dc_key, dctn, dlid);
         DciPublicWqeBuilder { inner, entry: self.entry }
+    }
+
+    /// Add an address vector for RoCE transport.
+    ///
+    /// # NOTE: RoCE support is untested (IB-only hardware environment)
+    #[inline]
+    pub fn av_roce(self, dc_key: u64, dctn: u32, grh: &GrhAttr) -> DciPublicWqeBuilder<'a, Entry, Next> {
+        let inner = self.inner.av_roce(dc_key, dctn, grh);
+        DciPublicWqeBuilder { inner, entry: self.entry }
+    }
+
+    /// Add an address vector.
+    ///
+    /// This is an alias for [`av_ib`] for backward compatibility.
+    #[inline]
+    #[deprecated(note = "Use av_ib() or av_roce() instead")]
+    pub fn av(self, dc_key: u64, dctn: u32, dlid: u16) -> DciPublicWqeBuilder<'a, Entry, Next> {
+        self.av_ib(dc_key, dctn, dlid)
     }
 }
 
