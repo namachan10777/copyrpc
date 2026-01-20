@@ -3,29 +3,15 @@
 //! Tests scatter-to-CQE verification for small receives (≤32B) and
 //! inline Send wrap-around handling.
 //!
-//! ## Known Issues
+//! ## Scatter-to-CQE Detection
 //!
-//! ### scatter-to-CQE not working as expected
+//! Scatter-to-CQE is indicated by flag bits in the CQE's op_own field,
+//! not by a distinct opcode:
+//! - `MLX5_INLINE_SCATTER_32 = 0x04` (bit 2): data in CQE offset 0-31
+//! - `MLX5_INLINE_SCATTER_64 = 0x08` (bit 3): data in previous CQE
 //!
-//! When `enable_scatter_to_cqe=true` is set in `RcQpConfig`:
-//!
-//! 1. **CQE opcode remains `RespSend`**: Even for small messages (≤32B),
-//!    the CQE opcode is `RespSend` instead of `InlineScatter32`.
-//!
-//! 2. **Receive buffer not populated**: When scatter-to-CQE is enabled,
-//!    small message data appears to go neither to the receive buffer
-//!    nor to the CQE inline data area.
-//!
-//! 3. **Possible causes**:
-//!    - The `MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE` flag may work differently
-//!      than expected (it controls disabling, not enabling)
-//!    - The hardware/driver may require additional configuration
-//!    - CQE parsing may need adjustment for scatter-to-CQE format
-//!
-//! ### Workaround
-//!
-//! Use `enable_scatter_to_cqe=false` (default) for reliable operation.
-//! Data will always be placed in the receive buffer.
+//! The CQE opcode remains `RespSend` even when scatter-to-CQE is active.
+//! Use `Cqe::is_inline_scatter()` and `Cqe::inline_data()` to access inlined data.
 //!
 //! Run with:
 //! ```bash
@@ -42,9 +28,6 @@ use mlx5::qp::{RcQpConfig, RemoteQpInfo};
 use mlx5::wqe::{WqeFlags, WqeOpcode};
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
-
-/// Maximum inline scatter size (32 bytes for 64-byte CQE).
-const MAX_INLINE_SCATTER_SIZE: usize = 32;
 
 /// Diagnostic test for scatter-to-CQE with SGE-based Send.
 ///
@@ -199,46 +182,45 @@ fn test_scatter_to_cqe_diagnostic() {
             size, recv_cqe.syndrome
         );
 
-        // Check data location based on opcode
-        let is_scatter = recv_cqe.opcode.is_inline_scatter();
+        // Check data location
+        let received = recv_buf.read_bytes(size);
+        let data_in_buffer = received == test_data;
 
-        if is_scatter {
-            // Data should be in CQE
-            if let Some(inline) = recv_cqe.inline_data() {
-                let data_matches = inline == &test_data[..];
-                scatter_count += 1;
-                println!(
-                    "  Size {:3}: scatter-to-CQE (opcode={:?}, data_ok={})",
-                    size, recv_cqe.opcode, data_matches
-                );
-            } else {
-                println!(
-                    "  Size {:3}: scatter-to-CQE (opcode={:?}, inline_data=None)",
-                    size, recv_cqe.opcode
-                );
-            }
+        // Check CQE inline data for scatter-to-CQE
+        // (detected via MLX5_INLINE_SCATTER_32/64 flags in op_own)
+        let data_in_cqe = if let Some(inline) = recv_cqe.inline_data() {
+            inline.len() >= size && inline[..size] == test_data[..]
         } else {
-            // Check if data is in receive buffer
-            let received = recv_buf.read_bytes(size);
-            let data_in_buffer = received == test_data;
-            let buffer_unchanged = recv_buf.read_bytes(size).iter().all(|&b| b == 0xAA);
+            false
+        };
 
-            if data_in_buffer {
-                buffer_count += 1;
+        if data_in_buffer {
+            buffer_count += 1;
+            println!(
+                "  Size {:3}: buffer receive (opcode={:?}, is_inline_scatter={})",
+                size, recv_cqe.opcode, recv_cqe.is_inline_scatter()
+            );
+        } else if data_in_cqe {
+            scatter_count += 1;
+            println!(
+                "  Size {:3}: scatter-to-CQE (opcode={:?}, is_inline_scatter={})",
+                size, recv_cqe.opcode, recv_cqe.is_inline_scatter()
+            );
+        } else {
+            // Data not found in expected locations
+            println!(
+                "  Size {:3}: DATA MISMATCH - opcode={:?}, is_inline_scatter={}, byte_cnt={}",
+                size, recv_cqe.opcode, recv_cqe.is_inline_scatter(), recv_cqe.byte_cnt
+            );
+            println!(
+                "            buffer[0..4]: {:?}, expected: {:?}",
+                &received[..4.min(size)],
+                &test_data[..4.min(size)]
+            );
+            if let Some(inline) = recv_cqe.inline_data() {
                 println!(
-                    "  Size {:3}: buffer receive (opcode={:?}, data_ok=true)",
-                    size, recv_cqe.opcode
-                );
-            } else if buffer_unchanged {
-                // Known issue: scatter-to-CQE enabled but data not in buffer or CQE
-                println!(
-                    "  Size {:3}: ISSUE - buffer unchanged (opcode={:?}) - see known issues",
-                    size, recv_cqe.opcode
-                );
-            } else {
-                println!(
-                    "  Size {:3}: buffer has unexpected data (opcode={:?})",
-                    size, recv_cqe.opcode
+                    "            inline_data[0..4]: {:?}",
+                    &inline[..4.min(inline.len())]
                 );
             }
         }
@@ -248,12 +230,6 @@ fn test_scatter_to_cqe_diagnostic() {
     println!("Scatter-to-CQE opcode used: {} times", scatter_count);
     println!("Buffer receive confirmed: {} times", buffer_count);
     println!("Total sizes tested: {}", test_sizes.len());
-
-    // This is a diagnostic test - we report but don't fail on known issues
-    if scatter_count == 0 && buffer_count < test_sizes.len() {
-        println!("\nNOTE: scatter-to-CQE may not be working as expected.");
-        println!("See module documentation for known issues.");
-    }
 
     println!("\nScatter-to-CQE diagnostic test completed.");
 }
@@ -382,7 +358,7 @@ fn test_scatter_to_cqe_disabled() {
 
         let recv_cqe = last_recv_cqe.take().expect("Recv callback not called");
 
-        if recv_cqe.opcode.is_inline_scatter() {
+        if recv_cqe.is_inline_scatter() {
             scatter_count += 1;
         }
 
@@ -398,7 +374,7 @@ fn test_scatter_to_cqe_disabled() {
             "  Size {}: opcode={:?}, is_inline_scatter={}",
             size,
             recv_cqe.opcode,
-            recv_cqe.opcode.is_inline_scatter()
+            recv_cqe.is_inline_scatter()
         );
     }
 

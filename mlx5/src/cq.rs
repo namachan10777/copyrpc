@@ -17,6 +17,9 @@ use crate::device::Context;
 // =============================================================================
 
 /// CQE opcode values.
+///
+/// Note: Scatter-to-CQE is indicated by separate flag bits in the op_own field,
+/// not by a distinct opcode. See `Cqe::is_inline_scatter()`.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CqeOpcode {
@@ -38,10 +41,6 @@ pub enum CqeOpcode {
     ReqErr = 0x0d,
     /// Responder error
     RespErr = 0x0e,
-    /// Inline scatter 32 (data inlined in 32-byte CQE)
-    InlineScatter32 = 0x12,
-    /// Inline scatter 64 (data inlined in 64-byte CQE)
-    InlineScatter64 = 0x13,
 }
 
 /// Mini CQE format values (for CQE compression).
@@ -233,6 +232,8 @@ impl MiniCqeIterator {
                 syndrome: 0,
                 vendor_err: 0,
                 app_info: 0,
+                // Mini CQEs don't support scatter-to-CQE (compression mode)
+                is_inline_scatter: false,
                 inline_data: [0u8; MAX_INLINE_SCATTER_SIZE],
             }
         };
@@ -259,8 +260,6 @@ impl CqeOpcode {
             0x06 => Some(Self::TmFinish),
             0x0d => Some(Self::ReqErr),
             0x0e => Some(Self::RespErr),
-            0x12 => Some(Self::InlineScatter32),
-            0x13 => Some(Self::InlineScatter64),
             _ => None,
         }
     }
@@ -268,8 +267,7 @@ impl CqeOpcode {
     /// Returns true if this is a responder (RQ) completion.
     ///
     /// Responder completions indicate that data was received on the Receive Queue.
-    /// This includes RDMA WRITE with immediate, SEND operations, responder errors,
-    /// and inline scatter completions.
+    /// This includes RDMA WRITE with immediate, SEND operations, and responder errors.
     pub fn is_responder(&self) -> bool {
         matches!(
             self,
@@ -278,18 +276,7 @@ impl CqeOpcode {
                 | Self::RespSendImm
                 | Self::RespSendInv
                 | Self::RespErr
-                | Self::InlineScatter32
-                | Self::InlineScatter64
         )
-    }
-
-    /// Returns true if this CQE contains inline scatter data.
-    ///
-    /// When scatter-to-CQE is enabled and the received data is small enough,
-    /// the hardware places the data directly in the CQE instead of the receive buffer.
-    /// Use [`Cqe::inline_data()`] to access the inlined data.
-    pub fn is_inline_scatter(&self) -> bool {
-        matches!(self, Self::InlineScatter32 | Self::InlineScatter64)
     }
 }
 
@@ -298,6 +285,10 @@ impl CqeOpcode {
 /// For 64-byte CQEs, up to 32 bytes can be inlined (offset 0-31).
 /// For 32-byte CQEs (not currently supported), up to 16 bytes can be inlined.
 pub const MAX_INLINE_SCATTER_SIZE: usize = 32;
+
+/// Inline scatter flag bits in the op_own field.
+const MLX5_INLINE_SCATTER_32: u8 = 0x04;
+const MLX5_INLINE_SCATTER_64: u8 = 0x08;
 
 /// Parsed CQE (Completion Queue Entry).
 #[derive(Debug, Clone, Copy)]
@@ -318,8 +309,11 @@ pub struct Cqe {
     pub vendor_err: u8,
     /// Application info (TM tag handle for Tag Matching operations)
     pub app_info: u16,
+    /// True if scatter-to-CQE is active (data is in CQE, not in receive buffer).
+    /// Detected from MLX5_INLINE_SCATTER_32/64 flags in op_own field.
+    is_inline_scatter: bool,
     /// Inline scatter data buffer.
-    /// Valid only when `opcode.is_inline_scatter()` returns true.
+    /// Valid only when `is_inline_scatter()` returns true.
     /// The actual data length is `byte_cnt`.
     inline_data: [u8; MAX_INLINE_SCATTER_SIZE],
 }
@@ -331,7 +325,7 @@ impl Cqe {
     /// The pointer must point to a valid 64-byte CQE.
     ///
     /// CQE64 layout (success):
-    /// - offset 0-31: inline scatter data (for InlineScatter32/64 opcodes)
+    /// - offset 0-31: inline scatter data (when scatter-to-CQE is active)
     /// - offset 36: imm_inval_pkey (4B, big-endian)
     /// - offset 44: byte_cnt (4B, big-endian)
     /// - offset 48-49: timestamp_h (2B)
@@ -339,7 +333,7 @@ impl Cqe {
     /// - offset 52-55: timestamp_l (4B)
     /// - offset 56: sop_drop_qpn (4B, big-endian) - QP number in [23:0]
     /// - offset 60: wqe_counter (2B, big-endian)
-    /// - offset 63: op_own (1B) - opcode[7:4] | owner_bit[0]
+    /// - offset 63: op_own (1B) - opcode[7:4] | inline_scatter_flags[3:2] | owner_bit[0]
     ///
     /// CQE64 layout (error - opcode 0x0d or 0x0e):
     /// - offset 54: vendor_err_synd (1B)
@@ -350,6 +344,12 @@ impl Cqe {
     pub(crate) unsafe fn from_ptr(ptr: *const u8) -> Self {
         let op_own = std::ptr::read_volatile(ptr.add(63));
         let opcode = CqeOpcode::from_u8(op_own >> 4).unwrap_or(CqeOpcode::ReqErr);
+
+        // Scatter-to-CQE is indicated by flag bits in op_own, not by opcode.
+        // MLX5_INLINE_SCATTER_32 (0x04) = bit 2: data in current CQE offset 0-31
+        // MLX5_INLINE_SCATTER_64 (0x08) = bit 3: data in previous CQE (cqe - 1)
+        let is_inline_scatter =
+            (op_own & (MLX5_INLINE_SCATTER_32 | MLX5_INLINE_SCATTER_64)) != 0;
 
         let wqe_counter = u16::from_be(std::ptr::read_volatile(ptr.add(60) as *const u16));
 
@@ -374,10 +374,11 @@ impl Cqe {
             (0, 0)
         };
 
-        // Copy inline scatter data for InlineScatter32/64 opcodes.
-        // For 64-byte CQEs, inline data is at offset 0-31 (up to 32 bytes).
+        // Copy inline scatter data from CQE offset 0-31 when scatter-to-CQE is active.
+        // Note: MLX5_INLINE_SCATTER_64 would require reading from (cqe - 1), but we only
+        // support 64-byte CQEs where the inline data fits in offset 0-31.
         let mut inline_data = [0u8; MAX_INLINE_SCATTER_SIZE];
-        if opcode.is_inline_scatter() {
+        if is_inline_scatter {
             let copy_len = (byte_cnt as usize).min(MAX_INLINE_SCATTER_SIZE);
             std::ptr::copy_nonoverlapping(ptr, inline_data.as_mut_ptr(), copy_len);
         }
@@ -391,14 +392,26 @@ impl Cqe {
             syndrome,
             vendor_err,
             app_info,
+            is_inline_scatter,
             inline_data,
         }
+    }
+
+    /// Returns true if this CQE contains inline scatter data.
+    ///
+    /// When scatter-to-CQE is enabled and the received data is small enough,
+    /// the hardware places the data directly in the CQE instead of the receive buffer.
+    /// This is detected from the MLX5_INLINE_SCATTER_32/64 flags in the op_own field.
+    ///
+    /// Use [`Cqe::inline_data()`] to access the inlined data.
+    pub fn is_inline_scatter(&self) -> bool {
+        self.is_inline_scatter
     }
 
     /// Get the inline scatter data if present.
     ///
     /// Returns `Some(&[u8])` if the CQE contains inline scatter data
-    /// (opcode is `InlineScatter32` or `InlineScatter64`), `None` otherwise.
+    /// (scatter-to-CQE flag is set), `None` otherwise.
     ///
     /// The returned slice length is determined by `byte_cnt`, capped at
     /// [`MAX_INLINE_SCATTER_SIZE`].
@@ -414,7 +427,7 @@ impl Cqe {
     /// }
     /// ```
     pub fn inline_data(&self) -> Option<&[u8]> {
-        if self.opcode.is_inline_scatter() {
+        if self.is_inline_scatter {
             let len = (self.byte_cnt as usize).min(MAX_INLINE_SCATTER_SIZE);
             Some(&self.inline_data[..len])
         } else {
@@ -434,6 +447,7 @@ impl Default for Cqe {
             syndrome: 0,
             vendor_err: 0,
             app_info: 0,
+            is_inline_scatter: false,
             inline_data: [0u8; MAX_INLINE_SCATTER_SIZE],
         }
     }

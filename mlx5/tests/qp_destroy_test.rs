@@ -36,6 +36,7 @@ fn test_qp_destroy_after_remote_gone() {
         max_send_sge: 1,
         max_recv_sge: 1,
         max_inline_data: 64,
+        enable_scatter_to_cqe: false,
     };
 
     // Create QP1 on context 1 (separate send and recv CQs)
@@ -168,6 +169,7 @@ fn test_qp_destroy_multi_thread() {
             max_send_sge: 1,
             max_recv_sge: 1,
             max_inline_data: 64,
+            enable_scatter_to_cqe: false,
         };
 
         let mut send_cq = ctx.ctx.create_cq(64).expect("create send_cq");
@@ -235,6 +237,7 @@ fn test_qp_destroy_multi_thread() {
         max_send_sge: 1,
         max_recv_sge: 1,
         max_inline_data: 64,
+        enable_scatter_to_cqe: false,
     };
 
     let mut send_cq = ctx.ctx.create_cq(64).expect("create send_cq");
@@ -339,6 +342,7 @@ fn test_qp_destroy_after_data_transfer() {
             max_send_sge: 1,
             max_recv_sge: 1,
             max_inline_data: 64,
+            enable_scatter_to_cqe: false,
         };
 
         let mut send_cq = ctx.ctx.create_cq(64).expect("create send_cq");
@@ -422,6 +426,7 @@ fn test_qp_destroy_after_data_transfer() {
         max_send_sge: 1,
         max_recv_sge: 1,
         max_inline_data: 64,
+        enable_scatter_to_cqe: false,
     };
 
     let mut send_cq = ctx.ctx.create_cq(64).expect("create send_cq");
@@ -560,6 +565,7 @@ fn test_qp_destroy_after_actual_send_recv() {
             max_send_sge: 1,
             max_recv_sge: 1,
             max_inline_data: 64,
+            enable_scatter_to_cqe: false,
         };
 
         let mut send_cq = ctx.ctx.create_cq(64).expect("create send_cq");
@@ -685,6 +691,7 @@ fn test_qp_destroy_after_actual_send_recv() {
         max_send_sge: 1,
         max_recv_sge: 1,
         max_inline_data: 64,
+        enable_scatter_to_cqe: false,
     };
 
     let mut send_cq = ctx.ctx.create_cq(64).expect("create send_cq");
