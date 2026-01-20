@@ -53,9 +53,6 @@ pub struct CqConfig {
     /// CQE compression is only valid for RX (responder side) completions.
     /// Using this for TX CQs will cause undefined behavior.
     ///
-    /// Note: Actual compressed CQEs (format=3) may only be generated
-    /// with Strided RQ (MPRQ) configurations.
-    ///
     /// Requires `MLX5DV_CONTEXT_FLAGS_CQE_128B_COMP` device capability.
     pub compression_format: Option<CqeCompressionFormat>,
 }
@@ -622,11 +619,16 @@ impl Context {
             // Set opcode = 0xf (INVALID) and owner = 1.
             // When CI = 0, sw_owner = 0, so CQEs with owner = 1 will be skipped.
             // This prevents reading garbage before HW writes valid CQEs.
+            //
+            // For 128-byte CQEs, the CQE64 structure is in the second half (offset 64-127).
+            // For 64-byte CQEs, it's at the beginning.
             const OP_OWN_INVALID: u8 = 0xf1; // opcode=INVALID(0xf), owner=1
             let buf = dv_cq.buf as *mut u8;
+            let cqe64_offset: usize = if dv_cq.cqe_size == 128 { 64 } else { 0 };
             for i in 0..dv_cq.cqe_cnt {
                 let cqe_ptr = buf.add((i as usize) * (dv_cq.cqe_size as usize));
-                let op_own_ptr = cqe_ptr.add(63);
+                let cqe64_ptr = cqe_ptr.add(cqe64_offset);
+                let op_own_ptr = cqe64_ptr.add(63);
                 std::ptr::write_volatile(op_own_ptr, OP_OWN_INVALID);
             }
 
@@ -703,11 +705,16 @@ impl Context {
             // Initialize all CQEs to look like they are in HW ownership (UCX-style).
             // op_own byte layout: opcode[7:4] | reserved[3:1] | owner[0]
             // Set opcode = 0xf (INVALID) and owner = 1.
+            //
+            // For 128-byte CQEs, the CQE64 structure is in the second half (offset 64-127).
+            // For 64-byte CQEs, it's at the beginning.
             const OP_OWN_INVALID: u8 = 0xf1; // opcode=INVALID(0xf), owner=1
             let buf = dv_cq.buf as *mut u8;
+            let cqe64_offset: usize = if dv_cq.cqe_size == 128 { 64 } else { 0 };
             for i in 0..dv_cq.cqe_cnt {
                 let cqe_ptr = buf.add((i as usize) * (dv_cq.cqe_size as usize));
-                let op_own_ptr = cqe_ptr.add(63);
+                let cqe64_ptr = cqe_ptr.add(cqe64_offset);
+                let op_own_ptr = cqe64_ptr.add(63);
                 std::ptr::write_volatile(op_own_ptr, OP_OWN_INVALID);
             }
 
@@ -908,8 +915,13 @@ impl CompletionQueue {
         let cqe_size = state.cqe_size as usize;
         let cqe_ptr = unsafe { state.buf.add((idx as usize) * cqe_size) };
 
+        // For 128-byte CQEs, the CQE64 structure is in the second half (offset 64-127).
+        // For 64-byte CQEs, it's at the beginning.
+        let cqe64_offset = if cqe_size == 128 { 64 } else { 0 };
+        let cqe64_ptr = unsafe { cqe_ptr.add(cqe64_offset) };
+
         // Owner bit check
-        let op_own = unsafe { std::ptr::read_volatile(cqe_ptr.add(63)) };
+        let op_own = unsafe { std::ptr::read_volatile(cqe64_ptr.add(63)) };
         let sw_owner = ((ci >> state.cqe_cnt_log2) & 1) as u8;
         let hw_owner = op_own & 1;
 
@@ -927,7 +939,7 @@ impl CompletionQueue {
 
             // Create mini CQE iterator using the title opcode from previous CQE
             let title_opcode = state.title_opcode.get();
-            let mut iter = unsafe { MiniCqeIterator::new(cqe_ptr, title_opcode) };
+            let mut iter = unsafe { MiniCqeIterator::new(cqe64_ptr, title_opcode) };
 
             state.ci.set(ci.wrapping_add(1));
 
@@ -961,7 +973,7 @@ impl CompletionQueue {
         // On ARM, this requires an explicit dmb ld instruction.
         udma_from_device_barrier!();
 
-        let cqe = unsafe { Cqe::from_ptr(cqe_ptr) };
+        let cqe = unsafe { Cqe::from_ptr(cqe64_ptr) };
 
         // Save the opcode as title opcode for potential compressed CQE following
         state.title_opcode.set(cqe.opcode);
