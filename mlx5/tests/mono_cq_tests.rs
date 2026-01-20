@@ -8,7 +8,7 @@ mod common;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use mlx5::cq::{CqConfig, Cqe};
+use mlx5::cq::{CqConfig, CqeCompressionFormat, Cqe};
 use mlx5::qp::{RcQpConfig, RcQpForMonoCq, RemoteQpInfo};
 use mlx5::wqe::{WqeFlags, WqeOpcode};
 
@@ -1063,7 +1063,7 @@ fn test_mono_cq_rx_compression() {
 
     // RX CQ with compression enabled
     let rx_config = CqConfig {
-        enable_compression: true,
+        compression_format: Some(CqeCompressionFormat::Hash),
         ..Default::default()
     };
     let recv_cq = ctx
@@ -1255,7 +1255,7 @@ fn test_rx_compression_benchmark() {
 
         let elapsed = {
             let rx_config = CqConfig {
-                enable_compression: true,
+                compression_format: Some(CqeCompressionFormat::Hash),
                 ..Default::default()
             };
             let recv_cq = ctx

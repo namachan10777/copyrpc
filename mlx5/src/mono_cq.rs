@@ -33,7 +33,7 @@ use std::ptr::NonNull;
 use std::rc::{Rc, Weak};
 use std::{io, mem::MaybeUninit};
 
-use crate::cq::{CqConfig, CqModeration, CqeSize, Cqe, CqeOpcode, MiniCqeIterator};
+use crate::cq::{CqConfig, CqModeration, CqeCompressionFormat, CqeSize, Cqe, CqeOpcode, MiniCqeIterator};
 use crate::device::Context;
 
 // =============================================================================
@@ -210,6 +210,19 @@ impl Context {
         Q: CompletionSource,
         F: Fn(Cqe, Q::Entry),
     {
+        // Check device support for CQE compression if requested
+        if config.compression_format.is_some() {
+            let mlx5_attr = self.query_mlx5_device()?;
+            const CQE_128B_COMP: u64 =
+                mlx5_sys::mlx5dv_context_flags_MLX5DV_CONTEXT_FLAGS_CQE_128B_COMP as u64;
+            if (mlx5_attr.flags & CQE_128B_COMP) == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "CQE 128B compression not supported by device (MLX5DV_CONTEXT_FLAGS_CQE_128B_COMP)",
+                ));
+            }
+        }
+
         unsafe {
             let mut attr: mlx5_sys::ibv_cq_init_attr_ex = MaybeUninit::zeroed().assume_init();
             attr.cqe = cqe as u32;
@@ -220,10 +233,10 @@ impl Context {
             attr.comp_mask = 0;
             attr.flags = 0;
 
-            let enable_compression = config.enable_compression;
+            let compression_format = config.compression_format;
             let use_custom_cqe_size = config.cqe_size != CqeSize::Size64;
 
-            let (cq_ex, cqe_compression) = if enable_compression || use_custom_cqe_size {
+            let (cq_ex, cqe_compression) = if compression_format.is_some() || use_custom_cqe_size {
                 // Use mlx5dv_create_cq for MLX5-specific features
                 let mut mlx5_attr: mlx5_sys::mlx5dv_cq_init_attr =
                     MaybeUninit::zeroed().assume_init();
@@ -236,27 +249,30 @@ impl Context {
                 // Enable compression if requested
                 // Note: CQE compression formats (HASH, CSUM, etc.) are responder-side only.
                 // DO NOT use this for TX (send) CQs - it will cause hangs.
-                if enable_compression {
+                if let Some(format) = compression_format {
                     mlx5_attr.comp_mask |=
                         mlx5_sys::mlx5dv_cq_init_attr_mask_MLX5DV_CQ_INIT_ATTR_MASK_COMPRESSED_CQE
                             as u64;
-                    mlx5_attr.cqe_comp_res_format =
-                        mlx5_sys::mlx5dv_cqe_comp_res_format_MLX5DV_CQE_RES_FORMAT_HASH as u8;
+                    mlx5_attr.cqe_comp_res_format = match format {
+                        CqeCompressionFormat::Hash => {
+                            mlx5_sys::mlx5dv_cqe_comp_res_format_MLX5DV_CQE_RES_FORMAT_HASH as u8
+                        }
+                        CqeCompressionFormat::Csum => {
+                            mlx5_sys::mlx5dv_cqe_comp_res_format_MLX5DV_CQE_RES_FORMAT_CSUM as u8
+                        }
+                        CqeCompressionFormat::CsumStridx => {
+                            mlx5_sys::mlx5dv_cqe_comp_res_format_MLX5DV_CQE_RES_FORMAT_CSUM_STRIDX
+                                as u8
+                        }
+                    };
                 }
 
                 let cq_ex = mlx5_sys::mlx5dv_create_cq(self.as_ptr(), &mut attr, &mut mlx5_attr);
 
-                if cq_ex.is_null() && enable_compression {
-                    // Fallback to standard CQ if compression not supported
-                    (
-                        mlx5_sys::ibv_create_cq_ex_ex(self.as_ptr(), &mut attr),
-                        false,
-                    )
-                } else if cq_ex.is_null() {
+                if cq_ex.is_null() {
                     return Err(io::Error::last_os_error());
-                } else {
-                    (cq_ex, enable_compression)
                 }
+                (cq_ex, compression_format.is_some())
             } else {
                 // Standard CQ without compression or custom CQE size
                 (

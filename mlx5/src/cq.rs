@@ -28,19 +28,36 @@ pub enum CqeSize {
     Size128 = 128,
 }
 
+/// CQE compression result format.
+///
+/// Specifies the format of compressed CQE results. Must be selected when
+/// enabling CQE compression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CqeCompressionFormat {
+    /// Hash format - contains L3/L4 hash value for RSS
+    Hash,
+    /// Checksum format - contains L3/L4 checksum
+    Csum,
+    /// Checksum with stride index - contains checksum and stride index
+    CsumStridx,
+}
+
 /// CQ creation configuration.
 #[derive(Debug, Clone, Default)]
 pub struct CqConfig {
     /// CQE size (64 or 128 bytes)
     pub cqe_size: CqeSize,
-    /// Enable CQE compression for RX (receive) completions.
+    /// CQE compression format for RX (receive) completions.
     ///
+    /// Set to `Some(format)` to enable CQE compression with the specified format.
     /// CQE compression is only valid for RX (responder side) completions.
     /// Using this for TX CQs will cause undefined behavior.
     ///
     /// Note: Actual compressed CQEs (format=3) may only be generated
     /// with Strided RQ (MPRQ) configurations.
-    pub enable_compression: bool,
+    ///
+    /// Requires `MLX5DV_CONTEXT_FLAGS_CQE_128B_COMP` device capability.
+    pub compression_format: Option<CqeCompressionFormat>,
 }
 
 /// CQ moderation settings for interrupt coalescing.
