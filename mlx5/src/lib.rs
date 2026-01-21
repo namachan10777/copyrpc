@@ -103,7 +103,7 @@ pub use qp::RcQpForMonoCq;
 
 // Re-export RQ type markers for SRQ support
 pub use qp::{OwnedRq, SharedRq, RcQpIbWithSrq, RcQpRoCEWithSrq};
-pub use ud::{UdOwnedRq, UdSharedRq, UdQpWithSrq};
+pub use ud::{UdOwnedRq, UdSharedRq, UdQpIb, UdQpIbWithSrq, UdQpRoCE, UdQpRoCEWithSrq};
 
 // Re-export TM-SRQ types
 pub use tm_srq::{RqWqeBuilder, TmSrqCompletion};

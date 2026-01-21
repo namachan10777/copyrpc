@@ -797,7 +797,7 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, HasData> {
 /// - `RqEntry`: Entry type stored in the RQ WQE table
 /// - `OnSqComplete`: SQ completion callback type `Fn(Cqe, SqEntry)`
 /// - `OnRqComplete`: RQ completion callback type `Fn(Cqe, RqEntry)`
-pub type RcQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = RcQpInner<SqEntry, RqEntry, InfiniBand, OrderedWqeTable<SqEntry>, OwnedRq<RqEntry>, OnSqComplete, OnRqComplete>;
+pub type RcQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = RcQp<SqEntry, RqEntry, InfiniBand, OrderedWqeTable<SqEntry>, OwnedRq<RqEntry>, OnSqComplete, OnRqComplete>;
 
 /// RC (Reliable Connection) Queue Pair with SRQ (InfiniBand).
 ///
@@ -806,7 +806,7 @@ pub type RcQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = RcQpInner<SqEntr
 /// - `RqEntry`: Entry type stored in the SRQ WQE table
 /// - `OnSqComplete`: SQ completion callback type `Fn(Cqe, SqEntry)`
 /// - `OnRqComplete`: RQ completion callback type `Fn(Cqe, RqEntry)`
-pub type RcQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = RcQpInner<SqEntry, RqEntry, InfiniBand, OrderedWqeTable<SqEntry>, SharedRq<RqEntry>, OnSqComplete, OnRqComplete>;
+pub type RcQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = RcQp<SqEntry, RqEntry, InfiniBand, OrderedWqeTable<SqEntry>, SharedRq<RqEntry>, OnSqComplete, OnRqComplete>;
 
 /// RC (Reliable Connection) Queue Pair with owned Receive Queue (RoCE).
 ///
@@ -815,7 +815,7 @@ pub type RcQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = RcQpInner
 /// - `RqEntry`: Entry type stored in the RQ WQE table
 /// - `OnSqComplete`: SQ completion callback type `Fn(Cqe, SqEntry)`
 /// - `OnRqComplete`: RQ completion callback type `Fn(Cqe, RqEntry)`
-pub type RcQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = RcQpInner<SqEntry, RqEntry, RoCE, OrderedWqeTable<SqEntry>, OwnedRq<RqEntry>, OnSqComplete, OnRqComplete>;
+pub type RcQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = RcQp<SqEntry, RqEntry, RoCE, OrderedWqeTable<SqEntry>, OwnedRq<RqEntry>, OnSqComplete, OnRqComplete>;
 
 /// RC (Reliable Connection) Queue Pair with SRQ (RoCE).
 ///
@@ -824,7 +824,7 @@ pub type RcQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = RcQpInner<SqEn
 /// - `RqEntry`: Entry type stored in the SRQ WQE table
 /// - `OnSqComplete`: SQ completion callback type `Fn(Cqe, SqEntry)`
 /// - `OnRqComplete`: RQ completion callback type `Fn(Cqe, RqEntry)`
-pub type RcQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = RcQpInner<SqEntry, RqEntry, RoCE, OrderedWqeTable<SqEntry>, SharedRq<RqEntry>, OnSqComplete, OnRqComplete>;
+pub type RcQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = RcQp<SqEntry, RqEntry, RoCE, OrderedWqeTable<SqEntry>, SharedRq<RqEntry>, OnSqComplete, OnRqComplete>;
 
 /// RC (Reliable Connection) Queue Pair (internal implementation).
 ///
@@ -838,7 +838,7 @@ pub type RcQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = RcQpInn
 /// - `Rq`: Receive queue type (`OwnedRq<RqEntry>` or `SharedRq<RqEntry>`)
 /// - `OnSqComplete`: SQ completion callback type
 /// - `OnRqComplete`: RQ completion callback type
-pub struct RcQpInner<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> {
+pub struct RcQp<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> {
     qp: NonNull<mlx5_sys::ibv_qp>,
     state: Cell<QpState>,
     /// Maximum inline data size (from QP config)
@@ -943,7 +943,7 @@ impl Context {
             let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
             let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
 
-            let mut result = RcQpInner {
+            let mut result = RcQp {
                 qp,
                 state: Cell::new(QpState::Reset),
                 max_inline_data: config.max_inline_data,
@@ -1050,7 +1050,7 @@ impl Context {
             let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
             let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
 
-            let mut result = RcQpInner {
+            let mut result = RcQp {
                 qp,
                 state: Cell::new(QpState::Reset),
                 max_inline_data: config.max_inline_data,
@@ -1150,7 +1150,7 @@ impl Context {
             let sq_wqe_cnt = dv_qp.sq.wqe_cnt as u16;
             let rq_wqe_cnt = dv_qp.rq.wqe_cnt;
 
-            Ok(Rc::new(RefCell::new(RcQpInner {
+            Ok(Rc::new(RefCell::new(RcQp {
                 qp,
                 state: Cell::new(QpState::Reset),
                 max_inline_data: config.max_inline_data,
@@ -1190,7 +1190,7 @@ impl Context {
     }
 }
 
-impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> Drop for RcQpInner<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> {
+impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> Drop for RcQp<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> {
     fn drop(&mut self) {
         let qpn = self.qpn();
         // Unregister from both CQs before destroying QP
@@ -1206,7 +1206,7 @@ impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> Dro
     }
 }
 
-impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> RcQpInner<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> {
+impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> RcQp<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> {
     /// Get the QP number.
     pub fn qpn(&self) -> u32 {
         unsafe { (*self.qp.as_ptr()).qp_num }
@@ -1363,7 +1363,7 @@ impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> RcQ
 }
 
 /// InfiniBand transport-specific methods.
-impl<SqEntry, RqEntry, TableType, Rq, OnSqComplete, OnRqComplete> RcQpInner<SqEntry, RqEntry, InfiniBand, TableType, Rq, OnSqComplete, OnRqComplete> {
+impl<SqEntry, RqEntry, TableType, Rq, OnSqComplete, OnRqComplete> RcQp<SqEntry, RqEntry, InfiniBand, TableType, Rq, OnSqComplete, OnRqComplete> {
     /// Transition QP from INIT to RTR (Ready to Receive).
     ///
     /// Uses LID-based addressing for InfiniBand fabric.
@@ -1432,7 +1432,7 @@ impl<SqEntry, RqEntry, TableType, Rq, OnSqComplete, OnRqComplete> RcQpInner<SqEn
 }
 
 /// RoCE transport-specific methods.
-impl<SqEntry, RqEntry, TableType, Rq, OnSqComplete, OnRqComplete> RcQpInner<SqEntry, RqEntry, RoCE, TableType, Rq, OnSqComplete, OnRqComplete> {
+impl<SqEntry, RqEntry, TableType, Rq, OnSqComplete, OnRqComplete> RcQp<SqEntry, RqEntry, RoCE, TableType, Rq, OnSqComplete, OnRqComplete> {
     /// Transition QP from INIT to RTR (Ready to Receive).
     ///
     /// Uses GID-based addressing for RoCE (RDMA over Converged Ethernet).
@@ -1597,7 +1597,7 @@ where
     OnRqComplete: Fn(Cqe, RqEntry),
 {
     fn qpn(&self) -> u32 {
-        RcQpInner::qpn(self)
+        RcQp::qpn(self)
     }
 
     fn dispatch_cqe(&self, cqe: Cqe) {
@@ -1629,7 +1629,7 @@ where
     OnRqComplete: Fn(Cqe, RqEntry),
 {
     fn qpn(&self) -> u32 {
-        RcQpInner::qpn(self)
+        RcQp::qpn(self)
     }
 
     fn dispatch_cqe(&self, cqe: Cqe) {
@@ -1654,7 +1654,7 @@ where
 // ReceiveQueue methods (OwnedRq)
 // =============================================================================
 
-impl<SqEntry, RqEntry, Transport, TableType, OnSqComplete, OnRqComplete> RcQpInner<SqEntry, RqEntry, Transport, TableType, OwnedRq<RqEntry>, OnSqComplete, OnRqComplete> {
+impl<SqEntry, RqEntry, Transport, TableType, OnSqComplete, OnRqComplete> RcQp<SqEntry, RqEntry, Transport, TableType, OwnedRq<RqEntry>, OnSqComplete, OnRqComplete> {
     /// Ring the RQ doorbell to notify HCA of new WQEs.
     pub fn ring_rq_doorbell(&self) {
         if let Some(rq) = self.rq.as_ref() {
@@ -1667,7 +1667,7 @@ impl<SqEntry, RqEntry, Transport, TableType, OnSqComplete, OnRqComplete> RcQpInn
 // SRQ access methods (SharedRq)
 // =============================================================================
 
-impl<SqEntry, RqEntry, Transport, TableType, OnSqComplete, OnRqComplete> RcQpInner<SqEntry, RqEntry, Transport, TableType, SharedRq<RqEntry>, OnSqComplete, OnRqComplete> {
+impl<SqEntry, RqEntry, Transport, TableType, OnSqComplete, OnRqComplete> RcQp<SqEntry, RqEntry, Transport, TableType, SharedRq<RqEntry>, OnSqComplete, OnRqComplete> {
     /// Get a reference to the underlying SRQ.
     pub fn srq(&self) -> &Srq<RqEntry> {
         self.rq.srq()
@@ -1678,7 +1678,7 @@ impl<SqEntry, RqEntry, Transport, TableType, OnSqComplete, OnRqComplete> RcQpInn
 // Common methods
 // =============================================================================
 
-impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> RcQpInner<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> {
+impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> RcQp<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> {
     /// Get the Send Queue Number (SQN).
     ///
     /// Returns None if direct access is not initialized.
@@ -1713,11 +1713,11 @@ pub struct SqSlot {
 
 use crate::mono_cq::CompletionSource;
 
-impl<Entry> CompletionSource for RcQpInner<Entry, Entry, InfiniBand, OrderedWqeTable<Entry>, OwnedRq<Entry>, (), ()> {
+impl<Entry> CompletionSource for RcQp<Entry, Entry, InfiniBand, OrderedWqeTable<Entry>, OwnedRq<Entry>, (), ()> {
     type Entry = Entry;
 
     fn qpn(&self) -> u32 {
-        RcQpInner::qpn(self)
+        RcQp::qpn(self)
     }
 
     fn process_cqe(&self, cqe: Cqe) -> Option<Entry> {
@@ -1739,7 +1739,7 @@ impl<Entry> CompletionSource for RcQpInner<Entry, Entry, InfiniBand, OrderedWqeT
 ///
 /// Uses a single Entry type for both SQ and RQ completions.
 /// If you need different Entry types for SQ and RQ, use separate CQs.
-pub type RcQpForMonoCq<Entry> = RcQpInner<Entry, Entry, InfiniBand, OrderedWqeTable<Entry>, OwnedRq<Entry>, (), ()>;
+pub type RcQpForMonoCq<Entry> = RcQp<Entry, Entry, InfiniBand, OrderedWqeTable<Entry>, OwnedRq<Entry>, (), ()>;
 
 // =============================================================================
 // Simplified WQE Builder API
@@ -2414,7 +2414,7 @@ impl<'a, Entry> NopWqeBuilder<'a, Entry> {
 // QP Entry Points (OwnedRq - RQ methods)
 // =============================================================================
 
-impl<SqEntry, RqEntry, Transport, OnSqComplete, OnRqComplete> RcQpInner<SqEntry, RqEntry, Transport, OrderedWqeTable<SqEntry>, OwnedRq<RqEntry>, OnSqComplete, OnRqComplete> {
+impl<SqEntry, RqEntry, Transport, OnSqComplete, OnRqComplete> RcQp<SqEntry, RqEntry, Transport, OrderedWqeTable<SqEntry>, OwnedRq<RqEntry>, OnSqComplete, OnRqComplete> {
     /// Post a receive WQE with a single scatter/gather entry.
     ///
     /// # Arguments
@@ -2487,7 +2487,7 @@ impl<SqEntry, RqEntry, Transport, OnSqComplete, OnRqComplete> RcQpInner<SqEntry,
 // QP Entry Points (sq_wqe - IB)
 // =============================================================================
 
-impl<SqEntry, RqEntry, Rq, OnSqComplete, OnRqComplete> RcQpInner<SqEntry, RqEntry, InfiniBand, OrderedWqeTable<SqEntry>, Rq, OnSqComplete, OnRqComplete> {
+impl<SqEntry, RqEntry, Rq, OnSqComplete, OnRqComplete> RcQp<SqEntry, RqEntry, InfiniBand, OrderedWqeTable<SqEntry>, Rq, OnSqComplete, OnRqComplete> {
     /// Get a SQ WQE builder for InfiniBand transport.
     ///
     /// # Example
@@ -2508,7 +2508,7 @@ impl<SqEntry, RqEntry, Rq, OnSqComplete, OnRqComplete> RcQpInner<SqEntry, RqEntr
     }
 }
 
-impl<SqEntry, RqEntry, Rq, OnSqComplete, OnRqComplete> RcQpInner<SqEntry, RqEntry, RoCE, OrderedWqeTable<SqEntry>, Rq, OnSqComplete, OnRqComplete> {
+impl<SqEntry, RqEntry, Rq, OnSqComplete, OnRqComplete> RcQp<SqEntry, RqEntry, RoCE, OrderedWqeTable<SqEntry>, Rq, OnSqComplete, OnRqComplete> {
     /// Get a SQ WQE builder for RoCE transport.
     ///
     /// # Example
@@ -2984,7 +2984,7 @@ impl<'b, 'a, Entry> BlueflameWqeBuilder<'b, 'a, Entry, HasData> {
     }
 }
 
-impl<SqEntry, RqEntry, Rq, OnSqComplete, OnRqComplete> RcQpInner<SqEntry, RqEntry, InfiniBand, OrderedWqeTable<SqEntry>, Rq, OnSqComplete, OnRqComplete> {
+impl<SqEntry, RqEntry, Rq, OnSqComplete, OnRqComplete> RcQp<SqEntry, RqEntry, InfiniBand, OrderedWqeTable<SqEntry>, Rq, OnSqComplete, OnRqComplete> {
     /// Get a BlueFlame batch builder for low-latency WQE submission.
     ///
     /// Multiple WQEs can be accumulated in the BlueFlame buffer (up to 256 bytes)

@@ -2029,3 +2029,351 @@ impl<Entry, OnComplete> DciIb<Entry, OnComplete> {
         Ok(DciBlueflameWqeBatch::new(sq, dc_key, dctn, dlid))
     }
 }
+
+// =============================================================================
+// DCI BlueFlame Batch Builder (RoCE)
+// =============================================================================
+
+/// BlueFlame WQE batch builder for DCI (RoCE transport).
+///
+/// Allows building multiple WQEs that fit within the BlueFlame buffer (256 bytes).
+/// Each WQE is copied to a contiguous buffer and submitted via BlueFlame doorbell
+/// when `finish()` is called.
+///
+/// # NOTE: RoCE support is untested (IB-only hardware environment)
+pub struct DciRoceBlueflameWqeBatch<'a, Entry> {
+    sq: &'a DciSendQueueState<Entry, OrderedWqeTable<Entry>>,
+    dc_key: u64,
+    dctn: u32,
+    grh: &'a GrhAttr,
+    buffer: [u8; BLUEFLAME_BUFFER_SIZE],
+    offset: usize,
+}
+
+impl<'a, Entry> DciRoceBlueflameWqeBatch<'a, Entry> {
+    fn new(sq: &'a DciSendQueueState<Entry, OrderedWqeTable<Entry>>, dc_key: u64, dctn: u32, grh: &'a GrhAttr) -> Self {
+        Self {
+            sq,
+            dc_key,
+            dctn,
+            grh,
+            buffer: [0u8; BLUEFLAME_BUFFER_SIZE],
+            offset: 0,
+        }
+    }
+
+    /// Get a WQE builder for the next WQE in the batch.
+    ///
+    /// # Errors
+    /// Returns `SqFull` if the send queue doesn't have enough space.
+    #[inline]
+    pub fn wqe(&mut self) -> Result<DciRoceBlueflameWqeEntryPoint<'_, 'a, Entry>, SubmissionError> {
+        if self.sq.available() == 0 {
+            return Err(SubmissionError::SqFull);
+        }
+        Ok(DciRoceBlueflameWqeEntryPoint { batch: self })
+    }
+
+    /// Finish the batch and submit all WQEs via BlueFlame doorbell.
+    #[inline]
+    pub fn finish(self) {
+        if self.offset == 0 {
+            return;
+        }
+
+        mmio_flush_writes!();
+
+        unsafe {
+            std::ptr::write_volatile(
+                self.sq.dbrec.add(1),
+                (self.sq.pi.get() as u32).to_be(),
+            );
+        }
+
+        udma_to_device_barrier!();
+
+        if self.sq.bf_size > 0 {
+            let bf_offset = self.sq.bf_offset.get();
+            let bf = unsafe { self.sq.bf_reg.add(bf_offset as usize) };
+
+            let mut src = self.buffer.as_ptr();
+            let mut dst = bf;
+            let mut remaining = self.offset;
+            while remaining > 0 {
+                unsafe {
+                    mlx5_bf_copy!(dst, src);
+                    src = src.add(WQEBB_SIZE);
+                    dst = dst.add(WQEBB_SIZE);
+                }
+                remaining = remaining.saturating_sub(WQEBB_SIZE);
+            }
+
+            mmio_flush_writes!();
+            self.sq.bf_offset.set(bf_offset ^ self.sq.bf_size);
+        }
+    }
+}
+
+/// BlueFlame WQE entry point for DCI (RoCE).
+#[must_use = "WQE builder must be finished"]
+pub struct DciRoceBlueflameWqeEntryPoint<'b, 'a, Entry> {
+    batch: &'b mut DciRoceBlueflameWqeBatch<'a, Entry>,
+}
+
+impl<'b, 'a, Entry> DciRoceBlueflameWqeEntryPoint<'b, 'a, Entry> {
+    /// Start building a SEND WQE.
+    #[inline]
+    pub fn send(self, flags: TxFlags) -> Result<DciRoceBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
+        let mut core = DciRoceBlueflameWqeCore::new(self.batch)?;
+        core.write_ctrl(WqeOpcode::Send, flags, 0);
+        core.write_dc_av_roce()?;
+        Ok(DciRoceBlueflameWqeBuilder { core, _data: PhantomData })
+    }
+
+    /// Start building a SEND with immediate WQE.
+    #[inline]
+    pub fn send_imm(self, flags: TxFlags, imm: u32) -> Result<DciRoceBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
+        let mut core = DciRoceBlueflameWqeCore::new(self.batch)?;
+        core.write_ctrl(WqeOpcode::SendImm, flags, imm);
+        core.write_dc_av_roce()?;
+        Ok(DciRoceBlueflameWqeBuilder { core, _data: PhantomData })
+    }
+
+    /// Start building an RDMA WRITE WQE.
+    #[inline]
+    pub fn write(self, flags: TxFlags, remote_addr: u64, rkey: u32) -> Result<DciRoceBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
+        let mut core = DciRoceBlueflameWqeCore::new(self.batch)?;
+        core.write_ctrl(WqeOpcode::RdmaWrite, flags, 0);
+        core.write_dc_av_roce()?;
+        core.write_rdma(remote_addr, rkey)?;
+        Ok(DciRoceBlueflameWqeBuilder { core, _data: PhantomData })
+    }
+
+    /// Start building an RDMA WRITE with immediate WQE.
+    #[inline]
+    pub fn write_imm(self, flags: TxFlags, remote_addr: u64, rkey: u32, imm: u32) -> Result<DciRoceBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
+        let mut core = DciRoceBlueflameWqeCore::new(self.batch)?;
+        core.write_ctrl(WqeOpcode::RdmaWriteImm, flags, imm);
+        core.write_dc_av_roce()?;
+        core.write_rdma(remote_addr, rkey)?;
+        Ok(DciRoceBlueflameWqeBuilder { core, _data: PhantomData })
+    }
+}
+
+/// Internal core for DCI BlueFlame WQE construction (RoCE).
+struct DciRoceBlueflameWqeCore<'b, 'a, Entry> {
+    batch: &'b mut DciRoceBlueflameWqeBatch<'a, Entry>,
+    wqe_start: usize,
+    offset: usize,
+    ds_count: u8,
+    signaled: bool,
+}
+
+impl<'b, 'a, Entry> DciRoceBlueflameWqeCore<'b, 'a, Entry> {
+    #[inline]
+    fn new(batch: &'b mut DciRoceBlueflameWqeBatch<'a, Entry>) -> Result<Self, SubmissionError> {
+        if batch.offset + CtrlSeg::SIZE > BLUEFLAME_BUFFER_SIZE {
+            return Err(SubmissionError::BlueflameOverflow);
+        }
+        Ok(Self {
+            wqe_start: batch.offset,
+            offset: batch.offset,
+            batch,
+            ds_count: 0,
+            signaled: false,
+        })
+    }
+
+    #[inline]
+    fn remaining(&self) -> usize {
+        BLUEFLAME_BUFFER_SIZE - self.offset
+    }
+
+    #[inline]
+    fn write_ctrl(&mut self, opcode: WqeOpcode, flags: TxFlags, imm: u32) {
+        let wqe_idx = self.batch.sq.pi.get();
+        let flags = WqeFlags::from_bits_truncate(flags.bits());
+        unsafe {
+            CtrlSeg::write(
+                self.batch.buffer.as_mut_ptr().add(self.offset),
+                0,
+                opcode as u8,
+                wqe_idx,
+                self.batch.sq.sqn,
+                0,
+                flags.bits(),
+                imm,
+            );
+        }
+        self.offset += CtrlSeg::SIZE;
+        self.ds_count = 1;
+    }
+
+    #[inline]
+    fn write_dc_av_roce(&mut self) -> Result<(), SubmissionError> {
+        if self.remaining() < AddressVector::SIZE {
+            return Err(SubmissionError::BlueflameOverflow);
+        }
+        unsafe {
+            AddressVector::write_roce(
+                self.batch.buffer.as_mut_ptr().add(self.offset),
+                self.batch.dc_key,
+                self.batch.dctn,
+                self.batch.grh,
+            );
+        }
+        self.offset += AddressVector::SIZE;
+        self.ds_count += (AddressVector::SIZE / 16) as u8;
+        Ok(())
+    }
+
+    #[inline]
+    fn write_rdma(&mut self, addr: u64, rkey: u32) -> Result<(), SubmissionError> {
+        if self.remaining() < RdmaSeg::SIZE {
+            return Err(SubmissionError::BlueflameOverflow);
+        }
+        unsafe {
+            RdmaSeg::write(self.batch.buffer.as_mut_ptr().add(self.offset), addr, rkey);
+        }
+        self.offset += RdmaSeg::SIZE;
+        self.ds_count += 1;
+        Ok(())
+    }
+
+    #[inline]
+    fn write_sge(&mut self, addr: u64, len: u32, lkey: u32) -> Result<(), SubmissionError> {
+        if self.remaining() < DataSeg::SIZE {
+            return Err(SubmissionError::BlueflameOverflow);
+        }
+        unsafe {
+            DataSeg::write(self.batch.buffer.as_mut_ptr().add(self.offset), len, lkey, addr);
+        }
+        self.offset += DataSeg::SIZE;
+        self.ds_count += 1;
+        Ok(())
+    }
+
+    #[inline]
+    fn write_inline(&mut self, data: &[u8]) -> Result<(), SubmissionError> {
+        let padded_size = ((4 + data.len()) + 15) & !15;
+        if self.remaining() < padded_size {
+            return Err(SubmissionError::BlueflameOverflow);
+        }
+        unsafe {
+            let ptr = self.batch.buffer.as_mut_ptr().add(self.offset);
+            InlineHeader::write(ptr, data.len() as u32);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
+        }
+        self.offset += padded_size;
+        self.ds_count += (padded_size / 16) as u8;
+        Ok(())
+    }
+
+    #[inline]
+    fn finish_internal(self, entry: Option<Entry>) -> Result<(), SubmissionError> {
+        unsafe {
+            CtrlSeg::update_ds_cnt(
+                self.batch.buffer.as_mut_ptr().add(self.wqe_start),
+                self.ds_count,
+            );
+            if self.signaled || entry.is_some() {
+                CtrlSeg::set_completion_flag(
+                    self.batch.buffer.as_mut_ptr().add(self.wqe_start),
+                );
+            }
+        }
+
+        let wqe_size = self.offset - self.wqe_start;
+        let wqebb_cnt = calc_wqebb_cnt(wqe_size);
+
+        let wqe_idx = self.batch.sq.pi.get();
+        if let Some(entry) = entry {
+            let ci_delta = wqe_idx.wrapping_add(wqebb_cnt);
+            self.batch.sq.table.store(wqe_idx, entry, ci_delta);
+        }
+
+        self.batch.offset = self.offset;
+        self.batch.sq.advance_pi(wqebb_cnt);
+
+        Ok(())
+    }
+}
+
+/// DCI BlueFlame WQE builder with type-state for data segments (RoCE).
+#[must_use = "WQE builder must be finished"]
+pub struct DciRoceBlueflameWqeBuilder<'b, 'a, Entry, DataState> {
+    core: DciRoceBlueflameWqeCore<'b, 'a, Entry>,
+    _data: PhantomData<DataState>,
+}
+
+impl<'b, 'a, Entry> DciRoceBlueflameWqeBuilder<'b, 'a, Entry, NoData> {
+    /// Add a scatter/gather entry.
+    #[inline]
+    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Result<DciRoceBlueflameWqeBuilder<'b, 'a, Entry, HasData>, SubmissionError> {
+        self.core.write_sge(addr, len, lkey)?;
+        Ok(DciRoceBlueflameWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    /// Add inline data.
+    #[inline]
+    pub fn inline(mut self, data: &[u8]) -> Result<DciRoceBlueflameWqeBuilder<'b, 'a, Entry, HasData>, SubmissionError> {
+        self.core.write_inline(data)?;
+        Ok(DciRoceBlueflameWqeBuilder { core: self.core, _data: PhantomData })
+    }
+}
+
+impl<'b, 'a, Entry> DciRoceBlueflameWqeBuilder<'b, 'a, Entry, HasData> {
+    /// Add another scatter/gather entry.
+    #[inline]
+    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Result<Self, SubmissionError> {
+        self.core.write_sge(addr, len, lkey)?;
+        Ok(self)
+    }
+
+    /// Add more inline data.
+    #[inline]
+    pub fn inline(mut self, data: &[u8]) -> Result<Self, SubmissionError> {
+        self.core.write_inline(data)?;
+        Ok(self)
+    }
+
+    /// Finish the WQE construction (unsignaled).
+    #[inline]
+    pub fn finish(self) -> Result<(), SubmissionError> {
+        self.core.finish_internal(None)
+    }
+
+    /// Finish the WQE construction with completion signaling.
+    #[inline]
+    pub fn finish_signaled(self, entry: Entry) -> Result<(), SubmissionError> {
+        self.core.finish_internal(Some(entry))
+    }
+}
+
+impl<Entry, OnComplete> DciRoCE<Entry, OnComplete> {
+    /// Get a BlueFlame batch builder for low-latency WQE submission (RoCE).
+    ///
+    /// Multiple WQEs can be accumulated in the BlueFlame buffer (up to 256 bytes)
+    /// and submitted together via a single BlueFlame doorbell.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut bf = dci.blueflame_sq_wqe(dc_key, dctn, &grh)?;
+    /// bf.wqe()?.send(TxFlags::empty()).inline(&data).finish()?;
+    /// bf.wqe()?.send(TxFlags::empty()).inline(&data).finish()?;
+    /// bf.finish();
+    /// ```
+    ///
+    /// # Errors
+    /// Returns `BlueflameNotAvailable` if BlueFlame is not supported on this device.
+    ///
+    /// # NOTE: RoCE support is untested (IB-only hardware environment)
+    #[inline]
+    pub fn blueflame_sq_wqe<'a>(&'a self, dc_key: u64, dctn: u32, grh: &'a GrhAttr) -> Result<DciRoceBlueflameWqeBatch<'a, Entry>, SubmissionError> {
+        let sq = self.sq.as_ref().ok_or(SubmissionError::SqFull)?;
+        if sq.bf_size == 0 {
+            return Err(SubmissionError::BlueflameNotAvailable);
+        }
+        Ok(DciRoceBlueflameWqeBatch::new(sq, dc_key, dctn, grh))
+    }
+}
