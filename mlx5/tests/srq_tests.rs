@@ -215,7 +215,7 @@ fn test_srq_with_dct_send() {
         .send(TxFlags::empty())
         .expect("send failed")
         .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-        .finish_signaled_with_blueflame(1u64)
+        .finish_signaled(1u64)
         .expect("finish failed");
     dci.borrow().ring_sq_doorbell();
 
@@ -355,7 +355,7 @@ fn test_srq_shared_by_multiple_dcts() {
             .send(TxFlags::empty())
             .expect("send failed")
             .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-            .finish_signaled_with_blueflame((i + 1) as u64)
+            .finish_signaled((i + 1) as u64)
             .expect("finish failed");
         dci.borrow().ring_sq_doorbell();
 

@@ -213,7 +213,7 @@ fn test_tm_tag_add_remove() {
         .expect("cmd_wqe_builder failed")
         .ctrl_tag_matching(0)
         .tag_del(tag_index, true)
-        .finish_with_blueflame();
+        .finish();
 
     // Poll for delete completion
     let start = std::time::Instant::now();
@@ -382,7 +382,7 @@ fn test_tm_multiple_tags() {
                 mrs[i as usize].lkey(),
                 true,
             )
-            .finish_with_blueflame();
+            .finish();
 
         // Poll for completion
         let start = std::time::Instant::now();
@@ -416,7 +416,7 @@ fn test_tm_multiple_tags() {
             .expect("cmd_wqe_builder failed")
             .ctrl_tag_matching(0)
             .tag_del(i, true)
-            .finish_with_blueflame();
+            .finish();
 
         // Poll for completion
         let start = std::time::Instant::now();

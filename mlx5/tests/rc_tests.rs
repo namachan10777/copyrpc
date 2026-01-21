@@ -185,16 +185,20 @@ fn test_rc_rdma_write() {
     );
     println!("QP1 QPN: 0x{:x}", qp1.borrow().qpn());
 
-    // Post RDMA WRITE
-    qp1.borrow_mut()
-        .sq_wqe()
-        .expect("sq_wqe failed")
-        .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
-        .expect("write failed")
-        .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-        .finish_signaled_with_blueflame(1u64)
-        .expect("finish failed");
-    qp1.borrow().ring_sq_doorbell();
+    // Post RDMA WRITE via BlueFlame batch builder
+    {
+        let qp1_ref = qp1.borrow();
+        let mut bf = qp1_ref.blueflame_sq_wqe().expect("blueflame_sq_wqe failed");
+        bf.wqe()
+            .expect("wqe failed")
+            .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+            .expect("write failed")
+            .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
+            .expect("sge failed")
+            .finish_signaled(1u64)
+            .expect("finish failed");
+        bf.finish();
+    }
 
     println!("WQE posted via BlueFlame");
 
@@ -253,14 +257,14 @@ fn test_rc_rdma_read() {
     remote_buf.fill_bytes(test_data);
     local_buf.fill(0); // Clear local buffer
 
-    // Post RDMA READ
+    // Post RDMA READ (uses regular doorbell, not BlueFlame batch builder)
     qp1.borrow_mut()
         .sq_wqe()
         .expect("sq_wqe failed")
         .read(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
         .expect("read failed")
         .buffer(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-        .finish_signaled_with_blueflame(1u64)
+        .finish_signaled(1u64)
         .expect("finish failed");
     qp1.borrow().ring_sq_doorbell();
 
@@ -318,14 +322,14 @@ fn test_rc_atomic_cas_success() {
     remote_buf.write_u64(0, initial_value);
     local_buf.fill(0); // Result buffer
 
-    // Post Atomic CAS
+    // Post Atomic CAS (uses regular doorbell)
     qp1.borrow_mut()
         .sq_wqe()
         .expect("sq_wqe failed")
         .cas(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey(), swap_value, compare_value)
         .expect("cas failed")
         .buffer(local_buf.addr(), 8, local_mr.lkey())
-        .finish_signaled_with_blueflame(1u64)
+        .finish_signaled(1u64)
         .expect("finish failed");
     qp1.borrow().ring_sq_doorbell();
 
@@ -402,7 +406,7 @@ fn test_rc_atomic_cas_failure() {
         .cas(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey(), swap_value, compare_value)
         .expect("cas failed")
         .buffer(local_buf.addr(), 8, local_mr.lkey())
-        .finish_signaled_with_blueflame(1u64)
+        .finish_signaled(1u64)
         .expect("finish failed");
     qp1.borrow().ring_sq_doorbell();
 
@@ -476,7 +480,7 @@ fn test_rc_atomic_fa() {
         .fetch_add(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey(), add_value)
         .expect("fetch_add failed")
         .buffer(local_buf.addr(), 8, local_mr.lkey())
-        .finish_signaled_with_blueflame(1u64)
+        .finish_signaled(1u64)
         .expect("finish failed");
     qp1.borrow().ring_sq_doorbell();
 
@@ -587,7 +591,7 @@ fn test_rc_rdma_write_imm() {
         .write_imm(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey(), imm_data)
         .expect("write_imm failed")
         .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-        .finish_signaled_with_blueflame(1u64)
+        .finish_signaled(1u64)
         .expect("finish failed");
     qp1.borrow().ring_sq_doorbell();
 
@@ -1134,7 +1138,7 @@ fn test_rc_send_recv() {
         .send(TxFlags::empty())
         .expect("send failed")
         .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-        .finish_signaled_with_blueflame(1u64)
+        .finish_signaled(1u64)
         .expect("finish failed");
     qp1.borrow().ring_sq_doorbell();
 
@@ -1519,7 +1523,7 @@ fn test_rc_send_recv_pingpong() {
             .send(TxFlags::COMPLETION)
             .expect("send")
             .sge(buf1.addr(), 32, mr1.lkey())
-            .finish_signaled_with_blueflame(i as u64)
+            .finish_signaled(i as u64)
             .expect("finish");
         qp1.borrow().ring_sq_doorbell();
 
@@ -1559,7 +1563,7 @@ fn test_rc_send_recv_pingpong() {
             .send(TxFlags::COMPLETION)
             .expect("send")
             .sge(buf2.addr(), 32, mr2.lkey())
-            .finish_signaled_with_blueflame(i as u64)
+            .finish_signaled(i as u64)
             .expect("finish");
         qp2.borrow().ring_sq_doorbell();
 
@@ -1625,7 +1629,7 @@ fn test_rc_inline_data() {
         .write(TxFlags::COMPLETION, remote_buf.addr(), remote_mr.rkey())
         .expect("write failed")
         .inline(test_data)
-        .finish_signaled_with_blueflame(1u64)
+        .finish_signaled(1u64)
         .expect("finish failed");
     qp1.borrow().ring_sq_doorbell();
 
@@ -1740,7 +1744,7 @@ fn test_rc_post_nop_to_ring_end() {
             .write(TxFlags::COMPLETION, remote_buf.addr(), remote_mr.rkey())
             .expect("write failed")
             .sge(local_buf.addr(), 4, local_mr.lkey())
-            .finish_signaled_with_blueflame(i as u64)
+            .finish_signaled(i as u64)
             .expect("finish failed");
         qp1.borrow().ring_sq_doorbell();
 
@@ -1808,7 +1812,7 @@ fn test_rc_wqe_builder_unsignaled() {
         .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
         .expect("write failed")
         .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-        .finish_unsignaled_with_blueflame()
+        .finish_unsignaled()
         .expect("finish failed");
     qp1.borrow().ring_sq_doorbell();
 
@@ -1819,7 +1823,7 @@ fn test_rc_wqe_builder_unsignaled() {
         .write(TxFlags::COMPLETION, remote_buf.addr(), remote_mr.rkey())
         .expect("write failed")
         .sge(local_buf.addr(), 1, local_mr.lkey())
-        .finish_signaled_with_blueflame(1u64)
+        .finish_signaled(1u64)
         .expect("finish failed");
     qp1.borrow().ring_sq_doorbell();
 

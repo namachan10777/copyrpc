@@ -14,9 +14,9 @@ use crate::pd::Pd;
 use crate::transport::{IbRemoteQpInfo, RoCERemoteQpInfo};
 use crate::types::GrhAttr;
 use crate::wqe::{
-    AddressVector, AtomicSeg, CtrlSeg, DataSeg, HasData, InlineHeader, Init, MaskedAtomicSeg32,
+    AtomicSeg, CtrlSeg, DataSeg, HasData, InlineHeader, Init, MaskedAtomicSeg32,
     MaskedAtomicSeg64, NeedsAtomic, NeedsData, NeedsRdma, NeedsRdmaThenAtomic, OrderedWqeTable,
-    RdmaSeg, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
+    RdmaSeg, SubmissionError, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
     // Transport type tags
     InfiniBand, RoCE,
 };
@@ -880,82 +880,6 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, HasData> {
         // 5. Update PI and set last WQE
         self.sq.advance_pi(wqebb_cnt);
         self.sq.set_last_wqe(new_wqe_ptr, self.offset);
-
-        Ok(WqeHandle {
-            wqe_idx: new_wqe_idx,
-            size: self.offset,
-        })
-    }
-
-    /// Finish the WQE construction and immediately ring BlueFlame doorbell.
-    ///
-    /// Use this for low-latency single WQE submission. The doorbell is issued
-    /// immediately, so no need to call `ring_sq_doorbell()` afterwards.
-    #[inline]
-    pub(crate) fn finish_internal_with_blueflame(self) -> io::Result<WqeHandle> {
-        let wqebb_cnt = calc_wqebb_cnt(self.offset);
-        let slots_to_end = self.sq.slots_to_end();
-
-        // Check for wrap-around
-        if wqebb_cnt > slots_to_end && slots_to_end < self.sq.wqe_cnt {
-            return self.finish_with_wrap_around_blueflame(wqebb_cnt, slots_to_end);
-        }
-
-        // Normal path - no wrap-around
-        unsafe {
-            CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
-        }
-
-        let wqe_idx = self.wqe_idx;
-        let wqe_ptr = self.wqe_ptr;
-
-        self.sq.advance_pi(wqebb_cnt);
-        self.sq.ring_blueflame(wqe_ptr);
-
-        Ok(WqeHandle {
-            wqe_idx,
-            size: self.offset,
-        })
-    }
-
-    /// Handle WQE wrap-around with BlueFlame doorbell.
-    #[cold]
-    fn finish_with_wrap_around_blueflame(
-        self,
-        wqebb_cnt: u16,
-        slots_to_end: u16,
-    ) -> io::Result<WqeHandle> {
-        // Check if we have enough space for NOP + WQE
-        let total_needed = slots_to_end + wqebb_cnt;
-        if self.sq.available() < total_needed {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
-        }
-
-        // 1. Copy current WQE to temp buffer (max 4 WQEBB = 256 bytes)
-        let mut temp_buf = [0u8; 256];
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.wqe_ptr, temp_buf.as_mut_ptr(), self.offset);
-        }
-
-        // 2. Post NOP to fill until ring end
-        unsafe {
-            self.sq.post_nop(slots_to_end);
-        }
-
-        // 3. Get new WQE position at ring start
-        let new_wqe_idx = self.sq.pi.get();
-        let new_wqe_ptr = self.sq.get_wqe_ptr(new_wqe_idx);
-
-        // 4. Copy WQE to new position and update wqe_idx in ctrl segment
-        unsafe {
-            std::ptr::copy_nonoverlapping(temp_buf.as_ptr(), new_wqe_ptr, self.offset);
-            CtrlSeg::update_wqe_idx(new_wqe_ptr, new_wqe_idx);
-            CtrlSeg::update_ds_cnt(new_wqe_ptr, self.ds_count);
-        }
-
-        // 5. Update PI and ring BlueFlame
-        self.sq.advance_pi(wqebb_cnt);
-        self.sq.ring_blueflame(new_wqe_ptr);
 
         Ok(WqeHandle {
             wqe_idx: new_wqe_idx,
@@ -2153,84 +2077,6 @@ impl<'a, Entry> WqeCore<'a, Entry> {
             size: self.offset,
         })
     }
-
-    #[inline]
-    fn finish_with_blueflame_internal(self) -> io::Result<WqeHandle> {
-        let wqebb_cnt = calc_wqebb_cnt(self.offset);
-        let slots_to_end = self.sq.slots_to_end();
-
-        if wqebb_cnt > slots_to_end && slots_to_end < self.sq.wqe_cnt {
-            return self.finish_with_wrap_around_blueflame(wqebb_cnt, slots_to_end);
-        }
-
-        unsafe {
-            CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
-            // Set completion flag if signaled (may not have been set at write_ctrl time)
-            if self.signaled {
-                CtrlSeg::set_completion_flag(self.wqe_ptr);
-            }
-        }
-
-        let wqe_idx = self.wqe_idx;
-        let wqe_ptr = self.wqe_ptr;
-
-        self.sq.advance_pi(wqebb_cnt);
-
-        if let Some(entry) = self.entry {
-            self.sq.table.store(wqe_idx, entry, self.sq.pi.get());
-        }
-
-        self.sq.ring_blueflame(wqe_ptr);
-
-        Ok(WqeHandle {
-            wqe_idx,
-            size: self.offset,
-        })
-    }
-
-    #[cold]
-    fn finish_with_wrap_around_blueflame(
-        self,
-        wqebb_cnt: u16,
-        slots_to_end: u16,
-    ) -> io::Result<WqeHandle> {
-        let total_needed = slots_to_end + wqebb_cnt;
-        if self.sq.available() < total_needed {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
-        }
-
-        let mut temp_buf = [0u8; 256];
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.wqe_ptr, temp_buf.as_mut_ptr(), self.offset);
-            self.sq.post_nop(slots_to_end);
-        }
-
-        let new_wqe_idx = self.sq.pi.get();
-        let new_wqe_ptr = self.sq.get_wqe_ptr(new_wqe_idx);
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(temp_buf.as_ptr(), new_wqe_ptr, self.offset);
-            CtrlSeg::update_wqe_idx(new_wqe_ptr, new_wqe_idx);
-            CtrlSeg::update_ds_cnt(new_wqe_ptr, self.ds_count);
-            // Set completion flag if signaled (may not have been set at write_ctrl time)
-            if self.signaled {
-                CtrlSeg::set_completion_flag(new_wqe_ptr);
-            }
-        }
-
-        self.sq.advance_pi(wqebb_cnt);
-
-        if let Some(entry) = self.entry {
-            self.sq.table.store(new_wqe_idx, entry, self.sq.pi.get());
-        }
-
-        self.sq.ring_blueflame(new_wqe_ptr);
-
-        Ok(WqeHandle {
-            wqe_idx: new_wqe_idx,
-            size: self.offset,
-        })
-    }
 }
 
 // =============================================================================
@@ -2461,20 +2307,6 @@ impl<'a, Entry> SendWqeBuilder<'a, Entry, HasData> {
         self.core.signaled = true;
         self.core.finish_internal()
     }
-
-    /// Finish with BlueFlame doorbell (unsignaled).
-    #[inline]
-    pub fn finish_unsignaled_with_blueflame(self) -> io::Result<WqeHandle> {
-        self.core.finish_with_blueflame_internal()
-    }
-
-    /// Finish with BlueFlame doorbell (signaled).
-    #[inline]
-    pub fn finish_signaled_with_blueflame(mut self, entry: Entry) -> io::Result<WqeHandle> {
-        self.core.entry = Some(entry);
-        self.core.signaled = true;
-        self.core.finish_with_blueflame_internal()
-    }
 }
 
 // =============================================================================
@@ -2538,20 +2370,6 @@ impl<'a, Entry> WriteWqeBuilder<'a, Entry, HasData> {
         self.core.signaled = true;
         self.core.finish_internal()
     }
-
-    /// Finish with BlueFlame doorbell (unsignaled).
-    #[inline]
-    pub fn finish_unsignaled_with_blueflame(self) -> io::Result<WqeHandle> {
-        self.core.finish_with_blueflame_internal()
-    }
-
-    /// Finish with BlueFlame doorbell (signaled).
-    #[inline]
-    pub fn finish_signaled_with_blueflame(mut self, entry: Entry) -> io::Result<WqeHandle> {
-        self.core.entry = Some(entry);
-        self.core.signaled = true;
-        self.core.finish_with_blueflame_internal()
-    }
 }
 
 // =============================================================================
@@ -2595,20 +2413,6 @@ impl<'a, Entry> ReadWqeBuilder<'a, Entry, HasData> {
         self.core.entry = Some(entry);
         self.core.signaled = true;
         self.core.finish_internal()
-    }
-
-    /// Finish with BlueFlame doorbell (unsignaled).
-    #[inline]
-    pub fn finish_unsignaled_with_blueflame(self) -> io::Result<WqeHandle> {
-        self.core.finish_with_blueflame_internal()
-    }
-
-    /// Finish with BlueFlame doorbell (signaled).
-    #[inline]
-    pub fn finish_signaled_with_blueflame(mut self, entry: Entry) -> io::Result<WqeHandle> {
-        self.core.entry = Some(entry);
-        self.core.signaled = true;
-        self.core.finish_with_blueflame_internal()
     }
 }
 
@@ -2654,20 +2458,6 @@ impl<'a, Entry> AtomicWqeBuilder<'a, Entry, HasData> {
         self.core.signaled = true;
         self.core.finish_internal()
     }
-
-    /// Finish with BlueFlame doorbell (unsignaled).
-    #[inline]
-    pub fn finish_unsignaled_with_blueflame(self) -> io::Result<WqeHandle> {
-        self.core.finish_with_blueflame_internal()
-    }
-
-    /// Finish with BlueFlame doorbell (signaled).
-    #[inline]
-    pub fn finish_signaled_with_blueflame(mut self, entry: Entry) -> io::Result<WqeHandle> {
-        self.core.entry = Some(entry);
-        self.core.signaled = true;
-        self.core.finish_with_blueflame_internal()
-    }
 }
 
 // =============================================================================
@@ -2696,20 +2486,6 @@ impl<'a, Entry> NopWqeBuilder<'a, Entry> {
         self.core.entry = Some(entry);
         self.core.signaled = true;
         self.core.finish_internal()
-    }
-
-    /// Finish with BlueFlame doorbell (unsignaled).
-    #[inline]
-    pub fn finish_unsignaled_with_blueflame(self) -> io::Result<WqeHandle> {
-        self.core.finish_with_blueflame_internal()
-    }
-
-    /// Finish with BlueFlame doorbell (signaled).
-    #[inline]
-    pub fn finish_signaled_with_blueflame(mut self, entry: Entry) -> io::Result<WqeHandle> {
-        self.core.entry = Some(entry);
-        self.core.signaled = true;
-        self.core.finish_with_blueflame_internal()
     }
 }
 
@@ -2817,5 +2593,344 @@ impl<Entry, OnComplete> RcQpInner<Entry, RoCE, OrderedWqeTable<Entry>, OnComplet
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
         }
         Ok(SqWqeEntryPoint::new(sq, grh))
+    }
+}
+
+// =============================================================================
+// BlueFlame Batch Builder
+// =============================================================================
+
+/// BlueFlame buffer size in bytes (256B doorbell window).
+const BLUEFLAME_BUFFER_SIZE: usize = 256;
+
+/// BlueFlame WQE batch builder for RC QP.
+///
+/// Allows building multiple WQEs that fit within the BlueFlame buffer (256 bytes).
+/// Each WQE is copied to a contiguous buffer and submitted via BlueFlame doorbell
+/// when `finish()` is called.
+///
+/// # Example
+/// ```ignore
+/// let mut bf = qp.blueflame_sq_wqe()?;
+/// bf.wqe()?.send(TxFlags::empty()).inline(&data).finish()?;
+/// bf.wqe()?.send(TxFlags::empty()).inline(&data).finish()?;
+/// bf.finish();
+/// ```
+pub struct BlueflameWqeBatch<'a, Entry> {
+    sq: &'a SendQueueState<Entry, OrderedWqeTable<Entry>>,
+    buffer: [u8; BLUEFLAME_BUFFER_SIZE],
+    offset: usize,
+}
+
+impl<'a, Entry> BlueflameWqeBatch<'a, Entry> {
+    /// Create a new BlueFlame batch builder.
+    fn new(sq: &'a SendQueueState<Entry, OrderedWqeTable<Entry>>) -> Self {
+        Self {
+            sq,
+            buffer: [0u8; BLUEFLAME_BUFFER_SIZE],
+            offset: 0,
+        }
+    }
+
+    /// Get a WQE builder for the next WQE in the batch.
+    ///
+    /// # Errors
+    /// Returns `SqFull` if the send queue doesn't have enough space.
+    #[inline]
+    pub fn wqe(&mut self) -> Result<BlueflameWqeEntryPoint<'_, 'a, Entry>, SubmissionError> {
+        if self.sq.available() == 0 {
+            return Err(SubmissionError::SqFull);
+        }
+        Ok(BlueflameWqeEntryPoint {
+            batch: self,
+        })
+    }
+
+    /// Finish the batch and submit all WQEs via BlueFlame doorbell.
+    ///
+    /// This method copies the accumulated WQEs to the BlueFlame register
+    /// and rings the doorbell.
+    #[inline]
+    pub fn finish(self) {
+        if self.offset == 0 {
+            return; // No WQEs to submit
+        }
+
+        mmio_flush_writes!();
+
+        unsafe {
+            // Update doorbell record with new PI
+            std::ptr::write_volatile(
+                self.sq.dbrec.add(1),
+                (self.sq.pi.get() as u32).to_be(),
+            );
+        }
+
+        udma_to_device_barrier!();
+
+        if self.sq.bf_size > 0 {
+            let bf_offset = self.sq.bf_offset.get();
+            let bf = unsafe { self.sq.bf_reg.add(bf_offset as usize) };
+
+            // Copy buffer to BlueFlame register in 64-byte chunks
+            let mut src = self.buffer.as_ptr();
+            let mut dst = bf;
+            let mut remaining = self.offset;
+            while remaining > 0 {
+                unsafe {
+                    mlx5_bf_copy!(dst, src);
+                    src = src.add(WQEBB_SIZE);
+                    dst = dst.add(WQEBB_SIZE);
+                }
+                remaining = remaining.saturating_sub(WQEBB_SIZE);
+            }
+
+            mmio_flush_writes!();
+            self.sq.bf_offset.set(bf_offset ^ self.sq.bf_size);
+        }
+    }
+}
+
+/// BlueFlame WQE entry point for a single WQE within a batch.
+#[must_use = "WQE builder must be finished"]
+pub struct BlueflameWqeEntryPoint<'b, 'a, Entry> {
+    batch: &'b mut BlueflameWqeBatch<'a, Entry>,
+}
+
+impl<'b, 'a, Entry> BlueflameWqeEntryPoint<'b, 'a, Entry> {
+    /// Start building a SEND WQE.
+    #[inline]
+    pub fn send(self, flags: TxFlags) -> Result<BlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
+        let mut core = BlueflameWqeCore::new(self.batch)?;
+        core.write_ctrl(WqeOpcode::Send, flags, 0);
+        Ok(BlueflameWqeBuilder { core, _data: PhantomData })
+    }
+
+    /// Start building a SEND with immediate data WQE.
+    #[inline]
+    pub fn send_imm(self, flags: TxFlags, imm: u32) -> Result<BlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
+        let mut core = BlueflameWqeCore::new(self.batch)?;
+        core.write_ctrl(WqeOpcode::SendImm, flags, imm);
+        Ok(BlueflameWqeBuilder { core, _data: PhantomData })
+    }
+
+    /// Start building an RDMA WRITE WQE.
+    #[inline]
+    pub fn write(self, flags: TxFlags, remote_addr: u64, rkey: u32) -> Result<BlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
+        let mut core = BlueflameWqeCore::new(self.batch)?;
+        core.write_ctrl(WqeOpcode::RdmaWrite, flags, 0);
+        core.write_rdma(remote_addr, rkey)?;
+        Ok(BlueflameWqeBuilder { core, _data: PhantomData })
+    }
+
+    /// Start building an RDMA WRITE with immediate data WQE.
+    #[inline]
+    pub fn write_imm(self, flags: TxFlags, remote_addr: u64, rkey: u32, imm: u32) -> Result<BlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
+        let mut core = BlueflameWqeCore::new(self.batch)?;
+        core.write_ctrl(WqeOpcode::RdmaWriteImm, flags, imm);
+        core.write_rdma(remote_addr, rkey)?;
+        Ok(BlueflameWqeBuilder { core, _data: PhantomData })
+    }
+}
+
+/// Internal core for BlueFlame WQE construction.
+struct BlueflameWqeCore<'b, 'a, Entry> {
+    batch: &'b mut BlueflameWqeBatch<'a, Entry>,
+    wqe_start: usize,
+    offset: usize,
+    ds_count: u8,
+    signaled: bool,
+}
+
+impl<'b, 'a, Entry> BlueflameWqeCore<'b, 'a, Entry> {
+    #[inline]
+    fn new(batch: &'b mut BlueflameWqeBatch<'a, Entry>) -> Result<Self, SubmissionError> {
+        // Ensure we have at least space for control segment
+        if batch.offset + CtrlSeg::SIZE > BLUEFLAME_BUFFER_SIZE {
+            return Err(SubmissionError::BlueflameOverflow);
+        }
+        Ok(Self {
+            wqe_start: batch.offset,
+            offset: batch.offset,
+            batch,
+            ds_count: 0,
+            signaled: false,
+        })
+    }
+
+    #[inline]
+    fn remaining(&self) -> usize {
+        BLUEFLAME_BUFFER_SIZE - self.offset
+    }
+
+    #[inline]
+    fn write_ctrl(&mut self, opcode: WqeOpcode, flags: TxFlags, imm: u32) {
+        let wqe_idx = self.batch.sq.pi.get();
+        let flags = WqeFlags::from_bits_truncate(flags.bits());
+        unsafe {
+            CtrlSeg::write(
+                self.batch.buffer.as_mut_ptr().add(self.offset),
+                0,
+                opcode as u8,
+                wqe_idx,
+                self.batch.sq.sqn,
+                0,
+                flags.bits(),
+                imm,
+            );
+        }
+        self.offset += CtrlSeg::SIZE;
+        self.ds_count = 1;
+    }
+
+    #[inline]
+    fn write_rdma(&mut self, addr: u64, rkey: u32) -> Result<(), SubmissionError> {
+        if self.remaining() < RdmaSeg::SIZE {
+            return Err(SubmissionError::BlueflameOverflow);
+        }
+        unsafe {
+            RdmaSeg::write(self.batch.buffer.as_mut_ptr().add(self.offset), addr, rkey);
+        }
+        self.offset += RdmaSeg::SIZE;
+        self.ds_count += 1;
+        Ok(())
+    }
+
+    #[inline]
+    fn write_sge(&mut self, addr: u64, len: u32, lkey: u32) -> Result<(), SubmissionError> {
+        if self.remaining() < DataSeg::SIZE {
+            return Err(SubmissionError::BlueflameOverflow);
+        }
+        unsafe {
+            DataSeg::write(self.batch.buffer.as_mut_ptr().add(self.offset), len, lkey, addr);
+        }
+        self.offset += DataSeg::SIZE;
+        self.ds_count += 1;
+        Ok(())
+    }
+
+    #[inline]
+    fn write_inline(&mut self, data: &[u8]) -> Result<(), SubmissionError> {
+        let padded_size = ((4 + data.len()) + 15) & !15;
+        if self.remaining() < padded_size {
+            return Err(SubmissionError::BlueflameOverflow);
+        }
+        unsafe {
+            let ptr = self.batch.buffer.as_mut_ptr().add(self.offset);
+            InlineHeader::write(ptr, data.len() as u32);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
+        }
+        self.offset += padded_size;
+        self.ds_count += (padded_size / 16) as u8;
+        Ok(())
+    }
+
+    #[inline]
+    fn finish_internal(self, entry: Option<Entry>) -> Result<(), SubmissionError> {
+        // Update ds_count in control segment
+        unsafe {
+            CtrlSeg::update_ds_cnt(
+                self.batch.buffer.as_mut_ptr().add(self.wqe_start),
+                self.ds_count,
+            );
+            if self.signaled || entry.is_some() {
+                CtrlSeg::set_completion_flag(
+                    self.batch.buffer.as_mut_ptr().add(self.wqe_start),
+                );
+            }
+        }
+
+        let wqe_size = self.offset - self.wqe_start;
+        let wqebb_cnt = calc_wqebb_cnt(wqe_size);
+
+        // Store entry if signaled
+        let wqe_idx = self.batch.sq.pi.get();
+        if let Some(entry) = entry {
+            let ci_delta = wqe_idx.wrapping_add(wqebb_cnt);
+            self.batch.sq.table.store(wqe_idx, entry, ci_delta);
+        }
+
+        // Advance batch state
+        self.batch.offset = self.offset;
+        self.batch.sq.advance_pi(wqebb_cnt);
+
+        Ok(())
+    }
+}
+
+/// BlueFlame WQE builder with type-state for data segments.
+#[must_use = "WQE builder must be finished"]
+pub struct BlueflameWqeBuilder<'b, 'a, Entry, DataState> {
+    core: BlueflameWqeCore<'b, 'a, Entry>,
+    _data: PhantomData<DataState>,
+}
+
+impl<'b, 'a, Entry> BlueflameWqeBuilder<'b, 'a, Entry, NoData> {
+    /// Add a scatter/gather entry.
+    #[inline]
+    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Result<BlueflameWqeBuilder<'b, 'a, Entry, HasData>, SubmissionError> {
+        self.core.write_sge(addr, len, lkey)?;
+        Ok(BlueflameWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    /// Add inline data.
+    #[inline]
+    pub fn inline(mut self, data: &[u8]) -> Result<BlueflameWqeBuilder<'b, 'a, Entry, HasData>, SubmissionError> {
+        self.core.write_inline(data)?;
+        Ok(BlueflameWqeBuilder { core: self.core, _data: PhantomData })
+    }
+}
+
+impl<'b, 'a, Entry> BlueflameWqeBuilder<'b, 'a, Entry, HasData> {
+    /// Add another scatter/gather entry.
+    #[inline]
+    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Result<Self, SubmissionError> {
+        self.core.write_sge(addr, len, lkey)?;
+        Ok(self)
+    }
+
+    /// Add more inline data.
+    #[inline]
+    pub fn inline(mut self, data: &[u8]) -> Result<Self, SubmissionError> {
+        self.core.write_inline(data)?;
+        Ok(self)
+    }
+
+    /// Finish the WQE construction (unsignaled).
+    #[inline]
+    pub fn finish(self) -> Result<(), SubmissionError> {
+        self.core.finish_internal(None)
+    }
+
+    /// Finish the WQE construction with completion signaling.
+    #[inline]
+    pub fn finish_signaled(self, entry: Entry) -> Result<(), SubmissionError> {
+        self.core.finish_internal(Some(entry))
+    }
+}
+
+impl<Entry, OnComplete> RcQpInner<Entry, InfiniBand, OrderedWqeTable<Entry>, OnComplete> {
+    /// Get a BlueFlame batch builder for low-latency WQE submission.
+    ///
+    /// Multiple WQEs can be accumulated in the BlueFlame buffer (up to 256 bytes)
+    /// and submitted together via a single BlueFlame doorbell.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut bf = qp.blueflame_sq_wqe()?;
+    /// bf.wqe()?.send(TxFlags::empty()).inline(&data).finish()?;
+    /// bf.wqe()?.send(TxFlags::empty()).inline(&data).finish()?;
+    /// bf.finish();
+    /// ```
+    ///
+    /// # Errors
+    /// Returns `BlueflameNotAvailable` if BlueFlame is not supported on this device.
+    #[inline]
+    pub fn blueflame_sq_wqe(&self) -> Result<BlueflameWqeBatch<'_, Entry>, SubmissionError> {
+        let sq = self.sq.as_ref().ok_or(SubmissionError::SqFull)?;
+        if sq.bf_size == 0 {
+            return Err(SubmissionError::BlueflameNotAvailable);
+        }
+        Ok(BlueflameWqeBatch::new(sq))
     }
 }

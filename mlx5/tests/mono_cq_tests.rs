@@ -153,7 +153,7 @@ fn test_mono_cq_with_rc_qp() {
         .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
         .expect("write failed")
         .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-        .finish_signaled_with_blueflame(42u64)
+        .finish_signaled(42u64)
         .expect("finish_with_blueflame failed");
 
     // Poll for completion
@@ -327,7 +327,7 @@ fn test_mono_cq_multiple_completions() {
             .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
             .expect("write failed")
             .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-            .finish_signaled_with_blueflame(100 + i as u64)
+            .finish_signaled(100 + i as u64)
             .expect("finish_with_blueflame failed");
     }
 
@@ -479,7 +479,7 @@ fn test_mono_cq_high_load() {
             .write(TxFlags::empty(), remote_buf.addr() + offset, remote_mr.rkey())
             .expect("write failed")
             .sge(local_buf.addr() + offset, chunk_size, local_mr.lkey())
-            .finish_signaled_with_blueflame(i as u64)
+            .finish_signaled(i as u64)
             .expect("finish_with_blueflame failed");
     }
 
@@ -638,7 +638,7 @@ fn test_mono_cq_recv_rdma_write_imm() {
             .write_imm(TxFlags::empty(), recv_buf.addr() + offset, recv_mr.rkey(), imm_data)
             .expect("write_imm failed")
             .sge(send_buf.addr() + offset, 64, send_mr.lkey())
-            .finish_signaled_with_blueflame(i as u64)
+            .finish_signaled(i as u64)
             .expect("finish_with_blueflame failed");
     }
 
@@ -828,7 +828,7 @@ fn test_mono_cq_bidirectional_pingpong() {
             .write_imm(TxFlags::empty(), buf2.addr() + offset, mr2.rkey(), imm)
             .expect("write_imm")
             .sge(buf1.addr() + offset, msg_size, mr1.lkey())
-            .finish_signaled_with_blueflame(i as u64)
+            .finish_signaled(i as u64)
             .expect("finish");
 
         // Wait for QP2 to receive
@@ -852,7 +852,7 @@ fn test_mono_cq_bidirectional_pingpong() {
             .write_imm(TxFlags::empty(), buf1.addr() + offset, mr1.rkey(), imm)
             .expect("write_imm")
             .sge(buf2.addr() + offset, msg_size, mr2.lkey())
-            .finish_signaled_with_blueflame(i as u64)
+            .finish_signaled(i as u64)
             .expect("finish");
 
         // Wait for QP1 to receive

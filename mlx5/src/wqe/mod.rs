@@ -4,6 +4,37 @@
 
 pub mod traits;
 
+// =============================================================================
+// Submission Error
+// =============================================================================
+
+/// Error type for WQE submission operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmissionError {
+    /// Send Queue is full.
+    SqFull,
+    /// WQE size exceeds BlueFlame buffer size (256 bytes).
+    BlueflameOverflow,
+    /// BlueFlame is not available on this device.
+    BlueflameNotAvailable,
+}
+
+impl std::fmt::Display for SubmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubmissionError::SqFull => write!(f, "send queue is full"),
+            SubmissionError::BlueflameOverflow => {
+                write!(f, "WQE size exceeds BlueFlame buffer size (256 bytes)")
+            }
+            SubmissionError::BlueflameNotAvailable => {
+                write!(f, "BlueFlame is not available on this device")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SubmissionError {}
+
 pub use traits::{
     // Transport type tags
     InfiniBand, RoCE,

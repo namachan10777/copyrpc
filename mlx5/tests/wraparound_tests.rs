@@ -143,7 +143,7 @@ fn test_rc_rdma_write_wraparound() {
             .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
             .expect("write failed")
             .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-            .finish_signaled_with_blueflame(i as u64)
+            .finish_signaled(i as u64)
             .expect("finish failed");
 
         // Wait for completion
@@ -299,7 +299,7 @@ fn test_rc_actual_wraparound_triggered() {
             .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
             .expect("write failed")
             .sge(local_buf.addr(), 8, local_mr.lkey())
-            .finish_signaled_with_blueflame(total_posted as u64);
+            .finish_signaled(total_posted as u64);
         total_posted += 1;
 
         // Wait for completion before posting next
@@ -338,7 +338,7 @@ fn test_rc_actual_wraparound_triggered() {
         .sge(local_buf.addr(), 8, local_mr.lkey())
         .sge(local_buf.addr().wrapping_add(8), 8, local_mr.lkey())
         .sge(local_buf.addr().wrapping_add(16), 8, local_mr.lkey())
-        .finish_signaled_with_blueflame(9999u64);
+        .finish_signaled(9999u64);
 
     let slots_after = qp1.borrow().slots_to_ring_end();
     println!("After large WQE: slots_to_ring_end={}", slots_after);
@@ -636,7 +636,7 @@ fn test_rc_slots_to_ring_end() {
             .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
             .expect("write failed")
             .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-            .finish_signaled_with_blueflame(i as u64)
+            .finish_signaled(i as u64)
             .expect("finish failed");
 
         let _ = poll_cq_timeout(&send_cq, 5000).expect("CQE timeout");
@@ -859,7 +859,7 @@ fn test_dc_rdma_write_wraparound() {
             .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
             .expect("write failed")
             .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-            .finish_signaled_with_blueflame(i as u64)
+            .finish_signaled(i as u64)
             .expect("finish failed");
 
         let cqe = poll_cq_timeout(&dci_cq, 5000).expect(&format!("CQE timeout at iteration {}", i));
@@ -973,7 +973,7 @@ fn test_dc_sq_methods() {
             .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
             .expect("write failed")
             .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-            .finish_signaled_with_blueflame(i as u64)
+            .finish_signaled(i as u64)
             .expect("finish failed");
 
         let _ = poll_cq_timeout(&dci_cq, 5000).expect("CQE timeout");
@@ -1188,7 +1188,7 @@ fn test_ud_send_wraparound() {
             .send(TxFlags::empty())
             .expect("send failed")
             .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-            .finish_signaled_with_blueflame(i as u64)
+            .finish_signaled(i as u64)
             .expect("finish failed");
         sender.borrow().ring_sq_doorbell();
 
@@ -1319,7 +1319,7 @@ fn test_ud_slots_to_ring_end() {
             .send(TxFlags::empty())
             .expect("send failed")
             .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-            .finish_signaled_with_blueflame(i as u64)
+            .finish_signaled(i as u64)
             .expect("finish failed");
         sender.borrow().ring_sq_doorbell();
 
@@ -1462,7 +1462,7 @@ fn test_rc_inline_wraparound() {
             .send(TxFlags::empty())
             .expect("send failed")
             .inline(&test_data)
-            .finish_signaled_with_blueflame(i as u64)
+            .finish_signaled(i as u64)
             .expect("finish failed");
 
         // Detect wrap-around: wqe_idx decreased or jumped significantly
@@ -1620,7 +1620,7 @@ fn test_rc_inline_variable_size_wraparound() {
             .send(TxFlags::empty())
             .expect("send failed")
             .inline(&test_data)
-            .finish_signaled_with_blueflame(i as u64)
+            .finish_signaled(i as u64)
             .expect("finish failed");
 
         // Poll CQs

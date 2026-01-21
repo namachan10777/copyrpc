@@ -199,7 +199,7 @@ fn test_ud_send_recv() {
         .send(TxFlags::empty())
         .expect("send failed")
         .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-        .finish_signaled_with_blueflame(1u64)
+        .finish_signaled(1u64)
         .expect("finish failed");
     sender.borrow().ring_sq_doorbell();
 
@@ -339,7 +339,7 @@ fn test_ud_send_raw_av() {
         .send(TxFlags::empty())
         .expect("send failed")
         .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-        .finish_signaled_with_blueflame(1u64)
+        .finish_signaled(1u64)
         .expect("finish failed");
     sender.borrow().ring_sq_doorbell();
 
@@ -481,7 +481,7 @@ fn test_ud_multiple_destinations() {
             .send(TxFlags::empty())
             .expect("send failed")
             .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-            .finish_signaled_with_blueflame((i + 1) as u64)
+            .finish_signaled((i + 1) as u64)
             .expect("finish failed");
         sender.borrow().ring_sq_doorbell();
 
@@ -621,7 +621,7 @@ fn test_ud_post_nop_to_ring_end() {
             .send(TxFlags::COMPLETION)
             .expect("send failed")
             .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-            .finish_signaled_with_blueflame(i as u64)
+            .finish_signaled(i as u64)
             .expect("finish failed");
         sender.borrow().ring_sq_doorbell();
 

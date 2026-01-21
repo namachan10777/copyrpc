@@ -641,7 +641,7 @@ fn test_qp_destroy_after_actual_send_recv() {
                     .and_then(|b| b.send(TxFlags::empty()))
                     .map(|b| {
                         b.sge(buf.addr() + offset, 32, mr.lkey())
-                            .finish_signaled_with_blueflame(idx as u64)
+                            .finish_signaled(idx as u64)
                     });
 
                 // Repost recv
@@ -804,7 +804,7 @@ fn test_qp_destroy_after_actual_send_recv() {
                     .and_then(|b| b.send(TxFlags::empty()))
                     .map(|b| {
                         b.sge(buf.addr() + offset, 32, mr.lkey())
-                            .finish_signaled_with_blueflame(idx as u64)
+                            .finish_signaled(idx as u64)
                     });
                 sent += 1;
             }
