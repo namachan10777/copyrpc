@@ -22,7 +22,7 @@ use crate::pd::{AddressHandle, Pd};
 use crate::qp::QpInfo;
 use crate::srq::Srq;
 use crate::transport::{InfiniBand, RoCE};
-use crate::wqe::{CTRL_SEG_SIZE, DATA_SEG_SIZE, OrderedWqeTable, WQEBB_SIZE, WqeOpcode, write_ctrl_seg, write_data_seg};
+use crate::wqe::{CTRL_SEG_SIZE, DATA_SEG_SIZE, OrderedWqeTable, WQEBB_SIZE, WqeFlags, WqeOpcode, write_ctrl_seg, write_data_seg};
 
 // =============================================================================
 // UD Configuration
@@ -144,7 +144,7 @@ impl<Entry, TableType> UdSendQueueState<Entry, TableType> {
             wqe_idx,
             self.sqn,
             ds_count,
-            0,
+            WqeFlags::empty(),
             0,
         );
 

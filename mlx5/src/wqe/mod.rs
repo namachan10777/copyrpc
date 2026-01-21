@@ -75,14 +75,14 @@ pub unsafe fn write_ctrl_seg(
     wqe_idx: u16,
     qpn: u32,
     ds_cnt: u8,
-    fm_ce_se: u8,
+    flags: WqeFlags,
     imm: u32,
 ) {
     let opmod_idx_opcode = ((opmod as u32) << 24) | ((wqe_idx as u32) << 8) | (opcode as u32);
     let qpn_ds = (qpn << 8) | (ds_cnt as u32);
-    // Combine sig(0), dci_stream[15:8](0), dci_stream[7:0](0), fm_ce_se into single u32
-    // Layout in big-endian: [sig][stream_hi][stream_lo][fm_ce_se]
-    let sig_stream_fm = fm_ce_se as u32;
+    // Combine sig (pcie_ctrl), dci_stream[15:8](0), dci_stream[7:0](0), fm_ce_se into single u32
+    // Layout in big-endian: [sig/pcie_ctrl][stream_hi][stream_lo][fm_ce_se]
+    let sig_stream_fm = ((flags.pcie_ctrl() as u32) << 24) | (flags.fm_ce_se() as u32);
 
     let ptr32 = ptr as *mut u32;
     std::ptr::write_volatile(ptr32, opmod_idx_opcode.to_be());
@@ -467,15 +467,63 @@ pub enum WqeOpcode {
 }
 
 bitflags! {
-    /// WQE flags for fm_ce_se field.
+    /// WQE flags for fm_ce_se field and PCIe control.
+    ///
+    /// Lower byte (0x00FF): fm_ce_se field flags
+    /// Upper byte (0xFF00): PCIe control flags (written to signature field)
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    pub struct WqeFlags: u8 {
-        /// Fence (wait for previous WQEs to complete).
-        const FENCE = 0x40;
-        /// Completion requested.
-        const COMPLETION = 0x08;
-        /// Solicited event.
-        const SOLICITED = 0x02;
+    pub struct WqeFlags: u16 {
+        // =================================================================
+        // fm_ce_se field flags (lower byte)
+        // =================================================================
+
+        /// Fence: wait for prior RDMA READ and Atomic operations to complete.
+        ///
+        /// Use this flag when a subsequent operation depends on the result of
+        /// a prior RDMA READ or Atomic operation. Without Fence, the subsequent
+        /// operation may start processing (and read from local memory) before
+        /// the prior operation's data has arrived.
+        ///
+        /// **Not needed** between SEND/WRITE operations (ordering is guaranteed).
+        const FENCE = 0x0040;
+
+        /// Request CQE generation on completion.
+        const COMPLETION = 0x0008;
+
+        /// Generate solicited event at the remote QP's CQ.
+        const SOLICITED = 0x0002;
+
+        // =================================================================
+        // PCIe control flags (upper byte, written to signature field)
+        // =================================================================
+
+        /// Enable PCIe relaxed ordering for this WQE's transactions.
+        ///
+        /// When set, the NIC may issue PCIe transactions with the Relaxed
+        /// Ordering attribute, allowing the PCIe fabric to reorder:
+        /// - Reads of WQE data from host memory
+        /// - Reads of scatter/gather data from host memory
+        ///
+        /// This can improve performance but requires the application to only
+        /// access received data **after** observing the corresponding CQE.
+        const RELAXED_ORDERING = 0x0400;
+    }
+}
+
+impl WqeFlags {
+    /// Extract the fm_ce_se byte (lower 8 bits).
+    #[inline]
+    pub fn fm_ce_se(self) -> u8 {
+        (self.bits() & 0xFF) as u8
+    }
+
+    /// Extract the PCIe control byte (upper 8 bits, for signature field).
+    ///
+    /// Maps WqeFlags bits to MLX5 PCIe control bits:
+    /// - RELAXED_ORDERING (0x0400) → MLX5_PCIE_CTRL_RELAXED_ORDERING (0x04)
+    #[inline]
+    pub fn pcie_ctrl(self) -> u8 {
+        ((self.bits() >> 8) & 0xFF) as u8
     }
 }
 

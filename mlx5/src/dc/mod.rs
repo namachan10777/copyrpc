@@ -19,7 +19,7 @@ use crate::qp::QpInfo;
 use crate::srq::Srq;
 use crate::transport::IbRemoteDctInfo;
 use crate::wqe::{
-    CTRL_SEG_SIZE, InfiniBand, OrderedWqeTable, RoCE, WQEBB_SIZE, WqeOpcode,
+    CTRL_SEG_SIZE, InfiniBand, OrderedWqeTable, RoCE, WQEBB_SIZE, WqeFlags, WqeOpcode,
     write_ctrl_seg,
 };
 
@@ -138,7 +138,7 @@ impl<Entry, TableType> DciSendQueueState<Entry, TableType> {
             wqe_idx,
             self.sqn,
             ds_count,
-            0,
+            WqeFlags::empty(),
             0,
         );
 

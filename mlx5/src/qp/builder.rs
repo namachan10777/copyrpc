@@ -133,7 +133,7 @@ impl<'a, Entry> WqeCore<'a, Entry> {
                 self.wqe_idx,
                 self.sq.sqn,
                 0,
-                flags.bits(),
+                flags,
                 imm,
             );
         }
@@ -983,7 +983,6 @@ impl<'b, 'a, Entry> BlueflameWqeCore<'b, 'a, Entry> {
     #[inline]
     fn write_ctrl(&mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) {
         let wqe_idx = self.batch.sq.pi.get();
-        let flags = WqeFlags::from_bits_truncate(flags.bits());
         unsafe {
             write_ctrl_seg(
                 self.batch.buffer.as_mut_ptr().add(self.offset),
@@ -992,7 +991,7 @@ impl<'b, 'a, Entry> BlueflameWqeCore<'b, 'a, Entry> {
                 wqe_idx,
                 self.batch.sq.sqn,
                 0,
-                flags.bits(),
+                flags,
                 imm,
             );
         }
@@ -1297,7 +1296,6 @@ impl<'b, 'a, Entry> RoceBlueflameWqeCore<'b, 'a, Entry> {
     #[inline]
     fn write_ctrl(&mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) {
         let wqe_idx = self.batch.sq.pi.get();
-        let flags = WqeFlags::from_bits_truncate(flags.bits());
         unsafe {
             write_ctrl_seg(
                 self.batch.buffer.as_mut_ptr().add(self.offset),
@@ -1306,7 +1304,7 @@ impl<'b, 'a, Entry> RoceBlueflameWqeCore<'b, 'a, Entry> {
                 wqe_idx,
                 self.batch.sq.sqn,
                 0,
-                flags.bits(),
+                flags,
                 imm,
             );
         }

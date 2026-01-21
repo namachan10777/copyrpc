@@ -18,7 +18,7 @@ use crate::srq::Srq;
 use crate::transport::{IbRemoteQpInfo, RoCERemoteQpInfo};
 use crate::types::GrhAttr;
 use crate::wqe::{
-    CTRL_SEG_SIZE, DATA_SEG_SIZE, OrderedWqeTable, SubmissionError, WQEBB_SIZE, WqeOpcode,
+    CTRL_SEG_SIZE, DATA_SEG_SIZE, OrderedWqeTable, SubmissionError, WQEBB_SIZE, WqeFlags, WqeOpcode,
     write_ctrl_seg, write_data_seg,
     // Transport type tags
     InfiniBand, RoCE,
@@ -193,7 +193,7 @@ impl<Entry, TableType> SendQueueState<Entry, TableType> {
             wqe_idx,
             self.sqn,
             ds_count,
-            0,
+            WqeFlags::empty(),
             0,
         );
 

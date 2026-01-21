@@ -9,7 +9,7 @@ use std::io;
 
 use crate::wqe::{
     CTRL_SEG_SIZE, DATA_SEG_SIZE, HasData, Init, NeedsTmSeg, OrderedWqeTable, TmCmdWqeBuilder,
-    TM_SEG_SIZE, TmTagAddWqeBuilder, TmTagDelWqeBuilder, WQEBB_SIZE, WqeHandle, WqeOpcode,
+    TM_SEG_SIZE, TmTagAddWqeBuilder, TmTagDelWqeBuilder, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode,
     write_ctrl_seg, write_data_seg, write_tm_seg_add, write_tm_seg_del,
 };
 
@@ -53,7 +53,6 @@ impl<'a, CmdEntry, CmdTableType> CmdQpWqeBuilder<'a, CmdEntry, CmdTableType, Ini
         opmod: u8,
     ) -> CmdQpWqeBuilder<'a, CmdEntry, CmdTableType, NeedsTmSeg> {
         // MLX5_WQE_CTRL_CQ_UPDATE = 0x08 - required for TM operations
-        const CQ_UPDATE: u8 = 0x08;
         unsafe {
             write_ctrl_seg(
                 self.wqe_ptr,
@@ -62,7 +61,7 @@ impl<'a, CmdEntry, CmdTableType> CmdQpWqeBuilder<'a, CmdEntry, CmdTableType, Ini
                 self.wqe_idx,
                 self.cmd_qp.qpn,
                 0,
-                CQ_UPDATE,
+                WqeFlags::COMPLETION,
                 0,
             );
         }
@@ -319,7 +318,6 @@ impl<'a, CmdEntry> TmCmdWqeBuilder<'a, CmdEntry> for TmCmdEntryPointImpl<'a, Cmd
     #[inline]
     fn tag_add(self, index: u16, tag: u64) -> impl TmTagAddWqeBuilder<'a, CmdEntry> + 'a {
         // Write control segment with TM opcode
-        const CQ_UPDATE: u8 = 0x08;
         unsafe {
             write_ctrl_seg(
                 self.wqe_ptr,
@@ -328,7 +326,7 @@ impl<'a, CmdEntry> TmCmdWqeBuilder<'a, CmdEntry> for TmCmdEntryPointImpl<'a, Cmd
                 self.wqe_idx,
                 self.cmd_qp.qpn,
                 0,
-                CQ_UPDATE,
+                WqeFlags::COMPLETION,
                 0,
             );
         }
@@ -347,7 +345,6 @@ impl<'a, CmdEntry> TmCmdWqeBuilder<'a, CmdEntry> for TmCmdEntryPointImpl<'a, Cmd
     #[inline]
     fn tag_del(self, index: u16) -> impl TmTagDelWqeBuilder<'a, CmdEntry> + 'a {
         // Write control segment with TM opcode
-        const CQ_UPDATE: u8 = 0x08;
         unsafe {
             write_ctrl_seg(
                 self.wqe_ptr,
@@ -356,7 +353,7 @@ impl<'a, CmdEntry> TmCmdWqeBuilder<'a, CmdEntry> for TmCmdEntryPointImpl<'a, Cmd
                 self.wqe_idx,
                 self.cmd_qp.qpn,
                 0,
-                CQ_UPDATE,
+                WqeFlags::COMPLETION,
                 0,
             );
 
