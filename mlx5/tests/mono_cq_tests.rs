@@ -52,60 +52,36 @@ fn test_mono_cq_with_rc_qp() {
         }
     };
 
-    // Track completions with callback
+    // Track completions (both SQ and RQ)
     let completions: Rc<RefCell<Vec<(Cqe, u64)>>> = Rc::new(RefCell::new(Vec::new()));
     let completions_clone = completions.clone();
 
+    // Single callback handles both SQ and RQ completions
     let callback = move |cqe: Cqe, entry: u64| {
         completions_clone.borrow_mut().push((cqe, entry));
     };
 
-    // Create send and recv MonoCqs
-    let send_cq = ctx
+    // Create a single CQ for both QPs
+    let cq = ctx
         .ctx
         .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, callback)
-        .expect("Failed to create send MonoCq");
-
-    // For recv CQ, we need a separate callback
-    let recv_completions: Rc<RefCell<Vec<(Cqe, u64)>>> = Rc::new(RefCell::new(Vec::new()));
-    let recv_completions_clone = recv_completions.clone();
-    let recv_callback = move |cqe: Cqe, entry: u64| {
-        recv_completions_clone.borrow_mut().push((cqe, entry));
-    };
-
-    let recv_cq1 = ctx
-        .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, recv_callback)
-        .expect("Failed to create recv MonoCq 1");
-
-    let recv_completions2: Rc<RefCell<Vec<(Cqe, u64)>>> = Rc::new(RefCell::new(Vec::new()));
-    let recv_completions2_clone = recv_completions2.clone();
-    let recv_callback2 = move |cqe: Cqe, entry: u64| {
-        recv_completions2_clone.borrow_mut().push((cqe, entry));
-    };
-
-    let recv_cq2 = ctx
-        .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, recv_callback2)
-        .expect("Failed to create recv MonoCq 2");
+        .expect("Failed to create MonoCq");
 
     let config = RcQpConfig::default();
 
-    // Create QPs for MonoCq
+    // Create QPs using the same CQ
     let qp1 = ctx
         .ctx
-        .create_rc_qp_for_mono_cq::<u64, _, _, _>(&ctx.pd, &send_cq, &recv_cq1, &config)
+        .create_rc_qp_for_mono_cq::<u64, _, _>(&ctx.pd, &cq, &config)
         .expect("Failed to create QP1");
     let qp2 = ctx
         .ctx
-        .create_rc_qp_for_mono_cq::<u64, _, _, _>(&ctx.pd, &send_cq, &recv_cq2, &config)
+        .create_rc_qp_for_mono_cq::<u64, _, _>(&ctx.pd, &cq, &config)
         .expect("Failed to create QP2");
 
-    // Register QPs with their CQs
-    send_cq.register(&qp1);
-    send_cq.register(&qp2);
-    recv_cq1.register(&qp1);
-    recv_cq2.register(&qp2);
+    // Register QPs with the CQ
+    cq.register(&qp1);
+    cq.register(&qp2);
 
     // Connect QPs
     let remote1 = RemoteQpInfo {
@@ -162,9 +138,9 @@ fn test_mono_cq_with_rc_qp() {
     let timeout = std::time::Duration::from_secs(5);
 
     loop {
-        let count = send_cq.poll();
+        let count = cq.poll();
         if count > 0 {
-            send_cq.flush();
+            cq.flush();
             break;
         }
         if start.elapsed() > timeout {
@@ -173,7 +149,7 @@ fn test_mono_cq_with_rc_qp() {
         std::hint::spin_loop();
     }
 
-    // Verify callback was invoked
+    // Verify callback was invoked (SQ completion from RDMA WRITE)
     let comps = completions.borrow();
     assert_eq!(comps.len(), 1, "Should have exactly 1 completion");
     let (cqe, entry) = &comps[0];
@@ -186,8 +162,8 @@ fn test_mono_cq_with_rc_qp() {
     assert_eq!(&written[..], test_data, "Data mismatch");
 
     // Test unregister
-    send_cq.unregister(qp1.borrow().qpn());
-    println!("QP1 unregistered from send_cq");
+    cq.unregister(qp1.borrow().qpn());
+    println!("QP1 unregistered from cq");
 
     println!("MonoCq with RC QP test passed!");
 }
@@ -233,6 +209,7 @@ fn test_mono_cq_multiple_completions() {
         }
     };
 
+    // Track completions
     let completions: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
     let completions_clone = completions.clone();
 
@@ -240,48 +217,25 @@ fn test_mono_cq_multiple_completions() {
         completions_clone.borrow_mut().push(entry);
     };
 
-    let send_cq = ctx
+    // Use a single CQ for both QPs
+    let cq = ctx
         .ctx
         .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, callback)
-        .expect("Failed to create send MonoCq");
-
-    let recv_completions: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
-    let recv_completions_clone = recv_completions.clone();
-    let recv_callback = move |_cqe: Cqe, entry: u64| {
-        recv_completions_clone.borrow_mut().push(entry);
-    };
-
-    let recv_cq1 = ctx
-        .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, recv_callback)
-        .expect("Failed to create recv MonoCq 1");
-
-    let recv_completions2: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
-    let recv_completions2_clone = recv_completions2.clone();
-    let recv_callback2 = move |_cqe: Cqe, entry: u64| {
-        recv_completions2_clone.borrow_mut().push(entry);
-    };
-
-    let recv_cq2 = ctx
-        .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, recv_callback2)
-        .expect("Failed to create recv MonoCq 2");
+        .expect("Failed to create MonoCq");
 
     let config = RcQpConfig::default();
 
     let qp1 = ctx
         .ctx
-        .create_rc_qp_for_mono_cq::<u64, _, _, _>(&ctx.pd, &send_cq, &recv_cq1, &config)
+        .create_rc_qp_for_mono_cq::<u64, _, _>(&ctx.pd, &cq, &config)
         .expect("Failed to create QP1");
     let qp2 = ctx
         .ctx
-        .create_rc_qp_for_mono_cq::<u64, _, _, _>(&ctx.pd, &send_cq, &recv_cq2, &config)
+        .create_rc_qp_for_mono_cq::<u64, _, _>(&ctx.pd, &cq, &config)
         .expect("Failed to create QP2");
 
-    send_cq.register(&qp1);
-    send_cq.register(&qp2);
-    recv_cq1.register(&qp1);
-    recv_cq2.register(&qp2);
+    cq.register(&qp1);
+    cq.register(&qp2);
 
     let remote1 = RemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
@@ -338,9 +292,9 @@ fn test_mono_cq_multiple_completions() {
     let timeout = std::time::Duration::from_secs(5);
 
     while completions.borrow().len() < num_ops {
-        let count = send_cq.poll();
+        let count = cq.poll();
         if count > 0 {
-            send_cq.flush();
+            cq.flush();
         }
         if start.elapsed() > timeout {
             panic!(
@@ -387,49 +341,29 @@ fn test_mono_cq_high_load() {
     let send_completions: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
     let send_completions_clone = send_completions.clone();
 
-    let send_callback = move |_cqe: Cqe, entry: u64| {
+    let callback = move |_cqe: Cqe, entry: u64| {
         send_completions_clone.borrow_mut().push(entry);
     };
 
-    let recv_completions: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
-    let recv_completions_clone = recv_completions.clone();
-
-    let recv_callback = move |_cqe: Cqe, entry: u64| {
-        recv_completions_clone.borrow_mut().push(entry);
-    };
-
-    // Use larger CQ to accommodate high load
-    let send_cq = ctx
+    // Use larger CQ to accommodate high load - single CQ for both QPs
+    let cq = ctx
         .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(512, send_callback)
-        .expect("Failed to create send MonoCq");
-
-    let recv_cq1 = ctx
-        .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(512, recv_callback)
-        .expect("Failed to create recv MonoCq 1");
-
-    // Dummy recv CQ for qp2
-    let recv_cq2 = ctx
-        .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(512, |_cqe: Cqe, _entry: u64| {})
-        .expect("Failed to create recv MonoCq 2");
+        .create_mono_cq::<RcQpForMonoCq<u64>, _>(512, callback)
+        .expect("Failed to create MonoCq");
 
     let config = RcQpConfig::default();
 
     let qp1 = ctx
         .ctx
-        .create_rc_qp_for_mono_cq::<u64, _, _, _>(&ctx.pd, &send_cq, &recv_cq1, &config)
+        .create_rc_qp_for_mono_cq::<u64, _, _>(&ctx.pd, &cq, &config)
         .expect("Failed to create QP1");
     let qp2 = ctx
         .ctx
-        .create_rc_qp_for_mono_cq::<u64, _, _, _>(&ctx.pd, &send_cq, &recv_cq2, &config)
+        .create_rc_qp_for_mono_cq::<u64, _, _>(&ctx.pd, &cq, &config)
         .expect("Failed to create QP2");
 
-    send_cq.register(&qp1);
-    send_cq.register(&qp2);
-    recv_cq1.register(&qp1);
-    recv_cq2.register(&qp2);
+    cq.register(&qp1);
+    cq.register(&qp2);
 
     let remote1 = RemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
@@ -491,9 +425,9 @@ fn test_mono_cq_high_load() {
     let timeout = std::time::Duration::from_secs(10);
 
     while send_completions.borrow().len() < num_ops {
-        let count = send_cq.poll();
+        let count = cq.poll();
         if count > 0 {
-            send_cq.flush();
+            cq.flush();
         }
         if start.elapsed() > timeout {
             panic!(
@@ -520,6 +454,9 @@ fn test_mono_cq_high_load() {
 ///
 /// This tests the recv side CQE handling which is different from send side.
 /// RDMA WRITE with IMM generates a CQE on the receiver's RQ.
+///
+/// Note: With single-Entry MonoCq design, we use separate CQs for
+/// different completion types when needed.
 #[test]
 fn test_mono_cq_recv_rdma_write_imm() {
     let ctx = match TestContext::new() {
@@ -530,56 +467,48 @@ fn test_mono_cq_recv_rdma_write_imm() {
         }
     };
 
+    // Track send completions from QP2
     let send_completions: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
     let send_completions_clone = send_completions.clone();
 
-    let send_callback = move |_cqe: Cqe, entry: u64| {
-        send_completions_clone.borrow_mut().push(entry);
-    };
-
+    // Track recv completions on QP1 (captures IMM data)
     let recv_completions: Rc<RefCell<Vec<(u32, u64)>>> = Rc::new(RefCell::new(Vec::new()));
     let recv_completions_clone = recv_completions.clone();
 
-    // Recv callback captures immediate data from CQE
-    let recv_callback = move |cqe: Cqe, entry: u64| {
+    // QP1's callback tracks recv completions (IMM data)
+    let qp1_callback = move |cqe: Cqe, entry: u64| {
         recv_completions_clone.borrow_mut().push((cqe.imm, entry));
     };
 
-    let send_cq = ctx
-        .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, send_callback)
-        .expect("Failed to create send MonoCq");
+    // QP2's callback tracks send completions
+    let qp2_callback = move |_cqe: Cqe, entry: u64| {
+        send_completions_clone.borrow_mut().push(entry);
+    };
 
-    let recv_cq = ctx
+    // Create separate CQs for each QP
+    let cq1 = ctx
         .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, recv_callback)
-        .expect("Failed to create recv MonoCq");
+        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, qp1_callback)
+        .expect("Failed to create MonoCq 1");
 
-    // Dummy CQs for qp2
-    let send_cq2 = ctx
+    let cq2 = ctx
         .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, |_cqe: Cqe, _entry: u64| {})
-        .expect("Failed to create send MonoCq 2");
-    let recv_cq2 = ctx
-        .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, |_cqe: Cqe, _entry: u64| {})
-        .expect("Failed to create recv MonoCq 2");
+        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, qp2_callback)
+        .expect("Failed to create MonoCq 2");
 
     let config = RcQpConfig::default();
 
     let qp1 = ctx
         .ctx
-        .create_rc_qp_for_mono_cq::<u64, _, _, _>(&ctx.pd, &send_cq, &recv_cq, &config)
+        .create_rc_qp_for_mono_cq::<u64, _, _>(&ctx.pd, &cq1, &config)
         .expect("Failed to create QP1");
     let qp2 = ctx
         .ctx
-        .create_rc_qp_for_mono_cq::<u64, _, _, _>(&ctx.pd, &send_cq2, &recv_cq2, &config)
+        .create_rc_qp_for_mono_cq::<u64, _, _>(&ctx.pd, &cq2, &config)
         .expect("Failed to create QP2");
 
-    send_cq.register(&qp1);
-    recv_cq.register(&qp1);
-    send_cq2.register(&qp2);
-    recv_cq2.register(&qp2);
+    cq1.register(&qp1);
+    cq2.register(&qp2);
 
     let remote1 = RemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
@@ -650,15 +579,15 @@ fn test_mono_cq_recv_rdma_write_imm() {
 
     // We only care about recv completions for this test
     while recv_completions.borrow().len() < num_ops {
-        let recv_count = recv_cq.poll();
+        let recv_count = cq1.poll();
         if recv_count > 0 {
-            recv_cq.flush();
+            cq1.flush();
         }
 
-        // Also drain send CQ to avoid overflow
-        let send_count = send_cq2.poll();
+        // Also drain send CQ (cq2) to avoid overflow
+        let send_count = cq2.poll();
         if send_count > 0 {
-            send_cq2.flush();
+            cq2.flush();
         }
 
         if start.elapsed() > timeout {
@@ -702,67 +631,35 @@ fn test_mono_cq_bidirectional_pingpong() {
         }
     };
 
-    // QP1 completions
-    let qp1_send_count = Rc::new(RefCell::new(0usize));
-    let qp1_recv_count = Rc::new(RefCell::new(0usize));
+    // QP completions - use Cell for interior mutability
+    let qp1_count = Rc::new(Cell::new(0usize));
+    let qp2_count = Rc::new(Cell::new(0usize));
 
-    let qp1_send_clone = qp1_send_count.clone();
-    let qp1_recv_clone = qp1_recv_count.clone();
+    fn noop_callback(_cqe: Cqe, _entry: u64) {}
 
-    let qp1_send_cb = move |_cqe: Cqe, _entry: u64| {
-        *qp1_send_clone.borrow_mut() += 1;
-    };
-    let qp1_recv_cb = move |_cqe: Cqe, _entry: u64| {
-        *qp1_recv_clone.borrow_mut() += 1;
-    };
-
-    // QP2 completions
-    let qp2_send_count = Rc::new(RefCell::new(0usize));
-    let qp2_recv_count = Rc::new(RefCell::new(0usize));
-
-    let qp2_send_clone = qp2_send_count.clone();
-    let qp2_recv_clone = qp2_recv_count.clone();
-
-    let qp2_send_cb = move |_cqe: Cqe, _entry: u64| {
-        *qp2_send_clone.borrow_mut() += 1;
-    };
-    let qp2_recv_cb = move |_cqe: Cqe, _entry: u64| {
-        *qp2_recv_clone.borrow_mut() += 1;
-    };
-
-    // Create CQs
-    let qp1_send_cq = ctx
+    // Create CQs with noop callbacks - we'll track completions via poll return value
+    let qp1_cq = ctx
         .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, qp1_send_cb)
-        .expect("qp1_send_cq");
-    let qp1_recv_cq = ctx
+        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, noop_callback)
+        .expect("qp1_cq");
+    let qp2_cq = ctx
         .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, qp1_recv_cb)
-        .expect("qp1_recv_cq");
-    let qp2_send_cq = ctx
-        .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, qp2_send_cb)
-        .expect("qp2_send_cq");
-    let qp2_recv_cq = ctx
-        .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, qp2_recv_cb)
-        .expect("qp2_recv_cq");
+        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, noop_callback)
+        .expect("qp2_cq");
 
     let config = RcQpConfig::default();
 
     let qp1 = ctx
         .ctx
-        .create_rc_qp_for_mono_cq::<u64, _, _, _>(&ctx.pd, &qp1_send_cq, &qp1_recv_cq, &config)
+        .create_rc_qp_for_mono_cq::<u64, _, _>(&ctx.pd, &qp1_cq, &config)
         .expect("QP1");
     let qp2 = ctx
         .ctx
-        .create_rc_qp_for_mono_cq::<u64, _, _, _>(&ctx.pd, &qp2_send_cq, &qp2_recv_cq, &config)
+        .create_rc_qp_for_mono_cq::<u64, _, _>(&ctx.pd, &qp2_cq, &config)
         .expect("QP2");
 
-    qp1_send_cq.register(&qp1);
-    qp1_recv_cq.register(&qp1);
-    qp2_send_cq.register(&qp2);
-    qp2_recv_cq.register(&qp2);
+    qp1_cq.register(&qp1);
+    qp2_cq.register(&qp2);
 
     let remote1 = RemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
@@ -830,16 +727,20 @@ fn test_mono_cq_bidirectional_pingpong() {
             .expect("finish");
         qp1.borrow().ring_sq_doorbell();
 
-        // Wait for QP2 to receive
-        while *qp2_recv_count.borrow() <= i {
-            qp2_recv_cq.poll();
-            qp2_recv_cq.flush();
+        // Wait for QP2 to receive (poll returns number of completions)
+        while qp2_count.get() <= i {
+            let count = qp2_cq.poll();
+            if count > 0 {
+                // Assume mixed send/recv completions
+                qp2_count.set(qp2_count.get() + count as usize);
+                qp2_cq.flush();
+            }
 
             if start.elapsed() > timeout {
                 panic!(
-                    "Timeout at iter {}: qp2_recv={}",
+                    "Timeout at iter {}: qp2_count={}",
                     i,
-                    *qp2_recv_count.borrow()
+                    qp2_count.get()
                 );
             }
         }
@@ -856,48 +757,33 @@ fn test_mono_cq_bidirectional_pingpong() {
         qp2.borrow().ring_sq_doorbell();
 
         // Wait for QP1 to receive
-        while *qp1_recv_count.borrow() <= i {
-            qp1_recv_cq.poll();
-            qp1_recv_cq.flush();
+        while qp1_count.get() <= i {
+            let count = qp1_cq.poll();
+            if count > 0 {
+                qp1_count.set(qp1_count.get() + count as usize);
+                qp1_cq.flush();
+            }
 
             if start.elapsed() > timeout {
                 panic!(
-                    "Timeout at iter {}: qp1_recv={}",
+                    "Timeout at iter {}: qp1_count={}",
                     i,
-                    *qp1_recv_count.borrow()
+                    qp1_count.get()
                 );
             }
         }
-
-        // Drain send CQs occasionally
-        if i % 8 == 7 {
-            qp1_send_cq.poll();
-            qp1_send_cq.flush();
-            qp2_send_cq.poll();
-            qp2_send_cq.flush();
-        }
     }
 
-    // Drain remaining send completions
-    qp1_send_cq.poll();
-    qp1_send_cq.flush();
-    qp2_send_cq.poll();
-    qp2_send_cq.flush();
+    // Drain remaining completions
+    qp1_cq.poll();
+    qp1_cq.flush();
+    qp2_cq.poll();
+    qp2_cq.flush();
 
     println!(
         "Bidirectional pingpong test passed! {} iters in {:?}",
         num_iters,
         start.elapsed()
-    );
-    println!(
-        "  QP1: send={}, recv={}",
-        *qp1_send_count.borrow(),
-        *qp1_recv_count.borrow()
-    );
-    println!(
-        "  QP2: send={}, recv={}",
-        *qp2_send_count.borrow(),
-        *qp2_recv_count.borrow()
     );
 }
 
@@ -927,29 +813,25 @@ fn test_mono_cq_wraparound() {
     let num_operations = cq_size * 3; // Process 768 completions to wrap around ~3 times
     let batch_size = 32; // Submit in batches to avoid filling the CQ
 
-    let send_cq = ctx
+    // Use a single CQ for both QPs
+    let cq = ctx
         .ctx
         .create_mono_cq::<RcQpForMonoCq<u64>, _>(cq_size as i32, callback)
-        .expect("Failed to create send MonoCq");
-
-    let recv_cq = ctx
-        .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(cq_size as i32, |_cqe: Cqe, _entry: u64| {})
-        .expect("Failed to create recv MonoCq");
+        .expect("Failed to create MonoCq");
 
     let config = RcQpConfig::default();
 
     let qp1 = ctx
         .ctx
-        .create_rc_qp_for_mono_cq::<u64, _, _, _>(&ctx.pd, &send_cq, &recv_cq, &config)
+        .create_rc_qp_for_mono_cq::<u64, _, _>(&ctx.pd, &cq, &config)
         .expect("Failed to create QP1");
     let qp2 = ctx
         .ctx
-        .create_rc_qp_for_mono_cq::<u64, _, _, _>(&ctx.pd, &recv_cq, &send_cq, &config)
+        .create_rc_qp_for_mono_cq::<u64, _, _>(&ctx.pd, &cq, &config)
         .expect("Failed to create QP2");
 
-    send_cq.register(&qp1);
-    recv_cq.register(&qp2);
+    cq.register(&qp1);
+    cq.register(&qp2);
 
     let remote1 = RemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
@@ -1006,8 +888,8 @@ fn test_mono_cq_wraparound() {
         let expected = completion_count.get() + batch_size as u64;
         let timeout = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while completion_count.get() < expected {
-            send_cq.poll();
-            send_cq.flush();
+            cq.poll();
+            cq.flush();
             if std::time::Instant::now() > timeout {
                 panic!(
                     "Timeout at batch {}: got {} completions, expected {}",
@@ -1025,4 +907,3 @@ fn test_mono_cq_wraparound() {
         start.elapsed()
     );
 }
-

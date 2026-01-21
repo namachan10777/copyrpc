@@ -45,6 +45,11 @@ use crate::device::Context;
 /// Unlike `CompletionTarget` which handles its own callback internally,
 /// `CompletionSource` returns the entry to the caller, allowing the
 /// callback to be stored on the CQ side for inlining.
+///
+/// # Design
+///
+/// MonoCq uses a single Entry type and single callback for all completions.
+/// If you need different Entry types for SQ and RQ, use separate CQs.
 pub trait CompletionSource {
     /// The entry type returned on completion.
     type Entry;
@@ -99,13 +104,18 @@ type MonoQueueVec<Q> = Vec<Option<Weak<RefCell<Q>>>>;
 /// Monomorphic Completion Queue with inlined callback dispatch.
 ///
 /// Unlike `CompletionQueue` which uses `dyn CompletionTarget` for dynamic dispatch,
-/// `MonoCq<Q, F>` keeps the queue type `Q` and callback type `F` as generics,
-/// enabling the compiler to inline `process_cqe` and the callback.
+/// `MonoCq<Q, F>` keeps the queue type `Q` and callback type as generics,
+/// enabling the compiler to inline processing and callback.
 ///
 /// # Type Parameters
 ///
 /// - `Q`: Queue type implementing `CompletionSource`
 /// - `F`: Callback type `Fn(Cqe, Q::Entry)`
+///
+/// # Design
+///
+/// MonoCq uses a single Entry type and single callback for all completions (SQ and RQ).
+/// If you need different Entry types or callbacks for SQ vs RQ, use separate CQs.
 ///
 /// # Constraints
 ///
@@ -149,7 +159,7 @@ impl Context {
     ///
     /// # Arguments
     /// * `cqe` - Minimum number of CQ entries (actual may be larger)
-    /// * `callback` - Completion callback `Fn(Cqe, T)` called for each completion
+    /// * `callback` - Completion callback `Fn(Cqe, Q::Entry)` called for each completion
     ///
     /// # Type Parameters
     /// * `Q` - Queue type implementing `CompletionSource`
@@ -172,7 +182,7 @@ impl Context {
     ///
     /// # Arguments
     /// * `cqe` - Minimum number of CQ entries (actual may be larger)
-    /// * `callback` - Completion callback `Fn(Cqe, T)` called for each completion
+    /// * `callback` - Completion callback `Fn(Cqe, Q::Entry)` called for each completion
     /// * `config` - CQ configuration options (CQE size, compression, etc.)
     ///
     /// # CQE Compression
@@ -431,25 +441,26 @@ where
         let Some(cqe) = self.try_next_cqe(false) else {
             return 0;
         };
+        self.dispatch_cqe(cqe);
+
+        // Subsequent CQEs: prefetch next slot
+        let mut count = 1;
+        while let Some(cqe) = self.try_next_cqe(true) {
+            self.dispatch_cqe(cqe);
+            count += 1;
+        }
+        count
+    }
+
+    /// Dispatch a CQE to the appropriate queue and callback.
+    #[inline]
+    fn dispatch_cqe(&self, cqe: Cqe) {
         if let Some(queue) = self.find_queue(cqe.qp_num) {
             let qp = queue.borrow();
             if let Some(entry) = qp.process_cqe(cqe) {
                 (self.callback)(cqe, entry);
             }
         }
-
-        // Subsequent CQEs: prefetch next slot
-        let mut count = 1;
-        while let Some(cqe) = self.try_next_cqe(true) {
-            if let Some(queue) = self.find_queue(cqe.qp_num) {
-                let qp = queue.borrow();
-                if let Some(entry) = qp.process_cqe(cqe) {
-                    (self.callback)(cqe, entry);
-                }
-            }
-            count += 1;
-        }
-        count
     }
 
     /// Update the CQ doorbell record.
@@ -685,4 +696,8 @@ use crate::qp::RcQpForMonoCq;
 /// MonoCq for RcQp without callback (callback on CQ side).
 ///
 /// Use with `create_rc_qp_for_mono_cq()` which creates QPs with `()` callback.
-pub type MonoCqRc<T, F> = MonoCq<RcQpForMonoCq<T>, F>;
+///
+/// # Type Parameters
+/// - `Entry`: Entry type for completions (same for SQ and RQ)
+/// - `F`: Callback type `Fn(Cqe, Entry)`
+pub type MonoCqRc<Entry, F> = MonoCq<RcQpForMonoCq<Entry>, F>;

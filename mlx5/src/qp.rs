@@ -324,14 +324,14 @@ impl<Entry> ReceiveQueueState<Entry> {
 /// When a QP uses `OwnedRq`, it has its own dedicated receive queue and
 /// the RQ-related methods (`post_recv`, `ring_rq_doorbell`, `blueflame_rq_batch`)
 /// are available.
-pub struct OwnedRq<Entry>(Option<ReceiveQueueState<Entry>>);
+pub struct OwnedRq<RqEntry>(Option<ReceiveQueueState<RqEntry>>);
 
-impl<Entry> OwnedRq<Entry> {
-    pub(crate) fn new(rq: Option<ReceiveQueueState<Entry>>) -> Self {
+impl<RqEntry> OwnedRq<RqEntry> {
+    pub(crate) fn new(rq: Option<ReceiveQueueState<RqEntry>>) -> Self {
         Self(rq)
     }
 
-    pub(crate) fn as_ref(&self) -> Option<&ReceiveQueueState<Entry>> {
+    pub(crate) fn as_ref(&self) -> Option<&ReceiveQueueState<RqEntry>> {
         self.0.as_ref()
     }
 }
@@ -341,15 +341,15 @@ impl<Entry> OwnedRq<Entry> {
 /// When a QP uses `SharedRq`, receive operations are handled through the SRQ
 /// and the QP's own RQ-related methods are not available. Instead, use
 /// `srq()` to access the underlying SRQ.
-pub struct SharedRq<Entry>(Srq<Entry>);
+pub struct SharedRq<RqEntry>(Srq<RqEntry>);
 
-impl<Entry> SharedRq<Entry> {
-    pub(crate) fn new(srq: Srq<Entry>) -> Self {
+impl<RqEntry> SharedRq<RqEntry> {
+    pub(crate) fn new(srq: Srq<RqEntry>) -> Self {
         Self(srq)
     }
 
     /// Get a reference to the underlying SRQ.
-    pub fn srq(&self) -> &Srq<Entry> {
+    pub fn srq(&self) -> &Srq<RqEntry> {
         &self.0
     }
 }
@@ -793,68 +793,75 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, HasData> {
 /// Only signaled WQEs have entries stored in the WQE table.
 ///
 /// Type parameters:
-/// - `Entry`: Entry type stored in the WQE table
-/// - `OnComplete`: Completion callback type `Fn(Cqe, Entry)`
-pub type RcQpIb<Entry, OnComplete> = RcQpInner<Entry, InfiniBand, OrderedWqeTable<Entry>, OwnedRq<Entry>, OnComplete>;
+/// - `SqEntry`: Entry type stored in the SQ WQE table
+/// - `RqEntry`: Entry type stored in the RQ WQE table
+/// - `OnSqComplete`: SQ completion callback type `Fn(Cqe, SqEntry)`
+/// - `OnRqComplete`: RQ completion callback type `Fn(Cqe, RqEntry)`
+pub type RcQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = RcQpInner<SqEntry, RqEntry, InfiniBand, OrderedWqeTable<SqEntry>, OwnedRq<RqEntry>, OnSqComplete, OnRqComplete>;
 
 /// RC (Reliable Connection) Queue Pair with SRQ (InfiniBand).
 ///
 /// Type parameters:
-/// - `Entry`: Entry type stored in the WQE table
-/// - `OnComplete`: Completion callback type `Fn(Cqe, Entry)`
-pub type RcQpIbWithSrq<Entry, OnComplete> = RcQpInner<Entry, InfiniBand, OrderedWqeTable<Entry>, SharedRq<Entry>, OnComplete>;
+/// - `SqEntry`: Entry type stored in the SQ WQE table
+/// - `RqEntry`: Entry type stored in the SRQ WQE table
+/// - `OnSqComplete`: SQ completion callback type `Fn(Cqe, SqEntry)`
+/// - `OnRqComplete`: RQ completion callback type `Fn(Cqe, RqEntry)`
+pub type RcQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = RcQpInner<SqEntry, RqEntry, InfiniBand, OrderedWqeTable<SqEntry>, SharedRq<RqEntry>, OnSqComplete, OnRqComplete>;
 
 /// RC (Reliable Connection) Queue Pair with owned Receive Queue (RoCE).
 ///
 /// Type parameters:
-/// - `Entry`: Entry type stored in the WQE table
-/// - `OnComplete`: Completion callback type `Fn(Cqe, Entry)`
-pub type RcQpRoCE<Entry, OnComplete> = RcQpInner<Entry, RoCE, OrderedWqeTable<Entry>, OwnedRq<Entry>, OnComplete>;
+/// - `SqEntry`: Entry type stored in the SQ WQE table
+/// - `RqEntry`: Entry type stored in the RQ WQE table
+/// - `OnSqComplete`: SQ completion callback type `Fn(Cqe, SqEntry)`
+/// - `OnRqComplete`: RQ completion callback type `Fn(Cqe, RqEntry)`
+pub type RcQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = RcQpInner<SqEntry, RqEntry, RoCE, OrderedWqeTable<SqEntry>, OwnedRq<RqEntry>, OnSqComplete, OnRqComplete>;
 
 /// RC (Reliable Connection) Queue Pair with SRQ (RoCE).
 ///
 /// Type parameters:
-/// - `Entry`: Entry type stored in the WQE table
-/// - `OnComplete`: Completion callback type `Fn(Cqe, Entry)`
-pub type RcQpRoCEWithSrq<Entry, OnComplete> = RcQpInner<Entry, RoCE, OrderedWqeTable<Entry>, SharedRq<Entry>, OnComplete>;
-
-/// Deprecated type alias for backward compatibility. Use `RcQpIb` instead.
-#[deprecated(note = "Use RcQpIb or RcQpRoCE with explicit transport type")]
-pub type RcQp<Entry, OnComplete> = RcQpInner<Entry, InfiniBand, OrderedWqeTable<Entry>, OwnedRq<Entry>, OnComplete>;
+/// - `SqEntry`: Entry type stored in the SQ WQE table
+/// - `RqEntry`: Entry type stored in the SRQ WQE table
+/// - `OnSqComplete`: SQ completion callback type `Fn(Cqe, SqEntry)`
+/// - `OnRqComplete`: RQ completion callback type `Fn(Cqe, RqEntry)`
+pub type RcQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = RcQpInner<SqEntry, RqEntry, RoCE, OrderedWqeTable<SqEntry>, SharedRq<RqEntry>, OnSqComplete, OnRqComplete>;
 
 /// RC (Reliable Connection) Queue Pair (internal implementation).
 ///
 /// Created using mlx5dv_create_qp for direct hardware access.
 ///
 /// Type parameters:
-/// - `Entry`: Entry type stored in the WQE table (used for both SQ and RQ)
+/// - `SqEntry`: Entry type stored in the SQ WQE table
+/// - `RqEntry`: Entry type stored in the RQ WQE table
 /// - `Transport`: Transport type tag (`InfiniBand` or `RoCE`)
 /// - `TableType`: WQE table behavior for the SQ (`OrderedWqeTable` or `UnorderedWqeTable`)
-/// - `Rq`: Receive queue type (`OwnedRq<Entry>` or `SharedRq<Entry>`)
-/// - `OnComplete`: Completion callback type
-pub struct RcQpInner<Entry, Transport, TableType, Rq, OnComplete> {
+/// - `Rq`: Receive queue type (`OwnedRq<RqEntry>` or `SharedRq<RqEntry>`)
+/// - `OnSqComplete`: SQ completion callback type
+/// - `OnRqComplete`: RQ completion callback type
+pub struct RcQpInner<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> {
     qp: NonNull<mlx5_sys::ibv_qp>,
     state: Cell<QpState>,
     /// Maximum inline data size (from QP config)
     max_inline_data: u32,
-    sq: Option<SendQueueState<Entry, TableType>>,
+    sq: Option<SendQueueState<SqEntry, TableType>>,
     rq: Rq,
-    callback: OnComplete,
+    sq_callback: OnSqComplete,
+    rq_callback: OnRqComplete,
     /// Weak reference to the send CQ for unregistration on drop
     send_cq: Weak<CompletionQueue>,
     /// Weak reference to the recv CQ for unregistration on drop
     recv_cq: Weak<CompletionQueue>,
     /// Keep the PD alive while this QP exists.
     _pd: Pd,
-    /// Phantom data for transport type
-    _transport: std::marker::PhantomData<Transport>,
+    /// Phantom data for transport type and RqEntry
+    _marker: std::marker::PhantomData<(Transport, RqEntry)>,
 }
 
 impl Context {
     /// Create an RC Queue Pair using mlx5dv_create_qp.
     ///
     /// Only signaled WQEs have entries stored in the WQE table.
-    /// The callback is invoked for each completion with the CQE and
+    /// The callbacks are invoked for each completion with the CQE and
     /// the entry stored at WQE submission.
     ///
     /// # Arguments
@@ -862,26 +869,30 @@ impl Context {
     /// * `send_cq` - Completion Queue for send completions (wrapped in Rc for shared ownership)
     /// * `recv_cq` - Completion Queue for receive completions (wrapped in Rc for shared ownership)
     /// * `config` - QP configuration
-    /// * `callback` - Completion callback `Fn(Cqe, Entry)` called for each signaled completion
+    /// * `sq_callback` - SQ completion callback `Fn(Cqe, SqEntry)` called for each signaled SQ completion
+    /// * `rq_callback` - RQ completion callback `Fn(Cqe, RqEntry)` called for each RQ completion
     ///
     /// # Errors
     /// Returns an error if the QP cannot be created.
     ///
     /// # Note
     /// The send_cq must have `init_direct_access()` called before this function.
-    pub fn create_rc_qp<Entry, OnComplete>(
+    pub fn create_rc_qp<SqEntry, RqEntry, OnSqComplete, OnRqComplete>(
         &self,
         pd: &Pd,
         send_cq: &Rc<CompletionQueue>,
         recv_cq: &Rc<CompletionQueue>,
         config: &RcQpConfig,
-        callback: OnComplete,
-    ) -> io::Result<Rc<RefCell<RcQp<Entry, OnComplete>>>>
+        sq_callback: OnSqComplete,
+        rq_callback: OnRqComplete,
+    ) -> io::Result<Rc<RefCell<RcQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>>>
     where
-        Entry: 'static,
-        OnComplete: Fn(Cqe, Entry) + 'static,
+        SqEntry: 'static,
+        RqEntry: 'static,
+        OnSqComplete: Fn(Cqe, SqEntry) + 'static,
+        OnRqComplete: Fn(Cqe, RqEntry) + 'static,
     {
-        let qp = self.create_rc_qp_raw(pd, send_cq, recv_cq, config, callback)?;
+        let qp = self.create_rc_qp_raw(pd, send_cq, recv_cq, config, sq_callback, rq_callback)?;
         let qp_rc = Rc::new(RefCell::new(qp));
         let qpn = qp_rc.borrow().qpn();
 
@@ -892,16 +903,18 @@ impl Context {
         Ok(qp_rc)
     }
 
-    fn create_rc_qp_raw<Entry, OnComplete>(
+    fn create_rc_qp_raw<SqEntry, RqEntry, OnSqComplete, OnRqComplete>(
         &self,
         pd: &Pd,
         send_cq: &Rc<CompletionQueue>,
         recv_cq: &Rc<CompletionQueue>,
         config: &RcQpConfig,
-        callback: OnComplete,
-    ) -> io::Result<RcQp<Entry, OnComplete>>
+        sq_callback: OnSqComplete,
+        rq_callback: OnRqComplete,
+    ) -> io::Result<RcQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>
     where
-        OnComplete: Fn(Cqe, Entry),
+        OnSqComplete: Fn(Cqe, SqEntry),
+        OnRqComplete: Fn(Cqe, RqEntry),
     {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
@@ -936,15 +949,16 @@ impl Context {
                 max_inline_data: config.max_inline_data,
                 sq: None,
                 rq: OwnedRq::new(None),
-                callback,
+                sq_callback,
+                rq_callback,
                 send_cq: Rc::downgrade(send_cq),
                 recv_cq: Rc::downgrade(recv_cq),
                 _pd: pd.clone(),
-                _transport: std::marker::PhantomData,
+                _marker: std::marker::PhantomData,
             };
 
             // Auto-initialize direct access
-            RcQpIb::<Entry, OnComplete>::init_direct_access_internal(&mut result)?;
+            RcQpIb::<SqEntry, RqEntry, OnSqComplete, OnRqComplete>::init_direct_access_internal(&mut result)?;
 
             Ok(result)
         }
@@ -962,24 +976,28 @@ impl Context {
     /// * `recv_cq` - Completion Queue for receive completions (wrapped in Rc for shared ownership)
     /// * `srq` - Shared Receive Queue
     /// * `config` - QP configuration (max_recv_wr and max_recv_sge are ignored)
-    /// * `callback` - Completion callback `Fn(Cqe, Entry)` called for each signaled completion
+    /// * `sq_callback` - SQ completion callback `Fn(Cqe, SqEntry)` called for each signaled SQ completion
+    /// * `rq_callback` - RQ completion callback `Fn(Cqe, RqEntry)` called for each RQ completion
     ///
     /// # Errors
     /// Returns an error if the QP cannot be created.
-    pub fn create_rc_qp_with_srq<Entry, OnComplete>(
+    pub fn create_rc_qp_with_srq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>(
         &self,
         pd: &Pd,
         send_cq: &Rc<CompletionQueue>,
         recv_cq: &Rc<CompletionQueue>,
-        srq: &Srq<Entry>,
+        srq: &Srq<RqEntry>,
         config: &RcQpConfig,
-        callback: OnComplete,
-    ) -> io::Result<Rc<RefCell<RcQpIbWithSrq<Entry, OnComplete>>>>
+        sq_callback: OnSqComplete,
+        rq_callback: OnRqComplete,
+    ) -> io::Result<Rc<RefCell<RcQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>>>
     where
-        Entry: 'static,
-        OnComplete: Fn(Cqe, Entry) + 'static,
+        SqEntry: 'static,
+        RqEntry: 'static,
+        OnSqComplete: Fn(Cqe, SqEntry) + 'static,
+        OnRqComplete: Fn(Cqe, RqEntry) + 'static,
     {
-        let qp = self.create_rc_qp_with_srq_raw(pd, send_cq, recv_cq, srq, config, callback)?;
+        let qp = self.create_rc_qp_with_srq_raw(pd, send_cq, recv_cq, srq, config, sq_callback, rq_callback)?;
         let qp_rc = Rc::new(RefCell::new(qp));
         let qpn = qp_rc.borrow().qpn();
 
@@ -990,17 +1008,19 @@ impl Context {
         Ok(qp_rc)
     }
 
-    fn create_rc_qp_with_srq_raw<Entry, OnComplete>(
+    fn create_rc_qp_with_srq_raw<SqEntry, RqEntry, OnSqComplete, OnRqComplete>(
         &self,
         pd: &Pd,
         send_cq: &Rc<CompletionQueue>,
         recv_cq: &Rc<CompletionQueue>,
-        srq: &Srq<Entry>,
+        srq: &Srq<RqEntry>,
         config: &RcQpConfig,
-        callback: OnComplete,
-    ) -> io::Result<RcQpIbWithSrq<Entry, OnComplete>>
+        sq_callback: OnSqComplete,
+        rq_callback: OnRqComplete,
+    ) -> io::Result<RcQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>
     where
-        OnComplete: Fn(Cqe, Entry),
+        OnSqComplete: Fn(Cqe, SqEntry),
+        OnRqComplete: Fn(Cqe, RqEntry),
     {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
@@ -1036,15 +1056,16 @@ impl Context {
                 max_inline_data: config.max_inline_data,
                 sq: None,
                 rq: SharedRq::new(srq.clone()),
-                callback,
+                sq_callback,
+                rq_callback,
                 send_cq: Rc::downgrade(send_cq),
                 recv_cq: Rc::downgrade(recv_cq),
                 _pd: pd.clone(),
-                _transport: std::marker::PhantomData,
+                _marker: std::marker::PhantomData,
             };
 
             // Initialize SQ direct access
-            RcQpIbWithSrq::<Entry, OnComplete>::init_direct_access_internal(&mut result)?;
+            RcQpIbWithSrq::<SqEntry, RqEntry, OnSqComplete, OnRqComplete>::init_direct_access_internal(&mut result)?;
 
             Ok(result)
         }
@@ -1055,31 +1076,31 @@ impl Context {
     /// The callback is stored on the MonoCq side, not the QP. This enables
     /// the compiler to inline the callback when polling the MonoCq.
     ///
+    /// Uses a single Entry type for both SQ and RQ completions.
+    /// If you need different Entry types, use separate CQs for send and recv.
+    ///
     /// # Arguments
     /// * `pd` - Protection Domain
-    /// * `send_cq` - MonoCq for send completions
-    /// * `recv_cq` - MonoCq for receive completions
+    /// * `cq` - MonoCq for completions (can be same CQ for send and recv)
     /// * `config` - QP configuration
     ///
     /// # Errors
     /// Returns an error if the QP cannot be created.
-    pub fn create_rc_qp_for_mono_cq<Entry, Q, SF, RF>(
+    pub fn create_rc_qp_for_mono_cq<Entry, Q, F>(
         &self,
         pd: &Pd,
-        send_cq: &crate::mono_cq::MonoCq<Q, SF>,
-        recv_cq: &crate::mono_cq::MonoCq<Q, RF>,
+        cq: &crate::mono_cq::MonoCq<Q, F>,
         config: &RcQpConfig,
     ) -> io::Result<Rc<RefCell<RcQpForMonoCq<Entry>>>>
     where
         Q: crate::mono_cq::CompletionSource,
-        SF: Fn(Cqe, Q::Entry),
-        RF: Fn(Cqe, Q::Entry),
+        F: Fn(Cqe, Q::Entry),
     {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
-            qp_attr.send_cq = send_cq.as_ptr();
-            qp_attr.recv_cq = recv_cq.as_ptr();
+            qp_attr.send_cq = cq.as_ptr();
+            qp_attr.recv_cq = cq.as_ptr();
             qp_attr.cap.max_send_wr = config.max_send_wr;
             qp_attr.cap.max_recv_wr = config.max_recv_wr;
             qp_attr.cap.max_send_sge = config.max_send_sge;
@@ -1157,18 +1178,19 @@ impl Context {
                     dbrec: dv_qp.dbrec,
                     table: (0..rq_wqe_cnt).map(|_| Cell::new(None)).collect(),
                 })),
-                callback: (),
+                sq_callback: (),
+                rq_callback: (),
                 // Empty weak references - MonoCq handles unregistration via Weak upgrade failure
                 send_cq: Weak::new(),
                 recv_cq: Weak::new(),
                 _pd: pd.clone(),
-                _transport: std::marker::PhantomData,
+                _marker: std::marker::PhantomData,
             })))
         }
     }
 }
 
-impl<Entry, Transport, TableType, Rq, OnComplete> Drop for RcQpInner<Entry, Transport, TableType, Rq, OnComplete> {
+impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> Drop for RcQpInner<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> {
     fn drop(&mut self) {
         let qpn = self.qpn();
         // Unregister from both CQs before destroying QP
@@ -1184,7 +1206,7 @@ impl<Entry, Transport, TableType, Rq, OnComplete> Drop for RcQpInner<Entry, Tran
     }
 }
 
-impl<Entry, Transport, TableType, Rq, OnComplete> RcQpInner<Entry, Transport, TableType, Rq, OnComplete> {
+impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> RcQpInner<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> {
     /// Get the QP number.
     pub fn qpn(&self) -> u32 {
         unsafe { (*self.qp.as_ptr()).qp_num }
@@ -1321,7 +1343,7 @@ impl<Entry, Transport, TableType, Rq, OnComplete> RcQpInner<Entry, Transport, Ta
         Ok(())
     }
 
-    fn sq(&self) -> io::Result<&SendQueueState<Entry, TableType>> {
+    fn sq(&self) -> io::Result<&SendQueueState<SqEntry, TableType>> {
         self.sq
             .as_ref()
             .ok_or_else(|| io::Error::other("direct access not initialized"))
@@ -1341,7 +1363,7 @@ impl<Entry, Transport, TableType, Rq, OnComplete> RcQpInner<Entry, Transport, Ta
 }
 
 /// InfiniBand transport-specific methods.
-impl<Entry, TableType, Rq, OnComplete> RcQpInner<Entry, InfiniBand, TableType, Rq, OnComplete> {
+impl<SqEntry, RqEntry, TableType, Rq, OnSqComplete, OnRqComplete> RcQpInner<SqEntry, RqEntry, InfiniBand, TableType, Rq, OnSqComplete, OnRqComplete> {
     /// Transition QP from INIT to RTR (Ready to Receive).
     ///
     /// Uses LID-based addressing for InfiniBand fabric.
@@ -1410,7 +1432,7 @@ impl<Entry, TableType, Rq, OnComplete> RcQpInner<Entry, InfiniBand, TableType, R
 }
 
 /// RoCE transport-specific methods.
-impl<Entry, TableType, Rq, OnComplete> RcQpInner<Entry, RoCE, TableType, Rq, OnComplete> {
+impl<SqEntry, RqEntry, TableType, Rq, OnSqComplete, OnRqComplete> RcQpInner<SqEntry, RqEntry, RoCE, TableType, Rq, OnSqComplete, OnRqComplete> {
     /// Transition QP from INIT to RTR (Ready to Receive).
     ///
     /// Uses GID-based addressing for RoCE (RDMA over Converged Ethernet).
@@ -1493,7 +1515,7 @@ impl<Entry, TableType, Rq, OnComplete> RcQpInner<Entry, RoCE, TableType, Rq, OnC
     }
 }
 
-impl<Entry, OnComplete> RcQpIb<Entry, OnComplete> {
+impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> RcQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete> {
     /// Initialize direct queue access (internal implementation).
     fn init_direct_access_internal(&mut self) -> io::Result<()> {
         if self.sq.is_some() {
@@ -1534,7 +1556,7 @@ impl<Entry, OnComplete> RcQpIb<Entry, OnComplete> {
     }
 }
 
-impl<Entry, OnComplete> RcQpIbWithSrq<Entry, OnComplete> {
+impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> RcQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> {
     /// Initialize direct queue access for SRQ variant (SQ only).
     fn init_direct_access_internal(&mut self) -> io::Result<()> {
         if self.sq.is_some() {
@@ -1569,9 +1591,10 @@ impl<Entry, OnComplete> RcQpIbWithSrq<Entry, OnComplete> {
 // CompletionTarget impl for RcQp with OwnedRq
 // =============================================================================
 
-impl<Entry, OnComplete> CompletionTarget for RcQpIb<Entry, OnComplete>
+impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> CompletionTarget for RcQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
 where
-    OnComplete: Fn(Cqe, Entry),
+    OnSqComplete: Fn(Cqe, SqEntry),
+    OnRqComplete: Fn(Cqe, RqEntry),
 {
     fn qpn(&self) -> u32 {
         RcQpInner::qpn(self)
@@ -1583,14 +1606,14 @@ where
             if let Some(rq) = self.rq.as_ref()
                 && let Some(entry) = rq.process_completion(cqe.wqe_counter)
             {
-                (self.callback)(cqe, entry);
+                (self.rq_callback)(cqe, entry);
             }
         } else {
             // SQ completion (requester)
             if let Some(sq) = self.sq.as_ref()
                 && let Some(entry) = sq.process_completion(cqe.wqe_counter)
             {
-                (self.callback)(cqe, entry);
+                (self.sq_callback)(cqe, entry);
             }
         }
     }
@@ -1600,9 +1623,10 @@ where
 // CompletionTarget impl for RcQp with SharedRq (SRQ)
 // =============================================================================
 
-impl<Entry, OnComplete> CompletionTarget for RcQpIbWithSrq<Entry, OnComplete>
+impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> CompletionTarget for RcQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
 where
-    OnComplete: Fn(Cqe, Entry),
+    OnSqComplete: Fn(Cqe, SqEntry),
+    OnRqComplete: Fn(Cqe, RqEntry),
 {
     fn qpn(&self) -> u32 {
         RcQpInner::qpn(self)
@@ -1613,14 +1637,14 @@ where
             // RQ completion via SRQ (responder)
             if let Some(entry) = self.rq.srq().process_recv_completion(cqe.wqe_counter)
             {
-                (self.callback)(cqe, entry);
+                (self.rq_callback)(cqe, entry);
             }
         } else {
             // SQ completion (requester)
             if let Some(sq) = self.sq.as_ref()
                 && let Some(entry) = sq.process_completion(cqe.wqe_counter)
             {
-                (self.callback)(cqe, entry);
+                (self.sq_callback)(cqe, entry);
             }
         }
     }
@@ -1630,7 +1654,7 @@ where
 // ReceiveQueue methods (OwnedRq)
 // =============================================================================
 
-impl<Entry, Transport, TableType, OnComplete> RcQpInner<Entry, Transport, TableType, OwnedRq<Entry>, OnComplete> {
+impl<SqEntry, RqEntry, Transport, TableType, OnSqComplete, OnRqComplete> RcQpInner<SqEntry, RqEntry, Transport, TableType, OwnedRq<RqEntry>, OnSqComplete, OnRqComplete> {
     /// Ring the RQ doorbell to notify HCA of new WQEs.
     pub fn ring_rq_doorbell(&self) {
         if let Some(rq) = self.rq.as_ref() {
@@ -1643,9 +1667,9 @@ impl<Entry, Transport, TableType, OnComplete> RcQpInner<Entry, Transport, TableT
 // SRQ access methods (SharedRq)
 // =============================================================================
 
-impl<Entry, Transport, TableType, OnComplete> RcQpInner<Entry, Transport, TableType, SharedRq<Entry>, OnComplete> {
+impl<SqEntry, RqEntry, Transport, TableType, OnSqComplete, OnRqComplete> RcQpInner<SqEntry, RqEntry, Transport, TableType, SharedRq<RqEntry>, OnSqComplete, OnRqComplete> {
     /// Get a reference to the underlying SRQ.
-    pub fn srq(&self) -> &Srq<Entry> {
+    pub fn srq(&self) -> &Srq<RqEntry> {
         self.rq.srq()
     }
 }
@@ -1654,7 +1678,7 @@ impl<Entry, Transport, TableType, OnComplete> RcQpInner<Entry, Transport, TableT
 // Common methods
 // =============================================================================
 
-impl<Entry, Transport, TableType, Rq, OnComplete> RcQpInner<Entry, Transport, TableType, Rq, OnComplete> {
+impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> RcQpInner<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> {
     /// Get the Send Queue Number (SQN).
     ///
     /// Returns None if direct access is not initialized.
@@ -1689,7 +1713,7 @@ pub struct SqSlot {
 
 use crate::mono_cq::CompletionSource;
 
-impl<Entry> CompletionSource for RcQpInner<Entry, InfiniBand, OrderedWqeTable<Entry>, OwnedRq<Entry>, ()> {
+impl<Entry> CompletionSource for RcQpInner<Entry, Entry, InfiniBand, OrderedWqeTable<Entry>, OwnedRq<Entry>, (), ()> {
     type Entry = Entry;
 
     fn qpn(&self) -> u32 {
@@ -1698,10 +1722,10 @@ impl<Entry> CompletionSource for RcQpInner<Entry, InfiniBand, OrderedWqeTable<En
 
     fn process_cqe(&self, cqe: Cqe) -> Option<Entry> {
         if cqe.opcode.is_responder() {
-            // RQ completion (responder)
+            // RQ completion
             self.rq.as_ref()?.process_completion(cqe.wqe_counter)
         } else {
-            // SQ completion (requester)
+            // SQ completion
             self.sq.as_ref()?.process_completion(cqe.wqe_counter)
         }
     }
@@ -1713,8 +1737,9 @@ impl<Entry> CompletionSource for RcQpInner<Entry, InfiniBand, OrderedWqeTable<En
 
 /// RcQp type for use with MonoCq (no internal callback).
 ///
-/// This is an alias for `RcQpIb<T, ()>`. All methods from `RcQpIb` are available.
-pub type RcQpForMonoCq<Entry> = RcQpInner<Entry, InfiniBand, OrderedWqeTable<Entry>, OwnedRq<Entry>, ()>;
+/// Uses a single Entry type for both SQ and RQ completions.
+/// If you need different Entry types for SQ and RQ, use separate CQs.
+pub type RcQpForMonoCq<Entry> = RcQpInner<Entry, Entry, InfiniBand, OrderedWqeTable<Entry>, OwnedRq<Entry>, (), ()>;
 
 // =============================================================================
 // Simplified WQE Builder API
@@ -2389,7 +2414,7 @@ impl<'a, Entry> NopWqeBuilder<'a, Entry> {
 // QP Entry Points (OwnedRq - RQ methods)
 // =============================================================================
 
-impl<Entry, Transport, OnComplete> RcQpInner<Entry, Transport, OrderedWqeTable<Entry>, OwnedRq<Entry>, OnComplete> {
+impl<SqEntry, RqEntry, Transport, OnSqComplete, OnRqComplete> RcQpInner<SqEntry, RqEntry, Transport, OrderedWqeTable<SqEntry>, OwnedRq<RqEntry>, OnSqComplete, OnRqComplete> {
     /// Post a receive WQE with a single scatter/gather entry.
     ///
     /// # Arguments
@@ -2404,7 +2429,7 @@ impl<Entry, Transport, OnComplete> RcQpInner<Entry, Transport, OrderedWqeTable<E
     /// qp.ring_rq_doorbell();
     /// ```
     #[inline]
-    pub fn post_recv(&self, entry: Entry, addr: u64, len: u32, lkey: u32) -> io::Result<()> {
+    pub fn post_recv(&self, entry: RqEntry, addr: u64, len: u32, lkey: u32) -> io::Result<()> {
         let rq = self
             .rq
             .as_ref()
@@ -2448,7 +2473,7 @@ impl<Entry, Transport, OnComplete> RcQpInner<Entry, Transport, OrderedWqeTable<E
     /// # Errors
     /// Returns `BlueflameNotAvailable` if BlueFlame is not supported on this device.
     #[inline]
-    pub fn blueflame_rq_batch(&self) -> Result<RqBlueflameWqeBatch<'_, Entry>, SubmissionError> {
+    pub fn blueflame_rq_batch(&self) -> Result<RqBlueflameWqeBatch<'_, RqEntry>, SubmissionError> {
         let rq = self.rq.as_ref().ok_or(SubmissionError::RqFull)?;
         let sq = self.sq.as_ref().ok_or(SubmissionError::BlueflameNotAvailable)?;
         if sq.bf_size == 0 {
@@ -2462,7 +2487,7 @@ impl<Entry, Transport, OnComplete> RcQpInner<Entry, Transport, OrderedWqeTable<E
 // QP Entry Points (sq_wqe - IB)
 // =============================================================================
 
-impl<Entry, Rq, OnComplete> RcQpInner<Entry, InfiniBand, OrderedWqeTable<Entry>, Rq, OnComplete> {
+impl<SqEntry, RqEntry, Rq, OnSqComplete, OnRqComplete> RcQpInner<SqEntry, RqEntry, InfiniBand, OrderedWqeTable<SqEntry>, Rq, OnSqComplete, OnRqComplete> {
     /// Get a SQ WQE builder for InfiniBand transport.
     ///
     /// # Example
@@ -2474,7 +2499,7 @@ impl<Entry, Rq, OnComplete> RcQpInner<Entry, InfiniBand, OrderedWqeTable<Entry>,
     /// qp.ring_sq_doorbell();
     /// ```
     #[inline]
-    pub fn sq_wqe(&self) -> io::Result<SqWqeEntryPoint<'_, Entry, NoAv>> {
+    pub fn sq_wqe(&self) -> io::Result<SqWqeEntryPoint<'_, SqEntry, NoAv>> {
         let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -2483,7 +2508,7 @@ impl<Entry, Rq, OnComplete> RcQpInner<Entry, InfiniBand, OrderedWqeTable<Entry>,
     }
 }
 
-impl<Entry, Rq, OnComplete> RcQpInner<Entry, RoCE, OrderedWqeTable<Entry>, Rq, OnComplete> {
+impl<SqEntry, RqEntry, Rq, OnSqComplete, OnRqComplete> RcQpInner<SqEntry, RqEntry, RoCE, OrderedWqeTable<SqEntry>, Rq, OnSqComplete, OnRqComplete> {
     /// Get a SQ WQE builder for RoCE transport.
     ///
     /// # Example
@@ -2495,7 +2520,7 @@ impl<Entry, Rq, OnComplete> RcQpInner<Entry, RoCE, OrderedWqeTable<Entry>, Rq, O
     /// qp.ring_sq_doorbell();
     /// ```
     #[inline]
-    pub fn sq_wqe<'a>(&'a self, grh: &'a GrhAttr) -> io::Result<SqWqeEntryPoint<'a, Entry, &'a GrhAttr>> {
+    pub fn sq_wqe<'a>(&'a self, grh: &'a GrhAttr) -> io::Result<SqWqeEntryPoint<'a, SqEntry, &'a GrhAttr>> {
         let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -2959,7 +2984,7 @@ impl<'b, 'a, Entry> BlueflameWqeBuilder<'b, 'a, Entry, HasData> {
     }
 }
 
-impl<Entry, Rq, OnComplete> RcQpInner<Entry, InfiniBand, OrderedWqeTable<Entry>, Rq, OnComplete> {
+impl<SqEntry, RqEntry, Rq, OnSqComplete, OnRqComplete> RcQpInner<SqEntry, RqEntry, InfiniBand, OrderedWqeTable<SqEntry>, Rq, OnSqComplete, OnRqComplete> {
     /// Get a BlueFlame batch builder for low-latency WQE submission.
     ///
     /// Multiple WQEs can be accumulated in the BlueFlame buffer (up to 256 bytes)
@@ -2976,7 +3001,7 @@ impl<Entry, Rq, OnComplete> RcQpInner<Entry, InfiniBand, OrderedWqeTable<Entry>,
     /// # Errors
     /// Returns `BlueflameNotAvailable` if BlueFlame is not supported on this device.
     #[inline]
-    pub fn blueflame_sq_wqe(&self) -> Result<BlueflameWqeBatch<'_, Entry>, SubmissionError> {
+    pub fn blueflame_sq_wqe(&self) -> Result<BlueflameWqeBatch<'_, SqEntry>, SubmissionError> {
         let sq = self.sq.as_ref().ok_or(SubmissionError::SqFull)?;
         if sq.bf_size == 0 {
             return Err(SubmissionError::BlueflameNotAvailable);

@@ -16,18 +16,21 @@ mod common;
 
 use std::rc::Rc;
 
-use mlx5::qp::{QpState, RcQpConfig, RemoteQpInfo};
-use mlx5::wqe::{TxFlags, WqeFlags, WqeOpcode};
+use mlx5::qp::{QpState, RcQpConfig, RcQpIb, RemoteQpInfo};
+use mlx5::wqe::TxFlags;
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
+
+/// Callback type alias for tests
+type TestCallback = fn(mlx5::cq::Cqe, u64);
 
 /// Result type for create_rc_loopback_pair
 ///
 /// Drop order is now automatically handled by Rc-based resource management.
 /// QPs, CQs, and MRs all internally hold references to their parent resources.
 pub struct RcLoopbackPair {
-    pub qp1: Rc<std::cell::RefCell<mlx5::qp::RcQp<u64, fn(mlx5::cq::Cqe, u64)>>>,
-    pub qp2: Rc<std::cell::RefCell<mlx5::qp::RcQp<u64, fn(mlx5::cq::Cqe, u64)>>>,
+    pub qp1: Rc<std::cell::RefCell<RcQpIb<u64, u64, TestCallback, TestCallback>>>,
+    pub qp2: Rc<std::cell::RefCell<RcQpIb<u64, u64, TestCallback, TestCallback>>>,
     pub send_cq: Rc<mlx5::cq::CompletionQueue>,
     _recv_cq1: Rc<mlx5::cq::CompletionQueue>,
     _recv_cq2: Rc<mlx5::cq::CompletionQueue>,
@@ -38,16 +41,17 @@ pub struct RcLoopbackPair {
 /// Helper to create a loopback RC QP pair.
 fn create_rc_loopback_pair(ctx: &TestContext) -> RcLoopbackPair {
     // Create separate send CQ (shared for polling) and recv CQs
-    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    let send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
-    let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
+    let recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    let recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     let config = RcQpConfig::default();
 
-    fn noop_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
+    fn noop_sq_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
+    fn noop_rq_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
 
     let qp1 = ctx
         .ctx
@@ -56,7 +60,8 @@ fn create_rc_loopback_pair(ctx: &TestContext) -> RcLoopbackPair {
             &send_cq,
             &recv_cq1,
             &config,
-            noop_callback as fn(_, _),
+            noop_sq_callback as TestCallback,
+            noop_rq_callback as TestCallback,
         )
         .expect("Failed to create QP1");
 
@@ -67,7 +72,8 @@ fn create_rc_loopback_pair(ctx: &TestContext) -> RcLoopbackPair {
             &send_cq,
             &recv_cq2,
             &config,
-            noop_callback as fn(_, _),
+            noop_sq_callback as TestCallback,
+            noop_rq_callback as TestCallback,
         )
         .expect("Failed to create QP2");
 
@@ -649,6 +655,9 @@ fn test_rc_send_recv() {
         recv_syndrome_clone.set(cqe.syndrome);
     };
 
+    fn noop_sq_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
+    fn noop_rq_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
+
     let qp1 = ctx
         .ctx
         .create_rc_qp(
@@ -656,13 +665,14 @@ fn test_rc_send_recv() {
             &send_cq,
             &recv_cq1,
             &config,
-            noop_callback as fn(_, _),
+            noop_sq_callback as fn(_, _),
+            noop_rq_callback as fn(_, _),
         )
         .expect("Failed to create QP1");
 
     let qp2 = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, recv_callback)
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, noop_sq_callback as fn(_, _), recv_callback)
         .expect("Failed to create QP2");
 
     // Connect QPs
@@ -814,22 +824,24 @@ fn test_rc_send_recv_pingpong() {
         ..Default::default()
     };
 
-    // Callbacks that capture opcode
-    let callback1 = move |cqe: mlx5::cq::Cqe, _entry: u64| {
+    // Callbacks that capture opcode (for RQ completions)
+    let rq_callback1 = move |cqe: mlx5::cq::Cqe, _entry: u64| {
         recv1_opcode_clone.set(Some(cqe.opcode));
     };
-    let callback2 = move |cqe: mlx5::cq::Cqe, _entry: u64| {
+    let rq_callback2 = move |cqe: mlx5::cq::Cqe, _entry: u64| {
         recv2_opcode_clone.set(Some(cqe.opcode));
     };
 
+    fn noop_sq_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
+
     let qp1 = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq1, &config, callback1)
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq1, &config, noop_sq_callback as fn(_, _), rq_callback1)
         .expect("Failed to create QP1");
 
     let qp2 = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, callback2)
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, noop_sq_callback as fn(_, _), rq_callback2)
         .expect("Failed to create QP2");
 
     // Connect QPs

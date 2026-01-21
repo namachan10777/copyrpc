@@ -50,7 +50,7 @@ fn test_ud_creation() {
 
     let qp = ctx
         .ctx
-        .create_ud_qp::<u64, _>(&ctx.pd, &send_cq, &recv_cq, &config, |_cqe, _entry| {})
+        .create_ud_qp::<u64, u64, _, _>(&ctx.pd, &send_cq, &recv_cq, &config, |_cqe, _entry| {}, |_cqe, _entry| {})
         .expect("Failed to create UD QP");
 
     println!("UD QP creation test passed!");
@@ -78,7 +78,7 @@ fn test_ud_activate() {
 
     let qp = ctx
         .ctx
-        .create_ud_qp::<u64, _>(&ctx.pd, &send_cq, &recv_cq, &config, |_cqe, _entry| {})
+        .create_ud_qp::<u64, u64, _, _>(&ctx.pd, &send_cq, &recv_cq, &config, |_cqe, _entry| {}, |_cqe, _entry| {})
         .expect("Failed to create UD QP");
 
     // Activate QP
@@ -123,7 +123,7 @@ fn test_ud_send_recv() {
     };
     let sender = ctx
         .ctx
-        .create_ud_qp::<u64, _>(&ctx.pd, &send_cq, &recv_cq, &send_config, |_cqe, _entry| {})
+        .create_ud_qp::<u64, u64, _, _>(&ctx.pd, &send_cq, &recv_cq, &send_config, |_cqe, _entry| {}, |_cqe, _entry| {})
         .expect("Failed to create sender QP");
     sender
         .borrow_mut()
@@ -137,7 +137,7 @@ fn test_ud_send_recv() {
     };
     let receiver = ctx
         .ctx
-        .create_ud_qp::<u64, _>(&ctx.pd, &send_cq, &recv_cq, &recv_config, |_cqe, _entry| {})
+        .create_ud_qp::<u64, u64, _, _>(&ctx.pd, &send_cq, &recv_cq, &recv_config, |_cqe, _entry| {}, |_cqe, _entry| {})
         .expect("Failed to create receiver QP");
     receiver
         .borrow_mut()
@@ -255,7 +255,7 @@ fn test_ud_send_raw_av() {
     };
     let sender = ctx
         .ctx
-        .create_ud_qp::<u64, _>(&ctx.pd, &send_cq, &recv_cq, &send_config, |_cqe, _entry| {})
+        .create_ud_qp::<u64, u64, _, _>(&ctx.pd, &send_cq, &recv_cq, &send_config, |_cqe, _entry| {}, |_cqe, _entry| {})
         .expect("Failed to create sender QP");
     sender
         .borrow_mut()
@@ -269,7 +269,7 @@ fn test_ud_send_raw_av() {
     };
     let receiver = ctx
         .ctx
-        .create_ud_qp::<u64, _>(&ctx.pd, &send_cq, &recv_cq, &recv_config, |_cqe, _entry| {})
+        .create_ud_qp::<u64, u64, _, _>(&ctx.pd, &send_cq, &recv_cq, &recv_config, |_cqe, _entry| {}, |_cqe, _entry| {})
         .expect("Failed to create receiver QP");
     receiver
         .borrow_mut()
@@ -386,7 +386,7 @@ fn test_ud_multiple_destinations() {
     };
     let sender = ctx
         .ctx
-        .create_ud_qp::<u64, _>(&ctx.pd, &cq, &recv_cq, &config, |_cqe, _entry| {})
+        .create_ud_qp::<u64, u64, _, _>(&ctx.pd, &cq, &recv_cq, &config, |_cqe, _entry| {}, |_cqe, _entry| {})
         .expect("Failed to create sender QP");
     sender
         .borrow_mut()
@@ -402,7 +402,7 @@ fn test_ud_multiple_destinations() {
     for i in 0..num_receivers {
         let receiver = ctx
             .ctx
-            .create_ud_qp::<u64, _>(&ctx.pd, &cq, &recv_cq, &config, |_cqe, _entry| {})
+            .create_ud_qp::<u64, u64, _, _>(&ctx.pd, &cq, &recv_cq, &config, |_cqe, _entry| {}, |_cqe, _entry| {})
             .expect(&format!("Failed to create receiver {}", i));
         receiver
             .borrow_mut()

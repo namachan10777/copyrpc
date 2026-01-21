@@ -28,7 +28,8 @@ fn test_qp_destroy_after_remote_gone() {
         }
     };
 
-    fn noop_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
+    fn noop_sq_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
+    fn noop_rq_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
 
     let config = RcQpConfig {
         max_send_wr: 64,
@@ -51,7 +52,8 @@ fn test_qp_destroy_after_remote_gone() {
             &send_cq1,
             &recv_cq1,
             &config,
-            noop_callback as fn(_, _),
+            noop_sq_callback as fn(_, _),
+            noop_rq_callback as fn(_, _),
         )
         .expect("create qp1");
 
@@ -67,7 +69,8 @@ fn test_qp_destroy_after_remote_gone() {
             &send_cq2,
             &recv_cq2,
             &config,
-            noop_callback as fn(_, _),
+            noop_sq_callback as fn(_, _),
+            noop_rq_callback as fn(_, _),
         )
         .expect("create qp2");
 
@@ -180,6 +183,7 @@ fn test_qp_destroy_multi_thread() {
                 &recv_cq,
                 &config,
                 noop_callback as fn(_, _),
+                noop_callback as fn(_, _),
             )
             .expect("create qp");
 
@@ -245,6 +249,7 @@ fn test_qp_destroy_multi_thread() {
             &send_cq,
             &recv_cq,
             &config,
+            noop_callback as fn(_, _),
             noop_callback as fn(_, _),
         )
         .expect("create qp");
@@ -349,6 +354,7 @@ fn test_qp_destroy_after_data_transfer() {
                 &recv_cq,
                 &config,
                 noop_callback as fn(_, _),
+                noop_callback as fn(_, _),
             )
             .expect("create qp");
 
@@ -429,6 +435,7 @@ fn test_qp_destroy_after_data_transfer() {
             &send_cq,
             &recv_cq,
             &config,
+            noop_callback as fn(_, _),
             noop_callback as fn(_, _),
         )
         .expect("create qp");
@@ -536,12 +543,11 @@ fn test_qp_destroy_after_actual_send_recv() {
         let server_rx_syndrome = Rc::new(Cell::new(0u8));
         let rx_count_clone = Rc::clone(&server_rx_count);
         let rx_syndrome_clone = Rc::clone(&server_rx_syndrome);
-        let recv_callback = move |cqe: mlx5::cq::Cqe, _entry: u64| {
-            if cqe.opcode.is_responder() {
-                rx_syndrome_clone.set(cqe.syndrome);
-                if cqe.syndrome == 0 {
-                    rx_count_clone.set(rx_count_clone.get() + 1);
-                }
+        fn noop_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
+        let rq_callback = move |cqe: mlx5::cq::Cqe, _entry: u64| {
+            rx_syndrome_clone.set(cqe.syndrome);
+            if cqe.syndrome == 0 {
+                rx_count_clone.set(rx_count_clone.get() + 1);
             }
         };
 
@@ -561,7 +567,7 @@ fn test_qp_destroy_after_actual_send_recv() {
 
         let qp = ctx
             .ctx
-            .create_rc_qp(&ctx.pd, &send_cq, &recv_cq, &config, recv_callback)
+            .create_rc_qp(&ctx.pd, &send_cq, &recv_cq, &config, noop_callback as fn(_, _), rq_callback)
             .expect("create qp");
 
         // Allocate buffer and MR
@@ -662,12 +668,11 @@ fn test_qp_destroy_after_actual_send_recv() {
     let client_rx_syndrome = Rc::new(Cell::new(0u8));
     let rx_count_clone = Rc::clone(&client_rx_count);
     let rx_syndrome_clone = Rc::clone(&client_rx_syndrome);
-    let recv_callback = move |cqe: mlx5::cq::Cqe, _entry: u64| {
-        if cqe.opcode.is_responder() {
-            rx_syndrome_clone.set(cqe.syndrome);
-            if cqe.syndrome == 0 {
-                rx_count_clone.set(rx_count_clone.get() + 1);
-            }
+    fn noop_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
+    let rq_callback = move |cqe: mlx5::cq::Cqe, _entry: u64| {
+        rx_syndrome_clone.set(cqe.syndrome);
+        if cqe.syndrome == 0 {
+            rx_count_clone.set(rx_count_clone.get() + 1);
         }
     };
 
@@ -687,7 +692,7 @@ fn test_qp_destroy_after_actual_send_recv() {
 
     let qp = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq, &config, recv_callback)
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq, &config, noop_callback as fn(_, _), rq_callback)
         .expect("create qp");
 
     // Allocate buffer and MR

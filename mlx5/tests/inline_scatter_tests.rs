@@ -68,7 +68,8 @@ fn test_scatter_to_cqe_diagnostic() {
     let last_recv_cqe: Rc<Cell<Option<Cqe>>> = Rc::new(Cell::new(None));
     let last_recv_cqe_clone = last_recv_cqe.clone();
 
-    fn noop_callback(_cqe: Cqe, _entry: u64) {}
+    fn noop_sq_callback(_cqe: Cqe, _entry: u64) {}
+    fn noop_rq_callback(_cqe: Cqe, _entry: u64) {}
 
     let qp1 = ctx
         .ctx
@@ -77,18 +78,19 @@ fn test_scatter_to_cqe_diagnostic() {
             &send_cq,
             &recv_cq1,
             &config,
-            noop_callback as fn(_, _),
+            noop_sq_callback as fn(_, _),
+            noop_rq_callback as fn(_, _),
         )
         .expect("Failed to create QP1");
 
-    // QP2 uses a callback that captures the CQE
+    // QP2 uses a callback that captures the CQE for RQ completions
     let recv_callback = move |cqe: Cqe, _entry: u64| {
         last_recv_cqe_clone.set(Some(cqe));
     };
 
     let qp2 = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, recv_callback)
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, noop_sq_callback as fn(_, _), recv_callback)
         .expect("Failed to create QP2");
 
     // Connect QPs
@@ -265,7 +267,8 @@ fn test_scatter_to_cqe_disabled() {
     let last_recv_cqe: Rc<Cell<Option<Cqe>>> = Rc::new(Cell::new(None));
     let last_recv_cqe_clone = last_recv_cqe.clone();
 
-    fn noop_callback(_cqe: Cqe, _entry: u64) {}
+    fn noop_sq_callback(_cqe: Cqe, _entry: u64) {}
+    fn noop_rq_callback(_cqe: Cqe, _entry: u64) {}
 
     let qp1 = ctx
         .ctx
@@ -274,7 +277,8 @@ fn test_scatter_to_cqe_disabled() {
             &send_cq,
             &recv_cq1,
             &config,
-            noop_callback as fn(_, _),
+            noop_sq_callback as fn(_, _),
+            noop_rq_callback as fn(_, _),
         )
         .expect("Failed to create QP1");
 
@@ -284,7 +288,7 @@ fn test_scatter_to_cqe_disabled() {
 
     let qp2 = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, recv_callback)
+        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, noop_sq_callback as fn(_, _), recv_callback)
         .expect("Failed to create QP2");
 
     let remote1 = RemoteQpInfo {
@@ -428,6 +432,7 @@ fn test_small_inline_wraparound() {
             &recv_cq1,
             &config,
             noop_callback as fn(_, _),
+            noop_callback as fn(_, _),
         )
         .expect("Failed to create QP1");
     let qp2 = ctx
@@ -437,6 +442,7 @@ fn test_small_inline_wraparound() {
             &send_cq,
             &recv_cq2,
             &config,
+            noop_callback as fn(_, _),
             noop_callback as fn(_, _),
         )
         .expect("Failed to create QP2");
