@@ -101,6 +101,10 @@ pub use cq::{CqConfig, CqeCompressionFormat, CqModeration, CqeSize, Cqe, CqeOpco
 pub use mono_cq::{CompletionSource, MonoCq, MonoCqRc};
 pub use qp::RcQpForMonoCq;
 
+// Re-export RQ type markers for SRQ support
+pub use qp::{OwnedRq, SharedRq, RcQpIbWithSrq, RcQpRoCEWithSrq};
+pub use ud::{UdOwnedRq, UdSharedRq, UdQpWithSrq};
+
 // Re-export TM-SRQ types
 pub use tm_srq::{RqWqeBuilder, TmSrqCompletion};
 

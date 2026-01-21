@@ -18,6 +18,7 @@ use crate::cq::{CompletionQueue, Cqe};
 use crate::device::Context;
 use crate::pd::{AddressHandle, Pd};
 use crate::qp::QpInfo;
+use crate::srq::Srq;
 use crate::wqe::{
     CtrlSeg, DataSeg, HasData, InlineHeader, NoData, OrderedWqeTable,
     SubmissionError, TxFlags, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
@@ -224,6 +225,45 @@ impl<Entry> UdRecvQueueState<Entry> {
 }
 
 // =============================================================================
+// UD Receive Queue Type Markers
+// =============================================================================
+
+/// Marker type for UD QP with owned Receive Queue.
+///
+/// When a QP uses `UdOwnedRq`, it has its own dedicated receive queue and
+/// the RQ-related methods (`post_recv`, `ring_rq_doorbell`, `blueflame_rq_batch`)
+/// are available.
+pub struct UdOwnedRq<Entry>(Option<UdRecvQueueState<Entry>>);
+
+impl<Entry> UdOwnedRq<Entry> {
+    pub(crate) fn new(rq: Option<UdRecvQueueState<Entry>>) -> Self {
+        Self(rq)
+    }
+
+    pub(crate) fn as_ref(&self) -> Option<&UdRecvQueueState<Entry>> {
+        self.0.as_ref()
+    }
+}
+
+/// Marker type for UD QP with Shared Receive Queue (SRQ).
+///
+/// When a QP uses `UdSharedRq`, receive operations are handled through the SRQ
+/// and the QP's own RQ-related methods are not available. Instead, use
+/// `srq()` to access the underlying SRQ.
+pub struct UdSharedRq<Entry>(Srq<Entry>);
+
+impl<Entry> UdSharedRq<Entry> {
+    pub(crate) fn new(srq: Srq<Entry>) -> Self {
+        Self(srq)
+    }
+
+    /// Get a reference to the underlying SRQ.
+    pub fn srq(&self) -> &Srq<Entry> {
+        &self.0
+    }
+}
+
+// =============================================================================
 // UD Receive WQE Builder
 // =============================================================================
 
@@ -351,8 +391,11 @@ impl UdAddressSeg {
 // UD QP
 // =============================================================================
 
-/// Type alias for UD QP with ordered WQE table.
-pub type UdQpWithTable<Entry, OnComplete> = UdQp<Entry, OrderedWqeTable<Entry>, OnComplete>;
+/// Type alias for UD QP with ordered WQE table and owned RQ.
+pub type UdQpWithTable<Entry, OnComplete> = UdQp<Entry, OrderedWqeTable<Entry>, UdOwnedRq<Entry>, OnComplete>;
+
+/// Type alias for UD QP with ordered WQE table and SRQ.
+pub type UdQpWithSrq<Entry, OnComplete> = UdQp<Entry, OrderedWqeTable<Entry>, UdSharedRq<Entry>, OnComplete>;
 
 /// UD (Unreliable Datagram) Queue Pair.
 ///
@@ -361,14 +404,15 @@ pub type UdQpWithTable<Entry, OnComplete> = UdQp<Entry, OrderedWqeTable<Entry>, 
 ///
 /// Type parameter `Entry` is the entry type stored in both SQ and RQ WQE tables.
 /// Type parameter `TableType` determines WQE table behavior.
+/// Type parameter `Rq` is the receive queue type (`UdOwnedRq<Entry>` or `UdSharedRq<Entry>`).
 /// Type parameter `OnComplete` is the completion callback type.
-pub struct UdQp<Entry, TableType, OnComplete> {
+pub struct UdQp<Entry, TableType, Rq, OnComplete> {
     qp: NonNull<mlx5_sys::ibv_qp>,
     state: Cell<UdQpState>,
     qkey: u32,
     max_inline_data: u32,
     sq: Option<UdSendQueueState<Entry, TableType>>,
-    rq: Option<UdRecvQueueState<Entry>>,
+    rq: Rq,
     callback: OnComplete,
     /// Weak reference to the send CQ for unregistration on drop.
     send_cq: Weak<CompletionQueue>,
@@ -442,7 +486,7 @@ impl Context {
                 qkey: config.qkey,
                 max_inline_data: config.max_inline_data,
                 sq: None,
-                rq: None,
+                rq: UdOwnedRq::new(None),
                 callback,
                 send_cq: Rc::downgrade(send_cq),
                 recv_cq: Rc::downgrade(recv_cq),
@@ -455,9 +499,99 @@ impl Context {
             Ok(result)
         }
     }
+
+    /// Create a UD QP with SRQ.
+    ///
+    /// This variant uses a Shared Receive Queue (SRQ) for receive operations.
+    /// The QP's own RQ-related methods (`post_recv`, `ring_rq_doorbell`, etc.)
+    /// are not available. Instead, use the SRQ's methods for receive operations.
+    ///
+    /// # Arguments
+    /// * `pd` - Protection Domain
+    /// * `send_cq` - Completion Queue for send completions
+    /// * `recv_cq` - Completion Queue for receive completions
+    /// * `srq` - Shared Receive Queue
+    /// * `config` - QP configuration (max_recv_wr and max_recv_sge are ignored)
+    /// * `callback` - Completion callback
+    ///
+    /// # Errors
+    /// Returns an error if the QP cannot be created.
+    pub fn create_ud_qp_with_srq<Entry, OnComplete>(
+        &self,
+        pd: &Pd,
+        send_cq: &Rc<CompletionQueue>,
+        recv_cq: &Rc<CompletionQueue>,
+        srq: &Srq<Entry>,
+        config: &UdQpConfig,
+        callback: OnComplete,
+    ) -> io::Result<Rc<RefCell<UdQpWithSrq<Entry, OnComplete>>>>
+    where
+        Entry: 'static,
+        OnComplete: Fn(Cqe, Entry) + 'static,
+    {
+        let qp = self.create_ud_qp_with_srq_raw(pd, send_cq, recv_cq, srq, config, callback)?;
+        let qp_rc = Rc::new(RefCell::new(qp));
+        let qpn = qp_rc.borrow().qpn();
+
+        send_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+        recv_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+
+        Ok(qp_rc)
+    }
+
+    fn create_ud_qp_with_srq_raw<Entry, OnComplete>(
+        &self,
+        pd: &Pd,
+        send_cq: &Rc<CompletionQueue>,
+        recv_cq: &Rc<CompletionQueue>,
+        srq: &Srq<Entry>,
+        config: &UdQpConfig,
+        callback: OnComplete,
+    ) -> io::Result<UdQpWithSrq<Entry, OnComplete>>
+    where
+        OnComplete: Fn(Cqe, Entry),
+    {
+        unsafe {
+            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
+            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_UD;
+            qp_attr.send_cq = send_cq.as_ptr();
+            qp_attr.recv_cq = recv_cq.as_ptr();
+            qp_attr.srq = srq.as_ptr();
+            qp_attr.cap.max_send_wr = config.max_send_wr;
+            qp_attr.cap.max_recv_wr = 0; // RQ disabled when using SRQ
+            qp_attr.cap.max_send_sge = config.max_send_sge;
+            qp_attr.cap.max_recv_sge = 0; // RQ disabled when using SRQ
+            qp_attr.cap.max_inline_data = config.max_inline_data;
+            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
+            qp_attr.pd = pd.as_ptr();
+
+            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
+
+            let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
+
+            let mut result = UdQp {
+                qp,
+                state: Cell::new(UdQpState::Reset),
+                qkey: config.qkey,
+                max_inline_data: config.max_inline_data,
+                sq: None,
+                rq: UdSharedRq::new(srq.clone()),
+                callback,
+                send_cq: Rc::downgrade(send_cq),
+                recv_cq: Rc::downgrade(recv_cq),
+                _pd: pd.clone(),
+            };
+
+            // Initialize SQ direct access (no RQ for SRQ variant)
+            UdQpWithSrq::<Entry, OnComplete>::init_direct_access_internal(&mut result)?;
+
+            Ok(result)
+        }
+    }
 }
 
-impl<Entry, TableType, OnComplete> Drop for UdQp<Entry, TableType, OnComplete> {
+impl<Entry, TableType, Rq, OnComplete> Drop for UdQp<Entry, TableType, Rq, OnComplete> {
     fn drop(&mut self) {
         let qpn = self.qpn();
         if let Some(cq) = self.send_cq.upgrade() {
@@ -472,7 +606,7 @@ impl<Entry, TableType, OnComplete> Drop for UdQp<Entry, TableType, OnComplete> {
     }
 }
 
-impl<Entry, TableType, OnComplete> UdQp<Entry, TableType, OnComplete> {
+impl<Entry, TableType, Rq, OnComplete> UdQp<Entry, TableType, Rq, OnComplete> {
     /// Get the QP number.
     pub fn qpn(&self) -> u32 {
         unsafe { (*self.qp.as_ptr()).qp_num }
@@ -610,7 +744,13 @@ impl<Entry, TableType, OnComplete> UdQp<Entry, TableType, OnComplete> {
             .as_ref()
             .ok_or_else(|| io::Error::other("direct access not initialized"))
     }
+}
 
+// =============================================================================
+// OwnedRq-specific methods
+// =============================================================================
+
+impl<Entry, TableType, OnComplete> UdQp<Entry, TableType, UdOwnedRq<Entry>, OnComplete> {
     fn rq(&self) -> io::Result<&UdRecvQueueState<Entry>> {
         self.rq
             .as_ref()
@@ -623,8 +763,20 @@ impl<Entry, TableType, OnComplete> UdQp<Entry, TableType, OnComplete> {
             rq.ring_doorbell();
         }
     }
-
 }
+
+// =============================================================================
+// SharedRq-specific methods
+// =============================================================================
+
+impl<Entry, TableType, OnComplete> UdQp<Entry, TableType, UdSharedRq<Entry>, OnComplete> {
+    /// Get a reference to the underlying SRQ.
+    pub fn srq(&self) -> &Srq<Entry> {
+        self.rq.srq()
+    }
+}
+
+
 
 impl<Entry, OnComplete> UdQpWithTable<Entry, OnComplete> {
     /// Initialize direct queue access (internal implementation).
@@ -653,7 +805,7 @@ impl<Entry, OnComplete> UdQpWithTable<Entry, OnComplete> {
         });
 
         let rq_wqe_cnt = info.rq_wqe_cnt as u16;
-        self.rq = Some(UdRecvQueueState {
+        self.rq = UdOwnedRq::new(Some(UdRecvQueueState {
             buf: info.rq_buf,
             wqe_cnt: rq_wqe_cnt,
             stride: info.rq_stride,
@@ -661,8 +813,48 @@ impl<Entry, OnComplete> UdQpWithTable<Entry, OnComplete> {
             ci: Cell::new(0),
             dbrec: info.dbrec,
             table: (0..rq_wqe_cnt).map(|_| Cell::new(None)).collect(),
+        }));
+
+        Ok(())
+    }
+
+    /// Activate UD QP (transition to RTS).
+    /// Direct queue access is auto-initialized at creation time.
+    pub fn activate(&mut self, port: u8, sq_psn: u32) -> io::Result<()> {
+        self.modify_to_init(port, 0)?;
+        self.modify_to_rtr()?;
+        self.modify_to_rts(sq_psn)?;
+        Ok(())
+    }
+}
+
+impl<Entry, OnComplete> UdQpWithSrq<Entry, OnComplete> {
+    /// Initialize direct queue access for SRQ variant (SQ only).
+    fn init_direct_access_internal(&mut self) -> io::Result<()> {
+        if self.sq.is_some() {
+            return Ok(()); // Already initialized
+        }
+
+        let info = self.query_info()?;
+        let wqe_cnt = info.sq_wqe_cnt as u16;
+
+        self.sq = Some(UdSendQueueState {
+            buf: info.sq_buf,
+            wqe_cnt,
+            sqn: info.sqn,
+            pi: Cell::new(0),
+            ci: Cell::new(0),
+            last_wqe: Cell::new(None),
+            dbrec: info.dbrec,
+            bf_reg: info.bf_reg,
+            bf_size: info.bf_size,
+            bf_offset: Cell::new(0),
+            max_inline_data: self.max_inline_data,
+            table: OrderedWqeTable::new(wqe_cnt),
+            _marker: PhantomData,
         });
 
+        // Note: RQ is not initialized for SRQ variant - SRQ handles receives
         Ok(())
     }
 
@@ -678,7 +870,7 @@ impl<Entry, OnComplete> UdQpWithTable<Entry, OnComplete> {
 }
 
 // =============================================================================
-// CompletionTarget Implementation
+// CompletionTarget Implementation (OwnedRq)
 // =============================================================================
 
 impl<Entry, OnComplete> CompletionTarget for UdQpWithTable<Entry, OnComplete>
@@ -694,6 +886,36 @@ where
             // RQ completion (responder)
             if let Some(rq) = self.rq.as_ref()
                 && let Some(entry) = rq.process_completion(cqe.wqe_counter)
+            {
+                (self.callback)(cqe, entry);
+            }
+        } else {
+            // SQ completion (requester)
+            if let Some(sq) = self.sq.as_ref()
+                && let Some(entry) = sq.process_completion(cqe.wqe_counter)
+            {
+                (self.callback)(cqe, entry);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// CompletionTarget Implementation (SharedRq/SRQ)
+// =============================================================================
+
+impl<Entry, OnComplete> CompletionTarget for UdQpWithSrq<Entry, OnComplete>
+where
+    OnComplete: Fn(Cqe, Entry),
+{
+    fn qpn(&self) -> u32 {
+        UdQp::qpn(self)
+    }
+
+    fn dispatch_cqe(&self, cqe: Cqe) {
+        if cqe.opcode.is_responder() {
+            // RQ completion via SRQ (responder)
+            if let Some(entry) = self.rq.srq().process_recv_completion(cqe.wqe_counter)
             {
                 (self.callback)(cqe, entry);
             }
