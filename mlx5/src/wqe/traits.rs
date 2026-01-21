@@ -65,7 +65,7 @@ pub struct RoCE;
 // =============================================================================
 
 use crate::types::GrhAttr;
-use crate::wqe::AddressVector;
+use crate::wqe::{ADDRESS_VECTOR_SIZE, write_address_vector_roce};
 
 /// Trait for Address Vector types.
 ///
@@ -98,13 +98,13 @@ impl Av for NoAv {
 }
 
 impl Av for &GrhAttr {
-    const SIZE: usize = AddressVector::SIZE;
-    const DS_COUNT: u8 = (AddressVector::SIZE / 16) as u8;
+    const SIZE: usize = ADDRESS_VECTOR_SIZE;
+    const DS_COUNT: u8 = (ADDRESS_VECTOR_SIZE / 16) as u8;
 
     #[inline]
     unsafe fn write_av(self, ptr: *mut u8) {
         // For RC QP RoCE, dc_key and dctn are not used (set to 0)
-        AddressVector::write_roce(ptr, 0, 0, self);
+        write_address_vector_roce(ptr, 0, 0, self);
     }
 }
 
