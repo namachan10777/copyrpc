@@ -55,26 +55,18 @@ fn create_rc_loopback_pair(ctx: &TestContext) -> RcLoopbackPair {
 
     let qp1 = ctx
         .ctx
-        .create_rc_qp(
-            &ctx.pd,
-            &send_cq,
-            &recv_cq1,
-            &config,
-            noop_sq_callback as TestCallback,
-            noop_rq_callback as TestCallback,
-        )
+        .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_cq(send_cq.clone(), noop_sq_callback as TestCallback)
+        .rq_cq(recv_cq1.clone(), noop_rq_callback as TestCallback)
+        .build()
         .expect("Failed to create QP1");
 
     let qp2 = ctx
         .ctx
-        .create_rc_qp(
-            &ctx.pd,
-            &send_cq,
-            &recv_cq2,
-            &config,
-            noop_sq_callback as TestCallback,
-            noop_rq_callback as TestCallback,
-        )
+        .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_cq(send_cq.clone(), noop_sq_callback as TestCallback)
+        .rq_cq(recv_cq2.clone(), noop_rq_callback as TestCallback)
+        .build()
         .expect("Failed to create QP2");
 
     // Connect QPs to each other
@@ -260,7 +252,7 @@ fn test_rc_rdma_read() {
         .expect("sq_wqe failed")
         .read(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
         .expect("read failed")
-        .buffer(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
+        .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
         .finish_signaled(1u64)
         .expect("finish failed");
     qp1.borrow().ring_sq_doorbell();
@@ -325,7 +317,7 @@ fn test_rc_atomic_cas_success() {
         .expect("sq_wqe failed")
         .cas(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey(), swap_value, compare_value)
         .expect("cas failed")
-        .buffer(local_buf.addr(), 8, local_mr.lkey())
+        .sge(local_buf.addr(), 8, local_mr.lkey())
         .finish_signaled(1u64)
         .expect("finish failed");
     qp1.borrow().ring_sq_doorbell();
@@ -402,7 +394,7 @@ fn test_rc_atomic_cas_failure() {
         .expect("sq_wqe failed")
         .cas(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey(), swap_value, compare_value)
         .expect("cas failed")
-        .buffer(local_buf.addr(), 8, local_mr.lkey())
+        .sge(local_buf.addr(), 8, local_mr.lkey())
         .finish_signaled(1u64)
         .expect("finish failed");
     qp1.borrow().ring_sq_doorbell();
@@ -476,7 +468,7 @@ fn test_rc_atomic_fa() {
         .expect("sq_wqe failed")
         .fetch_add(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey(), add_value)
         .expect("fetch_add failed")
-        .buffer(local_buf.addr(), 8, local_mr.lkey())
+        .sge(local_buf.addr(), 8, local_mr.lkey())
         .finish_signaled(1u64)
         .expect("finish failed");
     qp1.borrow().ring_sq_doorbell();
@@ -660,19 +652,18 @@ fn test_rc_send_recv() {
 
     let qp1 = ctx
         .ctx
-        .create_rc_qp(
-            &ctx.pd,
-            &send_cq,
-            &recv_cq1,
-            &config,
-            noop_sq_callback as fn(_, _),
-            noop_rq_callback as fn(_, _),
-        )
+        .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_cq(send_cq.clone(), noop_sq_callback as fn(_, _))
+        .rq_cq(recv_cq1.clone(), noop_rq_callback as fn(_, _))
+        .build()
         .expect("Failed to create QP1");
 
     let qp2 = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, noop_sq_callback as fn(_, _), recv_callback)
+        .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_cq(send_cq.clone(), noop_sq_callback as fn(_, _))
+        .rq_cq(recv_cq2.clone(), recv_callback)
+        .build()
         .expect("Failed to create QP2");
 
     // Connect QPs
@@ -836,12 +827,18 @@ fn test_rc_send_recv_pingpong() {
 
     let qp1 = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq1, &config, noop_sq_callback as fn(_, _), rq_callback1)
+        .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_cq(send_cq.clone(), noop_sq_callback as fn(_, _))
+        .rq_cq(recv_cq1.clone(), rq_callback1)
+        .build()
         .expect("Failed to create QP1");
 
     let qp2 = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq2, &config, noop_sq_callback as fn(_, _), rq_callback2)
+        .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_cq(send_cq.clone(), noop_sq_callback as fn(_, _))
+        .rq_cq(recv_cq2.clone(), rq_callback2)
+        .build()
         .expect("Failed to create QP2");
 
     // Connect QPs

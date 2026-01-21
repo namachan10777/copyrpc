@@ -435,339 +435,6 @@ pub struct RcQp<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqCo
     _marker: std::marker::PhantomData<(Transport, RqEntry)>,
 }
 
-impl Context {
-    /// Create an RC Queue Pair using mlx5dv_create_qp.
-    ///
-    /// Only signaled WQEs have entries stored in the WQE table.
-    /// The callbacks are invoked for each completion with the CQE and
-    /// the entry stored at WQE submission.
-    ///
-    /// # Arguments
-    /// * `pd` - Protection Domain
-    /// * `send_cq` - Completion Queue for send completions (wrapped in Rc for shared ownership)
-    /// * `recv_cq` - Completion Queue for receive completions (wrapped in Rc for shared ownership)
-    /// * `config` - QP configuration
-    /// * `sq_callback` - SQ completion callback `Fn(Cqe, SqEntry)` called for each signaled SQ completion
-    /// * `rq_callback` - RQ completion callback `Fn(Cqe, RqEntry)` called for each RQ completion
-    ///
-    /// # Errors
-    /// Returns an error if the QP cannot be created.
-    ///
-    /// # Note
-    /// The send_cq must have `init_direct_access()` called before this function.
-    pub fn create_rc_qp<SqEntry, RqEntry, OnSqComplete, OnRqComplete>(
-        &self,
-        pd: &Pd,
-        send_cq: &Rc<CompletionQueue>,
-        recv_cq: &Rc<CompletionQueue>,
-        config: &RcQpConfig,
-        sq_callback: OnSqComplete,
-        rq_callback: OnRqComplete,
-    ) -> io::Result<Rc<RefCell<RcQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>>>
-    where
-        SqEntry: 'static,
-        RqEntry: 'static,
-        OnSqComplete: Fn(Cqe, SqEntry) + 'static,
-        OnRqComplete: Fn(Cqe, RqEntry) + 'static,
-    {
-        let qp = self.create_rc_qp_raw(pd, send_cq, recv_cq, config, sq_callback, rq_callback)?;
-        let qp_rc = Rc::new(RefCell::new(qp));
-        let qpn = qp_rc.borrow().qpn();
-
-        // Register this QP with both CQs for completion dispatch
-        send_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-        recv_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-
-        Ok(qp_rc)
-    }
-
-    fn create_rc_qp_raw<SqEntry, RqEntry, OnSqComplete, OnRqComplete>(
-        &self,
-        pd: &Pd,
-        send_cq: &Rc<CompletionQueue>,
-        recv_cq: &Rc<CompletionQueue>,
-        config: &RcQpConfig,
-        sq_callback: OnSqComplete,
-        rq_callback: OnRqComplete,
-    ) -> io::Result<RcQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>
-    where
-        OnSqComplete: Fn(Cqe, SqEntry),
-        OnRqComplete: Fn(Cqe, RqEntry),
-    {
-        unsafe {
-            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
-            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
-            qp_attr.send_cq = send_cq.as_ptr();
-            qp_attr.recv_cq = recv_cq.as_ptr();
-            qp_attr.cap.max_send_wr = config.max_send_wr;
-            qp_attr.cap.max_recv_wr = config.max_recv_wr;
-            qp_attr.cap.max_send_sge = config.max_send_sge;
-            qp_attr.cap.max_recv_sge = config.max_recv_sge;
-            qp_attr.cap.max_inline_data = config.max_inline_data;
-            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
-            qp_attr.pd = pd.as_ptr();
-
-            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
-            // Optionally disable scatter to CQE. When disabled, received data goes to the
-            // receive buffer instead of being inlined in the CQE.
-            if !config.enable_scatter_to_cqe {
-                mlx5_attr.comp_mask =
-                    mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS
-                        as u64;
-                mlx5_attr.create_flags =
-                    mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
-            }
-
-            let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
-            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
-
-            let mut result = RcQp {
-                qp,
-                state: Cell::new(QpState::Reset),
-                max_inline_data: config.max_inline_data,
-                sq: None,
-                rq: OwnedRq::new(None),
-                sq_callback,
-                rq_callback,
-                send_cq: Rc::downgrade(send_cq),
-                recv_cq: Rc::downgrade(recv_cq),
-                _pd: pd.clone(),
-                _marker: std::marker::PhantomData,
-            };
-
-            // Auto-initialize direct access
-            RcQpIb::<SqEntry, RqEntry, OnSqComplete, OnRqComplete>::init_direct_access_internal(&mut result)?;
-
-            Ok(result)
-        }
-    }
-
-    /// Create an RC Queue Pair with SRQ using mlx5dv_create_qp.
-    ///
-    /// This variant uses a Shared Receive Queue (SRQ) for receive operations.
-    /// The QP's own RQ-related methods (`post_recv`, `ring_rq_doorbell`, etc.)
-    /// are not available. Instead, use the SRQ's methods for receive operations.
-    ///
-    /// # Arguments
-    /// * `pd` - Protection Domain
-    /// * `send_cq` - Completion Queue for send completions (wrapped in Rc for shared ownership)
-    /// * `recv_cq` - Completion Queue for receive completions (wrapped in Rc for shared ownership)
-    /// * `srq` - Shared Receive Queue
-    /// * `config` - QP configuration (max_recv_wr and max_recv_sge are ignored)
-    /// * `sq_callback` - SQ completion callback `Fn(Cqe, SqEntry)` called for each signaled SQ completion
-    /// * `rq_callback` - RQ completion callback `Fn(Cqe, RqEntry)` called for each RQ completion
-    ///
-    /// # Errors
-    /// Returns an error if the QP cannot be created.
-    pub fn create_rc_qp_with_srq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>(
-        &self,
-        pd: &Pd,
-        send_cq: &Rc<CompletionQueue>,
-        recv_cq: &Rc<CompletionQueue>,
-        srq: &Srq<RqEntry>,
-        config: &RcQpConfig,
-        sq_callback: OnSqComplete,
-        rq_callback: OnRqComplete,
-    ) -> io::Result<Rc<RefCell<RcQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>>>
-    where
-        SqEntry: 'static,
-        RqEntry: 'static,
-        OnSqComplete: Fn(Cqe, SqEntry) + 'static,
-        OnRqComplete: Fn(Cqe, RqEntry) + 'static,
-    {
-        let qp = self.create_rc_qp_with_srq_raw(pd, send_cq, recv_cq, srq, config, sq_callback, rq_callback)?;
-        let qp_rc = Rc::new(RefCell::new(qp));
-        let qpn = qp_rc.borrow().qpn();
-
-        // Register this QP with both CQs for completion dispatch
-        send_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-        recv_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-
-        Ok(qp_rc)
-    }
-
-    fn create_rc_qp_with_srq_raw<SqEntry, RqEntry, OnSqComplete, OnRqComplete>(
-        &self,
-        pd: &Pd,
-        send_cq: &Rc<CompletionQueue>,
-        recv_cq: &Rc<CompletionQueue>,
-        srq: &Srq<RqEntry>,
-        config: &RcQpConfig,
-        sq_callback: OnSqComplete,
-        rq_callback: OnRqComplete,
-    ) -> io::Result<RcQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>
-    where
-        OnSqComplete: Fn(Cqe, SqEntry),
-        OnRqComplete: Fn(Cqe, RqEntry),
-    {
-        unsafe {
-            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
-            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
-            qp_attr.send_cq = send_cq.as_ptr();
-            qp_attr.recv_cq = recv_cq.as_ptr();
-            qp_attr.srq = srq.as_ptr();
-            qp_attr.cap.max_send_wr = config.max_send_wr;
-            qp_attr.cap.max_recv_wr = 0; // RQ disabled when using SRQ
-            qp_attr.cap.max_send_sge = config.max_send_sge;
-            qp_attr.cap.max_recv_sge = 0; // RQ disabled when using SRQ
-            qp_attr.cap.max_inline_data = config.max_inline_data;
-            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
-            qp_attr.pd = pd.as_ptr();
-
-            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
-            // Optionally disable scatter to CQE. When disabled, received data goes to the
-            // receive buffer instead of being inlined in the CQE.
-            if !config.enable_scatter_to_cqe {
-                mlx5_attr.comp_mask =
-                    mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS
-                        as u64;
-                mlx5_attr.create_flags =
-                    mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
-            }
-
-            let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
-            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
-
-            let mut result = RcQp {
-                qp,
-                state: Cell::new(QpState::Reset),
-                max_inline_data: config.max_inline_data,
-                sq: None,
-                rq: SharedRq::new(srq.clone()),
-                sq_callback,
-                rq_callback,
-                send_cq: Rc::downgrade(send_cq),
-                recv_cq: Rc::downgrade(recv_cq),
-                _pd: pd.clone(),
-                _marker: std::marker::PhantomData,
-            };
-
-            // Initialize SQ direct access
-            RcQpIbWithSrq::<SqEntry, RqEntry, OnSqComplete, OnRqComplete>::init_direct_access_internal(&mut result)?;
-
-            Ok(result)
-        }
-    }
-
-    /// Create an RC Queue Pair for use with MonoCq (no internal callback).
-    ///
-    /// The callback is stored on the MonoCq side, not the QP. This enables
-    /// the compiler to inline the callback when polling the MonoCq.
-    ///
-    /// Uses a single Entry type for both SQ and RQ completions.
-    /// If you need different Entry types, use separate CQs for send and recv.
-    ///
-    /// # Arguments
-    /// * `pd` - Protection Domain
-    /// * `cq` - MonoCq for completions (can be same CQ for send and recv)
-    /// * `config` - QP configuration
-    ///
-    /// # Errors
-    /// Returns an error if the QP cannot be created.
-    pub fn create_rc_qp_for_mono_cq<Entry, Q, F>(
-        &self,
-        pd: &Pd,
-        cq: &crate::mono_cq::MonoCq<Q, F>,
-        config: &RcQpConfig,
-    ) -> io::Result<Rc<RefCell<RcQpForMonoCq<Entry>>>>
-    where
-        Q: crate::mono_cq::CompletionSource,
-        F: Fn(Cqe, Q::Entry),
-    {
-        unsafe {
-            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
-            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
-            qp_attr.send_cq = cq.as_ptr();
-            qp_attr.recv_cq = cq.as_ptr();
-            qp_attr.cap.max_send_wr = config.max_send_wr;
-            qp_attr.cap.max_recv_wr = config.max_recv_wr;
-            qp_attr.cap.max_send_sge = config.max_send_sge;
-            qp_attr.cap.max_recv_sge = config.max_recv_sge;
-            qp_attr.cap.max_inline_data = config.max_inline_data;
-            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
-            qp_attr.pd = pd.as_ptr();
-
-            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
-            // Optionally disable scatter to CQE. When disabled, received data goes to the
-            // receive buffer instead of being inlined in the CQE.
-            if !config.enable_scatter_to_cqe {
-                mlx5_attr.comp_mask =
-                    mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS
-                        as u64;
-                mlx5_attr.create_flags =
-                    mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
-            }
-
-            let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
-            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
-
-            // Query QP info for direct access initialization
-            let mut dv_qp: MaybeUninit<mlx5_sys::mlx5dv_qp> = MaybeUninit::zeroed();
-            let mut obj: MaybeUninit<mlx5_sys::mlx5dv_obj> = MaybeUninit::zeroed();
-
-            let dv_qp_ptr = dv_qp.as_mut_ptr();
-            (*dv_qp_ptr).comp_mask =
-                mlx5_sys::mlx5dv_qp_comp_mask_MLX5DV_QP_MASK_RAW_QP_HANDLES as u64;
-
-            let obj_ptr = obj.as_mut_ptr();
-            (*obj_ptr).qp.in_ = qp.as_ptr();
-            (*obj_ptr).qp.out = dv_qp_ptr;
-
-            let ret =
-                mlx5_sys::mlx5dv_init_obj(obj_ptr, mlx5_sys::mlx5dv_obj_type_MLX5DV_OBJ_QP as u64);
-            if ret != 0 {
-                // Destroy QP on failure
-                mlx5_sys::ibv_destroy_qp(qp.as_ptr());
-                return Err(io::Error::from_raw_os_error(-ret));
-            }
-
-            let dv_qp = dv_qp.assume_init();
-            let qp_num = (*qp.as_ptr()).qp_num;
-            let sqn = if dv_qp.sqn != 0 { dv_qp.sqn } else { qp_num };
-
-            let sq_wqe_cnt = dv_qp.sq.wqe_cnt as u16;
-            let rq_wqe_cnt = dv_qp.rq.wqe_cnt;
-
-            Ok(Rc::new(RefCell::new(RcQp {
-                qp,
-                state: Cell::new(QpState::Reset),
-                max_inline_data: config.max_inline_data,
-                sq: Some(SendQueueState {
-                    buf: dv_qp.sq.buf as *mut u8,
-                    wqe_cnt: sq_wqe_cnt,
-                    sqn,
-                    max_inline_data: config.max_inline_data,
-                    pi: Cell::new(0),
-                    ci: Cell::new(0),
-                    last_wqe: Cell::new(None),
-                    dbrec: dv_qp.dbrec,
-                    bf_reg: dv_qp.bf.reg as *mut u8,
-                    bf_size: dv_qp.bf.size,
-                    bf_offset: Cell::new(0),
-                    table: OrderedWqeTable::new(sq_wqe_cnt),
-                    _marker: std::marker::PhantomData,
-                }),
-                rq: OwnedRq::new(Some(ReceiveQueueState {
-                    buf: dv_qp.rq.buf as *mut u8,
-                    wqe_cnt: rq_wqe_cnt,
-                    stride: dv_qp.rq.stride,
-                    pi: Cell::new(0),
-                    ci: Cell::new(0),
-                    dbrec: dv_qp.dbrec,
-                    table: (0..rq_wqe_cnt).map(|_| Cell::new(None)).collect(),
-                })),
-                sq_callback: (),
-                rq_callback: (),
-                // Empty weak references - MonoCq handles unregistration via Weak upgrade failure
-                send_cq: Weak::new(),
-                recv_cq: Weak::new(),
-                _pd: pd.clone(),
-                _marker: std::marker::PhantomData,
-            })))
-        }
-    }
-}
-
 impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> Drop for RcQp<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> {
     fn drop(&mut self) {
         let qpn = self.qpn();
@@ -1166,6 +833,82 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> RcQpIbWithSrq<SqEntry, RqEntr
 }
 
 // =============================================================================
+// RoCE init_direct_access_internal implementations
+// =============================================================================
+
+impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> RcQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete> {
+    /// Initialize direct queue access for RoCE (same as IB).
+    fn init_direct_access_internal(&mut self) -> io::Result<()> {
+        if self.sq.is_some() {
+            return Ok(()); // Already initialized
+        }
+
+        let info = self.query_info()?;
+        let wqe_cnt = info.sq_wqe_cnt as u16;
+
+        self.sq = Some(SendQueueState {
+            buf: info.sq_buf,
+            wqe_cnt,
+            sqn: info.sqn,
+            max_inline_data: self.max_inline_data,
+            pi: Cell::new(0),
+            ci: Cell::new(0),
+            last_wqe: Cell::new(None),
+            dbrec: info.dbrec,
+            bf_reg: info.bf_reg,
+            bf_size: info.bf_size,
+            bf_offset: Cell::new(0),
+            table: OrderedWqeTable::new(wqe_cnt),
+            _marker: std::marker::PhantomData,
+        });
+
+        let rq_wqe_cnt = info.rq_wqe_cnt;
+        self.rq = OwnedRq::new(Some(ReceiveQueueState {
+            buf: info.rq_buf,
+            wqe_cnt: rq_wqe_cnt,
+            stride: info.rq_stride,
+            pi: Cell::new(0),
+            ci: Cell::new(0),
+            dbrec: info.dbrec,
+            table: (0..rq_wqe_cnt).map(|_| Cell::new(None)).collect(),
+        }));
+
+        Ok(())
+    }
+}
+
+impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> RcQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> {
+    /// Initialize direct queue access for RoCE with SRQ (SQ only).
+    fn init_direct_access_internal(&mut self) -> io::Result<()> {
+        if self.sq.is_some() {
+            return Ok(()); // Already initialized
+        }
+
+        let info = self.query_info()?;
+        let wqe_cnt = info.sq_wqe_cnt as u16;
+
+        self.sq = Some(SendQueueState {
+            buf: info.sq_buf,
+            wqe_cnt,
+            sqn: info.sqn,
+            max_inline_data: self.max_inline_data,
+            pi: Cell::new(0),
+            ci: Cell::new(0),
+            last_wqe: Cell::new(None),
+            dbrec: info.dbrec,
+            bf_reg: info.bf_reg,
+            bf_size: info.bf_size,
+            bf_offset: Cell::new(0),
+            table: OrderedWqeTable::new(wqe_cnt),
+            _marker: std::marker::PhantomData,
+        });
+
+        // Note: RQ is not initialized for SRQ variant - SRQ handles receives
+        Ok(())
+    }
+}
+
+// =============================================================================
 // CompletionTarget impl for RcQp with OwnedRq
 // =============================================================================
 
@@ -1202,6 +945,65 @@ where
 // =============================================================================
 
 impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> CompletionTarget for RcQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
+where
+    OnSqComplete: Fn(Cqe, SqEntry),
+    OnRqComplete: Fn(Cqe, RqEntry),
+{
+    fn qpn(&self) -> u32 {
+        RcQp::qpn(self)
+    }
+
+    fn dispatch_cqe(&self, cqe: Cqe) {
+        if cqe.opcode.is_responder() {
+            // RQ completion via SRQ (responder)
+            if let Some(entry) = self.rq.srq().process_recv_completion(cqe.wqe_counter)
+            {
+                (self.rq_callback)(cqe, entry);
+            }
+        } else {
+            // SQ completion (requester)
+            if let Some(sq) = self.sq.as_ref()
+                && let Some(entry) = sq.process_completion(cqe.wqe_counter)
+            {
+                (self.sq_callback)(cqe, entry);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// CompletionTarget impl for RoCE variants
+// =============================================================================
+
+impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> CompletionTarget for RcQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
+where
+    OnSqComplete: Fn(Cqe, SqEntry),
+    OnRqComplete: Fn(Cqe, RqEntry),
+{
+    fn qpn(&self) -> u32 {
+        RcQp::qpn(self)
+    }
+
+    fn dispatch_cqe(&self, cqe: Cqe) {
+        if cqe.opcode.is_responder() {
+            // RQ completion (responder)
+            if let Some(rq) = self.rq.as_ref()
+                && let Some(entry) = rq.process_completion(cqe.wqe_counter)
+            {
+                (self.rq_callback)(cqe, entry);
+            }
+        } else {
+            // SQ completion (requester)
+            if let Some(sq) = self.sq.as_ref()
+                && let Some(entry) = sq.process_completion(cqe.wqe_counter)
+            {
+                (self.sq_callback)(cqe, entry);
+            }
+        }
+    }
+}
+
+impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> CompletionTarget for RcQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
 where
     OnSqComplete: Fn(Cqe, SqEntry),
     OnRqComplete: Fn(Cqe, RqEntry),
@@ -1488,5 +1290,678 @@ impl<SqEntry, RqEntry, Rq, OnSqComplete, OnRqComplete> RcQp<SqEntry, RqEntry, Ro
             return Err(SubmissionError::BlueflameNotAvailable);
         }
         Ok(RoceBlueflameWqeBatch::new(sq, grh))
+    }
+}
+
+// =============================================================================
+// RcQpBuilder - Builder Pattern for QP Creation
+// =============================================================================
+
+/// Marker type indicating CQ is not yet set.
+pub struct NoCq;
+
+/// Marker type indicating CQ has been set.
+pub struct CqSet;
+
+/// Builder for RC Queue Pairs.
+///
+/// # MonoCq vs CompletionQueue
+///
+/// ## CompletionQueue (normal CQ)
+/// - Dispatches to QP via `dyn CompletionTarget` trait object
+/// - Dynamic dispatch prevents callback inlining
+/// - Flexible (different QP types can share same CQ)
+///
+/// ## MonoCq
+/// - Statically binds Entry type and Callback type via generics
+/// - Monomorphization enables complete inlining
+/// - Use for high-throughput, low-latency scenarios
+///
+/// Both are wrapped in Rc<T> and configured via builder methods.
+///
+/// # Type Parameters
+///
+/// - `SqEntry`: Entry type stored in SQ WQE table
+/// - `RqEntry`: Entry type stored in RQ WQE table
+/// - `T`: Transport type (`InfiniBand` or `RoCE`)
+/// - `Rq`: Receive queue type (`OwnedRq<RqEntry>` or `SharedRq<RqEntry>`)
+/// - `SqCqState`: SQ CQ configuration state (`NoCq` or `CqSet`)
+/// - `RqCqState`: RQ CQ configuration state (`NoCq` or `CqSet`)
+/// - `OnSq`: SQ completion callback type
+/// - `OnRq`: RQ completion callback type
+pub struct RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, RqCqState, OnSq, OnRq> {
+    ctx: &'a Context,
+    pd: &'a Pd,
+    config: RcQpConfig,
+
+    // CQ pointers (set via sq_cq/sq_mono_cq/rq_cq/rq_mono_cq)
+    send_cq_ptr: *mut mlx5_sys::ibv_cq,
+    recv_cq_ptr: *mut mlx5_sys::ibv_cq,
+
+    // Weak references to normal CQs for registration (None for MonoCq)
+    send_cq_weak: Option<Weak<CompletionQueue>>,
+    recv_cq_weak: Option<Weak<CompletionQueue>>,
+
+    // Callbacks (set via sq_cq/rq_cq, () for MonoCq)
+    sq_callback: OnSq,
+    rq_callback: OnRq,
+
+    // SRQ (set via with_srq())
+    srq: Option<Rc<Srq<RqEntry>>>,
+
+    _marker: std::marker::PhantomData<(SqEntry, RqEntry, T, Rq, SqCqState, RqCqState)>,
+}
+
+impl Context {
+    /// Create an RC QP Builder.
+    ///
+    /// CQs are configured via builder methods:
+    /// - `.sq_cq(cq, callback)` - Normal CQ with callback
+    /// - `.sq_mono_cq(mono_cq)` - MonoCq (callback is on CQ side, already monomorphized)
+    /// - `.rq_cq(cq, callback)` / `.rq_mono_cq(mono_cq)` - Same for RQ
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Both normal CQs with callbacks
+    /// let qp = ctx.rc_qp_builder::<u64, u64>(&pd, &config)
+    ///     .sq_cq(send_cq.clone(), |cqe, entry| { /* SQ completion */ })
+    ///     .rq_cq(recv_cq.clone(), |cqe, entry| { /* RQ completion */ })
+    ///     .build()?;
+    ///
+    /// // Both MonoCq (high-performance mode)
+    /// let qp = ctx.rc_qp_builder::<Entry, Entry>(&pd, &config)
+    ///     .sq_mono_cq(mono_cq.clone())
+    ///     .rq_mono_cq(mono_cq.clone())
+    ///     .build()?;
+    ///
+    /// // With SRQ
+    /// let qp = ctx.rc_qp_builder::<u64, u64>(&pd, &config)
+    ///     .with_srq(srq.clone())
+    ///     .sq_cq(send_cq.clone(), sq_callback)
+    ///     .rq_cq(recv_cq.clone(), rq_callback)
+    ///     .build()?;
+    ///
+    /// // For RoCE
+    /// let qp = ctx.rc_qp_builder::<u64, u64>(&pd, &config)
+    ///     .for_roce()
+    ///     .sq_cq(send_cq.clone(), sq_callback)
+    ///     .rq_cq(recv_cq.clone(), rq_callback)
+    ///     .build()?;
+    /// ```
+    pub fn rc_qp_builder<'a, SqEntry, RqEntry>(
+        &'a self,
+        pd: &'a Pd,
+        config: &RcQpConfig,
+    ) -> RcQpBuilder<'a, SqEntry, RqEntry, InfiniBand, OwnedRq<RqEntry>, NoCq, NoCq, (), ()> {
+        RcQpBuilder {
+            ctx: self,
+            pd,
+            config: config.clone(),
+            send_cq_ptr: std::ptr::null_mut(),
+            recv_cq_ptr: std::ptr::null_mut(),
+            send_cq_weak: None,
+            recv_cq_weak: None,
+            sq_callback: (),
+            rq_callback: (),
+            srq: None,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+// =============================================================================
+// SQ CQ Configuration Methods
+// =============================================================================
+
+impl<'a, SqEntry, RqEntry, T, Rq, RqCqState, OnRq>
+    RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, NoCq, RqCqState, (), OnRq>
+{
+    /// Set normal CQ for SQ with callback.
+    pub fn sq_cq<OnSq>(
+        self,
+        cq: Rc<CompletionQueue>,
+        callback: OnSq,
+    ) -> RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, CqSet, RqCqState, OnSq, OnRq>
+    where
+        OnSq: Fn(Cqe, SqEntry) + 'static,
+    {
+        RcQpBuilder {
+            ctx: self.ctx,
+            pd: self.pd,
+            config: self.config,
+            send_cq_ptr: cq.as_ptr(),
+            recv_cq_ptr: self.recv_cq_ptr,
+            send_cq_weak: Some(Rc::downgrade(&cq)),
+            recv_cq_weak: self.recv_cq_weak,
+            sq_callback: callback,
+            rq_callback: self.rq_callback,
+            srq: self.srq,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Set MonoCq for SQ (callback is on CQ side).
+    pub fn sq_mono_cq<Q, F>(
+        self,
+        mono_cq: &Rc<crate::mono_cq::MonoCq<Q, F>>,
+    ) -> RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, CqSet, RqCqState, (), OnRq>
+    where
+        Q: crate::mono_cq::CompletionSource,
+        F: Fn(Cqe, Q::Entry) + 'static,
+    {
+        RcQpBuilder {
+            ctx: self.ctx,
+            pd: self.pd,
+            config: self.config,
+            send_cq_ptr: mono_cq.as_ptr(),
+            recv_cq_ptr: self.recv_cq_ptr,
+            send_cq_weak: None, // MonoCq doesn't need CQ registration
+            recv_cq_weak: self.recv_cq_weak,
+            sq_callback: (),
+            rq_callback: self.rq_callback,
+            srq: self.srq,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+// =============================================================================
+// RQ CQ Configuration Methods
+// =============================================================================
+
+impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, OnSq>
+    RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, NoCq, OnSq, ()>
+{
+    /// Set normal CQ for RQ with callback.
+    pub fn rq_cq<OnRq>(
+        self,
+        cq: Rc<CompletionQueue>,
+        callback: OnRq,
+    ) -> RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, CqSet, OnSq, OnRq>
+    where
+        OnRq: Fn(Cqe, RqEntry) + 'static,
+    {
+        RcQpBuilder {
+            ctx: self.ctx,
+            pd: self.pd,
+            config: self.config,
+            send_cq_ptr: self.send_cq_ptr,
+            recv_cq_ptr: cq.as_ptr(),
+            send_cq_weak: self.send_cq_weak,
+            recv_cq_weak: Some(Rc::downgrade(&cq)),
+            sq_callback: self.sq_callback,
+            rq_callback: callback,
+            srq: self.srq,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Set MonoCq for RQ (callback is on CQ side).
+    pub fn rq_mono_cq<Q, F>(
+        self,
+        mono_cq: &Rc<crate::mono_cq::MonoCq<Q, F>>,
+    ) -> RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, CqSet, OnSq, ()>
+    where
+        Q: crate::mono_cq::CompletionSource,
+        F: Fn(Cqe, Q::Entry) + 'static,
+    {
+        RcQpBuilder {
+            ctx: self.ctx,
+            pd: self.pd,
+            config: self.config,
+            send_cq_ptr: self.send_cq_ptr,
+            recv_cq_ptr: mono_cq.as_ptr(),
+            send_cq_weak: self.send_cq_weak,
+            recv_cq_weak: None, // MonoCq doesn't need CQ registration
+            sq_callback: self.sq_callback,
+            rq_callback: (),
+            srq: self.srq,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+// =============================================================================
+// Transport / RQ Type Transition Methods
+// =============================================================================
+
+impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, RqCqState, OnSq, OnRq>
+    RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, RqCqState, OnSq, OnRq>
+{
+    /// Switch to RoCE transport.
+    ///
+    /// # NOTE: RoCE support is untested (IB-only hardware environment)
+    pub fn for_roce(
+        self,
+    ) -> RcQpBuilder<'a, SqEntry, RqEntry, RoCE, Rq, SqCqState, RqCqState, OnSq, OnRq> {
+        RcQpBuilder {
+            ctx: self.ctx,
+            pd: self.pd,
+            config: self.config,
+            send_cq_ptr: self.send_cq_ptr,
+            recv_cq_ptr: self.recv_cq_ptr,
+            send_cq_weak: self.send_cq_weak,
+            recv_cq_weak: self.recv_cq_weak,
+            sq_callback: self.sq_callback,
+            rq_callback: self.rq_callback,
+            srq: self.srq,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, SqEntry, RqEntry, T, SqCqState, RqCqState, OnSq, OnRq>
+    RcQpBuilder<'a, SqEntry, RqEntry, T, OwnedRq<RqEntry>, SqCqState, RqCqState, OnSq, OnRq>
+{
+    /// Use Shared Receive Queue (SRQ) instead of owned RQ.
+    ///
+    /// When using SRQ, receive operations are handled through the SRQ
+    /// and the QP's own RQ-related methods are not available.
+    pub fn with_srq(
+        self,
+        srq: Rc<Srq<RqEntry>>,
+    ) -> RcQpBuilder<'a, SqEntry, RqEntry, T, SharedRq<RqEntry>, SqCqState, RqCqState, OnSq, OnRq>
+    {
+        RcQpBuilder {
+            ctx: self.ctx,
+            pd: self.pd,
+            config: self.config,
+            send_cq_ptr: self.send_cq_ptr,
+            recv_cq_ptr: self.recv_cq_ptr,
+            send_cq_weak: self.send_cq_weak,
+            recv_cq_weak: self.recv_cq_weak,
+            sq_callback: self.sq_callback,
+            rq_callback: self.rq_callback,
+            srq: Some(srq),
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+// =============================================================================
+// Build Methods - InfiniBand + OwnedRq
+// =============================================================================
+
+impl<'a, SqEntry, RqEntry, OnSq, OnRq>
+    RcQpBuilder<'a, SqEntry, RqEntry, InfiniBand, OwnedRq<RqEntry>, CqSet, CqSet, OnSq, OnRq>
+where
+    SqEntry: 'static,
+    RqEntry: 'static,
+    OnSq: Fn(Cqe, SqEntry) + 'static,
+    OnRq: Fn(Cqe, RqEntry) + 'static,
+{
+    /// Build the RC QP.
+    ///
+    /// Only available when both SQ and RQ CQs are configured.
+    pub fn build(self) -> io::Result<Rc<RefCell<RcQpIb<SqEntry, RqEntry, OnSq, OnRq>>>> {
+        unsafe {
+            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
+            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
+            qp_attr.send_cq = self.send_cq_ptr;
+            qp_attr.recv_cq = self.recv_cq_ptr;
+            qp_attr.cap.max_send_wr = self.config.max_send_wr;
+            qp_attr.cap.max_recv_wr = self.config.max_recv_wr;
+            qp_attr.cap.max_send_sge = self.config.max_send_sge;
+            qp_attr.cap.max_recv_sge = self.config.max_recv_sge;
+            qp_attr.cap.max_inline_data = self.config.max_inline_data;
+            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
+            qp_attr.pd = self.pd.as_ptr();
+
+            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
+            if !self.config.enable_scatter_to_cqe {
+                mlx5_attr.comp_mask =
+                    mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS
+                        as u64;
+                mlx5_attr.create_flags =
+                    mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
+            }
+
+            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
+
+            // Clone weak references before moving into RcQp
+            let send_cq_for_register = self.send_cq_weak.clone();
+            let recv_cq_for_register = self.recv_cq_weak.clone();
+
+            let mut result = RcQp {
+                qp,
+                state: Cell::new(QpState::Reset),
+                max_inline_data: self.config.max_inline_data,
+                sq: None,
+                rq: OwnedRq::new(None),
+                sq_callback: self.sq_callback,
+                rq_callback: self.rq_callback,
+                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
+                recv_cq: self.recv_cq_weak.unwrap_or_else(Weak::new),
+                _pd: self.pd.clone(),
+                _marker: std::marker::PhantomData,
+            };
+
+            RcQpIb::<SqEntry, RqEntry, OnSq, OnRq>::init_direct_access_internal(&mut result)?;
+
+            let qp_rc = Rc::new(RefCell::new(result));
+            let qpn = qp_rc.borrow().qpn();
+
+            // Register with CQs if using normal CompletionQueue
+            if let Some(cq) = send_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
+                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+            }
+            if let Some(cq) = recv_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
+                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+            }
+
+            Ok(qp_rc)
+        }
+    }
+}
+
+// =============================================================================
+// Build Methods - InfiniBand + SharedRq (SRQ)
+// =============================================================================
+
+impl<'a, SqEntry, RqEntry, OnSq, OnRq>
+    RcQpBuilder<'a, SqEntry, RqEntry, InfiniBand, SharedRq<RqEntry>, CqSet, CqSet, OnSq, OnRq>
+where
+    SqEntry: 'static,
+    RqEntry: 'static,
+    OnSq: Fn(Cqe, SqEntry) + 'static,
+    OnRq: Fn(Cqe, RqEntry) + 'static,
+{
+    /// Build the RC QP with SRQ.
+    ///
+    /// Only available when both SQ and RQ CQs are configured.
+    pub fn build(self) -> io::Result<Rc<RefCell<RcQpIbWithSrq<SqEntry, RqEntry, OnSq, OnRq>>>> {
+        let srq = self.srq.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "SRQ not set")
+        })?;
+
+        unsafe {
+            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
+            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
+            qp_attr.send_cq = self.send_cq_ptr;
+            qp_attr.recv_cq = self.recv_cq_ptr;
+            qp_attr.srq = srq.as_ptr();
+            qp_attr.cap.max_send_wr = self.config.max_send_wr;
+            qp_attr.cap.max_recv_wr = 0; // RQ disabled when using SRQ
+            qp_attr.cap.max_send_sge = self.config.max_send_sge;
+            qp_attr.cap.max_recv_sge = 0; // RQ disabled when using SRQ
+            qp_attr.cap.max_inline_data = self.config.max_inline_data;
+            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
+            qp_attr.pd = self.pd.as_ptr();
+
+            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
+            if !self.config.enable_scatter_to_cqe {
+                mlx5_attr.comp_mask =
+                    mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS
+                        as u64;
+                mlx5_attr.create_flags =
+                    mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
+            }
+
+            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
+
+            // Clone the inner Srq from Rc<Srq<RqEntry>>
+            let srq_inner: Srq<RqEntry> = (**srq).clone();
+
+            // Clone weak references before moving into RcQp
+            let send_cq_for_register = self.send_cq_weak.clone();
+            let recv_cq_for_register = self.recv_cq_weak.clone();
+
+            let mut result = RcQp {
+                qp,
+                state: Cell::new(QpState::Reset),
+                max_inline_data: self.config.max_inline_data,
+                sq: None,
+                rq: SharedRq::new(srq_inner),
+                sq_callback: self.sq_callback,
+                rq_callback: self.rq_callback,
+                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
+                recv_cq: self.recv_cq_weak.unwrap_or_else(Weak::new),
+                _pd: self.pd.clone(),
+                _marker: std::marker::PhantomData,
+            };
+
+            RcQpIbWithSrq::<SqEntry, RqEntry, OnSq, OnRq>::init_direct_access_internal(&mut result)?;
+
+            let qp_rc = Rc::new(RefCell::new(result));
+            let qpn = qp_rc.borrow().qpn();
+
+            // Register with CQs if using normal CompletionQueue
+            if let Some(cq) = send_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
+                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+            }
+            if let Some(cq) = recv_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
+                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+            }
+
+            Ok(qp_rc)
+        }
+    }
+}
+
+// =============================================================================
+// Build Methods - RoCE + OwnedRq
+// =============================================================================
+
+impl<'a, SqEntry, RqEntry, OnSq, OnRq>
+    RcQpBuilder<'a, SqEntry, RqEntry, RoCE, OwnedRq<RqEntry>, CqSet, CqSet, OnSq, OnRq>
+where
+    SqEntry: 'static,
+    RqEntry: 'static,
+    OnSq: Fn(Cqe, SqEntry) + 'static,
+    OnRq: Fn(Cqe, RqEntry) + 'static,
+{
+    /// Build the RC QP for RoCE.
+    ///
+    /// Only available when both SQ and RQ CQs are configured.
+    ///
+    /// # NOTE: RoCE support is untested (IB-only hardware environment)
+    pub fn build(self) -> io::Result<Rc<RefCell<RcQpRoCE<SqEntry, RqEntry, OnSq, OnRq>>>> {
+        unsafe {
+            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
+            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
+            qp_attr.send_cq = self.send_cq_ptr;
+            qp_attr.recv_cq = self.recv_cq_ptr;
+            qp_attr.cap.max_send_wr = self.config.max_send_wr;
+            qp_attr.cap.max_recv_wr = self.config.max_recv_wr;
+            qp_attr.cap.max_send_sge = self.config.max_send_sge;
+            qp_attr.cap.max_recv_sge = self.config.max_recv_sge;
+            qp_attr.cap.max_inline_data = self.config.max_inline_data;
+            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
+            qp_attr.pd = self.pd.as_ptr();
+
+            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
+            if !self.config.enable_scatter_to_cqe {
+                mlx5_attr.comp_mask =
+                    mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS
+                        as u64;
+                mlx5_attr.create_flags =
+                    mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
+            }
+
+            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
+
+            // Clone weak references before moving into RcQp
+            let send_cq_for_register = self.send_cq_weak.clone();
+            let recv_cq_for_register = self.recv_cq_weak.clone();
+
+            let mut result = RcQp {
+                qp,
+                state: Cell::new(QpState::Reset),
+                max_inline_data: self.config.max_inline_data,
+                sq: None,
+                rq: OwnedRq::new(None),
+                sq_callback: self.sq_callback,
+                rq_callback: self.rq_callback,
+                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
+                recv_cq: self.recv_cq_weak.unwrap_or_else(Weak::new),
+                _pd: self.pd.clone(),
+                _marker: std::marker::PhantomData,
+            };
+
+            // Initialize direct access for RoCE (same as IB)
+            RcQpRoCE::<SqEntry, RqEntry, OnSq, OnRq>::init_direct_access_internal(&mut result)?;
+
+            let qp_rc = Rc::new(RefCell::new(result));
+            let qpn = qp_rc.borrow().qpn();
+
+            // Register with CQs if using normal CompletionQueue
+            if let Some(cq) = send_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
+                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+            }
+            if let Some(cq) = recv_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
+                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+            }
+
+            Ok(qp_rc)
+        }
+    }
+}
+
+// =============================================================================
+// Build Methods - RoCE + SharedRq (SRQ)
+// =============================================================================
+
+impl<'a, SqEntry, RqEntry, OnSq, OnRq>
+    RcQpBuilder<'a, SqEntry, RqEntry, RoCE, SharedRq<RqEntry>, CqSet, CqSet, OnSq, OnRq>
+where
+    SqEntry: 'static,
+    RqEntry: 'static,
+    OnSq: Fn(Cqe, SqEntry) + 'static,
+    OnRq: Fn(Cqe, RqEntry) + 'static,
+{
+    /// Build the RC QP with SRQ for RoCE.
+    ///
+    /// Only available when both SQ and RQ CQs are configured.
+    ///
+    /// # NOTE: RoCE support is untested (IB-only hardware environment)
+    pub fn build(self) -> io::Result<Rc<RefCell<RcQpRoCEWithSrq<SqEntry, RqEntry, OnSq, OnRq>>>> {
+        let srq = self.srq.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "SRQ not set")
+        })?;
+
+        unsafe {
+            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
+            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
+            qp_attr.send_cq = self.send_cq_ptr;
+            qp_attr.recv_cq = self.recv_cq_ptr;
+            qp_attr.srq = srq.as_ptr();
+            qp_attr.cap.max_send_wr = self.config.max_send_wr;
+            qp_attr.cap.max_recv_wr = 0;
+            qp_attr.cap.max_send_sge = self.config.max_send_sge;
+            qp_attr.cap.max_recv_sge = 0;
+            qp_attr.cap.max_inline_data = self.config.max_inline_data;
+            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
+            qp_attr.pd = self.pd.as_ptr();
+
+            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
+            if !self.config.enable_scatter_to_cqe {
+                mlx5_attr.comp_mask =
+                    mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS
+                        as u64;
+                mlx5_attr.create_flags =
+                    mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
+            }
+
+            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
+
+            let srq_inner: Srq<RqEntry> = (**srq).clone();
+
+            // Clone weak references before moving into RcQp
+            let send_cq_for_register = self.send_cq_weak.clone();
+            let recv_cq_for_register = self.recv_cq_weak.clone();
+
+            let mut result = RcQp {
+                qp,
+                state: Cell::new(QpState::Reset),
+                max_inline_data: self.config.max_inline_data,
+                sq: None,
+                rq: SharedRq::new(srq_inner),
+                sq_callback: self.sq_callback,
+                rq_callback: self.rq_callback,
+                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
+                recv_cq: self.recv_cq_weak.unwrap_or_else(Weak::new),
+                _pd: self.pd.clone(),
+                _marker: std::marker::PhantomData,
+            };
+
+            RcQpRoCEWithSrq::<SqEntry, RqEntry, OnSq, OnRq>::init_direct_access_internal(&mut result)?;
+
+            let qp_rc = Rc::new(RefCell::new(result));
+            let qpn = qp_rc.borrow().qpn();
+
+            if let Some(cq) = send_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
+                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+            }
+            if let Some(cq) = recv_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
+                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+            }
+
+            Ok(qp_rc)
+        }
+    }
+}
+
+// =============================================================================
+// Build Methods - MonoCq (OnSq = (), OnRq = ()) - InfiniBand + OwnedRq
+// =============================================================================
+
+impl<'a, Entry>
+    RcQpBuilder<'a, Entry, Entry, InfiniBand, OwnedRq<Entry>, CqSet, CqSet, (), ()>
+where
+    Entry: 'static,
+{
+    /// Build the RC QP for use with MonoCq.
+    ///
+    /// When using MonoCq, callbacks are stored in the MonoCq, not in the RcQp.
+    /// This method is available when both SQ and RQ use MonoCq.
+    pub fn build(self) -> io::Result<Rc<RefCell<RcQpForMonoCq<Entry>>>> {
+        unsafe {
+            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
+            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
+            qp_attr.send_cq = self.send_cq_ptr;
+            qp_attr.recv_cq = self.recv_cq_ptr;
+            qp_attr.cap.max_send_wr = self.config.max_send_wr;
+            qp_attr.cap.max_recv_wr = self.config.max_recv_wr;
+            qp_attr.cap.max_send_sge = self.config.max_send_sge;
+            qp_attr.cap.max_recv_sge = self.config.max_recv_sge;
+            qp_attr.cap.max_inline_data = self.config.max_inline_data;
+            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
+            qp_attr.pd = self.pd.as_ptr();
+
+            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
+            if !self.config.enable_scatter_to_cqe {
+                mlx5_attr.comp_mask =
+                    mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS
+                        as u64;
+                mlx5_attr.create_flags =
+                    mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
+            }
+
+            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
+
+            let mut result = RcQp {
+                qp,
+                state: Cell::new(QpState::Reset),
+                max_inline_data: self.config.max_inline_data,
+                sq: None,
+                rq: OwnedRq::new(None),
+                sq_callback: (),
+                rq_callback: (),
+                send_cq: Weak::new(),  // MonoCq doesn't use CompletionQueue registration
+                recv_cq: Weak::new(),
+                _pd: self.pd.clone(),
+                _marker: std::marker::PhantomData,
+            };
+
+            RcQpIb::<Entry, Entry, (), ()>::init_direct_access_internal(&mut result)?;
+
+            Ok(Rc::new(RefCell::new(result)))
+        }
     }
 }

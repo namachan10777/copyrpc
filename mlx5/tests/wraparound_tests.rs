@@ -63,25 +63,17 @@ fn test_rc_rdma_write_wraparound() {
 
     let qp1 = ctx
         .ctx
-        .create_rc_qp(
-            &ctx.pd,
-            &send_cq,
-            &recv_cq1,
-            &config,
-            noop_sq_callback as fn(_, _),
-            noop_rq_callback as fn(_, _),
-        )
+        .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_cq(send_cq.clone(), noop_sq_callback as fn(_, _))
+        .rq_cq(recv_cq1.clone(), noop_rq_callback as fn(_, _))
+        .build()
         .expect("Failed to create QP1");
     let qp2 = ctx
         .ctx
-        .create_rc_qp(
-            &ctx.pd,
-            &send_cq,
-            &recv_cq2,
-            &config,
-            noop_sq_callback as fn(_, _),
-            noop_rq_callback as fn(_, _),
-        )
+        .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_cq(send_cq.clone(), noop_sq_callback as fn(_, _))
+        .rq_cq(recv_cq2.clone(), noop_rq_callback as fn(_, _))
+        .build()
         .expect("Failed to create QP2");
 
     // Connect QPs
@@ -193,25 +185,17 @@ fn test_rc_ring_sq_doorbell() {
 
     let qp1 = ctx
         .ctx
-        .create_rc_qp(
-            &ctx.pd,
-            &send_cq,
-            &recv_cq1,
-            &config,
-            noop_sq_callback as fn(_, _),
-            noop_rq_callback as fn(_, _),
-        )
+        .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_cq(send_cq.clone(), noop_sq_callback as fn(_, _))
+        .rq_cq(recv_cq1.clone(), noop_rq_callback as fn(_, _))
+        .build()
         .expect("Failed to create QP1");
     let qp2 = ctx
         .ctx
-        .create_rc_qp(
-            &ctx.pd,
-            &send_cq,
-            &recv_cq2,
-            &config,
-            noop_sq_callback as fn(_, _),
-            noop_rq_callback as fn(_, _),
-        )
+        .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_cq(send_cq.clone(), noop_sq_callback as fn(_, _))
+        .rq_cq(recv_cq2.clone(), noop_rq_callback as fn(_, _))
+        .build()
         .expect("Failed to create QP2");
 
     let remote1 = RemoteQpInfo {
@@ -518,7 +502,10 @@ fn test_ud_send_wraparound() {
 
     let sender = ctx
         .ctx
-        .create_ud_qp::<u64, u64, _, _>(&ctx.pd, &send_cq, &recv_cq, &config, |_cqe, _entry| {}, |_cqe, _entry| {})
+        .ud_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_cq(send_cq.clone(), |_cqe: mlx5::cq::Cqe, _entry: u64| {})
+        .rq_cq(recv_cq.clone(), |_cqe: mlx5::cq::Cqe, _entry: u64| {})
+        .build()
         .expect("Failed to create sender QP");
     sender
         .borrow_mut()
@@ -527,7 +514,10 @@ fn test_ud_send_wraparound() {
 
     let receiver = ctx
         .ctx
-        .create_ud_qp::<u64, u64, _, _>(&ctx.pd, &send_cq, &recv_cq, &config, |_cqe, _entry| {}, |_cqe, _entry| {})
+        .ud_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_cq(send_cq.clone(), |_cqe: mlx5::cq::Cqe, _entry: u64| {})
+        .rq_cq(recv_cq.clone(), |_cqe: mlx5::cq::Cqe, _entry: u64| {})
+        .build()
         .expect("Failed to create receiver QP");
     receiver
         .borrow_mut()
@@ -657,25 +647,17 @@ fn test_rc_inline_wraparound() {
 
     let qp1 = ctx
         .ctx
-        .create_rc_qp(
-            &ctx.pd,
-            &send_cq,
-            &recv_cq1,
-            &config,
-            noop_sq_callback as fn(_, _),
-            noop_rq_callback as fn(_, _),
-        )
+        .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_cq(send_cq.clone(), noop_sq_callback as fn(_, _))
+        .rq_cq(recv_cq1.clone(), noop_rq_callback as fn(_, _))
+        .build()
         .expect("Failed to create QP1");
     let qp2 = ctx
         .ctx
-        .create_rc_qp(
-            &ctx.pd,
-            &send_cq,
-            &recv_cq2,
-            &config,
-            noop_sq_callback as fn(_, _),
-            noop_rq_callback as fn(_, _),
-        )
+        .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_cq(send_cq.clone(), noop_sq_callback as fn(_, _))
+        .rq_cq(recv_cq2.clone(), noop_rq_callback as fn(_, _))
+        .build()
         .expect("Failed to create QP2");
 
     // Connect QPs
@@ -810,25 +792,17 @@ fn test_rc_inline_variable_size_wraparound() {
 
     let qp1 = ctx
         .ctx
-        .create_rc_qp(
-            &ctx.pd,
-            &send_cq,
-            &recv_cq1,
-            &config,
-            noop_sq_callback as fn(_, _),
-            noop_rq_callback as fn(_, _),
-        )
+        .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_cq(send_cq.clone(), noop_sq_callback as fn(_, _))
+        .rq_cq(recv_cq1.clone(), noop_rq_callback as fn(_, _))
+        .build()
         .expect("Failed to create QP1");
     let qp2 = ctx
         .ctx
-        .create_rc_qp(
-            &ctx.pd,
-            &send_cq,
-            &recv_cq2,
-            &config,
-            noop_sq_callback as fn(_, _),
-            noop_rq_callback as fn(_, _),
-        )
+        .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_cq(send_cq.clone(), noop_sq_callback as fn(_, _))
+        .rq_cq(recv_cq2.clone(), noop_rq_callback as fn(_, _))
+        .build()
         .expect("Failed to create QP2");
 
     // Connect QPs

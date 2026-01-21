@@ -47,14 +47,10 @@ fn test_qp_destroy_after_remote_gone() {
     let recv_cq1 = Rc::new(recv_cq1);
     let qp1 = ctx1
         .ctx
-        .create_rc_qp(
-            &ctx1.pd,
-            &send_cq1,
-            &recv_cq1,
-            &config,
-            noop_sq_callback as fn(_, _),
-            noop_rq_callback as fn(_, _),
-        )
+        .rc_qp_builder::<u64, u64>(&ctx1.pd, &config)
+        .sq_cq(send_cq1.clone(), noop_sq_callback as fn(_, _))
+        .rq_cq(recv_cq1.clone(), noop_rq_callback as fn(_, _))
+        .build()
         .expect("create qp1");
 
     // Create QP2 on context 2 (separate send and recv CQs)
@@ -64,14 +60,10 @@ fn test_qp_destroy_after_remote_gone() {
     let recv_cq2 = Rc::new(recv_cq2);
     let qp2 = ctx2
         .ctx
-        .create_rc_qp(
-            &ctx2.pd,
-            &send_cq2,
-            &recv_cq2,
-            &config,
-            noop_sq_callback as fn(_, _),
-            noop_rq_callback as fn(_, _),
-        )
+        .rc_qp_builder::<u64, u64>(&ctx2.pd, &config)
+        .sq_cq(send_cq2.clone(), noop_sq_callback as fn(_, _))
+        .rq_cq(recv_cq2.clone(), noop_rq_callback as fn(_, _))
+        .build()
         .expect("create qp2");
 
     let access = full_access().bits();
@@ -177,14 +169,10 @@ fn test_qp_destroy_multi_thread() {
         let recv_cq = Rc::new(recv_cq);
         let qp = ctx
             .ctx
-            .create_rc_qp(
-                &ctx.pd,
-                &send_cq,
-                &recv_cq,
-                &config,
-                noop_callback as fn(_, _),
-                noop_callback as fn(_, _),
-            )
+            .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
+            .sq_cq(send_cq.clone(), noop_callback as fn(_, _))
+            .rq_cq(recv_cq.clone(), noop_callback as fn(_, _))
+            .build()
             .expect("create qp");
 
         // Send server info
@@ -244,14 +232,10 @@ fn test_qp_destroy_multi_thread() {
     let recv_cq = Rc::new(recv_cq);
     let qp = ctx
         .ctx
-        .create_rc_qp(
-            &ctx.pd,
-            &send_cq,
-            &recv_cq,
-            &config,
-            noop_callback as fn(_, _),
-            noop_callback as fn(_, _),
-        )
+        .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_cq(send_cq.clone(), noop_callback as fn(_, _))
+        .rq_cq(recv_cq.clone(), noop_callback as fn(_, _))
+        .build()
         .expect("create qp");
 
     // Receive server info
@@ -348,14 +332,10 @@ fn test_qp_destroy_after_data_transfer() {
         let recv_cq = Rc::new(recv_cq);
         let qp = ctx
             .ctx
-            .create_rc_qp(
-                &ctx.pd,
-                &send_cq,
-                &recv_cq,
-                &config,
-                noop_callback as fn(_, _),
-                noop_callback as fn(_, _),
-            )
+            .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
+            .sq_cq(send_cq.clone(), noop_callback as fn(_, _))
+            .rq_cq(recv_cq.clone(), noop_callback as fn(_, _))
+            .build()
             .expect("create qp");
 
         // Allocate buffer and MR
@@ -430,14 +410,10 @@ fn test_qp_destroy_after_data_transfer() {
     let recv_cq = Rc::new(recv_cq);
     let qp = ctx
         .ctx
-        .create_rc_qp(
-            &ctx.pd,
-            &send_cq,
-            &recv_cq,
-            &config,
-            noop_callback as fn(_, _),
-            noop_callback as fn(_, _),
-        )
+        .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_cq(send_cq.clone(), noop_callback as fn(_, _))
+        .rq_cq(recv_cq.clone(), noop_callback as fn(_, _))
+        .build()
         .expect("create qp");
 
     // Allocate buffer and MR
@@ -567,7 +543,10 @@ fn test_qp_destroy_after_actual_send_recv() {
 
         let qp = ctx
             .ctx
-            .create_rc_qp(&ctx.pd, &send_cq, &recv_cq, &config, noop_callback as fn(_, _), rq_callback)
+            .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
+            .sq_cq(send_cq.clone(), noop_callback as fn(_, _))
+            .rq_cq(recv_cq.clone(), rq_callback)
+            .build()
             .expect("create qp");
 
         // Allocate buffer and MR
@@ -692,7 +671,10 @@ fn test_qp_destroy_after_actual_send_recv() {
 
     let qp = ctx
         .ctx
-        .create_rc_qp(&ctx.pd, &send_cq, &recv_cq, &config, noop_callback as fn(_, _), rq_callback)
+        .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_cq(send_cq.clone(), noop_callback as fn(_, _))
+        .rq_cq(recv_cq.clone(), rq_callback)
+        .build()
         .expect("create qp");
 
     // Allocate buffer and MR

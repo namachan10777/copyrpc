@@ -466,190 +466,6 @@ pub struct UdQp<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqCo
     _marker: std::marker::PhantomData<(Transport, RqEntry)>,
 }
 
-impl Context {
-    /// Create a UD QP.
-    ///
-    /// Only signaled WQEs have entries stored in the WQE table.
-    ///
-    /// # Note
-    /// The send_cq must have `init_direct_access()` called before this function.
-    pub fn create_ud_qp<SqEntry, RqEntry, OnSqComplete, OnRqComplete>(
-        &self,
-        pd: &Pd,
-        send_cq: &Rc<CompletionQueue>,
-        recv_cq: &Rc<CompletionQueue>,
-        config: &UdQpConfig,
-        sq_callback: OnSqComplete,
-        rq_callback: OnRqComplete,
-    ) -> io::Result<Rc<RefCell<UdQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>>>
-    where
-        SqEntry: 'static,
-        RqEntry: 'static,
-        OnSqComplete: Fn(Cqe, SqEntry) + 'static,
-        OnRqComplete: Fn(Cqe, RqEntry) + 'static,
-    {
-        let qp = self.create_ud_qp_raw(pd, send_cq, recv_cq, config, sq_callback, rq_callback)?;
-        let qp_rc = Rc::new(RefCell::new(qp));
-        let qpn = qp_rc.borrow().qpn();
-
-        send_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-        recv_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-
-        Ok(qp_rc)
-    }
-
-    fn create_ud_qp_raw<SqEntry, RqEntry, OnSqComplete, OnRqComplete>(
-        &self,
-        pd: &Pd,
-        send_cq: &Rc<CompletionQueue>,
-        recv_cq: &Rc<CompletionQueue>,
-        config: &UdQpConfig,
-        sq_callback: OnSqComplete,
-        rq_callback: OnRqComplete,
-    ) -> io::Result<UdQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>
-    where
-        OnSqComplete: Fn(Cqe, SqEntry),
-        OnRqComplete: Fn(Cqe, RqEntry),
-    {
-        unsafe {
-            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
-            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_UD;
-            qp_attr.send_cq = send_cq.as_ptr();
-            qp_attr.recv_cq = recv_cq.as_ptr();
-            qp_attr.cap.max_send_wr = config.max_send_wr;
-            qp_attr.cap.max_recv_wr = config.max_recv_wr;
-            qp_attr.cap.max_send_sge = config.max_send_sge;
-            qp_attr.cap.max_recv_sge = config.max_recv_sge;
-            qp_attr.cap.max_inline_data = config.max_inline_data;
-            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
-            qp_attr.pd = pd.as_ptr();
-
-            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
-
-            let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
-            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
-
-            let mut result = UdQp {
-                qp,
-                state: Cell::new(UdQpState::Reset),
-                qkey: config.qkey,
-                max_inline_data: config.max_inline_data,
-                sq: None,
-                rq: UdOwnedRq::new(None),
-                sq_callback,
-                rq_callback,
-                send_cq: Rc::downgrade(send_cq),
-                recv_cq: Rc::downgrade(recv_cq),
-                _pd: pd.clone(),
-                _marker: std::marker::PhantomData,
-            };
-
-            // Auto-initialize direct access
-            UdQpIb::<SqEntry, RqEntry, OnSqComplete, OnRqComplete>::init_direct_access_internal(&mut result)?;
-
-            Ok(result)
-        }
-    }
-
-    /// Create a UD QP with SRQ.
-    ///
-    /// This variant uses a Shared Receive Queue (SRQ) for receive operations.
-    /// The QP's own RQ-related methods (`post_recv`, `ring_rq_doorbell`, etc.)
-    /// are not available. Instead, use the SRQ's methods for receive operations.
-    ///
-    /// # Arguments
-    /// * `pd` - Protection Domain
-    /// * `send_cq` - Completion Queue for send completions
-    /// * `recv_cq` - Completion Queue for receive completions
-    /// * `srq` - Shared Receive Queue
-    /// * `config` - QP configuration (max_recv_wr and max_recv_sge are ignored)
-    /// * `sq_callback` - SQ completion callback
-    /// * `rq_callback` - RQ completion callback
-    ///
-    /// # Errors
-    /// Returns an error if the QP cannot be created.
-    pub fn create_ud_qp_with_srq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>(
-        &self,
-        pd: &Pd,
-        send_cq: &Rc<CompletionQueue>,
-        recv_cq: &Rc<CompletionQueue>,
-        srq: &Srq<RqEntry>,
-        config: &UdQpConfig,
-        sq_callback: OnSqComplete,
-        rq_callback: OnRqComplete,
-    ) -> io::Result<Rc<RefCell<UdQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>>>
-    where
-        SqEntry: 'static,
-        RqEntry: 'static,
-        OnSqComplete: Fn(Cqe, SqEntry) + 'static,
-        OnRqComplete: Fn(Cqe, RqEntry) + 'static,
-    {
-        let qp = self.create_ud_qp_with_srq_raw(pd, send_cq, recv_cq, srq, config, sq_callback, rq_callback)?;
-        let qp_rc = Rc::new(RefCell::new(qp));
-        let qpn = qp_rc.borrow().qpn();
-
-        send_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-        recv_cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-
-        Ok(qp_rc)
-    }
-
-    fn create_ud_qp_with_srq_raw<SqEntry, RqEntry, OnSqComplete, OnRqComplete>(
-        &self,
-        pd: &Pd,
-        send_cq: &Rc<CompletionQueue>,
-        recv_cq: &Rc<CompletionQueue>,
-        srq: &Srq<RqEntry>,
-        config: &UdQpConfig,
-        sq_callback: OnSqComplete,
-        rq_callback: OnRqComplete,
-    ) -> io::Result<UdQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>
-    where
-        OnSqComplete: Fn(Cqe, SqEntry),
-        OnRqComplete: Fn(Cqe, RqEntry),
-    {
-        unsafe {
-            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
-            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_UD;
-            qp_attr.send_cq = send_cq.as_ptr();
-            qp_attr.recv_cq = recv_cq.as_ptr();
-            qp_attr.srq = srq.as_ptr();
-            qp_attr.cap.max_send_wr = config.max_send_wr;
-            qp_attr.cap.max_recv_wr = 0; // RQ disabled when using SRQ
-            qp_attr.cap.max_send_sge = config.max_send_sge;
-            qp_attr.cap.max_recv_sge = 0; // RQ disabled when using SRQ
-            qp_attr.cap.max_inline_data = config.max_inline_data;
-            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
-            qp_attr.pd = pd.as_ptr();
-
-            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
-
-            let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
-            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
-
-            let mut result = UdQp {
-                qp,
-                state: Cell::new(UdQpState::Reset),
-                qkey: config.qkey,
-                max_inline_data: config.max_inline_data,
-                sq: None,
-                rq: UdSharedRq::new(srq.clone()),
-                sq_callback,
-                rq_callback,
-                send_cq: Rc::downgrade(send_cq),
-                recv_cq: Rc::downgrade(recv_cq),
-                _pd: pd.clone(),
-                _marker: std::marker::PhantomData,
-            };
-
-            // Initialize SQ direct access (no RQ for SRQ variant)
-            UdQpIbWithSrq::<SqEntry, RqEntry, OnSqComplete, OnRqComplete>::init_direct_access_internal(&mut result)?;
-
-            Ok(result)
-        }
-    }
-}
-
 impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> Drop for UdQp<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> {
     fn drop(&mut self) {
         let qpn = self.qpn();
@@ -987,6 +803,678 @@ where
             {
                 (self.sq_callback)(cqe, entry);
             }
+        }
+    }
+}
+
+// =============================================================================
+// RoCE init_direct_access_internal implementations
+// =============================================================================
+
+impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete> {
+    /// Initialize direct queue access for RoCE (same as IB).
+    fn init_direct_access_internal(&mut self) -> io::Result<()> {
+        if self.sq.is_some() {
+            return Ok(()); // Already initialized
+        }
+
+        let info = self.query_info()?;
+        let wqe_cnt = info.sq_wqe_cnt as u16;
+
+        self.sq = Some(UdSendQueueState {
+            buf: info.sq_buf,
+            wqe_cnt,
+            sqn: info.sqn,
+            pi: Cell::new(0),
+            ci: Cell::new(0),
+            last_wqe: Cell::new(None),
+            dbrec: info.dbrec,
+            bf_reg: info.bf_reg,
+            bf_size: info.bf_size,
+            bf_offset: Cell::new(0),
+            max_inline_data: self.max_inline_data,
+            table: OrderedWqeTable::new(wqe_cnt),
+            _marker: PhantomData,
+        });
+
+        let rq_wqe_cnt = info.rq_wqe_cnt as u16;
+        self.rq = UdOwnedRq::new(Some(UdRecvQueueState {
+            buf: info.rq_buf,
+            wqe_cnt: rq_wqe_cnt,
+            stride: info.rq_stride,
+            pi: Cell::new(0),
+            ci: Cell::new(0),
+            dbrec: info.dbrec,
+            table: (0..rq_wqe_cnt).map(|_| Cell::new(None)).collect(),
+        }));
+
+        Ok(())
+    }
+}
+
+impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> {
+    /// Initialize direct queue access for RoCE with SRQ (SQ only).
+    fn init_direct_access_internal(&mut self) -> io::Result<()> {
+        if self.sq.is_some() {
+            return Ok(()); // Already initialized
+        }
+
+        let info = self.query_info()?;
+        let wqe_cnt = info.sq_wqe_cnt as u16;
+
+        self.sq = Some(UdSendQueueState {
+            buf: info.sq_buf,
+            wqe_cnt,
+            sqn: info.sqn,
+            pi: Cell::new(0),
+            ci: Cell::new(0),
+            last_wqe: Cell::new(None),
+            dbrec: info.dbrec,
+            bf_reg: info.bf_reg,
+            bf_size: info.bf_size,
+            bf_offset: Cell::new(0),
+            max_inline_data: self.max_inline_data,
+            table: OrderedWqeTable::new(wqe_cnt),
+            _marker: PhantomData,
+        });
+
+        // Note: RQ is not initialized for SRQ variant - SRQ handles receives
+        Ok(())
+    }
+}
+
+// =============================================================================
+// CompletionTarget impl for RoCE variants
+// =============================================================================
+
+impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> CompletionTarget for UdQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
+where
+    OnSqComplete: Fn(Cqe, SqEntry),
+    OnRqComplete: Fn(Cqe, RqEntry),
+{
+    fn qpn(&self) -> u32 {
+        UdQp::qpn(self)
+    }
+
+    fn dispatch_cqe(&self, cqe: Cqe) {
+        if cqe.opcode.is_responder() {
+            // RQ completion (responder)
+            if let Some(rq) = self.rq.as_ref()
+                && let Some(entry) = rq.process_completion(cqe.wqe_counter)
+            {
+                (self.rq_callback)(cqe, entry);
+            }
+        } else {
+            // SQ completion (requester)
+            if let Some(sq) = self.sq.as_ref()
+                && let Some(entry) = sq.process_completion(cqe.wqe_counter)
+            {
+                (self.sq_callback)(cqe, entry);
+            }
+        }
+    }
+}
+
+impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> CompletionTarget for UdQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
+where
+    OnSqComplete: Fn(Cqe, SqEntry),
+    OnRqComplete: Fn(Cqe, RqEntry),
+{
+    fn qpn(&self) -> u32 {
+        UdQp::qpn(self)
+    }
+
+    fn dispatch_cqe(&self, cqe: Cqe) {
+        if cqe.opcode.is_responder() {
+            // RQ completion via SRQ (responder)
+            if let Some(entry) = self.rq.srq().process_recv_completion(cqe.wqe_counter)
+            {
+                (self.rq_callback)(cqe, entry);
+            }
+        } else {
+            // SQ completion (requester)
+            if let Some(sq) = self.sq.as_ref()
+                && let Some(entry) = sq.process_completion(cqe.wqe_counter)
+            {
+                (self.sq_callback)(cqe, entry);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// UdQpBuilder - Builder Pattern for UD QP Creation
+// =============================================================================
+
+use crate::qp::{NoCq, CqSet};
+
+/// Builder for UD Queue Pairs.
+///
+/// # Type Parameters
+///
+/// - `SqEntry`: Entry type stored in SQ WQE table
+/// - `RqEntry`: Entry type stored in RQ WQE table
+/// - `T`: Transport type (`InfiniBand` or `RoCE`)
+/// - `Rq`: Receive queue type (`UdOwnedRq<RqEntry>` or `UdSharedRq<RqEntry>`)
+/// - `SqCqState`: SQ CQ configuration state (`NoCq` or `CqSet`)
+/// - `RqCqState`: RQ CQ configuration state (`NoCq` or `CqSet`)
+/// - `OnSq`: SQ completion callback type
+/// - `OnRq`: RQ completion callback type
+pub struct UdQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, RqCqState, OnSq, OnRq> {
+    ctx: &'a Context,
+    pd: &'a Pd,
+    config: UdQpConfig,
+
+    // CQ pointers (set via sq_cq/sq_mono_cq/rq_cq/rq_mono_cq)
+    send_cq_ptr: *mut mlx5_sys::ibv_cq,
+    recv_cq_ptr: *mut mlx5_sys::ibv_cq,
+
+    // Weak references to normal CQs for registration (None for MonoCq)
+    send_cq_weak: Option<Weak<CompletionQueue>>,
+    recv_cq_weak: Option<Weak<CompletionQueue>>,
+
+    // Callbacks (set via sq_cq/rq_cq, () for MonoCq)
+    sq_callback: OnSq,
+    rq_callback: OnRq,
+
+    // SRQ (set via with_srq())
+    srq: Option<Rc<Srq<RqEntry>>>,
+
+    _marker: std::marker::PhantomData<(SqEntry, RqEntry, T, Rq, SqCqState, RqCqState)>,
+}
+
+impl Context {
+    /// Create a UD QP Builder.
+    ///
+    /// CQs are configured via builder methods:
+    /// - `.sq_cq(cq, callback)` - Normal CQ with callback
+    /// - `.sq_mono_cq(mono_cq)` - MonoCq (callback is on CQ side)
+    /// - `.rq_cq(cq, callback)` / `.rq_mono_cq(mono_cq)` - Same for RQ
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let qp = ctx.ud_qp_builder::<u64, u64>(&pd, &config)
+    ///     .sq_cq(send_cq.clone(), |cqe, entry| { /* SQ completion */ })
+    ///     .rq_cq(recv_cq.clone(), |cqe, entry| { /* RQ completion */ })
+    ///     .build()?;
+    /// ```
+    pub fn ud_qp_builder<'a, SqEntry, RqEntry>(
+        &'a self,
+        pd: &'a Pd,
+        config: &UdQpConfig,
+    ) -> UdQpBuilder<'a, SqEntry, RqEntry, InfiniBand, UdOwnedRq<RqEntry>, NoCq, NoCq, (), ()> {
+        UdQpBuilder {
+            ctx: self,
+            pd,
+            config: config.clone(),
+            send_cq_ptr: std::ptr::null_mut(),
+            recv_cq_ptr: std::ptr::null_mut(),
+            send_cq_weak: None,
+            recv_cq_weak: None,
+            sq_callback: (),
+            rq_callback: (),
+            srq: None,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+// =============================================================================
+// SQ CQ Configuration Methods
+// =============================================================================
+
+impl<'a, SqEntry, RqEntry, T, Rq, RqCqState, OnRq>
+    UdQpBuilder<'a, SqEntry, RqEntry, T, Rq, NoCq, RqCqState, (), OnRq>
+{
+    /// Set normal CQ for SQ with callback.
+    pub fn sq_cq<OnSq>(
+        self,
+        cq: Rc<CompletionQueue>,
+        callback: OnSq,
+    ) -> UdQpBuilder<'a, SqEntry, RqEntry, T, Rq, CqSet, RqCqState, OnSq, OnRq>
+    where
+        OnSq: Fn(Cqe, SqEntry) + 'static,
+    {
+        UdQpBuilder {
+            ctx: self.ctx,
+            pd: self.pd,
+            config: self.config,
+            send_cq_ptr: cq.as_ptr(),
+            recv_cq_ptr: self.recv_cq_ptr,
+            send_cq_weak: Some(Rc::downgrade(&cq)),
+            recv_cq_weak: self.recv_cq_weak,
+            sq_callback: callback,
+            rq_callback: self.rq_callback,
+            srq: self.srq,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Set MonoCq for SQ (callback is on CQ side).
+    pub fn sq_mono_cq<Q, F>(
+        self,
+        mono_cq: &Rc<crate::mono_cq::MonoCq<Q, F>>,
+    ) -> UdQpBuilder<'a, SqEntry, RqEntry, T, Rq, CqSet, RqCqState, (), OnRq>
+    where
+        Q: crate::mono_cq::CompletionSource,
+        F: Fn(Cqe, Q::Entry) + 'static,
+    {
+        UdQpBuilder {
+            ctx: self.ctx,
+            pd: self.pd,
+            config: self.config,
+            send_cq_ptr: mono_cq.as_ptr(),
+            recv_cq_ptr: self.recv_cq_ptr,
+            send_cq_weak: None,
+            recv_cq_weak: self.recv_cq_weak,
+            sq_callback: (),
+            rq_callback: self.rq_callback,
+            srq: self.srq,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+// =============================================================================
+// RQ CQ Configuration Methods
+// =============================================================================
+
+impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, OnSq>
+    UdQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, NoCq, OnSq, ()>
+{
+    /// Set normal CQ for RQ with callback.
+    pub fn rq_cq<OnRq>(
+        self,
+        cq: Rc<CompletionQueue>,
+        callback: OnRq,
+    ) -> UdQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, CqSet, OnSq, OnRq>
+    where
+        OnRq: Fn(Cqe, RqEntry) + 'static,
+    {
+        UdQpBuilder {
+            ctx: self.ctx,
+            pd: self.pd,
+            config: self.config,
+            send_cq_ptr: self.send_cq_ptr,
+            recv_cq_ptr: cq.as_ptr(),
+            send_cq_weak: self.send_cq_weak,
+            recv_cq_weak: Some(Rc::downgrade(&cq)),
+            sq_callback: self.sq_callback,
+            rq_callback: callback,
+            srq: self.srq,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Set MonoCq for RQ (callback is on CQ side).
+    pub fn rq_mono_cq<Q, F>(
+        self,
+        mono_cq: &Rc<crate::mono_cq::MonoCq<Q, F>>,
+    ) -> UdQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, CqSet, OnSq, ()>
+    where
+        Q: crate::mono_cq::CompletionSource,
+        F: Fn(Cqe, Q::Entry) + 'static,
+    {
+        UdQpBuilder {
+            ctx: self.ctx,
+            pd: self.pd,
+            config: self.config,
+            send_cq_ptr: self.send_cq_ptr,
+            recv_cq_ptr: mono_cq.as_ptr(),
+            send_cq_weak: self.send_cq_weak,
+            recv_cq_weak: None,
+            sq_callback: self.sq_callback,
+            rq_callback: (),
+            srq: self.srq,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+// =============================================================================
+// Transport / RQ Type Transition Methods
+// =============================================================================
+
+impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, RqCqState, OnSq, OnRq>
+    UdQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, RqCqState, OnSq, OnRq>
+{
+    /// Switch to RoCE transport.
+    ///
+    /// # NOTE: RoCE support is untested (IB-only hardware environment)
+    pub fn for_roce(
+        self,
+    ) -> UdQpBuilder<'a, SqEntry, RqEntry, RoCE, Rq, SqCqState, RqCqState, OnSq, OnRq> {
+        UdQpBuilder {
+            ctx: self.ctx,
+            pd: self.pd,
+            config: self.config,
+            send_cq_ptr: self.send_cq_ptr,
+            recv_cq_ptr: self.recv_cq_ptr,
+            send_cq_weak: self.send_cq_weak,
+            recv_cq_weak: self.recv_cq_weak,
+            sq_callback: self.sq_callback,
+            rq_callback: self.rq_callback,
+            srq: self.srq,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, SqEntry, RqEntry, T, SqCqState, RqCqState, OnSq, OnRq>
+    UdQpBuilder<'a, SqEntry, RqEntry, T, UdOwnedRq<RqEntry>, SqCqState, RqCqState, OnSq, OnRq>
+{
+    /// Use Shared Receive Queue (SRQ) instead of owned RQ.
+    pub fn with_srq(
+        self,
+        srq: Rc<Srq<RqEntry>>,
+    ) -> UdQpBuilder<'a, SqEntry, RqEntry, T, UdSharedRq<RqEntry>, SqCqState, RqCqState, OnSq, OnRq>
+    {
+        UdQpBuilder {
+            ctx: self.ctx,
+            pd: self.pd,
+            config: self.config,
+            send_cq_ptr: self.send_cq_ptr,
+            recv_cq_ptr: self.recv_cq_ptr,
+            send_cq_weak: self.send_cq_weak,
+            recv_cq_weak: self.recv_cq_weak,
+            sq_callback: self.sq_callback,
+            rq_callback: self.rq_callback,
+            srq: Some(srq),
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+// =============================================================================
+// Build Methods - InfiniBand + OwnedRq
+// =============================================================================
+
+impl<'a, SqEntry, RqEntry, OnSq, OnRq>
+    UdQpBuilder<'a, SqEntry, RqEntry, InfiniBand, UdOwnedRq<RqEntry>, CqSet, CqSet, OnSq, OnRq>
+where
+    SqEntry: 'static,
+    RqEntry: 'static,
+    OnSq: Fn(Cqe, SqEntry) + 'static,
+    OnRq: Fn(Cqe, RqEntry) + 'static,
+{
+    /// Build the UD QP.
+    pub fn build(self) -> io::Result<Rc<RefCell<UdQpIb<SqEntry, RqEntry, OnSq, OnRq>>>> {
+        unsafe {
+            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
+            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_UD;
+            qp_attr.send_cq = self.send_cq_ptr;
+            qp_attr.recv_cq = self.recv_cq_ptr;
+            qp_attr.cap.max_send_wr = self.config.max_send_wr;
+            qp_attr.cap.max_recv_wr = self.config.max_recv_wr;
+            qp_attr.cap.max_send_sge = self.config.max_send_sge;
+            qp_attr.cap.max_recv_sge = self.config.max_recv_sge;
+            qp_attr.cap.max_inline_data = self.config.max_inline_data;
+            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
+            qp_attr.pd = self.pd.as_ptr();
+
+            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
+
+            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
+
+            // Clone weak references before moving into UdQp
+            let send_cq_for_register = self.send_cq_weak.clone();
+            let recv_cq_for_register = self.recv_cq_weak.clone();
+
+            let mut result = UdQp {
+                qp,
+                state: Cell::new(UdQpState::Reset),
+                qkey: self.config.qkey,
+                max_inline_data: self.config.max_inline_data,
+                sq: None,
+                rq: UdOwnedRq::new(None),
+                sq_callback: self.sq_callback,
+                rq_callback: self.rq_callback,
+                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
+                recv_cq: self.recv_cq_weak.unwrap_or_else(Weak::new),
+                _pd: self.pd.clone(),
+                _marker: std::marker::PhantomData,
+            };
+
+            UdQpIb::<SqEntry, RqEntry, OnSq, OnRq>::init_direct_access_internal(&mut result)?;
+
+            let qp_rc = Rc::new(RefCell::new(result));
+            let qpn = qp_rc.borrow().qpn();
+
+            // Register with CQs if using normal CompletionQueue
+            if let Some(cq) = send_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
+                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+            }
+            if let Some(cq) = recv_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
+                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+            }
+
+            Ok(qp_rc)
+        }
+    }
+}
+
+// =============================================================================
+// Build Methods - InfiniBand + SharedRq (SRQ)
+// =============================================================================
+
+impl<'a, SqEntry, RqEntry, OnSq, OnRq>
+    UdQpBuilder<'a, SqEntry, RqEntry, InfiniBand, UdSharedRq<RqEntry>, CqSet, CqSet, OnSq, OnRq>
+where
+    SqEntry: 'static,
+    RqEntry: 'static,
+    OnSq: Fn(Cqe, SqEntry) + 'static,
+    OnRq: Fn(Cqe, RqEntry) + 'static,
+{
+    /// Build the UD QP with SRQ.
+    pub fn build(self) -> io::Result<Rc<RefCell<UdQpIbWithSrq<SqEntry, RqEntry, OnSq, OnRq>>>> {
+        let srq = self.srq.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "SRQ not set")
+        })?;
+
+        unsafe {
+            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
+            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_UD;
+            qp_attr.send_cq = self.send_cq_ptr;
+            qp_attr.recv_cq = self.recv_cq_ptr;
+            qp_attr.srq = srq.as_ptr();
+            qp_attr.cap.max_send_wr = self.config.max_send_wr;
+            qp_attr.cap.max_recv_wr = 0;
+            qp_attr.cap.max_send_sge = self.config.max_send_sge;
+            qp_attr.cap.max_recv_sge = 0;
+            qp_attr.cap.max_inline_data = self.config.max_inline_data;
+            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
+            qp_attr.pd = self.pd.as_ptr();
+
+            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
+
+            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
+
+            let srq_inner: Srq<RqEntry> = (**srq).clone();
+
+            // Clone weak references before moving into UdQp
+            let send_cq_for_register = self.send_cq_weak.clone();
+            let recv_cq_for_register = self.recv_cq_weak.clone();
+
+            let mut result = UdQp {
+                qp,
+                state: Cell::new(UdQpState::Reset),
+                qkey: self.config.qkey,
+                max_inline_data: self.config.max_inline_data,
+                sq: None,
+                rq: UdSharedRq::new(srq_inner),
+                sq_callback: self.sq_callback,
+                rq_callback: self.rq_callback,
+                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
+                recv_cq: self.recv_cq_weak.unwrap_or_else(Weak::new),
+                _pd: self.pd.clone(),
+                _marker: std::marker::PhantomData,
+            };
+
+            UdQpIbWithSrq::<SqEntry, RqEntry, OnSq, OnRq>::init_direct_access_internal(&mut result)?;
+
+            let qp_rc = Rc::new(RefCell::new(result));
+            let qpn = qp_rc.borrow().qpn();
+
+            // Register with CQs if using normal CompletionQueue
+            if let Some(cq) = send_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
+                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+            }
+            if let Some(cq) = recv_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
+                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+            }
+
+            Ok(qp_rc)
+        }
+    }
+}
+
+// =============================================================================
+// Build Methods - RoCE + OwnedRq
+// =============================================================================
+
+impl<'a, SqEntry, RqEntry, OnSq, OnRq>
+    UdQpBuilder<'a, SqEntry, RqEntry, RoCE, UdOwnedRq<RqEntry>, CqSet, CqSet, OnSq, OnRq>
+where
+    SqEntry: 'static,
+    RqEntry: 'static,
+    OnSq: Fn(Cqe, SqEntry) + 'static,
+    OnRq: Fn(Cqe, RqEntry) + 'static,
+{
+    /// Build the UD QP for RoCE.
+    ///
+    /// # NOTE: RoCE support is untested (IB-only hardware environment)
+    pub fn build(self) -> io::Result<Rc<RefCell<UdQpRoCE<SqEntry, RqEntry, OnSq, OnRq>>>> {
+        unsafe {
+            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
+            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_UD;
+            qp_attr.send_cq = self.send_cq_ptr;
+            qp_attr.recv_cq = self.recv_cq_ptr;
+            qp_attr.cap.max_send_wr = self.config.max_send_wr;
+            qp_attr.cap.max_recv_wr = self.config.max_recv_wr;
+            qp_attr.cap.max_send_sge = self.config.max_send_sge;
+            qp_attr.cap.max_recv_sge = self.config.max_recv_sge;
+            qp_attr.cap.max_inline_data = self.config.max_inline_data;
+            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
+            qp_attr.pd = self.pd.as_ptr();
+
+            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
+
+            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
+
+            // Clone weak references before moving into UdQp
+            let send_cq_for_register = self.send_cq_weak.clone();
+            let recv_cq_for_register = self.recv_cq_weak.clone();
+
+            let mut result = UdQp {
+                qp,
+                state: Cell::new(UdQpState::Reset),
+                qkey: self.config.qkey,
+                max_inline_data: self.config.max_inline_data,
+                sq: None,
+                rq: UdOwnedRq::new(None),
+                sq_callback: self.sq_callback,
+                rq_callback: self.rq_callback,
+                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
+                recv_cq: self.recv_cq_weak.unwrap_or_else(Weak::new),
+                _pd: self.pd.clone(),
+                _marker: std::marker::PhantomData,
+            };
+
+            UdQpRoCE::<SqEntry, RqEntry, OnSq, OnRq>::init_direct_access_internal(&mut result)?;
+
+            let qp_rc = Rc::new(RefCell::new(result));
+            let qpn = qp_rc.borrow().qpn();
+
+            // Register with CQs if using normal CompletionQueue
+            if let Some(cq) = send_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
+                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+            }
+            if let Some(cq) = recv_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
+                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+            }
+
+            Ok(qp_rc)
+        }
+    }
+}
+
+// =============================================================================
+// Build Methods - RoCE + SharedRq (SRQ)
+// =============================================================================
+
+impl<'a, SqEntry, RqEntry, OnSq, OnRq>
+    UdQpBuilder<'a, SqEntry, RqEntry, RoCE, UdSharedRq<RqEntry>, CqSet, CqSet, OnSq, OnRq>
+where
+    SqEntry: 'static,
+    RqEntry: 'static,
+    OnSq: Fn(Cqe, SqEntry) + 'static,
+    OnRq: Fn(Cqe, RqEntry) + 'static,
+{
+    /// Build the UD QP with SRQ for RoCE.
+    ///
+    /// # NOTE: RoCE support is untested (IB-only hardware environment)
+    pub fn build(self) -> io::Result<Rc<RefCell<UdQpRoCEWithSrq<SqEntry, RqEntry, OnSq, OnRq>>>> {
+        let srq = self.srq.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "SRQ not set")
+        })?;
+
+        unsafe {
+            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
+            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_UD;
+            qp_attr.send_cq = self.send_cq_ptr;
+            qp_attr.recv_cq = self.recv_cq_ptr;
+            qp_attr.srq = srq.as_ptr();
+            qp_attr.cap.max_send_wr = self.config.max_send_wr;
+            qp_attr.cap.max_recv_wr = 0;
+            qp_attr.cap.max_send_sge = self.config.max_send_sge;
+            qp_attr.cap.max_recv_sge = 0;
+            qp_attr.cap.max_inline_data = self.config.max_inline_data;
+            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
+            qp_attr.pd = self.pd.as_ptr();
+
+            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
+
+            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
+
+            let srq_inner: Srq<RqEntry> = (**srq).clone();
+
+            // Clone weak references before moving into UdQp
+            let send_cq_for_register = self.send_cq_weak.clone();
+            let recv_cq_for_register = self.recv_cq_weak.clone();
+
+            let mut result = UdQp {
+                qp,
+                state: Cell::new(UdQpState::Reset),
+                qkey: self.config.qkey,
+                max_inline_data: self.config.max_inline_data,
+                sq: None,
+                rq: UdSharedRq::new(srq_inner),
+                sq_callback: self.sq_callback,
+                rq_callback: self.rq_callback,
+                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
+                recv_cq: self.recv_cq_weak.unwrap_or_else(Weak::new),
+                _pd: self.pd.clone(),
+                _marker: std::marker::PhantomData,
+            };
+
+            UdQpRoCEWithSrq::<SqEntry, RqEntry, OnSq, OnRq>::init_direct_access_internal(&mut result)?;
+
+            let qp_rc = Rc::new(RefCell::new(result));
+            let qpn = qp_rc.borrow().qpn();
+
+            if let Some(cq) = send_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
+                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+            }
+            if let Some(cq) = recv_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
+                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+            }
+
+            Ok(qp_rc)
         }
     }
 }

@@ -38,14 +38,15 @@
 //!
 //! ### Callback-Based Completion Handling
 //!
-//! Completions are delivered via registered callbacks, not manual polling:
+//! Completions are delivered via registered callbacks, not manual polling.
+//! QPs are created using the Builder pattern:
 //!
 //! ```ignore
-//! // Create QP with completion callback
-//! let qp = ctx.create_rc_qp(pd, send_cq, recv_cq, config, |cqe, entry| {
-//!     // Called for each completion with the original entry
-//!     println!("Completed: {:?}", entry);
-//! })?;
+//! // Create QP with completion callbacks using Builder pattern
+//! let qp = ctx.rc_qp_builder::<u64, u64>(&pd, &config)
+//!     .sq_cq(send_cq.clone(), |cqe, entry| { /* SQ completion */ })
+//!     .rq_cq(recv_cq.clone(), |cqe, entry| { /* RQ completion */ })
+//!     .build()?;
 //!
 //! // Poll CQ to dispatch completions to registered callbacks
 //! send_cq.poll();
@@ -104,6 +105,10 @@ pub use qp::RcQpForMonoCq;
 // Re-export RQ type markers for SRQ support
 pub use qp::{OwnedRq, SharedRq, RcQpIbWithSrq, RcQpRoCEWithSrq};
 pub use ud::{UdOwnedRq, UdSharedRq, UdQpIb, UdQpIbWithSrq, UdQpRoCE, UdQpRoCEWithSrq};
+
+// Re-export Builder types for QP creation
+pub use qp::{NoCq, CqSet, RcQpBuilder};
+pub use ud::UdQpBuilder;
 
 // Re-export TM-SRQ types
 pub use tm_srq::builder::RqWqeBuilder;
