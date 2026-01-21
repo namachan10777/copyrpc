@@ -171,27 +171,6 @@ impl<Entry, TableType> DciSendQueueState<Entry, TableType> {
         self.ring_db(last_wqe_ptr);
     }
 
-    /// Ring the doorbell using BlueFlame (low latency, single WQE).
-    fn ring_blueflame(&self, wqe_ptr: *mut u8) {
-        mmio_flush_writes!();
-
-        unsafe {
-            std::ptr::write_volatile(self.dbrec.add(1), (self.pi.get() as u32).to_be());
-        }
-
-        udma_to_device_barrier!();
-
-        if self.bf_size > 0 {
-            let bf = unsafe { self.bf_reg.add(self.bf_offset.get() as usize) };
-            mlx5_bf_copy!(bf, wqe_ptr);
-            mmio_flush_writes!();
-            self.bf_offset.set(self.bf_offset.get() ^ self.bf_size);
-        } else {
-            // Fallback to regular doorbell if BlueFlame not available
-            self.ring_db(wqe_ptr);
-        }
-    }
-
     fn ring_db(&self, wqe_ptr: *mut u8) {
         let bf = unsafe { self.bf_reg.add(self.bf_offset.get() as usize) as *mut u64 };
         let ctrl = wqe_ptr as *const u64;
@@ -1066,84 +1045,6 @@ impl<'a, Entry> DciWqeCore<'a, Entry> {
             size: self.offset,
         })
     }
-
-    #[inline]
-    fn finish_with_blueflame_internal(self) -> io::Result<WqeHandle> {
-        let wqebb_cnt = calc_wqebb_cnt(self.offset);
-        let slots_to_end = self.sq.slots_to_end();
-
-        if wqebb_cnt > slots_to_end && slots_to_end < self.sq.wqe_cnt {
-            return self.finish_with_wrap_around_blueflame(wqebb_cnt, slots_to_end);
-        }
-
-        unsafe {
-            CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
-            // Set completion flag if signaled (may not have been set at write_ctrl time)
-            if self.signaled {
-                CtrlSeg::set_completion_flag(self.wqe_ptr);
-            }
-        }
-
-        let wqe_idx = self.wqe_idx;
-        let wqe_ptr = self.wqe_ptr;
-
-        self.sq.advance_pi(wqebb_cnt);
-
-        if let Some(entry) = self.entry {
-            self.sq.table.store(wqe_idx, entry, self.sq.pi.get());
-        }
-
-        self.sq.ring_blueflame(wqe_ptr);
-
-        Ok(WqeHandle {
-            wqe_idx,
-            size: self.offset,
-        })
-    }
-
-    #[cold]
-    fn finish_with_wrap_around_blueflame(
-        self,
-        wqebb_cnt: u16,
-        slots_to_end: u16,
-    ) -> io::Result<WqeHandle> {
-        let total_needed = slots_to_end + wqebb_cnt;
-        if self.sq.available() < total_needed {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
-        }
-
-        let mut temp_buf = [0u8; 256];
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.wqe_ptr, temp_buf.as_mut_ptr(), self.offset);
-            self.sq.post_nop(slots_to_end);
-        }
-
-        let new_wqe_idx = self.sq.pi.get();
-        let new_wqe_ptr = self.sq.get_wqe_ptr(new_wqe_idx);
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(temp_buf.as_ptr(), new_wqe_ptr, self.offset);
-            CtrlSeg::update_wqe_idx(new_wqe_ptr, new_wqe_idx);
-            CtrlSeg::update_ds_cnt(new_wqe_ptr, self.ds_count);
-            // Set completion flag if signaled (may not have been set at write_ctrl time)
-            if self.signaled {
-                CtrlSeg::set_completion_flag(new_wqe_ptr);
-            }
-        }
-
-        self.sq.advance_pi(wqebb_cnt);
-
-        if let Some(entry) = self.entry {
-            self.sq.table.store(new_wqe_idx, entry, self.sq.pi.get());
-        }
-
-        self.sq.ring_blueflame(new_wqe_ptr);
-
-        Ok(WqeHandle {
-            wqe_idx: new_wqe_idx,
-            size: self.offset,
-        })
-    }
 }
 
 // =============================================================================
@@ -1546,20 +1447,6 @@ impl<'a, Entry> DciSendWqeBuilder<'a, Entry, HasData> {
         self.core.signaled = true;
         self.core.finish_internal()
     }
-
-    /// Finish with BlueFlame doorbell (unsignaled).
-    #[inline]
-    pub fn finish_unsignaled_with_blueflame(self) -> io::Result<WqeHandle> {
-        self.core.finish_with_blueflame_internal()
-    }
-
-    /// Finish with BlueFlame doorbell (signaled).
-    #[inline]
-    pub fn finish_signaled_with_blueflame(mut self, entry: Entry) -> io::Result<WqeHandle> {
-        self.core.entry = Some(entry);
-        self.core.signaled = true;
-        self.core.finish_with_blueflame_internal()
-    }
 }
 
 // =============================================================================
@@ -1622,20 +1509,6 @@ impl<'a, Entry> DciWriteWqeBuilder<'a, Entry, HasData> {
         self.core.signaled = true;
         self.core.finish_internal()
     }
-
-    /// Finish with BlueFlame doorbell (unsignaled).
-    #[inline]
-    pub fn finish_unsignaled_with_blueflame(self) -> io::Result<WqeHandle> {
-        self.core.finish_with_blueflame_internal()
-    }
-
-    /// Finish with BlueFlame doorbell (signaled).
-    #[inline]
-    pub fn finish_signaled_with_blueflame(mut self, entry: Entry) -> io::Result<WqeHandle> {
-        self.core.entry = Some(entry);
-        self.core.signaled = true;
-        self.core.finish_with_blueflame_internal()
-    }
 }
 
 // =============================================================================
@@ -1685,20 +1558,6 @@ impl<'a, Entry> DciReadWqeBuilder<'a, Entry, HasData> {
         self.core.signaled = true;
         self.core.finish_internal()
     }
-
-    /// Finish with BlueFlame doorbell (unsignaled).
-    #[inline]
-    pub fn finish_unsignaled_with_blueflame(self) -> io::Result<WqeHandle> {
-        self.core.finish_with_blueflame_internal()
-    }
-
-    /// Finish with BlueFlame doorbell (signaled).
-    #[inline]
-    pub fn finish_signaled_with_blueflame(mut self, entry: Entry) -> io::Result<WqeHandle> {
-        self.core.entry = Some(entry);
-        self.core.signaled = true;
-        self.core.finish_with_blueflame_internal()
-    }
 }
 
 // =============================================================================
@@ -1747,20 +1606,6 @@ impl<'a, Entry> DciAtomicWqeBuilder<'a, Entry, HasData> {
         self.core.signaled = true;
         self.core.finish_internal()
     }
-
-    /// Finish with BlueFlame doorbell (unsignaled).
-    #[inline]
-    pub fn finish_unsignaled_with_blueflame(self) -> io::Result<WqeHandle> {
-        self.core.finish_with_blueflame_internal()
-    }
-
-    /// Finish with BlueFlame doorbell (signaled).
-    #[inline]
-    pub fn finish_signaled_with_blueflame(mut self, entry: Entry) -> io::Result<WqeHandle> {
-        self.core.entry = Some(entry);
-        self.core.signaled = true;
-        self.core.finish_with_blueflame_internal()
-    }
 }
 
 // =============================================================================
@@ -1789,20 +1634,6 @@ impl<'a, Entry> DciNopWqeBuilder<'a, Entry> {
         self.core.entry = Some(entry);
         self.core.signaled = true;
         self.core.finish_internal()
-    }
-
-    /// Finish with BlueFlame doorbell (unsignaled).
-    #[inline]
-    pub fn finish_unsignaled_with_blueflame(self) -> io::Result<WqeHandle> {
-        self.core.finish_with_blueflame_internal()
-    }
-
-    /// Finish with BlueFlame doorbell (signaled).
-    #[inline]
-    pub fn finish_signaled_with_blueflame(mut self, entry: Entry) -> io::Result<WqeHandle> {
-        self.core.entry = Some(entry);
-        self.core.signaled = true;
-        self.core.finish_with_blueflame_internal()
     }
 }
 
