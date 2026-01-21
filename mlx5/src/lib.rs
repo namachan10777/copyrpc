@@ -106,7 +106,8 @@ pub use qp::{OwnedRq, SharedRq, RcQpIbWithSrq, RcQpRoCEWithSrq};
 pub use ud::{UdOwnedRq, UdSharedRq, UdQpIb, UdQpIbWithSrq, UdQpRoCE, UdQpRoCEWithSrq};
 
 // Re-export TM-SRQ types
-pub use tm_srq::{RqWqeBuilder, TmSrqCompletion};
+pub use tm_srq::builder::RqWqeBuilder;
+pub use tm_srq::TmSrqCompletion;
 
 // Re-export transport types for IB/RoCE distinction
 pub use transport::{InfiniBand, RoCE, Transport, IbRemoteQpInfo, RoCERemoteQpInfo, IbRemoteDctInfo, RoCERemoteDctInfo};

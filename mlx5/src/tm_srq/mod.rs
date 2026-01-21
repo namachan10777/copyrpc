@@ -33,6 +33,8 @@
 //! tm_srq.ring_cmd_doorbell();
 //! ```
 
+pub mod builder;
+
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::{io, mem::MaybeUninit, ptr::NonNull};
@@ -42,10 +44,7 @@ use crate::cq::{CompletionQueue, Cqe, CqeOpcode};
 use crate::device::Context;
 use crate::pd::Pd;
 use crate::srq::SrqInfo;
-use crate::wqe::{
-    CtrlSeg, DataSeg, HasData, Init, NeedsTmSeg, OrderedWqeTable, TmSeg, UnorderedWqeTable,
-    WQEBB_SIZE, WqeHandle, WqeOpcode,
-};
+use crate::wqe::{Init, OrderedWqeTable, UnorderedWqeTable, WQEBB_SIZE};
 
 // =============================================================================
 // TM-SRQ Completion Types
@@ -108,53 +107,53 @@ impl Default for TmSrqConfig {
 ///
 /// Generic over `CmdTableType` to support both sparse (signaled-only) and dense (all WQE)
 /// completion modes, similar to the main Send Queue implementation.
-struct CmdQpState<CmdEntry, CmdTableType> {
+pub(super) struct CmdQpState<CmdEntry, CmdTableType> {
     /// QP number.
-    qpn: u32,
+    pub(super) qpn: u32,
     /// Send queue buffer.
-    sq_buf: *mut u8,
+    pub(super) sq_buf: *mut u8,
     /// Send queue WQE count (power of 2).
-    sq_wqe_cnt: u16,
+    pub(super) sq_wqe_cnt: u16,
     /// Producer index.
-    pi: Cell<u16>,
+    pub(super) pi: Cell<u16>,
     /// Consumer index (for optimistic available calculation).
-    ci: Cell<u16>,
+    pub(super) ci: Cell<u16>,
     /// Doorbell record pointer.
-    dbrec: *mut u32,
+    pub(super) dbrec: *mut u32,
     /// BlueFlame register.
-    bf_reg: *mut u8,
+    pub(super) bf_reg: *mut u8,
     /// BlueFlame size.
-    bf_size: u32,
+    pub(super) bf_size: u32,
     /// BlueFlame offset.
-    bf_offset: Cell<u32>,
+    pub(super) bf_offset: Cell<u32>,
     /// Last WQE pointer and size for doorbell.
-    last_wqe: Cell<Option<(*mut u8, usize)>>,
+    pub(super) last_wqe: Cell<Option<(*mut u8, usize)>>,
     /// WQE table for tracking in-flight operations.
-    table: CmdTableType,
+    pub(super) table: CmdTableType,
     /// Phantom for entry type.
-    _marker: std::marker::PhantomData<CmdEntry>,
+    pub(super) _marker: std::marker::PhantomData<CmdEntry>,
 }
 
 impl<CmdEntry, CmdTableType> CmdQpState<CmdEntry, CmdTableType> {
-    fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
+    pub(super) fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
         let offset = ((idx & (self.sq_wqe_cnt - 1)) as usize) * WQEBB_SIZE;
         unsafe { self.sq_buf.add(offset) }
     }
 
-    fn advance_pi(&self, count: u16) {
+    pub(super) fn advance_pi(&self, count: u16) {
         self.pi.set(self.pi.get().wrapping_add(count));
     }
 
-    fn set_last_wqe(&self, ptr: *mut u8, size: usize) {
+    pub(super) fn set_last_wqe(&self, ptr: *mut u8, size: usize) {
         self.last_wqe.set(Some((ptr, size)));
     }
 
-    fn optimistic_available(&self) -> u16 {
+    pub(super) fn optimistic_available(&self) -> u16 {
         self.sq_wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
     }
 
     /// Ring the doorbell using regular doorbell write.
-    fn ring_doorbell(&self) {
+    pub(super) fn ring_doorbell(&self) {
         let Some((wqe_ptr, _)) = self.last_wqe.get() else {
             return;
         };
@@ -173,7 +172,7 @@ impl<CmdEntry, CmdTableType> CmdQpState<CmdEntry, CmdTableType> {
     }
 
     /// Ring the doorbell using BlueFlame (low latency, single WQE).
-    fn ring_blueflame(&self, wqe_ptr: *mut u8) {
+    pub(super) fn ring_blueflame(&self, wqe_ptr: *mut u8) {
         mmio_flush_writes!();
 
         // Update doorbell record (dbrec[1] is SQ doorbell)
@@ -216,243 +215,27 @@ impl<CmdEntry> CmdQpState<CmdEntry, OrderedWqeTable<CmdEntry>> {
 }
 
 // =============================================================================
-// Command QP WQE Builder
-// =============================================================================
-
-/// WQE builder for Command QP tag operations.
-///
-/// Uses type-state pattern to enforce valid WQE construction at compile time:
-/// - `Init` → `ctrl_tag_matching()` → `NeedsTmSeg`
-/// - `NeedsTmSeg` → `tag_add()` or `tag_del()` → `HasData`
-/// - `HasData` → `finish()` or `finish_with_blueflame()`
-pub struct CmdQpWqeBuilder<'a, CmdEntry, CmdTableType, State> {
-    cmd_qp: &'a CmdQpState<CmdEntry, CmdTableType>,
-    wqe_ptr: *mut u8,
-    wqe_idx: u16,
-    offset: usize,
-    ds_count: u8,
-    entry: CmdEntry,
-    /// Whether the TM operation requests a CQE on completion.
-    signaled: bool,
-    _state: std::marker::PhantomData<State>,
-}
-
-// =============================================================================
-// Command QP WQE Builder - Init State
-// =============================================================================
-
-impl<'a, CmdEntry, CmdTableType> CmdQpWqeBuilder<'a, CmdEntry, CmdTableType, Init> {
-    /// Write the control segment for tag matching operation.
-    ///
-    /// This transitions the builder to `NeedsTmSeg` state, requiring
-    /// `tag_add()` or `tag_del()` before finishing.
-    ///
-    /// For TM operations, CQ_UPDATE (0x08) is automatically set.
-    pub fn ctrl_tag_matching(mut self, opmod: u8) -> CmdQpWqeBuilder<'a, CmdEntry, CmdTableType, NeedsTmSeg> {
-        // MLX5_WQE_CTRL_CQ_UPDATE = 0x08 - required for TM operations
-        const CQ_UPDATE: u8 = 0x08;
-        unsafe {
-            CtrlSeg::write(
-                self.wqe_ptr,
-                opmod,
-                WqeOpcode::TagMatching as u8,
-                self.wqe_idx,
-                self.cmd_qp.qpn,
-                0,
-                CQ_UPDATE,
-                0,
-            );
-        }
-        self.offset = 16; // CtrlSeg::SIZE
-        self.ds_count = 1;
-        CmdQpWqeBuilder {
-            cmd_qp: self.cmd_qp,
-            wqe_ptr: self.wqe_ptr,
-            wqe_idx: self.wqe_idx,
-            offset: self.offset,
-            ds_count: self.ds_count,
-            entry: self.entry,
-            signaled: self.signaled,
-            _state: std::marker::PhantomData,
-        }
-    }
-}
-
-// =============================================================================
-// Command QP WQE Builder - NeedsTmSeg State
-// =============================================================================
-
-impl<'a, CmdEntry, CmdTableType> CmdQpWqeBuilder<'a, CmdEntry, CmdTableType, NeedsTmSeg> {
-    /// Add TAG_ADD segment with data segment.
-    ///
-    /// Transitions to `HasData` state, allowing `finish()` or `finish_with_blueflame()`.
-    ///
-    /// # Arguments
-    /// * `index` - Tag index in the SRQ tag list
-    /// * `tag` - Tag value to match against incoming messages
-    /// * `addr` - Buffer address for received data
-    /// * `len` - Buffer length
-    /// * `lkey` - Local key for the memory region
-    /// * `signaled` - Whether to request a CQE on completion
-    pub fn tag_add(
-        mut self,
-        index: u16,
-        tag: u64,
-        addr: u64,
-        len: u32,
-        lkey: u32,
-        signaled: bool,
-    ) -> CmdQpWqeBuilder<'a, CmdEntry, CmdTableType, HasData> {
-        unsafe {
-            TmSeg::write_add(
-                self.wqe_ptr.add(self.offset),
-                index,
-                index, // sw_cnt - same as index, per rdma-core
-                tag,
-                !0u64, // mask: all bits must match
-                signaled,
-            );
-        }
-        self.offset += TmSeg::SIZE;
-        self.ds_count += 2; // TmSeg = 32 bytes = 2 DS
-
-        unsafe {
-            DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
-        }
-        self.offset += DataSeg::SIZE;
-        self.ds_count += 1;
-
-        CmdQpWqeBuilder {
-            cmd_qp: self.cmd_qp,
-            wqe_ptr: self.wqe_ptr,
-            wqe_idx: self.wqe_idx,
-            offset: self.offset,
-            ds_count: self.ds_count,
-            entry: self.entry,
-            signaled,
-            _state: std::marker::PhantomData,
-        }
-    }
-
-    /// Add TAG_DEL segment.
-    ///
-    /// Transitions to `HasData` state, allowing `finish()` or `finish_with_blueflame()`.
-    ///
-    /// # Arguments
-    /// * `index` - Tag index to remove
-    /// * `signaled` - Whether to request a CQE on completion
-    pub fn tag_del(mut self, index: u16, signaled: bool) -> CmdQpWqeBuilder<'a, CmdEntry, CmdTableType, HasData> {
-        unsafe {
-            TmSeg::write_del(self.wqe_ptr.add(self.offset), index, signaled);
-        }
-        self.offset += TmSeg::SIZE;
-        self.ds_count += 2; // TmSeg = 32 bytes = 2 DS
-
-        CmdQpWqeBuilder {
-            cmd_qp: self.cmd_qp,
-            wqe_ptr: self.wqe_ptr,
-            wqe_idx: self.wqe_idx,
-            offset: self.offset,
-            ds_count: self.ds_count,
-            entry: self.entry,
-            signaled,
-            _state: std::marker::PhantomData,
-        }
-    }
-}
-
-// =============================================================================
-// Command QP WQE Builder - HasData State (finish methods)
-// =============================================================================
-
-impl<'a, CmdEntry> CmdQpWqeBuilder<'a, CmdEntry, OrderedWqeTable<CmdEntry>, HasData> {
-    /// Finish the WQE construction (sparse mode).
-    ///
-    /// The entry is stored only if signaled is true.
-    /// The doorbell will be issued when `ring_cmd_doorbell()` is called.
-    pub fn finish(self) -> WqeHandle {
-        // Extract all fields before any moves
-        let wqe_idx = self.wqe_idx;
-        let wqe_ptr = self.wqe_ptr;
-        let ds_count = self.ds_count;
-        let offset = self.offset;
-        let cmd_qp = self.cmd_qp;
-        let signaled = self.signaled;
-        let entry = self.entry;
-
-        // For sparse tables, only store if signaled
-        if signaled {
-            // ci_delta is the accumulated PI value at completion
-            let ci_delta = cmd_qp.pi.get().wrapping_add(1);
-            cmd_qp.table.store(wqe_idx, entry, ci_delta);
-        }
-
-        // Inline finish_internal logic
-        unsafe {
-            std::ptr::write_volatile(wqe_ptr.add(7), ds_count);
-        }
-        cmd_qp.advance_pi(1);
-        cmd_qp.set_last_wqe(wqe_ptr, offset);
-
-        WqeHandle {
-            wqe_idx,
-            size: offset,
-        }
-    }
-
-    /// Finish the WQE construction and immediately ring BlueFlame doorbell.
-    pub fn finish_with_blueflame(self) -> WqeHandle {
-        // Extract all fields before any moves
-        let wqe_idx = self.wqe_idx;
-        let wqe_ptr = self.wqe_ptr;
-        let ds_count = self.ds_count;
-        let offset = self.offset;
-        let cmd_qp = self.cmd_qp;
-        let signaled = self.signaled;
-        let entry = self.entry;
-
-        // For sparse tables, only store if signaled
-        if signaled {
-            let ci_delta = cmd_qp.pi.get().wrapping_add(1);
-            cmd_qp.table.store(wqe_idx, entry, ci_delta);
-        }
-
-        // Inline finish_internal_with_blueflame logic
-        unsafe {
-            std::ptr::write_volatile(wqe_ptr.add(7), ds_count);
-        }
-        cmd_qp.advance_pi(1);
-        cmd_qp.ring_blueflame(wqe_ptr);
-
-        WqeHandle {
-            wqe_idx,
-            size: offset,
-        }
-    }
-}
-
-// =============================================================================
 // SRQ State
 // =============================================================================
 
 /// SRQ state for direct receive WQE posting.
-struct TmSrqState<RecvEntry> {
+pub(super) struct TmSrqState<RecvEntry> {
     /// SRQ buffer pointer.
-    buf: *mut u8,
+    pub(super) buf: *mut u8,
     /// Number of WQE slots (power of 2).
-    wqe_cnt: u32,
+    pub(super) wqe_cnt: u32,
     /// WQE stride.
-    stride: u32,
+    pub(super) stride: u32,
     /// Producer index.
-    head: Cell<u32>,
+    pub(super) head: Cell<u32>,
     /// Doorbell record pointer.
-    dbrec: *mut u32,
+    pub(super) dbrec: *mut u32,
     /// RQ WQE table for unordered completion tracking.
-    table: UnorderedWqeTable<RecvEntry>,
+    pub(super) table: UnorderedWqeTable<RecvEntry>,
 }
 
 impl<RecvEntry> TmSrqState<RecvEntry> {
-    fn get_wqe_ptr(&self, idx: u32) -> *mut u8 {
+    pub(super) fn get_wqe_ptr(&self, idx: u32) -> *mut u8 {
         let offset = (idx & (self.wqe_cnt - 1)) * self.stride;
         unsafe { self.buf.add(offset as usize) }
     }
@@ -466,70 +249,6 @@ impl<RecvEntry> TmSrqState<RecvEntry> {
 
     fn process_completion(&self, wqe_idx: u16) -> Option<RecvEntry> {
         self.table.take(wqe_idx)
-    }
-}
-
-// =============================================================================
-// RQ WQE Builder
-// =============================================================================
-
-/// WQE builder for RQ unordered receive operations.
-///
-/// Supports incremental WQEBB allocation for multi-segment WQEs.
-pub struct RqWqeBuilder<'a, RecvEntry> {
-    srq_state: &'a TmSrqState<RecvEntry>,
-    wqe_ptr: *mut u8,
-    wqe_idx: u32,
-    wqebb_start: u16,
-    wqebb_count: u16,
-    offset: usize,
-    entry: RecvEntry,
-}
-
-impl<'a, RecvEntry> RqWqeBuilder<'a, RecvEntry> {
-    /// Add a data segment to the WQE.
-    ///
-    /// Automatically extends WQEBB allocation if needed.
-    pub fn data_seg(mut self, addr: u64, len: u32, lkey: u32) -> io::Result<Self> {
-        let new_offset = self.offset + DataSeg::SIZE;
-        let required_wqebbs = new_offset.div_ceil(WQEBB_SIZE) as u16;
-
-        // Extend allocation if we need more WQEBBs
-        while self.wqebb_count < required_wqebbs {
-            if !self
-                .srq_state
-                .table
-                .try_extend(self.wqebb_start, self.wqebb_count)
-            {
-                // Extension failed, rollback
-                self.srq_state
-                    .table
-                    .release(self.wqebb_start, self.wqebb_count);
-                return Err(io::Error::new(io::ErrorKind::WouldBlock, "RQ full"));
-            }
-            self.wqebb_count += 1;
-        }
-
-        unsafe {
-            DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
-        }
-        self.offset = new_offset;
-        Ok(self)
-    }
-
-    /// Finish the WQE construction and post it to the RQ.
-    ///
-    /// The doorbell should be rung via `ring_srq_doorbell()` after posting.
-    pub fn finish(self) {
-        self.srq_state.table.store(
-            self.wqe_idx as u16,
-            self.wqebb_start,
-            self.wqebb_count,
-            self.entry,
-        );
-        self.srq_state
-            .head
-            .set(self.srq_state.head.get().wrapping_add(1));
     }
 }
 
@@ -964,236 +683,11 @@ where
 }
 
 // =============================================================================
-// New Trait-Based WQE Builder API
-// =============================================================================
-
-use crate::wqe::{
-    TmCmdWqeBuilder,
-    TmTagAddWqeBuilder, TmTagDelWqeBuilder,
-};
-
-// =============================================================================
-// TM Command Queue Builder Implementations
-// =============================================================================
-
-/// TM-SRQ Command Queue entry point builder (internal).
-#[must_use = "WQE builder must be finished"]
-pub(crate) struct TmCmdEntryPointImpl<'a, CmdEntry> {
-    cmd_qp: &'a CmdQpState<CmdEntry, OrderedWqeTable<CmdEntry>>,
-    wqe_ptr: *mut u8,
-    wqe_idx: u16,
-    entry: CmdEntry,
-}
-
-impl<'a, CmdEntry> TmCmdWqeBuilder<'a, CmdEntry> for TmCmdEntryPointImpl<'a, CmdEntry> {
-    #[inline]
-    fn tag_add(self, index: u16, tag: u64) -> impl TmTagAddWqeBuilder<'a, CmdEntry> + 'a {
-        // Write control segment with TM opcode
-        const CQ_UPDATE: u8 = 0x08;
-        unsafe {
-            CtrlSeg::write(
-                self.wqe_ptr,
-                0,
-                WqeOpcode::TagMatching as u8,
-                self.wqe_idx,
-                self.cmd_qp.qpn,
-                0,
-                CQ_UPDATE,
-                0,
-            );
-        }
-
-        TmTagAddWqeBuilderImpl {
-            cmd_qp: self.cmd_qp,
-            wqe_ptr: self.wqe_ptr,
-            wqe_idx: self.wqe_idx,
-            entry: self.entry,
-            index,
-            tag,
-            has_data: false,
-        }
-    }
-
-    #[inline]
-    fn tag_del(self, index: u16) -> impl TmTagDelWqeBuilder<'a, CmdEntry> + 'a {
-        // Write control segment with TM opcode
-        const CQ_UPDATE: u8 = 0x08;
-        unsafe {
-            CtrlSeg::write(
-                self.wqe_ptr,
-                0,
-                WqeOpcode::TagMatching as u8,
-                self.wqe_idx,
-                self.cmd_qp.qpn,
-                0,
-                CQ_UPDATE,
-                0,
-            );
-
-            // Write TM segment for deletion
-            TmSeg::write_del(self.wqe_ptr.add(CtrlSeg::SIZE), index, false);
-        }
-
-        TmTagDelWqeBuilderImpl {
-            cmd_qp: self.cmd_qp,
-            wqe_ptr: self.wqe_ptr,
-            wqe_idx: self.wqe_idx,
-            entry: self.entry,
-            index,
-        }
-    }
-}
-
-/// TM Tag Add WQE builder (internal).
-#[must_use = "WQE builder must be finished"]
-pub(crate) struct TmTagAddWqeBuilderImpl<'a, CmdEntry> {
-    cmd_qp: &'a CmdQpState<CmdEntry, OrderedWqeTable<CmdEntry>>,
-    wqe_ptr: *mut u8,
-    wqe_idx: u16,
-    #[allow(dead_code)]
-    entry: CmdEntry,  // Preserved for future signaled-at-construction pattern
-    index: u16,
-    tag: u64,
-    has_data: bool,
-}
-
-impl<'a, CmdEntry> TmTagAddWqeBuilder<'a, CmdEntry> for TmTagAddWqeBuilderImpl<'a, CmdEntry> {
-    #[inline]
-    fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
-        if !self.has_data {
-            let offset = CtrlSeg::SIZE;
-            unsafe {
-                // Write TM segment for add (not signaled initially)
-                TmSeg::write_add(
-                    self.wqe_ptr.add(offset),
-                    self.index,
-                    self.index,
-                    self.tag,
-                    !0u64,
-                    false,
-                );
-
-                // Write data segment
-                DataSeg::write(self.wqe_ptr.add(offset + TmSeg::SIZE), len, lkey, addr);
-            }
-            self.has_data = true;
-        }
-        // Note: TM Tag Add only supports one data segment
-        self
-    }
-
-    #[inline]
-    fn inline(self, _data: &[u8]) -> Self {
-        // TM Tag Add doesn't support inline data
-        self
-    }
-
-    #[inline]
-    fn finish_unsignaled(self) -> WqeHandle {
-        let ds_count = 1 + 2 + 1; // Ctrl(1) + TmSeg(2) + DataSeg(1)
-        let offset = CtrlSeg::SIZE + TmSeg::SIZE + DataSeg::SIZE;
-
-        unsafe {
-            std::ptr::write_volatile(self.wqe_ptr.add(7), ds_count);
-        }
-        self.cmd_qp.advance_pi(1);
-        self.cmd_qp.set_last_wqe(self.wqe_ptr, offset);
-
-        WqeHandle {
-            wqe_idx: self.wqe_idx,
-            size: offset,
-        }
-    }
-
-    #[inline]
-    fn finish_signaled(self, entry: CmdEntry) -> WqeHandle {
-        let ds_count = 1 + 2 + 1; // Ctrl(1) + TmSeg(2) + DataSeg(1)
-        let offset = CtrlSeg::SIZE + TmSeg::SIZE + DataSeg::SIZE;
-
-        // Re-write TM segment with signaled flag
-        unsafe {
-            TmSeg::write_add(
-                self.wqe_ptr.add(CtrlSeg::SIZE),
-                self.index,
-                self.index,
-                self.tag,
-                !0u64,
-                true,
-            );
-        }
-        let ci_delta = self.cmd_qp.pi.get().wrapping_add(1);
-        self.cmd_qp.table.store(self.wqe_idx, entry, ci_delta);
-
-        unsafe {
-            std::ptr::write_volatile(self.wqe_ptr.add(7), ds_count);
-        }
-        self.cmd_qp.advance_pi(1);
-        self.cmd_qp.set_last_wqe(self.wqe_ptr, offset);
-
-        WqeHandle {
-            wqe_idx: self.wqe_idx,
-            size: offset,
-        }
-    }
-}
-
-/// TM Tag Del WQE builder (internal).
-#[must_use = "WQE builder must be finished"]
-pub(crate) struct TmTagDelWqeBuilderImpl<'a, CmdEntry> {
-    cmd_qp: &'a CmdQpState<CmdEntry, OrderedWqeTable<CmdEntry>>,
-    wqe_ptr: *mut u8,
-    wqe_idx: u16,
-    #[allow(dead_code)]
-    entry: CmdEntry,  // Preserved for future signaled-at-construction pattern
-    index: u16,
-}
-
-impl<'a, CmdEntry> TmTagDelWqeBuilder<'a, CmdEntry> for TmTagDelWqeBuilderImpl<'a, CmdEntry> {
-    #[inline]
-    fn finish_unsignaled(self) -> WqeHandle {
-        let ds_count = 1 + 2; // Ctrl(1) + TmSeg(2)
-        let offset = CtrlSeg::SIZE + TmSeg::SIZE;
-
-        unsafe {
-            std::ptr::write_volatile(self.wqe_ptr.add(7), ds_count);
-        }
-        self.cmd_qp.advance_pi(1);
-        self.cmd_qp.set_last_wqe(self.wqe_ptr, offset);
-
-        WqeHandle {
-            wqe_idx: self.wqe_idx,
-            size: offset,
-        }
-    }
-
-    #[inline]
-    fn finish_signaled(self, entry: CmdEntry) -> WqeHandle {
-        let ds_count = 1 + 2; // Ctrl(1) + TmSeg(2)
-        let offset = CtrlSeg::SIZE + TmSeg::SIZE;
-
-        // Re-write TM segment with signaled flag
-        unsafe {
-            TmSeg::write_del(self.wqe_ptr.add(CtrlSeg::SIZE), self.index, true);
-        }
-        let ci_delta = self.cmd_qp.pi.get().wrapping_add(1);
-        self.cmd_qp.table.store(self.wqe_idx, entry, ci_delta);
-
-        unsafe {
-            std::ptr::write_volatile(self.wqe_ptr.add(7), ds_count);
-        }
-        self.cmd_qp.advance_pi(1);
-        self.cmd_qp.set_last_wqe(self.wqe_ptr, offset);
-
-        WqeHandle {
-            wqe_idx: self.wqe_idx,
-            size: offset,
-        }
-    }
-}
-
-// =============================================================================
 // New API Entry Points for TM-SRQ
 // =============================================================================
+
+use builder::{CmdQpWqeBuilder, RqWqeBuilder, TmCmdEntryPointImpl};
+use crate::wqe::TmCmdWqeBuilder;
 
 impl<CmdEntry, RecvEntry, OnComplete> TmSrq<CmdEntry, RecvEntry, OnComplete> {
     /// Get a Command Queue WQE builder using the new trait-based API.
