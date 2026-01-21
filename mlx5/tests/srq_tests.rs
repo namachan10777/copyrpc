@@ -101,10 +101,8 @@ fn test_srq_post_recv() {
     // Post multiple receive buffers using rq_wqe
     for i in 0..10 {
         let offset = (i * 256) as usize;
-        srq.rq_wqe(i as u64)
-            .expect("rq_wqe failed")
-            .sge(recv_buf.addr() + offset as u64, 256, mr.lkey())
-            .finish();
+        srq.post_recv(i as u64, recv_buf.addr() + offset as u64, 256, mr.lkey())
+            .expect("post_recv failed");
     }
 
     // Ring doorbell
@@ -155,10 +153,8 @@ fn test_srq_with_dct_send() {
     }
     .expect("Failed to register recv MR");
 
-    srq.rq_wqe(0u64)
-        .expect("rq_wqe failed")
-        .sge(recv_buf.addr(), 4096, recv_mr.lkey())
-        .finish();
+    srq.post_recv(0u64, recv_buf.addr(), 4096, recv_mr.lkey())
+        .expect("post_recv failed");
     srq.ring_doorbell();
 
     // Create and activate DCI
@@ -278,12 +274,10 @@ fn test_srq_shared_by_multiple_dcts() {
         })
         .collect();
 
-    // Post receive buffers using rq_wqe
+    // Post receive buffers using post_recv
     for (i, (buf, mr)) in recv_bufs.iter().zip(recv_mrs.iter()).enumerate() {
-        srq.rq_wqe(i as u64)
-            .expect("rq_wqe failed")
-            .sge(buf.addr(), 4096, mr.lkey())
-            .finish();
+        srq.post_recv(i as u64, buf.addr(), 4096, mr.lkey())
+            .expect("post_recv failed");
     }
     srq.ring_doorbell();
 

@@ -13,6 +13,8 @@ pub mod traits;
 pub enum SubmissionError {
     /// Send Queue is full.
     SqFull,
+    /// Receive Queue is full.
+    RqFull,
     /// WQE size exceeds BlueFlame buffer size (256 bytes).
     BlueflameOverflow,
     /// BlueFlame is not available on this device.
@@ -23,6 +25,7 @@ impl std::fmt::Display for SubmissionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SubmissionError::SqFull => write!(f, "send queue is full"),
+            SubmissionError::RqFull => write!(f, "receive queue is full"),
             SubmissionError::BlueflameOverflow => {
                 write!(f, "WQE size exceeds BlueFlame buffer size (256 bytes)")
             }

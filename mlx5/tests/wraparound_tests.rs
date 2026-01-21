@@ -562,10 +562,8 @@ fn test_ud_send_wraparound() {
         // Post receive (must include space for GRH)
         receiver
             .borrow()
-            .rq_wqe(i as u64)
-            .expect("rq_wqe failed")
-            .sge(recv_buf.addr(), 256 + GRH_SIZE as u32, recv_mr.lkey())
-            .finish();
+            .post_recv(i as u64, recv_buf.addr(), 256 + GRH_SIZE as u32, recv_mr.lkey())
+            .expect("post_recv failed");
         receiver.borrow().ring_rq_doorbell();
 
         // Post send
@@ -712,10 +710,8 @@ fn test_rc_inline_wraparound() {
         // Post receive
         recv_buf.fill(0);
         qp2.borrow()
-            .rq_wqe(i as u64)
-            .expect("rq_wqe failed")
-            .sge(recv_buf.addr(), 256, recv_mr.lkey())
-            .finish();
+            .post_recv(i as u64, recv_buf.addr(), 256, recv_mr.lkey())
+            .expect("post_recv failed");
         qp2.borrow().ring_rq_doorbell();
 
         // Post SEND with inline data
@@ -862,10 +858,8 @@ fn test_rc_inline_variable_size_wraparound() {
         // Post receive
         recv_buf.fill(0);
         qp2.borrow()
-            .rq_wqe(i as u64)
-            .expect("rq_wqe failed")
-            .sge(recv_buf.addr(), 256, recv_mr.lkey())
-            .finish();
+            .post_recv(i as u64, recv_buf.addr(), 256, recv_mr.lkey())
+            .expect("post_recv failed");
         qp2.borrow().ring_rq_doorbell();
 
         // Post SEND with inline data

@@ -556,10 +556,8 @@ fn test_rc_rdma_write_imm() {
     .expect("Failed to register recv MR");
 
     qp2.borrow()
-        .rq_wqe(0u64)
-        .expect("rq_wqe failed")
-        .sge(recv_buf.addr(), 256, recv_mr.lkey())
-        .finish();
+        .post_recv(0u64, recv_buf.addr(), 256, recv_mr.lkey())
+        .expect("post_recv failed");
     qp2.borrow().ring_rq_doorbell();
 
     // Create a separate recv CQ for QP2
@@ -715,10 +713,8 @@ fn test_rc_send_recv() {
 
     // QP2 posts a receive
     qp2.borrow()
-        .rq_wqe(0u64)
-        .expect("rq_wqe failed")
-        .sge(recv_buf.addr(), 256, recv_mr.lkey())
-        .finish();
+        .post_recv(0u64, recv_buf.addr(), 256, recv_mr.lkey())
+        .expect("post_recv failed");
     qp2.borrow().ring_rq_doorbell();
 
     // QP1 sends data
@@ -871,8 +867,7 @@ fn test_rc_send_recv_pingpong() {
         // QP2 posts receive
         let _ = qp2
             .borrow()
-            .rq_wqe(i as u64)
-            .map(|b| b.sge(buf2.addr(), 64, mr2.lkey()).finish());
+            .post_recv(i as u64, buf2.addr(), 64, mr2.lkey());
         qp2.borrow().ring_rq_doorbell();
 
         // QP1 sends (signaled to get CQE)
@@ -911,8 +906,7 @@ fn test_rc_send_recv_pingpong() {
         // QP1 posts receive
         let _ = qp1
             .borrow()
-            .rq_wqe(i as u64)
-            .map(|b| b.sge(buf1.addr(), 64, mr1.lkey()).finish());
+            .post_recv(i as u64, buf1.addr(), 64, mr1.lkey());
         qp1.borrow().ring_rq_doorbell();
 
         // QP2 sends back (signaled to get CQE)

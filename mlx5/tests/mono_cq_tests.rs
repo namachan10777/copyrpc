@@ -620,10 +620,8 @@ fn test_mono_cq_recv_rdma_write_imm() {
     for i in 0..num_ops {
         let offset = (i * 64) as u64;
         qp1.borrow()
-            .rq_wqe(1000 + i as u64)
-            .expect("rq_wqe failed")
-            .sge(recv_buf.addr() + offset, 64, recv_mr.lkey())
-            .finish();
+            .post_recv(1000 + i as u64, recv_buf.addr() + offset, 64, recv_mr.lkey())
+            .expect("post_recv failed");
     }
     qp1.borrow().ring_rq_doorbell();
 
@@ -798,15 +796,11 @@ fn test_mono_cq_bidirectional_pingpong() {
     for i in 0..num_iters {
         let offset = (i * msg_size as usize) as u64;
         qp1.borrow()
-            .rq_wqe(i as u64)
-            .expect("rq_wqe")
-            .sge(buf1.addr() + offset, msg_size, mr1.lkey())
-            .finish();
+            .post_recv(i as u64, buf1.addr() + offset, msg_size, mr1.lkey())
+            .expect("post_recv");
         qp2.borrow()
-            .rq_wqe(i as u64)
-            .expect("rq_wqe")
-            .sge(buf2.addr() + offset, msg_size, mr2.lkey())
-            .finish();
+            .post_recv(i as u64, buf2.addr() + offset, msg_size, mr2.lkey())
+            .expect("post_recv");
     }
     qp1.borrow().ring_rq_doorbell();
     qp2.borrow().ring_rq_doorbell();

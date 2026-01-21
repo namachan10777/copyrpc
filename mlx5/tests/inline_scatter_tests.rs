@@ -142,10 +142,8 @@ fn test_scatter_to_cqe_diagnostic() {
 
         // Post receive on QP2
         qp2.borrow()
-            .rq_wqe(i as u64)
-            .expect("rq_wqe failed")
-            .sge(recv_buf.addr(), 512, recv_mr.lkey())
-            .finish();
+            .post_recv(i as u64, recv_buf.addr(), 512, recv_mr.lkey())
+            .expect("post_recv failed");
         qp2.borrow().ring_rq_doorbell();
 
         // Post SGE-based Send on QP1
@@ -333,10 +331,8 @@ fn test_scatter_to_cqe_disabled() {
 
         // Post receive
         qp2.borrow()
-            .rq_wqe(i as u64)
-            .expect("rq_wqe failed")
-            .sge(recv_buf.addr(), 64, recv_mr.lkey())
-            .finish();
+            .post_recv(i as u64, recv_buf.addr(), 64, recv_mr.lkey())
+            .expect("post_recv failed");
         qp2.borrow().ring_rq_doorbell();
 
         // Post inline send
@@ -488,10 +484,8 @@ fn test_small_inline_wraparound() {
 
             // Post receive
             qp2.borrow()
-                .rq_wqe((size * 100 + i) as u64)
-                .expect("rq_wqe failed")
-                .sge(recv_buf.addr(), 256, recv_mr.lkey())
-                .finish();
+                .post_recv((size * 100 + i) as u64, recv_buf.addr(), 256, recv_mr.lkey())
+                .expect("post_recv failed");
             qp2.borrow().ring_rq_doorbell();
 
             // Post small inline send

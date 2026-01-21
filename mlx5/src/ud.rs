@@ -1023,62 +1023,7 @@ impl<'a, Entry> UdSendWqeBuilder<'a, Entry, HasData> {
 }
 
 // =============================================================================
-// UD RQ WQE Builder
-// =============================================================================
-
-/// UD RQ WQE builder.
-///
-/// Uses type-state pattern: `DataState` is `NoData` initially,
-/// transitions to `HasData` after calling `sge()`.
-#[must_use = "WQE builder must be finished"]
-pub struct UdRqWqeBuilder<'a, Entry, DataState> {
-    rq: &'a UdRecvQueueState<Entry>,
-    entry: Entry,
-    wqe_idx: u16,
-    _data: PhantomData<DataState>,
-}
-
-/// sge: NoData state, transitions to HasData.
-impl<'a, Entry> UdRqWqeBuilder<'a, Entry, NoData> {
-    /// Add a scatter/gather entry for receive buffer.
-    #[inline]
-    pub fn sge(self, addr: u64, len: u32, lkey: u32) -> UdRqWqeBuilder<'a, Entry, HasData> {
-        unsafe {
-            let wqe_ptr = self.rq.get_wqe_ptr(self.wqe_idx);
-            DataSeg::write(wqe_ptr, len, lkey, addr);
-        }
-        UdRqWqeBuilder {
-            rq: self.rq,
-            entry: self.entry,
-            wqe_idx: self.wqe_idx,
-            _data: PhantomData,
-        }
-    }
-}
-
-/// finish: only available in HasData state.
-impl<'a, Entry> UdRqWqeBuilder<'a, Entry, HasData> {
-    /// Add another scatter/gather entry.
-    #[inline]
-    pub fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
-        unsafe {
-            let wqe_ptr = self.rq.get_wqe_ptr(self.wqe_idx);
-            DataSeg::write(wqe_ptr, len, lkey, addr);
-        }
-        self
-    }
-
-    /// Finish the WQE construction.
-    #[inline]
-    pub fn finish(self) {
-        let idx = (self.wqe_idx as usize) & ((self.rq.wqe_cnt - 1) as usize);
-        self.rq.table[idx].set(Some(self.entry));
-        self.rq.pi.set(self.rq.pi.get().wrapping_add(1));
-    }
-}
-
-// =============================================================================
-// sq_wqe / rq_wqe Methods
+// sq_wqe / post_recv Methods
 // =============================================================================
 
 impl<Entry, OnComplete> UdQpWithTable<Entry, OnComplete> {
@@ -1101,23 +1046,61 @@ impl<Entry, OnComplete> UdQpWithTable<Entry, OnComplete> {
         Ok(UdSqWqeEntryPoint::new(sq, ah, self.qkey))
     }
 
-    /// Get a RQ WQE builder for UD transport.
+    /// Post a receive WQE with a single scatter/gather entry.
+    ///
+    /// # Arguments
+    /// * `entry` - User entry to associate with this receive operation
+    /// * `addr` - Address of the receive buffer
+    /// * `len` - Length of the receive buffer
+    /// * `lkey` - Local key for the memory region
     ///
     /// # Example
     /// ```ignore
-    /// qp.rq_wqe(entry)?
-    ///     .sge(addr, len, lkey)
-    ///     .finish();
+    /// qp.post_recv(entry, addr, len, lkey)?;
     /// qp.ring_rq_doorbell();
     /// ```
     #[inline]
-    pub fn rq_wqe(&self, entry: Entry) -> io::Result<UdRqWqeBuilder<'_, Entry, NoData>> {
+    pub fn post_recv(&self, entry: Entry, addr: u64, len: u32, lkey: u32) -> io::Result<()> {
         let rq = self.rq()?;
         if rq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "RQ full"));
         }
         let wqe_idx = rq.pi.get();
-        Ok(UdRqWqeBuilder { rq, entry, wqe_idx, _data: PhantomData })
+        unsafe {
+            let wqe_ptr = rq.get_wqe_ptr(wqe_idx);
+            DataSeg::write(wqe_ptr, len, lkey, addr);
+        }
+        let idx = (wqe_idx as usize) & ((rq.wqe_cnt - 1) as usize);
+        rq.table[idx].set(Some(entry));
+        rq.pi.set(rq.pi.get().wrapping_add(1));
+        Ok(())
+    }
+
+    /// Get a BlueFlame batch builder for low-latency RQ WQE submission.
+    ///
+    /// Multiple receive WQEs can be accumulated in the BlueFlame buffer (up to 256 bytes)
+    /// and submitted together via a single BlueFlame doorbell.
+    ///
+    /// RQ WQE size is 16 bytes (single DataSeg), so up to 16 WQEs can fit in a batch.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut batch = qp.blueflame_rq_batch()?;
+    /// batch.post(entry1, addr1, len1, lkey1)?;
+    /// batch.post(entry2, addr2, len2, lkey2)?;
+    /// batch.finish();
+    /// ```
+    ///
+    /// # Errors
+    /// Returns `BlueflameNotAvailable` if BlueFlame is not supported on this device.
+    #[inline]
+    pub fn blueflame_rq_batch(&self) -> Result<UdRqBlueflameWqeBatch<'_, Entry>, SubmissionError> {
+        let rq = self.rq.as_ref().ok_or(SubmissionError::RqFull)?;
+        let sq = self.sq.as_ref().ok_or(SubmissionError::BlueflameNotAvailable)?;
+        if sq.bf_size == 0 {
+            return Err(SubmissionError::BlueflameNotAvailable);
+        }
+        Ok(UdRqBlueflameWqeBatch::new(rq, sq.bf_reg, sq.bf_size, &sq.bf_offset))
     }
 
     /// Ring the send queue doorbell.
@@ -1158,11 +1141,146 @@ impl<Entry, OnComplete> UdQpWithTable<Entry, OnComplete> {
 }
 
 // =============================================================================
-// UD BlueFlame Batch Builder
+// UD RQ BlueFlame Batch Builder
 // =============================================================================
 
 /// BlueFlame buffer size in bytes (256B doorbell window).
 const BLUEFLAME_BUFFER_SIZE: usize = 256;
+
+/// RQ WQE size in bytes (single DataSeg).
+const RQ_WQE_SIZE: usize = DataSeg::SIZE;
+
+/// BlueFlame WQE batch builder for UD RQ.
+///
+/// Allows posting multiple receive WQEs efficiently using BlueFlame MMIO.
+/// WQEs are accumulated in an internal buffer and submitted together
+/// via BlueFlame doorbell when `finish()` is called.
+///
+/// RQ WQE size is 16 bytes (single DataSeg), so up to 16 WQEs can fit in a batch.
+///
+/// # Example
+/// ```ignore
+/// let mut batch = qp.blueflame_rq_batch()?;
+/// batch.post(entry1, addr1, len1, lkey1)?;
+/// batch.post(entry2, addr2, len2, lkey2)?;
+/// batch.finish();
+/// ```
+pub struct UdRqBlueflameWqeBatch<'a, Entry> {
+    rq: &'a UdRecvQueueState<Entry>,
+    buffer: [u8; BLUEFLAME_BUFFER_SIZE],
+    offset: usize,
+    wqe_count: u16,
+    bf_reg: *mut u8,
+    bf_size: u32,
+    bf_offset: &'a Cell<u32>,
+}
+
+impl<'a, Entry> UdRqBlueflameWqeBatch<'a, Entry> {
+    /// Create a new UD RQ BlueFlame batch builder.
+    fn new(
+        rq: &'a UdRecvQueueState<Entry>,
+        bf_reg: *mut u8,
+        bf_size: u32,
+        bf_offset: &'a Cell<u32>,
+    ) -> Self {
+        Self {
+            rq,
+            buffer: [0u8; BLUEFLAME_BUFFER_SIZE],
+            offset: 0,
+            wqe_count: 0,
+            bf_reg,
+            bf_size,
+            bf_offset,
+        }
+    }
+
+    /// Post a receive WQE to the batch.
+    ///
+    /// # Arguments
+    /// * `entry` - User entry to associate with this receive operation
+    /// * `addr` - Address of the receive buffer
+    /// * `len` - Length of the receive buffer
+    /// * `lkey` - Local key for the memory region
+    ///
+    /// # Errors
+    /// Returns `RqFull` if the receive queue doesn't have enough space.
+    /// Returns `BlueflameOverflow` if the batch buffer is full.
+    #[inline]
+    pub fn post(&mut self, entry: Entry, addr: u64, len: u32, lkey: u32) -> Result<(), SubmissionError> {
+        if self.rq.available() <= self.wqe_count as u32 {
+            return Err(SubmissionError::RqFull);
+        }
+        if self.offset + RQ_WQE_SIZE > BLUEFLAME_BUFFER_SIZE {
+            return Err(SubmissionError::BlueflameOverflow);
+        }
+
+        // Write WQE to RQ buffer
+        let wqe_idx = self.rq.pi.get().wrapping_add(self.wqe_count);
+        unsafe {
+            let wqe_ptr = self.rq.get_wqe_ptr(wqe_idx);
+            DataSeg::write(wqe_ptr, len, lkey, addr);
+
+            // Also write to batch buffer for BlueFlame copy
+            DataSeg::write(self.buffer.as_mut_ptr().add(self.offset), len, lkey, addr);
+        }
+
+        // Store entry in table
+        let idx = (wqe_idx as usize) & ((self.rq.wqe_cnt - 1) as usize);
+        self.rq.table[idx].set(Some(entry));
+
+        self.offset += RQ_WQE_SIZE;
+        self.wqe_count += 1;
+        Ok(())
+    }
+
+    /// Finish the batch and submit all WQEs via BlueFlame doorbell.
+    ///
+    /// This method updates the producer index, writes to the doorbell record,
+    /// and copies the WQEs to the BlueFlame register.
+    #[inline]
+    pub fn finish(self) {
+        if self.wqe_count == 0 {
+            return; // No WQEs to submit
+        }
+
+        // Advance RQ producer index
+        self.rq.pi.set(self.rq.pi.get().wrapping_add(self.wqe_count));
+
+        mmio_flush_writes!();
+
+        // Update doorbell record
+        unsafe {
+            std::ptr::write_volatile(self.rq.dbrec, (self.rq.pi.get() as u32).to_be());
+        }
+
+        udma_to_device_barrier!();
+
+        // Copy buffer to BlueFlame register
+        if self.bf_size > 0 {
+            let bf_offset = self.bf_offset.get();
+            let bf = unsafe { self.bf_reg.add(bf_offset as usize) };
+
+            let mut src = self.buffer.as_ptr();
+            let mut dst = bf;
+            let mut remaining = self.offset;
+            while remaining > 0 {
+                unsafe {
+                    mlx5_bf_copy!(dst, src);
+                    src = src.add(WQEBB_SIZE);
+                    dst = dst.add(WQEBB_SIZE);
+                }
+                remaining = remaining.saturating_sub(WQEBB_SIZE);
+            }
+
+            mmio_flush_writes!();
+            self.bf_offset.set(bf_offset ^ self.bf_size);
+        }
+    }
+}
+
+// =============================================================================
+// UD SQ BlueFlame Batch Builder
+// =============================================================================
 
 /// BlueFlame WQE batch builder for UD QP.
 ///
