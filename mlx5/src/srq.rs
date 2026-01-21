@@ -347,29 +347,8 @@ impl<T> Srq<T> {
     /// srq.ring_doorbell();
     /// ```
     #[inline]
-    pub fn rq_wqe(&self, entry: T) -> io::Result<impl SrqRqWqeBuilder<'_, T> + '_> {
+    pub fn rq_wqe(&self, entry: T) -> io::Result<SrqRecvWqeBuilder<'_, T>> {
         self.recv_builder(entry)
     }
 }
 
-// =============================================================================
-// New Trait-Based WQE Builder API
-// =============================================================================
-
-use crate::wqe::{RqWqeBuilder, SrqRqWqeBuilder};
-
-impl<'a, T> RqWqeBuilder<'a, T> for SrqRecvWqeBuilder<'a, T> {
-    #[inline]
-    fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
-        // Delegate to the existing sge method
-        SrqRecvWqeBuilder::sge(self, addr, len, lkey)
-    }
-
-    #[inline]
-    fn finish(self) {
-        // Delegate to the existing finish method
-        SrqRecvWqeBuilder::finish(self)
-    }
-}
-
-impl<'a, T> SrqRqWqeBuilder<'a, T> for SrqRecvWqeBuilder<'a, T> {}

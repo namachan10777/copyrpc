@@ -620,8 +620,8 @@ fn test_mono_cq_recv_rdma_write_imm() {
     for i in 0..num_ops {
         let offset = (i * 64) as u64;
         qp1.borrow()
-            .recv_builder(1000 + i as u64)
-            .expect("recv_builder failed")
+            .rq_wqe(1000 + i as u64)
+            .expect("rq_wqe failed")
             .sge(recv_buf.addr() + offset, 64, recv_mr.lkey())
             .finish();
     }
@@ -798,13 +798,13 @@ fn test_mono_cq_bidirectional_pingpong() {
     for i in 0..num_iters {
         let offset = (i * msg_size as usize) as u64;
         qp1.borrow()
-            .recv_builder(i as u64)
-            .expect("recv_builder")
+            .rq_wqe(i as u64)
+            .expect("rq_wqe")
             .sge(buf1.addr() + offset, msg_size, mr1.lkey())
             .finish();
         qp2.borrow()
-            .recv_builder(i as u64)
-            .expect("recv_builder")
+            .rq_wqe(i as u64)
+            .expect("rq_wqe")
             .sge(buf2.addr() + offset, msg_size, mr2.lkey())
             .finish();
     }

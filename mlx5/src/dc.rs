@@ -1607,24 +1607,6 @@ impl<'a, Entry> DciWqeCore<'a, Entry> {
     }
 
     #[inline]
-    fn write_av_ib(&mut self, dc_key: u64, dctn: u32, dlid: u16) {
-        unsafe {
-            AddressVector::write_ib(self.wqe_ptr.add(self.offset), dc_key, dctn, dlid);
-        }
-        self.offset += AddressVector::SIZE;
-        self.ds_count += 3;
-    }
-
-    #[inline]
-    fn write_av_roce(&mut self, dc_key: u64, dctn: u32, grh: &GrhAttr) {
-        unsafe {
-            AddressVector::write_roce(self.wqe_ptr.add(self.offset), dc_key, dctn, grh);
-        }
-        self.offset += AddressVector::SIZE;
-        self.ds_count += 3;
-    }
-
-    #[inline]
     fn write_rdma(&mut self, addr: u64, rkey: u32) {
         unsafe {
             RdmaSeg::write(self.wqe_ptr.add(self.offset), addr, rkey);

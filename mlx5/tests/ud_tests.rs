@@ -170,7 +170,7 @@ fn test_ud_send_recv() {
     let recv_len = 256 + GRH_SIZE as u32;
     receiver
         .borrow()
-        .recv_builder(0u64)
+        .rq_wqe(0u64)
         .expect("Failed to create recv builder")
         .sge(recv_buf.addr(), recv_len, recv_mr.lkey())
         .finish();
@@ -310,7 +310,7 @@ fn test_ud_send_raw_av() {
     let recv_len = 256 + GRH_SIZE as u32;
     receiver
         .borrow()
-        .recv_builder(0u64)
+        .rq_wqe(0u64)
         .expect("Failed to create recv builder")
         .sge(recv_buf.addr(), recv_len, recv_mr.lkey())
         .finish();
@@ -440,7 +440,7 @@ fn test_ud_multiple_destinations() {
         // Post receive
         receiver
             .borrow()
-            .recv_builder(i as u64)
+            .rq_wqe(i as u64)
             .expect("Failed to create recv builder")
             .sge(recv_buf.addr(), 256 + GRH_SIZE as u32, recv_mr.lkey())
             .finish();
@@ -608,8 +608,8 @@ fn test_ud_post_nop_to_ring_end() {
         recv_buf.fill(0);
         receiver
             .borrow()
-            .recv_builder(i as u64)
-            .expect("recv_builder failed")
+            .rq_wqe(i as u64)
+            .expect("rq_wqe failed")
             .sge(recv_buf.addr(), 256 + GRH_SIZE as u32, recv_mr.lkey())
             .finish();
         receiver.borrow().ring_rq_doorbell();

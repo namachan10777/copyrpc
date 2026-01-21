@@ -972,7 +972,7 @@ where
 // =============================================================================
 
 use crate::wqe::{
-    RqWqeBuilder as RqWqeBuilderTrait, TmCmdWqeBuilder,
+    TmCmdWqeBuilder,
     TmTagAddWqeBuilder, TmTagDelWqeBuilder,
 };
 
@@ -1196,27 +1196,6 @@ impl<'a, Entry> TmTagDelWqeBuilder<'a, Entry> for TmTagDelWqeBuilderImpl<'a, Ent
 }
 
 // =============================================================================
-// TM RQ WQE Builder Implementation
-// =============================================================================
-
-impl<'a, U> RqWqeBuilderTrait<'a, U> for RqWqeBuilder<'a, U> {
-    #[inline]
-    fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
-        // Call data_seg which handles WQEBB extension
-        // Since data_seg returns io::Result, we need to handle it
-        // For the trait implementation, we panic on error (design limitation)
-        self.data_seg(addr, len, lkey)
-            .expect("RQ full during sge")
-    }
-
-    #[inline]
-    fn finish(self) {
-        // Delegate to existing finish
-        RqWqeBuilder::finish(self)
-    }
-}
-
-// =============================================================================
 // New API Entry Points for TM-SRQ
 // =============================================================================
 
@@ -1250,17 +1229,17 @@ impl<T, U, F> TmSrq<T, U, F> {
         })
     }
 
-    /// Get a RQ WQE builder using the new trait-based API.
+    /// Get a RQ WQE builder.
     ///
     /// # Example
     /// ```ignore
-    /// tm_srq.rq_wqe(entry)
-    ///     .sge(addr, len, lkey)
+    /// tm_srq.rq_wqe(entry)?
+    ///     .data_seg(addr, len, lkey)?
     ///     .finish();
     /// tm_srq.ring_srq_doorbell();
     /// ```
     #[inline]
-    pub fn rq_wqe(&self, entry: U) -> io::Result<impl RqWqeBuilderTrait<'_, U> + '_> {
+    pub fn rq_wqe(&self, entry: U) -> io::Result<RqWqeBuilder<'_, U>> {
         self.rq_wqe_builder(entry)
     }
 }

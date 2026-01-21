@@ -565,8 +565,8 @@ fn test_rc_rdma_write_imm() {
     .expect("Failed to register recv MR");
 
     qp2.borrow()
-        .recv_builder(0u64)
-        .expect("recv_builder failed")
+        .rq_wqe(0u64)
+        .expect("rq_wqe failed")
         .sge(recv_buf.addr(), 256, recv_mr.lkey())
         .finish();
     qp2.borrow().ring_rq_doorbell();
@@ -1125,8 +1125,8 @@ fn test_rc_send_recv() {
 
     // QP2 posts a receive
     qp2.borrow()
-        .recv_builder(0u64)
-        .expect("recv_builder failed")
+        .rq_wqe(0u64)
+        .expect("rq_wqe failed")
         .sge(recv_buf.addr(), 256, recv_mr.lkey())
         .finish();
     qp2.borrow().ring_rq_doorbell();
@@ -1512,7 +1512,7 @@ fn test_rc_send_recv_pingpong() {
         // QP2 posts receive
         let _ = qp2
             .borrow()
-            .recv_builder(i as u64)
+            .rq_wqe(i as u64)
             .map(|b| b.sge(buf2.addr(), 64, mr2.lkey()).finish());
         qp2.borrow().ring_rq_doorbell();
 
@@ -1552,7 +1552,7 @@ fn test_rc_send_recv_pingpong() {
         // QP1 posts receive
         let _ = qp1
             .borrow()
-            .recv_builder(i as u64)
+            .rq_wqe(i as u64)
             .map(|b| b.sge(buf1.addr(), 64, mr1.lkey()).finish());
         qp1.borrow().ring_rq_doorbell();
 
@@ -1588,7 +1588,7 @@ fn test_rc_send_recv_pingpong() {
     }
 }
 
-// NOTE: test_rc_send_recv_with_recv_builder is temporarily disabled due to
+// NOTE: test_rc_send_recv_with_rq_wqe is temporarily disabled due to
 // a pre-existing issue with RefCell borrow conflicts when QP's Drop
 // implementation attempts to unregister from a shared CQ that is still borrowed.
 // This is an existing library design issue, not related to the RQ tracking changes.

@@ -227,29 +227,6 @@ impl<Entry, TableType> SendQueueState<Entry, TableType> {
         self.ring_db(last_wqe_ptr);
     }
 
-    /// Ring the doorbell using BlueFlame (low latency, single WQE).
-    #[inline]
-    fn ring_blueflame(&self, wqe_ptr: *mut u8) {
-        mmio_flush_writes!();
-
-        unsafe {
-            std::ptr::write_volatile(self.dbrec.add(1), (self.pi.get() as u32).to_be());
-        }
-
-        udma_to_device_barrier!();
-
-        if self.bf_size > 0 {
-            let bf_offset = self.bf_offset.get();
-            let bf = unsafe { self.bf_reg.add(bf_offset as usize) };
-            mlx5_bf_copy!(bf, wqe_ptr);
-            mmio_flush_writes!();
-            self.bf_offset.set(bf_offset ^ self.bf_size);
-        } else {
-            // Fallback to regular doorbell if BlueFlame not available
-            self.ring_db(wqe_ptr);
-        }
-    }
-
     #[inline]
     fn ring_db(&self, wqe_ptr: *mut u8) {
         let bf_offset = self.bf_offset.get();
@@ -334,56 +311,6 @@ impl<Entry> ReceiveQueueState<Entry> {
         unsafe {
             std::ptr::write_volatile(self.dbrec, (self.pi.get() as u32).to_be());
         }
-    }
-}
-
-// =============================================================================
-// Receive WQE Builder
-// =============================================================================
-
-/// Zero-copy WQE builder for receive operations.
-///
-/// Writes segments directly to the RQ buffer without intermediate copies.
-/// Similar to the send WQE builder pattern, but for receive WQEs.
-pub struct RecvWqeBuilder<'a, Entry> {
-    rq: &'a ReceiveQueueState<Entry>,
-    entry: Entry,
-    wqe_idx: u16,
-}
-
-impl<'a, Entry> RecvWqeBuilder<'a, Entry> {
-    /// Add a data segment (SGE) for the receive buffer.
-    ///
-    /// # Safety
-    /// The caller must ensure the buffer is registered and valid.
-    #[inline]
-    pub fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
-        unsafe {
-            let wqe_ptr = self.rq.get_wqe_ptr(self.wqe_idx);
-            DataSeg::write(wqe_ptr, len, lkey, addr);
-
-            // If there's room for another SGE, write a sentinel to mark end of list.
-            // The sentinel has byte_count=0 and lkey=MLX5_INVALID_LKEY.
-            if self.rq.stride > DataSeg::SIZE as u32 {
-                let sentinel_ptr = wqe_ptr.add(DataSeg::SIZE);
-                let ptr32 = sentinel_ptr as *mut u32;
-                std::ptr::write_volatile(ptr32, 0u32); // byte_count = 0
-                std::ptr::write_volatile(ptr32.add(1), MLX5_INVALID_LKEY.to_be());
-                // lkey = invalid
-            }
-        }
-        self
-    }
-
-    /// Finish the receive WQE construction.
-    ///
-    /// Stores the entry in the table and advances the producer index.
-    /// Call `ring_rq_doorbell()` after posting one or more WQEs to notify the HCA.
-    #[inline]
-    pub fn finish(self) {
-        let idx = (self.wqe_idx as usize) & ((self.rq.wqe_cnt - 1) as usize);
-        self.rq.table[idx].set(Some(self.entry));
-        self.rq.pi.set(self.rq.pi.get().wrapping_add(1));
     }
 }
 
@@ -815,77 +742,6 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, HasData> {
         self.ds_count += 1;
         self
     }
-
-    /// Finish a WQE construction (internal).
-    ///
-    /// If a WQE would wrap around ring boundary, automatically inserts
-    /// a NOP WQE to fill in remaining slots and relocates the WQE to
-    /// ring start.
-    #[inline]
-    pub(crate) fn finish_internal(self) -> io::Result<WqeHandle> {
-        let wqebb_cnt = calc_wqebb_cnt(self.offset);
-        let slots_to_end = self.sq.slots_to_end();
-
-        // Check for wrap-around
-        if wqebb_cnt > slots_to_end && slots_to_end < self.sq.wqe_cnt {
-            return self.finish_with_wrap_around(wqebb_cnt, slots_to_end);
-        }
-
-        // Normal path - no wrap-around
-        unsafe {
-            CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
-        }
-
-        let wqe_idx = self.wqe_idx;
-        self.sq.advance_pi(wqebb_cnt);
-        self.sq.set_last_wqe(self.wqe_ptr, self.offset);
-
-        Ok(WqeHandle {
-            wqe_idx,
-            size: self.offset,
-        })
-    }
-
-    /// Handle WQE wrap-around by inserting NOP and relocating WQE.
-    #[cold]
-    fn finish_with_wrap_around(self, wqebb_cnt: u16, slots_to_end: u16) -> io::Result<WqeHandle> {
-        // Check if we have enough space for NOP + WQE
-        let total_needed = slots_to_end + wqebb_cnt;
-        if self.sq.available() < total_needed {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
-        }
-
-        // 1. Copy current WQE to temp buffer (max 4 WQEBB = 256 bytes)
-        let mut temp_buf = [0u8; 256];
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.wqe_ptr, temp_buf.as_mut_ptr(), self.offset);
-        }
-
-        // 2. Post NOP to fill until ring end
-        unsafe {
-            self.sq.post_nop(slots_to_end);
-        }
-
-        // 3. Get new WQE position at ring start
-        let new_wqe_idx = self.sq.pi.get();
-        let new_wqe_ptr = self.sq.get_wqe_ptr(new_wqe_idx);
-
-        // 4. Copy WQE to new position and update wqe_idx in ctrl segment
-        unsafe {
-            std::ptr::copy_nonoverlapping(temp_buf.as_ptr(), new_wqe_ptr, self.offset);
-            CtrlSeg::update_wqe_idx(new_wqe_ptr, new_wqe_idx);
-            CtrlSeg::update_ds_cnt(new_wqe_ptr, self.ds_count);
-        }
-
-        // 5. Update PI and set last WQE
-        self.sq.advance_pi(wqebb_cnt);
-        self.sq.set_last_wqe(new_wqe_ptr, self.offset);
-
-        Ok(WqeHandle {
-            wqe_idx: new_wqe_idx,
-            size: self.offset,
-        })
-    }
 }
 
 // =============================================================================
@@ -1261,113 +1117,6 @@ impl<Entry, Transport, TableType, OnComplete> RcQpInner<Entry, Transport, TableT
         Ok(())
     }
 
-    /// Transition QP from INIT to RTR (Ready to Receive).
-    pub fn modify_to_rtr(
-        &mut self,
-        remote: &RemoteQpInfo,
-        port: u8,
-        max_dest_rd_atomic: u8,
-    ) -> io::Result<()> {
-        if self.state.get() != QpState::Init {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "QP must be in INIT state",
-            ));
-        }
-
-        unsafe {
-            let mut attr: mlx5_sys::ibv_qp_attr = MaybeUninit::zeroed().assume_init();
-            attr.qp_state = mlx5_sys::ibv_qp_state_IBV_QPS_RTR;
-            attr.path_mtu = mlx5_sys::ibv_mtu_IBV_MTU_4096;
-            attr.dest_qp_num = remote.qp_number;
-            attr.rq_psn = remote.packet_sequence_number;
-            attr.max_dest_rd_atomic = max_dest_rd_atomic;
-            attr.min_rnr_timer = 12;
-            attr.ah_attr.dlid = remote.local_identifier;
-            attr.ah_attr.sl = 0;
-            attr.ah_attr.src_path_bits = 0;
-            attr.ah_attr.is_global = 0;
-            attr.ah_attr.port_num = port;
-
-            let mask = mlx5_sys::ibv_qp_attr_mask_IBV_QP_STATE
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_AV
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_PATH_MTU
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_DEST_QPN
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_RQ_PSN
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_MAX_DEST_RD_ATOMIC
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_MIN_RNR_TIMER;
-
-            let ret = mlx5_sys::ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask as i32);
-            if ret != 0 {
-                return Err(io::Error::from_raw_os_error(ret));
-            }
-        }
-
-        self.state.set(QpState::Rtr);
-        Ok(())
-    }
-
-    /// Transition QP from INIT to RTR (Ready to Receive) for RoCE transport.
-    ///
-    /// Uses GID-based addressing (is_global = 1) instead of LID-based addressing.
-    ///
-    /// # NOTE: RoCE support is untested (IB-only hardware environment)
-    pub fn modify_to_rtr_roce(
-        &mut self,
-        remote: &RoCERemoteQpInfo,
-        port: u8,
-        max_dest_rd_atomic: u8,
-    ) -> io::Result<()> {
-        if self.state.get() != QpState::Init {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "QP must be in INIT state",
-            ));
-        }
-
-        unsafe {
-            let mut attr: mlx5_sys::ibv_qp_attr = MaybeUninit::zeroed().assume_init();
-            attr.qp_state = mlx5_sys::ibv_qp_state_IBV_QPS_RTR;
-            attr.path_mtu = mlx5_sys::ibv_mtu_IBV_MTU_4096;
-            attr.dest_qp_num = remote.qp_number;
-            attr.rq_psn = remote.packet_sequence_number;
-            attr.max_dest_rd_atomic = max_dest_rd_atomic;
-            attr.min_rnr_timer = 12;
-
-            // RoCE: use GRH (Global Route Header)
-            attr.ah_attr.is_global = 1;
-            attr.ah_attr.port_num = port;
-            attr.ah_attr.dlid = 0; // Not used for RoCE
-
-            // GRH configuration
-            attr.ah_attr.grh.dgid.raw = remote.grh.dgid.raw;
-            attr.ah_attr.grh.sgid_index = remote.grh.sgid_index;
-            attr.ah_attr.grh.flow_label = remote.grh.flow_label;
-            attr.ah_attr.grh.traffic_class = remote.grh.traffic_class;
-            attr.ah_attr.grh.hop_limit = remote.grh.hop_limit;
-
-            // Service level and source path bits
-            attr.ah_attr.sl = 0;
-            attr.ah_attr.src_path_bits = 0;
-
-            let mask = mlx5_sys::ibv_qp_attr_mask_IBV_QP_STATE
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_AV
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_PATH_MTU
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_DEST_QPN
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_RQ_PSN
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_MAX_DEST_RD_ATOMIC
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_MIN_RNR_TIMER;
-
-            let ret = mlx5_sys::ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask as i32);
-            if ret != 0 {
-                return Err(io::Error::from_raw_os_error(ret));
-            }
-        }
-
-        self.state.set(QpState::Rtr);
-        Ok(())
-    }
-
     /// Transition QP from RTR to RTS (Ready to Send).
     pub fn modify_to_rts(&mut self, local_psn: u32, max_rd_atomic: u8) -> io::Result<()> {
         if self.state.get() != QpState::Rtr {
@@ -1516,6 +1265,159 @@ impl<Entry, Transport, TableType, OnComplete> RcQpInner<Entry, Transport, TableT
     }
 }
 
+/// InfiniBand transport-specific methods.
+impl<Entry, TableType, OnComplete> RcQpInner<Entry, InfiniBand, TableType, OnComplete> {
+    /// Transition QP from INIT to RTR (Ready to Receive).
+    ///
+    /// Uses LID-based addressing for InfiniBand fabric.
+    pub fn modify_to_rtr(
+        &mut self,
+        remote: &RemoteQpInfo,
+        port: u8,
+        max_dest_rd_atomic: u8,
+    ) -> io::Result<()> {
+        if self.state.get() != QpState::Init {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "QP must be in INIT state",
+            ));
+        }
+
+        unsafe {
+            let mut attr: mlx5_sys::ibv_qp_attr = MaybeUninit::zeroed().assume_init();
+            attr.qp_state = mlx5_sys::ibv_qp_state_IBV_QPS_RTR;
+            attr.path_mtu = mlx5_sys::ibv_mtu_IBV_MTU_4096;
+            attr.dest_qp_num = remote.qp_number;
+            attr.rq_psn = remote.packet_sequence_number;
+            attr.max_dest_rd_atomic = max_dest_rd_atomic;
+            attr.min_rnr_timer = 12;
+            attr.ah_attr.dlid = remote.local_identifier;
+            attr.ah_attr.sl = 0;
+            attr.ah_attr.src_path_bits = 0;
+            attr.ah_attr.is_global = 0;
+            attr.ah_attr.port_num = port;
+
+            let mask = mlx5_sys::ibv_qp_attr_mask_IBV_QP_STATE
+                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_AV
+                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_PATH_MTU
+                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_DEST_QPN
+                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_RQ_PSN
+                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_MAX_DEST_RD_ATOMIC
+                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_MIN_RNR_TIMER;
+
+            let ret = mlx5_sys::ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask as i32);
+            if ret != 0 {
+                return Err(io::Error::from_raw_os_error(ret));
+            }
+        }
+
+        self.state.set(QpState::Rtr);
+        Ok(())
+    }
+
+    /// Connect to a remote QP.
+    ///
+    /// Transitions the QP through RESET -> INIT -> RTR -> RTS.
+    pub fn connect(
+        &mut self,
+        remote: &RemoteQpInfo,
+        port: u8,
+        local_psn: u32,
+        max_rd_atomic: u8,
+        max_dest_rd_atomic: u8,
+        access_flags: u32,
+    ) -> io::Result<()> {
+        self.modify_to_init(port, access_flags)?;
+        self.modify_to_rtr(remote, port, max_dest_rd_atomic)?;
+        self.modify_to_rts(local_psn, max_rd_atomic)?;
+        Ok(())
+    }
+}
+
+/// RoCE transport-specific methods.
+impl<Entry, TableType, OnComplete> RcQpInner<Entry, RoCE, TableType, OnComplete> {
+    /// Transition QP from INIT to RTR (Ready to Receive).
+    ///
+    /// Uses GID-based addressing for RoCE (RDMA over Converged Ethernet).
+    ///
+    /// # NOTE: RoCE support is untested (IB-only hardware environment)
+    pub fn modify_to_rtr(
+        &mut self,
+        remote: &RoCERemoteQpInfo,
+        port: u8,
+        max_dest_rd_atomic: u8,
+    ) -> io::Result<()> {
+        if self.state.get() != QpState::Init {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "QP must be in INIT state",
+            ));
+        }
+
+        unsafe {
+            let mut attr: mlx5_sys::ibv_qp_attr = MaybeUninit::zeroed().assume_init();
+            attr.qp_state = mlx5_sys::ibv_qp_state_IBV_QPS_RTR;
+            attr.path_mtu = mlx5_sys::ibv_mtu_IBV_MTU_4096;
+            attr.dest_qp_num = remote.qp_number;
+            attr.rq_psn = remote.packet_sequence_number;
+            attr.max_dest_rd_atomic = max_dest_rd_atomic;
+            attr.min_rnr_timer = 12;
+
+            // RoCE: use GRH (Global Route Header)
+            attr.ah_attr.is_global = 1;
+            attr.ah_attr.port_num = port;
+            attr.ah_attr.dlid = 0; // Not used for RoCE
+
+            // GRH configuration
+            attr.ah_attr.grh.dgid.raw = remote.grh.dgid.raw;
+            attr.ah_attr.grh.sgid_index = remote.grh.sgid_index;
+            attr.ah_attr.grh.flow_label = remote.grh.flow_label;
+            attr.ah_attr.grh.traffic_class = remote.grh.traffic_class;
+            attr.ah_attr.grh.hop_limit = remote.grh.hop_limit;
+
+            // Service level and source path bits
+            attr.ah_attr.sl = 0;
+            attr.ah_attr.src_path_bits = 0;
+
+            let mask = mlx5_sys::ibv_qp_attr_mask_IBV_QP_STATE
+                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_AV
+                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_PATH_MTU
+                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_DEST_QPN
+                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_RQ_PSN
+                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_MAX_DEST_RD_ATOMIC
+                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_MIN_RNR_TIMER;
+
+            let ret = mlx5_sys::ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask as i32);
+            if ret != 0 {
+                return Err(io::Error::from_raw_os_error(ret));
+            }
+        }
+
+        self.state.set(QpState::Rtr);
+        Ok(())
+    }
+
+    /// Connect to a remote QP.
+    ///
+    /// Transitions the QP through RESET -> INIT -> RTR -> RTS.
+    ///
+    /// # NOTE: RoCE support is untested (IB-only hardware environment)
+    pub fn connect(
+        &mut self,
+        remote: &RoCERemoteQpInfo,
+        port: u8,
+        local_psn: u32,
+        max_rd_atomic: u8,
+        max_dest_rd_atomic: u8,
+        access_flags: u32,
+    ) -> io::Result<()> {
+        self.modify_to_init(port, access_flags)?;
+        self.modify_to_rtr(remote, port, max_dest_rd_atomic)?;
+        self.modify_to_rts(local_psn, max_rd_atomic)?;
+        Ok(())
+    }
+}
+
 impl<Entry, OnComplete> RcQp<Entry, OnComplete> {
     /// Initialize direct queue access (internal implementation).
     fn init_direct_access_internal(&mut self) -> io::Result<()> {
@@ -1565,63 +1467,6 @@ impl<Entry, OnComplete> RcQp<Entry, OnComplete> {
     pub fn init_direct_access(&mut self) -> io::Result<()> {
         self.init_direct_access_internal()
     }
-
-    /// Connect to a remote QP.
-    ///
-    /// Transitions the QP through RESET -> INIT -> RTR -> RTS.
-    /// Direct queue access is auto-initialized at creation time.
-    pub fn connect(
-        &mut self,
-        remote: &RemoteQpInfo,
-        port: u8,
-        local_psn: u32,
-        max_rd_atomic: u8,
-        max_dest_rd_atomic: u8,
-        access_flags: u32,
-    ) -> io::Result<()> {
-        self.modify_to_init(port, access_flags)?;
-        self.modify_to_rtr(remote, port, max_dest_rd_atomic)?;
-        self.modify_to_rts(local_psn, max_rd_atomic)?;
-        Ok(())
-    }
-
-    /// Connect to a remote QP over RoCE.
-    ///
-    /// Transitions the QP through RESET -> INIT -> RTR -> RTS.
-    /// Uses GID-based addressing instead of LID-based addressing.
-    ///
-    /// # NOTE: RoCE support is untested (IB-only hardware environment)
-    pub fn connect_roce(
-        &mut self,
-        remote: &RoCERemoteQpInfo,
-        port: u8,
-        local_psn: u32,
-        max_rd_atomic: u8,
-        max_dest_rd_atomic: u8,
-        access_flags: u32,
-    ) -> io::Result<()> {
-        self.modify_to_init(port, access_flags)?;
-        self.modify_to_rtr_roce(remote, port, max_dest_rd_atomic)?;
-        self.modify_to_rts(local_psn, max_rd_atomic)?;
-        Ok(())
-    }
-
-    /// Get a receive WQE builder for zero-copy WQE construction.
-    ///
-    /// The entry will be stored and returned via callback on RQ completion.
-    pub fn recv_builder(&self, entry: Entry) -> io::Result<RecvWqeBuilder<'_, Entry>> {
-        let rq = self
-            .rq
-            .as_ref()
-            .ok_or_else(|| io::Error::other("direct access not initialized"))?;
-        if rq.available() == 0 {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "RQ full"));
-        }
-
-        let wqe_idx = rq.pi.get();
-        Ok(RecvWqeBuilder { rq, entry, wqe_idx })
-    }
-
 }
 
 // =============================================================================
@@ -1694,96 +1539,6 @@ pub struct SqSlot {
     pub sqn: u32,
 }
 
-impl<Entry, Transport, TableType, OnComplete> RcQpInner<Entry, Transport, TableType, OnComplete> {
-    /// Get a raw SQ slot for direct WQE construction.
-    ///
-    /// Returns `None` if the SQ is not initialized or full.
-    ///
-    /// # Safety
-    /// The caller must:
-    /// - Write a valid WQE to the returned pointer
-    /// - Call `__sq_advance_pi()` after writing the WQE
-    /// - Call `__sq_set_last_wqe()` or `__sq_ring_blueflame()` to notify the HCA
-    #[inline]
-    pub unsafe fn __sq_ptr(&self) -> Option<SqSlot> {
-        let sq = self.sq.as_ref()?;
-        if sq.available() == 0 {
-            return None;
-        }
-
-        let wqe_idx = sq.pi.get();
-        let ptr = sq.get_wqe_ptr(wqe_idx);
-
-        Some(SqSlot {
-            ptr,
-            wqe_idx,
-            sqn: sq.sqn,
-        })
-    }
-
-    /// Advance the SQ producer index.
-    ///
-    /// # Safety
-    /// The caller must have written a valid WQE to the SQ buffer before calling this.
-    #[inline]
-    pub unsafe fn __sq_advance_pi(&self, wqebb_cnt: u16) {
-        if let Some(sq) = self.sq.as_ref() {
-            sq.advance_pi(wqebb_cnt);
-        }
-    }
-
-    /// Set the last WQE pointer and size for doorbell.
-    ///
-    /// Call `ring_sq_doorbell()` after this to notify the HCA.
-    ///
-    /// # Safety
-    /// The caller must ensure `ptr` points to a valid WQE in the SQ buffer.
-    #[inline]
-    pub unsafe fn __sq_set_last_wqe(&self, ptr: *mut u8, size: usize) {
-        if let Some(sq) = self.sq.as_ref() {
-            sq.set_last_wqe(ptr, size);
-        }
-    }
-
-    /// Ring the BlueFlame doorbell for low-latency WQE submission.
-    ///
-    /// This combines the doorbell record update and BlueFlame copy in a single operation.
-    ///
-    /// # Safety
-    /// The caller must ensure `wqe_ptr` points to a valid WQE in the SQ buffer.
-    #[inline]
-    pub unsafe fn __sq_ring_blueflame(&self, wqe_ptr: *mut u8) {
-        if let Some(sq) = self.sq.as_ref() {
-            sq.ring_blueflame(wqe_ptr);
-        }
-    }
-
-    /// Get the BlueFlame buffer size.
-    ///
-    /// Returns 0 if BlueFlame is not available or SQ is not initialized.
-    #[inline]
-    pub fn __sq_bf_size(&self) -> u32 {
-        self.sq.as_ref().map(|sq| sq.bf_size).unwrap_or(0)
-    }
-}
-
-impl<Entry, OnComplete> RcQp<Entry, OnComplete> {
-    /// Store an entry in the WQE table.
-    ///
-    /// # Arguments
-    /// * `wqe_idx` - WQE index
-    /// * `entry` - User data to store
-    /// * `ci_delta` - Accumulated PI value at completion (for correct CI update)
-    ///
-    /// # Safety
-    /// The caller must ensure `wqe_idx` corresponds to a valid pending WQE.
-    #[inline]
-    pub unsafe fn __sq_store_entry(&self, wqe_idx: u16, entry: Entry, ci_delta: u16) {
-        if let Some(sq) = self.sq.as_ref() {
-            sq.table.store(wqe_idx, entry, ci_delta);
-        }
-    }
-}
 
 // =============================================================================
 // CompletionSource impl for RcQp (for use with MonoCq)
@@ -1827,8 +1582,6 @@ use crate::wqe::{
     NoData,
     // Address Vector trait and types
     Av, NoAv,
-    // RQ builder trait
-    RqWqeBuilder,
     // Flags
     TxFlags,
 };
@@ -2495,15 +2248,16 @@ impl<'a, Entry> NopWqeBuilder<'a, Entry> {
 
 /// RQ WQE builder.
 #[must_use = "WQE builder must be finished"]
-pub struct RqWqeBuilderImpl<'a, Entry> {
+pub struct RqWqeBuilder<'a, Entry> {
     rq: &'a ReceiveQueueState<Entry>,
     entry: Entry,
     wqe_idx: u16,
 }
 
-impl<'a, Entry> RqWqeBuilder<'a, Entry> for RqWqeBuilderImpl<'a, Entry> {
+impl<'a, Entry> RqWqeBuilder<'a, Entry> {
+    /// Add a scatter/gather entry for receive buffer.
     #[inline]
-    fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
+    pub fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
         unsafe {
             let wqe_ptr = self.rq.get_wqe_ptr(self.wqe_idx);
             DataSeg::write(wqe_ptr, len, lkey, addr);
@@ -2518,8 +2272,9 @@ impl<'a, Entry> RqWqeBuilder<'a, Entry> for RqWqeBuilderImpl<'a, Entry> {
         self
     }
 
+    /// Finish the WQE construction.
     #[inline]
-    fn finish(self) {
+    pub fn finish(self) {
         let idx = (self.wqe_idx as usize) & ((self.rq.wqe_cnt - 1) as usize);
         self.rq.table[idx].set(Some(self.entry));
         self.rq.pi.set(self.rq.pi.get().wrapping_add(1));
@@ -2541,7 +2296,7 @@ impl<Entry, Transport, OnComplete> RcQpInner<Entry, Transport, OrderedWqeTable<E
     /// qp.ring_rq_doorbell();
     /// ```
     #[inline]
-    pub fn rq_wqe(&self, entry: Entry) -> io::Result<RqWqeBuilderImpl<'_, Entry>> {
+    pub fn rq_wqe(&self, entry: Entry) -> io::Result<RqWqeBuilder<'_, Entry>> {
         let rq = self
             .rq
             .as_ref()
@@ -2550,7 +2305,7 @@ impl<Entry, Transport, OnComplete> RcQpInner<Entry, Transport, OrderedWqeTable<E
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "RQ full"));
         }
         let wqe_idx = rq.pi.get();
-        Ok(RqWqeBuilderImpl { rq, entry, wqe_idx })
+        Ok(RqWqeBuilder { rq, entry, wqe_idx })
     }
 }
 

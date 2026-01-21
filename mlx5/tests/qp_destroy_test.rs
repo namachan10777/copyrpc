@@ -390,7 +390,7 @@ fn test_qp_destroy_after_data_transfer() {
         for i in 0..32 {
             let _ = qp
                 .borrow()
-                .recv_builder(i as u64)
+                .rq_wqe(i as u64)
                 .map(|b| b.sge(buf.addr() + (i * 64) as u64, 64, mr.lkey()).finish());
         }
         qp.borrow().ring_rq_doorbell();
@@ -473,7 +473,7 @@ fn test_qp_destroy_after_data_transfer() {
     for i in 0..32 {
         let _ = qp
             .borrow()
-            .recv_builder(i as u64)
+            .rq_wqe(i as u64)
             .map(|b| b.sge(buf.addr() + (i * 64) as u64, 64, mr.lkey()).finish());
     }
     qp.borrow().ring_rq_doorbell();
@@ -607,7 +607,7 @@ fn test_qp_destroy_after_actual_send_recv() {
         for i in 0..32 {
             let _ = qp
                 .borrow()
-                .recv_builder(i as u64)
+                .rq_wqe(i as u64)
                 .map(|b| b.sge(buf.addr() + (i * 64) as u64, 64, mr.lkey()).finish());
         }
         qp.borrow().ring_rq_doorbell();
@@ -647,7 +647,7 @@ fn test_qp_destroy_after_actual_send_recv() {
                 // Repost recv
                 let _ = qp
                     .borrow()
-                    .recv_builder(idx as u64)
+                    .rq_wqe(idx as u64)
                     .map(|b| b.sge(buf.addr() + offset, 64, mr.lkey()).finish());
                 qp.borrow().ring_rq_doorbell();
             }
@@ -735,7 +735,7 @@ fn test_qp_destroy_after_actual_send_recv() {
     for i in 0..32 {
         let _ = qp
             .borrow()
-            .recv_builder(i as u64)
+            .rq_wqe(i as u64)
             .map(|b| b.sge(buf.addr() + (i * 64) as u64, 64, mr.lkey()).finish());
     }
     qp.borrow().ring_rq_doorbell();
@@ -792,7 +792,7 @@ fn test_qp_destroy_after_actual_send_recv() {
             // Repost recv
             let _ = qp
                 .borrow()
-                .recv_builder(idx as u64)
+                .rq_wqe(idx as u64)
                 .map(|b| b.sge(buf.addr() + offset, 64, mr.lkey()).finish());
             qp.borrow().ring_rq_doorbell();
 

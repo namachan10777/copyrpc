@@ -19,7 +19,7 @@ use crate::device::Context;
 use crate::pd::{AddressHandle, Pd};
 use crate::qp::QpInfo;
 use crate::wqe::{
-    CtrlSeg, DataSeg, HasData, InlineHeader, Init, NeedsData, NoData, OrderedWqeTable, RqWqeBuilder,
+    CtrlSeg, DataSeg, HasData, InlineHeader, Init, NeedsData, NoData, OrderedWqeTable,
     SubmissionError, TxFlags, UdNeedsAddr, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
 };
 
@@ -1662,17 +1662,18 @@ impl<'a, Entry> UdSendWqeBuilder<'a, Entry, HasData> {
 // UD RQ WQE Builder
 // =============================================================================
 
-/// UD RQ WQE builder (new API).
+/// UD RQ WQE builder.
 #[must_use = "WQE builder must be finished"]
-pub struct UdRqWqeBuilderImpl<'a, Entry> {
+pub struct UdRqWqeBuilder<'a, Entry> {
     rq: &'a UdRecvQueueState<Entry>,
     entry: Entry,
     wqe_idx: u16,
 }
 
-impl<'a, Entry> RqWqeBuilder<'a, Entry> for UdRqWqeBuilderImpl<'a, Entry> {
+impl<'a, Entry> UdRqWqeBuilder<'a, Entry> {
+    /// Add a scatter/gather entry for receive buffer.
     #[inline]
-    fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
+    pub fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
         unsafe {
             let wqe_ptr = self.rq.get_wqe_ptr(self.wqe_idx);
             DataSeg::write(wqe_ptr, len, lkey, addr);
@@ -1680,8 +1681,9 @@ impl<'a, Entry> RqWqeBuilder<'a, Entry> for UdRqWqeBuilderImpl<'a, Entry> {
         self
     }
 
+    /// Finish the WQE construction.
     #[inline]
-    fn finish(self) {
+    pub fn finish(self) {
         let idx = (self.wqe_idx as usize) & ((self.rq.wqe_cnt - 1) as usize);
         self.rq.table[idx].set(Some(self.entry));
         self.rq.pi.set(self.rq.pi.get().wrapping_add(1));
@@ -1722,13 +1724,13 @@ impl<Entry, OnComplete> UdQpWithTable<Entry, OnComplete> {
     /// qp.ring_rq_doorbell();
     /// ```
     #[inline]
-    pub fn rq_wqe(&self, entry: Entry) -> io::Result<UdRqWqeBuilderImpl<'_, Entry>> {
+    pub fn rq_wqe(&self, entry: Entry) -> io::Result<UdRqWqeBuilder<'_, Entry>> {
         let rq = self.rq()?;
         if rq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "RQ full"));
         }
         let wqe_idx = rq.pi.get();
-        Ok(UdRqWqeBuilderImpl { rq, entry, wqe_idx })
+        Ok(UdRqWqeBuilder { rq, entry, wqe_idx })
     }
 
     /// Ring the send queue doorbell.

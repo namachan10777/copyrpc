@@ -131,22 +131,6 @@ pub struct NoData;
 // NOTE: HasData is defined in mod.rs as a WqeState, re-exported here for consistency
 
 // =============================================================================
-// Receive Queue Traits
-// =============================================================================
-
-/// QP RQ builder.
-///
-/// All RQ WQEs generate completions, so entry is always required at construction.
-#[must_use = "WQE builder must be finished"]
-pub trait RqWqeBuilder<'a, Entry>: Sized {
-    /// Add a scatter/gather entry for receive buffer.
-    fn sge(self, addr: u64, len: u32, lkey: u32) -> Self;
-
-    /// Finish the WQE construction.
-    fn finish(self);
-}
-
-// =============================================================================
 // TM-SRQ Traits (Tag Matching)
 // =============================================================================
 
@@ -188,10 +172,3 @@ pub trait TmTagDelWqeBuilder<'a, Entry>: Sized {
     fn finish_signaled(self, entry: Entry) -> WqeHandle;
 }
 
-// =============================================================================
-// SRQ RQ Traits
-// =============================================================================
-
-/// SRQ RQ builder - same interface as QP RQ.
-#[must_use = "WQE builder must be finished"]
-pub trait SrqRqWqeBuilder<'a, Entry>: RqWqeBuilder<'a, Entry> {}

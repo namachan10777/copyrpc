@@ -44,8 +44,6 @@ pub use traits::{
     TxFlags,
     // Data state marker (NoData)
     NoData,
-    // RQ builder traits
-    RqWqeBuilder, SrqRqWqeBuilder,
     // TM-SRQ builder traits
     TmCmdWqeBuilder, TmTagAddWqeBuilder, TmTagDelWqeBuilder,
 };
