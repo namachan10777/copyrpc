@@ -154,7 +154,8 @@ fn test_mono_cq_with_rc_qp() {
         .expect("write failed")
         .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
         .finish_signaled(42u64)
-        .expect("finish_with_blueflame failed");
+        .expect("finish_signaled failed");
+    qp1.borrow().ring_sq_doorbell();
 
     // Poll for completion
     let start = std::time::Instant::now();
@@ -328,8 +329,9 @@ fn test_mono_cq_multiple_completions() {
             .expect("write failed")
             .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
             .finish_signaled(100 + i as u64)
-            .expect("finish_with_blueflame failed");
+            .expect("finish_signaled failed");
     }
+    qp1.borrow().ring_sq_doorbell();
 
     // Poll until all completions are received
     let start = std::time::Instant::now();
@@ -480,8 +482,9 @@ fn test_mono_cq_high_load() {
             .expect("write failed")
             .sge(local_buf.addr() + offset, chunk_size, local_mr.lkey())
             .finish_signaled(i as u64)
-            .expect("finish_with_blueflame failed");
+            .expect("finish_signaled failed");
     }
+    qp1.borrow().ring_sq_doorbell();
 
     // Poll until all completions are received
     let start = std::time::Instant::now();
@@ -639,8 +642,9 @@ fn test_mono_cq_recv_rdma_write_imm() {
             .expect("write_imm failed")
             .sge(send_buf.addr() + offset, 64, send_mr.lkey())
             .finish_signaled(i as u64)
-            .expect("finish_with_blueflame failed");
+            .expect("finish_signaled failed");
     }
+    qp2.borrow().ring_sq_doorbell();
 
     // Poll both CQs
     let start = std::time::Instant::now();
@@ -830,6 +834,7 @@ fn test_mono_cq_bidirectional_pingpong() {
             .sge(buf1.addr() + offset, msg_size, mr1.lkey())
             .finish_signaled(i as u64)
             .expect("finish");
+        qp1.borrow().ring_sq_doorbell();
 
         // Wait for QP2 to receive
         while *qp2_recv_count.borrow() <= i {
@@ -854,6 +859,7 @@ fn test_mono_cq_bidirectional_pingpong() {
             .sge(buf2.addr() + offset, msg_size, mr2.lkey())
             .finish_signaled(i as u64)
             .expect("finish");
+        qp2.borrow().ring_sq_doorbell();
 
         // Wait for QP1 to receive
         while *qp1_recv_count.borrow() <= i {
