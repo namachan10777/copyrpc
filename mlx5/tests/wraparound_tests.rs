@@ -18,7 +18,7 @@ use mlx5::pd::RemoteUdQpInfo;
 use mlx5::qp::{RcQpConfig, RemoteQpInfo};
 use mlx5::srq::SrqConfig;
 use mlx5::ud::UdQpConfig;
-use mlx5::wqe::{WqeFlags, WqeOpcode};
+use mlx5::wqe::TxFlags;
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_batch, poll_cq_timeout};
 
@@ -138,12 +138,13 @@ fn test_rc_rdma_write_wraparound() {
 
         // Post RDMA WRITE
         qp1.borrow_mut()
-            .wqe_builder(i as u64)
-            .expect("wqe_builder failed")
-            .ctrl_rdma_write(WqeFlags::COMPLETION)
-            .rdma(remote_buf.addr(), remote_mr.rkey())
+            .sq_wqe()
+            .expect("sq_wqe failed")
+            .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+            .expect("write failed")
             .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-            .finish_with_blueflame();
+            .finish_signaled_with_blueflame(i as u64)
+            .expect("finish failed");
 
         // Wait for completion
         let cqe =
@@ -293,12 +294,12 @@ fn test_rc_actual_wraparound_triggered() {
         // Post one small WQE (1 WQEBB)
         let _ = qp1
             .borrow_mut()
-            .wqe_builder(total_posted as u64)
-            .expect("wqe_builder failed")
-            .ctrl_rdma_write(WqeFlags::COMPLETION)
-            .rdma(remote_buf.addr(), remote_mr.rkey())
+            .sq_wqe()
+            .expect("sq_wqe failed")
+            .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+            .expect("write failed")
             .sge(local_buf.addr(), 8, local_mr.lkey())
-            .finish_with_blueflame();
+            .finish_signaled_with_blueflame(total_posted as u64);
         total_posted += 1;
 
         // Wait for completion before posting next
@@ -330,14 +331,14 @@ fn test_rc_actual_wraparound_triggered() {
 
     let _ = qp1
         .borrow_mut()
-        .wqe_builder(9999u64)
-        .expect("wqe_builder failed")
-        .ctrl_rdma_write(WqeFlags::COMPLETION)
-        .rdma(remote_buf.addr(), remote_mr.rkey())
+        .sq_wqe()
+        .expect("sq_wqe failed")
+        .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+        .expect("write failed")
         .sge(local_buf.addr(), 8, local_mr.lkey())
         .sge(local_buf.addr().wrapping_add(8), 8, local_mr.lkey())
         .sge(local_buf.addr().wrapping_add(16), 8, local_mr.lkey())
-        .finish_with_blueflame();
+        .finish_signaled_with_blueflame(9999u64);
 
     let slots_after = qp1.borrow().slots_to_ring_end();
     println!("After large WQE: slots_to_ring_end={}", slots_after);
@@ -479,12 +480,12 @@ fn test_rc_wraparound_with_doorbell() {
 
         let _ = qp1
             .borrow_mut()
-            .wqe_builder(total_posted as u64)
-            .expect("wqe_builder failed")
-            .ctrl_rdma_write(WqeFlags::COMPLETION)
-            .rdma(remote_buf.addr(), remote_mr.rkey())
+            .sq_wqe()
+            .expect("sq_wqe failed")
+            .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+            .expect("write failed")
             .sge(local_buf.addr(), 8, local_mr.lkey())
-            .finish(); // Use finish() not finish_with_blueflame()
+            .finish_signaled(total_posted as u64); // Use finish_signaled() not finish_signaled_with_blueflame()
 
         qp1.borrow().ring_sq_doorbell();
         total_posted += 1;
@@ -497,17 +498,17 @@ fn test_rc_wraparound_with_doorbell() {
     let slots_before = qp1.borrow().slots_to_ring_end();
     println!("Before large WQE: slots_to_ring_end={}", slots_before);
 
-    // Post a 2-WQEBB WQE using finish() + doorbell
+    // Post a 2-WQEBB WQE using finish_signaled() + doorbell
     let _ = qp1
         .borrow_mut()
-        .wqe_builder(9999u64)
-        .expect("wqe_builder failed")
-        .ctrl_rdma_write(WqeFlags::COMPLETION)
-        .rdma(remote_buf.addr(), remote_mr.rkey())
+        .sq_wqe()
+        .expect("sq_wqe failed")
+        .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+        .expect("write failed")
         .sge(local_buf.addr(), 8, local_mr.lkey())
         .sge(local_buf.addr().wrapping_add(8), 8, local_mr.lkey())
         .sge(local_buf.addr().wrapping_add(16), 8, local_mr.lkey())
-        .finish(); // Use finish() not finish_with_blueflame()
+        .finish_signaled(9999u64); // Use finish_signaled() not finish_signaled_with_blueflame()
 
     qp1.borrow().ring_sq_doorbell();
 
@@ -630,12 +631,13 @@ fn test_rc_slots_to_ring_end() {
     // Post 5 WQEs to advance towards ring end
     for i in 0..5 {
         qp1.borrow_mut()
-            .wqe_builder(i as u64)
-            .expect("wqe_builder failed")
-            .ctrl_rdma_write(WqeFlags::COMPLETION)
-            .rdma(remote_buf.addr(), remote_mr.rkey())
+            .sq_wqe()
+            .expect("sq_wqe failed")
+            .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+            .expect("write failed")
             .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-            .finish_with_blueflame();
+            .finish_signaled_with_blueflame(i as u64)
+            .expect("finish failed");
 
         let _ = poll_cq_timeout(&send_cq, 5000).expect("CQE timeout");
         send_cq.flush();
@@ -741,14 +743,14 @@ fn test_rc_ring_sq_doorbell() {
     local_buf.fill_bytes(test_data);
     remote_buf.fill(0);
 
-    // Use finish() instead of finish_with_blueflame(), then ring doorbell manually
+    // Use finish_signaled() instead of finish_signaled_with_blueflame(), then ring doorbell manually
     qp1.borrow_mut()
-        .wqe_builder(1u64)
-        .expect("wqe_builder failed")
-        .ctrl_rdma_write(WqeFlags::COMPLETION)
-        .rdma(remote_buf.addr(), remote_mr.rkey())
+        .sq_wqe()
+        .expect("sq_wqe failed")
+        .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+        .expect("write failed")
         .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-        .finish();
+        .finish_signaled(1u64);
 
     // Ring doorbell manually
     qp1.borrow().ring_sq_doorbell();
@@ -852,13 +854,13 @@ fn test_dc_rdma_write_wraparound() {
         remote_buf.fill(0xBB);
 
         dci.borrow_mut()
-            .wqe_builder(i as u64)
-            .expect("wqe_builder failed")
-            .ctrl_rdma_write(WqeFlags::COMPLETION)
-            .av(dc_key, dctn, dlid)
-            .rdma(remote_buf.addr(), remote_mr.rkey())
+            .sq_wqe(dc_key, dctn, dlid)
+            .expect("sq_wqe failed")
+            .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+            .expect("write failed")
             .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-            .finish_with_blueflame();
+            .finish_signaled_with_blueflame(i as u64)
+            .expect("finish failed");
 
         let cqe = poll_cq_timeout(&dci_cq, 5000).expect(&format!("CQE timeout at iteration {}", i));
         assert_eq!(
@@ -966,13 +968,13 @@ fn test_dc_sq_methods() {
 
     for i in 0..3 {
         dci.borrow_mut()
-            .wqe_builder(i as u64)
-            .expect("wqe_builder failed")
-            .ctrl_rdma_write(WqeFlags::COMPLETION)
-            .av(dc_key, dctn, dlid)
-            .rdma(remote_buf.addr(), remote_mr.rkey())
+            .sq_wqe(dc_key, dctn, dlid)
+            .expect("sq_wqe failed")
+            .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+            .expect("write failed")
             .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-            .finish_with_blueflame();
+            .finish_signaled_with_blueflame(i as u64)
+            .expect("finish failed");
 
         let _ = poll_cq_timeout(&dci_cq, 5000).expect("CQE timeout");
         dci_cq.flush();
@@ -1056,15 +1058,14 @@ fn test_dc_ring_sq_doorbell() {
     local_buf.fill_bytes(test_data);
     remote_buf.fill(0);
 
-    // Use finish() + ring_sq_doorbell() instead of finish_with_blueflame()
+    // Use finish_signaled() + ring_sq_doorbell() instead of finish_signaled_with_blueflame()
     dci.borrow_mut()
-        .wqe_builder(1u64)
-        .expect("wqe_builder failed")
-        .ctrl_rdma_write(WqeFlags::COMPLETION)
-        .av(dc_key, dctn, dlid)
-        .rdma(remote_buf.addr(), remote_mr.rkey())
+        .sq_wqe(dc_key, dctn, dlid)
+        .expect("sq_wqe failed")
+        .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+        .expect("write failed")
         .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-        .finish();
+        .finish_signaled(1u64);
 
     dci.borrow().ring_sq_doorbell();
 
@@ -1181,13 +1182,15 @@ fn test_ud_send_wraparound() {
 
         // Post send
         sender
-            .borrow_mut()
-            .wqe_builder(i as u64)
-            .expect("wqe_builder failed")
-            .ctrl_send(WqeFlags::COMPLETION)
-            .ud_av(&ah, qkey)
+            .borrow()
+            .sq_wqe(&ah)
+            .expect("sq_wqe failed")
+            .send(TxFlags::empty())
+            .expect("send failed")
             .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-            .finish_with_blueflame();
+            .finish_signaled_with_blueflame(i as u64)
+            .expect("finish failed");
+        sender.borrow().ring_sq_doorbell();
 
         // Wait for send completion
         let send_cqe =
@@ -1310,13 +1313,15 @@ fn test_ud_slots_to_ring_end() {
         receiver.borrow().ring_rq_doorbell();
 
         sender
-            .borrow_mut()
-            .wqe_builder(i as u64)
-            .expect("wqe_builder failed")
-            .ctrl_send(WqeFlags::COMPLETION)
-            .ud_av(&ah, qkey)
+            .borrow()
+            .sq_wqe(&ah)
+            .expect("sq_wqe failed")
+            .send(TxFlags::empty())
+            .expect("send failed")
             .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-            .finish_with_blueflame();
+            .finish_signaled_with_blueflame(i as u64)
+            .expect("finish failed");
+        sender.borrow().ring_sq_doorbell();
 
         let _ = poll_cq_timeout(&send_cq, 5000).expect("Send CQE timeout");
         send_cq.flush();
@@ -1452,11 +1457,12 @@ fn test_rc_inline_wraparound() {
         // Post SEND with inline data
         let handle = qp1
             .borrow_mut()
-            .wqe_builder(i as u64)
-            .expect("wqe_builder failed")
-            .ctrl_send(WqeFlags::COMPLETION)
-            .inline_data(&test_data)
-            .finish_with_blueflame()
+            .sq_wqe()
+            .expect("sq_wqe failed")
+            .send(TxFlags::empty())
+            .expect("send failed")
+            .inline(&test_data)
+            .finish_signaled_with_blueflame(i as u64)
             .expect("finish failed");
 
         // Detect wrap-around: wqe_idx decreased or jumped significantly
@@ -1609,11 +1615,12 @@ fn test_rc_inline_variable_size_wraparound() {
 
         // Post SEND with inline data
         qp1.borrow_mut()
-            .wqe_builder(i as u64)
-            .expect("wqe_builder failed")
-            .ctrl_send(WqeFlags::COMPLETION)
-            .inline_data(&test_data)
-            .finish_with_blueflame()
+            .sq_wqe()
+            .expect("sq_wqe failed")
+            .send(TxFlags::empty())
+            .expect("send failed")
+            .inline(&test_data)
+            .finish_signaled_with_blueflame(i as u64)
             .expect("finish failed");
 
         // Poll CQs

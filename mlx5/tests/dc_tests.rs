@@ -20,7 +20,7 @@ use std::rc::Rc;
 
 use mlx5::dc::{DciConfig, DctConfig};
 use mlx5::srq::SrqConfig;
-use mlx5::wqe::{WqeFlags, WqeOpcode};
+use mlx5::wqe::{TxFlags, WqeFlags, WqeOpcode};
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
@@ -170,13 +170,14 @@ fn test_dc_rdma_write() {
 
     // Post RDMA WRITE via DCI
     dci.borrow_mut()
-        .wqe_builder(1u64)
-        .expect("wqe_builder failed")
-        .ctrl_rdma_write(WqeFlags::empty())
-        .av(dc_key, dctn, dlid)
-        .rdma(remote_buf.addr(), remote_mr.rkey())
+        .sq_wqe(dc_key, dctn, dlid)
+        .expect("sq_wqe failed")
+        .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+        .expect("write failed")
         .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-        .finish_with_blueflame();
+        .finish_signaled_with_blueflame(1u64)
+        .expect("finish failed");
+    dci.borrow().ring_sq_doorbell();
 
     // Poll CQ
     let cqe = poll_cq_timeout(&dci_cq, 5000).expect("CQE timeout");
@@ -274,13 +275,14 @@ fn test_dc_rdma_read() {
 
     // Post RDMA READ via DCI
     dci.borrow_mut()
-        .wqe_builder(1u64)
-        .expect("wqe_builder failed")
-        .ctrl_rdma_read(WqeFlags::empty())
-        .av(dc_key, dctn, dlid)
-        .rdma(remote_buf.addr(), remote_mr.rkey())
+        .sq_wqe(dc_key, dctn, dlid)
+        .expect("sq_wqe failed")
+        .read(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+        .expect("read failed")
         .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-        .finish_with_blueflame();
+        .finish_signaled_with_blueflame(1u64)
+        .expect("finish failed");
+    dci.borrow().ring_sq_doorbell();
 
     // Poll CQ
     let cqe = poll_cq_timeout(&dci_cq, 5000).expect("CQE timeout");
@@ -382,17 +384,18 @@ fn test_dc_multiple_dci() {
         local_bufs[i].fill_bytes(test_data.as_bytes());
 
         dci.borrow_mut()
-            .wqe_builder((i + 1) as u64)
-            .expect("wqe_builder failed")
-            .ctrl_rdma_write(WqeFlags::empty())
-            .av(dc_key, dctn, dlid)
-            .rdma(remote_buf.addr() + offset as u64, remote_mr.rkey())
+            .sq_wqe(dc_key, dctn, dlid)
+            .expect("sq_wqe failed")
+            .write(TxFlags::empty(), remote_buf.addr() + offset as u64, remote_mr.rkey())
+            .expect("write failed")
             .sge(
                 local_bufs[i].addr(),
                 test_data.len() as u32,
                 local_mrs[i].lkey(),
             )
-            .finish_with_blueflame();
+            .finish_signaled_with_blueflame((i + 1) as u64)
+            .expect("finish failed");
+        dci.borrow().ring_sq_doorbell();
 
         // Poll for this DCI's completion
         let cqe = poll_cq_timeout(&dci_cq, 5000).expect(&format!("CQE timeout for DCI {}", i));
@@ -486,14 +489,14 @@ fn test_dc_inline_data() {
     let test_data = b"DC inline_data test!";
 
     dci.borrow_mut()
-        .wqe_builder(1u64)
-        .expect("wqe_builder failed")
-        .ctrl_rdma_write(WqeFlags::COMPLETION)
-        .av(dc_key, dctn, dlid)
-        .rdma(remote_buf.addr(), remote_mr.rkey())
-        .inline_data(test_data)
-        .finish_with_blueflame()
+        .sq_wqe(dc_key, dctn, dlid)
+        .expect("sq_wqe failed")
+        .write(TxFlags::COMPLETION, remote_buf.addr(), remote_mr.rkey())
+        .expect("write failed")
+        .inline(test_data)
+        .finish_signaled_with_blueflame(1u64)
         .expect("finish failed");
+    dci.borrow().ring_sq_doorbell();
 
     let cqe = poll_cq_timeout(&dci_cq, 5000).expect("CQE timeout");
     assert_eq!(cqe.syndrome, 0, "CQE error: syndrome={}", cqe.syndrome);
@@ -579,14 +582,14 @@ fn test_dc_post_nop_to_ring_end() {
     // Post a few WQEs to advance PI
     for i in 0..3 {
         dci.borrow_mut()
-            .wqe_builder(i as u64)
-            .expect("wqe_builder failed")
-            .ctrl_rdma_write(WqeFlags::COMPLETION)
-            .av(dc_key, dctn, dlid)
-            .rdma(remote_buf.addr(), remote_mr.rkey())
+            .sq_wqe(dc_key, dctn, dlid)
+            .expect("sq_wqe failed")
+            .write(TxFlags::COMPLETION, remote_buf.addr(), remote_mr.rkey())
+            .expect("write failed")
             .sge(local_buf.addr(), 4, local_mr.lkey())
-            .finish_with_blueflame()
+            .finish_signaled_with_blueflame(i as u64)
             .expect("finish failed");
+        dci.borrow().ring_sq_doorbell();
 
         let _ = poll_cq_timeout(&dci_cq, 5000).expect("CQE timeout");
         dci_cq.flush();

@@ -25,7 +25,7 @@ use std::rc::Rc;
 
 use mlx5::cq::Cqe;
 use mlx5::qp::{RcQpConfig, RemoteQpInfo};
-use mlx5::wqe::{WqeFlags, WqeOpcode};
+use mlx5::wqe::TxFlags;
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
@@ -151,11 +151,12 @@ fn test_scatter_to_cqe_diagnostic() {
         // Post SGE-based Send on QP1
         let _ = qp1
             .borrow_mut()
-            .wqe_builder(i as u64)
-            .expect("wqe_builder failed")
-            .ctrl_send(WqeFlags::COMPLETION)
+            .sq_wqe()
+            .expect("sq_wqe failed")
+            .send(TxFlags::empty())
+            .expect("send failed")
             .sge(send_buf.addr(), size as u32, send_mr.lkey())
-            .finish();
+            .finish_signaled(i as u64);
         qp1.borrow().ring_sq_doorbell();
 
         // Wait for send completion
@@ -341,11 +342,12 @@ fn test_scatter_to_cqe_disabled() {
         // Post inline send
         let _ = qp1
             .borrow_mut()
-            .wqe_builder(i as u64)
-            .expect("wqe_builder failed")
-            .ctrl_send(WqeFlags::COMPLETION)
-            .inline_data(&test_data)
-            .finish();
+            .sq_wqe()
+            .expect("sq_wqe failed")
+            .send(TxFlags::empty())
+            .expect("send failed")
+            .inline(&test_data)
+            .finish_signaled(i as u64);
         qp1.borrow().ring_sq_doorbell();
 
         // Wait for completions
@@ -498,11 +500,12 @@ fn test_small_inline_wraparound() {
             // Post small inline send
             let _ = qp1
                 .borrow_mut()
-                .wqe_builder((size * 100 + i) as u64)
-                .expect("wqe_builder failed")
-                .ctrl_send(WqeFlags::COMPLETION)
-                .inline_data(&test_data)
-                .finish();
+                .sq_wqe()
+                .expect("sq_wqe failed")
+                .send(TxFlags::empty())
+                .expect("send failed")
+                .inline(&test_data)
+                .finish_signaled((size * 100 + i) as u64);
             qp1.borrow().ring_sq_doorbell();
 
             let slots_after = qp1.borrow().slots_to_ring_end();

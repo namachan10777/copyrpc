@@ -19,7 +19,7 @@ use std::rc::Rc;
 
 use mlx5::pd::RemoteUdQpInfo;
 use mlx5::ud::{UdQpConfig, UdQpState};
-use mlx5::wqe::{WqeFlags, WqeOpcode};
+use mlx5::wqe::{TxFlags, WqeFlags, WqeOpcode};
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
@@ -193,13 +193,15 @@ fn test_ud_send_recv() {
 
     // Post UD SEND
     sender
-        .borrow_mut()
-        .wqe_builder(1u64)
-        .expect("wqe_builder failed")
-        .ctrl_send(WqeFlags::empty())
-        .ud_av(&ah, qkey)
+        .borrow()
+        .sq_wqe(&ah)
+        .expect("sq_wqe failed")
+        .send(TxFlags::empty())
+        .expect("send failed")
         .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-        .finish_with_blueflame();
+        .finish_signaled_with_blueflame(1u64)
+        .expect("finish failed");
+    sender.borrow().ring_sq_doorbell();
 
     // Poll send CQ
     let send_cqe = poll_cq_timeout(&send_cq, 5000).expect("Send CQE timeout");
@@ -318,19 +320,28 @@ fn test_ud_send_raw_av() {
     let test_data = b"UD SEND with raw AV - direct addressing!";
     send_buf.fill_bytes(test_data);
 
-    // Use raw AV (without creating ibv_ah)
-    let remote_qpn = receiver.borrow().qpn();
-    let dlid = ctx.port_attr.lid;
+    // Create Address Handle for receiver
+    let remote_info = RemoteUdQpInfo {
+        qpn: receiver.borrow().qpn(),
+        qkey,
+        lid: ctx.port_attr.lid,
+    };
+    let ah = ctx
+        .pd
+        .create_ah(ctx.port, &remote_info)
+        .expect("Failed to create AH");
 
-    // Post UD SEND with raw AV
+    // Post UD SEND with new API
     sender
-        .borrow_mut()
-        .wqe_builder(1u64)
-        .expect("wqe_builder failed")
-        .ctrl_send(WqeFlags::empty())
-        .ud_av_raw(remote_qpn, qkey, dlid)
+        .borrow()
+        .sq_wqe(&ah)
+        .expect("sq_wqe failed")
+        .send(TxFlags::empty())
+        .expect("send failed")
         .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-        .finish_with_blueflame();
+        .finish_signaled_with_blueflame(1u64)
+        .expect("finish failed");
+    sender.borrow().ring_sq_doorbell();
 
     // Poll send CQ
     let send_cqe = poll_cq_timeout(&send_cq, 5000).expect("Send CQE timeout");
@@ -464,13 +475,15 @@ fn test_ud_multiple_destinations() {
             .expect("Failed to create AH");
 
         sender
-            .borrow_mut()
-            .wqe_builder((i + 1) as u64)
-            .expect("wqe_builder failed")
-            .ctrl_send(WqeFlags::empty())
-            .ud_av(&ah, qkey)
+            .borrow()
+            .sq_wqe(&ah)
+            .expect("sq_wqe failed")
+            .send(TxFlags::empty())
+            .expect("send failed")
             .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-            .finish_with_blueflame();
+            .finish_signaled_with_blueflame((i + 1) as u64)
+            .expect("finish failed");
+        sender.borrow().ring_sq_doorbell();
 
         // Poll send CQ
         let send_cqe =
@@ -602,14 +615,15 @@ fn test_ud_post_nop_to_ring_end() {
         receiver.borrow().ring_rq_doorbell();
 
         sender
-            .borrow_mut()
-            .wqe_builder(i as u64)
-            .expect("wqe_builder failed")
-            .ctrl_send(WqeFlags::COMPLETION)
-            .ud_av(&ah, qkey)
+            .borrow()
+            .sq_wqe(&ah)
+            .expect("sq_wqe failed")
+            .send(TxFlags::COMPLETION)
+            .expect("send failed")
             .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-            .finish_with_blueflame()
+            .finish_signaled_with_blueflame(i as u64)
             .expect("finish failed");
+        sender.borrow().ring_sq_doorbell();
 
         let _ = poll_cq_timeout(&send_cq, 5000).expect("Send CQE timeout");
         send_cq.flush();

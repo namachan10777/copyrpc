@@ -517,7 +517,7 @@ fn test_qp_destroy_after_data_transfer() {
 /// This mimics the benchmark's behavior more closely.
 #[test]
 fn test_qp_destroy_after_actual_send_recv() {
-    use mlx5::wqe::{WqeFlags, WqeOpcode};
+    use mlx5::wqe::TxFlags;
     use std::cell::Cell;
     use std::sync::{
         Arc,
@@ -635,11 +635,14 @@ fn test_qp_destroy_after_actual_send_recv() {
                 let idx = (recv_count as usize - 1) % 32;
                 let offset = (idx * 64) as u64;
 
-                let _ = qp.borrow_mut().wqe_builder(idx as u64).map(|b| {
-                    b.ctrl_send(WqeFlags::empty())
-                        .sge(buf.addr() + offset, 32, mr.lkey())
-                        .finish_with_blueflame()
-                });
+                let _ = qp
+                    .borrow_mut()
+                    .sq_wqe()
+                    .and_then(|b| b.send(TxFlags::empty()))
+                    .map(|b| {
+                        b.sge(buf.addr() + offset, 32, mr.lkey())
+                            .finish_signaled_with_blueflame(idx as u64)
+                    });
 
                 // Repost recv
                 let _ = qp
@@ -752,14 +755,17 @@ fn test_qp_destroy_after_actual_send_recv() {
     // Initial burst of 32 SENDs
     for i in 0..32.min(target) as usize {
         let offset = (i * 64) as u64;
-        let _ = qp.borrow_mut().wqe_builder(i as u64).map(|b| {
-            b.ctrl_send(WqeFlags::empty())
-                .sge(buf.addr() + offset, 32, mr.lkey())
-                .finish()
-        });
+        let _ = qp
+            .borrow_mut()
+            .sq_wqe()
+            .and_then(|b| b.send(TxFlags::empty()))
+            .map(|b| {
+                b.sge(buf.addr() + offset, 32, mr.lkey())
+                    .finish_signaled(i as u64)
+            });
         sent += 1;
     }
-    qp.borrow_mut().ring_sq_doorbell();
+    qp.borrow().ring_sq_doorbell();
 
     // Ping-pong loop
     while received < target {
@@ -792,11 +798,14 @@ fn test_qp_destroy_after_actual_send_recv() {
 
             // Send more if needed
             if sent < target {
-                let _ = qp.borrow_mut().wqe_builder(idx as u64).map(|b| {
-                    b.ctrl_send(WqeFlags::empty())
-                        .sge(buf.addr() + offset, 32, mr.lkey())
-                        .finish_with_blueflame()
-                });
+                let _ = qp
+                    .borrow_mut()
+                    .sq_wqe()
+                    .and_then(|b| b.send(TxFlags::empty()))
+                    .map(|b| {
+                        b.sge(buf.addr() + offset, 32, mr.lkey())
+                            .finish_signaled_with_blueflame(idx as u64)
+                    });
                 sent += 1;
             }
         }

@@ -966,3 +966,301 @@ where
         }
     }
 }
+
+// =============================================================================
+// New Trait-Based WQE Builder API
+// =============================================================================
+
+use crate::wqe::{
+    RqWqeBuilder as RqWqeBuilderTrait, TmCmdWqeBuilder,
+    TmTagAddWqeBuilder, TmTagDelWqeBuilder,
+};
+
+// =============================================================================
+// TM Command Queue Builder Implementations
+// =============================================================================
+
+/// TM-SRQ Command Queue entry point builder (internal).
+#[must_use = "WQE builder must be finished"]
+pub(crate) struct TmCmdEntryPointImpl<'a, Entry> {
+    cmd_qp: &'a CmdQpState<Entry, OrderedWqeTable<Entry>>,
+    wqe_ptr: *mut u8,
+    wqe_idx: u16,
+    entry: Entry,
+}
+
+impl<'a, Entry> TmCmdWqeBuilder<'a, Entry> for TmCmdEntryPointImpl<'a, Entry> {
+    #[inline]
+    fn tag_add(self, index: u16, tag: u64) -> impl TmTagAddWqeBuilder<'a, Entry> + 'a {
+        // Write control segment with TM opcode
+        const CQ_UPDATE: u8 = 0x08;
+        unsafe {
+            CtrlSeg::write(
+                self.wqe_ptr,
+                0,
+                WqeOpcode::TagMatching as u8,
+                self.wqe_idx,
+                self.cmd_qp.qpn,
+                0,
+                CQ_UPDATE,
+                0,
+            );
+        }
+
+        TmTagAddWqeBuilderImpl {
+            cmd_qp: self.cmd_qp,
+            wqe_ptr: self.wqe_ptr,
+            wqe_idx: self.wqe_idx,
+            entry: self.entry,
+            index,
+            tag,
+            has_data: false,
+        }
+    }
+
+    #[inline]
+    fn tag_del(self, index: u16) -> impl TmTagDelWqeBuilder<'a, Entry> + 'a {
+        // Write control segment with TM opcode
+        const CQ_UPDATE: u8 = 0x08;
+        unsafe {
+            CtrlSeg::write(
+                self.wqe_ptr,
+                0,
+                WqeOpcode::TagMatching as u8,
+                self.wqe_idx,
+                self.cmd_qp.qpn,
+                0,
+                CQ_UPDATE,
+                0,
+            );
+
+            // Write TM segment for deletion
+            TmSeg::write_del(self.wqe_ptr.add(CtrlSeg::SIZE), index, false);
+        }
+
+        TmTagDelWqeBuilderImpl {
+            cmd_qp: self.cmd_qp,
+            wqe_ptr: self.wqe_ptr,
+            wqe_idx: self.wqe_idx,
+            entry: self.entry,
+            index,
+        }
+    }
+}
+
+/// TM Tag Add WQE builder (internal).
+#[must_use = "WQE builder must be finished"]
+pub(crate) struct TmTagAddWqeBuilderImpl<'a, Entry> {
+    cmd_qp: &'a CmdQpState<Entry, OrderedWqeTable<Entry>>,
+    wqe_ptr: *mut u8,
+    wqe_idx: u16,
+    #[allow(dead_code)]
+    entry: Entry,  // Preserved for future signaled-at-construction pattern
+    index: u16,
+    tag: u64,
+    has_data: bool,
+}
+
+impl<'a, Entry> TmTagAddWqeBuilder<'a, Entry> for TmTagAddWqeBuilderImpl<'a, Entry> {
+    #[inline]
+    fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
+        if !self.has_data {
+            let offset = CtrlSeg::SIZE;
+            unsafe {
+                // Write TM segment for add (not signaled initially)
+                TmSeg::write_add(
+                    self.wqe_ptr.add(offset),
+                    self.index,
+                    self.index,
+                    self.tag,
+                    !0u64,
+                    false,
+                );
+
+                // Write data segment
+                DataSeg::write(self.wqe_ptr.add(offset + TmSeg::SIZE), len, lkey, addr);
+            }
+            self.has_data = true;
+        }
+        // Note: TM Tag Add only supports one data segment
+        self
+    }
+
+    #[inline]
+    fn inline(self, _data: &[u8]) -> Self {
+        // TM Tag Add doesn't support inline data
+        self
+    }
+
+    #[inline]
+    fn finish_unsignaled(self) -> WqeHandle {
+        let ds_count = 1 + 2 + 1; // Ctrl(1) + TmSeg(2) + DataSeg(1)
+        let offset = CtrlSeg::SIZE + TmSeg::SIZE + DataSeg::SIZE;
+
+        unsafe {
+            std::ptr::write_volatile(self.wqe_ptr.add(7), ds_count);
+        }
+        self.cmd_qp.advance_pi(1);
+        self.cmd_qp.set_last_wqe(self.wqe_ptr, offset);
+
+        WqeHandle {
+            wqe_idx: self.wqe_idx,
+            size: offset,
+        }
+    }
+
+    #[inline]
+    fn finish_signaled(self, entry: Entry) -> WqeHandle {
+        let ds_count = 1 + 2 + 1; // Ctrl(1) + TmSeg(2) + DataSeg(1)
+        let offset = CtrlSeg::SIZE + TmSeg::SIZE + DataSeg::SIZE;
+
+        // Re-write TM segment with signaled flag
+        unsafe {
+            TmSeg::write_add(
+                self.wqe_ptr.add(CtrlSeg::SIZE),
+                self.index,
+                self.index,
+                self.tag,
+                !0u64,
+                true,
+            );
+        }
+        let ci_delta = self.cmd_qp.pi.get().wrapping_add(1);
+        self.cmd_qp.table.store(self.wqe_idx, entry, ci_delta);
+
+        unsafe {
+            std::ptr::write_volatile(self.wqe_ptr.add(7), ds_count);
+        }
+        self.cmd_qp.advance_pi(1);
+        self.cmd_qp.set_last_wqe(self.wqe_ptr, offset);
+
+        WqeHandle {
+            wqe_idx: self.wqe_idx,
+            size: offset,
+        }
+    }
+}
+
+/// TM Tag Del WQE builder (internal).
+#[must_use = "WQE builder must be finished"]
+pub(crate) struct TmTagDelWqeBuilderImpl<'a, Entry> {
+    cmd_qp: &'a CmdQpState<Entry, OrderedWqeTable<Entry>>,
+    wqe_ptr: *mut u8,
+    wqe_idx: u16,
+    #[allow(dead_code)]
+    entry: Entry,  // Preserved for future signaled-at-construction pattern
+    index: u16,
+}
+
+impl<'a, Entry> TmTagDelWqeBuilder<'a, Entry> for TmTagDelWqeBuilderImpl<'a, Entry> {
+    #[inline]
+    fn finish_unsignaled(self) -> WqeHandle {
+        let ds_count = 1 + 2; // Ctrl(1) + TmSeg(2)
+        let offset = CtrlSeg::SIZE + TmSeg::SIZE;
+
+        unsafe {
+            std::ptr::write_volatile(self.wqe_ptr.add(7), ds_count);
+        }
+        self.cmd_qp.advance_pi(1);
+        self.cmd_qp.set_last_wqe(self.wqe_ptr, offset);
+
+        WqeHandle {
+            wqe_idx: self.wqe_idx,
+            size: offset,
+        }
+    }
+
+    #[inline]
+    fn finish_signaled(self, entry: Entry) -> WqeHandle {
+        let ds_count = 1 + 2; // Ctrl(1) + TmSeg(2)
+        let offset = CtrlSeg::SIZE + TmSeg::SIZE;
+
+        // Re-write TM segment with signaled flag
+        unsafe {
+            TmSeg::write_del(self.wqe_ptr.add(CtrlSeg::SIZE), self.index, true);
+        }
+        let ci_delta = self.cmd_qp.pi.get().wrapping_add(1);
+        self.cmd_qp.table.store(self.wqe_idx, entry, ci_delta);
+
+        unsafe {
+            std::ptr::write_volatile(self.wqe_ptr.add(7), ds_count);
+        }
+        self.cmd_qp.advance_pi(1);
+        self.cmd_qp.set_last_wqe(self.wqe_ptr, offset);
+
+        WqeHandle {
+            wqe_idx: self.wqe_idx,
+            size: offset,
+        }
+    }
+}
+
+// =============================================================================
+// TM RQ WQE Builder Implementation
+// =============================================================================
+
+impl<'a, U> RqWqeBuilderTrait<'a, U> for RqWqeBuilder<'a, U> {
+    #[inline]
+    fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
+        // Call data_seg which handles WQEBB extension
+        // Since data_seg returns io::Result, we need to handle it
+        // For the trait implementation, we panic on error (design limitation)
+        self.data_seg(addr, len, lkey)
+            .expect("RQ full during sge")
+    }
+
+    #[inline]
+    fn finish(self) {
+        // Delegate to existing finish
+        RqWqeBuilder::finish(self)
+    }
+}
+
+// =============================================================================
+// New API Entry Points for TM-SRQ
+// =============================================================================
+
+impl<T, U, F> TmSrq<T, U, F> {
+    /// Get a Command Queue WQE builder using the new trait-based API.
+    ///
+    /// # Example
+    /// ```ignore
+    /// tm_srq.cmd_wqe(entry)
+    ///     .tag_add(index, tag)
+    ///     .sge(addr, len, lkey)
+    ///     .signal(entry)
+    ///     .finish();
+    /// tm_srq.ring_cmd_doorbell();
+    /// ```
+    #[inline]
+    pub fn cmd_wqe(&self, entry: T) -> io::Result<impl TmCmdWqeBuilder<'_, T> + '_> {
+        let cmd_qp = self.cmd_qp();
+        if !cmd_qp.table.is_available(cmd_qp.pi.get()) {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Command QP full"));
+        }
+
+        let wqe_idx = cmd_qp.pi.get();
+        let wqe_ptr = cmd_qp.get_wqe_ptr(wqe_idx);
+
+        Ok(TmCmdEntryPointImpl {
+            cmd_qp,
+            wqe_ptr,
+            wqe_idx,
+            entry,
+        })
+    }
+
+    /// Get a RQ WQE builder using the new trait-based API.
+    ///
+    /// # Example
+    /// ```ignore
+    /// tm_srq.rq_wqe(entry)
+    ///     .sge(addr, len, lkey)
+    ///     .finish();
+    /// tm_srq.ring_srq_doorbell();
+    /// ```
+    #[inline]
+    pub fn rq_wqe(&self, entry: U) -> io::Result<impl RqWqeBuilderTrait<'_, U> + '_> {
+        self.rq_wqe_builder(entry)
+    }
+}

@@ -17,7 +17,7 @@ use std::rc::Rc;
 
 use mlx5::dc::{DciConfig, DctConfig};
 use mlx5::srq::SrqConfig;
-use mlx5::wqe::{WqeFlags, WqeOpcode};
+use mlx5::wqe::{TxFlags, WqeFlags, WqeOpcode};
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
@@ -210,12 +210,14 @@ fn test_srq_with_dct_send() {
 
     // Post DC SEND
     dci.borrow_mut()
-        .wqe_builder(1u64)
-        .expect("wqe_builder failed")
-        .ctrl_send(WqeFlags::empty())
-        .av(dc_key, dctn, dlid)
+        .sq_wqe(dc_key, dctn, dlid)
+        .expect("sq_wqe failed")
+        .send(TxFlags::empty())
+        .expect("send failed")
         .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-        .finish_with_blueflame();
+        .finish_signaled_with_blueflame(1u64)
+        .expect("finish failed");
+    dci.borrow().ring_sq_doorbell();
 
     // Poll DCI CQ for send completion
     let send_cqe = poll_cq_timeout(&dci_cq, 5000).expect("Send CQE timeout");
@@ -348,12 +350,14 @@ fn test_srq_shared_by_multiple_dcts() {
         send_buf.fill_bytes(test_data.as_bytes());
 
         dci.borrow_mut()
-            .wqe_builder((i + 1) as u64)
-            .expect("wqe_builder failed")
-            .ctrl_send(WqeFlags::empty())
-            .av(dct.dc_key(), dct.dctn(), dlid)
+            .sq_wqe(dct.dc_key(), dct.dctn(), dlid)
+            .expect("sq_wqe failed")
+            .send(TxFlags::empty())
+            .expect("send failed")
             .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-            .finish_with_blueflame();
+            .finish_signaled_with_blueflame((i + 1) as u64)
+            .expect("finish failed");
+        dci.borrow().ring_sq_doorbell();
 
         // Poll send completion
         let send_cqe =

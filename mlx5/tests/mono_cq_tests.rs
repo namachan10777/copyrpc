@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use mlx5::cq::Cqe;
 use mlx5::qp::{RcQpConfig, RcQpForMonoCq, RemoteQpInfo};
-use mlx5::wqe::WqeFlags;
+use mlx5::wqe::TxFlags;
 
 use common::{AlignedBuffer, TestContext, full_access};
 
@@ -148,12 +148,12 @@ fn test_mono_cq_with_rc_qp() {
 
     // Post RDMA WRITE with entry = 42
     qp1.borrow_mut()
-        .wqe_builder(42u64)
-        .expect("wqe_builder failed")
-        .ctrl_rdma_write(WqeFlags::COMPLETION)
-        .rdma(remote_buf.addr(), remote_mr.rkey())
+        .sq_wqe()
+        .expect("sq_wqe failed")
+        .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+        .expect("write failed")
         .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-        .finish_with_blueflame()
+        .finish_signaled_with_blueflame(42u64)
         .expect("finish_with_blueflame failed");
 
     // Poll for completion
@@ -322,12 +322,12 @@ fn test_mono_cq_multiple_completions() {
     let num_ops = 5;
     for i in 0..num_ops {
         qp1.borrow_mut()
-            .wqe_builder(100 + i as u64)
-            .expect("wqe_builder failed")
-            .ctrl_rdma_write(WqeFlags::COMPLETION)
-            .rdma(remote_buf.addr(), remote_mr.rkey())
+            .sq_wqe()
+            .expect("sq_wqe failed")
+            .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+            .expect("write failed")
             .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-            .finish_with_blueflame()
+            .finish_signaled_with_blueflame(100 + i as u64)
             .expect("finish_with_blueflame failed");
     }
 
@@ -474,12 +474,12 @@ fn test_mono_cq_high_load() {
     for i in 0..num_ops {
         let offset = (i as u64) * (chunk_size as u64);
         qp1.borrow_mut()
-            .wqe_builder(i as u64)
-            .expect("wqe_builder failed")
-            .ctrl_rdma_write(WqeFlags::COMPLETION)
-            .rdma(remote_buf.addr() + offset, remote_mr.rkey())
+            .sq_wqe()
+            .expect("sq_wqe failed")
+            .write(TxFlags::empty(), remote_buf.addr() + offset, remote_mr.rkey())
+            .expect("write failed")
             .sge(local_buf.addr() + offset, chunk_size, local_mr.lkey())
-            .finish_with_blueflame()
+            .finish_signaled_with_blueflame(i as u64)
             .expect("finish_with_blueflame failed");
     }
 
@@ -633,12 +633,12 @@ fn test_mono_cq_recv_rdma_write_imm() {
         let offset = (i * 64) as u64;
         let imm_data = (i + 100) as u32;
         qp2.borrow_mut()
-            .wqe_builder(i as u64)
-            .expect("wqe_builder failed")
-            .ctrl_rdma_write_imm(WqeFlags::COMPLETION, imm_data)
-            .rdma(recv_buf.addr() + offset, recv_mr.rkey())
+            .sq_wqe()
+            .expect("sq_wqe failed")
+            .write_imm(TxFlags::empty(), recv_buf.addr() + offset, recv_mr.rkey(), imm_data)
+            .expect("write_imm failed")
             .sge(send_buf.addr() + offset, 64, send_mr.lkey())
-            .finish_with_blueflame()
+            .finish_signaled_with_blueflame(i as u64)
             .expect("finish_with_blueflame failed");
     }
 
@@ -823,12 +823,12 @@ fn test_mono_cq_bidirectional_pingpong() {
 
         // QP1 -> QP2
         qp1.borrow_mut()
-            .wqe_builder(i as u64)
-            .expect("wqe_builder")
-            .ctrl_rdma_write_imm(WqeFlags::COMPLETION, imm)
-            .rdma(buf2.addr() + offset, mr2.rkey())
+            .sq_wqe()
+            .expect("sq_wqe")
+            .write_imm(TxFlags::empty(), buf2.addr() + offset, mr2.rkey(), imm)
+            .expect("write_imm")
             .sge(buf1.addr() + offset, msg_size, mr1.lkey())
-            .finish_with_blueflame()
+            .finish_signaled_with_blueflame(i as u64)
             .expect("finish");
 
         // Wait for QP2 to receive
@@ -847,12 +847,12 @@ fn test_mono_cq_bidirectional_pingpong() {
 
         // QP2 -> QP1
         qp2.borrow_mut()
-            .wqe_builder(i as u64)
-            .expect("wqe_builder")
-            .ctrl_rdma_write_imm(WqeFlags::COMPLETION, imm)
-            .rdma(buf1.addr() + offset, mr1.rkey())
+            .sq_wqe()
+            .expect("sq_wqe")
+            .write_imm(TxFlags::empty(), buf1.addr() + offset, mr1.rkey(), imm)
+            .expect("write_imm")
             .sge(buf2.addr() + offset, msg_size, mr2.lkey())
-            .finish_with_blueflame()
+            .finish_signaled_with_blueflame(i as u64)
             .expect("finish");
 
         // Wait for QP1 to receive
@@ -987,16 +987,16 @@ fn test_mono_cq_wraparound() {
     while submitted < num_operations as u64 {
         // Submit a batch of operations
         {
-            let qp = qp1.borrow();
+            let mut qp = qp1.borrow_mut();
             for i in 0..batch_size.min((num_operations as u64 - submitted) as usize) {
                 let offset = (i * 32) as u64;
                 let _ = qp
-                    .wqe_builder(submitted + i as u64)
+                    .sq_wqe()
                     .unwrap()
-                    .ctrl_rdma_write(WqeFlags::COMPLETION)
-                    .rdma(buf.addr() + offset, mr.lkey())
+                    .write(TxFlags::empty(), buf.addr() + offset, mr.lkey())
+                    .unwrap()
                     .sge(buf.addr() + offset, 32, mr.lkey())
-                    .finish();
+                    .finish_signaled(submitted + i as u64);
             }
             qp.ring_sq_doorbell();
         }

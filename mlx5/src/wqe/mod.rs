@@ -2,6 +2,23 @@
 //!
 //! Provides segment definitions, opcodes, WQE table, and traits shared across QP types.
 
+pub mod traits;
+
+pub use traits::{
+    // Transport type tags
+    InfiniBand, RoCE,
+    // Address Vector trait and types
+    Av, NoAv,
+    // Flags
+    TxFlags,
+    // Data state marker (NoData)
+    NoData,
+    // RQ builder traits
+    RqWqeBuilder, SrqRqWqeBuilder,
+    // TM-SRQ builder traits
+    TmCmdWqeBuilder, TmTagAddWqeBuilder, TmTagDelWqeBuilder,
+};
+
 use bitflags::bitflags;
 
 use crate::types::GrhAttr;
@@ -71,6 +88,18 @@ impl CtrlSeg {
         // Layout: [0][wqe_idx_hi][wqe_idx_lo][opcode]
         std::ptr::write_volatile(ptr.add(1), (wqe_idx >> 8) as u8);
         std::ptr::write_volatile(ptr.add(2), wqe_idx as u8);
+    }
+
+    /// Set the completion flag (CQE generation) in the control segment.
+    ///
+    /// # Safety
+    /// The pointer must point to a valid control segment.
+    #[inline]
+    pub unsafe fn set_completion_flag(ptr: *mut u8) {
+        // fm_ce_se is stored at byte 11 (DWORD 2, last byte)
+        // WqeFlags::COMPLETION = 0x08
+        let current = std::ptr::read_volatile(ptr.add(11));
+        std::ptr::write_volatile(ptr.add(11), current | 0x08);
     }
 }
 

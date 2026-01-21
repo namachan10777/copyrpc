@@ -17,8 +17,9 @@ use crate::srq::Srq;
 use crate::transport::IbRemoteDctInfo;
 use crate::types::GrhAttr;
 use crate::wqe::{
-    AddressVector, CtrlSeg, DataSeg, DcNeedsAv, HasData, InlineHeader, Init, NeedsData, NeedsRdma,
-    OrderedWqeTable, RdmaSeg, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
+    AddressVector, CtrlSeg, DataSeg, DcNeedsAv, HasData, InfiniBand, InlineHeader, Init, NeedsData,
+    NeedsRdma, NoData, OrderedWqeTable, RdmaSeg, RoCE, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode,
+    calc_wqebb_cnt,
 };
 
 /// DCI configuration.
@@ -79,6 +80,8 @@ struct DciSendQueueState<Entry, TableType> {
     buf: *mut u8,
     wqe_cnt: u16,
     sqn: u32,
+    /// Maximum inline data size (from DCI config)
+    max_inline_data: u32,
     pi: Cell<u16>,
     ci: Cell<u16>,
     last_wqe: Cell<Option<(*mut u8, usize)>>,
@@ -95,6 +98,10 @@ struct DciSendQueueState<Entry, TableType> {
 impl<Entry, TableType> DciSendQueueState<Entry, TableType> {
     fn available(&self) -> u16 {
         self.wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
+    }
+
+    fn max_inline_data(&self) -> u32 {
+        self.max_inline_data
     }
 
     fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
@@ -759,8 +766,14 @@ impl<'a, Entry> DciPublicWqeBuilder<'a, Entry, HasData> {
 // DCI
 // =============================================================================
 
-/// Type alias for DCI with ordered WQE table.
-pub type DciWithTable<Entry, OnComplete> = Dci<Entry, OrderedWqeTable<Entry>, OnComplete>;
+/// Type alias for DCI with ordered WQE table (InfiniBand transport).
+pub type DciWithTable<Entry, OnComplete> = Dci<Entry, InfiniBand, OrderedWqeTable<Entry>, OnComplete>;
+
+/// Type alias for DCI with ordered WQE table (InfiniBand transport).
+pub type DciIb<Entry, OnComplete> = Dci<Entry, InfiniBand, OrderedWqeTable<Entry>, OnComplete>;
+
+/// Type alias for DCI with ordered WQE table (RoCE transport).
+pub type DciRoCE<Entry, OnComplete> = Dci<Entry, RoCE, OrderedWqeTable<Entry>, OnComplete>;
 
 /// DC Initiator (DCI).
 ///
@@ -770,17 +783,22 @@ pub type DciWithTable<Entry, OnComplete> = Dci<Entry, OrderedWqeTable<Entry>, On
 /// Type parameter `Entry` is the entry type stored in the WQE table for tracking
 /// in-flight operations. When a completion arrives, the associated entry is
 /// returned via the callback.
+/// Type parameter `Transport` determines InfiniBand vs RoCE transport.
 /// Type parameter `TableType` determines sparse vs dense table behavior.
 /// Type parameter `OnComplete` is the completion callback type.
-pub struct Dci<Entry, TableType, OnComplete> {
+pub struct Dci<Entry, Transport, TableType, OnComplete> {
     qp: NonNull<mlx5_sys::ibv_qp>,
     state: Cell<DcQpState>,
+    /// Maximum inline data size (from DCI config)
+    max_inline_data: u32,
     sq: Option<DciSendQueueState<Entry, TableType>>,
     callback: OnComplete,
     /// Weak reference to the CQ for unregistration on drop
     send_cq: Weak<CompletionQueue>,
     /// Keep the PD alive while this DCI exists.
     _pd: Pd,
+    /// Phantom data for transport type parameter
+    _transport: PhantomData<Transport>,
 }
 
 impl Context {
@@ -865,10 +883,12 @@ impl Context {
             let mut result = Dci {
                 qp,
                 state: Cell::new(DcQpState::Reset),
+                max_inline_data: config.max_inline_data,
                 sq: None,
                 callback,
                 send_cq: Rc::downgrade(send_cq),
                 _pd: pd.clone(),
+                _transport: PhantomData,
             };
 
             // Auto-initialize direct access
@@ -879,7 +899,7 @@ impl Context {
     }
 }
 
-impl<Entry, TableType, OnComplete> Drop for Dci<Entry, TableType, OnComplete> {
+impl<Entry, Transport, TableType, OnComplete> Drop for Dci<Entry, Transport, TableType, OnComplete> {
     fn drop(&mut self) {
         // Unregister from CQ before destroying QP
         if let Some(cq) = self.send_cq.upgrade() {
@@ -891,7 +911,7 @@ impl<Entry, TableType, OnComplete> Drop for Dci<Entry, TableType, OnComplete> {
     }
 }
 
-impl<Entry, TableType, OnComplete> Dci<Entry, TableType, OnComplete> {
+impl<Entry, Transport, TableType, OnComplete> Dci<Entry, Transport, TableType, OnComplete> {
     /// Get the QP number.
     pub fn qpn(&self) -> u32 {
         unsafe { (*self.qp.as_ptr()).qp_num }
@@ -1111,6 +1131,7 @@ impl<Entry, OnComplete> DciWithTable<Entry, OnComplete> {
             buf: info.sq_buf,
             wqe_cnt,
             sqn: info.sqn,
+            max_inline_data: self.max_inline_data,
             pi: Cell::new(0),
             ci: Cell::new(0),
             last_wqe: Cell::new(None),
@@ -1409,5 +1430,1099 @@ impl<T> Dct<T> {
     /// * `wqe_idx` - WQE index from the CQE (wqe_counter field)
     pub fn process_recv_completion(&self, wqe_idx: u16) -> Option<T> {
         self.srq.process_recv_completion(wqe_idx)
+    }
+}
+
+// =============================================================================
+// Simplified WQE Builder API
+// =============================================================================
+
+use crate::wqe::{
+    AtomicSeg,
+    // Flags
+    TxFlags,
+};
+
+// =============================================================================
+// Maximum WQEBB Calculation Functions for DCI
+// =============================================================================
+
+/// Calculate the padded inline data size (16-byte aligned).
+///
+/// inline_padded = ((4 + max_inline_data + 15) & !15)
+#[inline]
+fn calc_inline_padded(max_inline_data: u32) -> usize {
+    ((4 + max_inline_data as usize) + 15) & !15
+}
+
+/// Calculate maximum WQEBB count for DCI SEND operation.
+///
+/// Layout: ctrl(16) + AV(48) + inline_padded
+#[inline]
+fn calc_max_wqebb_send(max_inline_data: u32) -> u16 {
+    let size = CtrlSeg::SIZE + AddressVector::SIZE + calc_inline_padded(max_inline_data);
+    calc_wqebb_cnt(size)
+}
+
+/// Calculate maximum WQEBB count for DCI WRITE operation.
+///
+/// Layout: ctrl(16) + AV(48) + rdma(16) + inline_padded
+#[inline]
+fn calc_max_wqebb_write(max_inline_data: u32) -> u16 {
+    let size = CtrlSeg::SIZE + AddressVector::SIZE + RdmaSeg::SIZE + calc_inline_padded(max_inline_data);
+    calc_wqebb_cnt(size)
+}
+
+/// Calculate maximum WQEBB count for DCI READ operation.
+///
+/// Layout: ctrl(16) + AV(48) + rdma(16) + sge(16)
+#[inline]
+fn calc_max_wqebb_read() -> u16 {
+    let size = CtrlSeg::SIZE + AddressVector::SIZE + RdmaSeg::SIZE + DataSeg::SIZE;
+    calc_wqebb_cnt(size)
+}
+
+/// Calculate maximum WQEBB count for DCI Atomic operation.
+///
+/// Layout: ctrl(16) + AV(48) + rdma(16) + atomic(16) + sge(16)
+#[inline]
+fn calc_max_wqebb_atomic() -> u16 {
+    let size = CtrlSeg::SIZE + AddressVector::SIZE + RdmaSeg::SIZE + AtomicSeg::SIZE + DataSeg::SIZE;
+    calc_wqebb_cnt(size)
+}
+
+/// Calculate maximum WQEBB count for DCI NOP operation.
+///
+/// Layout: ctrl(16) + AV(48)
+#[inline]
+fn calc_max_wqebb_nop() -> u16 {
+    let size = CtrlSeg::SIZE + AddressVector::SIZE;
+    calc_wqebb_cnt(size)
+}
+
+/// Pending AV info to be written after ctrl segment.
+enum PendingAv<'a> {
+    None,
+    Ib { dc_key: u64, dctn: u32, dlid: u16 },
+    RoCE { dc_key: u64, dctn: u32, grh: &'a GrhAttr },
+}
+
+/// Internal WQE builder core for DCI that handles direct buffer writes.
+struct DciWqeCore<'a, Entry> {
+    sq: &'a DciSendQueueState<Entry, OrderedWqeTable<Entry>>,
+    wqe_ptr: *mut u8,
+    wqe_idx: u16,
+    offset: usize,
+    ds_count: u8,
+    signaled: bool,
+    entry: Option<Entry>,
+    pending_av: PendingAv<'a>,
+}
+
+impl<'a, Entry> DciWqeCore<'a, Entry> {
+    #[inline]
+    fn new(
+        sq: &'a DciSendQueueState<Entry, OrderedWqeTable<Entry>>,
+        entry: Option<Entry>,
+    ) -> Self {
+        let wqe_idx = sq.pi.get();
+        let wqe_ptr = sq.get_wqe_ptr(wqe_idx);
+        Self {
+            sq,
+            wqe_ptr,
+            wqe_idx,
+            offset: 0,
+            ds_count: 0,
+            signaled: entry.is_some(),
+            entry,
+            pending_av: PendingAv::None,
+        }
+    }
+
+    #[inline]
+    fn available(&self) -> u16 {
+        self.sq.available()
+    }
+
+    #[inline]
+    fn max_inline_data(&self) -> u32 {
+        self.sq.max_inline_data()
+    }
+
+    /// Store AV parameters for IB transport to be written later.
+    #[inline]
+    fn set_av_ib(&mut self, dc_key: u64, dctn: u32, dlid: u16) {
+        self.pending_av = PendingAv::Ib { dc_key, dctn, dlid };
+    }
+
+    /// Store AV parameters for RoCE transport to be written later.
+    #[inline]
+    fn set_av_roce(&mut self, dc_key: u64, dctn: u32, grh: &'a GrhAttr) {
+        self.pending_av = PendingAv::RoCE { dc_key, dctn, grh };
+    }
+
+    /// Write the pending AV segment (must be called after write_ctrl).
+    #[inline]
+    fn write_pending_av(&mut self) {
+        match self.pending_av {
+            PendingAv::None => {}
+            PendingAv::Ib { dc_key, dctn, dlid } => {
+                unsafe {
+                    AddressVector::write_ib(self.wqe_ptr.add(self.offset), dc_key, dctn, dlid);
+                }
+                self.offset += AddressVector::SIZE;
+                self.ds_count += 3;
+            }
+            PendingAv::RoCE { dc_key, dctn, grh } => {
+                unsafe {
+                    AddressVector::write_roce(self.wqe_ptr.add(self.offset), dc_key, dctn, grh);
+                }
+                self.offset += AddressVector::SIZE;
+                self.ds_count += 3;
+            }
+        }
+    }
+
+    #[inline]
+    fn write_ctrl(&mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) {
+        let flags = if self.signaled {
+            flags | WqeFlags::COMPLETION
+        } else {
+            flags
+        };
+        unsafe {
+            CtrlSeg::write(
+                self.wqe_ptr,
+                0,
+                opcode as u8,
+                self.wqe_idx,
+                self.sq.sqn,
+                0,
+                flags.bits(),
+                imm,
+            );
+        }
+        self.offset = CtrlSeg::SIZE;
+        self.ds_count = 1;
+    }
+
+    #[inline]
+    fn write_av_ib(&mut self, dc_key: u64, dctn: u32, dlid: u16) {
+        unsafe {
+            AddressVector::write_ib(self.wqe_ptr.add(self.offset), dc_key, dctn, dlid);
+        }
+        self.offset += AddressVector::SIZE;
+        self.ds_count += 3;
+    }
+
+    #[inline]
+    fn write_av_roce(&mut self, dc_key: u64, dctn: u32, grh: &GrhAttr) {
+        unsafe {
+            AddressVector::write_roce(self.wqe_ptr.add(self.offset), dc_key, dctn, grh);
+        }
+        self.offset += AddressVector::SIZE;
+        self.ds_count += 3;
+    }
+
+    #[inline]
+    fn write_rdma(&mut self, addr: u64, rkey: u32) {
+        unsafe {
+            RdmaSeg::write(self.wqe_ptr.add(self.offset), addr, rkey);
+        }
+        self.offset += RdmaSeg::SIZE;
+        self.ds_count += 1;
+    }
+
+    #[inline]
+    fn write_sge(&mut self, addr: u64, len: u32, lkey: u32) {
+        unsafe {
+            DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
+        }
+        self.offset += DataSeg::SIZE;
+        self.ds_count += 1;
+    }
+
+    #[inline]
+    fn write_inline(&mut self, data: &[u8]) {
+        let padded_size = unsafe {
+            let ptr = self.wqe_ptr.add(self.offset);
+            let size = InlineHeader::write(ptr, data.len() as u32);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
+            size
+        };
+        self.offset += padded_size;
+        self.ds_count += (padded_size / 16) as u8;
+    }
+
+    #[inline]
+    fn write_atomic_cas(&mut self, swap: u64, compare: u64) {
+        unsafe {
+            AtomicSeg::write_cas(self.wqe_ptr.add(self.offset), swap, compare);
+        }
+        self.offset += AtomicSeg::SIZE;
+        self.ds_count += 1;
+    }
+
+    #[inline]
+    fn write_atomic_fa(&mut self, add_value: u64) {
+        unsafe {
+            AtomicSeg::write_fa(self.wqe_ptr.add(self.offset), add_value);
+        }
+        self.offset += AtomicSeg::SIZE;
+        self.ds_count += 1;
+    }
+
+    #[inline]
+    fn finish_internal(self) -> io::Result<WqeHandle> {
+        let wqebb_cnt = calc_wqebb_cnt(self.offset);
+        let slots_to_end = self.sq.slots_to_end();
+
+        if wqebb_cnt > slots_to_end && slots_to_end < self.sq.wqe_cnt {
+            return self.finish_with_wrap_around(wqebb_cnt, slots_to_end);
+        }
+
+        unsafe {
+            CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
+            // Set completion flag if signaled (may not have been set at write_ctrl time)
+            if self.signaled {
+                CtrlSeg::set_completion_flag(self.wqe_ptr);
+            }
+        }
+
+        let wqe_idx = self.wqe_idx;
+        self.sq.advance_pi(wqebb_cnt);
+        self.sq.set_last_wqe(self.wqe_ptr, self.offset);
+
+        if let Some(entry) = self.entry {
+            self.sq.table.store(wqe_idx, entry, self.sq.pi.get());
+        }
+
+        Ok(WqeHandle {
+            wqe_idx,
+            size: self.offset,
+        })
+    }
+
+    #[cold]
+    fn finish_with_wrap_around(self, wqebb_cnt: u16, slots_to_end: u16) -> io::Result<WqeHandle> {
+        let total_needed = slots_to_end + wqebb_cnt;
+        if self.sq.available() < total_needed {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+
+        let mut temp_buf = [0u8; 256];
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.wqe_ptr, temp_buf.as_mut_ptr(), self.offset);
+            self.sq.post_nop(slots_to_end);
+        }
+
+        let new_wqe_idx = self.sq.pi.get();
+        let new_wqe_ptr = self.sq.get_wqe_ptr(new_wqe_idx);
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(temp_buf.as_ptr(), new_wqe_ptr, self.offset);
+            CtrlSeg::update_wqe_idx(new_wqe_ptr, new_wqe_idx);
+            CtrlSeg::update_ds_cnt(new_wqe_ptr, self.ds_count);
+            // Set completion flag if signaled (may not have been set at write_ctrl time)
+            if self.signaled {
+                CtrlSeg::set_completion_flag(new_wqe_ptr);
+            }
+        }
+
+        self.sq.advance_pi(wqebb_cnt);
+        self.sq.set_last_wqe(new_wqe_ptr, self.offset);
+
+        if let Some(entry) = self.entry {
+            self.sq.table.store(new_wqe_idx, entry, self.sq.pi.get());
+        }
+
+        Ok(WqeHandle {
+            wqe_idx: new_wqe_idx,
+            size: self.offset,
+        })
+    }
+
+    #[inline]
+    fn finish_with_blueflame_internal(self) -> io::Result<WqeHandle> {
+        let wqebb_cnt = calc_wqebb_cnt(self.offset);
+        let slots_to_end = self.sq.slots_to_end();
+
+        if wqebb_cnt > slots_to_end && slots_to_end < self.sq.wqe_cnt {
+            return self.finish_with_wrap_around_blueflame(wqebb_cnt, slots_to_end);
+        }
+
+        unsafe {
+            CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
+            // Set completion flag if signaled (may not have been set at write_ctrl time)
+            if self.signaled {
+                CtrlSeg::set_completion_flag(self.wqe_ptr);
+            }
+        }
+
+        let wqe_idx = self.wqe_idx;
+        let wqe_ptr = self.wqe_ptr;
+
+        self.sq.advance_pi(wqebb_cnt);
+
+        if let Some(entry) = self.entry {
+            self.sq.table.store(wqe_idx, entry, self.sq.pi.get());
+        }
+
+        self.sq.ring_blueflame(wqe_ptr);
+
+        Ok(WqeHandle {
+            wqe_idx,
+            size: self.offset,
+        })
+    }
+
+    #[cold]
+    fn finish_with_wrap_around_blueflame(
+        self,
+        wqebb_cnt: u16,
+        slots_to_end: u16,
+    ) -> io::Result<WqeHandle> {
+        let total_needed = slots_to_end + wqebb_cnt;
+        if self.sq.available() < total_needed {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+
+        let mut temp_buf = [0u8; 256];
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.wqe_ptr, temp_buf.as_mut_ptr(), self.offset);
+            self.sq.post_nop(slots_to_end);
+        }
+
+        let new_wqe_idx = self.sq.pi.get();
+        let new_wqe_ptr = self.sq.get_wqe_ptr(new_wqe_idx);
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(temp_buf.as_ptr(), new_wqe_ptr, self.offset);
+            CtrlSeg::update_wqe_idx(new_wqe_ptr, new_wqe_idx);
+            CtrlSeg::update_ds_cnt(new_wqe_ptr, self.ds_count);
+            // Set completion flag if signaled (may not have been set at write_ctrl time)
+            if self.signaled {
+                CtrlSeg::set_completion_flag(new_wqe_ptr);
+            }
+        }
+
+        self.sq.advance_pi(wqebb_cnt);
+
+        if let Some(entry) = self.entry {
+            self.sq.table.store(new_wqe_idx, entry, self.sq.pi.get());
+        }
+
+        self.sq.ring_blueflame(new_wqe_ptr);
+
+        Ok(WqeHandle {
+            wqe_idx: new_wqe_idx,
+            size: self.offset,
+        })
+    }
+}
+
+// =============================================================================
+// Simplified DCI SQ WQE Entry Point (IB)
+// =============================================================================
+
+/// DCI SQ WQE entry point for IB transport.
+///
+/// DC info (dc_key, dctn, dlid) is passed to entry point method.
+#[must_use = "WQE builder must be finished"]
+pub struct DciSqWqeEntryPoint<'a, Entry> {
+    core: DciWqeCore<'a, Entry>,
+}
+
+impl<'a, Entry> DciSqWqeEntryPoint<'a, Entry> {
+    /// Create a new DCI entry point with IB AV.
+    #[inline]
+    pub(crate) fn new(
+        sq: &'a DciSendQueueState<Entry, OrderedWqeTable<Entry>>,
+        dc_key: u64,
+        dctn: u32,
+        dlid: u16,
+    ) -> Self {
+        let mut core = DciWqeCore::new(sq, None);
+        // Store AV parameters for later - AV is written AFTER ctrl segment
+        core.set_av_ib(dc_key, dctn, dlid);
+        Self { core }
+    }
+
+    // -------------------------------------------------------------------------
+    // SEND operations
+    // -------------------------------------------------------------------------
+
+    /// Start building a SEND WQE.
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the maximum
+    /// possible WQE size (based on max_inline_data).
+    #[inline]
+    pub fn send(mut self, flags: TxFlags) -> io::Result<DciSendWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_max_wqebb_send(self.core.max_inline_data());
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        self.core.write_ctrl(WqeOpcode::Send, flags, 0);
+        self.core.write_pending_av();
+        Ok(DciSendWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    /// Start building a SEND with immediate data WQE.
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the maximum
+    /// possible WQE size (based on max_inline_data).
+    #[inline]
+    pub fn send_imm(mut self, flags: TxFlags, imm: u32) -> io::Result<DciSendWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_max_wqebb_send(self.core.max_inline_data());
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        self.core.write_ctrl(WqeOpcode::SendImm, flags, imm);
+        self.core.write_pending_av();
+        Ok(DciSendWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    // -------------------------------------------------------------------------
+    // WRITE operations
+    // -------------------------------------------------------------------------
+
+    /// Start building an RDMA WRITE WQE.
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the maximum
+    /// possible WQE size (based on max_inline_data).
+    #[inline]
+    pub fn write(mut self, flags: TxFlags, remote_addr: u64, rkey: u32) -> io::Result<DciWriteWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_max_wqebb_write(self.core.max_inline_data());
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        self.core.write_ctrl(WqeOpcode::RdmaWrite, flags, 0);
+        self.core.write_pending_av();
+        self.core.write_rdma(remote_addr, rkey);
+        Ok(DciWriteWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    /// Start building an RDMA WRITE with immediate data WQE.
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the maximum
+    /// possible WQE size (based on max_inline_data).
+    #[inline]
+    pub fn write_imm(mut self, flags: TxFlags, remote_addr: u64, rkey: u32, imm: u32) -> io::Result<DciWriteWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_max_wqebb_write(self.core.max_inline_data());
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        self.core.write_ctrl(WqeOpcode::RdmaWriteImm, flags, imm);
+        self.core.write_pending_av();
+        self.core.write_rdma(remote_addr, rkey);
+        Ok(DciWriteWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    // -------------------------------------------------------------------------
+    // READ operations
+    // -------------------------------------------------------------------------
+
+    /// Start building an RDMA READ WQE.
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
+    #[inline]
+    pub fn read(mut self, flags: TxFlags, remote_addr: u64, rkey: u32) -> io::Result<DciReadWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_max_wqebb_read();
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        self.core.write_ctrl(WqeOpcode::RdmaRead, flags, 0);
+        self.core.write_pending_av();
+        self.core.write_rdma(remote_addr, rkey);
+        Ok(DciReadWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    // -------------------------------------------------------------------------
+    // Atomic operations
+    // -------------------------------------------------------------------------
+
+    /// Start building an Atomic Compare-and-Swap WQE.
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
+    #[inline]
+    pub fn cas(mut self, flags: TxFlags, remote_addr: u64, rkey: u32, swap: u64, compare: u64) -> io::Result<DciAtomicWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_max_wqebb_atomic();
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        self.core.write_ctrl(WqeOpcode::AtomicCs, flags, 0);
+        self.core.write_pending_av();
+        self.core.write_rdma(remote_addr, rkey);
+        self.core.write_atomic_cas(swap, compare);
+        Ok(DciAtomicWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    /// Start building an Atomic Fetch-and-Add WQE.
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
+    #[inline]
+    pub fn fetch_add(mut self, flags: TxFlags, remote_addr: u64, rkey: u32, add_value: u64) -> io::Result<DciAtomicWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_max_wqebb_atomic();
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        self.core.write_ctrl(WqeOpcode::AtomicFa, flags, 0);
+        self.core.write_pending_av();
+        self.core.write_rdma(remote_addr, rkey);
+        self.core.write_atomic_fa(add_value);
+        Ok(DciAtomicWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    // -------------------------------------------------------------------------
+    // NOP operation
+    // -------------------------------------------------------------------------
+
+    /// Start building a NOP WQE.
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
+    #[inline]
+    pub fn nop(mut self, flags: TxFlags) -> io::Result<DciNopWqeBuilder<'a, Entry>> {
+        let max_wqebb = calc_max_wqebb_nop();
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        self.core.write_ctrl(WqeOpcode::Nop, flags, 0);
+        self.core.write_pending_av();
+        Ok(DciNopWqeBuilder { core: self.core })
+    }
+}
+
+// =============================================================================
+// Simplified DCI SQ WQE Entry Point (RoCE)
+// =============================================================================
+
+/// DCI SQ WQE entry point for RoCE transport.
+#[must_use = "WQE builder must be finished"]
+pub struct DciRoceSqWqeEntryPoint<'a, Entry> {
+    core: DciWqeCore<'a, Entry>,
+}
+
+impl<'a, Entry> DciRoceSqWqeEntryPoint<'a, Entry> {
+    /// Create a new DCI entry point with RoCE AV.
+    #[inline]
+    pub(crate) fn new(
+        sq: &'a DciSendQueueState<Entry, OrderedWqeTable<Entry>>,
+        dc_key: u64,
+        dctn: u32,
+        grh: &'a GrhAttr,
+    ) -> Self {
+        let mut core = DciWqeCore::new(sq, None);
+        // Store AV parameters for later - AV is written AFTER ctrl segment
+        core.set_av_roce(dc_key, dctn, grh);
+        Self { core }
+    }
+
+    // -------------------------------------------------------------------------
+    // SEND operations
+    // -------------------------------------------------------------------------
+
+    /// Start building a SEND WQE.
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the maximum
+    /// possible WQE size (based on max_inline_data).
+    #[inline]
+    pub fn send(mut self, flags: TxFlags) -> io::Result<DciSendWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_max_wqebb_send(self.core.max_inline_data());
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        self.core.write_ctrl(WqeOpcode::Send, flags, 0);
+        self.core.write_pending_av();
+        Ok(DciSendWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    /// Start building a SEND with immediate data WQE.
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the maximum
+    /// possible WQE size (based on max_inline_data).
+    #[inline]
+    pub fn send_imm(mut self, flags: TxFlags, imm: u32) -> io::Result<DciSendWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_max_wqebb_send(self.core.max_inline_data());
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        self.core.write_ctrl(WqeOpcode::SendImm, flags, imm);
+        self.core.write_pending_av();
+        Ok(DciSendWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    // -------------------------------------------------------------------------
+    // WRITE operations
+    // -------------------------------------------------------------------------
+
+    /// Start building an RDMA WRITE WQE.
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the maximum
+    /// possible WQE size (based on max_inline_data).
+    #[inline]
+    pub fn write(mut self, flags: TxFlags, remote_addr: u64, rkey: u32) -> io::Result<DciWriteWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_max_wqebb_write(self.core.max_inline_data());
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        self.core.write_ctrl(WqeOpcode::RdmaWrite, flags, 0);
+        self.core.write_pending_av();
+        self.core.write_rdma(remote_addr, rkey);
+        Ok(DciWriteWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    /// Start building an RDMA WRITE with immediate data WQE.
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the maximum
+    /// possible WQE size (based on max_inline_data).
+    #[inline]
+    pub fn write_imm(mut self, flags: TxFlags, remote_addr: u64, rkey: u32, imm: u32) -> io::Result<DciWriteWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_max_wqebb_write(self.core.max_inline_data());
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        self.core.write_ctrl(WqeOpcode::RdmaWriteImm, flags, imm);
+        self.core.write_pending_av();
+        self.core.write_rdma(remote_addr, rkey);
+        Ok(DciWriteWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    // -------------------------------------------------------------------------
+    // READ operations
+    // -------------------------------------------------------------------------
+
+    /// Start building an RDMA READ WQE.
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
+    #[inline]
+    pub fn read(mut self, flags: TxFlags, remote_addr: u64, rkey: u32) -> io::Result<DciReadWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_max_wqebb_read();
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        self.core.write_ctrl(WqeOpcode::RdmaRead, flags, 0);
+        self.core.write_pending_av();
+        self.core.write_rdma(remote_addr, rkey);
+        Ok(DciReadWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    // -------------------------------------------------------------------------
+    // Atomic operations
+    // -------------------------------------------------------------------------
+
+    /// Start building an Atomic Compare-and-Swap WQE.
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
+    #[inline]
+    pub fn cas(mut self, flags: TxFlags, remote_addr: u64, rkey: u32, swap: u64, compare: u64) -> io::Result<DciAtomicWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_max_wqebb_atomic();
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        self.core.write_ctrl(WqeOpcode::AtomicCs, flags, 0);
+        self.core.write_pending_av();
+        self.core.write_rdma(remote_addr, rkey);
+        self.core.write_atomic_cas(swap, compare);
+        Ok(DciAtomicWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    /// Start building an Atomic Fetch-and-Add WQE.
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
+    #[inline]
+    pub fn fetch_add(mut self, flags: TxFlags, remote_addr: u64, rkey: u32, add_value: u64) -> io::Result<DciAtomicWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_max_wqebb_atomic();
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        self.core.write_ctrl(WqeOpcode::AtomicFa, flags, 0);
+        self.core.write_pending_av();
+        self.core.write_rdma(remote_addr, rkey);
+        self.core.write_atomic_fa(add_value);
+        Ok(DciAtomicWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    // -------------------------------------------------------------------------
+    // NOP operation
+    // -------------------------------------------------------------------------
+
+    /// Start building a NOP WQE.
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
+    #[inline]
+    pub fn nop(mut self, flags: TxFlags) -> io::Result<DciNopWqeBuilder<'a, Entry>> {
+        let max_wqebb = calc_max_wqebb_nop();
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        self.core.write_ctrl(WqeOpcode::Nop, flags, 0);
+        self.core.write_pending_av();
+        Ok(DciNopWqeBuilder { core: self.core })
+    }
+}
+
+// =============================================================================
+// DCI Send WQE Builder
+// =============================================================================
+
+/// DCI SEND WQE builder.
+///
+/// Uses type-state pattern: `DataState` is `NoData` initially,
+/// transitions to `HasData` after calling `sge()` or `inline()`.
+#[must_use = "WQE builder must be finished"]
+pub struct DciSendWqeBuilder<'a, Entry, DataState> {
+    core: DciWqeCore<'a, Entry>,
+    _data: PhantomData<DataState>,
+}
+
+/// sge/inline: NoData state, transitions to HasData.
+impl<'a, Entry> DciSendWqeBuilder<'a, Entry, NoData> {
+    /// Add a scatter/gather entry.
+    #[inline]
+    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> DciSendWqeBuilder<'a, Entry, HasData> {
+        self.core.write_sge(addr, len, lkey);
+        DciSendWqeBuilder { core: self.core, _data: PhantomData }
+    }
+
+    /// Add inline data.
+    #[inline]
+    pub fn inline(mut self, data: &[u8]) -> DciSendWqeBuilder<'a, Entry, HasData> {
+        self.core.write_inline(data);
+        DciSendWqeBuilder { core: self.core, _data: PhantomData }
+    }
+}
+
+/// finish methods: only available in HasData state.
+impl<'a, Entry> DciSendWqeBuilder<'a, Entry, HasData> {
+    /// Add another scatter/gather entry.
+    #[inline]
+    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
+        self.core.write_sge(addr, len, lkey);
+        self
+    }
+
+    /// Add more inline data.
+    #[inline]
+    pub fn inline(mut self, data: &[u8]) -> Self {
+        self.core.write_inline(data);
+        self
+    }
+
+    /// Finish the WQE construction (unsignaled).
+    #[inline]
+    pub fn finish_unsignaled(self) -> io::Result<WqeHandle> {
+        self.core.finish_internal()
+    }
+
+    /// Finish the WQE construction with completion signaling.
+    #[inline]
+    pub fn finish_signaled(mut self, entry: Entry) -> io::Result<WqeHandle> {
+        self.core.entry = Some(entry);
+        self.core.signaled = true;
+        self.core.finish_internal()
+    }
+
+    /// Finish with BlueFlame doorbell (unsignaled).
+    #[inline]
+    pub fn finish_unsignaled_with_blueflame(self) -> io::Result<WqeHandle> {
+        self.core.finish_with_blueflame_internal()
+    }
+
+    /// Finish with BlueFlame doorbell (signaled).
+    #[inline]
+    pub fn finish_signaled_with_blueflame(mut self, entry: Entry) -> io::Result<WqeHandle> {
+        self.core.entry = Some(entry);
+        self.core.signaled = true;
+        self.core.finish_with_blueflame_internal()
+    }
+}
+
+// =============================================================================
+// DCI Write WQE Builder
+// =============================================================================
+
+/// DCI RDMA WRITE WQE builder.
+///
+/// Uses type-state pattern: `DataState` is `NoData` initially,
+/// transitions to `HasData` after calling `sge()` or `inline()`.
+#[must_use = "WQE builder must be finished"]
+pub struct DciWriteWqeBuilder<'a, Entry, DataState> {
+    core: DciWqeCore<'a, Entry>,
+    _data: PhantomData<DataState>,
+}
+
+/// sge/inline: NoData state, transitions to HasData.
+impl<'a, Entry> DciWriteWqeBuilder<'a, Entry, NoData> {
+    /// Add a scatter/gather entry.
+    #[inline]
+    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> DciWriteWqeBuilder<'a, Entry, HasData> {
+        self.core.write_sge(addr, len, lkey);
+        DciWriteWqeBuilder { core: self.core, _data: PhantomData }
+    }
+
+    /// Add inline data.
+    #[inline]
+    pub fn inline(mut self, data: &[u8]) -> DciWriteWqeBuilder<'a, Entry, HasData> {
+        self.core.write_inline(data);
+        DciWriteWqeBuilder { core: self.core, _data: PhantomData }
+    }
+}
+
+/// finish methods: only available in HasData state.
+impl<'a, Entry> DciWriteWqeBuilder<'a, Entry, HasData> {
+    /// Add another scatter/gather entry.
+    #[inline]
+    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
+        self.core.write_sge(addr, len, lkey);
+        self
+    }
+
+    /// Add more inline data.
+    #[inline]
+    pub fn inline(mut self, data: &[u8]) -> Self {
+        self.core.write_inline(data);
+        self
+    }
+
+    /// Finish the WQE construction (unsignaled).
+    #[inline]
+    pub fn finish_unsignaled(self) -> io::Result<WqeHandle> {
+        self.core.finish_internal()
+    }
+
+    /// Finish the WQE construction with completion signaling.
+    #[inline]
+    pub fn finish_signaled(mut self, entry: Entry) -> io::Result<WqeHandle> {
+        self.core.entry = Some(entry);
+        self.core.signaled = true;
+        self.core.finish_internal()
+    }
+
+    /// Finish with BlueFlame doorbell (unsignaled).
+    #[inline]
+    pub fn finish_unsignaled_with_blueflame(self) -> io::Result<WqeHandle> {
+        self.core.finish_with_blueflame_internal()
+    }
+
+    /// Finish with BlueFlame doorbell (signaled).
+    #[inline]
+    pub fn finish_signaled_with_blueflame(mut self, entry: Entry) -> io::Result<WqeHandle> {
+        self.core.entry = Some(entry);
+        self.core.signaled = true;
+        self.core.finish_with_blueflame_internal()
+    }
+}
+
+// =============================================================================
+// DCI Read WQE Builder
+// =============================================================================
+
+/// DCI RDMA READ WQE builder.
+///
+/// Uses type-state pattern: `DataState` is `NoData` initially,
+/// transitions to `HasData` after calling `sge()`.
+/// Note: READ operations do not support inline data.
+#[must_use = "WQE builder must be finished"]
+pub struct DciReadWqeBuilder<'a, Entry, DataState> {
+    core: DciWqeCore<'a, Entry>,
+    _data: PhantomData<DataState>,
+}
+
+/// sge: NoData state, transitions to HasData.
+impl<'a, Entry> DciReadWqeBuilder<'a, Entry, NoData> {
+    /// Add a scatter/gather entry.
+    #[inline]
+    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> DciReadWqeBuilder<'a, Entry, HasData> {
+        self.core.write_sge(addr, len, lkey);
+        DciReadWqeBuilder { core: self.core, _data: PhantomData }
+    }
+}
+
+/// finish methods: only available in HasData state.
+impl<'a, Entry> DciReadWqeBuilder<'a, Entry, HasData> {
+    /// Add another scatter/gather entry.
+    #[inline]
+    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
+        self.core.write_sge(addr, len, lkey);
+        self
+    }
+
+    /// Finish the WQE construction (unsignaled).
+    #[inline]
+    pub fn finish_unsignaled(self) -> io::Result<WqeHandle> {
+        self.core.finish_internal()
+    }
+
+    /// Finish the WQE construction with completion signaling.
+    #[inline]
+    pub fn finish_signaled(mut self, entry: Entry) -> io::Result<WqeHandle> {
+        self.core.entry = Some(entry);
+        self.core.signaled = true;
+        self.core.finish_internal()
+    }
+
+    /// Finish with BlueFlame doorbell (unsignaled).
+    #[inline]
+    pub fn finish_unsignaled_with_blueflame(self) -> io::Result<WqeHandle> {
+        self.core.finish_with_blueflame_internal()
+    }
+
+    /// Finish with BlueFlame doorbell (signaled).
+    #[inline]
+    pub fn finish_signaled_with_blueflame(mut self, entry: Entry) -> io::Result<WqeHandle> {
+        self.core.entry = Some(entry);
+        self.core.signaled = true;
+        self.core.finish_with_blueflame_internal()
+    }
+}
+
+// =============================================================================
+// DCI Atomic WQE Builder
+// =============================================================================
+
+/// DCI Atomic operation WQE builder.
+///
+/// Uses type-state pattern: `DataState` is `NoData` initially,
+/// transitions to `HasData` after calling `sge()`.
+#[must_use = "WQE builder must be finished"]
+pub struct DciAtomicWqeBuilder<'a, Entry, DataState> {
+    core: DciWqeCore<'a, Entry>,
+    _data: PhantomData<DataState>,
+}
+
+/// sge: NoData state, transitions to HasData.
+impl<'a, Entry> DciAtomicWqeBuilder<'a, Entry, NoData> {
+    /// Add a scatter/gather entry for the result buffer.
+    #[inline]
+    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> DciAtomicWqeBuilder<'a, Entry, HasData> {
+        self.core.write_sge(addr, len, lkey);
+        DciAtomicWqeBuilder { core: self.core, _data: PhantomData }
+    }
+}
+
+/// finish methods: only available in HasData state.
+impl<'a, Entry> DciAtomicWqeBuilder<'a, Entry, HasData> {
+    /// Add another scatter/gather entry.
+    #[inline]
+    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
+        self.core.write_sge(addr, len, lkey);
+        self
+    }
+
+    /// Finish the WQE construction (unsignaled).
+    #[inline]
+    pub fn finish_unsignaled(self) -> io::Result<WqeHandle> {
+        self.core.finish_internal()
+    }
+
+    /// Finish the WQE construction with completion signaling.
+    #[inline]
+    pub fn finish_signaled(mut self, entry: Entry) -> io::Result<WqeHandle> {
+        self.core.entry = Some(entry);
+        self.core.signaled = true;
+        self.core.finish_internal()
+    }
+
+    /// Finish with BlueFlame doorbell (unsignaled).
+    #[inline]
+    pub fn finish_unsignaled_with_blueflame(self) -> io::Result<WqeHandle> {
+        self.core.finish_with_blueflame_internal()
+    }
+
+    /// Finish with BlueFlame doorbell (signaled).
+    #[inline]
+    pub fn finish_signaled_with_blueflame(mut self, entry: Entry) -> io::Result<WqeHandle> {
+        self.core.entry = Some(entry);
+        self.core.signaled = true;
+        self.core.finish_with_blueflame_internal()
+    }
+}
+
+// =============================================================================
+// DCI NOP WQE Builder
+// =============================================================================
+
+/// DCI NOP WQE builder.
+///
+/// NOP operations have no data segment, so `finish_*()` methods are
+/// available immediately without needing to call `sge()` or `inline()`.
+#[must_use = "WQE builder must be finished"]
+pub struct DciNopWqeBuilder<'a, Entry> {
+    core: DciWqeCore<'a, Entry>,
+}
+
+impl<'a, Entry> DciNopWqeBuilder<'a, Entry> {
+    /// Finish the WQE construction (unsignaled).
+    #[inline]
+    pub fn finish_unsignaled(self) -> io::Result<WqeHandle> {
+        self.core.finish_internal()
+    }
+
+    /// Finish the WQE construction with completion signaling.
+    #[inline]
+    pub fn finish_signaled(mut self, entry: Entry) -> io::Result<WqeHandle> {
+        self.core.entry = Some(entry);
+        self.core.signaled = true;
+        self.core.finish_internal()
+    }
+
+    /// Finish with BlueFlame doorbell (unsignaled).
+    #[inline]
+    pub fn finish_unsignaled_with_blueflame(self) -> io::Result<WqeHandle> {
+        self.core.finish_with_blueflame_internal()
+    }
+
+    /// Finish with BlueFlame doorbell (signaled).
+    #[inline]
+    pub fn finish_signaled_with_blueflame(mut self, entry: Entry) -> io::Result<WqeHandle> {
+        self.core.entry = Some(entry);
+        self.core.signaled = true;
+        self.core.finish_with_blueflame_internal()
+    }
+}
+
+// =============================================================================
+// DCI Entry Points
+// =============================================================================
+
+impl<Entry, OnComplete> DciIb<Entry, OnComplete> {
+    /// Get a SQ WQE builder for InfiniBand transport.
+    ///
+    /// # Example
+    /// ```ignore
+    /// dci.sq_wqe(dc_key, dctn, dlid)?
+    ///     .write(TxFlags::empty(), remote_addr, rkey)
+    ///     .sge(local_addr, len, lkey)
+    ///     .finish_signaled(entry)?;
+    /// dci.ring_sq_doorbell();
+    /// ```
+    #[inline]
+    pub fn sq_wqe(&self, dc_key: u64, dctn: u32, dlid: u16) -> io::Result<DciSqWqeEntryPoint<'_, Entry>> {
+        let sq = self.sq()?;
+        if sq.available() == 0 {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        Ok(DciSqWqeEntryPoint::new(sq, dc_key, dctn, dlid))
+    }
+}
+
+impl<Entry, OnComplete> DciRoCE<Entry, OnComplete> {
+    /// Get a SQ WQE builder for RoCE transport.
+    ///
+    /// # Example
+    /// ```ignore
+    /// dci.sq_wqe(dc_key, dctn, &grh)?
+    ///     .write(TxFlags::empty(), remote_addr, rkey)
+    ///     .sge(local_addr, len, lkey)
+    ///     .finish_signaled(entry)?;
+    /// dci.ring_sq_doorbell();
+    /// ```
+    #[inline]
+    pub fn sq_wqe<'a>(&'a self, dc_key: u64, dctn: u32, grh: &'a GrhAttr) -> io::Result<DciRoceSqWqeEntryPoint<'a, Entry>> {
+        let sq = self.sq()?;
+        if sq.available() == 0 {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        Ok(DciRoceSqWqeEntryPoint::new(sq, dc_key, dctn, grh))
     }
 }

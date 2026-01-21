@@ -19,8 +19,8 @@ use crate::device::Context;
 use crate::pd::{AddressHandle, Pd};
 use crate::qp::QpInfo;
 use crate::wqe::{
-    CtrlSeg, DataSeg, HasData, InlineHeader, Init, NeedsData, OrderedWqeTable, UdNeedsAddr,
-    WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
+    CtrlSeg, DataSeg, HasData, InlineHeader, Init, NeedsData, NoData, OrderedWqeTable, RqWqeBuilder,
+    TxFlags, UdNeedsAddr, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
 };
 
 // =============================================================================
@@ -85,6 +85,8 @@ struct UdSendQueueState<Entry, TableType> {
     bf_reg: *mut u8,
     bf_size: u32,
     bf_offset: Cell<u32>,
+    /// Maximum inline data size.
+    max_inline_data: u32,
     /// WQE table for tracking in-flight operations.
     /// Uses interior mutability (Cell<Option<Entry>>) so no RefCell needed.
     table: TableType,
@@ -94,6 +96,10 @@ struct UdSendQueueState<Entry, TableType> {
 impl<Entry, TableType> UdSendQueueState<Entry, TableType> {
     fn available(&self) -> u16 {
         self.wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
+    }
+
+    fn max_inline_data(&self) -> u32 {
+        self.max_inline_data
     }
 
     fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
@@ -791,6 +797,7 @@ pub struct UdQp<Entry, TableType, OnComplete> {
     qp: NonNull<mlx5_sys::ibv_qp>,
     state: Cell<UdQpState>,
     qkey: u32,
+    max_inline_data: u32,
     sq: Option<UdSendQueueState<Entry, TableType>>,
     rq: Option<UdRecvQueueState<Entry>>,
     callback: OnComplete,
@@ -864,6 +871,7 @@ impl Context {
                 qp,
                 state: Cell::new(UdQpState::Reset),
                 qkey: config.qkey,
+                max_inline_data: config.max_inline_data,
                 sq: None,
                 rq: None,
                 callback,
@@ -1126,6 +1134,7 @@ impl<Entry, OnComplete> UdQpWithTable<Entry, OnComplete> {
             bf_reg: info.bf_reg,
             bf_size: info.bf_size,
             bf_offset: Cell::new(0),
+            max_inline_data: self.max_inline_data,
             table: OrderedWqeTable::new(wqe_cnt),
             _marker: PhantomData,
         });
@@ -1238,6 +1247,498 @@ where
                 && let Some(entry) = sq.process_completion(cqe.wqe_counter)
             {
                 (self.callback)(cqe, entry);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// New SQ WQE Builder API
+// =============================================================================
+
+/// Calculate maximum WQEBB count for UD SEND operation.
+///
+/// Layout: ctrl(16) + ud_addr(48) + inline_data(padded)
+#[inline]
+fn calc_ud_max_wqebb_send(max_inline_data: u32) -> u16 {
+    let inline_padded = ((4 + max_inline_data as usize) + 15) & !15;
+    let size = CtrlSeg::SIZE + UdAddressSeg::SIZE + inline_padded;
+    calc_wqebb_cnt(size)
+}
+
+/// Internal WQE builder core for UD operations.
+struct UdWqeCore<'a, Entry> {
+    sq: &'a UdSendQueueState<Entry, OrderedWqeTable<Entry>>,
+    wqe_ptr: *mut u8,
+    wqe_idx: u16,
+    offset: usize,
+    ds_count: u8,
+    signaled: bool,
+    entry: Option<Entry>,
+}
+
+impl<'a, Entry> UdWqeCore<'a, Entry> {
+    #[inline]
+    fn new(sq: &'a UdSendQueueState<Entry, OrderedWqeTable<Entry>>, entry: Option<Entry>) -> Self {
+        let wqe_idx = sq.pi.get();
+        let wqe_ptr = sq.get_wqe_ptr(wqe_idx);
+        Self {
+            sq,
+            wqe_ptr,
+            wqe_idx,
+            offset: 0,
+            ds_count: 0,
+            signaled: entry.is_some(),
+            entry,
+        }
+    }
+
+    #[inline]
+    fn available(&self) -> u16 {
+        self.sq.available()
+    }
+
+    #[inline]
+    fn max_inline_data(&self) -> u32 {
+        self.sq.max_inline_data()
+    }
+
+    #[inline]
+    fn write_ctrl(&mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) {
+        let flags = if self.signaled {
+            flags | WqeFlags::COMPLETION
+        } else {
+            flags
+        };
+        unsafe {
+            CtrlSeg::write(
+                self.wqe_ptr,
+                0,
+                opcode as u8,
+                self.wqe_idx,
+                self.sq.sqn,
+                0,
+                flags.bits(),
+                imm,
+            );
+        }
+        self.offset = CtrlSeg::SIZE;
+        self.ds_count = 1;
+    }
+
+    #[inline]
+    fn write_ud_av(&mut self, ah: &AddressHandle, qkey: u32) {
+        unsafe {
+            UdAddressSeg::write(self.wqe_ptr.add(self.offset), ah, qkey);
+        }
+        self.offset += UdAddressSeg::SIZE;
+        self.ds_count += 3; // 48 bytes = 3 DS
+    }
+
+    #[inline]
+    fn write_sge(&mut self, addr: u64, len: u32, lkey: u32) {
+        unsafe {
+            DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
+        }
+        self.offset += DataSeg::SIZE;
+        self.ds_count += 1;
+    }
+
+    #[inline]
+    fn write_inline(&mut self, data: &[u8]) {
+        let padded_size = unsafe {
+            let ptr = self.wqe_ptr.add(self.offset);
+            let size = InlineHeader::write(ptr, data.len() as u32);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
+            size
+        };
+        self.offset += padded_size;
+        self.ds_count += (padded_size / 16) as u8;
+    }
+
+    #[inline]
+    fn finish_internal(self) -> io::Result<WqeHandle> {
+        let wqebb_cnt = calc_wqebb_cnt(self.offset);
+        let slots_to_end = self.sq.slots_to_end();
+
+        if wqebb_cnt > slots_to_end && slots_to_end < self.sq.wqe_cnt {
+            return self.finish_with_wrap_around(wqebb_cnt, slots_to_end);
+        }
+
+        unsafe {
+            CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
+            // Set completion flag if signaled (may not have been set at write_ctrl time)
+            if self.signaled {
+                CtrlSeg::set_completion_flag(self.wqe_ptr);
+            }
+        }
+
+        let wqe_idx = self.wqe_idx;
+        self.sq.advance_pi(wqebb_cnt);
+        self.sq.set_last_wqe(self.wqe_ptr, self.offset);
+
+        if let Some(entry) = self.entry {
+            self.sq.table.store(wqe_idx, entry, self.sq.pi.get());
+        }
+
+        Ok(WqeHandle {
+            wqe_idx,
+            size: self.offset,
+        })
+    }
+
+    #[cold]
+    fn finish_with_wrap_around(self, wqebb_cnt: u16, slots_to_end: u16) -> io::Result<WqeHandle> {
+        let total_needed = slots_to_end + wqebb_cnt;
+        if self.sq.available() < total_needed {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+
+        let mut temp_buf = [0u8; 256];
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.wqe_ptr, temp_buf.as_mut_ptr(), self.offset);
+            self.sq.post_nop(slots_to_end);
+        }
+
+        let new_wqe_idx = self.sq.pi.get();
+        let new_wqe_ptr = self.sq.get_wqe_ptr(new_wqe_idx);
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(temp_buf.as_ptr(), new_wqe_ptr, self.offset);
+            CtrlSeg::update_wqe_idx(new_wqe_ptr, new_wqe_idx);
+            CtrlSeg::update_ds_cnt(new_wqe_ptr, self.ds_count);
+            // Set completion flag if signaled (may not have been set at write_ctrl time)
+            if self.signaled {
+                CtrlSeg::set_completion_flag(new_wqe_ptr);
+            }
+        }
+
+        self.sq.advance_pi(wqebb_cnt);
+        self.sq.set_last_wqe(new_wqe_ptr, self.offset);
+
+        if let Some(entry) = self.entry {
+            self.sq.table.store(new_wqe_idx, entry, self.sq.pi.get());
+        }
+
+        Ok(WqeHandle {
+            wqe_idx: new_wqe_idx,
+            size: self.offset,
+        })
+    }
+
+    #[inline]
+    fn finish_with_blueflame_internal(self) -> io::Result<WqeHandle> {
+        let wqebb_cnt = calc_wqebb_cnt(self.offset);
+        let slots_to_end = self.sq.slots_to_end();
+
+        if wqebb_cnt > slots_to_end && slots_to_end < self.sq.wqe_cnt {
+            return self.finish_with_wrap_around_blueflame(wqebb_cnt, slots_to_end);
+        }
+
+        unsafe {
+            CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
+            // Set completion flag if signaled (may not have been set at write_ctrl time)
+            if self.signaled {
+                CtrlSeg::set_completion_flag(self.wqe_ptr);
+            }
+        }
+
+        let wqe_idx = self.wqe_idx;
+        let wqe_ptr = self.wqe_ptr;
+
+        self.sq.advance_pi(wqebb_cnt);
+
+        if let Some(entry) = self.entry {
+            self.sq.table.store(wqe_idx, entry, self.sq.pi.get());
+        }
+
+        self.sq.ring_blueflame(wqe_ptr);
+
+        Ok(WqeHandle {
+            wqe_idx,
+            size: self.offset,
+        })
+    }
+
+    #[cold]
+    fn finish_with_wrap_around_blueflame(
+        self,
+        wqebb_cnt: u16,
+        slots_to_end: u16,
+    ) -> io::Result<WqeHandle> {
+        let total_needed = slots_to_end + wqebb_cnt;
+        if self.sq.available() < total_needed {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+
+        let mut temp_buf = [0u8; 256];
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.wqe_ptr, temp_buf.as_mut_ptr(), self.offset);
+            self.sq.post_nop(slots_to_end);
+        }
+
+        let new_wqe_idx = self.sq.pi.get();
+        let new_wqe_ptr = self.sq.get_wqe_ptr(new_wqe_idx);
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(temp_buf.as_ptr(), new_wqe_ptr, self.offset);
+            CtrlSeg::update_wqe_idx(new_wqe_ptr, new_wqe_idx);
+            CtrlSeg::update_ds_cnt(new_wqe_ptr, self.ds_count);
+            // Set completion flag if signaled (may not have been set at write_ctrl time)
+            if self.signaled {
+                CtrlSeg::set_completion_flag(new_wqe_ptr);
+            }
+        }
+
+        self.sq.advance_pi(wqebb_cnt);
+
+        if let Some(entry) = self.entry {
+            self.sq.table.store(new_wqe_idx, entry, self.sq.pi.get());
+        }
+
+        self.sq.ring_blueflame(new_wqe_ptr);
+
+        Ok(WqeHandle {
+            wqe_idx: new_wqe_idx,
+            size: self.offset,
+        })
+    }
+}
+
+// =============================================================================
+// UD SQ WQE Entry Point
+// =============================================================================
+
+/// UD SQ WQE entry point.
+///
+/// Provides verb methods for UD operations (SEND only).
+#[must_use = "WQE builder must be finished"]
+pub struct UdSqWqeEntryPoint<'a, Entry> {
+    core: UdWqeCore<'a, Entry>,
+    ah: &'a AddressHandle,
+    qkey: u32,
+}
+
+impl<'a, Entry> UdSqWqeEntryPoint<'a, Entry> {
+    /// Create a new entry point.
+    #[inline]
+    pub(crate) fn new(
+        sq: &'a UdSendQueueState<Entry, OrderedWqeTable<Entry>>,
+        ah: &'a AddressHandle,
+        qkey: u32,
+    ) -> Self {
+        Self {
+            core: UdWqeCore::new(sq, None),
+            ah,
+            qkey,
+        }
+    }
+
+    /// Start building a SEND WQE.
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the maximum
+    /// possible WQE size (based on max_inline_data).
+    #[inline]
+    pub fn send(mut self, flags: TxFlags) -> io::Result<UdSendWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_ud_max_wqebb_send(self.core.max_inline_data());
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        self.core.write_ctrl(WqeOpcode::Send, flags, 0);
+        self.core.write_ud_av(self.ah, self.qkey);
+        Ok(UdSendWqeBuilder {
+            core: self.core,
+            _data: PhantomData,
+        })
+    }
+
+    /// Start building a SEND with immediate data WQE.
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the maximum
+    /// possible WQE size (based on max_inline_data).
+    #[inline]
+    pub fn send_imm(
+        mut self,
+        flags: TxFlags,
+        imm: u32,
+    ) -> io::Result<UdSendWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_ud_max_wqebb_send(self.core.max_inline_data());
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        self.core.write_ctrl(WqeOpcode::SendImm, flags, imm);
+        self.core.write_ud_av(self.ah, self.qkey);
+        Ok(UdSendWqeBuilder {
+            core: self.core,
+            _data: PhantomData,
+        })
+    }
+}
+
+// =============================================================================
+// UD Send WQE Builder
+// =============================================================================
+
+/// UD SEND WQE builder.
+///
+/// Uses type-state pattern: `DataState` is `NoData` initially,
+/// transitions to `HasData` after calling `sge()` or `inline()`.
+/// `finish_*()` methods are only available in `HasData` state.
+#[must_use = "WQE builder must be finished"]
+pub struct UdSendWqeBuilder<'a, Entry, DataState> {
+    core: UdWqeCore<'a, Entry>,
+    _data: PhantomData<DataState>,
+}
+
+/// sge/inline: NoData state, transitions to HasData.
+impl<'a, Entry> UdSendWqeBuilder<'a, Entry, NoData> {
+    /// Add a scatter/gather entry.
+    #[inline]
+    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> UdSendWqeBuilder<'a, Entry, HasData> {
+        self.core.write_sge(addr, len, lkey);
+        UdSendWqeBuilder {
+            core: self.core,
+            _data: PhantomData,
+        }
+    }
+
+    /// Add inline data.
+    #[inline]
+    pub fn inline(mut self, data: &[u8]) -> UdSendWqeBuilder<'a, Entry, HasData> {
+        self.core.write_inline(data);
+        UdSendWqeBuilder {
+            core: self.core,
+            _data: PhantomData,
+        }
+    }
+}
+
+/// finish methods: only available in HasData state.
+impl<'a, Entry> UdSendWqeBuilder<'a, Entry, HasData> {
+    /// Add another scatter/gather entry.
+    #[inline]
+    pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
+        self.core.write_sge(addr, len, lkey);
+        self
+    }
+
+    /// Add more inline data.
+    #[inline]
+    pub fn inline(mut self, data: &[u8]) -> Self {
+        self.core.write_inline(data);
+        self
+    }
+
+    /// Finish the WQE construction (unsignaled).
+    #[inline]
+    pub fn finish_unsignaled(self) -> io::Result<WqeHandle> {
+        self.core.finish_internal()
+    }
+
+    /// Finish the WQE construction with completion signaling.
+    #[inline]
+    pub fn finish_signaled(mut self, entry: Entry) -> io::Result<WqeHandle> {
+        self.core.entry = Some(entry);
+        self.core.signaled = true;
+        self.core.finish_internal()
+    }
+
+    /// Finish with BlueFlame doorbell (unsignaled).
+    #[inline]
+    pub fn finish_unsignaled_with_blueflame(self) -> io::Result<WqeHandle> {
+        self.core.finish_with_blueflame_internal()
+    }
+
+    /// Finish with BlueFlame doorbell (signaled).
+    #[inline]
+    pub fn finish_signaled_with_blueflame(mut self, entry: Entry) -> io::Result<WqeHandle> {
+        self.core.entry = Some(entry);
+        self.core.signaled = true;
+        self.core.finish_with_blueflame_internal()
+    }
+}
+
+// =============================================================================
+// UD RQ WQE Builder
+// =============================================================================
+
+/// UD RQ WQE builder (new API).
+#[must_use = "WQE builder must be finished"]
+pub struct UdRqWqeBuilderImpl<'a, Entry> {
+    rq: &'a UdRecvQueueState<Entry>,
+    entry: Entry,
+    wqe_idx: u16,
+}
+
+impl<'a, Entry> RqWqeBuilder<'a, Entry> for UdRqWqeBuilderImpl<'a, Entry> {
+    #[inline]
+    fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
+        unsafe {
+            let wqe_ptr = self.rq.get_wqe_ptr(self.wqe_idx);
+            DataSeg::write(wqe_ptr, len, lkey, addr);
+        }
+        self
+    }
+
+    #[inline]
+    fn finish(self) {
+        let idx = (self.wqe_idx as usize) & ((self.rq.wqe_cnt - 1) as usize);
+        self.rq.table[idx].set(Some(self.entry));
+        self.rq.pi.set(self.rq.pi.get().wrapping_add(1));
+    }
+}
+
+// =============================================================================
+// sq_wqe / rq_wqe Methods
+// =============================================================================
+
+impl<Entry, OnComplete> UdQpWithTable<Entry, OnComplete> {
+    /// Get a SQ WQE builder for UD transport.
+    ///
+    /// # Example
+    /// ```ignore
+    /// qp.sq_wqe(&ah)?
+    ///     .send(TxFlags::empty())?
+    ///     .sge(addr, len, lkey)
+    ///     .finish_signaled(entry)?;
+    /// qp.ring_sq_doorbell();
+    /// ```
+    #[inline]
+    pub fn sq_wqe<'a>(&'a self, ah: &'a AddressHandle) -> io::Result<UdSqWqeEntryPoint<'a, Entry>> {
+        let sq = self.sq()?;
+        if sq.available() == 0 {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        Ok(UdSqWqeEntryPoint::new(sq, ah, self.qkey))
+    }
+
+    /// Get a RQ WQE builder for UD transport.
+    ///
+    /// # Example
+    /// ```ignore
+    /// qp.rq_wqe(entry)?
+    ///     .sge(addr, len, lkey)
+    ///     .finish();
+    /// qp.ring_rq_doorbell();
+    /// ```
+    #[inline]
+    pub fn rq_wqe(&self, entry: Entry) -> io::Result<UdRqWqeBuilderImpl<'_, Entry>> {
+        let rq = self.rq()?;
+        if rq.available() == 0 {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "RQ full"));
+        }
+        let wqe_idx = rq.pi.get();
+        Ok(UdRqWqeBuilderImpl { rq, entry, wqe_idx })
+    }
+
+    /// Ring the send queue doorbell.
+    ///
+    /// Call this after posting one or more WQEs to notify the HCA.
+    #[inline]
+    pub fn ring_sq_doorbell(&self) {
+        if let Some(sq) = self.sq.as_ref() {
+            if let Some((wqe_ptr, _)) = sq.last_wqe.get() {
+                sq.ring_db(wqe_ptr);
             }
         }
     }
