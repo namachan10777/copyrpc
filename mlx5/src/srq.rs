@@ -254,16 +254,6 @@ impl<T> Srq<T> {
         Ok(())
     }
 
-    /// Initialize direct access for the SRQ.
-    ///
-    /// # Deprecated
-    /// Direct access is now auto-initialized at SRQ creation.
-    /// This method is kept for backwards compatibility and is a no-op if already initialized.
-    #[deprecated(note = "Direct access is now auto-initialized at creation")]
-    pub fn init_direct_access(&self) -> io::Result<()> {
-        self.init_direct_access_internal()
-    }
-
     /// Get the SRQ number.
     pub fn srq_number(&self) -> io::Result<u32> {
         self.query_info().map(|info| info.srq_number)

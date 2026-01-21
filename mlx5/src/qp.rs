@@ -1037,11 +1037,6 @@ impl<Entry, Transport, TableType, OnComplete> RcQpInner<Entry, Transport, TableT
         unsafe { (*self.qp.as_ptr()).qp_num }
     }
 
-    /// Get the raw ibv_qp pointer.
-    pub fn as_ptr(&self) -> *mut mlx5_sys::ibv_qp {
-        self.qp.as_ptr()
-    }
-
     /// Get the current QP state.
     pub fn state(&self) -> QpState {
         self.state.get()
@@ -1184,84 +1179,11 @@ impl<Entry, Transport, TableType, OnComplete> RcQpInner<Entry, Transport, TableT
         self.sq.as_ref().map(|sq| sq.available()).unwrap_or(0)
     }
 
-    /// Get the number of available WQE slots.
-    #[deprecated(note = "Use send_queue_available() instead")]
-    pub fn sq_available(&self) -> u16 {
-        self.send_queue_available()
-    }
-
-    /// Get the total SQ WQE count (hardware queue size).
-    #[deprecated(note = "Internal implementation detail, do not use")]
-    pub fn sq_wqe_cnt(&self) -> u16 {
-        self.sq.as_ref().map(|sq| sq.wqe_cnt).unwrap_or(0)
-    }
-
-    /// Get the total RQ WQE count (hardware queue size).
-    #[deprecated(note = "Internal implementation detail, do not use")]
-    pub fn rq_wqe_cnt(&self) -> u32 {
-        self.rq.as_ref().map(|rq| rq.wqe_cnt).unwrap_or(0)
-    }
-
     /// Ring the SQ doorbell to notify HCA of new WQEs.
     pub fn ring_sq_doorbell(&self) {
         if let Some(sq) = self.sq.as_ref() {
             sq.ring_doorbell();
         }
-    }
-
-    /// Get the number of WQEBBs from current position to the end of the ring buffer.
-    ///
-    /// Use this to check if a variable-length WQE would wrap around the ring boundary.
-    /// If the WQE size exceeds this value, you should call `post_nop_to_ring_end()`
-    /// first to align to the ring start.
-    ///
-    /// Returns 0 if direct access is not initialized.
-    #[inline]
-    pub fn slots_to_ring_end(&self) -> u16 {
-        self.sq.as_ref().map(|sq| sq.slots_to_end()).unwrap_or(0)
-    }
-
-    /// Post a NOP WQE to fill remaining slots until the ring end.
-    ///
-    /// This should be called before posting a variable-length WQE that would
-    /// wrap around the ring boundary. The NOP WQE consumes all slots until the
-    /// ring end, so the next WQE starts at the ring beginning.
-    ///
-    /// # Errors
-    /// Returns an error if:
-    /// - Direct access is not initialized
-    /// - Not enough available slots (SQ is too full)
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Before posting a large WQE that might span multiple WQEBBs:
-    /// let max_wqebb_needed = 4; // estimate your WQE size
-    /// if qp.slots_to_ring_end() < max_wqebb_needed {
-    ///     qp.post_nop_to_ring_end()?;
-    /// }
-    /// // Now safe to build the WQE
-    /// let builder = qp.wqe_builder(entry)?;
-    /// ```
-    pub fn post_nop_to_ring_end(&self) -> io::Result<()> {
-        let sq = self.sq()?;
-        let slots_to_end = sq.slots_to_end();
-
-        // If we're already at the ring start, no NOP needed
-        if slots_to_end == sq.wqe_cnt {
-            return Ok(());
-        }
-
-        if sq.available() < slots_to_end {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "Not enough slots for NOP",
-            ));
-        }
-
-        unsafe {
-            sq.post_nop(slots_to_end);
-        }
-        Ok(())
     }
 }
 
@@ -1456,16 +1378,6 @@ impl<Entry, OnComplete> RcQp<Entry, OnComplete> {
         });
 
         Ok(())
-    }
-
-    /// Initialize direct queue access.
-    ///
-    /// # Deprecated
-    /// Direct access is now auto-initialized at QP creation.
-    /// This method is kept for backwards compatibility and is a no-op if already initialized.
-    #[deprecated(note = "Direct access is now auto-initialized at creation")]
-    pub fn init_direct_access(&mut self) -> io::Result<()> {
-        self.init_direct_access_internal()
     }
 }
 

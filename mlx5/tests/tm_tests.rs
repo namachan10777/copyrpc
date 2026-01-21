@@ -78,8 +78,6 @@ fn test_tm_srq_direct_access() {
     require_tm_srq!(&ctx);
 
     let mut cq = ctx.ctx.create_cq(256).expect("Failed to create CQ");
-    cq.init_direct_access()
-        .expect("Failed to init CQ direct access");
     let cq = Rc::new(cq);
 
     let config = TmSrqConfig {
@@ -264,16 +262,10 @@ fn test_tm_tag_matching_with_dc() {
 
     // Create CQ for DCI
     let mut dci_cq = ctx.ctx.create_cq(256).expect("Failed to create DCI CQ");
-    dci_cq
-        .init_direct_access()
-        .expect("Failed to init DCI CQ direct access");
     let dci_cq = Rc::new(dci_cq);
 
     // Create CQ for TM-SRQ
     let mut tm_cq = ctx.ctx.create_cq(256).expect("Failed to create TM CQ");
-    tm_cq
-        .init_direct_access()
-        .expect("Failed to init TM CQ direct access");
     let tm_cq = Rc::new(tm_cq);
 
     // Create TM-SRQ
@@ -459,8 +451,6 @@ fn test_tm_unordered_recv() {
     require_tm_srq!(&ctx);
 
     let mut cq = ctx.ctx.create_cq(256).expect("Failed to create CQ");
-    cq.init_direct_access()
-        .expect("Failed to init CQ direct access");
     let cq = Rc::new(cq);
 
     let config = TmSrqConfig {
@@ -518,8 +508,6 @@ fn test_tm_tag_via_verbs_api() {
     require_tm_srq!(&ctx);
 
     let mut cq = ctx.ctx.create_cq(256).expect("Failed to create CQ");
-    cq.init_direct_access()
-        .expect("Failed to init CQ direct access");
     let cq = Rc::new(cq);
 
     let config = TmSrqConfig {

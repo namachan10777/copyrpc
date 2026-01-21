@@ -755,15 +755,6 @@ impl CompletionQueue {
         self.cq.as_ptr()
     }
 
-    /// Initialize direct access for CQE polling.
-    ///
-    /// This is now a no-op since direct access is initialized at CQ creation.
-    /// Kept for backward compatibility.
-    #[deprecated(note = "Direct access is now initialized at CQ creation")]
-    pub fn init_direct_access(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-
     /// Register a queue for completion dispatch.
     ///
     /// Called automatically when a QP is created with this CQ.

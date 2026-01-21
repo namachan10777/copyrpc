@@ -849,35 +849,15 @@ pub struct Init;
 impl sealed::Sealed for Init {}
 impl WqeState for Init {}
 
-/// DC/UD: Address vector required before data.
-pub struct NeedsAv;
-impl sealed::Sealed for NeedsAv {}
-impl WqeState for NeedsAv {}
-
-/// DC/UD: Address vector has been written.
-pub struct HasAv;
-impl sealed::Sealed for HasAv {}
-impl WqeState for HasAv {}
-
 /// RDMA ops: RDMA segment required before data.
 pub struct NeedsRdma;
 impl sealed::Sealed for NeedsRdma {}
 impl WqeState for NeedsRdma {}
 
-/// RDMA ops: RDMA segment has been written.
-pub struct HasRdma;
-impl sealed::Sealed for HasRdma {}
-impl WqeState for HasRdma {}
-
 /// Atomic ops: Atomic segment required after RDMA.
 pub struct NeedsAtomic;
 impl sealed::Sealed for NeedsAtomic {}
 impl WqeState for NeedsAtomic {}
-
-/// Atomic ops: Atomic segment has been written.
-pub struct HasAtomic;
-impl sealed::Sealed for HasAtomic {}
-impl WqeState for HasAtomic {}
 
 /// Data segment (SGE or inline) required.
 pub struct NeedsData;
@@ -893,16 +873,6 @@ impl WqeState for HasData {}
 pub struct NeedsTmSeg;
 impl sealed::Sealed for NeedsTmSeg {}
 impl WqeState for NeedsTmSeg {}
-
-/// Composite state: DC needs AV, then transitions to Next state.
-pub struct DcNeedsAv<Next>(std::marker::PhantomData<Next>);
-impl<Next: WqeState> sealed::Sealed for DcNeedsAv<Next> {}
-impl<Next: WqeState> WqeState for DcNeedsAv<Next> {}
-
-/// Composite state: UD needs address, then transitions to Next state.
-pub struct UdNeedsAddr<Next>(std::marker::PhantomData<Next>);
-impl<Next: WqeState> sealed::Sealed for UdNeedsAddr<Next> {}
-impl<Next: WqeState> WqeState for UdNeedsAddr<Next> {}
 
 /// Composite state: Needs RDMA segment, then needs Atomic segment.
 pub struct NeedsRdmaThenAtomic;

@@ -65,8 +65,6 @@ fn test_srq_direct_access() {
     let srq: mlx5::srq::Srq<u64> = ctx.pd.create_srq(&config).expect("Failed to create SRQ");
 
     // Initialize direct access
-    srq.init_direct_access()
-        .expect("Failed to init SRQ direct access");
 
     println!("SRQ direct access test passed!");
 }
@@ -91,8 +89,6 @@ fn test_srq_post_recv() {
     };
 
     let srq: mlx5::srq::Srq<u64> = ctx.pd.create_srq(&config).expect("Failed to create SRQ");
-    srq.init_direct_access()
-        .expect("Failed to init SRQ direct access");
 
     // Allocate receive buffer
     let recv_buf = AlignedBuffer::new(4096);
@@ -136,15 +132,9 @@ fn test_srq_with_dct_send() {
 
     // Create CQs
     let mut dci_cq = ctx.ctx.create_cq(256).expect("Failed to create DCI CQ");
-    dci_cq
-        .init_direct_access()
-        .expect("Failed to init DCI CQ direct access");
     let dci_cq = Rc::new(dci_cq);
 
     let mut dct_cq = ctx.ctx.create_cq(256).expect("Failed to create DCT CQ");
-    dct_cq
-        .init_direct_access()
-        .expect("Failed to init DCT CQ direct access");
     let dct_cq = Rc::new(dct_cq);
 
     // Create SRQ
@@ -156,8 +146,6 @@ fn test_srq_with_dct_send() {
         .pd
         .create_srq(&srq_config)
         .expect("Failed to create SRQ");
-    srq.init_direct_access()
-        .expect("Failed to init SRQ direct access");
 
     // Create receive buffer and post to SRQ
     let recv_buf = AlignedBuffer::new(4096);
@@ -265,15 +253,9 @@ fn test_srq_shared_by_multiple_dcts() {
 
     // Create CQs
     let mut dci_cq = ctx.ctx.create_cq(256).expect("Failed to create DCI CQ");
-    dci_cq
-        .init_direct_access()
-        .expect("Failed to init DCI CQ direct access");
     let dci_cq = Rc::new(dci_cq);
 
     let mut dct_cq = ctx.ctx.create_cq(256).expect("Failed to create DCT CQ");
-    dct_cq
-        .init_direct_access()
-        .expect("Failed to init DCT CQ direct access");
     let dct_cq = Rc::new(dct_cq);
 
     // Create shared SRQ
@@ -285,8 +267,6 @@ fn test_srq_shared_by_multiple_dcts() {
         .pd
         .create_srq(&srq_config)
         .expect("Failed to create SRQ");
-    srq.init_direct_access()
-        .expect("Failed to init SRQ direct access");
 
     // Create receive buffers and post to SRQ
     let recv_bufs: Vec<_> = (0..4).map(|_| AlignedBuffer::new(4096)).collect();
