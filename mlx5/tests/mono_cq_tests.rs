@@ -9,8 +9,9 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use mlx5::cq::{CqConfig, Cqe};
-use mlx5::qp::{RcQpConfig, RcQpForMonoCq, RemoteQpInfo};
-use mlx5::wqe::TxFlags;
+use mlx5::qp::{RcQpConfig, RcQpForMonoCq};
+use mlx5::transport::IbRemoteQpInfo;
+use mlx5::wqe::WqeFlags;
 
 use common::{AlignedBuffer, TestContext, full_access};
 
@@ -90,12 +91,12 @@ fn test_mono_cq_with_rc_qp() {
     cq.register(&qp2);
 
     // Connect QPs
-    let remote1 = RemoteQpInfo {
+    let remote1 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
     };
-    let remote2 = RemoteQpInfo {
+    let remote2 = IbRemoteQpInfo {
         qp_number: qp2.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
@@ -132,7 +133,7 @@ fn test_mono_cq_with_rc_qp() {
     qp1.borrow_mut()
         .sq_wqe()
         .expect("sq_wqe failed")
-        .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+        .write(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
         .expect("write failed")
         .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
         .finish_signaled(42u64)
@@ -249,12 +250,12 @@ fn test_mono_cq_multiple_completions() {
     cq.register(&qp1);
     cq.register(&qp2);
 
-    let remote1 = RemoteQpInfo {
+    let remote1 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
     };
-    let remote2 = RemoteQpInfo {
+    let remote2 = IbRemoteQpInfo {
         qp_number: qp2.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
@@ -291,7 +292,7 @@ fn test_mono_cq_multiple_completions() {
         qp1.borrow_mut()
             .sq_wqe()
             .expect("sq_wqe failed")
-            .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+            .write(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
             .expect("write failed")
             .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
             .finish_signaled(100 + i as u64)
@@ -383,12 +384,12 @@ fn test_mono_cq_high_load() {
     cq.register(&qp1);
     cq.register(&qp2);
 
-    let remote1 = RemoteQpInfo {
+    let remote1 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
     };
-    let remote2 = RemoteQpInfo {
+    let remote2 = IbRemoteQpInfo {
         qp_number: qp2.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
@@ -430,7 +431,7 @@ fn test_mono_cq_high_load() {
         qp1.borrow_mut()
             .sq_wqe()
             .expect("sq_wqe failed")
-            .write(TxFlags::empty(), remote_buf.addr() + offset, remote_mr.rkey())
+            .write(WqeFlags::empty(), remote_buf.addr() + offset, remote_mr.rkey())
             .expect("write failed")
             .sge(local_buf.addr() + offset, chunk_size, local_mr.lkey())
             .finish_signaled(i as u64)
@@ -534,12 +535,12 @@ fn test_mono_cq_recv_rdma_write_imm() {
     cq1.register(&qp1);
     cq2.register(&qp2);
 
-    let remote1 = RemoteQpInfo {
+    let remote1 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
     };
-    let remote2 = RemoteQpInfo {
+    let remote2 = IbRemoteQpInfo {
         qp_number: qp2.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
@@ -589,7 +590,7 @@ fn test_mono_cq_recv_rdma_write_imm() {
         qp2.borrow_mut()
             .sq_wqe()
             .expect("sq_wqe failed")
-            .write_imm(TxFlags::empty(), recv_buf.addr() + offset, recv_mr.rkey(), imm_data)
+            .write_imm(WqeFlags::empty(), recv_buf.addr() + offset, recv_mr.rkey(), imm_data)
             .expect("write_imm failed")
             .sge(send_buf.addr() + offset, 64, send_mr.lkey())
             .finish_signaled(i as u64)
@@ -691,12 +692,12 @@ fn test_mono_cq_bidirectional_pingpong() {
     qp1_cq.register(&qp1);
     qp2_cq.register(&qp2);
 
-    let remote1 = RemoteQpInfo {
+    let remote1 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
     };
-    let remote2 = RemoteQpInfo {
+    let remote2 = IbRemoteQpInfo {
         qp_number: qp2.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
@@ -750,7 +751,7 @@ fn test_mono_cq_bidirectional_pingpong() {
         qp1.borrow_mut()
             .sq_wqe()
             .expect("sq_wqe")
-            .write_imm(TxFlags::empty(), buf2.addr() + offset, mr2.rkey(), imm)
+            .write_imm(WqeFlags::empty(), buf2.addr() + offset, mr2.rkey(), imm)
             .expect("write_imm")
             .sge(buf1.addr() + offset, msg_size, mr1.lkey())
             .finish_signaled(i as u64)
@@ -779,7 +780,7 @@ fn test_mono_cq_bidirectional_pingpong() {
         qp2.borrow_mut()
             .sq_wqe()
             .expect("sq_wqe")
-            .write_imm(TxFlags::empty(), buf1.addr() + offset, mr1.rkey(), imm)
+            .write_imm(WqeFlags::empty(), buf1.addr() + offset, mr1.rkey(), imm)
             .expect("write_imm")
             .sge(buf2.addr() + offset, msg_size, mr2.lkey())
             .finish_signaled(i as u64)
@@ -869,12 +870,12 @@ fn test_mono_cq_wraparound() {
     cq.register(&qp1);
     cq.register(&qp2);
 
-    let remote1 = RemoteQpInfo {
+    let remote1 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
     };
-    let remote2 = RemoteQpInfo {
+    let remote2 = IbRemoteQpInfo {
         qp_number: qp2.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
@@ -911,7 +912,7 @@ fn test_mono_cq_wraparound() {
                 let _ = qp
                     .sq_wqe()
                     .unwrap()
-                    .write(TxFlags::empty(), buf.addr() + offset, mr.lkey())
+                    .write(WqeFlags::empty(), buf.addr() + offset, mr.lkey())
                     .unwrap()
                     .sge(buf.addr() + offset, 32, mr.lkey())
                     .finish_signaled(submitted + i as u64);

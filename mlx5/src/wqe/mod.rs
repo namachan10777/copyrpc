@@ -43,8 +43,6 @@ pub use traits::{
     InfiniBand, RoCE,
     // Address Vector trait and types
     Av, NoAv,
-    // Flags
-    TxFlags,
     // Data state marker (NoData)
     NoData,
     // TM-SRQ builder traits
@@ -784,20 +782,6 @@ pub struct Init;
 impl sealed::Sealed for Init {}
 impl WqeState for Init {}
 
-/// RDMA ops: RDMA segment required before data.
-pub struct NeedsRdma;
-impl sealed::Sealed for NeedsRdma {}
-impl WqeState for NeedsRdma {}
-
-/// Atomic ops: Atomic segment required after RDMA.
-pub struct NeedsAtomic;
-impl sealed::Sealed for NeedsAtomic {}
-impl WqeState for NeedsAtomic {}
-
-/// Data segment (SGE or inline) required.
-pub struct NeedsData;
-impl sealed::Sealed for NeedsData {}
-impl WqeState for NeedsData {}
 
 /// Data segment has been written, finish() available.
 pub struct HasData;
@@ -808,11 +792,6 @@ impl WqeState for HasData {}
 pub struct NeedsTmSeg;
 impl sealed::Sealed for NeedsTmSeg {}
 impl WqeState for NeedsTmSeg {}
-
-/// Composite state: Needs RDMA segment, then needs Atomic segment.
-pub struct NeedsRdmaThenAtomic;
-impl sealed::Sealed for NeedsRdmaThenAtomic {}
-impl WqeState for NeedsRdmaThenAtomic {}
 
 // =============================================================================
 // Unit Tests

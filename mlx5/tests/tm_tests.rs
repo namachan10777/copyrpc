@@ -19,8 +19,7 @@ mod common;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use mlx5::Cqe;
-use mlx5::cq::{CqConfig, CqeOpcode};
+use mlx5::cq::{CqConfig, Cqe, CqeOpcode};
 use mlx5::dc::DciConfig;
 use mlx5::tm_srq::{TmSrqCompletion, TmSrqConfig};
 use mlx5::wqe::WqeOpcode;

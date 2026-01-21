@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use crate::types::GrhAttr;
 use crate::wqe::{
     ADDRESS_VECTOR_SIZE, ATOMIC_SEG_SIZE, CTRL_SEG_SIZE, DATA_SEG_SIZE, HasData, NoData,
-    OrderedWqeTable, RDMA_SEG_SIZE, SubmissionError, TxFlags, WQEBB_SIZE, WqeFlags,
+    OrderedWqeTable, RDMA_SEG_SIZE, SubmissionError, WqeFlags, WQEBB_SIZE,
     WqeHandle, WqeOpcode, calc_wqebb_cnt,
     set_ctrl_seg_completion_flag, update_ctrl_seg_ds_cnt, update_ctrl_seg_wqe_idx,
     write_address_vector_ib, write_address_vector_roce, write_atomic_seg_cas, write_atomic_seg_fa,
@@ -333,7 +333,7 @@ impl<'a, Entry> DciSqWqeEntryPoint<'a, Entry> {
     /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the maximum
     /// possible WQE size (based on max_inline_data).
     #[inline]
-    pub fn send(mut self, flags: TxFlags) -> io::Result<DciSendWqeBuilder<'a, Entry, NoData>> {
+    pub fn send(mut self, flags: WqeFlags) -> io::Result<DciSendWqeBuilder<'a, Entry, NoData>> {
         let max_wqebb = calc_max_wqebb_send(self.core.max_inline_data());
         if self.core.available() < max_wqebb {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -348,7 +348,7 @@ impl<'a, Entry> DciSqWqeEntryPoint<'a, Entry> {
     /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the maximum
     /// possible WQE size (based on max_inline_data).
     #[inline]
-    pub fn send_imm(mut self, flags: TxFlags, imm: u32) -> io::Result<DciSendWqeBuilder<'a, Entry, NoData>> {
+    pub fn send_imm(mut self, flags: WqeFlags, imm: u32) -> io::Result<DciSendWqeBuilder<'a, Entry, NoData>> {
         let max_wqebb = calc_max_wqebb_send(self.core.max_inline_data());
         if self.core.available() < max_wqebb {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -367,7 +367,7 @@ impl<'a, Entry> DciSqWqeEntryPoint<'a, Entry> {
     /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the maximum
     /// possible WQE size (based on max_inline_data).
     #[inline]
-    pub fn write(mut self, flags: TxFlags, remote_addr: u64, rkey: u32) -> io::Result<DciWriteWqeBuilder<'a, Entry, NoData>> {
+    pub fn write(mut self, flags: WqeFlags, remote_addr: u64, rkey: u32) -> io::Result<DciWriteWqeBuilder<'a, Entry, NoData>> {
         let max_wqebb = calc_max_wqebb_write(self.core.max_inline_data());
         if self.core.available() < max_wqebb {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -383,7 +383,7 @@ impl<'a, Entry> DciSqWqeEntryPoint<'a, Entry> {
     /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the maximum
     /// possible WQE size (based on max_inline_data).
     #[inline]
-    pub fn write_imm(mut self, flags: TxFlags, remote_addr: u64, rkey: u32, imm: u32) -> io::Result<DciWriteWqeBuilder<'a, Entry, NoData>> {
+    pub fn write_imm(mut self, flags: WqeFlags, remote_addr: u64, rkey: u32, imm: u32) -> io::Result<DciWriteWqeBuilder<'a, Entry, NoData>> {
         let max_wqebb = calc_max_wqebb_write(self.core.max_inline_data());
         if self.core.available() < max_wqebb {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -402,7 +402,7 @@ impl<'a, Entry> DciSqWqeEntryPoint<'a, Entry> {
     ///
     /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
     #[inline]
-    pub fn read(mut self, flags: TxFlags, remote_addr: u64, rkey: u32) -> io::Result<DciReadWqeBuilder<'a, Entry, NoData>> {
+    pub fn read(mut self, flags: WqeFlags, remote_addr: u64, rkey: u32) -> io::Result<DciReadWqeBuilder<'a, Entry, NoData>> {
         let max_wqebb = calc_max_wqebb_read();
         if self.core.available() < max_wqebb {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -421,7 +421,7 @@ impl<'a, Entry> DciSqWqeEntryPoint<'a, Entry> {
     ///
     /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
     #[inline]
-    pub fn cas(mut self, flags: TxFlags, remote_addr: u64, rkey: u32, swap: u64, compare: u64) -> io::Result<DciAtomicWqeBuilder<'a, Entry, NoData>> {
+    pub fn cas(mut self, flags: WqeFlags, remote_addr: u64, rkey: u32, swap: u64, compare: u64) -> io::Result<DciAtomicWqeBuilder<'a, Entry, NoData>> {
         let max_wqebb = calc_max_wqebb_atomic();
         if self.core.available() < max_wqebb {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -437,7 +437,7 @@ impl<'a, Entry> DciSqWqeEntryPoint<'a, Entry> {
     ///
     /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
     #[inline]
-    pub fn fetch_add(mut self, flags: TxFlags, remote_addr: u64, rkey: u32, add_value: u64) -> io::Result<DciAtomicWqeBuilder<'a, Entry, NoData>> {
+    pub fn fetch_add(mut self, flags: WqeFlags, remote_addr: u64, rkey: u32, add_value: u64) -> io::Result<DciAtomicWqeBuilder<'a, Entry, NoData>> {
         let max_wqebb = calc_max_wqebb_atomic();
         if self.core.available() < max_wqebb {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -457,7 +457,7 @@ impl<'a, Entry> DciSqWqeEntryPoint<'a, Entry> {
     ///
     /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
     #[inline]
-    pub fn nop(mut self, flags: TxFlags) -> io::Result<DciNopWqeBuilder<'a, Entry>> {
+    pub fn nop(mut self, flags: WqeFlags) -> io::Result<DciNopWqeBuilder<'a, Entry>> {
         let max_wqebb = calc_max_wqebb_nop();
         if self.core.available() < max_wqebb {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -502,7 +502,7 @@ impl<'a, Entry> DciRoceSqWqeEntryPoint<'a, Entry> {
     /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the maximum
     /// possible WQE size (based on max_inline_data).
     #[inline]
-    pub fn send(mut self, flags: TxFlags) -> io::Result<DciSendWqeBuilder<'a, Entry, NoData>> {
+    pub fn send(mut self, flags: WqeFlags) -> io::Result<DciSendWqeBuilder<'a, Entry, NoData>> {
         let max_wqebb = calc_max_wqebb_send(self.core.max_inline_data());
         if self.core.available() < max_wqebb {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -517,7 +517,7 @@ impl<'a, Entry> DciRoceSqWqeEntryPoint<'a, Entry> {
     /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the maximum
     /// possible WQE size (based on max_inline_data).
     #[inline]
-    pub fn send_imm(mut self, flags: TxFlags, imm: u32) -> io::Result<DciSendWqeBuilder<'a, Entry, NoData>> {
+    pub fn send_imm(mut self, flags: WqeFlags, imm: u32) -> io::Result<DciSendWqeBuilder<'a, Entry, NoData>> {
         let max_wqebb = calc_max_wqebb_send(self.core.max_inline_data());
         if self.core.available() < max_wqebb {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -536,7 +536,7 @@ impl<'a, Entry> DciRoceSqWqeEntryPoint<'a, Entry> {
     /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the maximum
     /// possible WQE size (based on max_inline_data).
     #[inline]
-    pub fn write(mut self, flags: TxFlags, remote_addr: u64, rkey: u32) -> io::Result<DciWriteWqeBuilder<'a, Entry, NoData>> {
+    pub fn write(mut self, flags: WqeFlags, remote_addr: u64, rkey: u32) -> io::Result<DciWriteWqeBuilder<'a, Entry, NoData>> {
         let max_wqebb = calc_max_wqebb_write(self.core.max_inline_data());
         if self.core.available() < max_wqebb {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -552,7 +552,7 @@ impl<'a, Entry> DciRoceSqWqeEntryPoint<'a, Entry> {
     /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the maximum
     /// possible WQE size (based on max_inline_data).
     #[inline]
-    pub fn write_imm(mut self, flags: TxFlags, remote_addr: u64, rkey: u32, imm: u32) -> io::Result<DciWriteWqeBuilder<'a, Entry, NoData>> {
+    pub fn write_imm(mut self, flags: WqeFlags, remote_addr: u64, rkey: u32, imm: u32) -> io::Result<DciWriteWqeBuilder<'a, Entry, NoData>> {
         let max_wqebb = calc_max_wqebb_write(self.core.max_inline_data());
         if self.core.available() < max_wqebb {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -571,7 +571,7 @@ impl<'a, Entry> DciRoceSqWqeEntryPoint<'a, Entry> {
     ///
     /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
     #[inline]
-    pub fn read(mut self, flags: TxFlags, remote_addr: u64, rkey: u32) -> io::Result<DciReadWqeBuilder<'a, Entry, NoData>> {
+    pub fn read(mut self, flags: WqeFlags, remote_addr: u64, rkey: u32) -> io::Result<DciReadWqeBuilder<'a, Entry, NoData>> {
         let max_wqebb = calc_max_wqebb_read();
         if self.core.available() < max_wqebb {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -590,7 +590,7 @@ impl<'a, Entry> DciRoceSqWqeEntryPoint<'a, Entry> {
     ///
     /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
     #[inline]
-    pub fn cas(mut self, flags: TxFlags, remote_addr: u64, rkey: u32, swap: u64, compare: u64) -> io::Result<DciAtomicWqeBuilder<'a, Entry, NoData>> {
+    pub fn cas(mut self, flags: WqeFlags, remote_addr: u64, rkey: u32, swap: u64, compare: u64) -> io::Result<DciAtomicWqeBuilder<'a, Entry, NoData>> {
         let max_wqebb = calc_max_wqebb_atomic();
         if self.core.available() < max_wqebb {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -606,7 +606,7 @@ impl<'a, Entry> DciRoceSqWqeEntryPoint<'a, Entry> {
     ///
     /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
     #[inline]
-    pub fn fetch_add(mut self, flags: TxFlags, remote_addr: u64, rkey: u32, add_value: u64) -> io::Result<DciAtomicWqeBuilder<'a, Entry, NoData>> {
+    pub fn fetch_add(mut self, flags: WqeFlags, remote_addr: u64, rkey: u32, add_value: u64) -> io::Result<DciAtomicWqeBuilder<'a, Entry, NoData>> {
         let max_wqebb = calc_max_wqebb_atomic();
         if self.core.available() < max_wqebb {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -626,7 +626,7 @@ impl<'a, Entry> DciRoceSqWqeEntryPoint<'a, Entry> {
     ///
     /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
     #[inline]
-    pub fn nop(mut self, flags: TxFlags) -> io::Result<DciNopWqeBuilder<'a, Entry>> {
+    pub fn nop(mut self, flags: WqeFlags) -> io::Result<DciNopWqeBuilder<'a, Entry>> {
         let max_wqebb = calc_max_wqebb_nop();
         if self.core.available() < max_wqebb {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -897,7 +897,7 @@ impl<Entry, OnComplete> DciIb<Entry, OnComplete> {
     /// # Example
     /// ```ignore
     /// dci.sq_wqe(dc_key, dctn, dlid)?
-    ///     .write(TxFlags::empty(), remote_addr, rkey)
+    ///     .write(WqeFlags::empty(), remote_addr, rkey)
     ///     .sge(local_addr, len, lkey)
     ///     .finish_signaled(entry)?;
     /// dci.ring_sq_doorbell();
@@ -918,7 +918,7 @@ impl<Entry, OnComplete> DciRoCE<Entry, OnComplete> {
     /// # Example
     /// ```ignore
     /// dci.sq_wqe(dc_key, dctn, &grh)?
-    ///     .write(TxFlags::empty(), remote_addr, rkey)
+    ///     .write(WqeFlags::empty(), remote_addr, rkey)
     ///     .sge(local_addr, len, lkey)
     ///     .finish_signaled(entry)?;
     /// dci.ring_sq_doorbell();
@@ -1027,7 +1027,7 @@ pub struct DciBlueflameWqeEntryPoint<'b, 'a, Entry> {
 impl<'b, 'a, Entry> DciBlueflameWqeEntryPoint<'b, 'a, Entry> {
     /// Start building a SEND WQE.
     #[inline]
-    pub fn send(self, flags: TxFlags) -> Result<DciBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
+    pub fn send(self, flags: WqeFlags) -> Result<DciBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
         let mut core = DciBlueflameWqeCore::new(self.batch)?;
         core.write_ctrl(WqeOpcode::Send, flags, 0);
         core.write_dc_av_ib()?;
@@ -1036,7 +1036,7 @@ impl<'b, 'a, Entry> DciBlueflameWqeEntryPoint<'b, 'a, Entry> {
 
     /// Start building a SEND with immediate data WQE.
     #[inline]
-    pub fn send_imm(self, flags: TxFlags, imm: u32) -> Result<DciBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
+    pub fn send_imm(self, flags: WqeFlags, imm: u32) -> Result<DciBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
         let mut core = DciBlueflameWqeCore::new(self.batch)?;
         core.write_ctrl(WqeOpcode::SendImm, flags, imm);
         core.write_dc_av_ib()?;
@@ -1045,7 +1045,7 @@ impl<'b, 'a, Entry> DciBlueflameWqeEntryPoint<'b, 'a, Entry> {
 
     /// Start building an RDMA WRITE WQE.
     #[inline]
-    pub fn write(self, flags: TxFlags, remote_addr: u64, rkey: u32) -> Result<DciBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
+    pub fn write(self, flags: WqeFlags, remote_addr: u64, rkey: u32) -> Result<DciBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
         let mut core = DciBlueflameWqeCore::new(self.batch)?;
         core.write_ctrl(WqeOpcode::RdmaWrite, flags, 0);
         core.write_dc_av_ib()?;
@@ -1055,7 +1055,7 @@ impl<'b, 'a, Entry> DciBlueflameWqeEntryPoint<'b, 'a, Entry> {
 
     /// Start building an RDMA WRITE with immediate data WQE.
     #[inline]
-    pub fn write_imm(self, flags: TxFlags, remote_addr: u64, rkey: u32, imm: u32) -> Result<DciBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
+    pub fn write_imm(self, flags: WqeFlags, remote_addr: u64, rkey: u32, imm: u32) -> Result<DciBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
         let mut core = DciBlueflameWqeCore::new(self.batch)?;
         core.write_ctrl(WqeOpcode::RdmaWriteImm, flags, imm);
         core.write_dc_av_ib()?;
@@ -1094,7 +1094,7 @@ impl<'b, 'a, Entry> DciBlueflameWqeCore<'b, 'a, Entry> {
     }
 
     #[inline]
-    fn write_ctrl(&mut self, opcode: WqeOpcode, flags: TxFlags, imm: u32) {
+    fn write_ctrl(&mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) {
         let wqe_idx = self.batch.sq.pi.get();
         let flags = WqeFlags::from_bits_truncate(flags.bits());
         unsafe {
@@ -1263,8 +1263,8 @@ impl<Entry, OnComplete> DciIb<Entry, OnComplete> {
     /// # Example
     /// ```ignore
     /// let mut bf = dci.blueflame_sq_wqe(dc_key, dctn, dlid)?;
-    /// bf.wqe()?.send(TxFlags::empty()).inline(&data).finish()?;
-    /// bf.wqe()?.send(TxFlags::empty()).inline(&data).finish()?;
+    /// bf.wqe()?.send(WqeFlags::empty()).inline(&data).finish()?;
+    /// bf.wqe()?.send(WqeFlags::empty()).inline(&data).finish()?;
     /// bf.finish();
     /// ```
     ///
@@ -1373,7 +1373,7 @@ pub struct DciRoceBlueflameWqeEntryPoint<'b, 'a, Entry> {
 impl<'b, 'a, Entry> DciRoceBlueflameWqeEntryPoint<'b, 'a, Entry> {
     /// Start building a SEND WQE.
     #[inline]
-    pub fn send(self, flags: TxFlags) -> Result<DciRoceBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
+    pub fn send(self, flags: WqeFlags) -> Result<DciRoceBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
         let mut core = DciRoceBlueflameWqeCore::new(self.batch)?;
         core.write_ctrl(WqeOpcode::Send, flags, 0);
         core.write_dc_av_roce()?;
@@ -1382,7 +1382,7 @@ impl<'b, 'a, Entry> DciRoceBlueflameWqeEntryPoint<'b, 'a, Entry> {
 
     /// Start building a SEND with immediate WQE.
     #[inline]
-    pub fn send_imm(self, flags: TxFlags, imm: u32) -> Result<DciRoceBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
+    pub fn send_imm(self, flags: WqeFlags, imm: u32) -> Result<DciRoceBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
         let mut core = DciRoceBlueflameWqeCore::new(self.batch)?;
         core.write_ctrl(WqeOpcode::SendImm, flags, imm);
         core.write_dc_av_roce()?;
@@ -1391,7 +1391,7 @@ impl<'b, 'a, Entry> DciRoceBlueflameWqeEntryPoint<'b, 'a, Entry> {
 
     /// Start building an RDMA WRITE WQE.
     #[inline]
-    pub fn write(self, flags: TxFlags, remote_addr: u64, rkey: u32) -> Result<DciRoceBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
+    pub fn write(self, flags: WqeFlags, remote_addr: u64, rkey: u32) -> Result<DciRoceBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
         let mut core = DciRoceBlueflameWqeCore::new(self.batch)?;
         core.write_ctrl(WqeOpcode::RdmaWrite, flags, 0);
         core.write_dc_av_roce()?;
@@ -1401,7 +1401,7 @@ impl<'b, 'a, Entry> DciRoceBlueflameWqeEntryPoint<'b, 'a, Entry> {
 
     /// Start building an RDMA WRITE with immediate WQE.
     #[inline]
-    pub fn write_imm(self, flags: TxFlags, remote_addr: u64, rkey: u32, imm: u32) -> Result<DciRoceBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
+    pub fn write_imm(self, flags: WqeFlags, remote_addr: u64, rkey: u32, imm: u32) -> Result<DciRoceBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
         let mut core = DciRoceBlueflameWqeCore::new(self.batch)?;
         core.write_ctrl(WqeOpcode::RdmaWriteImm, flags, imm);
         core.write_dc_av_roce()?;
@@ -1440,7 +1440,7 @@ impl<'b, 'a, Entry> DciRoceBlueflameWqeCore<'b, 'a, Entry> {
     }
 
     #[inline]
-    fn write_ctrl(&mut self, opcode: WqeOpcode, flags: TxFlags, imm: u32) {
+    fn write_ctrl(&mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) {
         let wqe_idx = self.batch.sq.pi.get();
         let flags = WqeFlags::from_bits_truncate(flags.bits());
         unsafe {
@@ -1609,8 +1609,8 @@ impl<Entry, OnComplete> DciRoCE<Entry, OnComplete> {
     /// # Example
     /// ```ignore
     /// let mut bf = dci.blueflame_sq_wqe(dc_key, dctn, &grh)?;
-    /// bf.wqe()?.send(TxFlags::empty()).inline(&data).finish()?;
-    /// bf.wqe()?.send(TxFlags::empty()).inline(&data).finish()?;
+    /// bf.wqe()?.send(WqeFlags::empty()).inline(&data).finish()?;
+    /// bf.wqe()?.send(WqeFlags::empty()).inline(&data).finish()?;
     /// bf.finish();
     /// ```
     ///

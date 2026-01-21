@@ -67,14 +67,6 @@ pub enum QpState {
     Error,
 }
 
-/// Remote QP information for connection (InfiniBand).
-///
-/// This is an alias for [`IbRemoteQpInfo`] for backward compatibility.
-/// New code should use [`IbRemoteQpInfo`] directly.
-///
-/// For RoCE, use [`crate::transport::RoCERemoteQpInfo`] instead.
-pub type RemoteQpInfo = IbRemoteQpInfo;
-
 /// QP internal info obtained from mlx5dv_init_obj.
 #[derive(Debug)]
 pub(crate) struct QpInfo {
@@ -615,7 +607,7 @@ impl<SqEntry, RqEntry, TableType, Rq, OnSqComplete, OnRqComplete> RcQp<SqEntry, 
     /// Uses LID-based addressing for InfiniBand fabric.
     pub fn modify_to_rtr(
         &mut self,
-        remote: &RemoteQpInfo,
+        remote: &IbRemoteQpInfo,
         port: u8,
         max_dest_rd_atomic: u8,
     ) -> io::Result<()> {
@@ -663,7 +655,7 @@ impl<SqEntry, RqEntry, TableType, Rq, OnSqComplete, OnRqComplete> RcQp<SqEntry, 
     /// Transitions the QP through RESET -> INIT -> RTR -> RTS.
     pub fn connect(
         &mut self,
-        remote: &RemoteQpInfo,
+        remote: &IbRemoteQpInfo,
         port: u8,
         local_psn: u32,
         max_rd_atomic: u8,

@@ -4,7 +4,8 @@ mod common;
 
 use common::{TestContext, full_access};
 use mlx5::cq::CqConfig;
-use mlx5::qp::{RcQpConfig, RemoteQpInfo};
+use mlx5::qp::RcQpConfig;
+use mlx5::transport::IbRemoteQpInfo;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
@@ -71,7 +72,7 @@ fn test_qp_destroy_after_remote_gone() {
     let port = 1u8;
 
     // Connect QP1 -> QP2
-    let remote1 = RemoteQpInfo {
+    let remote1 = IbRemoteQpInfo {
         qp_number: qp2.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx2.port_attr.lid,
@@ -81,7 +82,7 @@ fn test_qp_destroy_after_remote_gone() {
         .expect("connect qp1");
 
     // Connect QP2 -> QP1
-    let remote2 = RemoteQpInfo {
+    let remote2 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx1.port_attr.lid,
@@ -183,7 +184,7 @@ fn test_qp_destroy_multi_thread() {
         let (client_qpn, client_lid) = rx2.recv().unwrap();
 
         // Connect
-        let client_remote = RemoteQpInfo {
+        let client_remote = IbRemoteQpInfo {
             qp_number: client_qpn,
             packet_sequence_number: 0,
             local_identifier: client_lid,
@@ -246,7 +247,7 @@ fn test_qp_destroy_multi_thread() {
     tx2.send((qp.borrow().qpn(), ctx.port_attr.lid)).unwrap();
 
     // Connect
-    let server_remote = RemoteQpInfo {
+    let server_remote = IbRemoteQpInfo {
         qp_number: server_qpn,
         packet_sequence_number: 0,
         local_identifier: server_lid,
@@ -352,7 +353,7 @@ fn test_qp_destroy_after_data_transfer() {
         let (client_qpn, client_lid, _client_buf, _client_rkey) = rx2.recv().unwrap();
 
         // Connect
-        let client_remote = RemoteQpInfo {
+        let client_remote = IbRemoteQpInfo {
             qp_number: client_qpn,
             packet_sequence_number: 0,
             local_identifier: client_lid,
@@ -429,7 +430,7 @@ fn test_qp_destroy_after_data_transfer() {
         .unwrap();
 
     // Connect
-    let server_remote = RemoteQpInfo {
+    let server_remote = IbRemoteQpInfo {
         qp_number: server_qpn,
         packet_sequence_number: 0,
         local_identifier: server_lid,
@@ -487,7 +488,7 @@ fn test_qp_destroy_after_data_transfer() {
 /// This mimics the benchmark's behavior more closely.
 #[test]
 fn test_qp_destroy_after_actual_send_recv() {
-    use mlx5::wqe::TxFlags;
+    use mlx5::wqe::WqeFlags;
     use std::cell::Cell;
     use std::sync::{
         Arc,
@@ -562,7 +563,7 @@ fn test_qp_destroy_after_actual_send_recv() {
         let (client_qpn, client_lid) = rx2.recv().unwrap();
 
         // Connect
-        let client_remote = RemoteQpInfo {
+        let client_remote = IbRemoteQpInfo {
             qp_number: client_qpn,
             packet_sequence_number: 0,
             local_identifier: client_lid,
@@ -607,7 +608,7 @@ fn test_qp_destroy_after_actual_send_recv() {
                 let _ = qp
                     .borrow_mut()
                     .sq_wqe()
-                    .and_then(|b| b.send(TxFlags::empty()))
+                    .and_then(|b| b.send(WqeFlags::empty()))
                     .map(|b| {
                         b.sge(buf.addr() + offset, 32, mr.lkey())
                             .finish_signaled(idx as u64)
@@ -689,7 +690,7 @@ fn test_qp_destroy_after_actual_send_recv() {
     tx2.send((qp.borrow().qpn(), ctx.port_attr.lid)).unwrap();
 
     // Connect
-    let server_remote = RemoteQpInfo {
+    let server_remote = IbRemoteQpInfo {
         qp_number: server_qpn,
         packet_sequence_number: 0,
         local_identifier: server_lid,
@@ -726,7 +727,7 @@ fn test_qp_destroy_after_actual_send_recv() {
         let _ = qp
             .borrow_mut()
             .sq_wqe()
-            .and_then(|b| b.send(TxFlags::empty()))
+            .and_then(|b| b.send(WqeFlags::empty()))
             .map(|b| {
                 b.sge(buf.addr() + offset, 32, mr.lkey())
                     .finish_signaled(i as u64)
@@ -768,7 +769,7 @@ fn test_qp_destroy_after_actual_send_recv() {
                 let _ = qp
                     .borrow_mut()
                     .sq_wqe()
-                    .and_then(|b| b.send(TxFlags::empty()))
+                    .and_then(|b| b.send(WqeFlags::empty()))
                     .map(|b| {
                         b.sge(buf.addr() + offset, 32, mr.lkey())
                             .finish_signaled(idx as u64)

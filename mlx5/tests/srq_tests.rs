@@ -18,7 +18,7 @@ use std::rc::Rc;
 use mlx5::cq::CqConfig;
 use mlx5::dc::{DciConfig, DctConfig};
 use mlx5::srq::SrqConfig;
-use mlx5::wqe::{TxFlags, WqeFlags, WqeOpcode};
+use mlx5::wqe::{WqeFlags, WqeOpcode};
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
@@ -201,7 +201,7 @@ fn test_srq_with_dct_send() {
     dci.borrow_mut()
         .sq_wqe(dc_key, dctn, dlid)
         .expect("sq_wqe failed")
-        .send(TxFlags::empty())
+        .send(WqeFlags::empty())
         .expect("send failed")
         .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
         .finish_signaled(1u64)
@@ -335,7 +335,7 @@ fn test_srq_shared_by_multiple_dcts() {
         dci.borrow_mut()
             .sq_wqe(dct.dc_key(), dct.dctn(), dlid)
             .expect("sq_wqe failed")
-            .send(TxFlags::empty())
+            .send(WqeFlags::empty())
             .expect("send failed")
             .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
             .finish_signaled((i + 1) as u64)

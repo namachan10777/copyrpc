@@ -20,7 +20,7 @@ use std::rc::Rc;
 use mlx5::cq::CqConfig;
 use mlx5::pd::RemoteUdQpInfo;
 use mlx5::ud::{UdQpConfig, UdQpState};
-use mlx5::wqe::{TxFlags, WqeFlags, WqeOpcode};
+use mlx5::wqe::{WqeFlags, WqeOpcode};
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
@@ -201,7 +201,7 @@ fn test_ud_send_recv() {
         .borrow()
         .sq_wqe(&ah)
         .expect("sq_wqe failed")
-        .send(TxFlags::empty())
+        .send(WqeFlags::empty())
         .expect("send failed")
         .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
         .finish_signaled(1u64)
@@ -339,7 +339,7 @@ fn test_ud_send_raw_av() {
         .borrow()
         .sq_wqe(&ah)
         .expect("sq_wqe failed")
-        .send(TxFlags::empty())
+        .send(WqeFlags::empty())
         .expect("send failed")
         .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
         .finish_signaled(1u64)
@@ -480,7 +480,7 @@ fn test_ud_multiple_destinations() {
             .borrow()
             .sq_wqe(&ah)
             .expect("sq_wqe failed")
-            .send(TxFlags::empty())
+            .send(WqeFlags::empty())
             .expect("send failed")
             .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
             .finish_signaled((i + 1) as u64)

@@ -24,8 +24,9 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use mlx5::cq::{CqConfig, Cqe};
-use mlx5::qp::{RcQpConfig, RemoteQpInfo};
-use mlx5::wqe::TxFlags;
+use mlx5::qp::RcQpConfig;
+use mlx5::transport::IbRemoteQpInfo;
+use mlx5::wqe::WqeFlags;
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
@@ -93,12 +94,12 @@ fn test_scatter_to_cqe_diagnostic() {
         .expect("Failed to create QP2");
 
     // Connect QPs
-    let remote1 = RemoteQpInfo {
+    let remote1 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
     };
-    let remote2 = RemoteQpInfo {
+    let remote2 = IbRemoteQpInfo {
         qp_number: qp2.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
@@ -152,7 +153,7 @@ fn test_scatter_to_cqe_diagnostic() {
             .borrow_mut()
             .sq_wqe()
             .expect("sq_wqe failed")
-            .send(TxFlags::empty())
+            .send(WqeFlags::empty())
             .expect("send failed")
             .sge(send_buf.addr(), size as u32, send_mr.lkey())
             .finish_signaled(i as u64);
@@ -289,12 +290,12 @@ fn test_scatter_to_cqe_disabled() {
         .build()
         .expect("Failed to create QP2");
 
-    let remote1 = RemoteQpInfo {
+    let remote1 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
     };
-    let remote2 = RemoteQpInfo {
+    let remote2 = IbRemoteQpInfo {
         qp_number: qp2.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
@@ -342,7 +343,7 @@ fn test_scatter_to_cqe_disabled() {
             .borrow_mut()
             .sq_wqe()
             .expect("sq_wqe failed")
-            .send(TxFlags::empty())
+            .send(WqeFlags::empty())
             .expect("send failed")
             .inline(&test_data)
             .finish_signaled(i as u64);
@@ -437,12 +438,12 @@ fn test_small_inline_wraparound() {
         .build()
         .expect("Failed to create QP2");
 
-    let remote1 = RemoteQpInfo {
+    let remote1 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
     };
-    let remote2 = RemoteQpInfo {
+    let remote2 = IbRemoteQpInfo {
         qp_number: qp2.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
@@ -489,7 +490,7 @@ fn test_small_inline_wraparound() {
                 .borrow_mut()
                 .sq_wqe()
                 .expect("sq_wqe failed")
-                .send(TxFlags::empty())
+                .send(WqeFlags::empty())
                 .expect("send failed")
                 .inline(&test_data)
                 .finish_signaled((size * 100 + i) as u64);

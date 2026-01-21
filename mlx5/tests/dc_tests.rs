@@ -21,7 +21,7 @@ use std::rc::Rc;
 use mlx5::cq::CqConfig;
 use mlx5::dc::{DciConfig, DctConfig};
 use mlx5::srq::SrqConfig;
-use mlx5::wqe::{TxFlags, WqeFlags, WqeOpcode};
+use mlx5::wqe::{WqeFlags, WqeOpcode};
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
@@ -178,7 +178,7 @@ fn test_dc_rdma_write() {
     dci.borrow_mut()
         .sq_wqe(dc_key, dctn, dlid)
         .expect("sq_wqe failed")
-        .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+        .write(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
         .expect("write failed")
         .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
         .finish_signaled(1u64)
@@ -284,7 +284,7 @@ fn test_dc_rdma_read() {
     dci.borrow_mut()
         .sq_wqe(dc_key, dctn, dlid)
         .expect("sq_wqe failed")
-        .read(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+        .read(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
         .expect("read failed")
         .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
         .finish_signaled(1u64)
@@ -394,7 +394,7 @@ fn test_dc_multiple_dci() {
         dci.borrow_mut()
             .sq_wqe(dc_key, dctn, dlid)
             .expect("sq_wqe failed")
-            .write(TxFlags::empty(), remote_buf.addr() + offset as u64, remote_mr.rkey())
+            .write(WqeFlags::empty(), remote_buf.addr() + offset as u64, remote_mr.rkey())
             .expect("write failed")
             .sge(
                 local_bufs[i].addr(),
@@ -500,7 +500,7 @@ fn test_dc_inline_data() {
     dci.borrow_mut()
         .sq_wqe(dc_key, dctn, dlid)
         .expect("sq_wqe failed")
-        .write(TxFlags::COMPLETION, remote_buf.addr(), remote_mr.rkey())
+        .write(WqeFlags::COMPLETION, remote_buf.addr(), remote_mr.rkey())
         .expect("write failed")
         .inline(test_data)
         .finish_signaled(1u64)

@@ -61,14 +61,6 @@ pub enum DcQpState {
     Error,
 }
 
-/// Remote DCT information for sending (InfiniBand).
-///
-/// This is an alias for [`IbRemoteDctInfo`] for backward compatibility.
-/// New code should use [`IbRemoteDctInfo`] directly.
-///
-/// For RoCE, use [`crate::transport::RoCERemoteDctInfo`] instead.
-pub type RemoteDctInfo = IbRemoteDctInfo;
-
 // =============================================================================
 // DCI Send Queue State
 // =============================================================================
@@ -914,8 +906,8 @@ impl<T> Dct<T> {
     }
 
     /// Get remote DCT info for senders.
-    pub fn remote_info(&self, local_identifier: u16) -> RemoteDctInfo {
-        RemoteDctInfo {
+    pub fn remote_info(&self, local_identifier: u16) -> IbRemoteDctInfo {
+        IbRemoteDctInfo {
             dct_number: self.dctn(),
             dc_key: self.dc_key,
             local_identifier,

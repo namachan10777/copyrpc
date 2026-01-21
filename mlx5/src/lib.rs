@@ -95,31 +95,6 @@ pub mod types;
 pub mod ud;
 pub mod wqe;
 
-// Re-export CQ and CQE types
-pub use cq::{CqConfig, CqeCompressionFormat, CqModeration, CqeSize, Cqe, CqeOpcode};
-
-// Re-export MonoCq types for inlined callback dispatch
-pub use mono_cq::{CompletionSource, MonoCq, MonoCqRc};
-pub use qp::RcQpForMonoCq;
-
-// Re-export RQ type markers for SRQ support
-pub use qp::{OwnedRq, SharedRq, RcQpIbWithSrq, RcQpRoCEWithSrq};
-pub use ud::{UdOwnedRq, UdSharedRq, UdQpIb, UdQpIbWithSrq, UdQpRoCE, UdQpRoCEWithSrq};
-
-// Re-export Builder types for QP creation
-pub use qp::{NoCq, CqSet, RcQpBuilder};
-pub use ud::UdQpBuilder;
-
-// Re-export TM-SRQ types
-pub use tm_srq::builder::RqWqeBuilder;
-pub use tm_srq::TmSrqCompletion;
-
-// Re-export transport types for IB/RoCE distinction
-pub use transport::{InfiniBand, RoCE, Transport, IbRemoteQpInfo, RoCERemoteQpInfo, IbRemoteDctInfo, RoCERemoteDctInfo};
-
-// Re-export GID/GRH types for RoCE
-pub use types::{Gid, GrhAttr};
-
 /// Trait for queues that can receive completion notifications from a CQ.
 ///
 /// Implemented by RcQp, UdQp, Dci, TmSrq, etc.
@@ -130,5 +105,5 @@ pub trait CompletionTarget {
     /// Dispatch a CQE to this queue.
     ///
     /// Called by Cq::poll() when a CQE for this queue is received.
-    fn dispatch_cqe(&self, cqe: Cqe);
+    fn dispatch_cqe(&self, cqe: cq::Cqe);
 }

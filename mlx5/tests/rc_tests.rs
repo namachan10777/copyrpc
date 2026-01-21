@@ -17,8 +17,9 @@ mod common;
 use std::rc::Rc;
 
 use mlx5::cq::CqConfig;
-use mlx5::qp::{QpState, RcQpConfig, RcQpIb, RemoteQpInfo};
-use mlx5::wqe::TxFlags;
+use mlx5::qp::{QpState, RcQpConfig, RcQpIb};
+use mlx5::transport::IbRemoteQpInfo;
+use mlx5::wqe::WqeFlags;
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
@@ -71,12 +72,12 @@ fn create_rc_loopback_pair(ctx: &TestContext) -> RcLoopbackPair {
         .expect("Failed to create QP2");
 
     // Connect QPs to each other
-    let remote1 = RemoteQpInfo {
+    let remote1 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
     };
-    let remote2 = RemoteQpInfo {
+    let remote2 = IbRemoteQpInfo {
         qp_number: qp2.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
@@ -181,7 +182,7 @@ fn test_rc_rdma_write() {
         let mut bf = qp1_ref.blueflame_sq_wqe().expect("blueflame_sq_wqe failed");
         bf.wqe()
             .expect("wqe failed")
-            .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+            .write(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
             .expect("write failed")
             .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
             .expect("sge failed")
@@ -251,7 +252,7 @@ fn test_rc_rdma_read() {
     qp1.borrow_mut()
         .sq_wqe()
         .expect("sq_wqe failed")
-        .read(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+        .read(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
         .expect("read failed")
         .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
         .finish_signaled(1u64)
@@ -316,7 +317,7 @@ fn test_rc_atomic_cas_success() {
     qp1.borrow_mut()
         .sq_wqe()
         .expect("sq_wqe failed")
-        .cas(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey(), swap_value, compare_value)
+        .cas(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey(), swap_value, compare_value)
         .expect("cas failed")
         .sge(local_buf.addr(), 8, local_mr.lkey())
         .finish_signaled(1u64)
@@ -393,7 +394,7 @@ fn test_rc_atomic_cas_failure() {
     qp1.borrow_mut()
         .sq_wqe()
         .expect("sq_wqe failed")
-        .cas(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey(), swap_value, compare_value)
+        .cas(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey(), swap_value, compare_value)
         .expect("cas failed")
         .sge(local_buf.addr(), 8, local_mr.lkey())
         .finish_signaled(1u64)
@@ -467,7 +468,7 @@ fn test_rc_atomic_fa() {
     qp1.borrow_mut()
         .sq_wqe()
         .expect("sq_wqe failed")
-        .fetch_add(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey(), add_value)
+        .fetch_add(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey(), add_value)
         .expect("fetch_add failed")
         .sge(local_buf.addr(), 8, local_mr.lkey())
         .finish_signaled(1u64)
@@ -573,7 +574,7 @@ fn test_rc_rdma_write_imm() {
     qp1.borrow_mut()
         .sq_wqe()
         .expect("sq_wqe failed")
-        .write_imm(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey(), imm_data)
+        .write_imm(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey(), imm_data)
         .expect("write_imm failed")
         .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
         .finish_signaled(1u64)
@@ -668,12 +669,12 @@ fn test_rc_send_recv() {
         .expect("Failed to create QP2");
 
     // Connect QPs
-    let remote1 = RemoteQpInfo {
+    let remote1 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
     };
-    let remote2 = RemoteQpInfo {
+    let remote2 = IbRemoteQpInfo {
         qp_number: qp2.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
@@ -723,7 +724,7 @@ fn test_rc_send_recv() {
     qp1.borrow_mut()
         .sq_wqe()
         .expect("sq_wqe failed")
-        .send(TxFlags::empty())
+        .send(WqeFlags::empty())
         .expect("send failed")
         .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
         .finish_signaled(1u64)
@@ -843,12 +844,12 @@ fn test_rc_send_recv_pingpong() {
         .expect("Failed to create QP2");
 
     // Connect QPs
-    let remote1 = RemoteQpInfo {
+    let remote1 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
     };
-    let remote2 = RemoteQpInfo {
+    let remote2 = IbRemoteQpInfo {
         qp_number: qp2.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
@@ -884,7 +885,7 @@ fn test_rc_send_recv_pingpong() {
         qp1.borrow_mut()
             .sq_wqe()
             .expect("sq_wqe")
-            .send(TxFlags::COMPLETION)
+            .send(WqeFlags::COMPLETION)
             .expect("send")
             .sge(buf1.addr(), 32, mr1.lkey())
             .finish_signaled(i as u64)
@@ -923,7 +924,7 @@ fn test_rc_send_recv_pingpong() {
         qp2.borrow_mut()
             .sq_wqe()
             .expect("sq_wqe")
-            .send(TxFlags::COMPLETION)
+            .send(WqeFlags::COMPLETION)
             .expect("send")
             .sge(buf2.addr(), 32, mr2.lkey())
             .finish_signaled(i as u64)
@@ -989,7 +990,7 @@ fn test_rc_inline_data() {
     qp1.borrow_mut()
         .sq_wqe()
         .expect("sq_wqe failed")
-        .write(TxFlags::COMPLETION, remote_buf.addr(), remote_mr.rkey())
+        .write(WqeFlags::COMPLETION, remote_buf.addr(), remote_mr.rkey())
         .expect("write failed")
         .inline(test_data)
         .finish_signaled(1u64)
@@ -1043,7 +1044,7 @@ fn test_rc_wqe_builder_unsignaled() {
     qp1.borrow_mut()
         .sq_wqe()
         .expect("sq_wqe failed")
-        .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+        .write(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
         .expect("write failed")
         .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
         .finish_unsignaled()
@@ -1054,7 +1055,7 @@ fn test_rc_wqe_builder_unsignaled() {
     qp1.borrow_mut()
         .sq_wqe()
         .expect("sq_wqe failed")
-        .write(TxFlags::COMPLETION, remote_buf.addr(), remote_mr.rkey())
+        .write(WqeFlags::COMPLETION, remote_buf.addr(), remote_mr.rkey())
         .expect("write failed")
         .sge(local_buf.addr(), 1, local_mr.lkey())
         .finish_signaled(1u64)

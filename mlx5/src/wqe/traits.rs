@@ -42,8 +42,6 @@
 //! Builders start in `NoData` state. After calling `sge()` or `inline()`,
 //! they transition to `HasData` state. Only `HasData` state allows `finish_*()` methods.
 
-use crate::wqe::WqeFlags;
-
 // =============================================================================
 // Transport Type Tags
 // =============================================================================
@@ -108,15 +106,6 @@ impl Av for &GrhAttr {
     }
 }
 
-// =============================================================================
-// Flags
-// =============================================================================
-
-/// Transmission flags for WQE operations.
-///
-/// This is an alias for `WqeFlags`. The `COMPLETION` flag is automatically
-/// set when using `finish_signaled(entry)`, so users typically don't need to set it.
-pub type TxFlags = WqeFlags;
 
 // =============================================================================
 // Data State Markers

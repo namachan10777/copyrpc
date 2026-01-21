@@ -15,10 +15,11 @@ use std::rc::Rc;
 use mlx5::cq::{Cq, CqConfig};
 use mlx5::dc::{DciConfig, DctConfig};
 use mlx5::pd::RemoteUdQpInfo;
-use mlx5::qp::{RcQpConfig, RemoteQpInfo};
+use mlx5::qp::RcQpConfig;
 use mlx5::srq::SrqConfig;
+use mlx5::transport::IbRemoteQpInfo;
 use mlx5::ud::UdQpConfig;
-use mlx5::wqe::TxFlags;
+use mlx5::wqe::WqeFlags;
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_batch, poll_cq_timeout};
 
@@ -77,12 +78,12 @@ fn test_rc_rdma_write_wraparound() {
         .expect("Failed to create QP2");
 
     // Connect QPs
-    let remote1 = RemoteQpInfo {
+    let remote1 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
     };
-    let remote2 = RemoteQpInfo {
+    let remote2 = IbRemoteQpInfo {
         qp_number: qp2.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
@@ -126,7 +127,7 @@ fn test_rc_rdma_write_wraparound() {
         qp1.borrow_mut()
             .sq_wqe()
             .expect("sq_wqe failed")
-            .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+            .write(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
             .expect("write failed")
             .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
             .finish_signaled(i as u64)
@@ -198,12 +199,12 @@ fn test_rc_ring_sq_doorbell() {
         .build()
         .expect("Failed to create QP2");
 
-    let remote1 = RemoteQpInfo {
+    let remote1 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
     };
-    let remote2 = RemoteQpInfo {
+    let remote2 = IbRemoteQpInfo {
         qp_number: qp2.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
@@ -239,7 +240,7 @@ fn test_rc_ring_sq_doorbell() {
     qp1.borrow_mut()
         .sq_wqe()
         .expect("sq_wqe failed")
-        .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+        .write(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
         .expect("write failed")
         .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
         .finish_signaled(1u64);
@@ -351,7 +352,7 @@ fn test_dc_rdma_write_wraparound() {
         dci.borrow_mut()
             .sq_wqe(dc_key, dctn, dlid)
             .expect("sq_wqe failed")
-            .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+            .write(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
             .expect("write failed")
             .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
             .finish_signaled(i as u64)
@@ -456,7 +457,7 @@ fn test_dc_ring_sq_doorbell() {
     dci.borrow_mut()
         .sq_wqe(dc_key, dctn, dlid)
         .expect("sq_wqe failed")
-        .write(TxFlags::empty(), remote_buf.addr(), remote_mr.rkey())
+        .write(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
         .expect("write failed")
         .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
         .finish_signaled(1u64);
@@ -577,7 +578,7 @@ fn test_ud_send_wraparound() {
             .borrow()
             .sq_wqe(&ah)
             .expect("sq_wqe failed")
-            .send(TxFlags::empty())
+            .send(WqeFlags::empty())
             .expect("send failed")
             .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
             .finish_signaled(i as u64)
@@ -669,12 +670,12 @@ fn test_rc_inline_wraparound() {
         .expect("Failed to create QP2");
 
     // Connect QPs
-    let remote1 = RemoteQpInfo {
+    let remote1 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
     };
-    let remote2 = RemoteQpInfo {
+    let remote2 = IbRemoteQpInfo {
         qp_number: qp2.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
@@ -720,7 +721,7 @@ fn test_rc_inline_wraparound() {
             .borrow_mut()
             .sq_wqe()
             .expect("sq_wqe failed")
-            .send(TxFlags::empty())
+            .send(WqeFlags::empty())
             .expect("send failed")
             .inline(&test_data)
             .finish_signaled(i as u64)
@@ -814,12 +815,12 @@ fn test_rc_inline_variable_size_wraparound() {
         .expect("Failed to create QP2");
 
     // Connect QPs
-    let remote1 = RemoteQpInfo {
+    let remote1 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
     };
-    let remote2 = RemoteQpInfo {
+    let remote2 = IbRemoteQpInfo {
         qp_number: qp2.borrow().qpn(),
         packet_sequence_number: 0,
         local_identifier: ctx.port_attr.lid,
@@ -863,7 +864,7 @@ fn test_rc_inline_variable_size_wraparound() {
         qp1.borrow_mut()
             .sq_wqe()
             .expect("sq_wqe failed")
-            .send(TxFlags::empty())
+            .send(WqeFlags::empty())
             .expect("send failed")
             .inline(&test_data)
             .finish_signaled(i as u64)

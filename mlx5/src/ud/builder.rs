@@ -7,7 +7,7 @@ use std::marker::PhantomData;
 use crate::pd::AddressHandle;
 use crate::wqe::{
     CTRL_SEG_SIZE, DATA_SEG_SIZE, HasData, NoData, OrderedWqeTable,
-    SubmissionError, TxFlags, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
+    SubmissionError, WqeFlags, WQEBB_SIZE, WqeHandle, WqeOpcode, calc_wqebb_cnt,
     set_ctrl_seg_completion_flag, update_ctrl_seg_ds_cnt, update_ctrl_seg_wqe_idx,
     write_ctrl_seg, write_data_seg, write_inline_header,
 };
@@ -223,7 +223,7 @@ impl<'a, Entry> UdSqWqeEntryPoint<'a, Entry> {
     /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the maximum
     /// possible WQE size (based on max_inline_data).
     #[inline]
-    pub fn send(mut self, flags: TxFlags) -> io::Result<UdSendWqeBuilder<'a, Entry, NoData>> {
+    pub fn send(mut self, flags: WqeFlags) -> io::Result<UdSendWqeBuilder<'a, Entry, NoData>> {
         let max_wqebb = calc_ud_max_wqebb_send(self.core.max_inline_data());
         if self.core.available() < max_wqebb {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -243,7 +243,7 @@ impl<'a, Entry> UdSqWqeEntryPoint<'a, Entry> {
     #[inline]
     pub fn send_imm(
         mut self,
-        flags: TxFlags,
+        flags: WqeFlags,
         imm: u32,
     ) -> io::Result<UdSendWqeBuilder<'a, Entry, NoData>> {
         let max_wqebb = calc_ud_max_wqebb_send(self.core.max_inline_data());
@@ -338,7 +338,7 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIb<SqEntry, RqEntry, OnSq
     /// # Example
     /// ```ignore
     /// qp.sq_wqe(&ah)?
-    ///     .send(TxFlags::empty())?
+    ///     .send(WqeFlags::empty())?
     ///     .sge(addr, len, lkey)
     ///     .finish_signaled(entry)?;
     /// qp.ring_sq_doorbell();
@@ -429,8 +429,8 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIb<SqEntry, RqEntry, OnSq
     /// # Example
     /// ```ignore
     /// let mut bf = qp.blueflame_sq_wqe(&ah)?;
-    /// bf.wqe()?.send(TxFlags::empty()).inline(&data).finish()?;
-    /// bf.wqe()?.send(TxFlags::empty()).inline(&data).finish()?;
+    /// bf.wqe()?.send(WqeFlags::empty()).inline(&data).finish()?;
+    /// bf.wqe()?.send(WqeFlags::empty()).inline(&data).finish()?;
     /// bf.finish();
     /// ```
     ///
@@ -673,7 +673,7 @@ pub struct UdBlueflameWqeEntryPoint<'b, 'a, Entry> {
 impl<'b, 'a, Entry> UdBlueflameWqeEntryPoint<'b, 'a, Entry> {
     /// Start building a SEND WQE.
     #[inline]
-    pub fn send(self, flags: TxFlags) -> Result<UdBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
+    pub fn send(self, flags: WqeFlags) -> Result<UdBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
         let mut core = UdBlueflameWqeCore::new(self.batch)?;
         core.write_ctrl(WqeOpcode::Send, flags, 0);
         core.write_ud_addr()?;
@@ -682,7 +682,7 @@ impl<'b, 'a, Entry> UdBlueflameWqeEntryPoint<'b, 'a, Entry> {
 
     /// Start building a SEND with immediate data WQE.
     #[inline]
-    pub fn send_imm(self, flags: TxFlags, imm: u32) -> Result<UdBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
+    pub fn send_imm(self, flags: WqeFlags, imm: u32) -> Result<UdBlueflameWqeBuilder<'b, 'a, Entry, NoData>, SubmissionError> {
         let mut core = UdBlueflameWqeCore::new(self.batch)?;
         core.write_ctrl(WqeOpcode::SendImm, flags, imm);
         core.write_ud_addr()?;
@@ -720,7 +720,7 @@ impl<'b, 'a, Entry> UdBlueflameWqeCore<'b, 'a, Entry> {
     }
 
     #[inline]
-    fn write_ctrl(&mut self, opcode: WqeOpcode, flags: TxFlags, imm: u32) {
+    fn write_ctrl(&mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) {
         let wqe_idx = self.batch.sq.pi.get();
         let flags = WqeFlags::from_bits_truncate(flags.bits());
         unsafe {
