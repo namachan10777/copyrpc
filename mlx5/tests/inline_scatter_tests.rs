@@ -23,7 +23,7 @@ mod common;
 use std::cell::Cell;
 use std::rc::Rc;
 
-use mlx5::cq::Cqe;
+use mlx5::cq::{CqConfig, Cqe};
 use mlx5::qp::{RcQpConfig, RemoteQpInfo};
 use mlx5::wqe::TxFlags;
 
@@ -46,12 +46,12 @@ fn test_scatter_to_cqe_diagnostic() {
     };
 
     // Create CQs
-    let send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    let send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
+    let recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    let recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     // Configure QP with scatter-to-CQE enabled
@@ -245,12 +245,12 @@ fn test_scatter_to_cqe_disabled() {
         }
     };
 
-    let send_cq = ctx.ctx.create_cq(64).expect("Failed to create send CQ");
+    let send_cq = ctx.ctx.create_cq(64, &CqConfig::default()).expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let recv_cq1 = ctx.ctx.create_cq(64).expect("Failed to create recv CQ1");
+    let recv_cq1 = ctx.ctx.create_cq(64, &CqConfig::default()).expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let recv_cq2 = ctx.ctx.create_cq(64).expect("Failed to create recv CQ2");
+    let recv_cq2 = ctx.ctx.create_cq(64, &CqConfig::default()).expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     // Scatter-to-CQE disabled (default)
@@ -402,12 +402,12 @@ fn test_small_inline_wraparound() {
         }
     };
 
-    let send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    let send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
+    let recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    let recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     // Small queue to trigger wrap-around

@@ -40,7 +40,7 @@ use std::rc::{Rc, Weak};
 use std::{io, mem::MaybeUninit, ptr::NonNull};
 
 use crate::CompletionTarget;
-use crate::cq::{CompletionQueue, Cqe, CqeOpcode};
+use crate::cq::{Cq, Cqe, CqeOpcode};
 use crate::device::Context;
 use crate::pd::Pd;
 use crate::srq::SrqInfo;
@@ -282,7 +282,7 @@ pub struct TmSrq<CmdEntry, RecvEntry, OnComplete> {
     /// Callback for completion handling.
     callback: OnComplete,
     /// Weak reference to the CQ for unregistration on drop.
-    send_cq: Weak<CompletionQueue>,
+    send_cq: Weak<Cq>,
     /// Keep the PD alive while this TM-SRQ exists.
     _pd: Pd,
 }
@@ -303,7 +303,7 @@ impl Context {
     pub fn create_tm_srq<CmdEntry, RecvEntry, OnComplete>(
         &self,
         pd: &Pd,
-        cq: &Rc<CompletionQueue>,
+        cq: &Rc<Cq>,
         config: &TmSrqConfig,
         callback: OnComplete,
     ) -> io::Result<Rc<RefCell<TmSrq<CmdEntry, RecvEntry, OnComplete>>>>
@@ -364,7 +364,7 @@ impl Context {
     unsafe fn create_tm_srq_raw(
         &self,
         pd: &Pd,
-        cq: &Rc<CompletionQueue>,
+        cq: &Rc<Cq>,
         config: &TmSrqConfig,
     ) -> io::Result<(NonNull<mlx5_sys::ibv_srq>, u32)> {
         let mut attr: mlx5_sys::ibv_srq_init_attr_ex = MaybeUninit::zeroed().assume_init();

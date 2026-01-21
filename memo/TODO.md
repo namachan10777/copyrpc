@@ -1,6 +1,5 @@
 - DC Stream実装
   - 他のSend系とか異なり、Unorderedなので実装が異なる
-- DC Streamを実装した時に、型レベルでUnordered+Stream ID設定可能と、Sparse/DenseでStream id設定不可能の二択なっているか
 - mlx5拡張atomic命令サポート
 - RELAXED_ORDERING対応
   - 普通のSQ、DCIでもUnorderedは使用可能であるべき
@@ -9,12 +8,8 @@
   - これも型レベルでの保証かな
   - 構築時のジェネリクスで指定する。UseRelaxedOrdering型を指定すると、ジェネリクスによってRelaxed Orderingが存在するバージョンのFlagを使える。ただし、これを指定するとSparse/DenseではFenceが付かないとWQEBBの解放処理やcallbackを呼ぶ処理が行われないことに注意させる（これはドキュメントに明記かな）
 - 可能な限り`mlx5_`系の関数を使う。
-- UdQp, RcQpでSrqを使えるようにする
-  - ジェネリクスとimplを使って、非SrqだけQpにrq投入メソッドが生える様にする
 - callbackにCQE渡す
 - rxとtxのcallbackの型を分ける
   - MonoCqでもこれは問題なくできるはず。
-- DCでRoCEの場合にAV足りていない気がする。修正する。
 - mlx5 RawPacket対応
-- BlueFlameがInfinibandにしか対応していないものがある。修正する
 - `&mut`を使ってWQEBBが不正にならないことを適切に保証する

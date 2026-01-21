@@ -16,6 +16,7 @@ mod common;
 
 use std::rc::Rc;
 
+use mlx5::cq::CqConfig;
 use mlx5::qp::{QpState, RcQpConfig, RcQpIb, RemoteQpInfo};
 use mlx5::wqe::TxFlags;
 
@@ -31,9 +32,9 @@ type TestCallback = fn(mlx5::cq::Cqe, u64);
 pub struct RcLoopbackPair {
     pub qp1: Rc<std::cell::RefCell<RcQpIb<u64, u64, TestCallback, TestCallback>>>,
     pub qp2: Rc<std::cell::RefCell<RcQpIb<u64, u64, TestCallback, TestCallback>>>,
-    pub send_cq: Rc<mlx5::cq::CompletionQueue>,
-    _recv_cq1: Rc<mlx5::cq::CompletionQueue>,
-    _recv_cq2: Rc<mlx5::cq::CompletionQueue>,
+    pub send_cq: Rc<mlx5::cq::Cq>,
+    _recv_cq1: Rc<mlx5::cq::Cq>,
+    _recv_cq2: Rc<mlx5::cq::Cq>,
     // PD is kept alive via QP's internal Rc<Pd>
     _pd: mlx5::pd::Pd,
 }
@@ -41,11 +42,11 @@ pub struct RcLoopbackPair {
 /// Helper to create a loopback RC QP pair.
 fn create_rc_loopback_pair(ctx: &TestContext) -> RcLoopbackPair {
     // Create separate send CQ (shared for polling) and recv CQs
-    let send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    let send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
-    let recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
+    let recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    let recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     let config = RcQpConfig::default();
@@ -559,7 +560,7 @@ fn test_rc_rdma_write_imm() {
     qp2.borrow().ring_rq_doorbell();
 
     // Create a separate recv CQ for QP2
-    let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    let mut recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
 
     // Note: The recv_cq is internal to RcLoopbackPair, we need to check the pair's recv_cq
     // Actually in our setup, qp2's recv CQ is _recv_cq2 which is private
@@ -619,12 +620,12 @@ fn test_rc_send_recv() {
     };
 
     // Create QPs with separate recv CQs that we can access
-    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    let mut send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
+    let mut recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    let mut recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     // Shared state to capture recv CQE info
@@ -802,12 +803,12 @@ fn test_rc_send_recv_pingpong() {
     let recv2_opcode_clone = recv2_opcode.clone();
 
     // Create QPs with separate recv CQs
-    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    let mut send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
+    let mut recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    let mut recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     let config = mlx5::qp::RcQpConfig {

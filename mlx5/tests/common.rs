@@ -2,7 +2,7 @@
 //!
 //! This module provides helper functions and types for writing RDMA tests.
 
-use mlx5::cq::{CompletionQueue, Cqe};
+use mlx5::cq::{Cq, CqConfig, Cqe};
 use mlx5::device::{Context, DeviceList};
 use mlx5::pd::{AccessFlags, Pd};
 use mlx5::types::PortAttr;
@@ -130,7 +130,7 @@ impl Drop for AlignedBuffer {
 ///
 /// This function works with send CQs that have QPs registered.
 /// Returns the first CQE collected by the callback.
-pub fn poll_cq_timeout(cq: &CompletionQueue, timeout_ms: u64) -> Option<Cqe> {
+pub fn poll_cq_timeout(cq: &Cq, timeout_ms: u64) -> Option<Cqe> {
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_millis(timeout_ms);
 
@@ -152,7 +152,7 @@ pub fn poll_cq_timeout(cq: &CompletionQueue, timeout_ms: u64) -> Option<Cqe> {
 
 /// Poll CQ for multiple completions using poll() method.
 pub fn poll_cq_batch(
-    cq: &CompletionQueue,
+    cq: &Cq,
     count: usize,
     timeout_ms: u64,
 ) -> Result<Vec<Cqe>, String> {
@@ -235,7 +235,7 @@ pub fn is_dct_supported(ctx: &TestContext) -> bool {
     use mlx5::dc::DctConfig;
     use mlx5::srq::SrqConfig;
 
-    let dct_cq = match ctx.ctx.create_cq(16) {
+    let dct_cq = match ctx.ctx.create_cq(16, &CqConfig::default()) {
         Ok(cq) => cq,
         Err(e) => {
             eprintln!("  DCT check: CQ creation failed: {}", e);
@@ -256,7 +256,12 @@ pub fn is_dct_supported(ctx: &TestContext) -> bool {
     };
 
     let dct_config = DctConfig { dc_key: 0x12345 };
-    let mut dct = match ctx.ctx.create_dct(&ctx.pd, &srq, &dct_cq, &dct_config) {
+    let mut dct = match ctx
+        .ctx
+        .dct_builder(&ctx.pd, &srq, &dct_config)
+        .recv_cq(&dct_cq)
+        .build()
+    {
         Ok(dct) => dct,
         Err(e) => {
             eprintln!("  DCT check: DCT creation failed: {}", e);
@@ -322,7 +327,7 @@ pub fn is_tm_srq_supported(ctx: &TestContext) -> bool {
         }
     }
 
-    let cq = match ctx.ctx.create_cq(16) {
+    let cq = match ctx.ctx.create_cq(16, &CqConfig::default()) {
         Ok(cq) => Rc::new(cq),
         Err(e) => {
             eprintln!("  TM-SRQ check: CQ creation failed: {}", e);

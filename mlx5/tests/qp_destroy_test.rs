@@ -3,6 +3,7 @@
 mod common;
 
 use common::{TestContext, full_access};
+use mlx5::cq::CqConfig;
 use mlx5::qp::{RcQpConfig, RemoteQpInfo};
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -41,9 +42,9 @@ fn test_qp_destroy_after_remote_gone() {
     };
 
     // Create QP1 on context 1 (separate send and recv CQs)
-    let mut send_cq1 = ctx1.ctx.create_cq(64).expect("create send_cq1");
+    let mut send_cq1 = ctx1.ctx.create_cq(64, &CqConfig::default()).expect("create send_cq1");
     let send_cq1 = Rc::new(send_cq1);
-    let mut recv_cq1 = ctx1.ctx.create_cq(64).expect("create recv_cq1");
+    let mut recv_cq1 = ctx1.ctx.create_cq(64, &CqConfig::default()).expect("create recv_cq1");
     let recv_cq1 = Rc::new(recv_cq1);
     let qp1 = ctx1
         .ctx
@@ -54,9 +55,9 @@ fn test_qp_destroy_after_remote_gone() {
         .expect("create qp1");
 
     // Create QP2 on context 2 (separate send and recv CQs)
-    let mut send_cq2 = ctx2.ctx.create_cq(64).expect("create send_cq2");
+    let mut send_cq2 = ctx2.ctx.create_cq(64, &CqConfig::default()).expect("create send_cq2");
     let send_cq2 = Rc::new(send_cq2);
-    let mut recv_cq2 = ctx2.ctx.create_cq(64).expect("create recv_cq2");
+    let mut recv_cq2 = ctx2.ctx.create_cq(64, &CqConfig::default()).expect("create recv_cq2");
     let recv_cq2 = Rc::new(recv_cq2);
     let qp2 = ctx2
         .ctx
@@ -163,9 +164,9 @@ fn test_qp_destroy_multi_thread() {
             enable_scatter_to_cqe: false,
         };
 
-        let mut send_cq = ctx.ctx.create_cq(64).expect("create send_cq");
+        let mut send_cq = ctx.ctx.create_cq(64, &CqConfig::default()).expect("create send_cq");
         let send_cq = Rc::new(send_cq);
-        let mut recv_cq = ctx.ctx.create_cq(64).expect("create recv_cq");
+        let mut recv_cq = ctx.ctx.create_cq(64, &CqConfig::default()).expect("create recv_cq");
         let recv_cq = Rc::new(recv_cq);
         let qp = ctx
             .ctx
@@ -226,9 +227,9 @@ fn test_qp_destroy_multi_thread() {
         enable_scatter_to_cqe: false,
     };
 
-    let mut send_cq = ctx.ctx.create_cq(64).expect("create send_cq");
+    let mut send_cq = ctx.ctx.create_cq(64, &CqConfig::default()).expect("create send_cq");
     let send_cq = Rc::new(send_cq);
-    let mut recv_cq = ctx.ctx.create_cq(64).expect("create recv_cq");
+    let mut recv_cq = ctx.ctx.create_cq(64, &CqConfig::default()).expect("create recv_cq");
     let recv_cq = Rc::new(recv_cq);
     let qp = ctx
         .ctx
@@ -326,9 +327,9 @@ fn test_qp_destroy_after_data_transfer() {
             enable_scatter_to_cqe: false,
         };
 
-        let mut send_cq = ctx.ctx.create_cq(64).expect("create send_cq");
+        let mut send_cq = ctx.ctx.create_cq(64, &CqConfig::default()).expect("create send_cq");
         let send_cq = Rc::new(send_cq);
-        let mut recv_cq = ctx.ctx.create_cq(64).expect("create recv_cq");
+        let mut recv_cq = ctx.ctx.create_cq(64, &CqConfig::default()).expect("create recv_cq");
         let recv_cq = Rc::new(recv_cq);
         let qp = ctx
             .ctx
@@ -404,9 +405,9 @@ fn test_qp_destroy_after_data_transfer() {
         enable_scatter_to_cqe: false,
     };
 
-    let mut send_cq = ctx.ctx.create_cq(64).expect("create send_cq");
+    let mut send_cq = ctx.ctx.create_cq(64, &CqConfig::default()).expect("create send_cq");
     let send_cq = Rc::new(send_cq);
-    let mut recv_cq = ctx.ctx.create_cq(64).expect("create recv_cq");
+    let mut recv_cq = ctx.ctx.create_cq(64, &CqConfig::default()).expect("create recv_cq");
     let recv_cq = Rc::new(recv_cq);
     let qp = ctx
         .ctx
@@ -536,9 +537,9 @@ fn test_qp_destroy_after_actual_send_recv() {
             enable_scatter_to_cqe: false,
         };
 
-        let mut send_cq = ctx.ctx.create_cq(64).expect("create send_cq");
+        let mut send_cq = ctx.ctx.create_cq(64, &CqConfig::default()).expect("create send_cq");
         let send_cq = Rc::new(send_cq);
-        let mut recv_cq = ctx.ctx.create_cq(64).expect("create recv_cq");
+        let mut recv_cq = ctx.ctx.create_cq(64, &CqConfig::default()).expect("create recv_cq");
         let recv_cq = Rc::new(recv_cq);
 
         let qp = ctx
@@ -664,9 +665,9 @@ fn test_qp_destroy_after_actual_send_recv() {
         enable_scatter_to_cqe: false,
     };
 
-    let mut send_cq = ctx.ctx.create_cq(64).expect("create send_cq");
+    let mut send_cq = ctx.ctx.create_cq(64, &CqConfig::default()).expect("create send_cq");
     let send_cq = Rc::new(send_cq);
-    let mut recv_cq = ctx.ctx.create_cq(64).expect("create recv_cq");
+    let mut recv_cq = ctx.ctx.create_cq(64, &CqConfig::default()).expect("create recv_cq");
     let recv_cq = Rc::new(recv_cq);
 
     let qp = ctx

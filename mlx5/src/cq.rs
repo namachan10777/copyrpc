@@ -554,7 +554,7 @@ type CachedQueue = Option<(u32, Rc<RefCell<dyn CompletionTarget>>)>;
 ///
 /// Used to receive completion notifications for send and receive operations.
 /// Multiple QPs can share the same CQ.
-pub struct CompletionQueue {
+pub struct Cq {
     cq: NonNull<mlx5_sys::ibv_cq>,
     /// Direct verbs state for CQE polling (always initialized).
     state: CqState,
@@ -571,90 +571,7 @@ pub struct CompletionQueue {
 }
 
 impl Context {
-    /// Create a Completion Queue using extended CQ API.
-    ///
-    /// Extended CQs support additional features required for TM-SRQ and other
-    /// advanced operations.
-    ///
-    /// # Arguments
-    /// * `cqe` - Minimum number of CQ entries (actual may be larger)
-    ///
-    /// # Errors
-    /// Returns an error if the CQ cannot be created.
-    pub fn create_cq(&self, cqe: i32) -> io::Result<CompletionQueue> {
-        unsafe {
-            let mut attr: mlx5_sys::ibv_cq_init_attr_ex = MaybeUninit::zeroed().assume_init();
-            attr.cqe = cqe as u32;
-            attr.cq_context = std::ptr::null_mut();
-            attr.channel = std::ptr::null_mut();
-            attr.comp_vector = 0;
-            attr.wc_flags = 0;
-            attr.comp_mask = 0;
-            attr.flags = 0;
-
-            let cq_ex = mlx5_sys::ibv_create_cq_ex_ex(self.as_ptr(), &mut attr);
-            if cq_ex.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-
-            // ibv_cq_ex can be cast to ibv_cq (first fields are identical)
-            let cq_ptr = cq_ex as *mut mlx5_sys::ibv_cq;
-
-            // Initialize direct verbs access immediately
-            let mut dv_cq: MaybeUninit<mlx5_sys::mlx5dv_cq> = MaybeUninit::zeroed();
-            let mut obj: MaybeUninit<mlx5_sys::mlx5dv_obj> = MaybeUninit::zeroed();
-
-            let obj_ptr = obj.as_mut_ptr();
-            (*obj_ptr).cq.in_ = cq_ptr;
-            (*obj_ptr).cq.out = dv_cq.as_mut_ptr();
-
-            let ret =
-                mlx5_sys::mlx5dv_init_obj(obj_ptr, mlx5_sys::mlx5dv_obj_type_MLX5DV_OBJ_CQ as u64);
-            if ret != 0 {
-                mlx5_sys::ibv_destroy_cq(cq_ptr);
-                return Err(io::Error::from_raw_os_error(-ret));
-            }
-
-            let dv_cq = dv_cq.assume_init();
-
-            // Initialize all CQEs to look like they are in HW ownership (UCX-style).
-            // op_own byte layout: opcode[7:4] | reserved[3:1] | owner[0]
-            // Set opcode = 0xf (INVALID) and owner = 1.
-            // When CI = 0, sw_owner = 0, so CQEs with owner = 1 will be skipped.
-            // This prevents reading garbage before HW writes valid CQEs.
-            //
-            // For 128-byte CQEs, the CQE64 structure is in the second half (offset 64-127).
-            // For 64-byte CQEs, it's at the beginning.
-            const OP_OWN_INVALID: u8 = 0xf1; // opcode=INVALID(0xf), owner=1
-            let buf = dv_cq.buf as *mut u8;
-            let cqe64_offset: usize = if dv_cq.cqe_size == 128 { 64 } else { 0 };
-            for i in 0..dv_cq.cqe_cnt {
-                let cqe_ptr = buf.add((i as usize) * (dv_cq.cqe_size as usize));
-                let cqe64_ptr = cqe_ptr.add(cqe64_offset);
-                let op_own_ptr = cqe64_ptr.add(63);
-                std::ptr::write_volatile(op_own_ptr, OP_OWN_INVALID);
-            }
-
-            Ok(CompletionQueue {
-                cq: NonNull::new(cq_ptr).unwrap(),
-                state: CqState {
-                    buf: dv_cq.buf as *mut u8,
-                    cqe_cnt: dv_cq.cqe_cnt,
-                    cqe_cnt_log2: dv_cq.cqe_cnt.trailing_zeros(),
-                    cqe_size: dv_cq.cqe_size,
-                    dbrec: dv_cq.dbrec,
-                    ci: Cell::new(0),
-                    pending_mini_cqes: UnsafeCell::new(None),
-                    title_opcode: Cell::new(CqeOpcode::Req),
-                },
-                queues: RefCell::new(HashMap::with_hasher(BuildHasherDefault::default())),
-                last_queue_cache: UnsafeCell::new(None),
-                _ctx: self.clone(),
-            })
-        }
-    }
-
-    /// Create a Completion Queue with custom configuration.
+    /// Create a Completion Queue.
     ///
     /// Uses `mlx5dv_create_cq` to enable MLX5-specific features like CQE size.
     ///
@@ -664,7 +581,7 @@ impl Context {
     ///
     /// # Errors
     /// Returns an error if the CQ cannot be created.
-    pub fn create_cq_with_config(&self, cqe: i32, config: &CqConfig) -> io::Result<CompletionQueue> {
+    pub fn create_cq(&self, cqe: i32, config: &CqConfig) -> io::Result<Cq> {
         unsafe {
             let mut attr: mlx5_sys::ibv_cq_init_attr_ex = MaybeUninit::zeroed().assume_init();
             attr.cqe = cqe as u32;
@@ -721,7 +638,7 @@ impl Context {
                 std::ptr::write_volatile(op_own_ptr, OP_OWN_INVALID);
             }
 
-            Ok(CompletionQueue {
+            Ok(Cq {
                 cq: NonNull::new(cq_ptr).unwrap(),
                 state: CqState {
                     buf: dv_cq.buf as *mut u8,
@@ -741,7 +658,7 @@ impl Context {
     }
 }
 
-impl Drop for CompletionQueue {
+impl Drop for Cq {
     fn drop(&mut self) {
         unsafe {
             mlx5_sys::ibv_destroy_cq(self.cq.as_ptr());
@@ -749,7 +666,7 @@ impl Drop for CompletionQueue {
     }
 }
 
-impl CompletionQueue {
+impl Cq {
     /// Get the raw ibv_cq pointer.
     pub fn as_ptr(&self) -> *mut mlx5_sys::ibv_cq {
         self.cq.as_ptr()

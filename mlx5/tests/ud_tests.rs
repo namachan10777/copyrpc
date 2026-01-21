@@ -17,6 +17,7 @@ mod common;
 
 use std::rc::Rc;
 
+use mlx5::cq::CqConfig;
 use mlx5::pd::RemoteUdQpInfo;
 use mlx5::ud::{UdQpConfig, UdQpState};
 use mlx5::wqe::{TxFlags, WqeFlags, WqeOpcode};
@@ -40,8 +41,8 @@ fn test_ud_creation() {
         }
     };
 
-    let send_cq = Rc::new(ctx.ctx.create_cq(256).expect("Failed to create send CQ"));
-    let recv_cq = Rc::new(ctx.ctx.create_cq(256).expect("Failed to create recv CQ"));
+    let send_cq = Rc::new(ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ"));
+    let recv_cq = Rc::new(ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ"));
 
     let config = UdQpConfig {
         qkey: 0x12345678,
@@ -71,8 +72,8 @@ fn test_ud_activate() {
         }
     };
 
-    let send_cq = Rc::new(ctx.ctx.create_cq(256).expect("Failed to create send CQ"));
-    let recv_cq = Rc::new(ctx.ctx.create_cq(256).expect("Failed to create recv CQ"));
+    let send_cq = Rc::new(ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ"));
+    let recv_cq = Rc::new(ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ"));
 
     let config = UdQpConfig {
         qkey: 0x12345678,
@@ -113,10 +114,10 @@ fn test_ud_send_recv() {
     };
 
     // Create CQs
-    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    let mut send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let mut recv_cq = ctx.ctx.create_cq(256).expect("Failed to create recv CQ");
+    let mut recv_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ");
     let recv_cq = Rc::new(recv_cq);
 
     // Q_Key must have MSB=0 for non-privileged users (bit 31 indicates privileged Q_Key)
@@ -252,10 +253,10 @@ fn test_ud_send_raw_av() {
     };
 
     // Create CQs
-    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    let mut send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let mut recv_cq = ctx.ctx.create_cq(256).expect("Failed to create recv CQ");
+    let mut recv_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ");
     let recv_cq = Rc::new(recv_cq);
 
     let qkey: u32 = 0x11111111;
@@ -389,10 +390,10 @@ fn test_ud_multiple_destinations() {
     };
 
     // Create CQs
-    let mut cq = ctx.ctx.create_cq(256).expect("Failed to create CQ");
+    let mut cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ");
     let cq = Rc::new(cq);
 
-    let mut recv_cq = ctx.ctx.create_cq(256).expect("Failed to create recv CQ");
+    let mut recv_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ");
     let recv_cq = Rc::new(recv_cq);
 
     let qkey: u32 = 0x22222222;

@@ -8,7 +8,7 @@ mod common;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use mlx5::cq::Cqe;
+use mlx5::cq::{CqConfig, Cqe};
 use mlx5::qp::{RcQpConfig, RcQpForMonoCq, RemoteQpInfo};
 use mlx5::wqe::TxFlags;
 
@@ -29,7 +29,7 @@ fn test_mono_cq_creation() {
 
     let mono_cq = Rc::new(ctx
         .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, callback as fn(_, _))
+        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, callback as fn(_, _), &CqConfig::default())
         .expect("Failed to create MonoCq"));
 
     // Verify as_ptr returns non-null
@@ -64,7 +64,7 @@ fn test_mono_cq_with_rc_qp() {
     // Create a single CQ for both QPs
     let cq = Rc::new(ctx
         .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, callback)
+        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, callback, &CqConfig::default())
         .expect("Failed to create MonoCq"));
 
     let config = RcQpConfig::default();
@@ -191,7 +191,7 @@ fn test_mono_cq_poll_empty() {
 
     let mono_cq = Rc::new(ctx
         .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, callback as fn(_, _))
+        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, callback as fn(_, _), &CqConfig::default())
         .expect("Failed to create MonoCq"));
 
     // Poll should return 0 when no completions
@@ -226,7 +226,7 @@ fn test_mono_cq_multiple_completions() {
     // Use a single CQ for both QPs
     let cq = Rc::new(ctx
         .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, callback)
+        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, callback, &CqConfig::default())
         .expect("Failed to create MonoCq"));
 
     let config = RcQpConfig::default();
@@ -360,7 +360,7 @@ fn test_mono_cq_high_load() {
     // Use larger CQ to accommodate high load - single CQ for both QPs
     let cq = Rc::new(ctx
         .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(512, callback)
+        .create_mono_cq::<RcQpForMonoCq<u64>, _>(512, callback, &CqConfig::default())
         .expect("Failed to create MonoCq"));
 
     let config = RcQpConfig::default();
@@ -506,12 +506,12 @@ fn test_mono_cq_recv_rdma_write_imm() {
     // Create separate CQs for each QP
     let cq1 = Rc::new(ctx
         .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, qp1_callback)
+        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, qp1_callback, &CqConfig::default())
         .expect("Failed to create MonoCq 1"));
 
     let cq2 = Rc::new(ctx
         .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, qp2_callback)
+        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, qp2_callback, &CqConfig::default())
         .expect("Failed to create MonoCq 2"));
 
     let config = RcQpConfig::default();
@@ -664,11 +664,11 @@ fn test_mono_cq_bidirectional_pingpong() {
     // Create CQs with noop callbacks - we'll track completions via poll return value
     let qp1_cq = Rc::new(ctx
         .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, noop_callback)
+        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, noop_callback, &CqConfig::default())
         .expect("qp1_cq"));
     let qp2_cq = Rc::new(ctx
         .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, noop_callback)
+        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, noop_callback, &CqConfig::default())
         .expect("qp2_cq"));
 
     let config = RcQpConfig::default();
@@ -846,7 +846,7 @@ fn test_mono_cq_wraparound() {
     // Use a single CQ for both QPs
     let cq = Rc::new(ctx
         .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(cq_size as i32, callback)
+        .create_mono_cq::<RcQpForMonoCq<u64>, _>(cq_size as i32, callback, &CqConfig::default())
         .expect("Failed to create MonoCq"));
 
     let config = RcQpConfig::default();

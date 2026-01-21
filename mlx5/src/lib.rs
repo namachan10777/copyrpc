@@ -129,6 +129,6 @@ pub trait CompletionTarget {
 
     /// Dispatch a CQE to this queue.
     ///
-    /// Called by CompletionQueue::poll() when a CQE for this queue is received.
+    /// Called by Cq::poll() when a CQE for this queue is received.
     fn dispatch_cqe(&self, cqe: Cqe);
 }

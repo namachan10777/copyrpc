@@ -20,7 +20,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use mlx5::Cqe;
-use mlx5::cq::CqeOpcode;
+use mlx5::cq::{CqConfig, CqeOpcode};
 use mlx5::dc::DciConfig;
 use mlx5::tm_srq::{TmSrqCompletion, TmSrqConfig};
 use mlx5::wqe::WqeOpcode;
@@ -43,7 +43,7 @@ fn test_tm_srq_creation() {
 
     require_tm_srq!(&ctx);
 
-    let cq = Rc::new(ctx.ctx.create_cq(256).expect("Failed to create CQ"));
+    let cq = Rc::new(ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ"));
 
     let config = TmSrqConfig {
         max_wr: 256,
@@ -77,7 +77,7 @@ fn test_tm_srq_direct_access() {
 
     require_tm_srq!(&ctx);
 
-    let mut cq = ctx.ctx.create_cq(256).expect("Failed to create CQ");
+    let mut cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ");
     let cq = Rc::new(cq);
 
     let config = TmSrqConfig {
@@ -116,7 +116,7 @@ fn test_tm_tag_add_remove() {
 
     require_tm_srq!(&ctx);
 
-    let cq = Rc::new(ctx.ctx.create_cq(256).expect("Failed to create CQ"));
+    let cq = Rc::new(ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ"));
 
     let config = TmSrqConfig {
         max_wr: 256,
@@ -262,11 +262,11 @@ fn test_tm_tag_matching_with_dc() {
     require_tm_srq!(&ctx);
 
     // Create CQ for DCI
-    let mut dci_cq = ctx.ctx.create_cq(256).expect("Failed to create DCI CQ");
+    let mut dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
     let dci_cq = Rc::new(dci_cq);
 
     // Create CQ for TM-SRQ
-    let mut tm_cq = ctx.ctx.create_cq(256).expect("Failed to create TM CQ");
+    let mut tm_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create TM CQ");
     let tm_cq = Rc::new(tm_cq);
 
     // Create TM-SRQ
@@ -288,7 +288,9 @@ fn test_tm_tag_matching_with_dc() {
     let dci_config = DciConfig::default();
     let dci = ctx
         .ctx
-        .create_dci::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
+        .dci_builder::<u64>(&ctx.pd, &dci_config)
+        .sq_cq(dci_cq.clone(), |_cqe, _entry| {})
+        .build()
         .expect("Failed to create DCI");
     dci.borrow_mut()
         .activate(ctx.port, 0, 4)
@@ -318,7 +320,7 @@ fn test_tm_multiple_tags() {
 
     require_tm_srq!(&ctx);
 
-    let cq = Rc::new(ctx.ctx.create_cq(256).expect("Failed to create CQ"));
+    let cq = Rc::new(ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ"));
 
     let config = TmSrqConfig {
         max_wr: 256,
@@ -453,7 +455,7 @@ fn test_tm_unordered_recv() {
 
     require_tm_srq!(&ctx);
 
-    let mut cq = ctx.ctx.create_cq(256).expect("Failed to create CQ");
+    let mut cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ");
     let cq = Rc::new(cq);
 
     let config = TmSrqConfig {
@@ -510,7 +512,7 @@ fn test_tm_tag_via_verbs_api() {
 
     require_tm_srq!(&ctx);
 
-    let mut cq = ctx.ctx.create_cq(256).expect("Failed to create CQ");
+    let mut cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ");
     let cq = Rc::new(cq);
 
     let config = TmSrqConfig {

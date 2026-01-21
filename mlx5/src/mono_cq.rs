@@ -5,7 +5,7 @@
 //!
 //! # Performance Benefits
 //!
-//! The standard `CompletionQueue::poll()` uses dynamic dispatch (`dyn CompletionTarget`)
+//! The standard `Cq::poll()` uses dynamic dispatch (`dyn CompletionTarget`)
 //! which prevents inlining of the callback. `MonoCq<Q, F>` keeps type information,
 //! enabling the compiler to inline both `process_cqe` and the callback.
 //!
@@ -103,7 +103,7 @@ type MonoQueueVec<Q> = Vec<Option<Weak<RefCell<Q>>>>;
 
 /// Monomorphic Completion Queue with inlined callback dispatch.
 ///
-/// Unlike `CompletionQueue` which uses `dyn CompletionTarget` for dynamic dispatch,
+/// Unlike `Cq` which uses `dyn CompletionTarget` for dynamic dispatch,
 /// `MonoCq<Q, F>` keeps the queue type `Q` and callback type as generics,
 /// enabling the compiler to inline processing and callback.
 ///
@@ -120,7 +120,7 @@ type MonoQueueVec<Q> = Vec<Option<Weak<RefCell<Q>>>>;
 /// # Constraints
 ///
 /// All registered queues must be of the same type `Q`. For heterogeneous
-/// queues, use the standard `CompletionQueue` instead.
+/// queues, use the standard `Cq` instead.
 pub struct MonoCq<Q, F>
 where
     Q: CompletionSource,
@@ -160,30 +160,11 @@ impl Context {
     /// # Arguments
     /// * `cqe` - Minimum number of CQ entries (actual may be larger)
     /// * `callback` - Completion callback `Fn(Cqe, Q::Entry)` called for each completion
+    /// * `config` - CQ configuration options (CQE size, compression, etc.)
     ///
     /// # Type Parameters
     /// * `Q` - Queue type implementing `CompletionSource`
     /// * `F` - Callback type
-    ///
-    /// # Errors
-    /// Returns an error if the CQ cannot be created.
-    pub fn create_mono_cq<Q, F>(&self, cqe: i32, callback: F) -> io::Result<MonoCq<Q, F>>
-    where
-        Q: CompletionSource,
-        F: Fn(Cqe, Q::Entry),
-    {
-        self.create_mono_cq_with_config(cqe, callback, &CqConfig::default())
-    }
-
-    /// Create a Monomorphic Completion Queue with custom configuration.
-    ///
-    /// Uses `mlx5dv_create_cq` to enable MLX5-specific features like CQE size
-    /// and CQE compression.
-    ///
-    /// # Arguments
-    /// * `cqe` - Minimum number of CQ entries (actual may be larger)
-    /// * `callback` - Completion callback `Fn(Cqe, Q::Entry)` called for each completion
-    /// * `config` - CQ configuration options (CQE size, compression, etc.)
     ///
     /// # CQE Compression
     /// When `config.compression_format` is Some:
@@ -195,21 +176,7 @@ impl Context {
     ///
     /// # Errors
     /// Returns an error if the CQ cannot be created.
-    pub fn create_mono_cq_with_config<Q, F>(
-        &self,
-        cqe: i32,
-        callback: F,
-        config: &CqConfig,
-    ) -> io::Result<MonoCq<Q, F>>
-    where
-        Q: CompletionSource,
-        F: Fn(Cqe, Q::Entry),
-    {
-        self.create_mono_cq_internal(cqe, callback, config)
-    }
-
-    /// Internal function to create MonoCq with config.
-    fn create_mono_cq_internal<Q, F>(
+    pub fn create_mono_cq<Q, F>(
         &self,
         cqe: i32,
         callback: F,
@@ -431,7 +398,7 @@ where
 
     /// Poll for completions and dispatch to registered queues with inlined callback.
     ///
-    /// This is the main performance-critical method. Unlike `CompletionQueue::poll()`,
+    /// This is the main performance-critical method. Unlike `Cq::poll()`,
     /// both `process_cqe` and the callback are statically known and can be inlined.
     ///
     /// Returns the number of completions processed.

@@ -15,6 +15,7 @@ mod common;
 
 use std::rc::Rc;
 
+use mlx5::cq::CqConfig;
 use mlx5::dc::{DciConfig, DctConfig};
 use mlx5::srq::SrqConfig;
 use mlx5::wqe::{TxFlags, WqeFlags, WqeOpcode};
@@ -129,10 +130,10 @@ fn test_srq_with_dct_send() {
     require_dct!(&ctx);
 
     // Create CQs
-    let mut dci_cq = ctx.ctx.create_cq(256).expect("Failed to create DCI CQ");
+    let mut dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
     let dci_cq = Rc::new(dci_cq);
 
-    let mut dct_cq = ctx.ctx.create_cq(256).expect("Failed to create DCT CQ");
+    let mut dct_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCT CQ");
     let dct_cq = Rc::new(dct_cq);
 
     // Create SRQ
@@ -161,7 +162,9 @@ fn test_srq_with_dct_send() {
     let dci_config = DciConfig::default();
     let dci = ctx
         .ctx
-        .create_dci::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
+        .dci_builder::<u64>(&ctx.pd, &dci_config)
+            .sq_cq(dci_cq.clone(), |_cqe, _entry| {})
+            .build()
         .expect("Failed to create DCI");
     dci.borrow_mut()
         .activate(ctx.port, 0, 4)
@@ -172,7 +175,9 @@ fn test_srq_with_dct_send() {
     let dct_config = DctConfig { dc_key };
     let mut dct = ctx
         .ctx
-        .create_dct(&ctx.pd, &srq, &dct_cq, &dct_config)
+        .dct_builder(&ctx.pd, &srq, &dct_config)
+            .recv_cq(&dct_cq)
+            .build()
         .expect("Failed to create DCT");
     let access = full_access().bits();
     dct.activate(ctx.port, access, 4)
@@ -248,10 +253,10 @@ fn test_srq_shared_by_multiple_dcts() {
     require_dct!(&ctx);
 
     // Create CQs
-    let mut dci_cq = ctx.ctx.create_cq(256).expect("Failed to create DCI CQ");
+    let mut dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
     let dci_cq = Rc::new(dci_cq);
 
-    let mut dct_cq = ctx.ctx.create_cq(256).expect("Failed to create DCT CQ");
+    let mut dct_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCT CQ");
     let dct_cq = Rc::new(dct_cq);
 
     // Create shared SRQ
@@ -285,7 +290,9 @@ fn test_srq_shared_by_multiple_dcts() {
     let dci_config = DciConfig::default();
     let dci = ctx
         .ctx
-        .create_dci::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
+        .dci_builder::<u64>(&ctx.pd, &dci_config)
+            .sq_cq(dci_cq.clone(), |_cqe, _entry| {})
+            .build()
         .expect("Failed to create DCI");
     dci.borrow_mut()
         .activate(ctx.port, 0, 4)
@@ -301,7 +308,9 @@ fn test_srq_shared_by_multiple_dcts() {
         let dct_config = DctConfig { dc_key };
         let mut dct = ctx
             .ctx
-            .create_dct(&ctx.pd, &srq, &dct_cq, &dct_config)
+            .dct_builder(&ctx.pd, &srq, &dct_config)
+            .recv_cq(&dct_cq)
+            .build()
             .expect(&format!("Failed to create DCT {}", i));
         dct.activate(ctx.port, access, 4)
             .expect(&format!("Failed to activate DCT {}", i));

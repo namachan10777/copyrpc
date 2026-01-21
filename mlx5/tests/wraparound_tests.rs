@@ -12,7 +12,7 @@ mod common;
 
 use std::rc::Rc;
 
-use mlx5::cq::CompletionQueue;
+use mlx5::cq::{Cq, CqConfig};
 use mlx5::dc::{DciConfig, DctConfig};
 use mlx5::pd::RemoteUdQpInfo;
 use mlx5::qp::{RcQpConfig, RemoteQpInfo};
@@ -43,12 +43,12 @@ fn test_rc_rdma_write_wraparound() {
     };
 
     // Create CQs
-    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    let mut send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
+    let mut recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    let mut recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     // Use small queue to force wrap-around quickly
@@ -170,12 +170,12 @@ fn test_rc_ring_sq_doorbell() {
         }
     };
 
-    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    let mut send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
+    let mut recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    let mut recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     let config = RcQpConfig::default();
@@ -281,10 +281,10 @@ fn test_dc_rdma_write_wraparound() {
     require_dct!(&ctx);
 
     // Create CQ for DCI with small size
-    let mut dci_cq = ctx.ctx.create_cq(256).expect("Failed to create DCI CQ");
+    let mut dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
     let dci_cq = Rc::new(dci_cq);
 
-    let dct_cq = ctx.ctx.create_cq(256).expect("Failed to create DCT CQ");
+    let dct_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCT CQ");
 
     let srq_config = SrqConfig {
         max_wr: 128,
@@ -302,7 +302,9 @@ fn test_dc_rdma_write_wraparound() {
     };
     let dci = ctx
         .ctx
-        .create_dci::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
+        .dci_builder::<u64>(&ctx.pd, &dci_config)
+            .sq_cq(dci_cq.clone(), |_cqe, _entry| {})
+            .build()
         .expect("Failed to create DCI");
     dci.borrow_mut()
         .activate(ctx.port, 0, 4)
@@ -312,7 +314,9 @@ fn test_dc_rdma_write_wraparound() {
     let dct_config = DctConfig { dc_key };
     let mut dct = ctx
         .ctx
-        .create_dct(&ctx.pd, &srq, &dct_cq, &dct_config)
+        .dct_builder(&ctx.pd, &srq, &dct_config)
+            .recv_cq(&dct_cq)
+            .build()
         .expect("Failed to create DCT");
     let access = full_access().bits();
     dct.activate(ctx.port, access, 4)
@@ -390,10 +394,10 @@ fn test_dc_ring_sq_doorbell() {
 
     require_dct!(&ctx);
 
-    let mut dci_cq = ctx.ctx.create_cq(256).expect("Failed to create DCI CQ");
+    let mut dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
     let dci_cq = Rc::new(dci_cq);
 
-    let dct_cq = ctx.ctx.create_cq(256).expect("Failed to create DCT CQ");
+    let dct_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCT CQ");
 
     let srq_config = SrqConfig {
         max_wr: 128,
@@ -407,7 +411,9 @@ fn test_dc_ring_sq_doorbell() {
     let dci_config = DciConfig::default();
     let dci = ctx
         .ctx
-        .create_dci::<u64, _>(&ctx.pd, &dci_cq, &dci_config, |_cqe, _entry| {})
+        .dci_builder::<u64>(&ctx.pd, &dci_config)
+            .sq_cq(dci_cq.clone(), |_cqe, _entry| {})
+            .build()
         .expect("Failed to create DCI");
     dci.borrow_mut()
         .activate(ctx.port, 0, 4)
@@ -417,7 +423,9 @@ fn test_dc_ring_sq_doorbell() {
     let dct_config = DctConfig { dc_key };
     let mut dct = ctx
         .ctx
-        .create_dct(&ctx.pd, &srq, &dct_cq, &dct_config)
+        .dct_builder(&ctx.pd, &srq, &dct_config)
+            .recv_cq(&dct_cq)
+            .build()
         .expect("Failed to create DCT");
     let access = full_access().bits();
     dct.activate(ctx.port, access, 4)
@@ -484,10 +492,10 @@ fn test_ud_send_wraparound() {
         }
     };
 
-    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    let mut send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let mut recv_cq = ctx.ctx.create_cq(256).expect("Failed to create recv CQ");
+    let mut recv_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ");
     let recv_cq = Rc::new(recv_cq);
 
     let qkey: u32 = 0x1BCDEF00;
@@ -623,12 +631,12 @@ fn test_rc_inline_wraparound() {
     };
 
     // Create CQs
-    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    let mut send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
+    let mut recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    let mut recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     // Use small queue (16 WQEs) with max inline to force wrap-around
@@ -769,12 +777,12 @@ fn test_rc_inline_variable_size_wraparound() {
     };
 
     // Create CQs
-    let mut send_cq = ctx.ctx.create_cq(256).expect("Failed to create send CQ");
+    let mut send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let mut recv_cq1 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ1");
+    let mut recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let mut recv_cq2 = ctx.ctx.create_cq(256).expect("Failed to create recv CQ2");
+    let mut recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     // Use small queue with max inline

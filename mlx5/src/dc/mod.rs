@@ -11,8 +11,9 @@ use std::rc::{Rc, Weak};
 use std::{io, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
 use crate::CompletionTarget;
-use crate::cq::{CompletionQueue, Cqe};
+use crate::cq::{Cq, Cqe};
 use crate::device::Context;
+use crate::mono_cq::MonoCq;
 use crate::pd::Pd;
 use crate::qp::QpInfo;
 use crate::srq::Srq;
@@ -223,73 +224,135 @@ pub struct Dci<Entry, Transport, TableType, OnComplete> {
     sq: Option<DciSendQueueState<Entry, TableType>>,
     callback: OnComplete,
     /// Weak reference to the CQ for unregistration on drop
-    send_cq: Weak<CompletionQueue>,
+    send_cq: Weak<Cq>,
     /// Keep the PD alive while this DCI exists.
     _pd: Pd,
     /// Phantom data for transport type parameter
     _transport: PhantomData<Transport>,
 }
 
+// =============================================================================
+// DCI Builder (type-state pattern)
+// =============================================================================
+
+/// CQ not yet configured.
+pub struct NoCq;
+/// CQ configured.
+pub struct CqSet;
+
+/// DCI Builder with type-state pattern for CQ configuration.
+pub struct DciBuilder<'a, Entry, T, CqState, OnComplete> {
+    ctx: &'a Context,
+    pd: &'a Pd,
+    config: DciConfig,
+    send_cq_ptr: *mut mlx5_sys::ibv_cq,
+    send_cq_weak: Option<Weak<Cq>>,
+    callback: OnComplete,
+    _marker: PhantomData<(Entry, T, CqState)>,
+}
+
 impl Context {
-    /// Create a DCI (DC Initiator) using mlx5dv_create_qp.
+    /// Create a DCI Builder.
     ///
-    /// Only signaled WQEs have entries stored in the WQE table.
-    /// The callback is invoked for each completion with the CQE and the entry.
-    ///
-    /// # Arguments
-    /// * `pd` - Protection Domain
-    /// * `send_cq` - Completion Queue for send completions
-    /// * `config` - DCI configuration
-    /// * `callback` - Completion callback `Fn(Cqe, Entry)` called for each signaled completion
-    ///
-    /// # Errors
-    /// Returns an error if the DCI cannot be created.
-    ///
-    /// # Note
-    /// The send_cq must have `init_direct_access()` called before this function.
-    pub fn create_dci<Entry, OnComplete>(
-        &self,
-        pd: &Pd,
-        send_cq: &Rc<CompletionQueue>,
+    /// # Example
+    /// ```ignore
+    /// let dci = ctx.dci_builder::<u64>(&pd, &config)
+    ///     .sq_cq(cq.clone(), |cqe, entry| { /* handle completion */ })
+    ///     .build()?;
+    /// ```
+    pub fn dci_builder<'a, Entry>(
+        &'a self,
+        pd: &'a Pd,
         config: &DciConfig,
+    ) -> DciBuilder<'a, Entry, InfiniBand, NoCq, ()> {
+        DciBuilder {
+            ctx: self,
+            pd,
+            config: config.clone(),
+            send_cq_ptr: std::ptr::null_mut(),
+            send_cq_weak: None,
+            callback: (),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'a, Entry, T> DciBuilder<'a, Entry, T, NoCq, ()> {
+    /// Set normal CQ with callback.
+    pub fn sq_cq<OnComplete>(
+        self,
+        cq: Rc<Cq>,
         callback: OnComplete,
-    ) -> io::Result<Rc<RefCell<DciWithTable<Entry, OnComplete>>>>
+    ) -> DciBuilder<'a, Entry, T, CqSet, OnComplete>
     where
-        Entry: 'static,
         OnComplete: Fn(Cqe, Entry) + 'static,
     {
-        let dci = self.create_dci_raw(pd, send_cq, config, callback)?;
-        let dci_rc = Rc::new(RefCell::new(dci));
-        let qpn = dci_rc.borrow().qpn();
-
-        // Register this DCI with the CQ for completion dispatch
-        send_cq.register_queue(qpn, Rc::downgrade(&dci_rc) as _);
-
-        Ok(dci_rc)
+        DciBuilder {
+            ctx: self.ctx,
+            pd: self.pd,
+            config: self.config,
+            send_cq_ptr: cq.as_ptr(),
+            send_cq_weak: Some(Rc::downgrade(&cq)),
+            callback,
+            _marker: PhantomData,
+        }
     }
 
-    fn create_dci_raw<Entry, OnComplete>(
-        &self,
-        pd: &Pd,
-        send_cq: &Rc<CompletionQueue>,
-        config: &DciConfig,
-        callback: OnComplete,
-    ) -> io::Result<DciWithTable<Entry, OnComplete>>
+    /// Set MonoCq (callback is stored in MonoCq).
+    pub fn sq_mono_cq<Q, F>(
+        self,
+        mono_cq: &Rc<MonoCq<Q, F>>,
+    ) -> DciBuilder<'a, Entry, T, CqSet, ()>
     where
-        OnComplete: Fn(Cqe, Entry),
+        F: Fn(Cqe, Q::Entry) + 'static,
+        Q: crate::mono_cq::CompletionSource,
     {
+        DciBuilder {
+            ctx: self.ctx,
+            pd: self.pd,
+            config: self.config,
+            send_cq_ptr: mono_cq.as_ptr(),
+            send_cq_weak: None, // MonoCq doesn't need CQ registration
+            callback: (),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'a, Entry, T> DciBuilder<'a, Entry, T, NoCq, ()> {
+    /// Switch to RoCE transport.
+    pub fn for_roce(self) -> DciBuilder<'a, Entry, RoCE, NoCq, ()> {
+        DciBuilder {
+            ctx: self.ctx,
+            pd: self.pd,
+            config: self.config,
+            send_cq_ptr: self.send_cq_ptr,
+            send_cq_weak: self.send_cq_weak,
+            callback: self.callback,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'a, Entry, OnComplete> DciBuilder<'a, Entry, InfiniBand, CqSet, OnComplete>
+where
+    Entry: 'static,
+    OnComplete: Fn(Cqe, Entry) + 'static,
+{
+    /// Build the DCI with normal CQ.
+    pub fn build(self) -> io::Result<Rc<RefCell<DciWithTable<Entry, OnComplete>>>> {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_DRIVER;
-            qp_attr.send_cq = send_cq.as_ptr();
-            qp_attr.recv_cq = send_cq.as_ptr();
-            qp_attr.cap.max_send_wr = config.max_send_wr;
+            qp_attr.send_cq = self.send_cq_ptr;
+            qp_attr.recv_cq = self.send_cq_ptr;
+            qp_attr.cap.max_send_wr = self.config.max_send_wr;
             qp_attr.cap.max_recv_wr = 0;
-            qp_attr.cap.max_send_sge = config.max_send_sge;
+            qp_attr.cap.max_send_sge = self.config.max_send_sge;
             qp_attr.cap.max_recv_sge = 0;
-            qp_attr.cap.max_inline_data = config.max_inline_data;
+            qp_attr.cap.max_inline_data = self.config.max_inline_data;
             qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
-            qp_attr.pd = pd.as_ptr();
+            qp_attr.pd = self.pd.as_ptr();
 
             let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
             mlx5_attr.comp_mask =
@@ -306,24 +369,89 @@ impl Context {
                 .dci_streams
                 .log_num_errored = 0;
 
-            let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
             let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
 
             let mut result = Dci {
                 qp,
                 state: Cell::new(DcQpState::Reset),
-                max_inline_data: config.max_inline_data,
+                max_inline_data: self.config.max_inline_data,
                 sq: None,
-                callback,
-                send_cq: Rc::downgrade(send_cq),
-                _pd: pd.clone(),
+                callback: self.callback,
+                send_cq: self.send_cq_weak.clone().unwrap_or_else(|| Weak::new()),
+                _pd: self.pd.clone(),
                 _transport: PhantomData,
             };
 
-            // Auto-initialize direct access
             DciWithTable::<Entry, OnComplete>::init_direct_access_internal(&mut result)?;
 
-            Ok(result)
+            let dci_rc = Rc::new(RefCell::new(result));
+            let qpn = dci_rc.borrow().qpn();
+
+            // Register with CQ if using normal Cq
+            if let Some(cq) = self.send_cq_weak.as_ref().and_then(|w| w.upgrade()) {
+                cq.register_queue(qpn, Rc::downgrade(&dci_rc) as _);
+            }
+
+            Ok(dci_rc)
+        }
+    }
+}
+
+/// Type alias for DCI with MonoCq (no callback stored).
+pub type DciForMonoCq<Entry> = Dci<Entry, InfiniBand, OrderedWqeTable<Entry>, ()>;
+
+impl<'a, Entry> DciBuilder<'a, Entry, InfiniBand, CqSet, ()>
+where
+    Entry: 'static,
+{
+    /// Build the DCI for MonoCq.
+    pub fn build(self) -> io::Result<Rc<RefCell<DciForMonoCq<Entry>>>> {
+        unsafe {
+            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
+            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_DRIVER;
+            qp_attr.send_cq = self.send_cq_ptr;
+            qp_attr.recv_cq = self.send_cq_ptr;
+            qp_attr.cap.max_send_wr = self.config.max_send_wr;
+            qp_attr.cap.max_recv_wr = 0;
+            qp_attr.cap.max_send_sge = self.config.max_send_sge;
+            qp_attr.cap.max_recv_sge = 0;
+            qp_attr.cap.max_inline_data = self.config.max_inline_data;
+            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
+            qp_attr.pd = self.pd.as_ptr();
+
+            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
+            mlx5_attr.comp_mask =
+                mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_DC as u64;
+            mlx5_attr.dc_init_attr.dc_type = mlx5_sys::mlx5dv_dc_type_MLX5DV_DCTYPE_DCI;
+            mlx5_attr
+                .dc_init_attr
+                .__bindgen_anon_1
+                .dci_streams
+                .log_num_concurent = 0;
+            mlx5_attr
+                .dc_init_attr
+                .__bindgen_anon_1
+                .dci_streams
+                .log_num_errored = 0;
+
+            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
+
+            let mut result = Dci {
+                qp,
+                state: Cell::new(DcQpState::Reset),
+                max_inline_data: self.config.max_inline_data,
+                sq: None,
+                callback: (),
+                send_cq: Weak::new(),
+                _pd: self.pd.clone(),
+                _transport: PhantomData,
+            };
+
+            DciForMonoCq::<Entry>::init_direct_access_internal(&mut result)?;
+
+            Ok(Rc::new(RefCell::new(result)))
         }
     }
 }
@@ -584,49 +712,104 @@ pub struct Dct<T> {
     srq: Srq<T>,
 }
 
+// =============================================================================
+// DCT Builder (type-state pattern)
+// =============================================================================
+
+/// DCT Builder with type-state pattern for CQ configuration.
+pub struct DctBuilder<'a, Entry, CqState> {
+    ctx: &'a Context,
+    pd: &'a Pd,
+    srq: &'a Srq<Entry>,
+    config: DctConfig,
+    recv_cq_ptr: *mut mlx5_sys::ibv_cq,
+    _marker: PhantomData<CqState>,
+}
+
 impl Context {
-    /// Create a DCT (DC Target) using mlx5dv_create_qp.
+    /// Create a DCT Builder.
     ///
-    /// # Arguments
-    /// * `pd` - Protection Domain
-    /// * `srq` - Shared Receive Queue for incoming messages
-    /// * `cq` - Completion Queue
-    /// * `config` - DCT configuration
-    ///
-    /// # Errors
-    /// Returns an error if the DCT cannot be created.
-    pub fn create_dct<T>(
-        &self,
-        pd: &Pd,
-        srq: &Srq<T>,
-        cq: &CompletionQueue,
+    /// # Example
+    /// ```ignore
+    /// let dct = ctx.dct_builder(&pd, &srq, &config)
+    ///     .recv_cq(&cq)
+    ///     .build()?;
+    /// ```
+    pub fn dct_builder<'a, Entry>(
+        &'a self,
+        pd: &'a Pd,
+        srq: &'a Srq<Entry>,
         config: &DctConfig,
-    ) -> io::Result<Dct<T>> {
+    ) -> DctBuilder<'a, Entry, NoCq> {
+        DctBuilder {
+            ctx: self,
+            pd,
+            srq,
+            config: config.clone(),
+            recv_cq_ptr: std::ptr::null_mut(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'a, Entry> DctBuilder<'a, Entry, NoCq> {
+    /// Set normal CQ for receive completions.
+    pub fn recv_cq(self, cq: &Cq) -> DctBuilder<'a, Entry, CqSet> {
+        DctBuilder {
+            ctx: self.ctx,
+            pd: self.pd,
+            srq: self.srq,
+            config: self.config,
+            recv_cq_ptr: cq.as_ptr(),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Set MonoCq for receive completions.
+    pub fn recv_mono_cq<Q, F>(self, mono_cq: &MonoCq<Q, F>) -> DctBuilder<'a, Entry, CqSet>
+    where
+        F: Fn(Cqe, Q::Entry) + 'static,
+        Q: crate::mono_cq::CompletionSource,
+    {
+        DctBuilder {
+            ctx: self.ctx,
+            pd: self.pd,
+            srq: self.srq,
+            config: self.config,
+            recv_cq_ptr: mono_cq.as_ptr(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'a, Entry> DctBuilder<'a, Entry, CqSet> {
+    /// Build the DCT.
+    pub fn build(self) -> io::Result<Dct<Entry>> {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_DRIVER;
-            qp_attr.send_cq = cq.as_ptr();
-            qp_attr.recv_cq = cq.as_ptr();
-            qp_attr.srq = srq.as_ptr();
+            qp_attr.send_cq = self.recv_cq_ptr;
+            qp_attr.recv_cq = self.recv_cq_ptr;
+            qp_attr.srq = self.srq.as_ptr();
             qp_attr.cap.max_recv_wr = 0;
             qp_attr.cap.max_recv_sge = 0;
             qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
-            qp_attr.pd = pd.as_ptr();
+            qp_attr.pd = self.pd.as_ptr();
 
             let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
             mlx5_attr.comp_mask =
                 mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_DC as u64;
             mlx5_attr.dc_init_attr.dc_type = mlx5_sys::mlx5dv_dc_type_MLX5DV_DCTYPE_DCT;
-            mlx5_attr.dc_init_attr.__bindgen_anon_1.dct_access_key = config.dc_key;
+            mlx5_attr.dc_init_attr.__bindgen_anon_1.dct_access_key = self.config.dc_key;
 
-            let qp = mlx5_sys::mlx5dv_create_qp(self.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
             NonNull::new(qp).map_or(Err(io::Error::last_os_error()), |qp| {
                 Ok(Dct {
                     qp,
-                    dc_key: config.dc_key,
+                    dc_key: self.config.dc_key,
                     state: DcQpState::Reset,
-                    _pd: pd.clone(),
-                    srq: srq.clone(),
+                    _pd: self.pd.clone(),
+                    srq: self.srq.clone(),
                 })
             })
         }

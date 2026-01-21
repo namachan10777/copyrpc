@@ -16,7 +16,7 @@ use std::rc::{Rc, Weak};
 use std::{io, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
 use crate::CompletionTarget;
-use crate::cq::{CompletionQueue, Cqe};
+use crate::cq::{Cq, Cqe};
 use crate::device::Context;
 use crate::pd::{AddressHandle, Pd};
 use crate::qp::QpInfo;
@@ -457,9 +457,9 @@ pub struct UdQp<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqCo
     sq_callback: OnSqComplete,
     rq_callback: OnRqComplete,
     /// Weak reference to the send CQ for unregistration on drop.
-    send_cq: Weak<CompletionQueue>,
+    send_cq: Weak<Cq>,
     /// Weak reference to the recv CQ for unregistration on drop.
-    recv_cq: Weak<CompletionQueue>,
+    recv_cq: Weak<Cq>,
     /// Keep the PD alive while this QP exists.
     _pd: Pd,
     /// Phantom for Transport and RqEntry types.
@@ -970,8 +970,8 @@ pub struct UdQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, RqCqState, OnSq, 
     recv_cq_ptr: *mut mlx5_sys::ibv_cq,
 
     // Weak references to normal CQs for registration (None for MonoCq)
-    send_cq_weak: Option<Weak<CompletionQueue>>,
-    recv_cq_weak: Option<Weak<CompletionQueue>>,
+    send_cq_weak: Option<Weak<Cq>>,
+    recv_cq_weak: Option<Weak<Cq>>,
 
     // Callbacks (set via sq_cq/rq_cq, () for MonoCq)
     sq_callback: OnSq,
@@ -1030,7 +1030,7 @@ impl<'a, SqEntry, RqEntry, T, Rq, RqCqState, OnRq>
     /// Set normal CQ for SQ with callback.
     pub fn sq_cq<OnSq>(
         self,
-        cq: Rc<CompletionQueue>,
+        cq: Rc<Cq>,
         callback: OnSq,
     ) -> UdQpBuilder<'a, SqEntry, RqEntry, T, Rq, CqSet, RqCqState, OnSq, OnRq>
     where
@@ -1086,7 +1086,7 @@ impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, OnSq>
     /// Set normal CQ for RQ with callback.
     pub fn rq_cq<OnRq>(
         self,
-        cq: Rc<CompletionQueue>,
+        cq: Rc<Cq>,
         callback: OnRq,
     ) -> UdQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, CqSet, OnSq, OnRq>
     where
@@ -1242,7 +1242,7 @@ where
             let qp_rc = Rc::new(RefCell::new(result));
             let qpn = qp_rc.borrow().qpn();
 
-            // Register with CQs if using normal CompletionQueue
+            // Register with CQs if using normal Cq
             if let Some(cq) = send_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
                 cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
             }
@@ -1318,7 +1318,7 @@ where
             let qp_rc = Rc::new(RefCell::new(result));
             let qpn = qp_rc.borrow().qpn();
 
-            // Register with CQs if using normal CompletionQueue
+            // Register with CQs if using normal Cq
             if let Some(cq) = send_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
                 cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
             }
@@ -1389,7 +1389,7 @@ where
             let qp_rc = Rc::new(RefCell::new(result));
             let qpn = qp_rc.borrow().qpn();
 
-            // Register with CQs if using normal CompletionQueue
+            // Register with CQs if using normal Cq
             if let Some(cq) = send_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
                 cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
             }
