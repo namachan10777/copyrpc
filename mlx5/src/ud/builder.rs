@@ -6,8 +6,10 @@ use std::marker::PhantomData;
 
 use crate::pd::AddressHandle;
 use crate::wqe::{
-    CtrlSeg, DataSeg, HasData, InlineHeader, NoData, OrderedWqeTable,
+    CTRL_SEG_SIZE, DATA_SEG_SIZE, HasData, NoData, OrderedWqeTable,
     SubmissionError, TxFlags, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
+    set_ctrl_seg_completion_flag, update_ctrl_seg_ds_cnt, update_ctrl_seg_wqe_idx,
+    write_ctrl_seg, write_data_seg, write_inline_header,
 };
 
 use super::{UdAddressSeg, UdQpIb, UdRecvQueueState, UdSendQueueState};
@@ -22,7 +24,7 @@ use super::{UdAddressSeg, UdQpIb, UdRecvQueueState, UdSendQueueState};
 #[inline]
 fn calc_ud_max_wqebb_send(max_inline_data: u32) -> u16 {
     let inline_padded = ((4 + max_inline_data as usize) + 15) & !15;
-    let size = CtrlSeg::SIZE + UdAddressSeg::SIZE + inline_padded;
+    let size = CTRL_SEG_SIZE + UdAddressSeg::SIZE + inline_padded;
     calc_wqebb_cnt(size)
 }
 
@@ -71,7 +73,7 @@ impl<'a, Entry> UdWqeCore<'a, Entry> {
             flags
         };
         unsafe {
-            CtrlSeg::write(
+            write_ctrl_seg(
                 self.wqe_ptr,
                 0,
                 opcode as u8,
@@ -82,7 +84,7 @@ impl<'a, Entry> UdWqeCore<'a, Entry> {
                 imm,
             );
         }
-        self.offset = CtrlSeg::SIZE;
+        self.offset = CTRL_SEG_SIZE;
         self.ds_count = 1;
     }
 
@@ -98,9 +100,9 @@ impl<'a, Entry> UdWqeCore<'a, Entry> {
     #[inline]
     fn write_sge(&mut self, addr: u64, len: u32, lkey: u32) {
         unsafe {
-            DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
+            write_data_seg(self.wqe_ptr.add(self.offset), len, lkey, addr);
         }
-        self.offset += DataSeg::SIZE;
+        self.offset += DATA_SEG_SIZE;
         self.ds_count += 1;
     }
 
@@ -108,7 +110,7 @@ impl<'a, Entry> UdWqeCore<'a, Entry> {
     fn write_inline(&mut self, data: &[u8]) {
         let padded_size = unsafe {
             let ptr = self.wqe_ptr.add(self.offset);
-            let size = InlineHeader::write(ptr, data.len() as u32);
+            let size = write_inline_header(ptr, data.len() as u32);
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
             size
         };
@@ -126,10 +128,10 @@ impl<'a, Entry> UdWqeCore<'a, Entry> {
         }
 
         unsafe {
-            CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
+            update_ctrl_seg_ds_cnt(self.wqe_ptr, self.ds_count);
             // Set completion flag if signaled (may not have been set at write_ctrl time)
             if self.signaled {
-                CtrlSeg::set_completion_flag(self.wqe_ptr);
+                set_ctrl_seg_completion_flag(self.wqe_ptr);
             }
         }
 
@@ -165,11 +167,11 @@ impl<'a, Entry> UdWqeCore<'a, Entry> {
 
         unsafe {
             std::ptr::copy_nonoverlapping(temp_buf.as_ptr(), new_wqe_ptr, self.offset);
-            CtrlSeg::update_wqe_idx(new_wqe_ptr, new_wqe_idx);
-            CtrlSeg::update_ds_cnt(new_wqe_ptr, self.ds_count);
+            update_ctrl_seg_wqe_idx(new_wqe_ptr, new_wqe_idx);
+            update_ctrl_seg_ds_cnt(new_wqe_ptr, self.ds_count);
             // Set completion flag if signaled (may not have been set at write_ctrl time)
             if self.signaled {
-                CtrlSeg::set_completion_flag(new_wqe_ptr);
+                set_ctrl_seg_completion_flag(new_wqe_ptr);
             }
         }
 
@@ -372,7 +374,7 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIb<SqEntry, RqEntry, OnSq
         let wqe_idx = rq.pi.get();
         unsafe {
             let wqe_ptr = rq.get_wqe_ptr(wqe_idx);
-            DataSeg::write(wqe_ptr, len, lkey, addr);
+            write_data_seg(wqe_ptr, len, lkey, addr);
         }
         let idx = (wqe_idx as usize) & ((rq.wqe_cnt - 1) as usize);
         rq.table[idx].set(Some(entry));
@@ -452,7 +454,7 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIb<SqEntry, RqEntry, OnSq
 const BLUEFLAME_BUFFER_SIZE: usize = 256;
 
 /// RQ WQE size in bytes (single DataSeg).
-const RQ_WQE_SIZE: usize = DataSeg::SIZE;
+const RQ_WQE_SIZE: usize = DATA_SEG_SIZE;
 
 /// BlueFlame WQE batch builder for UD RQ.
 ///
@@ -522,10 +524,10 @@ impl<'a, Entry> UdRqBlueflameWqeBatch<'a, Entry> {
         let wqe_idx = self.rq.pi.get().wrapping_add(self.wqe_count);
         unsafe {
             let wqe_ptr = self.rq.get_wqe_ptr(wqe_idx);
-            DataSeg::write(wqe_ptr, len, lkey, addr);
+            write_data_seg(wqe_ptr, len, lkey, addr);
 
             // Also write to batch buffer for BlueFlame copy
-            DataSeg::write(self.buffer.as_mut_ptr().add(self.offset), len, lkey, addr);
+            write_data_seg(self.buffer.as_mut_ptr().add(self.offset), len, lkey, addr);
         }
 
         // Store entry in table
@@ -700,7 +702,7 @@ struct UdBlueflameWqeCore<'b, 'a, Entry> {
 impl<'b, 'a, Entry> UdBlueflameWqeCore<'b, 'a, Entry> {
     #[inline]
     fn new(batch: &'b mut UdBlueflameWqeBatch<'a, Entry>) -> Result<Self, SubmissionError> {
-        if batch.offset + CtrlSeg::SIZE > BLUEFLAME_BUFFER_SIZE {
+        if batch.offset + CTRL_SEG_SIZE > BLUEFLAME_BUFFER_SIZE {
             return Err(SubmissionError::BlueflameOverflow);
         }
         Ok(Self {
@@ -722,7 +724,7 @@ impl<'b, 'a, Entry> UdBlueflameWqeCore<'b, 'a, Entry> {
         let wqe_idx = self.batch.sq.pi.get();
         let flags = WqeFlags::from_bits_truncate(flags.bits());
         unsafe {
-            CtrlSeg::write(
+            write_ctrl_seg(
                 self.batch.buffer.as_mut_ptr().add(self.offset),
                 0,
                 opcode as u8,
@@ -733,7 +735,7 @@ impl<'b, 'a, Entry> UdBlueflameWqeCore<'b, 'a, Entry> {
                 imm,
             );
         }
-        self.offset += CtrlSeg::SIZE;
+        self.offset += CTRL_SEG_SIZE;
         self.ds_count = 1;
     }
 
@@ -756,13 +758,13 @@ impl<'b, 'a, Entry> UdBlueflameWqeCore<'b, 'a, Entry> {
 
     #[inline]
     fn write_sge(&mut self, addr: u64, len: u32, lkey: u32) -> Result<(), SubmissionError> {
-        if self.remaining() < DataSeg::SIZE {
+        if self.remaining() < DATA_SEG_SIZE {
             return Err(SubmissionError::BlueflameOverflow);
         }
         unsafe {
-            DataSeg::write(self.batch.buffer.as_mut_ptr().add(self.offset), len, lkey, addr);
+            write_data_seg(self.batch.buffer.as_mut_ptr().add(self.offset), len, lkey, addr);
         }
-        self.offset += DataSeg::SIZE;
+        self.offset += DATA_SEG_SIZE;
         self.ds_count += 1;
         Ok(())
     }
@@ -775,7 +777,7 @@ impl<'b, 'a, Entry> UdBlueflameWqeCore<'b, 'a, Entry> {
         }
         unsafe {
             let ptr = self.batch.buffer.as_mut_ptr().add(self.offset);
-            InlineHeader::write(ptr, data.len() as u32);
+            write_inline_header(ptr, data.len() as u32);
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
         }
         self.offset += padded_size;
@@ -786,12 +788,12 @@ impl<'b, 'a, Entry> UdBlueflameWqeCore<'b, 'a, Entry> {
     #[inline]
     fn finish_internal(self, entry: Option<Entry>) -> Result<(), SubmissionError> {
         unsafe {
-            CtrlSeg::update_ds_cnt(
+            update_ctrl_seg_ds_cnt(
                 self.batch.buffer.as_mut_ptr().add(self.wqe_start),
                 self.ds_count,
             );
             if self.signaled || entry.is_some() {
-                CtrlSeg::set_completion_flag(
+                set_ctrl_seg_completion_flag(
                     self.batch.buffer.as_mut_ptr().add(self.wqe_start),
                 );
             }

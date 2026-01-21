@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::{io, mem::MaybeUninit, ptr::NonNull};
 
 use crate::pd::Pd;
-use crate::wqe::{DataSeg, SubmissionError, WQEBB_SIZE};
+use crate::wqe::{DATA_SEG_SIZE, SubmissionError, WQEBB_SIZE, write_data_seg};
 
 /// SRQ configuration.
 #[derive(Debug, Clone)]
@@ -263,7 +263,7 @@ impl<T> Srq<T> {
             std::ptr::write_bytes(wqe_ptr, 0, 16);
 
             // Write Data Segment at offset 16
-            DataSeg::write(wqe_ptr.add(16), len, lkey, addr);
+            write_data_seg(wqe_ptr.add(16), len, lkey, addr);
         }
 
         let idx = (wqe_idx as usize) & ((state.wqe_cnt - 1) as usize);
@@ -438,12 +438,12 @@ impl<'a, T> SrqBlueflameWqeBatch<'a, T> {
 
             // SRQ WQE format: Next Segment (16 bytes) + Data Segment (16 bytes)
             std::ptr::write_bytes(wqe_ptr, 0, 16);
-            DataSeg::write(wqe_ptr.add(16), len, lkey, addr);
+            write_data_seg(wqe_ptr.add(16), len, lkey, addr);
 
             // Also write to batch buffer for BlueFlame copy
             let buf_ptr = self.buffer.as_mut_ptr().add(self.offset);
             std::ptr::write_bytes(buf_ptr, 0, 16);
-            DataSeg::write(buf_ptr.add(16), len, lkey, addr);
+            write_data_seg(buf_ptr.add(16), len, lkey, addr);
         }
 
         // Store entry in table

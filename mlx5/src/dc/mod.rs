@@ -18,7 +18,8 @@ use crate::qp::QpInfo;
 use crate::srq::Srq;
 use crate::transport::IbRemoteDctInfo;
 use crate::wqe::{
-    CtrlSeg, InfiniBand, OrderedWqeTable, RoCE, WQEBB_SIZE, WqeOpcode,
+    CTRL_SEG_SIZE, InfiniBand, OrderedWqeTable, RoCE, WQEBB_SIZE, WqeOpcode,
+    write_ctrl_seg,
 };
 
 /// DCI configuration.
@@ -137,7 +138,7 @@ impl<Entry, TableType> DciSendQueueState<Entry, TableType> {
 
         // Write NOP control segment
         let ds_count = (nop_wqebb_cnt as u8) * 4;
-        CtrlSeg::write(
+        write_ctrl_seg(
             wqe_ptr,
             0, // opmod = 0 for NOP
             WqeOpcode::Nop as u8,

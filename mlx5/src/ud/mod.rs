@@ -22,7 +22,7 @@ use crate::pd::{AddressHandle, Pd};
 use crate::qp::QpInfo;
 use crate::srq::Srq;
 use crate::transport::{InfiniBand, RoCE};
-use crate::wqe::{CtrlSeg, DataSeg, OrderedWqeTable, WQEBB_SIZE, WqeOpcode};
+use crate::wqe::{CTRL_SEG_SIZE, DATA_SEG_SIZE, OrderedWqeTable, WQEBB_SIZE, WqeOpcode, write_ctrl_seg, write_data_seg};
 
 // =============================================================================
 // UD Configuration
@@ -137,7 +137,7 @@ impl<Entry, TableType> UdSendQueueState<Entry, TableType> {
 
         // Write NOP control segment
         let ds_count = (nop_wqebb_cnt as u8) * 4;
-        CtrlSeg::write(
+        write_ctrl_seg(
             wqe_ptr,
             0, // opmod = 0 for NOP
             WqeOpcode::Nop as u8,
@@ -284,7 +284,7 @@ impl<'a, Entry> UdRecvWqeBuilder<'a, Entry> {
     pub fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
         unsafe {
             let wqe_ptr = self.rq.get_wqe_ptr(self.wqe_idx);
-            DataSeg::write(wqe_ptr, len, lkey, addr);
+            write_data_seg(wqe_ptr, len, lkey, addr);
         }
         self
     }

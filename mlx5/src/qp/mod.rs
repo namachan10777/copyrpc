@@ -18,7 +18,8 @@ use crate::srq::Srq;
 use crate::transport::{IbRemoteQpInfo, RoCERemoteQpInfo};
 use crate::types::GrhAttr;
 use crate::wqe::{
-    CtrlSeg, DataSeg, OrderedWqeTable, SubmissionError, WQEBB_SIZE, WqeOpcode,
+    CTRL_SEG_SIZE, DATA_SEG_SIZE, OrderedWqeTable, SubmissionError, WQEBB_SIZE, WqeOpcode,
+    write_ctrl_seg, write_data_seg,
     // Transport type tags
     InfiniBand, RoCE,
     // Address Vector trait and types (needed for sq_wqe)
@@ -193,7 +194,7 @@ impl<Entry, TableType> SendQueueState<Entry, TableType> {
         // Write NOP control segment
         // ds_count = nop_wqebb_cnt * 4 (each WQEBB = 4 data segments of 16 bytes)
         let ds_count = (nop_wqebb_cnt as u8) * 4;
-        CtrlSeg::write(
+        write_ctrl_seg(
             wqe_ptr,
             0, // opmod = 0 for NOP
             WqeOpcode::Nop as u8,
@@ -1152,10 +1153,10 @@ impl<SqEntry, RqEntry, Transport, OnSqComplete, OnRqComplete> RcQp<SqEntry, RqEn
         let wqe_idx = rq.pi.get();
         unsafe {
             let wqe_ptr = rq.get_wqe_ptr(wqe_idx);
-            DataSeg::write(wqe_ptr, len, lkey, addr);
+            write_data_seg(wqe_ptr, len, lkey, addr);
 
-            if rq.stride > DataSeg::SIZE as u32 {
-                let sentinel_ptr = wqe_ptr.add(DataSeg::SIZE);
+            if rq.stride > DATA_SEG_SIZE as u32 {
+                let sentinel_ptr = wqe_ptr.add(DATA_SEG_SIZE);
                 let ptr32 = sentinel_ptr as *mut u32;
                 std::ptr::write_volatile(ptr32, 0u32);
                 std::ptr::write_volatile(ptr32.add(1), MLX5_INVALID_LKEY.to_be());
