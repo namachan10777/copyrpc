@@ -212,6 +212,7 @@ fn test_tm_tag_add_remove() {
         .ctrl_tag_matching(0)
         .tag_del(tag_index, true)
         .finish();
+    tm_srq.borrow_mut().ring_cmd_doorbell();
 
     // Poll for delete completion
     let start = std::time::Instant::now();
@@ -375,6 +376,7 @@ fn test_tm_multiple_tags() {
                 true,
             )
             .finish();
+        tm_srq.borrow_mut().ring_cmd_doorbell();
 
         // Poll for completion
         let start = std::time::Instant::now();
@@ -409,6 +411,7 @@ fn test_tm_multiple_tags() {
             .ctrl_tag_matching(0)
             .tag_del(i, true)
             .finish();
+        tm_srq.borrow_mut().ring_cmd_doorbell();
 
         // Poll for completion
         let start = std::time::Instant::now();

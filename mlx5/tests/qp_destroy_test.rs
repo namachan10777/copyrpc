@@ -626,6 +626,7 @@ fn test_qp_destroy_after_actual_send_recv() {
                         b.sge(buf.addr() + offset, 32, mr.lkey())
                             .finish_signaled(idx as u64)
                     });
+                qp.borrow().ring_sq_doorbell();
 
                 // Repost recv
                 let _ = qp
@@ -784,6 +785,7 @@ fn test_qp_destroy_after_actual_send_recv() {
                         b.sge(buf.addr() + offset, 32, mr.lkey())
                             .finish_signaled(idx as u64)
                     });
+                qp.borrow().ring_sq_doorbell();
                 sent += 1;
             }
         }

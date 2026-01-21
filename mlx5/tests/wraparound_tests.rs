@@ -136,6 +136,7 @@ fn test_rc_rdma_write_wraparound() {
             .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
             .finish_signaled(i as u64)
             .expect("finish failed");
+        qp1.borrow().ring_sq_doorbell();
 
         // Wait for completion
         let cqe =
@@ -361,6 +362,7 @@ fn test_dc_rdma_write_wraparound() {
             .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
             .finish_signaled(i as u64)
             .expect("finish failed");
+        dci.borrow().ring_sq_doorbell();
 
         let cqe = poll_cq_timeout(&dci_cq, 5000).expect(&format!("CQE timeout at iteration {}", i));
         assert_eq!(
@@ -724,6 +726,7 @@ fn test_rc_inline_wraparound() {
             .inline(&test_data)
             .finish_signaled(i as u64)
             .expect("finish failed");
+        qp1.borrow().ring_sq_doorbell();
 
         // Detect wrap-around: wqe_idx decreased or jumped significantly
         if let Some(prev) = prev_wqe_idx {
@@ -871,6 +874,7 @@ fn test_rc_inline_variable_size_wraparound() {
             .inline(&test_data)
             .finish_signaled(i as u64)
             .expect("finish failed");
+        qp1.borrow().ring_sq_doorbell();
 
         // Poll CQs
         let send_cqe = poll_cq_timeout(&send_cq, 5000).expect("Send CQE timeout");
