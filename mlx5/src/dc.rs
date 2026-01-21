@@ -17,9 +17,13 @@ use crate::srq::Srq;
 use crate::transport::IbRemoteDctInfo;
 use crate::types::GrhAttr;
 use crate::wqe::{
-    AddressVector, CtrlSeg, DataSeg, HasData, InfiniBand, InlineHeader, NoData,
-    OrderedWqeTable, RdmaSeg, RoCE, SubmissionError, WQEBB_SIZE, WqeFlags,
-    WqeHandle, WqeOpcode, calc_wqebb_cnt,
+    ADDRESS_VECTOR_SIZE, ATOMIC_SEG_SIZE, CTRL_SEG_SIZE, DATA_SEG_SIZE,
+    HasData, InfiniBand, NoData, OrderedWqeTable, RDMA_SEG_SIZE, RoCE,
+    SubmissionError, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
+    set_ctrl_seg_completion_flag, update_ctrl_seg_ds_cnt, update_ctrl_seg_wqe_idx,
+    write_address_vector_ib, write_address_vector_roce, write_atomic_seg_cas,
+    write_atomic_seg_fa, write_ctrl_seg, write_data_seg, write_inline_header,
+    write_rdma_seg,
 };
 
 /// DCI configuration.
@@ -138,7 +142,7 @@ impl<Entry, TableType> DciSendQueueState<Entry, TableType> {
 
         // Write NOP control segment
         let ds_count = (nop_wqebb_cnt as u8) * 4;
-        CtrlSeg::write(
+        write_ctrl_seg(
             wqe_ptr,
             0, // opmod = 0 for NOP
             WqeOpcode::Nop as u8,
@@ -759,11 +763,7 @@ impl<T> Dct<T> {
 // Simplified WQE Builder API
 // =============================================================================
 
-use crate::wqe::{
-    AtomicSeg,
-    // Flags
-    TxFlags,
-};
+use crate::wqe::TxFlags;
 
 // =============================================================================
 // Maximum WQEBB Calculation Functions for DCI
@@ -782,7 +782,7 @@ fn calc_inline_padded(max_inline_data: u32) -> usize {
 /// Layout: ctrl(16) + AV(48) + inline_padded
 #[inline]
 fn calc_max_wqebb_send(max_inline_data: u32) -> u16 {
-    let size = CtrlSeg::SIZE + AddressVector::SIZE + calc_inline_padded(max_inline_data);
+    let size = CTRL_SEG_SIZE + ADDRESS_VECTOR_SIZE + calc_inline_padded(max_inline_data);
     calc_wqebb_cnt(size)
 }
 
@@ -791,7 +791,7 @@ fn calc_max_wqebb_send(max_inline_data: u32) -> u16 {
 /// Layout: ctrl(16) + AV(48) + rdma(16) + inline_padded
 #[inline]
 fn calc_max_wqebb_write(max_inline_data: u32) -> u16 {
-    let size = CtrlSeg::SIZE + AddressVector::SIZE + RdmaSeg::SIZE + calc_inline_padded(max_inline_data);
+    let size = CTRL_SEG_SIZE + ADDRESS_VECTOR_SIZE + RDMA_SEG_SIZE + calc_inline_padded(max_inline_data);
     calc_wqebb_cnt(size)
 }
 
@@ -800,7 +800,7 @@ fn calc_max_wqebb_write(max_inline_data: u32) -> u16 {
 /// Layout: ctrl(16) + AV(48) + rdma(16) + sge(16)
 #[inline]
 fn calc_max_wqebb_read() -> u16 {
-    let size = CtrlSeg::SIZE + AddressVector::SIZE + RdmaSeg::SIZE + DataSeg::SIZE;
+    let size = CTRL_SEG_SIZE + ADDRESS_VECTOR_SIZE + RDMA_SEG_SIZE + DATA_SEG_SIZE;
     calc_wqebb_cnt(size)
 }
 
@@ -809,7 +809,7 @@ fn calc_max_wqebb_read() -> u16 {
 /// Layout: ctrl(16) + AV(48) + rdma(16) + atomic(16) + sge(16)
 #[inline]
 fn calc_max_wqebb_atomic() -> u16 {
-    let size = CtrlSeg::SIZE + AddressVector::SIZE + RdmaSeg::SIZE + AtomicSeg::SIZE + DataSeg::SIZE;
+    let size = CTRL_SEG_SIZE + ADDRESS_VECTOR_SIZE + RDMA_SEG_SIZE + ATOMIC_SEG_SIZE + DATA_SEG_SIZE;
     calc_wqebb_cnt(size)
 }
 
@@ -818,7 +818,7 @@ fn calc_max_wqebb_atomic() -> u16 {
 /// Layout: ctrl(16) + AV(48)
 #[inline]
 fn calc_max_wqebb_nop() -> u16 {
-    let size = CtrlSeg::SIZE + AddressVector::SIZE;
+    let size = CTRL_SEG_SIZE + ADDRESS_VECTOR_SIZE;
     calc_wqebb_cnt(size)
 }
 
@@ -890,16 +890,16 @@ impl<'a, Entry> DciWqeCore<'a, Entry> {
             PendingAv::None => {}
             PendingAv::Ib { dc_key, dctn, dlid } => {
                 unsafe {
-                    AddressVector::write_ib(self.wqe_ptr.add(self.offset), dc_key, dctn, dlid);
+                    write_address_vector_ib(self.wqe_ptr.add(self.offset), dc_key, dctn, dlid);
                 }
-                self.offset += AddressVector::SIZE;
+                self.offset += ADDRESS_VECTOR_SIZE;
                 self.ds_count += 3;
             }
             PendingAv::RoCE { dc_key, dctn, grh } => {
                 unsafe {
-                    AddressVector::write_roce(self.wqe_ptr.add(self.offset), dc_key, dctn, grh);
+                    write_address_vector_roce(self.wqe_ptr.add(self.offset), dc_key, dctn, grh);
                 }
-                self.offset += AddressVector::SIZE;
+                self.offset += ADDRESS_VECTOR_SIZE;
                 self.ds_count += 3;
             }
         }
@@ -913,7 +913,7 @@ impl<'a, Entry> DciWqeCore<'a, Entry> {
             flags
         };
         unsafe {
-            CtrlSeg::write(
+            write_ctrl_seg(
                 self.wqe_ptr,
                 0,
                 opcode as u8,
@@ -924,25 +924,25 @@ impl<'a, Entry> DciWqeCore<'a, Entry> {
                 imm,
             );
         }
-        self.offset = CtrlSeg::SIZE;
+        self.offset = CTRL_SEG_SIZE;
         self.ds_count = 1;
     }
 
     #[inline]
     fn write_rdma(&mut self, addr: u64, rkey: u32) {
         unsafe {
-            RdmaSeg::write(self.wqe_ptr.add(self.offset), addr, rkey);
+            write_rdma_seg(self.wqe_ptr.add(self.offset), addr, rkey);
         }
-        self.offset += RdmaSeg::SIZE;
+        self.offset += RDMA_SEG_SIZE;
         self.ds_count += 1;
     }
 
     #[inline]
     fn write_sge(&mut self, addr: u64, len: u32, lkey: u32) {
         unsafe {
-            DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
+            write_data_seg(self.wqe_ptr.add(self.offset), len, lkey, addr);
         }
-        self.offset += DataSeg::SIZE;
+        self.offset += DATA_SEG_SIZE;
         self.ds_count += 1;
     }
 
@@ -950,7 +950,7 @@ impl<'a, Entry> DciWqeCore<'a, Entry> {
     fn write_inline(&mut self, data: &[u8]) {
         let padded_size = unsafe {
             let ptr = self.wqe_ptr.add(self.offset);
-            let size = InlineHeader::write(ptr, data.len() as u32);
+            let size = write_inline_header(ptr, data.len() as u32);
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
             size
         };
@@ -961,18 +961,18 @@ impl<'a, Entry> DciWqeCore<'a, Entry> {
     #[inline]
     fn write_atomic_cas(&mut self, swap: u64, compare: u64) {
         unsafe {
-            AtomicSeg::write_cas(self.wqe_ptr.add(self.offset), swap, compare);
+            write_atomic_seg_cas(self.wqe_ptr.add(self.offset), swap, compare);
         }
-        self.offset += AtomicSeg::SIZE;
+        self.offset += ATOMIC_SEG_SIZE;
         self.ds_count += 1;
     }
 
     #[inline]
     fn write_atomic_fa(&mut self, add_value: u64) {
         unsafe {
-            AtomicSeg::write_fa(self.wqe_ptr.add(self.offset), add_value);
+            write_atomic_seg_fa(self.wqe_ptr.add(self.offset), add_value);
         }
-        self.offset += AtomicSeg::SIZE;
+        self.offset += ATOMIC_SEG_SIZE;
         self.ds_count += 1;
     }
 
@@ -986,10 +986,10 @@ impl<'a, Entry> DciWqeCore<'a, Entry> {
         }
 
         unsafe {
-            CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
+            update_ctrl_seg_ds_cnt(self.wqe_ptr, self.ds_count);
             // Set completion flag if signaled (may not have been set at write_ctrl time)
             if self.signaled {
-                CtrlSeg::set_completion_flag(self.wqe_ptr);
+                set_ctrl_seg_completion_flag(self.wqe_ptr);
             }
         }
 
@@ -1025,11 +1025,11 @@ impl<'a, Entry> DciWqeCore<'a, Entry> {
 
         unsafe {
             std::ptr::copy_nonoverlapping(temp_buf.as_ptr(), new_wqe_ptr, self.offset);
-            CtrlSeg::update_wqe_idx(new_wqe_ptr, new_wqe_idx);
-            CtrlSeg::update_ds_cnt(new_wqe_ptr, self.ds_count);
+            update_ctrl_seg_wqe_idx(new_wqe_ptr, new_wqe_idx);
+            update_ctrl_seg_ds_cnt(new_wqe_ptr, self.ds_count);
             // Set completion flag if signaled (may not have been set at write_ctrl time)
             if self.signaled {
-                CtrlSeg::set_completion_flag(new_wqe_ptr);
+                set_ctrl_seg_completion_flag(new_wqe_ptr);
             }
         }
 
@@ -1826,7 +1826,7 @@ struct DciBlueflameWqeCore<'b, 'a, Entry> {
 impl<'b, 'a, Entry> DciBlueflameWqeCore<'b, 'a, Entry> {
     #[inline]
     fn new(batch: &'b mut DciBlueflameWqeBatch<'a, Entry>) -> Result<Self, SubmissionError> {
-        if batch.offset + CtrlSeg::SIZE > BLUEFLAME_BUFFER_SIZE {
+        if batch.offset + CTRL_SEG_SIZE > BLUEFLAME_BUFFER_SIZE {
             return Err(SubmissionError::BlueflameOverflow);
         }
         Ok(Self {
@@ -1848,7 +1848,7 @@ impl<'b, 'a, Entry> DciBlueflameWqeCore<'b, 'a, Entry> {
         let wqe_idx = self.batch.sq.pi.get();
         let flags = WqeFlags::from_bits_truncate(flags.bits());
         unsafe {
-            CtrlSeg::write(
+            write_ctrl_seg(
                 self.batch.buffer.as_mut_ptr().add(self.offset),
                 0,
                 opcode as u8,
@@ -1859,50 +1859,50 @@ impl<'b, 'a, Entry> DciBlueflameWqeCore<'b, 'a, Entry> {
                 imm,
             );
         }
-        self.offset += CtrlSeg::SIZE;
+        self.offset += CTRL_SEG_SIZE;
         self.ds_count = 1;
     }
 
     #[inline]
     fn write_dc_av_ib(&mut self) -> Result<(), SubmissionError> {
-        if self.remaining() < AddressVector::SIZE {
+        if self.remaining() < ADDRESS_VECTOR_SIZE {
             return Err(SubmissionError::BlueflameOverflow);
         }
         unsafe {
-            AddressVector::write_ib(
+            write_address_vector_ib(
                 self.batch.buffer.as_mut_ptr().add(self.offset),
                 self.batch.dc_key,
                 self.batch.dctn,
                 self.batch.dlid,
             );
         }
-        self.offset += AddressVector::SIZE;
-        self.ds_count += (AddressVector::SIZE / 16) as u8;
+        self.offset += ADDRESS_VECTOR_SIZE;
+        self.ds_count += (ADDRESS_VECTOR_SIZE / 16) as u8;
         Ok(())
     }
 
     #[inline]
     fn write_rdma(&mut self, addr: u64, rkey: u32) -> Result<(), SubmissionError> {
-        if self.remaining() < RdmaSeg::SIZE {
+        if self.remaining() < RDMA_SEG_SIZE {
             return Err(SubmissionError::BlueflameOverflow);
         }
         unsafe {
-            RdmaSeg::write(self.batch.buffer.as_mut_ptr().add(self.offset), addr, rkey);
+            write_rdma_seg(self.batch.buffer.as_mut_ptr().add(self.offset), addr, rkey);
         }
-        self.offset += RdmaSeg::SIZE;
+        self.offset += RDMA_SEG_SIZE;
         self.ds_count += 1;
         Ok(())
     }
 
     #[inline]
     fn write_sge(&mut self, addr: u64, len: u32, lkey: u32) -> Result<(), SubmissionError> {
-        if self.remaining() < DataSeg::SIZE {
+        if self.remaining() < DATA_SEG_SIZE {
             return Err(SubmissionError::BlueflameOverflow);
         }
         unsafe {
-            DataSeg::write(self.batch.buffer.as_mut_ptr().add(self.offset), len, lkey, addr);
+            write_data_seg(self.batch.buffer.as_mut_ptr().add(self.offset), len, lkey, addr);
         }
-        self.offset += DataSeg::SIZE;
+        self.offset += DATA_SEG_SIZE;
         self.ds_count += 1;
         Ok(())
     }
@@ -1915,7 +1915,7 @@ impl<'b, 'a, Entry> DciBlueflameWqeCore<'b, 'a, Entry> {
         }
         unsafe {
             let ptr = self.batch.buffer.as_mut_ptr().add(self.offset);
-            InlineHeader::write(ptr, data.len() as u32);
+            write_inline_header(ptr, data.len() as u32);
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
         }
         self.offset += padded_size;
@@ -1926,12 +1926,12 @@ impl<'b, 'a, Entry> DciBlueflameWqeCore<'b, 'a, Entry> {
     #[inline]
     fn finish_internal(self, entry: Option<Entry>) -> Result<(), SubmissionError> {
         unsafe {
-            CtrlSeg::update_ds_cnt(
+            update_ctrl_seg_ds_cnt(
                 self.batch.buffer.as_mut_ptr().add(self.wqe_start),
                 self.ds_count,
             );
             if self.signaled || entry.is_some() {
-                CtrlSeg::set_completion_flag(
+                set_ctrl_seg_completion_flag(
                     self.batch.buffer.as_mut_ptr().add(self.wqe_start),
                 );
             }

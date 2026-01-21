@@ -14,9 +14,14 @@ use crate::pd::Pd;
 use crate::transport::{IbRemoteQpInfo, RoCERemoteQpInfo};
 use crate::types::GrhAttr;
 use crate::wqe::{
-    AtomicSeg, CtrlSeg, DataSeg, HasData, InlineHeader, Init, MaskedAtomicSeg32,
-    MaskedAtomicSeg64, NeedsAtomic, NeedsData, NeedsRdma, NeedsRdmaThenAtomic, OrderedWqeTable,
-    RdmaSeg, SubmissionError, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
+    ATOMIC_SEG_SIZE, CTRL_SEG_SIZE, DATA_SEG_SIZE, HasData, Init,
+    MASKED_ATOMIC_SEG32_SIZE, MASKED_ATOMIC_SEG64_SIZE_CAS, MASKED_ATOMIC_SEG64_SIZE_FA,
+    NeedsAtomic, NeedsData, NeedsRdma, NeedsRdmaThenAtomic, OrderedWqeTable,
+    RDMA_SEG_SIZE, SubmissionError, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
+    set_ctrl_seg_completion_flag, update_ctrl_seg_ds_cnt, update_ctrl_seg_wqe_idx,
+    write_atomic_seg_cas, write_atomic_seg_fa, write_ctrl_seg, write_data_seg, write_inline_header,
+    write_masked_atomic_seg32_cas, write_masked_atomic_seg32_fa,
+    write_masked_atomic_seg64_cas, write_masked_atomic_seg64_fa, write_rdma_seg,
     // Transport type tags
     InfiniBand, RoCE,
 };
@@ -189,7 +194,7 @@ impl<Entry, TableType> SendQueueState<Entry, TableType> {
         // Write NOP control segment
         // ds_count = nop_wqebb_cnt * 4 (each WQEBB = 4 data segments of 16 bytes)
         let ds_count = (nop_wqebb_cnt as u8) * 4;
-        CtrlSeg::write(
+        write_ctrl_seg(
             wqe_ptr,
             0, // opmod = 0 for NOP
             WqeOpcode::Nop as u8,
@@ -362,7 +367,7 @@ impl<'a, Entry, TableType, State> WqeBuilder<'a, Entry, TableType, State> {
             flags
         };
         unsafe {
-            CtrlSeg::write(
+            write_ctrl_seg(
                 self.wqe_ptr,
                 0, // opmod = 0 for normal operations
                 opcode as u8,
@@ -373,7 +378,7 @@ impl<'a, Entry, TableType, State> WqeBuilder<'a, Entry, TableType, State> {
                 imm,
             );
         }
-        self.offset = CtrlSeg::SIZE;
+        self.offset = CTRL_SEG_SIZE;
         self.ds_count = 1;
     }
 
@@ -387,7 +392,7 @@ impl<'a, Entry, TableType, State> WqeBuilder<'a, Entry, TableType, State> {
         };
 
         unsafe {
-            CtrlSeg::write(
+            write_ctrl_seg(
                 self.wqe_ptr,
                 opmod,
                 opcode as u8,
@@ -398,7 +403,7 @@ impl<'a, Entry, TableType, State> WqeBuilder<'a, Entry, TableType, State> {
                 imm,
             );
         }
-        self.offset = CtrlSeg::SIZE;
+        self.offset = CTRL_SEG_SIZE;
         self.ds_count = 1;
     }
 }
@@ -562,9 +567,9 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, NeedsRdma> {
     #[inline]
     pub fn rdma(mut self, remote_addr: u64, rkey: u32) -> WqeBuilder<'a, Entry, TableType, NeedsData> {
         unsafe {
-            RdmaSeg::write(self.wqe_ptr.add(self.offset), remote_addr, rkey);
+            write_rdma_seg(self.wqe_ptr.add(self.offset), remote_addr, rkey);
         }
-        self.offset += RdmaSeg::SIZE;
+        self.offset += RDMA_SEG_SIZE;
         self.ds_count += 1;
         self.transition()
     }
@@ -576,9 +581,9 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, NeedsRdmaThenAtomic>
     #[inline]
     pub fn rdma(mut self, remote_addr: u64, rkey: u32) -> WqeBuilder<'a, Entry, TableType, NeedsAtomic> {
         unsafe {
-            RdmaSeg::write(self.wqe_ptr.add(self.offset), remote_addr, rkey);
+            write_rdma_seg(self.wqe_ptr.add(self.offset), remote_addr, rkey);
         }
-        self.offset += RdmaSeg::SIZE;
+        self.offset += RDMA_SEG_SIZE;
         self.ds_count += 1;
         self.transition()
     }
@@ -595,9 +600,9 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, NeedsAtomic> {
     #[inline]
     pub fn atomic_cas(mut self, swap: u64, compare: u64) -> WqeBuilder<'a, Entry, TableType, NeedsData> {
         unsafe {
-            AtomicSeg::write_cas(self.wqe_ptr.add(self.offset), swap, compare);
+            write_atomic_seg_cas(self.wqe_ptr.add(self.offset), swap, compare);
         }
-        self.offset += AtomicSeg::SIZE;
+        self.offset += ATOMIC_SEG_SIZE;
         self.ds_count += 1;
         self.transition()
     }
@@ -611,9 +616,9 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, NeedsAtomic> {
     #[inline]
     pub fn atomic_fa(mut self, add_value: u64) -> WqeBuilder<'a, Entry, TableType, NeedsData> {
         unsafe {
-            AtomicSeg::write_fa(self.wqe_ptr.add(self.offset), add_value);
+            write_atomic_seg_fa(self.wqe_ptr.add(self.offset), add_value);
         }
-        self.offset += AtomicSeg::SIZE;
+        self.offset += ATOMIC_SEG_SIZE;
         self.ds_count += 1;
         self.transition()
     }
@@ -631,11 +636,11 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, NeedsAtomic> {
             let ptr1 = self.wqe_ptr.add(self.offset);
             let ptr2 = self
                 .wqe_ptr
-                .add(self.offset + MaskedAtomicSeg64::SIZE_CAS / 2);
+                .add(self.offset + MASKED_ATOMIC_SEG64_SIZE_CAS / 2);
 
-            MaskedAtomicSeg64::write_cas(ptr1, ptr2, swap, compare, swap_mask, compare_mask);
+            write_masked_atomic_seg64_cas(ptr1, ptr2, swap, compare, swap_mask, compare_mask);
         }
-        self.offset += MaskedAtomicSeg64::SIZE_CAS;
+        self.offset += MASKED_ATOMIC_SEG64_SIZE_CAS;
         self.ds_count += 2;
         self.transition()
     }
@@ -644,9 +649,9 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, NeedsAtomic> {
     #[inline]
     pub fn masked_fa64(mut self, add: u64, field_mask: u64) -> WqeBuilder<'a, Entry, TableType, NeedsData> {
         unsafe {
-            MaskedAtomicSeg64::write_fa(self.wqe_ptr.add(self.offset), add, field_mask);
+            write_masked_atomic_seg64_fa(self.wqe_ptr.add(self.offset), add, field_mask);
         }
-        self.offset += MaskedAtomicSeg64::SIZE_FA;
+        self.offset += MASKED_ATOMIC_SEG64_SIZE_FA;
         self.ds_count += 1;
         self.transition()
     }
@@ -661,7 +666,7 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, NeedsAtomic> {
         compare_mask: u32,
     ) -> WqeBuilder<'a, Entry, TableType, NeedsData> {
         unsafe {
-            MaskedAtomicSeg32::write_cas(
+            write_masked_atomic_seg32_cas(
                 self.wqe_ptr.add(self.offset),
                 swap,
                 compare,
@@ -669,7 +674,7 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, NeedsAtomic> {
                 compare_mask,
             );
         }
-        self.offset += MaskedAtomicSeg32::SIZE;
+        self.offset += MASKED_ATOMIC_SEG32_SIZE;
         self.ds_count += 1;
         self.transition()
     }
@@ -678,9 +683,9 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, NeedsAtomic> {
     #[inline]
     pub fn masked_fa32(mut self, add: u32, field_mask: u32) -> WqeBuilder<'a, Entry, TableType, NeedsData> {
         unsafe {
-            MaskedAtomicSeg32::write_fa(self.wqe_ptr.add(self.offset), add, field_mask);
+            write_masked_atomic_seg32_fa(self.wqe_ptr.add(self.offset), add, field_mask);
         }
-        self.offset += MaskedAtomicSeg32::SIZE;
+        self.offset += MASKED_ATOMIC_SEG32_SIZE;
         self.ds_count += 1;
         self.transition()
     }
@@ -692,9 +697,9 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, NeedsData> {
     #[inline]
     pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> WqeBuilder<'a, Entry, TableType, HasData> {
         unsafe {
-            DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
+            write_data_seg(self.wqe_ptr.add(self.offset), len, lkey, addr);
         }
-        self.offset += DataSeg::SIZE;
+        self.offset += DATA_SEG_SIZE;
         self.ds_count += 1;
         self.transition()
     }
@@ -704,7 +709,7 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, NeedsData> {
     pub fn inline_data(mut self, data: &[u8]) -> WqeBuilder<'a, Entry, TableType, HasData> {
         let padded_size = unsafe {
             let ptr = self.wqe_ptr.add(self.offset);
-            let size = InlineHeader::write(ptr, data.len() as u32);
+            let size = write_inline_header(ptr, data.len() as u32);
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
             size
         };
@@ -720,7 +725,7 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, NeedsData> {
     pub fn inline_slice(mut self, len: usize) -> (WqeBuilder<'a, Entry, TableType, HasData>, &'a mut [u8]) {
         let padded_size = unsafe {
             let ptr = self.wqe_ptr.add(self.offset);
-            InlineHeader::write(ptr, len as u32)
+            write_inline_header(ptr, len as u32)
         };
         let data_ptr = unsafe { self.wqe_ptr.add(self.offset + 4) };
         let slice = unsafe { std::slice::from_raw_parts_mut(data_ptr, len) };
@@ -736,9 +741,9 @@ impl<'a, Entry, TableType> WqeBuilder<'a, Entry, TableType, HasData> {
     #[inline]
     pub fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
         unsafe {
-            DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
+            write_data_seg(self.wqe_ptr.add(self.offset), len, lkey, addr);
         }
-        self.offset += DataSeg::SIZE;
+        self.offset += DATA_SEG_SIZE;
         self.ds_count += 1;
         self
     }
@@ -1516,7 +1521,7 @@ fn calc_inline_padded(max_inline_data: u32) -> usize {
 /// Layout: ctrl(16) + AV + inline_padded
 #[inline]
 fn calc_max_wqebb_send(av_size: usize, max_inline_data: u32) -> u16 {
-    let size = CtrlSeg::SIZE + av_size + calc_inline_padded(max_inline_data);
+    let size = CTRL_SEG_SIZE + av_size + calc_inline_padded(max_inline_data);
     calc_wqebb_cnt(size)
 }
 
@@ -1525,7 +1530,7 @@ fn calc_max_wqebb_send(av_size: usize, max_inline_data: u32) -> u16 {
 /// Layout: ctrl(16) + AV + rdma(16) + inline_padded
 #[inline]
 fn calc_max_wqebb_write(av_size: usize, max_inline_data: u32) -> u16 {
-    let size = CtrlSeg::SIZE + av_size + RdmaSeg::SIZE + calc_inline_padded(max_inline_data);
+    let size = CTRL_SEG_SIZE + av_size + RDMA_SEG_SIZE + calc_inline_padded(max_inline_data);
     calc_wqebb_cnt(size)
 }
 
@@ -1534,7 +1539,7 @@ fn calc_max_wqebb_write(av_size: usize, max_inline_data: u32) -> u16 {
 /// Layout: ctrl(16) + AV + rdma(16) + sge(16)
 #[inline]
 fn calc_max_wqebb_read(av_size: usize) -> u16 {
-    let size = CtrlSeg::SIZE + av_size + RdmaSeg::SIZE + DataSeg::SIZE;
+    let size = CTRL_SEG_SIZE + av_size + RDMA_SEG_SIZE + DATA_SEG_SIZE;
     calc_wqebb_cnt(size)
 }
 
@@ -1543,7 +1548,7 @@ fn calc_max_wqebb_read(av_size: usize) -> u16 {
 /// Layout: ctrl(16) + AV + rdma(16) + atomic(16) + sge(16)
 #[inline]
 fn calc_max_wqebb_atomic(av_size: usize) -> u16 {
-    let size = CtrlSeg::SIZE + av_size + RdmaSeg::SIZE + AtomicSeg::SIZE + DataSeg::SIZE;
+    let size = CTRL_SEG_SIZE + av_size + RDMA_SEG_SIZE + ATOMIC_SEG_SIZE + DATA_SEG_SIZE;
     calc_wqebb_cnt(size)
 }
 
@@ -1552,7 +1557,7 @@ fn calc_max_wqebb_atomic(av_size: usize) -> u16 {
 /// Layout: ctrl(16) only
 #[inline]
 fn calc_max_wqebb_nop() -> u16 {
-    calc_wqebb_cnt(CtrlSeg::SIZE)
+    calc_wqebb_cnt(CTRL_SEG_SIZE)
 }
 
 /// Internal WQE builder core that handles direct buffer writes.
@@ -1600,7 +1605,7 @@ impl<'a, Entry> WqeCore<'a, Entry> {
             flags
         };
         unsafe {
-            CtrlSeg::write(
+            write_ctrl_seg(
                 self.wqe_ptr,
                 0,
                 opcode as u8,
@@ -1611,7 +1616,7 @@ impl<'a, Entry> WqeCore<'a, Entry> {
                 imm,
             );
         }
-        self.offset = CtrlSeg::SIZE;
+        self.offset = CTRL_SEG_SIZE;
         self.ds_count = 1;
     }
 
@@ -1628,18 +1633,18 @@ impl<'a, Entry> WqeCore<'a, Entry> {
     #[inline]
     fn write_rdma(&mut self, addr: u64, rkey: u32) {
         unsafe {
-            RdmaSeg::write(self.wqe_ptr.add(self.offset), addr, rkey);
+            write_rdma_seg(self.wqe_ptr.add(self.offset), addr, rkey);
         }
-        self.offset += RdmaSeg::SIZE;
+        self.offset += RDMA_SEG_SIZE;
         self.ds_count += 1;
     }
 
     #[inline]
     fn write_sge(&mut self, addr: u64, len: u32, lkey: u32) {
         unsafe {
-            DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
+            write_data_seg(self.wqe_ptr.add(self.offset), len, lkey, addr);
         }
-        self.offset += DataSeg::SIZE;
+        self.offset += DATA_SEG_SIZE;
         self.ds_count += 1;
     }
 
@@ -1647,7 +1652,7 @@ impl<'a, Entry> WqeCore<'a, Entry> {
     fn write_inline(&mut self, data: &[u8]) {
         let padded_size = unsafe {
             let ptr = self.wqe_ptr.add(self.offset);
-            let size = InlineHeader::write(ptr, data.len() as u32);
+            let size = write_inline_header(ptr, data.len() as u32);
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
             size
         };
@@ -1658,18 +1663,18 @@ impl<'a, Entry> WqeCore<'a, Entry> {
     #[inline]
     fn write_atomic_cas(&mut self, swap: u64, compare: u64) {
         unsafe {
-            AtomicSeg::write_cas(self.wqe_ptr.add(self.offset), swap, compare);
+            write_atomic_seg_cas(self.wqe_ptr.add(self.offset), swap, compare);
         }
-        self.offset += AtomicSeg::SIZE;
+        self.offset += ATOMIC_SEG_SIZE;
         self.ds_count += 1;
     }
 
     #[inline]
     fn write_atomic_fa(&mut self, add_value: u64) {
         unsafe {
-            AtomicSeg::write_fa(self.wqe_ptr.add(self.offset), add_value);
+            write_atomic_seg_fa(self.wqe_ptr.add(self.offset), add_value);
         }
-        self.offset += AtomicSeg::SIZE;
+        self.offset += ATOMIC_SEG_SIZE;
         self.ds_count += 1;
     }
 
@@ -1683,10 +1688,10 @@ impl<'a, Entry> WqeCore<'a, Entry> {
         }
 
         unsafe {
-            CtrlSeg::update_ds_cnt(self.wqe_ptr, self.ds_count);
+            update_ctrl_seg_ds_cnt(self.wqe_ptr, self.ds_count);
             // Set completion flag if signaled (may not have been set at write_ctrl time)
             if self.signaled {
-                CtrlSeg::set_completion_flag(self.wqe_ptr);
+                set_ctrl_seg_completion_flag(self.wqe_ptr);
             }
         }
 
@@ -1722,11 +1727,11 @@ impl<'a, Entry> WqeCore<'a, Entry> {
 
         unsafe {
             std::ptr::copy_nonoverlapping(temp_buf.as_ptr(), new_wqe_ptr, self.offset);
-            CtrlSeg::update_wqe_idx(new_wqe_ptr, new_wqe_idx);
-            CtrlSeg::update_ds_cnt(new_wqe_ptr, self.ds_count);
+            update_ctrl_seg_wqe_idx(new_wqe_ptr, new_wqe_idx);
+            update_ctrl_seg_ds_cnt(new_wqe_ptr, self.ds_count);
             // Set completion flag if signaled (may not have been set at write_ctrl time)
             if self.signaled {
-                CtrlSeg::set_completion_flag(new_wqe_ptr);
+                set_ctrl_seg_completion_flag(new_wqe_ptr);
             }
         }
 
@@ -2177,10 +2182,10 @@ impl<'a, Entry> RqWqeBuilder<'a, Entry, NoData> {
     pub fn sge(self, addr: u64, len: u32, lkey: u32) -> RqWqeBuilder<'a, Entry, HasData> {
         unsafe {
             let wqe_ptr = self.rq.get_wqe_ptr(self.wqe_idx);
-            DataSeg::write(wqe_ptr, len, lkey, addr);
+            write_data_seg(wqe_ptr, len, lkey, addr);
 
-            if self.rq.stride > DataSeg::SIZE as u32 {
-                let sentinel_ptr = wqe_ptr.add(DataSeg::SIZE);
+            if self.rq.stride > DATA_SEG_SIZE as u32 {
+                let sentinel_ptr = wqe_ptr.add(DATA_SEG_SIZE);
                 let ptr32 = sentinel_ptr as *mut u32;
                 std::ptr::write_volatile(ptr32, 0u32);
                 std::ptr::write_volatile(ptr32.add(1), MLX5_INVALID_LKEY.to_be());
@@ -2202,7 +2207,7 @@ impl<'a, Entry> RqWqeBuilder<'a, Entry, HasData> {
     pub fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
         unsafe {
             let wqe_ptr = self.rq.get_wqe_ptr(self.wqe_idx);
-            DataSeg::write(wqe_ptr, len, lkey, addr);
+            write_data_seg(wqe_ptr, len, lkey, addr);
         }
         self
     }
@@ -2436,7 +2441,7 @@ impl<'b, 'a, Entry> BlueflameWqeCore<'b, 'a, Entry> {
     #[inline]
     fn new(batch: &'b mut BlueflameWqeBatch<'a, Entry>) -> Result<Self, SubmissionError> {
         // Ensure we have at least space for control segment
-        if batch.offset + CtrlSeg::SIZE > BLUEFLAME_BUFFER_SIZE {
+        if batch.offset + CTRL_SEG_SIZE > BLUEFLAME_BUFFER_SIZE {
             return Err(SubmissionError::BlueflameOverflow);
         }
         Ok(Self {
@@ -2458,7 +2463,7 @@ impl<'b, 'a, Entry> BlueflameWqeCore<'b, 'a, Entry> {
         let wqe_idx = self.batch.sq.pi.get();
         let flags = WqeFlags::from_bits_truncate(flags.bits());
         unsafe {
-            CtrlSeg::write(
+            write_ctrl_seg(
                 self.batch.buffer.as_mut_ptr().add(self.offset),
                 0,
                 opcode as u8,
@@ -2469,32 +2474,32 @@ impl<'b, 'a, Entry> BlueflameWqeCore<'b, 'a, Entry> {
                 imm,
             );
         }
-        self.offset += CtrlSeg::SIZE;
+        self.offset += CTRL_SEG_SIZE;
         self.ds_count = 1;
     }
 
     #[inline]
     fn write_rdma(&mut self, addr: u64, rkey: u32) -> Result<(), SubmissionError> {
-        if self.remaining() < RdmaSeg::SIZE {
+        if self.remaining() < RDMA_SEG_SIZE {
             return Err(SubmissionError::BlueflameOverflow);
         }
         unsafe {
-            RdmaSeg::write(self.batch.buffer.as_mut_ptr().add(self.offset), addr, rkey);
+            write_rdma_seg(self.batch.buffer.as_mut_ptr().add(self.offset), addr, rkey);
         }
-        self.offset += RdmaSeg::SIZE;
+        self.offset += RDMA_SEG_SIZE;
         self.ds_count += 1;
         Ok(())
     }
 
     #[inline]
     fn write_sge(&mut self, addr: u64, len: u32, lkey: u32) -> Result<(), SubmissionError> {
-        if self.remaining() < DataSeg::SIZE {
+        if self.remaining() < DATA_SEG_SIZE {
             return Err(SubmissionError::BlueflameOverflow);
         }
         unsafe {
-            DataSeg::write(self.batch.buffer.as_mut_ptr().add(self.offset), len, lkey, addr);
+            write_data_seg(self.batch.buffer.as_mut_ptr().add(self.offset), len, lkey, addr);
         }
-        self.offset += DataSeg::SIZE;
+        self.offset += DATA_SEG_SIZE;
         self.ds_count += 1;
         Ok(())
     }
@@ -2507,7 +2512,7 @@ impl<'b, 'a, Entry> BlueflameWqeCore<'b, 'a, Entry> {
         }
         unsafe {
             let ptr = self.batch.buffer.as_mut_ptr().add(self.offset);
-            InlineHeader::write(ptr, data.len() as u32);
+            write_inline_header(ptr, data.len() as u32);
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
         }
         self.offset += padded_size;
@@ -2519,12 +2524,12 @@ impl<'b, 'a, Entry> BlueflameWqeCore<'b, 'a, Entry> {
     fn finish_internal(self, entry: Option<Entry>) -> Result<(), SubmissionError> {
         // Update ds_count in control segment
         unsafe {
-            CtrlSeg::update_ds_cnt(
+            update_ctrl_seg_ds_cnt(
                 self.batch.buffer.as_mut_ptr().add(self.wqe_start),
                 self.ds_count,
             );
             if self.signaled || entry.is_some() {
-                CtrlSeg::set_completion_flag(
+                set_ctrl_seg_completion_flag(
                     self.batch.buffer.as_mut_ptr().add(self.wqe_start),
                 );
             }

@@ -59,460 +59,392 @@ pub(crate) const WQEBB_SIZE: usize = 64;
 // WQE Segments
 // =============================================================================
 
-/// Control Segment (16 bytes).
+/// Size of the control segment in bytes.
+pub const CTRL_SEG_SIZE: usize = 16;
+
+/// Write the control segment to the given pointer.
 ///
-/// First segment of every WQE.
-pub struct CtrlSeg;
+/// # Safety
+/// The pointer must point to at least 16 bytes of writable memory.
+#[inline]
+pub unsafe fn write_ctrl_seg(
+    ptr: *mut u8,
+    opmod: u8,
+    opcode: u8,
+    wqe_idx: u16,
+    qpn: u32,
+    ds_cnt: u8,
+    fm_ce_se: u8,
+    imm: u32,
+) {
+    let opmod_idx_opcode = ((opmod as u32) << 24) | ((wqe_idx as u32) << 8) | (opcode as u32);
+    let qpn_ds = (qpn << 8) | (ds_cnt as u32);
+    // Combine sig(0), dci_stream[15:8](0), dci_stream[7:0](0), fm_ce_se into single u32
+    // Layout in big-endian: [sig][stream_hi][stream_lo][fm_ce_se]
+    let sig_stream_fm = fm_ce_se as u32;
 
-impl CtrlSeg {
-    /// Size of the control segment in bytes.
-    pub const SIZE: usize = 16;
-
-    /// Write the control segment to the given pointer.
-    ///
-    /// # Safety
-    /// The pointer must point to at least 16 bytes of writable memory.
-    #[inline]
-    pub unsafe fn write(
-        ptr: *mut u8,
-        opmod: u8,
-        opcode: u8,
-        wqe_idx: u16,
-        qpn: u32,
-        ds_cnt: u8,
-        fm_ce_se: u8,
-        imm: u32,
-    ) {
-        let opmod_idx_opcode = ((opmod as u32) << 24) | ((wqe_idx as u32) << 8) | (opcode as u32);
-        let qpn_ds = (qpn << 8) | (ds_cnt as u32);
-        // Combine sig(0), dci_stream[15:8](0), dci_stream[7:0](0), fm_ce_se into single u32
-        // Layout in big-endian: [sig][stream_hi][stream_lo][fm_ce_se]
-        let sig_stream_fm = fm_ce_se as u32;
-
-        let ptr32 = ptr as *mut u32;
-        std::ptr::write_volatile(ptr32, opmod_idx_opcode.to_be());
-        std::ptr::write_volatile(ptr32.add(1), qpn_ds.to_be());
-        std::ptr::write_volatile(ptr32.add(2), sig_stream_fm.to_be());
-        std::ptr::write_volatile(ptr32.add(3), imm.to_be());
-    }
-
-    /// Update the DS count after WQE is complete.
-    ///
-    /// # Safety
-    /// The pointer must point to a valid control segment.
-    #[inline]
-    pub unsafe fn update_ds_cnt(ptr: *mut u8, ds_cnt: u8) {
-        std::ptr::write_volatile(ptr.add(7), ds_cnt);
-    }
-
-    /// Update the WQE index in the control segment.
-    ///
-    /// Used when relocating a WQE due to ring wrap-around.
-    ///
-    /// # Safety
-    /// The pointer must point to a valid control segment.
-    #[inline]
-    pub unsafe fn update_wqe_idx(ptr: *mut u8, wqe_idx: u16) {
-        // wqe_idx is stored at bytes 1-2 in big-endian format
-        // Layout: [0][wqe_idx_hi][wqe_idx_lo][opcode]
-        std::ptr::write_volatile(ptr.add(1), (wqe_idx >> 8) as u8);
-        std::ptr::write_volatile(ptr.add(2), wqe_idx as u8);
-    }
-
-    /// Set the completion flag (CQE generation) in the control segment.
-    ///
-    /// # Safety
-    /// The pointer must point to a valid control segment.
-    #[inline]
-    pub unsafe fn set_completion_flag(ptr: *mut u8) {
-        // fm_ce_se is stored at byte 11 (DWORD 2, last byte)
-        // WqeFlags::COMPLETION = 0x08
-        let current = std::ptr::read_volatile(ptr.add(11));
-        std::ptr::write_volatile(ptr.add(11), current | 0x08);
-    }
+    let ptr32 = ptr as *mut u32;
+    std::ptr::write_volatile(ptr32, opmod_idx_opcode.to_be());
+    std::ptr::write_volatile(ptr32.add(1), qpn_ds.to_be());
+    std::ptr::write_volatile(ptr32.add(2), sig_stream_fm.to_be());
+    std::ptr::write_volatile(ptr32.add(3), imm.to_be());
 }
 
-/// RDMA Segment (16 bytes).
+/// Update the DS count after WQE is complete.
 ///
-/// Used for RDMA WRITE, RDMA READ operations.
-pub struct RdmaSeg;
-
-impl RdmaSeg {
-    /// Size of the RDMA segment in bytes.
-    pub const SIZE: usize = 16;
-
-    /// Write the RDMA segment to the given pointer.
-    ///
-    /// # Safety
-    /// The pointer must point to at least 16 bytes of writable memory.
-    #[inline]
-    pub unsafe fn write(ptr: *mut u8, remote_addr: u64, rkey: u32) {
-        let ptr64 = ptr as *mut u64;
-        let ptr32 = ptr.add(8) as *mut u32;
-        std::ptr::write_volatile(ptr64, remote_addr.to_be());
-        std::ptr::write_volatile(ptr32, rkey.to_be());
-        std::ptr::write_volatile(ptr32.add(1), 0);
-    }
+/// # Safety
+/// The pointer must point to a valid control segment.
+#[inline]
+pub unsafe fn update_ctrl_seg_ds_cnt(ptr: *mut u8, ds_cnt: u8) {
+    std::ptr::write_volatile(ptr.add(7), ds_cnt);
 }
 
-/// Data Segment / SGE (16 bytes).
+/// Update the WQE index in the control segment.
 ///
-/// Points to a memory region for data transfer.
-pub struct DataSeg;
-
-impl DataSeg {
-    /// Size of the data segment in bytes.
-    pub const SIZE: usize = 16;
-
-    /// Write the data segment to the given pointer.
-    ///
-    /// # Safety
-    /// The pointer must point to at least 16 bytes of writable memory.
-    #[inline]
-    pub unsafe fn write(ptr: *mut u8, byte_count: u32, lkey: u32, addr: u64) {
-        let ptr32 = ptr as *mut u32;
-        let ptr64 = ptr.add(8) as *mut u64;
-        std::ptr::write_volatile(ptr32, byte_count.to_be());
-        std::ptr::write_volatile(ptr32.add(1), lkey.to_be());
-        std::ptr::write_volatile(ptr64, addr.to_be());
-    }
+/// Used when relocating a WQE due to ring wrap-around.
+///
+/// # Safety
+/// The pointer must point to a valid control segment.
+#[inline]
+pub unsafe fn update_ctrl_seg_wqe_idx(ptr: *mut u8, wqe_idx: u16) {
+    // wqe_idx is stored at bytes 1-2 in big-endian format
+    // Layout: [0][wqe_idx_hi][wqe_idx_lo][opcode]
+    std::ptr::write_volatile(ptr.add(1), (wqe_idx >> 8) as u8);
+    std::ptr::write_volatile(ptr.add(2), wqe_idx as u8);
 }
 
-/// Inline data header.
-pub struct InlineHeader;
-
-impl InlineHeader {
-    /// Write inline header.
-    ///
-    /// Returns the padded size (16-byte aligned).
-    ///
-    /// # Safety
-    /// The pointer must point to at least 4 bytes of writable memory.
-    #[inline]
-    pub unsafe fn write(ptr: *mut u8, byte_count: u32) -> usize {
-        let ptr32 = ptr as *mut u32;
-        let header = 0x8000_0000 | byte_count;
-        std::ptr::write_volatile(ptr32, header.to_be());
-        ((4 + byte_count as usize) + 15) & !15
-    }
+/// Set the completion flag (CQE generation) in the control segment.
+///
+/// # Safety
+/// The pointer must point to a valid control segment.
+#[inline]
+pub unsafe fn set_ctrl_seg_completion_flag(ptr: *mut u8) {
+    // fm_ce_se is stored at byte 11 (DWORD 2, last byte)
+    // WqeFlags::COMPLETION = 0x08
+    let current = std::ptr::read_volatile(ptr.add(11));
+    std::ptr::write_volatile(ptr.add(11), current | 0x08);
 }
 
-/// Address Vector (for DC QPs).
+/// Size of the RDMA segment in bytes.
+pub const RDMA_SEG_SIZE: usize = 16;
+
+/// Write the RDMA segment to the given pointer.
 ///
-/// 48 bytes, specifies the destination for DC operations.
-pub struct AddressVector;
+/// # Safety
+/// The pointer must point to at least 16 bytes of writable memory.
+#[inline]
+pub unsafe fn write_rdma_seg(ptr: *mut u8, remote_addr: u64, rkey: u32) {
+    let ptr64 = ptr as *mut u64;
+    let ptr32 = ptr.add(8) as *mut u32;
+    std::ptr::write_volatile(ptr64, remote_addr.to_be());
+    std::ptr::write_volatile(ptr32, rkey.to_be());
+    std::ptr::write_volatile(ptr32.add(1), 0);
+}
 
-impl AddressVector {
-    /// Size of the address vector in bytes.
-    pub const SIZE: usize = 48;
+/// Size of the data segment in bytes.
+pub const DATA_SEG_SIZE: usize = 16;
 
-    /// Write the address vector for InfiniBand transport.
-    ///
-    /// Uses LID-based addressing (is_global = 0).
-    ///
-    /// # Safety
-    /// The pointer must point to at least 48 bytes of writable memory.
-    #[inline]
-    pub unsafe fn write_ib(ptr: *mut u8, dc_key: u64, dctn: u32, dlid: u16) {
-        let ptr64 = ptr as *mut u64;
-        let ptr32 = ptr.add(8) as *mut u32;
-        let ptr16 = ptr.add(14) as *mut u16;
+/// Write the data segment to the given pointer.
+///
+/// # Safety
+/// The pointer must point to at least 16 bytes of writable memory.
+#[inline]
+pub unsafe fn write_data_seg(ptr: *mut u8, byte_count: u32, lkey: u32, addr: u64) {
+    let ptr32 = ptr as *mut u32;
+    let ptr64 = ptr.add(8) as *mut u64;
+    std::ptr::write_volatile(ptr32, byte_count.to_be());
+    std::ptr::write_volatile(ptr32.add(1), lkey.to_be());
+    std::ptr::write_volatile(ptr64, addr.to_be());
+}
 
-        std::ptr::write_volatile(ptr64, dc_key.to_be());
-        let dqp_dct = 0x8000_0000 | (dctn & 0x00FF_FFFF);
-        std::ptr::write_volatile(ptr32, dqp_dct.to_be());
-        // rlid: byte 12-13 (16-bit)
-        std::ptr::write_volatile(ptr.add(12), 0);
-        std::ptr::write_volatile(ptr.add(13), 0);
-        // stat_rate, sl, fl, mlid: byte 14-15
-        std::ptr::write_volatile(ptr16, dlid.to_be());
-        // Rest of AV (grh fields): zero for IB
-        std::ptr::write_bytes(ptr.add(16), 0, 32);
-    }
+/// Write inline header.
+///
+/// Returns the padded size (16-byte aligned).
+///
+/// # Safety
+/// The pointer must point to at least 4 bytes of writable memory.
+#[inline]
+pub unsafe fn write_inline_header(ptr: *mut u8, byte_count: u32) -> usize {
+    let ptr32 = ptr as *mut u32;
+    let header = 0x8000_0000 | byte_count;
+    std::ptr::write_volatile(ptr32, header.to_be());
+    ((4 + byte_count as usize) + 15) & !15
+}
 
-    /// Write the address vector for RoCE transport.
-    ///
-    /// Uses GID-based addressing (is_global = 1).
-    ///
-    /// # NOTE: RoCE support is untested (IB-only hardware environment)
-    ///
-    /// # Safety
-    /// The pointer must point to at least 48 bytes of writable memory.
-    ///
-    /// Address Vector layout (48 bytes):
-    /// - offset 0-7: dc_key (8B)
-    /// - offset 8-11: dqp_dct (4B) - bit 31 = ext, bits 23:0 = DCT number
-    /// - offset 12-13: rlid (2B) - not used for RoCE
-    /// - offset 14: stat_rate[3:0], sl[7:4] (1B)
-    /// - offset 15: fl[0], mlid[7:1] (1B)
-    /// - offset 16-19: fl_mlid + grh_gid_fl[3:0] (4B)
-    /// - offset 20: reserved (1B)
-    /// - offset 21: grh_hop_limit (1B)
-    /// - offset 22: grh_traffic_class (1B)
-    /// - offset 23: grh_sgid_index (1B)
-    /// - offset 24-39: grh_dgid (16B)
-    /// - offset 40-47: reserved (8B)
-    #[inline]
-    pub unsafe fn write_roce(ptr: *mut u8, dc_key: u64, dctn: u32, grh: &GrhAttr) {
-        let ptr64 = ptr as *mut u64;
-        let ptr32 = ptr.add(8) as *mut u32;
+/// Size of the address vector in bytes.
+pub const ADDRESS_VECTOR_SIZE: usize = 48;
 
-        // dc_key at offset 0
-        std::ptr::write_volatile(ptr64, dc_key.to_be());
+/// Write the address vector for InfiniBand transport.
+///
+/// Uses LID-based addressing (is_global = 0).
+///
+/// # Safety
+/// The pointer must point to at least 48 bytes of writable memory.
+#[inline]
+pub unsafe fn write_address_vector_ib(ptr: *mut u8, dc_key: u64, dctn: u32, dlid: u16) {
+    let ptr64 = ptr as *mut u64;
+    let ptr32 = ptr.add(8) as *mut u32;
+    let ptr16 = ptr.add(14) as *mut u16;
 
-        // dqp_dct at offset 8: bit 31 = 1 (ext), bits 23:0 = DCT number
-        let dqp_dct = 0x8000_0000 | (dctn & 0x00FF_FFFF);
-        std::ptr::write_volatile(ptr32, dqp_dct.to_be());
+    std::ptr::write_volatile(ptr64, dc_key.to_be());
+    let dqp_dct = 0x8000_0000 | (dctn & 0x00FF_FFFF);
+    std::ptr::write_volatile(ptr32, dqp_dct.to_be());
+    // rlid: byte 12-13 (16-bit)
+    std::ptr::write_volatile(ptr.add(12), 0);
+    std::ptr::write_volatile(ptr.add(13), 0);
+    // stat_rate, sl, fl, mlid: byte 14-15
+    std::ptr::write_volatile(ptr16, dlid.to_be());
+    // Rest of AV (grh fields): zero for IB
+    std::ptr::write_bytes(ptr.add(16), 0, 32);
+}
 
-        // rlid at offset 12-13 (not used for RoCE, set to 0)
-        std::ptr::write_volatile(ptr.add(12) as *mut u16, 0u16);
+/// Write the address vector for RoCE transport.
+///
+/// Uses GID-based addressing (is_global = 1).
+///
+/// # NOTE: RoCE support is untested (IB-only hardware environment)
+///
+/// # Safety
+/// The pointer must point to at least 48 bytes of writable memory.
+///
+/// Address Vector layout (48 bytes):
+/// - offset 0-7: dc_key (8B)
+/// - offset 8-11: dqp_dct (4B) - bit 31 = ext, bits 23:0 = DCT number
+/// - offset 12-13: rlid (2B) - not used for RoCE
+/// - offset 14: stat_rate[3:0], sl[7:4] (1B)
+/// - offset 15: fl[0], mlid[7:1] (1B)
+/// - offset 16-19: fl_mlid + grh_gid_fl[3:0] (4B)
+/// - offset 20: reserved (1B)
+/// - offset 21: grh_hop_limit (1B)
+/// - offset 22: grh_traffic_class (1B)
+/// - offset 23: grh_sgid_index (1B)
+/// - offset 24-39: grh_dgid (16B)
+/// - offset 40-47: reserved (8B)
+#[inline]
+pub unsafe fn write_address_vector_roce(ptr: *mut u8, dc_key: u64, dctn: u32, grh: &GrhAttr) {
+    let ptr64 = ptr as *mut u64;
+    let ptr32 = ptr.add(8) as *mut u32;
 
-        // sl at offset 14 upper nibble (bits 7:4), stat_rate at lower nibble (bits 3:0)
-        // For RoCE, set stat_rate = 0 (auto), sl = 0
-        std::ptr::write_volatile(ptr.add(14), 0u8);
+    // dc_key at offset 0
+    std::ptr::write_volatile(ptr64, dc_key.to_be());
 
-        // fl (1 bit), mlid (7 bits) at offset 15
-        // fl = 1 means flow_label is valid
-        let fl_mlid = if grh.flow_label != 0 { 0x80u8 } else { 0x00u8 };
-        std::ptr::write_volatile(ptr.add(15), fl_mlid);
+    // dqp_dct at offset 8: bit 31 = 1 (ext), bits 23:0 = DCT number
+    let dqp_dct = 0x8000_0000 | (dctn & 0x00FF_FFFF);
+    std::ptr::write_volatile(ptr32, dqp_dct.to_be());
 
-        // GRH section starts at offset 16
-        // grh_gid_fl at offset 16-19: is_global (bit 31) | flow_label (bits 19:0)
-        let grh_gid_fl = 0x8000_0000 | (grh.flow_label & 0x000F_FFFF);
-        std::ptr::write_volatile(ptr.add(16) as *mut u32, grh_gid_fl.to_be());
+    // rlid at offset 12-13 (not used for RoCE, set to 0)
+    std::ptr::write_volatile(ptr.add(12) as *mut u16, 0u16);
 
-        // reserved at offset 20
-        std::ptr::write_volatile(ptr.add(20), 0u8);
+    // sl at offset 14 upper nibble (bits 7:4), stat_rate at lower nibble (bits 3:0)
+    // For RoCE, set stat_rate = 0 (auto), sl = 0
+    std::ptr::write_volatile(ptr.add(14), 0u8);
 
-        // hop_limit at offset 21
-        std::ptr::write_volatile(ptr.add(21), grh.hop_limit);
+    // fl (1 bit), mlid (7 bits) at offset 15
+    // fl = 1 means flow_label is valid
+    let fl_mlid = if grh.flow_label != 0 { 0x80u8 } else { 0x00u8 };
+    std::ptr::write_volatile(ptr.add(15), fl_mlid);
 
-        // traffic_class at offset 22
-        std::ptr::write_volatile(ptr.add(22), grh.traffic_class);
+    // GRH section starts at offset 16
+    // grh_gid_fl at offset 16-19: is_global (bit 31) | flow_label (bits 19:0)
+    let grh_gid_fl = 0x8000_0000 | (grh.flow_label & 0x000F_FFFF);
+    std::ptr::write_volatile(ptr.add(16) as *mut u32, grh_gid_fl.to_be());
 
-        // sgid_index at offset 23
-        std::ptr::write_volatile(ptr.add(23), grh.sgid_index);
+    // reserved at offset 20
+    std::ptr::write_volatile(ptr.add(20), 0u8);
 
-        // dgid at offset 24-39 (16 bytes)
-        std::ptr::copy_nonoverlapping(grh.dgid.raw.as_ptr(), ptr.add(24), 16);
+    // hop_limit at offset 21
+    std::ptr::write_volatile(ptr.add(21), grh.hop_limit);
 
-        // Reserved at offset 40-47 (8 bytes)
-        std::ptr::write_bytes(ptr.add(40), 0, 8);
-    }
+    // traffic_class at offset 22
+    std::ptr::write_volatile(ptr.add(22), grh.traffic_class);
 
-    /// Write the address vector to the given pointer.
-    ///
-    /// This is an alias for [`write_ib`] for backward compatibility.
-    /// New code should use [`write_ib`] or [`write_roce`] directly.
-    ///
-    /// # Safety
-    /// The pointer must point to at least 48 bytes of writable memory.
-    #[inline]
-    #[deprecated(note = "Use write_ib() or write_roce() instead")]
-    pub unsafe fn write(ptr: *mut u8, dc_key: u64, dctn: u32, dlid: u16) {
-        Self::write_ib(ptr, dc_key, dctn, dlid)
-    }
+    // sgid_index at offset 23
+    std::ptr::write_volatile(ptr.add(23), grh.sgid_index);
+
+    // dgid at offset 24-39 (16 bytes)
+    std::ptr::copy_nonoverlapping(grh.dgid.raw.as_ptr(), ptr.add(24), 16);
+
+    // Reserved at offset 40-47 (8 bytes)
+    std::ptr::write_bytes(ptr.add(40), 0, 8);
 }
 
 // =============================================================================
 // WQE Opcodes and Flags
 // =============================================================================
 
-/// Atomic Segment (16 bytes).
+/// Size of the atomic segment in bytes.
+pub const ATOMIC_SEG_SIZE: usize = 16;
+
+/// Write the atomic segment for Compare-and-Swap operation.
 ///
-/// Used for atomic Compare-and-Swap and Fetch-and-Add operations.
-/// Follows the RDMA segment in an atomic WQE.
-pub struct AtomicSeg;
-
-impl AtomicSeg {
-    /// Size of the atomic segment in bytes.
-    pub const SIZE: usize = 16;
-
-    /// Write the atomic segment for Compare-and-Swap operation.
-    ///
-    /// The CAS operation atomically compares the value at the remote address
-    /// with `compare`. If equal, replaces it with `swap`. Returns the original
-    /// value in the local buffer.
-    ///
-    /// # Safety
-    /// The pointer must point to at least 16 bytes of writable memory.
-    #[inline]
-    pub unsafe fn write_cas(ptr: *mut u8, swap: u64, compare: u64) {
-        let ptr64 = ptr as *mut u64;
-        std::ptr::write_volatile(ptr64, swap.to_be());
-        std::ptr::write_volatile(ptr64.add(1), compare.to_be());
-    }
-
-    /// Write the atomic segment for Fetch-and-Add operation.
-    ///
-    /// The FA operation atomically adds `add_value` to the value at the remote
-    /// address. Returns the original value in the local buffer.
-    ///
-    /// # Safety
-    /// The pointer must point to at least 16 bytes of writable memory.
-    #[inline]
-    pub unsafe fn write_fa(ptr: *mut u8, add_value: u64) {
-        let ptr64 = ptr as *mut u64;
-        std::ptr::write_volatile(ptr64, add_value.to_be());
-        std::ptr::write_volatile(ptr64.add(1), 0u64.to_be());
-    }
-}
-
-/// Masked Atomic Segment for 32-bit operations (16 bytes).
-pub struct MaskedAtomicSeg32;
-
-impl MaskedAtomicSeg32 {
-    pub const SIZE: usize = 16;
-
-    /// Write masked Compare-and-Swap segment (32-bit).
-    ///
-    /// # Safety
-    /// The pointer must point to at least 16 bytes of writable memory.
-    #[inline]
-    pub unsafe fn write_cas(
-        ptr: *mut u8,
-        swap: u32,
-        compare: u32,
-        swap_mask: u32,
-        compare_mask: u32,
-    ) {
-        let ptr32 = ptr as *mut u32;
-        std::ptr::write_volatile(ptr32, swap.to_be());
-        std::ptr::write_volatile(ptr32.add(1), compare.to_be());
-        std::ptr::write_volatile(ptr32.add(2), swap_mask.to_be());
-        std::ptr::write_volatile(ptr32.add(3), compare_mask.to_be());
-    }
-
-    /// Write masked Fetch-and-Add segment (32-bit).
-    ///
-    /// # Safety
-    /// The pointer must point to at least 16 bytes of writable memory.
-    #[inline]
-    pub unsafe fn write_fa(ptr: *mut u8, add: u32, field_mask: u32) {
-        let ptr32 = ptr as *mut u32;
-        std::ptr::write_volatile(ptr32, add.to_be());
-        std::ptr::write_volatile(ptr32.add(1), field_mask.to_be());
-        std::ptr::write_volatile(ptr32.add(2), 0u32.to_be());
-        std::ptr::write_volatile(ptr32.add(3), 0u32.to_be());
-    }
-}
-
-/// Masked Atomic Segment for 64-bit operations.
-pub struct MaskedAtomicSeg64;
-
-impl MaskedAtomicSeg64 {
-    pub const SIZE_CAS: usize = 32;
-    pub const SIZE_FA: usize = 16;
-
-    /// Write masked Compare-and-Swap segment (64-bit, 2 segments).
-    ///
-    /// # Safety
-    /// The pointers must point to at least 32 bytes of writable memory.
-    #[inline]
-    pub unsafe fn write_cas(
-        ptr1: *mut u8,
-        ptr2: *mut u8,
-        swap: u64,
-        compare: u64,
-        swap_mask: u64,
-        compare_mask: u64,
-    ) {
-        let ptr64_1 = ptr1 as *mut u64;
-        std::ptr::write_volatile(ptr64_1, swap.to_be());
-        std::ptr::write_volatile(ptr64_1.add(1), compare.to_be());
-
-        let ptr64_2 = ptr2 as *mut u64;
-        std::ptr::write_volatile(ptr64_2, swap_mask.to_be());
-        std::ptr::write_volatile(ptr64_2.add(1), compare_mask.to_be());
-    }
-
-    /// Write masked Fetch-and-Add segment (64-bit, 1 segment).
-    ///
-    /// # Safety
-    /// The pointer must point to at least 16 bytes of writable memory.
-    #[inline]
-    pub unsafe fn write_fa(ptr: *mut u8, add: u64, field_mask: u64) {
-        let ptr64 = ptr as *mut u64;
-        std::ptr::write_volatile(ptr64, add.to_be());
-        std::ptr::write_volatile(ptr64.add(1), field_mask.to_be());
-    }
-}
-
-/// Tag Matching Segment (32 bytes).
+/// The CAS operation atomically compares the value at the remote address
+/// with `compare`. If equal, replaces it with `swap`. Returns the original
+/// value in the local buffer.
 ///
-/// Used for TM operations (TAG_ADD, TAG_DEL) via Command QP.
-pub struct TmSeg;
+/// # Safety
+/// The pointer must point to at least 16 bytes of writable memory.
+#[inline]
+pub unsafe fn write_atomic_seg_cas(ptr: *mut u8, swap: u64, compare: u64) {
+    let ptr64 = ptr as *mut u64;
+    std::ptr::write_volatile(ptr64, swap.to_be());
+    std::ptr::write_volatile(ptr64.add(1), compare.to_be());
+}
 
-impl TmSeg {
-    /// Size of the TM segment in bytes.
-    pub const SIZE: usize = 32;
+/// Write the atomic segment for Fetch-and-Add operation.
+///
+/// The FA operation atomically adds `add_value` to the value at the remote
+/// address. Returns the original value in the local buffer.
+///
+/// # Safety
+/// The pointer must point to at least 16 bytes of writable memory.
+#[inline]
+pub unsafe fn write_atomic_seg_fa(ptr: *mut u8, add_value: u64) {
+    let ptr64 = ptr as *mut u64;
+    std::ptr::write_volatile(ptr64, add_value.to_be());
+    std::ptr::write_volatile(ptr64.add(1), 0u64.to_be());
+}
 
-    /// Write the TM segment for TAG_ADD operation.
-    ///
-    /// # Safety
-    /// The pointer must point to at least 32 bytes of writable memory.
-    ///
-    /// # Arguments
-    /// * `ptr` - Pointer to 32-byte TM segment buffer
-    /// * `index` - TM tag index in the SRQ tag list
-    /// * `sw_cnt` - Software count (typically used for tracking)
-    /// * `tag` - Tag value to match against incoming messages
-    /// * `mask` - Mask for tag matching (1 bits = must match)
-    /// * `signaled` - Whether to generate a CQE on completion
-    #[inline]
-    pub unsafe fn write_add(
-        ptr: *mut u8,
-        index: u16,
-        sw_cnt: u16,
-        tag: u64,
-        mask: u64,
-        signaled: bool,
-    ) {
-        // mlx5_wqe_tm_seg layout (32 bytes):
-        //   offset 0: opcode (1 byte) - APPEND=0x01 shifted left 4 bits = 0x10
-        //   offset 1: flags (1 byte) - 0x80 for CQE request
-        //   offset 2-3: index (2 bytes, big-endian)
-        //   offset 4-5: rsvd0 (2 bytes)
-        //   offset 6-7: sw_cnt (2 bytes, big-endian)
-        //   offset 8-15: rsvd1 (8 bytes)
-        //   offset 16-23: append_tag (8 bytes, big-endian)
-        //   offset 24-31: append_mask (8 bytes, big-endian)
+/// Size of masked atomic segment for 32-bit operations.
+pub const MASKED_ATOMIC_SEG32_SIZE: usize = 16;
 
-        // opcode = MLX5_TM_OPCODE_APPEND << 4 = 0x10
-        std::ptr::write_volatile(ptr, 0x10);
-        // flags: TM_CQE_REQ = 0x80
-        let flags = if signaled { 0x80 } else { 0x00 };
-        std::ptr::write_volatile(ptr.add(1), flags);
-        // index (big-endian)
-        std::ptr::write_volatile(ptr.add(2) as *mut u16, index.to_be());
-        // rsvd0 (2 bytes at offset 4-5)
-        std::ptr::write_volatile(ptr.add(4) as *mut u16, 0);
-        // sw_cnt (2 bytes at offset 6-7, big-endian)
-        std::ptr::write_volatile(ptr.add(6) as *mut u16, sw_cnt.to_be());
-        // rsvd1 (8 bytes at offset 8-15)
-        std::ptr::write_volatile(ptr.add(8) as *mut u64, 0);
-        // append_tag (big-endian)
-        std::ptr::write_volatile(ptr.add(16) as *mut u64, tag.to_be());
-        // append_mask (big-endian)
-        std::ptr::write_volatile(ptr.add(24) as *mut u64, mask.to_be());
-    }
+/// Write masked Compare-and-Swap segment (32-bit).
+///
+/// # Safety
+/// The pointer must point to at least 16 bytes of writable memory.
+#[inline]
+pub unsafe fn write_masked_atomic_seg32_cas(
+    ptr: *mut u8,
+    swap: u32,
+    compare: u32,
+    swap_mask: u32,
+    compare_mask: u32,
+) {
+    let ptr32 = ptr as *mut u32;
+    std::ptr::write_volatile(ptr32, swap.to_be());
+    std::ptr::write_volatile(ptr32.add(1), compare.to_be());
+    std::ptr::write_volatile(ptr32.add(2), swap_mask.to_be());
+    std::ptr::write_volatile(ptr32.add(3), compare_mask.to_be());
+}
 
-    /// Write the TM segment for TAG_DEL operation.
-    ///
-    /// # Safety
-    /// The pointer must point to at least 32 bytes of writable memory.
-    #[inline]
-    pub unsafe fn write_del(ptr: *mut u8, index: u16, signaled: bool) {
-        // opcode = MLX5_TM_OPCODE_REMOVE << 4 = 0x20
-        std::ptr::write_volatile(ptr, 0x20);
-        // flags
-        let flags = if signaled { 0x80 } else { 0x00 };
-        std::ptr::write_volatile(ptr.add(1), flags);
-        // index (big-endian)
-        std::ptr::write_volatile(ptr.add(2) as *mut u16, index.to_be());
-        // Clear remaining bytes
-        std::ptr::write_bytes(ptr.add(4), 0, 28);
-    }
+/// Write masked Fetch-and-Add segment (32-bit).
+///
+/// # Safety
+/// The pointer must point to at least 16 bytes of writable memory.
+#[inline]
+pub unsafe fn write_masked_atomic_seg32_fa(ptr: *mut u8, add: u32, field_mask: u32) {
+    let ptr32 = ptr as *mut u32;
+    std::ptr::write_volatile(ptr32, add.to_be());
+    std::ptr::write_volatile(ptr32.add(1), field_mask.to_be());
+    std::ptr::write_volatile(ptr32.add(2), 0u32.to_be());
+    std::ptr::write_volatile(ptr32.add(3), 0u32.to_be());
+}
+
+/// Size of masked atomic segment for 64-bit CAS operations (2 segments).
+pub const MASKED_ATOMIC_SEG64_SIZE_CAS: usize = 32;
+/// Size of masked atomic segment for 64-bit FA operations (1 segment).
+pub const MASKED_ATOMIC_SEG64_SIZE_FA: usize = 16;
+
+/// Write masked Compare-and-Swap segment (64-bit, 2 segments).
+///
+/// # Safety
+/// The pointers must point to at least 32 bytes of writable memory.
+#[inline]
+pub unsafe fn write_masked_atomic_seg64_cas(
+    ptr1: *mut u8,
+    ptr2: *mut u8,
+    swap: u64,
+    compare: u64,
+    swap_mask: u64,
+    compare_mask: u64,
+) {
+    let ptr64_1 = ptr1 as *mut u64;
+    std::ptr::write_volatile(ptr64_1, swap.to_be());
+    std::ptr::write_volatile(ptr64_1.add(1), compare.to_be());
+
+    let ptr64_2 = ptr2 as *mut u64;
+    std::ptr::write_volatile(ptr64_2, swap_mask.to_be());
+    std::ptr::write_volatile(ptr64_2.add(1), compare_mask.to_be());
+}
+
+/// Write masked Fetch-and-Add segment (64-bit, 1 segment).
+///
+/// # Safety
+/// The pointer must point to at least 16 bytes of writable memory.
+#[inline]
+pub unsafe fn write_masked_atomic_seg64_fa(ptr: *mut u8, add: u64, field_mask: u64) {
+    let ptr64 = ptr as *mut u64;
+    std::ptr::write_volatile(ptr64, add.to_be());
+    std::ptr::write_volatile(ptr64.add(1), field_mask.to_be());
+}
+
+/// Size of the TM segment in bytes.
+pub const TM_SEG_SIZE: usize = 32;
+
+/// Write the TM segment for TAG_ADD operation.
+///
+/// # Safety
+/// The pointer must point to at least 32 bytes of writable memory.
+///
+/// # Arguments
+/// * `ptr` - Pointer to 32-byte TM segment buffer
+/// * `index` - TM tag index in the SRQ tag list
+/// * `sw_cnt` - Software count (typically used for tracking)
+/// * `tag` - Tag value to match against incoming messages
+/// * `mask` - Mask for tag matching (1 bits = must match)
+/// * `signaled` - Whether to generate a CQE on completion
+#[inline]
+pub unsafe fn write_tm_seg_add(
+    ptr: *mut u8,
+    index: u16,
+    sw_cnt: u16,
+    tag: u64,
+    mask: u64,
+    signaled: bool,
+) {
+    // mlx5_wqe_tm_seg layout (32 bytes):
+    //   offset 0: opcode (1 byte) - APPEND=0x01 shifted left 4 bits = 0x10
+    //   offset 1: flags (1 byte) - 0x80 for CQE request
+    //   offset 2-3: index (2 bytes, big-endian)
+    //   offset 4-5: rsvd0 (2 bytes)
+    //   offset 6-7: sw_cnt (2 bytes, big-endian)
+    //   offset 8-15: rsvd1 (8 bytes)
+    //   offset 16-23: append_tag (8 bytes, big-endian)
+    //   offset 24-31: append_mask (8 bytes, big-endian)
+
+    // opcode = MLX5_TM_OPCODE_APPEND << 4 = 0x10
+    std::ptr::write_volatile(ptr, 0x10);
+    // flags: TM_CQE_REQ = 0x80
+    let flags = if signaled { 0x80 } else { 0x00 };
+    std::ptr::write_volatile(ptr.add(1), flags);
+    // index (big-endian)
+    std::ptr::write_volatile(ptr.add(2) as *mut u16, index.to_be());
+    // rsvd0 (2 bytes at offset 4-5)
+    std::ptr::write_volatile(ptr.add(4) as *mut u16, 0);
+    // sw_cnt (2 bytes at offset 6-7, big-endian)
+    std::ptr::write_volatile(ptr.add(6) as *mut u16, sw_cnt.to_be());
+    // rsvd1 (8 bytes at offset 8-15)
+    std::ptr::write_volatile(ptr.add(8) as *mut u64, 0);
+    // append_tag (big-endian)
+    std::ptr::write_volatile(ptr.add(16) as *mut u64, tag.to_be());
+    // append_mask (big-endian)
+    std::ptr::write_volatile(ptr.add(24) as *mut u64, mask.to_be());
+}
+
+/// Write the TM segment for TAG_DEL operation.
+///
+/// # Safety
+/// The pointer must point to at least 32 bytes of writable memory.
+#[inline]
+pub unsafe fn write_tm_seg_del(ptr: *mut u8, index: u16, signaled: bool) {
+    // opcode = MLX5_TM_OPCODE_REMOVE << 4 = 0x20
+    std::ptr::write_volatile(ptr, 0x20);
+    // flags
+    let flags = if signaled { 0x80 } else { 0x00 };
+    std::ptr::write_volatile(ptr.add(1), flags);
+    // index (big-endian)
+    std::ptr::write_volatile(ptr.add(2) as *mut u16, index.to_be());
+    // Clear remaining bytes
+    std::ptr::write_bytes(ptr.add(4), 0, 28);
 }
 
 /// WQE opcodes.
@@ -898,32 +830,32 @@ mod tests {
 
     #[test]
     fn test_ctrl_seg_size() {
-        assert_eq!(CtrlSeg::SIZE, 16);
+        assert_eq!(CTRL_SEG_SIZE, 16);
     }
 
     #[test]
     fn test_rdma_seg_size() {
-        assert_eq!(RdmaSeg::SIZE, 16);
+        assert_eq!(RDMA_SEG_SIZE, 16);
     }
 
     #[test]
     fn test_data_seg_size() {
-        assert_eq!(DataSeg::SIZE, 16);
+        assert_eq!(DATA_SEG_SIZE, 16);
     }
 
     #[test]
     fn test_atomic_seg_size() {
-        assert_eq!(AtomicSeg::SIZE, 16);
+        assert_eq!(ATOMIC_SEG_SIZE, 16);
     }
 
     #[test]
     fn test_address_vector_size() {
-        assert_eq!(AddressVector::SIZE, 48);
+        assert_eq!(ADDRESS_VECTOR_SIZE, 48);
     }
 
     #[test]
     fn test_tm_seg_size() {
-        assert_eq!(TmSeg::SIZE, 32);
+        assert_eq!(TM_SEG_SIZE, 32);
     }
 
     // -------------------------------------------------------------------------

@@ -10,7 +10,7 @@ use std::{io, mem::MaybeUninit, ptr::NonNull};
 use std::marker::PhantomData;
 
 use crate::pd::Pd;
-use crate::wqe::{DataSeg, HasData, NoData};
+use crate::wqe::{HasData, NoData, write_data_seg};
 
 /// SRQ configuration.
 #[derive(Debug, Clone)]
@@ -113,7 +113,7 @@ impl<'a, T> SrqRecvWqeBuilder<'a, T, NoData> {
             std::ptr::write_bytes(wqe_ptr, 0, 16);
 
             // Write Data Segment at offset 16
-            DataSeg::write(wqe_ptr.add(16), len, lkey, addr);
+            write_data_seg(wqe_ptr.add(16), len, lkey, addr);
         }
         SrqRecvWqeBuilder {
             state: self.state,
@@ -133,7 +133,7 @@ impl<'a, T> SrqRecvWqeBuilder<'a, T, HasData> {
             let wqe_ptr = self.state.get_wqe_ptr(self.wqe_idx);
             // Additional SGEs would be written at subsequent offsets
             // For now, SRQ typically uses single SGE
-            DataSeg::write(wqe_ptr.add(16), len, lkey, addr);
+            write_data_seg(wqe_ptr.add(16), len, lkey, addr);
         }
         self
     }

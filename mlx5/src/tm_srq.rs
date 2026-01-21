@@ -43,8 +43,9 @@ use crate::device::Context;
 use crate::pd::Pd;
 use crate::srq::SrqInfo;
 use crate::wqe::{
-    CtrlSeg, DataSeg, HasData, Init, NeedsTmSeg, OrderedWqeTable, TmSeg, UnorderedWqeTable,
-    WQEBB_SIZE, WqeHandle, WqeOpcode,
+    CTRL_SEG_SIZE, DATA_SEG_SIZE, HasData, Init, NeedsTmSeg, OrderedWqeTable,
+    TM_SEG_SIZE, UnorderedWqeTable, WQEBB_SIZE, WqeHandle, WqeOpcode,
+    write_ctrl_seg, write_data_seg, write_tm_seg_add, write_tm_seg_del,
 };
 
 // =============================================================================
@@ -252,7 +253,7 @@ impl<'a, T, Tab> CmdQpWqeBuilder<'a, T, Tab, Init> {
         // MLX5_WQE_CTRL_CQ_UPDATE = 0x08 - required for TM operations
         const CQ_UPDATE: u8 = 0x08;
         unsafe {
-            CtrlSeg::write(
+            write_ctrl_seg(
                 self.wqe_ptr,
                 opmod,
                 WqeOpcode::TagMatching as u8,
@@ -263,7 +264,7 @@ impl<'a, T, Tab> CmdQpWqeBuilder<'a, T, Tab, Init> {
                 0,
             );
         }
-        self.offset = 16; // CtrlSeg::SIZE
+        self.offset = 16; // CTRL_SEG_SIZE
         self.ds_count = 1;
         CmdQpWqeBuilder {
             cmd_qp: self.cmd_qp,
@@ -304,7 +305,7 @@ impl<'a, T, Tab> CmdQpWqeBuilder<'a, T, Tab, NeedsTmSeg> {
         signaled: bool,
     ) -> CmdQpWqeBuilder<'a, T, Tab, HasData> {
         unsafe {
-            TmSeg::write_add(
+            write_tm_seg_add(
                 self.wqe_ptr.add(self.offset),
                 index,
                 index, // sw_cnt - same as index, per rdma-core
@@ -313,13 +314,13 @@ impl<'a, T, Tab> CmdQpWqeBuilder<'a, T, Tab, NeedsTmSeg> {
                 signaled,
             );
         }
-        self.offset += TmSeg::SIZE;
+        self.offset += TM_SEG_SIZE;
         self.ds_count += 2; // TmSeg = 32 bytes = 2 DS
 
         unsafe {
-            DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
+            write_data_seg(self.wqe_ptr.add(self.offset), len, lkey, addr);
         }
-        self.offset += DataSeg::SIZE;
+        self.offset += DATA_SEG_SIZE;
         self.ds_count += 1;
 
         CmdQpWqeBuilder {
@@ -343,9 +344,9 @@ impl<'a, T, Tab> CmdQpWqeBuilder<'a, T, Tab, NeedsTmSeg> {
     /// * `signaled` - Whether to request a CQE on completion
     pub fn tag_del(mut self, index: u16, signaled: bool) -> CmdQpWqeBuilder<'a, T, Tab, HasData> {
         unsafe {
-            TmSeg::write_del(self.wqe_ptr.add(self.offset), index, signaled);
+            write_tm_seg_del(self.wqe_ptr.add(self.offset), index, signaled);
         }
-        self.offset += TmSeg::SIZE;
+        self.offset += TM_SEG_SIZE;
         self.ds_count += 2; // TmSeg = 32 bytes = 2 DS
 
         CmdQpWqeBuilder {
@@ -491,7 +492,7 @@ impl<'a, U> RqWqeBuilder<'a, U> {
     ///
     /// Automatically extends WQEBB allocation if needed.
     pub fn data_seg(mut self, addr: u64, len: u32, lkey: u32) -> io::Result<Self> {
-        let new_offset = self.offset + DataSeg::SIZE;
+        let new_offset = self.offset + DATA_SEG_SIZE;
         let required_wqebbs = new_offset.div_ceil(WQEBB_SIZE) as u16;
 
         // Extend allocation if we need more WQEBBs
@@ -511,7 +512,7 @@ impl<'a, U> RqWqeBuilder<'a, U> {
         }
 
         unsafe {
-            DataSeg::write(self.wqe_ptr.add(self.offset), len, lkey, addr);
+            write_data_seg(self.wqe_ptr.add(self.offset), len, lkey, addr);
         }
         self.offset = new_offset;
         Ok(self)
@@ -995,7 +996,7 @@ impl<'a, Entry> TmCmdWqeBuilder<'a, Entry> for TmCmdEntryPointImpl<'a, Entry> {
         // Write control segment with TM opcode
         const CQ_UPDATE: u8 = 0x08;
         unsafe {
-            CtrlSeg::write(
+            write_ctrl_seg(
                 self.wqe_ptr,
                 0,
                 WqeOpcode::TagMatching as u8,
@@ -1023,7 +1024,7 @@ impl<'a, Entry> TmCmdWqeBuilder<'a, Entry> for TmCmdEntryPointImpl<'a, Entry> {
         // Write control segment with TM opcode
         const CQ_UPDATE: u8 = 0x08;
         unsafe {
-            CtrlSeg::write(
+            write_ctrl_seg(
                 self.wqe_ptr,
                 0,
                 WqeOpcode::TagMatching as u8,
@@ -1035,7 +1036,7 @@ impl<'a, Entry> TmCmdWqeBuilder<'a, Entry> for TmCmdEntryPointImpl<'a, Entry> {
             );
 
             // Write TM segment for deletion
-            TmSeg::write_del(self.wqe_ptr.add(CtrlSeg::SIZE), index, false);
+            write_tm_seg_del(self.wqe_ptr.add(CTRL_SEG_SIZE), index, false);
         }
 
         TmTagDelWqeBuilderImpl {
@@ -1065,10 +1066,10 @@ impl<'a, Entry> TmTagAddWqeBuilder<'a, Entry> for TmTagAddWqeBuilderImpl<'a, Ent
     #[inline]
     fn sge(mut self, addr: u64, len: u32, lkey: u32) -> Self {
         if !self.has_data {
-            let offset = CtrlSeg::SIZE;
+            let offset = CTRL_SEG_SIZE;
             unsafe {
                 // Write TM segment for add (not signaled initially)
-                TmSeg::write_add(
+                write_tm_seg_add(
                     self.wqe_ptr.add(offset),
                     self.index,
                     self.index,
@@ -1078,7 +1079,7 @@ impl<'a, Entry> TmTagAddWqeBuilder<'a, Entry> for TmTagAddWqeBuilderImpl<'a, Ent
                 );
 
                 // Write data segment
-                DataSeg::write(self.wqe_ptr.add(offset + TmSeg::SIZE), len, lkey, addr);
+                write_data_seg(self.wqe_ptr.add(offset + TM_SEG_SIZE), len, lkey, addr);
             }
             self.has_data = true;
         }
@@ -1095,7 +1096,7 @@ impl<'a, Entry> TmTagAddWqeBuilder<'a, Entry> for TmTagAddWqeBuilderImpl<'a, Ent
     #[inline]
     fn finish_unsignaled(self) -> WqeHandle {
         let ds_count = 1 + 2 + 1; // Ctrl(1) + TmSeg(2) + DataSeg(1)
-        let offset = CtrlSeg::SIZE + TmSeg::SIZE + DataSeg::SIZE;
+        let offset = CTRL_SEG_SIZE + TM_SEG_SIZE + DATA_SEG_SIZE;
 
         unsafe {
             std::ptr::write_volatile(self.wqe_ptr.add(7), ds_count);
@@ -1112,12 +1113,12 @@ impl<'a, Entry> TmTagAddWqeBuilder<'a, Entry> for TmTagAddWqeBuilderImpl<'a, Ent
     #[inline]
     fn finish_signaled(self, entry: Entry) -> WqeHandle {
         let ds_count = 1 + 2 + 1; // Ctrl(1) + TmSeg(2) + DataSeg(1)
-        let offset = CtrlSeg::SIZE + TmSeg::SIZE + DataSeg::SIZE;
+        let offset = CTRL_SEG_SIZE + TM_SEG_SIZE + DATA_SEG_SIZE;
 
         // Re-write TM segment with signaled flag
         unsafe {
-            TmSeg::write_add(
-                self.wqe_ptr.add(CtrlSeg::SIZE),
+            write_tm_seg_add(
+                self.wqe_ptr.add(CTRL_SEG_SIZE),
                 self.index,
                 self.index,
                 self.tag,
@@ -1156,7 +1157,7 @@ impl<'a, Entry> TmTagDelWqeBuilder<'a, Entry> for TmTagDelWqeBuilderImpl<'a, Ent
     #[inline]
     fn finish_unsignaled(self) -> WqeHandle {
         let ds_count = 1 + 2; // Ctrl(1) + TmSeg(2)
-        let offset = CtrlSeg::SIZE + TmSeg::SIZE;
+        let offset = CTRL_SEG_SIZE + TM_SEG_SIZE;
 
         unsafe {
             std::ptr::write_volatile(self.wqe_ptr.add(7), ds_count);
@@ -1173,11 +1174,11 @@ impl<'a, Entry> TmTagDelWqeBuilder<'a, Entry> for TmTagDelWqeBuilderImpl<'a, Ent
     #[inline]
     fn finish_signaled(self, entry: Entry) -> WqeHandle {
         let ds_count = 1 + 2; // Ctrl(1) + TmSeg(2)
-        let offset = CtrlSeg::SIZE + TmSeg::SIZE;
+        let offset = CTRL_SEG_SIZE + TM_SEG_SIZE;
 
         // Re-write TM segment with signaled flag
         unsafe {
-            TmSeg::write_del(self.wqe_ptr.add(CtrlSeg::SIZE), self.index, true);
+            write_tm_seg_del(self.wqe_ptr.add(CTRL_SEG_SIZE), self.index, true);
         }
         let ci_delta = self.cmd_qp.pi.get().wrapping_add(1);
         self.cmd_qp.table.store(self.wqe_idx, entry, ci_delta);
