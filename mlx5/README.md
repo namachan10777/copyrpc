@@ -214,6 +214,75 @@ This library takes a different approach:
 
 By designing around inlining, this library eliminates function call overhead and achieves optimizations on par with or exceeding UCX.
 
+## Feature Checklist
+
+Legend: ✅ Supported | ⚠️ Untested | 📋 Planned | ❌ Not Planned | ➖ N/A
+
+### Transports
+
+| Feature | mlx5 | ibverbs | Notes |
+|---------|------|---------|-------|
+| RC (Reliable Connection) | ✅ | ✅ | IB/RoCE |
+| UD (Unreliable Datagram) | ✅ | ✅ | IB/RoCE |
+| DC (Dynamically Connected) | ✅ | ➖ | mlx5dv only |
+| Raw Packet | 📋 | ✅ | |
+| XRC (eXtended Reliable Connection) | ❌ | ✅ | DC provides similar scalability |
+
+### Operations
+
+| Feature | mlx5 | ibverbs | Notes |
+|---------|------|---------|-------|
+| SEND / SEND with Immediate / SEND with Invalidate | ✅ | ✅ | |
+| RECV | ✅ | ✅ | |
+| RDMA WRITE / RDMA WRITE with Immediate | ✅ | ✅ | |
+| RDMA READ | ✅ | ✅ | |
+| Atomic CAS (Compare-And-Swap) | ✅ | ✅ | |
+| Atomic Fetch-Add | ✅ | ✅ | |
+| Masked Atomic (32-bit / 64-bit) | ✅ | ✅ | |
+| Extended Atomics (MLX5) | 📋 | ➖ | mlx5dv only |
+| TSO (TCP Segmentation Offload) | 📋 | ✅ | |
+| Bind Memory Window | 📋 | ✅ | |
+| Local/Remote Invalidate | ❌ | ✅ | Rarely used |
+
+### Performance Features
+
+| Feature | mlx5 | ibverbs | Notes |
+|---------|------|---------|-------|
+| Explicit BlueFlame | ✅ | ➖ | Direct WQE posting to BF register |
+| CQE Compression | ⚠️ | ➖ | Requires MPRQ |
+| Scatter-to-CQE | ✅ | ✅ | ≤32B in 64B CQE, ≤64B in 128B CQE |
+| Inline Data | ✅ | ✅ | |
+| Flexible Data Segment | ✅ | ➖ | Direct WQE construction only |
+| Performance optimized CQ (MonoCq) | ✅ | ➖ | Inlined callbacks, no vtable |
+| Explicit Doorbell Batching | ✅ | ➖ | |
+| MPRQ (Multi-Packet RQ) | 📋 | ➖ | Strided RQ, mlx5dv only |
+
+### Queue Features
+
+| Feature | mlx5 | ibverbs | Notes |
+|---------|------|---------|-------|
+| SRQ (Shared Receive Queue) | ✅ | ✅ | |
+| Tag Matching SRQ (TM-SRQ) | ✅ | ➖ | mlx5dv only |
+| CQE size selection (64B / 128B) | ✅ | ✅ | |
+| CQ moderation | ✅ | ✅ | |
+
+### Memory
+
+| Feature | mlx5 | ibverbs | Notes |
+|---------|------|---------|-------|
+| Memory Registration (MR) | ✅ | ✅ | |
+| On-Demand Paging (ODP) | 📋 | ✅ | |
+| Huge Pages | 📋 | ✅ | |
+| Memory Window Type 1 | 📋 | ✅ | |
+| Memory Window Type 2A/2B | 📋 | ✅ | |
+
+### Environment
+
+| Feature | mlx5 | ibverbs | Notes |
+|---------|------|---------|-------|
+| InfiniBand | ✅ | ✅ | |
+| RoCE | ⚠️ | ✅ | Implemented but untested |
+
 ## License
 
 [See LICENSE file]
