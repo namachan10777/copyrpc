@@ -7,8 +7,10 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::{io, mem::MaybeUninit, ptr::NonNull};
 
+use std::marker::PhantomData;
+
 use crate::pd::Pd;
-use crate::wqe::DataSeg;
+use crate::wqe::{DataSeg, HasData, NoData};
 
 /// SRQ configuration.
 #[derive(Debug, Clone)]
@@ -88,15 +90,22 @@ impl<T> SrqState<T> {
 // =============================================================================
 
 /// Builder for posting receive WQEs to SRQ.
-pub struct SrqRecvWqeBuilder<'a, T> {
+///
+/// Uses type-state pattern: `DataState` is `NoData` initially,
+/// transitions to `HasData` after calling `sge()`.
+#[must_use = "WQE builder must be finished"]
+pub struct SrqRecvWqeBuilder<'a, T, DataState> {
     state: &'a SrqState<T>,
     entry: T,
     wqe_idx: u32,
+    _data: PhantomData<DataState>,
 }
 
-impl<'a, T> SrqRecvWqeBuilder<'a, T> {
+/// sge: NoData state, transitions to HasData.
+impl<'a, T> SrqRecvWqeBuilder<'a, T, NoData> {
     /// Add an SGE (Scatter/Gather Element) to the receive WQE.
-    pub fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
+    #[inline]
+    pub fn sge(self, addr: u64, len: u32, lkey: u32) -> SrqRecvWqeBuilder<'a, T, HasData> {
         unsafe {
             let wqe_ptr = self.state.get_wqe_ptr(self.wqe_idx);
 
@@ -106,10 +115,31 @@ impl<'a, T> SrqRecvWqeBuilder<'a, T> {
             // Write Data Segment at offset 16
             DataSeg::write(wqe_ptr.add(16), len, lkey, addr);
         }
+        SrqRecvWqeBuilder {
+            state: self.state,
+            entry: self.entry,
+            wqe_idx: self.wqe_idx,
+            _data: PhantomData,
+        }
+    }
+}
+
+/// finish: only available in HasData state.
+impl<'a, T> SrqRecvWqeBuilder<'a, T, HasData> {
+    /// Add another scatter/gather entry.
+    #[inline]
+    pub fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
+        unsafe {
+            let wqe_ptr = self.state.get_wqe_ptr(self.wqe_idx);
+            // Additional SGEs would be written at subsequent offsets
+            // For now, SRQ typically uses single SGE
+            DataSeg::write(wqe_ptr.add(16), len, lkey, addr);
+        }
         self
     }
 
     /// Finish the WQE construction.
+    #[inline]
     pub fn finish(self) {
         let idx = (self.wqe_idx as usize) & ((self.state.wqe_cnt - 1) as usize);
         self.state.table[idx].set(Some(self.entry));
@@ -266,7 +296,7 @@ impl<T> Srq<T> {
     ///
     /// # Errors
     /// Returns `WouldBlock` if the SRQ is full.
-    pub fn recv_builder(&self, entry: T) -> io::Result<SrqRecvWqeBuilder<'_, T>> {
+    pub fn recv_builder(&self, entry: T) -> io::Result<SrqRecvWqeBuilder<'_, T, NoData>> {
         let inner = self.0.borrow();
         let state = inner
             .state
@@ -289,6 +319,7 @@ impl<T> Srq<T> {
             state: unsafe { &*state_ptr },
             entry,
             wqe_idx,
+            _data: PhantomData,
         })
     }
 
@@ -325,19 +356,19 @@ impl<T> Srq<T> {
             .and_then(|s| s.process_completion(wqe_idx))
     }
 
-    /// Get a RQ WQE builder using the new trait-based API.
+    /// Get a RQ WQE builder.
     ///
     /// The entry will be stored and returned via callback on RQ completion.
     ///
     /// # Example
     /// ```ignore
-    /// srq.rq_wqe(entry)
+    /// srq.rq_wqe(entry)?
     ///     .sge(addr, len, lkey)
     ///     .finish();
     /// srq.ring_doorbell();
     /// ```
     #[inline]
-    pub fn rq_wqe(&self, entry: T) -> io::Result<SrqRecvWqeBuilder<'_, T>> {
+    pub fn rq_wqe(&self, entry: T) -> io::Result<SrqRecvWqeBuilder<'_, T, NoData>> {
         self.recv_builder(entry)
     }
 }

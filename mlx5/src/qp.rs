@@ -2159,17 +2159,22 @@ impl<'a, Entry> NopWqeBuilder<'a, Entry> {
 // =============================================================================
 
 /// RQ WQE builder.
+///
+/// Uses type-state pattern: `DataState` is `NoData` initially,
+/// transitions to `HasData` after calling `sge()`.
 #[must_use = "WQE builder must be finished"]
-pub struct RqWqeBuilder<'a, Entry> {
+pub struct RqWqeBuilder<'a, Entry, DataState> {
     rq: &'a ReceiveQueueState<Entry>,
     entry: Entry,
     wqe_idx: u16,
+    _data: PhantomData<DataState>,
 }
 
-impl<'a, Entry> RqWqeBuilder<'a, Entry> {
+/// sge: NoData state, transitions to HasData.
+impl<'a, Entry> RqWqeBuilder<'a, Entry, NoData> {
     /// Add a scatter/gather entry for receive buffer.
     #[inline]
-    pub fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
+    pub fn sge(self, addr: u64, len: u32, lkey: u32) -> RqWqeBuilder<'a, Entry, HasData> {
         unsafe {
             let wqe_ptr = self.rq.get_wqe_ptr(self.wqe_idx);
             DataSeg::write(wqe_ptr, len, lkey, addr);
@@ -2180,6 +2185,24 @@ impl<'a, Entry> RqWqeBuilder<'a, Entry> {
                 std::ptr::write_volatile(ptr32, 0u32);
                 std::ptr::write_volatile(ptr32.add(1), MLX5_INVALID_LKEY.to_be());
             }
+        }
+        RqWqeBuilder {
+            rq: self.rq,
+            entry: self.entry,
+            wqe_idx: self.wqe_idx,
+            _data: PhantomData,
+        }
+    }
+}
+
+/// finish: only available in HasData state.
+impl<'a, Entry> RqWqeBuilder<'a, Entry, HasData> {
+    /// Add another scatter/gather entry.
+    #[inline]
+    pub fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
+        unsafe {
+            let wqe_ptr = self.rq.get_wqe_ptr(self.wqe_idx);
+            DataSeg::write(wqe_ptr, len, lkey, addr);
         }
         self
     }
@@ -2208,7 +2231,7 @@ impl<Entry, Transport, OnComplete> RcQpInner<Entry, Transport, OrderedWqeTable<E
     /// qp.ring_rq_doorbell();
     /// ```
     #[inline]
-    pub fn rq_wqe(&self, entry: Entry) -> io::Result<RqWqeBuilder<'_, Entry>> {
+    pub fn rq_wqe(&self, entry: Entry) -> io::Result<RqWqeBuilder<'_, Entry, NoData>> {
         let rq = self
             .rq
             .as_ref()
@@ -2217,7 +2240,7 @@ impl<Entry, Transport, OnComplete> RcQpInner<Entry, Transport, OrderedWqeTable<E
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "RQ full"));
         }
         let wqe_idx = rq.pi.get();
-        Ok(RqWqeBuilder { rq, entry, wqe_idx })
+        Ok(RqWqeBuilder { rq, entry, wqe_idx, _data: PhantomData })
     }
 }
 

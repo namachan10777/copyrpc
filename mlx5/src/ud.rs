@@ -1027,15 +1027,38 @@ impl<'a, Entry> UdSendWqeBuilder<'a, Entry, HasData> {
 // =============================================================================
 
 /// UD RQ WQE builder.
+///
+/// Uses type-state pattern: `DataState` is `NoData` initially,
+/// transitions to `HasData` after calling `sge()`.
 #[must_use = "WQE builder must be finished"]
-pub struct UdRqWqeBuilder<'a, Entry> {
+pub struct UdRqWqeBuilder<'a, Entry, DataState> {
     rq: &'a UdRecvQueueState<Entry>,
     entry: Entry,
     wqe_idx: u16,
+    _data: PhantomData<DataState>,
 }
 
-impl<'a, Entry> UdRqWqeBuilder<'a, Entry> {
+/// sge: NoData state, transitions to HasData.
+impl<'a, Entry> UdRqWqeBuilder<'a, Entry, NoData> {
     /// Add a scatter/gather entry for receive buffer.
+    #[inline]
+    pub fn sge(self, addr: u64, len: u32, lkey: u32) -> UdRqWqeBuilder<'a, Entry, HasData> {
+        unsafe {
+            let wqe_ptr = self.rq.get_wqe_ptr(self.wqe_idx);
+            DataSeg::write(wqe_ptr, len, lkey, addr);
+        }
+        UdRqWqeBuilder {
+            rq: self.rq,
+            entry: self.entry,
+            wqe_idx: self.wqe_idx,
+            _data: PhantomData,
+        }
+    }
+}
+
+/// finish: only available in HasData state.
+impl<'a, Entry> UdRqWqeBuilder<'a, Entry, HasData> {
+    /// Add another scatter/gather entry.
     #[inline]
     pub fn sge(self, addr: u64, len: u32, lkey: u32) -> Self {
         unsafe {
@@ -1088,13 +1111,13 @@ impl<Entry, OnComplete> UdQpWithTable<Entry, OnComplete> {
     /// qp.ring_rq_doorbell();
     /// ```
     #[inline]
-    pub fn rq_wqe(&self, entry: Entry) -> io::Result<UdRqWqeBuilder<'_, Entry>> {
+    pub fn rq_wqe(&self, entry: Entry) -> io::Result<UdRqWqeBuilder<'_, Entry, NoData>> {
         let rq = self.rq()?;
         if rq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "RQ full"));
         }
         let wqe_idx = rq.pi.get();
-        Ok(UdRqWqeBuilder { rq, entry, wqe_idx })
+        Ok(UdRqWqeBuilder { rq, entry, wqe_idx, _data: PhantomData })
     }
 
     /// Ring the send queue doorbell.
