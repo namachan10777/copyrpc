@@ -8,3 +8,9 @@ mlx5 = { version = "0.1.0", path = "../mlx5" }
 mlx5_sys = { version = "0.1.0", path = "../mlx5_sys" }
 
 [dev-dependencies]
+criterion = "0.5"
+libc = "0.2"
+
+[[bench]]
+name = "pingpong"
+harness = false
