@@ -82,6 +82,7 @@
 #[macro_use]
 mod barrier;
 
+pub(crate) mod builder_common;
 pub mod cq;
 pub mod dc;
 pub mod device;

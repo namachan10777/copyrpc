@@ -76,9 +76,16 @@ impl<T> SrqState<T> {
     }
 
     /// Process a receive completion and return the associated entry.
+    ///
+    /// Note: For RDMA WRITE+IMM with SRQ, the CQE wqe_counter field may be 0.
+    /// In this case, we use the CI (consumer index) to track completions in FIFO order.
     fn process_completion(&self, wqe_idx: u16) -> Option<T> {
-        self.ci.set(self.ci.get().wrapping_add(1));
-        let idx = (wqe_idx as usize) & ((self.wqe_cnt - 1) as usize);
+        let ci = self.ci.get();
+        self.ci.set(ci.wrapping_add(1));
+        // Use CI for FIFO ordering instead of wqe_idx from CQE
+        // This handles RDMA WRITE+IMM where wqe_counter is not reliably set
+        let idx = (ci as usize) & ((self.wqe_cnt - 1) as usize);
+        let _ = wqe_idx; // Acknowledge the parameter even though we don't use it
         self.table[idx].take()
     }
 }

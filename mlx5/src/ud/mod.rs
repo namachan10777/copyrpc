@@ -16,6 +16,7 @@ use std::rc::{Rc, Weak};
 use std::{io, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
 use crate::CompletionTarget;
+use crate::builder_common::register_with_cqs;
 use crate::cq::{Cq, Cqe};
 use crate::device::Context;
 use crate::pd::{AddressHandle, Pd};
@@ -434,6 +435,19 @@ pub type UdQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
 /// # NOTE: RoCE support is untested (IB-only hardware environment)
 pub type UdQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
     UdQp<SqEntry, RqEntry, RoCE, OrderedWqeTable<SqEntry>, UdSharedRq<RqEntry>, OnSqComplete, OnRqComplete>;
+
+/// Type alias for UD QP with MonoCq (no callback stored, InfiniBand).
+///
+/// When using MonoCq, callbacks are stored in the MonoCq, not in the UdQp.
+/// Both SQ and RQ use the same Entry type with MonoCq.
+pub type UdQpForMonoCq<Entry> =
+    UdQp<Entry, Entry, InfiniBand, OrderedWqeTable<Entry>, UdOwnedRq<Entry>, (), ()>;
+
+/// Type alias for UD QP with MonoCq (no callback stored, RoCE).
+///
+/// # NOTE: RoCE support is untested (IB-only hardware environment)
+pub type UdQpForMonoCqRoCE<Entry> =
+    UdQp<Entry, Entry, RoCE, OrderedWqeTable<Entry>, UdOwnedRq<Entry>, (), ()>;
 
 /// UD (Unreliable Datagram) Queue Pair.
 ///
@@ -1243,12 +1257,7 @@ where
             let qpn = qp_rc.borrow().qpn();
 
             // Register with CQs if using normal Cq
-            if let Some(cq) = send_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
-                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-            }
-            if let Some(cq) = recv_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
-                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-            }
+            register_with_cqs(qpn, &send_cq_for_register, &recv_cq_for_register, &qp_rc);
 
             Ok(qp_rc)
         }
@@ -1319,12 +1328,7 @@ where
             let qpn = qp_rc.borrow().qpn();
 
             // Register with CQs if using normal Cq
-            if let Some(cq) = send_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
-                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-            }
-            if let Some(cq) = recv_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
-                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-            }
+            register_with_cqs(qpn, &send_cq_for_register, &recv_cq_for_register, &qp_rc);
 
             Ok(qp_rc)
         }
@@ -1390,12 +1394,7 @@ where
             let qpn = qp_rc.borrow().qpn();
 
             // Register with CQs if using normal Cq
-            if let Some(cq) = send_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
-                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-            }
-            if let Some(cq) = recv_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
-                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-            }
+            register_with_cqs(qpn, &send_cq_for_register, &recv_cq_for_register, &qp_rc);
 
             Ok(qp_rc)
         }
@@ -1467,14 +1466,119 @@ where
             let qp_rc = Rc::new(RefCell::new(result));
             let qpn = qp_rc.borrow().qpn();
 
-            if let Some(cq) = send_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
-                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-            }
-            if let Some(cq) = recv_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
-                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-            }
+            register_with_cqs(qpn, &send_cq_for_register, &recv_cq_for_register, &qp_rc);
 
             Ok(qp_rc)
+        }
+    }
+}
+
+// =============================================================================
+// Build Methods - MonoCq (OnSq = (), OnRq = ()) - InfiniBand + OwnedRq
+// =============================================================================
+
+impl<'a, Entry>
+    UdQpBuilder<'a, Entry, Entry, InfiniBand, UdOwnedRq<Entry>, CqSet, CqSet, (), ()>
+where
+    Entry: 'static,
+{
+    /// Build the UD QP for use with MonoCq.
+    ///
+    /// When using MonoCq, callbacks are stored in the MonoCq, not in the UdQp.
+    /// This method is available when both SQ and RQ use MonoCq.
+    pub fn build(self) -> io::Result<Rc<RefCell<UdQpForMonoCq<Entry>>>> {
+        unsafe {
+            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
+            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_UD;
+            qp_attr.send_cq = self.send_cq_ptr;
+            qp_attr.recv_cq = self.recv_cq_ptr;
+            qp_attr.cap.max_send_wr = self.config.max_send_wr;
+            qp_attr.cap.max_recv_wr = self.config.max_recv_wr;
+            qp_attr.cap.max_send_sge = self.config.max_send_sge;
+            qp_attr.cap.max_recv_sge = self.config.max_recv_sge;
+            qp_attr.cap.max_inline_data = self.config.max_inline_data;
+            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
+            qp_attr.pd = self.pd.as_ptr();
+
+            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
+
+            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
+
+            let mut result = UdQp {
+                qp,
+                state: Cell::new(UdQpState::Reset),
+                qkey: self.config.qkey,
+                max_inline_data: self.config.max_inline_data,
+                sq: None,
+                rq: UdOwnedRq::new(None),
+                sq_callback: (),
+                rq_callback: (),
+                send_cq: Weak::new(),  // MonoCq doesn't use Cq registration
+                recv_cq: Weak::new(),
+                _pd: self.pd.clone(),
+                _marker: std::marker::PhantomData,
+            };
+
+            UdQpForMonoCq::<Entry>::init_direct_access_internal(&mut result)?;
+
+            Ok(Rc::new(RefCell::new(result)))
+        }
+    }
+}
+
+// =============================================================================
+// Build Methods - MonoCq (OnSq = (), OnRq = ()) - RoCE + OwnedRq
+// =============================================================================
+
+impl<'a, Entry>
+    UdQpBuilder<'a, Entry, Entry, RoCE, UdOwnedRq<Entry>, CqSet, CqSet, (), ()>
+where
+    Entry: 'static,
+{
+    /// Build the UD QP for use with MonoCq (RoCE).
+    ///
+    /// When using MonoCq, callbacks are stored in the MonoCq, not in the UdQp.
+    /// This method is available when both SQ and RQ use MonoCq.
+    ///
+    /// # NOTE: RoCE support is untested (IB-only hardware environment)
+    pub fn build(self) -> io::Result<Rc<RefCell<UdQpForMonoCqRoCE<Entry>>>> {
+        unsafe {
+            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
+            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_UD;
+            qp_attr.send_cq = self.send_cq_ptr;
+            qp_attr.recv_cq = self.recv_cq_ptr;
+            qp_attr.cap.max_send_wr = self.config.max_send_wr;
+            qp_attr.cap.max_recv_wr = self.config.max_recv_wr;
+            qp_attr.cap.max_send_sge = self.config.max_send_sge;
+            qp_attr.cap.max_recv_sge = self.config.max_recv_sge;
+            qp_attr.cap.max_inline_data = self.config.max_inline_data;
+            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
+            qp_attr.pd = self.pd.as_ptr();
+
+            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
+
+            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
+
+            let mut result = UdQp {
+                qp,
+                state: Cell::new(UdQpState::Reset),
+                qkey: self.config.qkey,
+                max_inline_data: self.config.max_inline_data,
+                sq: None,
+                rq: UdOwnedRq::new(None),
+                sq_callback: (),
+                rq_callback: (),
+                send_cq: Weak::new(),  // MonoCq doesn't use Cq registration
+                recv_cq: Weak::new(),
+                _pd: self.pd.clone(),
+                _marker: std::marker::PhantomData,
+            };
+
+            UdQpForMonoCqRoCE::<Entry>::init_direct_access_internal(&mut result)?;
+
+            Ok(Rc::new(RefCell::new(result)))
         }
     }
 }

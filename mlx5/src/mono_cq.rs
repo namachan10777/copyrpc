@@ -658,7 +658,7 @@ where
 // Type Aliases
 // =============================================================================
 
-use crate::qp::RcQpForMonoCq;
+use crate::qp::{RcQpForMonoCq, RcQpForMonoCqWithSrq};
 
 /// MonoCq for RcQp without callback (callback on CQ side).
 ///
@@ -668,3 +668,12 @@ use crate::qp::RcQpForMonoCq;
 /// - `Entry`: Entry type for completions (same for SQ and RQ)
 /// - `F`: Callback type `Fn(Cqe, Entry)`
 pub type MonoCqRc<Entry, F> = MonoCq<RcQpForMonoCq<Entry>, F>;
+
+/// MonoCq for RcQp with Shared Receive Queue without callback (callback on CQ side).
+///
+/// Use with `with_srq()` builder method to create QPs that share an SRQ.
+///
+/// # Type Parameters
+/// - `Entry`: Entry type for completions (same for SQ and SRQ)
+/// - `F`: Callback type `Fn(Cqe, Entry)`
+pub type MonoCqRcWithSrq<Entry, F> = MonoCq<RcQpForMonoCqWithSrq<Entry>, F>;

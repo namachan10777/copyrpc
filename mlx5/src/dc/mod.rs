@@ -11,6 +11,7 @@ use std::rc::{Rc, Weak};
 use std::{io, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
 use crate::CompletionTarget;
+use crate::builder_common::register_with_send_cq;
 use crate::cq::{Cq, Cqe};
 use crate::device::Context;
 use crate::mono_cq::MonoCq;
@@ -381,9 +382,7 @@ where
             let qpn = dci_rc.borrow().qpn();
 
             // Register with CQ if using normal Cq
-            if let Some(cq) = self.send_cq_weak.as_ref().and_then(|w| w.upgrade()) {
-                cq.register_queue(qpn, Rc::downgrade(&dci_rc) as _);
-            }
+            register_with_send_cq(qpn, &self.send_cq_weak, &dci_rc);
 
             Ok(dci_rc)
         }

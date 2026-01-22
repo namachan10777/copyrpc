@@ -11,6 +11,7 @@ use std::rc::{Rc, Weak};
 use std::{io, mem::MaybeUninit, ptr::NonNull};
 
 use crate::CompletionTarget;
+use crate::builder_common::{register_with_cqs, register_with_send_cq};
 use crate::cq::{Cq, Cqe};
 use crate::device::Context;
 use crate::pd::Pd;
@@ -1114,6 +1115,53 @@ impl<Entry> CompletionSource for RcQp<Entry, Entry, InfiniBand, OrderedWqeTable<
 /// If you need different Entry types for SQ and RQ, use separate CQs.
 pub type RcQpForMonoCq<Entry> = RcQp<Entry, Entry, InfiniBand, OrderedWqeTable<Entry>, OwnedRq<Entry>, (), ()>;
 
+/// RcQp type for use with MonoCq with Shared Receive Queue (no internal callback).
+///
+/// Uses a single Entry type for both SQ and SRQ completions.
+/// The RQ completions are processed via the SRQ.
+pub type RcQpForMonoCqWithSrq<Entry> = RcQp<Entry, Entry, InfiniBand, OrderedWqeTable<Entry>, SharedRq<Entry>, (), ()>;
+
+// =============================================================================
+// CompletionSource impl for RcQp with SharedRq (for use with MonoCq)
+// =============================================================================
+
+impl<Entry: Clone + 'static> CompletionSource for RcQpForMonoCqWithSrq<Entry> {
+    type Entry = Entry;
+
+    fn qpn(&self) -> u32 {
+        RcQp::qpn(self)
+    }
+
+    fn process_cqe(&self, cqe: Cqe) -> Option<Entry> {
+        if cqe.opcode.is_responder() {
+            // RQ completion via SRQ
+            self.rq.srq().process_recv_completion(cqe.wqe_counter)
+        } else {
+            // SQ completion
+            self.sq.as_ref()?.process_completion(cqe.wqe_counter)
+        }
+    }
+}
+
+// CompletionTarget impl for RcQpForMonoCqWithSrq (for send CQ polling)
+//
+// This implementation allows the QP to be registered with a normal Cq for SQ completions
+// while using MonoCq for RQ completions via SRQ.
+impl<Entry: Clone + 'static> CompletionTarget for RcQpForMonoCqWithSrq<Entry> {
+    fn qpn(&self) -> u32 {
+        RcQp::qpn(self)
+    }
+
+    fn dispatch_cqe(&self, cqe: Cqe) {
+        if !cqe.opcode.is_responder() {
+            // SQ completion - update ci to free SQ slots
+            if let Some(sq) = self.sq.as_ref() {
+                let _ = sq.process_completion(cqe.wqe_counter);
+            }
+        }
+        // RQ completions are handled by MonoCq via CompletionSource, not this method
+    }
+}
 
 // =============================================================================
 // QP Entry Points (OwnedRq - RQ methods)
@@ -1637,12 +1685,7 @@ where
             let qpn = qp_rc.borrow().qpn();
 
             // Register with CQs if using normal Cq
-            if let Some(cq) = send_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
-                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-            }
-            if let Some(cq) = recv_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
-                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-            }
+            register_with_cqs(qpn, &send_cq_for_register, &recv_cq_for_register, &qp_rc);
 
             Ok(qp_rc)
         }
@@ -1722,12 +1765,86 @@ where
             let qpn = qp_rc.borrow().qpn();
 
             // Register with CQs if using normal Cq
-            if let Some(cq) = send_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
-                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
+            register_with_cqs(qpn, &send_cq_for_register, &recv_cq_for_register, &qp_rc);
+
+            Ok(qp_rc)
+        }
+    }
+}
+
+// =============================================================================
+// Build Methods - InfiniBand + SharedRq (SRQ) with MonoCq for RQ
+// =============================================================================
+
+impl<'a, Entry, OnSq>
+    RcQpBuilder<'a, Entry, Entry, InfiniBand, SharedRq<Entry>, CqSet, CqSet, OnSq, ()>
+where
+    Entry: Clone + 'static,
+    OnSq: Fn(Cqe, Entry) + 'static,
+{
+    /// Build the RC QP with SRQ using MonoCq for recv.
+    ///
+    /// This variant is for when RQ uses MonoCq (callback on CQ side, not QP).
+    /// Only available when SQ uses normal CQ with callback and RQ uses MonoCq.
+    pub fn build(self) -> io::Result<Rc<RefCell<RcQpForMonoCqWithSrq<Entry>>>> {
+        let srq = self.srq.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "SRQ not set")
+        })?;
+
+        unsafe {
+            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
+            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
+            qp_attr.send_cq = self.send_cq_ptr;
+            qp_attr.recv_cq = self.recv_cq_ptr;
+            qp_attr.srq = srq.as_ptr();
+            qp_attr.cap.max_send_wr = self.config.max_send_wr;
+            qp_attr.cap.max_recv_wr = 0; // RQ disabled when using SRQ
+            qp_attr.cap.max_send_sge = self.config.max_send_sge;
+            qp_attr.cap.max_recv_sge = 0; // RQ disabled when using SRQ
+            qp_attr.cap.max_inline_data = self.config.max_inline_data;
+            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
+            qp_attr.pd = self.pd.as_ptr();
+
+            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
+            if !self.config.enable_scatter_to_cqe {
+                mlx5_attr.comp_mask =
+                    mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS
+                        as u64;
+                mlx5_attr.create_flags =
+                    mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
             }
-            if let Some(cq) = recv_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
-                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-            }
+
+            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
+
+            // Clone the inner Srq from Rc<Srq<Entry>>
+            let srq_inner: Srq<Entry> = (**srq).clone();
+
+            // Clone weak reference for CQ registration before moving into RcQp
+            let send_cq_for_register = self.send_cq_weak.clone();
+
+            let mut result = RcQp {
+                qp,
+                state: Cell::new(QpState::Reset),
+                max_inline_data: self.config.max_inline_data,
+                sq: None,
+                rq: SharedRq::new(srq_inner),
+                sq_callback: (),
+                rq_callback: (),
+                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
+                recv_cq: Weak::new(), // MonoCq doesn't need CQ registration
+                _pd: self.pd.clone(),
+                _marker: std::marker::PhantomData,
+            };
+
+            RcQpForMonoCqWithSrq::<Entry>::init_direct_access_internal(&mut result)?;
+
+            let qp_rc = Rc::new(RefCell::new(result));
+            let qpn = qp_rc.borrow().qpn();
+
+            // Register with send CQ for SQ completion processing (updates ci to free SQ slots)
+            // recv_cq (MonoCq) registration is done separately by caller via MonoCq::register()
+            register_with_send_cq(qpn, &send_cq_for_register, &qp_rc);
 
             Ok(qp_rc)
         }
@@ -1802,12 +1919,7 @@ where
             let qpn = qp_rc.borrow().qpn();
 
             // Register with CQs if using normal Cq
-            if let Some(cq) = send_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
-                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-            }
-            if let Some(cq) = recv_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
-                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-            }
+            register_with_cqs(qpn, &send_cq_for_register, &recv_cq_for_register, &qp_rc);
 
             Ok(qp_rc)
         }
@@ -1887,12 +1999,7 @@ where
             let qp_rc = Rc::new(RefCell::new(result));
             let qpn = qp_rc.borrow().qpn();
 
-            if let Some(cq) = send_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
-                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-            }
-            if let Some(cq) = recv_cq_for_register.as_ref().and_then(|w| w.upgrade()) {
-                cq.register_queue(qpn, Rc::downgrade(&qp_rc) as _);
-            }
+            register_with_cqs(qpn, &send_cq_for_register, &recv_cq_for_register, &qp_rc);
 
             Ok(qp_rc)
         }

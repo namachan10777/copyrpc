@@ -9,7 +9,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use mlx5::cq::{CqConfig, Cqe};
-use mlx5::qp::{RcQpConfig, RcQpForMonoCq};
+use mlx5::qp::{RcQpConfig, RcQpForMonoCq, RcQpForMonoCqWithSrq};
+use mlx5::srq::SrqConfig;
 use mlx5::transport::IbRemoteQpInfo;
 use mlx5::wqe::WqeFlags;
 
@@ -943,4 +944,160 @@ fn test_mono_cq_wraparound() {
         completion_count.get(),
         start.elapsed()
     );
+}
+
+/// Test MonoCq with SRQ and RDMA WRITE+IMM.
+///
+/// This test verifies that MonoCq works correctly with Shared Receive Queue,
+/// which is the pattern used by copyrpc.
+#[test]
+fn test_mono_cq_with_srq() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    #[derive(Clone, Copy, Debug)]
+    struct SrqEntry {
+        qpn: u32,
+    }
+
+    // Track recv completions
+    let recv_completions: Rc<RefCell<Vec<(u32, SrqEntry)>>> = Rc::new(RefCell::new(Vec::new()));
+    let recv_completions_clone = recv_completions.clone();
+
+    let recv_callback = move |cqe: Cqe, entry: SrqEntry| {
+        eprintln!("recv_callback: qpn={}, imm={}", entry.qpn, cqe.imm);
+        recv_completions_clone.borrow_mut().push((cqe.imm, entry));
+    };
+
+    // Create send CQ (normal CQ)
+    let send_cq = Rc::new(ctx.ctx.create_cq(256, &CqConfig::default()).expect("send_cq"));
+
+    // Create recv CQ (MonoCq for SRQ-based QP)
+    let recv_cq = Rc::new(
+        ctx.ctx
+            .create_mono_cq::<RcQpForMonoCqWithSrq<SrqEntry>, _>(256, recv_callback, &CqConfig::default())
+            .expect("recv_cq"),
+    );
+
+    // Create SRQ
+    let srq: mlx5::srq::Srq<SrqEntry> = ctx.pd.create_srq(&SrqConfig { max_wr: 256, max_sge: 1 }).expect("SRQ");
+    let srq = Rc::new(srq);
+
+    let config = RcQpConfig::default();
+
+    // Create QP1 with SRQ using MonoCq for recv
+    let qp1 = ctx.ctx
+        .rc_qp_builder::<SrqEntry, SrqEntry>(&ctx.pd, &config)
+        .with_srq(srq.clone())
+        .sq_cq(send_cq.clone(), |_cqe, _entry| {})
+        .rq_mono_cq(&recv_cq)
+        .build()
+        .expect("Failed to create QP1");
+
+    let qpn1 = qp1.borrow().qpn();
+    eprintln!("QP1 QPN: {}", qpn1);
+
+    // Register QP1 with recv MonoCq
+    recv_cq.register(&qp1);
+
+    // Create QP2 (sender) - normal QP without SRQ
+    let qp2 = ctx.ctx
+        .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_cq(send_cq.clone(), |_cqe, _entry| {})
+        .rq_cq(send_cq.clone(), |_cqe, _entry| {})
+        .build()
+        .expect("Failed to create QP2");
+
+    let qpn2 = qp2.borrow().qpn();
+    eprintln!("QP2 QPN: {}", qpn2);
+
+    // Connect QPs
+    let remote1 = IbRemoteQpInfo {
+        qp_number: qpn1,
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
+    };
+    let remote2 = IbRemoteQpInfo {
+        qp_number: qpn2,
+        packet_sequence_number: 0,
+        local_identifier: ctx.port_attr.lid,
+    };
+
+    let access = full_access().bits();
+    qp1.borrow_mut().connect(&remote2, ctx.port, 0, 4, 4, access).expect("connect QP1");
+    qp2.borrow_mut().connect(&remote1, ctx.port, 0, 4, 4, access).expect("connect QP2");
+
+    // Allocate and register buffers
+    let mut send_buf = AlignedBuffer::new(4096);
+    let mut recv_buf = AlignedBuffer::new(4096);
+
+    let send_mr = unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }.expect("send_mr");
+    let recv_mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }.expect("recv_mr");
+
+    send_buf.fill(0xAB);
+    recv_buf.fill(0);
+
+    // Post recv to SRQ with QPN
+    let num_ops = 8;
+    for _ in 0..num_ops {
+        srq.post_recv(SrqEntry { qpn: qpn1 }, 0, 0, 0).expect("post_recv");
+    }
+    srq.ring_doorbell();
+
+    // QP2 sends RDMA WRITE+IMM to QP1
+    eprintln!("Posting {} RDMA WRITE IMM operations...", num_ops);
+    for i in 0..num_ops {
+        let offset = (i * 64) as u64;
+        let imm_data = (i + 100) as u32;
+        qp2.borrow_mut()
+            .sq_wqe()
+            .expect("sq_wqe")
+            .write_imm(WqeFlags::empty(), recv_buf.addr() + offset, recv_mr.rkey(), imm_data)
+            .expect("write_imm")
+            .sge(send_buf.addr() + offset, 64, send_mr.lkey())
+            .finish_signaled(i as u64)
+            .expect("finish");
+    }
+    qp2.borrow().ring_sq_doorbell();
+
+    // Poll for completions
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(10);
+
+    while recv_completions.borrow().len() < num_ops {
+        let recv_count = recv_cq.poll();
+        if recv_count > 0 {
+            eprintln!("recv_cq.poll() returned {}", recv_count);
+            recv_cq.flush();
+        }
+
+        // Drain send CQ
+        send_cq.poll();
+        send_cq.flush();
+
+        if start.elapsed() > timeout {
+            panic!(
+                "Timeout: recv={}, expected={}",
+                recv_completions.borrow().len(),
+                num_ops
+            );
+        }
+        std::hint::spin_loop();
+    }
+
+    // Verify completions
+    let comps = recv_completions.borrow();
+    assert_eq!(comps.len(), num_ops, "Should have all recv completions");
+
+    for (imm, entry) in comps.iter() {
+        eprintln!("Recv: imm={}, qpn={}", imm, entry.qpn);
+        assert_eq!(entry.qpn, qpn1, "QPN should match");
+    }
+
+    eprintln!("MonoCq with SRQ test passed!");
 }
