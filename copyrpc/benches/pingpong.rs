@@ -6,7 +6,7 @@
 //!
 //! Run with:
 //! ```bash
-//! taskset -c 0,2,4,6,8 cargo bench --package copyrpc --bench pingpong
+//! cargo bench --package copyrpc --bench pingpong
 //! ```
 
 use std::cell::{Cell, RefCell};
