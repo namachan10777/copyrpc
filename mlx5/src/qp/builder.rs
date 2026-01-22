@@ -8,6 +8,7 @@ use std::io;
 use std::marker::PhantomData;
 
 use crate::types::GrhAttr;
+use crate::pd::{AccessFlags, MemoryWindow, MwBindInfo};
 use crate::wqe::{
     ATOMIC_SEG_SIZE, CTRL_SEG_SIZE, DATA_SEG_SIZE, HasData, MaskedCasParams, OrderedWqeTable,
     MASKED_ATOMIC_SEG32_SIZE, MASKED_ATOMIC_SEG64_SIZE_CAS, MASKED_ATOMIC_SEG64_SIZE_FA,
@@ -22,6 +23,11 @@ use crate::wqe::{
     ADDRESS_VECTOR_SIZE, write_address_vector_roce,
     // Address Vector trait and types
     Av, NoData,
+    // UMR segments
+    UMR_CTRL_SEG_SIZE, MKEY_CONTEXT_SEG_SIZE, UMR_KLM_SEG_PADDED_SIZE,
+    write_umr_ctrl_seg_bind, write_umr_ctrl_seg_invalidate,
+    write_mkey_context_seg_bind, write_mkey_context_seg_invalidate,
+    write_umr_klm_seg_padded, mkey_access_flags,
 };
 
 use super::SendQueueState;
@@ -130,6 +136,24 @@ fn calc_max_wqebb_masked_atomic_128_fa(av_size: usize) -> u16 {
     calc_wqebb_cnt(size)
 }
 
+/// Calculate maximum WQEBB count for UMR (bind_mw) operation.
+///
+/// Layout: ctrl(16) + umr_ctrl(48) + mkey_context(64) + klm_padded(64) = 192 bytes
+#[inline]
+fn calc_max_wqebb_umr() -> u16 {
+    let size = CTRL_SEG_SIZE + UMR_CTRL_SEG_SIZE + MKEY_CONTEXT_SEG_SIZE + UMR_KLM_SEG_PADDED_SIZE;
+    calc_wqebb_cnt(size)
+}
+
+/// Calculate maximum WQEBB count for Local Invalidate operation.
+///
+/// Layout: ctrl(16) + umr_ctrl(48) + mkey_context(64) = 128 bytes
+#[inline]
+fn calc_max_wqebb_local_inval() -> u16 {
+    // Same as UMR
+    calc_max_wqebb_umr()
+}
+
 // =============================================================================
 // WqeCore
 // =============================================================================
@@ -178,11 +202,17 @@ impl<'a, Entry> WqeCore<'a, Entry> {
 
     #[inline]
     pub(super) fn write_ctrl_with_opmod(&mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32, opmod: u8) {
+        // Apply fence from prior UMR operation (bind_mw/local_invalidate)
+        let fence = self.sq.next_fence.get();
+        self.sq.next_fence.set(0);
+
         let flags = if self.signaled {
             flags | WqeFlags::COMPLETION
         } else {
             flags
         };
+        // Combine passed flags with fence bits
+        let flags_with_fence = WqeFlags::from_bits_truncate(flags.bits() | (fence as u16));
         unsafe {
             write_ctrl_seg(
                 self.wqe_ptr,
@@ -191,7 +221,7 @@ impl<'a, Entry> WqeCore<'a, Entry> {
                 self.wqe_idx,
                 self.sq.sqn,
                 0,
-                flags,
+                flags_with_fence,
                 imm,
             );
         }
@@ -347,6 +377,73 @@ impl<'a, Entry> WqeCore<'a, Entry> {
     }
 
     #[inline]
+    pub(super) fn write_umr_ctrl_bind(&mut self, klm_octwords: u16) {
+        unsafe {
+            write_umr_ctrl_seg_bind(self.wqe_ptr.add(self.offset), klm_octwords);
+        }
+        self.offset += UMR_CTRL_SEG_SIZE;
+        self.ds_count += (UMR_CTRL_SEG_SIZE / 16) as u8;
+    }
+
+    #[inline]
+    pub(super) fn write_umr_ctrl_invalidate(&mut self) {
+        unsafe {
+            write_umr_ctrl_seg_invalidate(self.wqe_ptr.add(self.offset));
+        }
+        self.offset += UMR_CTRL_SEG_SIZE;
+        self.ds_count += (UMR_CTRL_SEG_SIZE / 16) as u8;
+    }
+
+    #[inline]
+    pub(super) fn write_mkey_context_bind(
+        &mut self,
+        mw_rkey: u32,
+        pdn: u32,
+        access_flags: u8,
+        start_addr: u64,
+        length: u64,
+        klm_octwords: u32,
+    ) {
+        unsafe {
+            write_mkey_context_seg_bind(
+                self.wqe_ptr.add(self.offset),
+                mw_rkey,
+                self.sq.sqn,
+                pdn,
+                access_flags,
+                start_addr,
+                length,
+                klm_octwords,
+            );
+        }
+        self.offset += MKEY_CONTEXT_SEG_SIZE;
+        self.ds_count += (MKEY_CONTEXT_SEG_SIZE / 16) as u8;
+    }
+
+    #[inline]
+    pub(super) fn write_klm_seg_padded(&mut self, byte_count: u32, lkey: u32, address: u64) {
+        unsafe {
+            write_umr_klm_seg_padded(
+                self.wqe_ptr.add(self.offset),
+                byte_count,
+                lkey,
+                address,
+            );
+        }
+        self.offset += UMR_KLM_SEG_PADDED_SIZE;
+        self.ds_count += (UMR_KLM_SEG_PADDED_SIZE / 16) as u8;
+    }
+
+    #[inline]
+    pub(super) fn write_mkey_context_invalidate(&mut self, mkey: u32) {
+        unsafe {
+            write_mkey_context_seg_invalidate(self.wqe_ptr.add(self.offset), mkey);
+        }
+        self.offset += MKEY_CONTEXT_SEG_SIZE;
+        self.ds_count += (MKEY_CONTEXT_SEG_SIZE / 16) as u8;
+    }
+
+    #[inline]
     pub(super) fn finish_internal(self) -> io::Result<WqeHandle> {
         let wqebb_cnt = calc_wqebb_cnt(self.offset);
         let slots_to_end = self.sq.slots_to_end();
@@ -471,6 +568,29 @@ impl<'a, Entry, A: Av> SqWqeEntryPoint<'a, Entry, A> {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
         }
         self.core.write_ctrl(WqeOpcode::SendImm, flags, imm);
+        self.core.write_av(self.av);
+        Ok(SendWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    /// Start building a SEND with Invalidate WQE.
+    ///
+    /// This operation sends data to the remote side and also requests the remote
+    /// side to invalidate the specified rkey (typically a Memory Window).
+    ///
+    /// # Arguments
+    /// * `flags` - WQE flags
+    /// * `inv_rkey` - The rkey to invalidate at the remote side
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the maximum
+    /// possible WQE size (based on max_inline_data).
+    #[inline]
+    pub fn send_with_invalidate(mut self, flags: WqeFlags, inv_rkey: u32) -> io::Result<SendWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_max_wqebb_send(A::SIZE, self.core.max_inline_data());
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        // inv_rkey is placed in the imm field of the control segment
+        self.core.write_ctrl(WqeOpcode::SendInval, flags, inv_rkey);
         self.core.write_av(self.av);
         Ok(SendWqeBuilder { core: self.core, _data: PhantomData })
     }
@@ -916,6 +1036,199 @@ impl<'a, Entry, A: Av> SqWqeEntryPoint<'a, Entry, A> {
         }
         self.core.write_ctrl(WqeOpcode::Nop, flags, 0);
         Ok(NopWqeBuilder { core: self.core })
+    }
+
+    // -------------------------------------------------------------------------
+    // Memory Window operations
+    // -------------------------------------------------------------------------
+
+    /// Start building a Type 2 MW bind WQE using UMR.
+    ///
+    /// This operation binds a Memory Window to a Memory Region, allowing remote
+    /// access through the MW's rkey.
+    ///
+    /// # Arguments
+    /// * `flags` - WQE flags
+    /// * `mw` - The Memory Window to bind
+    /// * `bind_info` - Binding information (MR, address, length, access)
+    ///
+    /// # Important
+    /// After successful completion, the MW's rkey can be used for remote RDMA
+    /// operations on the bound memory region.
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
+    #[inline]
+    pub fn bind_mw(
+        mut self,
+        flags: WqeFlags,
+        mw: &MemoryWindow,
+        bind_info: MwBindInfo<'_>,
+    ) -> io::Result<BindMwWqeBuilder<'a, Entry>> {
+        let max_wqebb = calc_max_wqebb_umr();
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+
+        // Get current rkey and advance to a new rkey tag for this bind
+        let orig_rkey = unsafe { mw.rkey() };
+        let new_rkey = unsafe { mw.inc_rkey() };
+
+        // Convert AccessFlags to MLX5 mkey access flags
+        let access = convert_access_flags(bind_info.access);
+
+        // KLM octowords in UMR ctrl seg: get_klm_octo(1) = ALIGN(1, 3) / 2 = 4
+        let klm_octwords: u16 = 4;
+
+        // translations_octword_size in mkey context: same as get_klm_octo(1)
+        let translations_octwords: u32 = 4;
+
+        // opmod = 0 for UMR bind
+        let pdn = bind_info.mr.pdn();
+        eprintln!("[DEBUG bind_mw] sqn={}, pdn={}, mw_rkey=0x{:x}, new_rkey=0x{:x}, mr_lkey=0x{:x}, addr=0x{:x}, len={}",
+            self.core.sq.sqn, pdn, orig_rkey, new_rkey, bind_info.mr.lkey(), bind_info.addr, bind_info.length);
+        self.core.write_ctrl_with_opmod(WqeOpcode::Umr, flags, orig_rkey, 0);
+        self.core.write_umr_ctrl_bind(klm_octwords);
+        self.core.write_mkey_context_bind(
+            new_rkey,
+            pdn,
+            access,
+            bind_info.addr,
+            bind_info.length,
+            translations_octwords,
+        );
+        // Write the KLM segment with the underlying MR's information
+        // Padded to 64 bytes for hardware alignment requirements
+        self.core.write_klm_seg_padded(
+            bind_info.length as u32,
+            bind_info.mr.lkey(),
+            bind_info.addr,
+        );
+
+        Ok(BindMwWqeBuilder { core: self.core })
+    }
+
+    /// Start building a Local Invalidate WQE.
+    ///
+    /// This operation invalidates an mkey (Memory Window or Memory Region),
+    /// making it unusable for further RDMA operations.
+    ///
+    /// # Arguments
+    /// * `flags` - WQE flags
+    /// * `mkey` - The mkey to invalidate (MW's rkey or MR's rkey)
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
+    #[inline]
+    pub fn local_invalidate(
+        mut self,
+        flags: WqeFlags,
+        mkey: u32,
+    ) -> io::Result<LocalInvalWqeBuilder<'a, Entry>> {
+        let max_wqebb = calc_max_wqebb_local_inval();
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+
+        // opmod = 0 for local invalidate
+        self.core.write_ctrl_with_opmod(WqeOpcode::Umr, flags, mkey, 0);
+        self.core.write_umr_ctrl_invalidate();
+        self.core.write_mkey_context_invalidate(mkey);
+
+        Ok(LocalInvalWqeBuilder { core: self.core })
+    }
+}
+
+/// Convert AccessFlags to MLX5 mkey access flags.
+#[inline]
+fn convert_access_flags(flags: AccessFlags) -> u8 {
+    let mut result = mkey_access_flags::MLX5_MKEY_LOCAL_READ;
+    if flags.contains(AccessFlags::LOCAL_WRITE) {
+        result |= mkey_access_flags::MLX5_MKEY_LOCAL_WRITE;
+    }
+    if flags.contains(AccessFlags::REMOTE_READ) {
+        result |= mkey_access_flags::MLX5_MKEY_REMOTE_READ;
+    }
+    if flags.contains(AccessFlags::REMOTE_WRITE) {
+        result |= mkey_access_flags::MLX5_MKEY_REMOTE_WRITE;
+    }
+    if flags.contains(AccessFlags::REMOTE_ATOMIC) {
+        result |= mkey_access_flags::MLX5_MKEY_REMOTE_ATOMIC;
+    }
+    result
+}
+
+// =============================================================================
+// Bind MW WQE Builder
+// =============================================================================
+
+/// Bind MW WQE builder.
+///
+/// This builder is complete and ready to finish.
+#[must_use = "WQE builder must be finished"]
+pub struct BindMwWqeBuilder<'a, Entry> {
+    core: WqeCore<'a, Entry>,
+}
+
+impl<'a, Entry> BindMwWqeBuilder<'a, Entry> {
+    /// Finish the WQE construction (unsignaled).
+    #[inline]
+    pub fn finish_unsignaled(self) -> io::Result<WqeHandle> {
+        // Save reference before finish_internal consumes self.core
+        let sq = self.core.sq;
+        let result = self.core.finish_internal();
+        // Set fence for next WQE (required after UMR operations)
+        sq.next_fence.set(WqeFlags::INITIATOR_SMALL_FENCE.bits() as u8);
+        result
+    }
+
+    /// Finish the WQE construction with completion signaling.
+    #[inline]
+    pub fn finish_signaled(mut self, entry: Entry) -> io::Result<WqeHandle> {
+        self.core.entry = Some(entry);
+        self.core.signaled = true;
+        // Save reference before finish_internal consumes self.core
+        let sq = self.core.sq;
+        let result = self.core.finish_internal();
+        // Set fence for next WQE (required after UMR operations)
+        sq.next_fence.set(WqeFlags::INITIATOR_SMALL_FENCE.bits() as u8);
+        result
+    }
+}
+
+// =============================================================================
+// Local Invalidate WQE Builder
+// =============================================================================
+
+/// Local Invalidate WQE builder.
+///
+/// This builder is complete and ready to finish.
+#[must_use = "WQE builder must be finished"]
+pub struct LocalInvalWqeBuilder<'a, Entry> {
+    core: WqeCore<'a, Entry>,
+}
+
+impl<'a, Entry> LocalInvalWqeBuilder<'a, Entry> {
+    /// Finish the WQE construction (unsignaled).
+    #[inline]
+    pub fn finish_unsignaled(self) -> io::Result<WqeHandle> {
+        // Save reference before finish_internal consumes self.core
+        let sq = self.core.sq;
+        let result = self.core.finish_internal();
+        // Set fence for next WQE (required after UMR operations)
+        sq.next_fence.set(WqeFlags::INITIATOR_SMALL_FENCE.bits() as u8);
+        result
+    }
+
+    /// Finish the WQE construction with completion signaling.
+    #[inline]
+    pub fn finish_signaled(mut self, entry: Entry) -> io::Result<WqeHandle> {
+        self.core.entry = Some(entry);
+        self.core.signaled = true;
+        // Save reference before finish_internal consumes self.core
+        let sq = self.core.sq;
+        let result = self.core.finish_internal();
+        // Set fence for next WQE (required after UMR operations)
+        sq.next_fence.set(WqeFlags::INITIATOR_SMALL_FENCE.bits() as u8);
+        result
     }
 }
 
@@ -1464,7 +1777,13 @@ impl<'b, 'a, Entry> BlueflameWqeCore<'b, 'a, Entry> {
 
     #[inline]
     fn write_ctrl(&mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) {
+        // Apply fence from prior UMR operation (bind_mw/local_invalidate)
+        let fence = self.batch.sq.next_fence.get();
+        self.batch.sq.next_fence.set(0);
+
         let wqe_idx = self.batch.sq.pi.get();
+        // Combine passed flags with fence bits
+        let flags_with_fence = WqeFlags::from_bits_truncate(flags.bits() | (fence as u16));
         unsafe {
             write_ctrl_seg(
                 self.batch.buffer.as_mut_ptr().add(self.offset),
@@ -1473,7 +1792,7 @@ impl<'b, 'a, Entry> BlueflameWqeCore<'b, 'a, Entry> {
                 wqe_idx,
                 self.batch.sq.sqn,
                 0,
-                flags,
+                flags_with_fence,
                 imm,
             );
         }
@@ -1777,7 +2096,13 @@ impl<'b, 'a, Entry> RoceBlueflameWqeCore<'b, 'a, Entry> {
 
     #[inline]
     fn write_ctrl(&mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) {
+        // Apply fence from prior UMR operation (bind_mw/local_invalidate)
+        let fence = self.batch.sq.next_fence.get();
+        self.batch.sq.next_fence.set(0);
+
         let wqe_idx = self.batch.sq.pi.get();
+        // Combine passed flags with fence bits
+        let flags_with_fence = WqeFlags::from_bits_truncate(flags.bits() | (fence as u16));
         unsafe {
             write_ctrl_seg(
                 self.batch.buffer.as_mut_ptr().add(self.offset),
@@ -1786,7 +2111,7 @@ impl<'b, 'a, Entry> RoceBlueflameWqeCore<'b, 'a, Entry> {
                 wqe_idx,
                 self.batch.sq.sqn,
                 0,
-                flags,
+                flags_with_fence,
                 imm,
             );
         }
