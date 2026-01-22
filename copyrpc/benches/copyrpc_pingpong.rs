@@ -43,8 +43,8 @@ const SERVER_CORE: usize = 1;
 // Constants
 // =============================================================================
 
-const NUM_ENDPOINTS: usize = 1;
-const REQUESTS_PER_EP: usize = 1;
+const NUM_ENDPOINTS: usize = 8;
+const REQUESTS_PER_EP: usize = 128;
 const MESSAGE_SIZE: usize = 32;
 const RING_SIZE: usize = 1 << 20; // 1 MB
 
