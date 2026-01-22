@@ -161,7 +161,7 @@ fn test_scatter_to_cqe_diagnostic() {
 
         // Wait for send completion
         let send_cqe =
-            poll_cq_timeout(&send_cq, 5000).expect(&format!("Send CQE timeout for size {}", size));
+            poll_cq_timeout(&send_cq, 5000).unwrap_or_else(|| panic!("Send CQE timeout for size {}", size));
         assert_eq!(
             send_cqe.syndrome, 0,
             "Send CQE error for size {}: syndrome={}",
@@ -172,7 +172,7 @@ fn test_scatter_to_cqe_diagnostic() {
         // Wait for recv completion
         last_recv_cqe.set(None);
         let _ = poll_cq_timeout(&recv_cq2, 5000)
-            .expect(&format!("Recv CQE timeout for size {}", size));
+            .unwrap_or_else(|| panic!("Recv CQE timeout for size {}", size));
         recv_cq2.flush();
 
         // Get the actual CQE from callback
@@ -497,10 +497,8 @@ fn test_small_inline_wraparound() {
             qp1.borrow().ring_sq_doorbell();
 
             // Wait for completions
-            let send_cqe = poll_cq_timeout(&send_cq, 5000).expect(&format!(
-                "Send CQE timeout at size={}, iter={}",
-                size, i
-            ));
+            let send_cqe = poll_cq_timeout(&send_cq, 5000).unwrap_or_else(|| panic!("Send CQE timeout at size={}, iter={}",
+                size, i));
             assert_eq!(
                 send_cqe.syndrome, 0,
                 "Send error at size={}, iter={}: syndrome={}",
@@ -508,10 +506,8 @@ fn test_small_inline_wraparound() {
             );
             send_cq.flush();
 
-            let recv_cqe = poll_cq_timeout(&recv_cq2, 5000).expect(&format!(
-                "Recv CQE timeout at size={}, iter={}",
-                size, i
-            ));
+            let recv_cqe = poll_cq_timeout(&recv_cq2, 5000).unwrap_or_else(|| panic!("Recv CQE timeout at size={}, iter={}",
+                size, i));
             assert_eq!(
                 recv_cqe.syndrome, 0,
                 "Recv error at size={}, iter={}: syndrome={}",

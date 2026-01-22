@@ -194,7 +194,7 @@ fn test_rc_rdma_write() {
     println!("WQE posted via BlueFlame");
 
     // Poll CQ
-    let cqe = poll_cq_timeout(&cq, 5000).expect("CQE timeout");
+    let cqe = poll_cq_timeout(cq, 5000).expect("CQE timeout");
     println!(
         "CQE: opcode={:?}, syndrome={}, qpn=0x{:x}, wqe_counter={}",
         cqe.opcode, cqe.syndrome, cqe.qp_num, cqe.wqe_counter
@@ -260,7 +260,7 @@ fn test_rc_rdma_read() {
     qp1.borrow().ring_sq_doorbell();
 
     // Poll CQ
-    let cqe = poll_cq_timeout(&cq, 5000).expect("CQE timeout");
+    let cqe = poll_cq_timeout(cq, 5000).expect("CQE timeout");
     assert_eq!(cqe.syndrome, 0, "CQE error: syndrome={}", cqe.syndrome);
     cq.flush();
 
@@ -325,7 +325,7 @@ fn test_rc_atomic_cas_success() {
     qp1.borrow().ring_sq_doorbell();
 
     // Poll CQ
-    let cqe = poll_cq_timeout(&cq, 5000).expect("CQE timeout");
+    let cqe = poll_cq_timeout(cq, 5000).expect("CQE timeout");
     assert_eq!(cqe.syndrome, 0, "CQE error: syndrome={}", cqe.syndrome);
     cq.flush();
 
@@ -402,7 +402,7 @@ fn test_rc_atomic_cas_failure() {
     qp1.borrow().ring_sq_doorbell();
 
     // Poll CQ
-    let cqe = poll_cq_timeout(&cq, 5000).expect("CQE timeout");
+    let cqe = poll_cq_timeout(cq, 5000).expect("CQE timeout");
     assert_eq!(cqe.syndrome, 0, "CQE error: syndrome={}", cqe.syndrome);
     cq.flush();
 
@@ -476,7 +476,7 @@ fn test_rc_atomic_fa() {
     qp1.borrow().ring_sq_doorbell();
 
     // Poll CQ
-    let cqe = poll_cq_timeout(&cq, 5000).expect("CQE timeout");
+    let cqe = poll_cq_timeout(cq, 5000).expect("CQE timeout");
     assert_eq!(cqe.syndrome, 0, "CQE error: syndrome={}", cqe.syndrome);
     cq.flush();
 
@@ -529,7 +529,7 @@ fn test_rc_rdma_write_imm() {
 
     // Allocate buffers
     let mut local_buf = AlignedBuffer::new(4096);
-    let mut remote_buf = AlignedBuffer::new(4096);
+    let remote_buf = AlignedBuffer::new(4096);
 
     // Register memory regions
     let local_mr = unsafe {
@@ -561,7 +561,7 @@ fn test_rc_rdma_write_imm() {
     qp2.borrow().ring_rq_doorbell();
 
     // Create a separate recv CQ for QP2
-    let mut recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
+    let _recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
 
     // Note: The recv_cq is internal to RcLoopbackPair, we need to check the pair's recv_cq
     // Actually in our setup, qp2's recv CQ is _recv_cq2 which is private
@@ -582,7 +582,7 @@ fn test_rc_rdma_write_imm() {
     qp1.borrow().ring_sq_doorbell();
 
     // Poll send CQ for completion
-    let cqe = poll_cq_timeout(&send_cq, 5000).expect("Send CQE timeout");
+    let cqe = poll_cq_timeout(send_cq, 5000).expect("Send CQE timeout");
     println!(
         "Send CQE: opcode={:?}, syndrome={}, wqe_counter={}",
         cqe.opcode, cqe.syndrome, cqe.wqe_counter
@@ -621,12 +621,12 @@ fn test_rc_send_recv() {
     };
 
     // Create QPs with separate recv CQs that we can access
-    let mut send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
+    let send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let mut recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
+    let recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let mut recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
+    let recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     // Shared state to capture recv CQE info
@@ -639,8 +639,6 @@ fn test_rc_send_recv() {
     let recv_syndrome_clone = recv_cqe_syndrome.clone();
 
     let config = mlx5::qp::RcQpConfig::default();
-
-    fn noop_callback(_cqe: mlx5::cq::Cqe, _entry: u64) {}
 
     // Callback to capture recv CQE info
     let recv_callback = move |cqe: mlx5::cq::Cqe, _entry: u64| {
@@ -804,12 +802,12 @@ fn test_rc_send_recv_pingpong() {
     let recv2_opcode_clone = recv2_opcode.clone();
 
     // Create QPs with separate recv CQs
-    let mut send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
+    let send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let mut recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
+    let recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let mut recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
+    let recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     let config = mlx5::qp::RcQpConfig {

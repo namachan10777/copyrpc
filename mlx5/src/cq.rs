@@ -159,7 +159,7 @@ impl MiniCqe {
     /// The pointer must point to valid 8-byte mini CQE data.
     ///
     /// Requester mini CQE layout (8 bytes):
-    /// - offset 0-3: s_wqe_info (4B, contains wqe_counter in [31:16])
+    /// - offset 0-3: s_wqe_info (4B, contains wqe_counter in \[31:16\])
     /// - offset 4-7: byte_cnt (4B, big-endian)
     #[inline]
     pub unsafe fn from_ptr_requester(ptr: *const u8) -> Self {
@@ -201,10 +201,10 @@ impl CompressedCqeHeader {
     ///
     /// Compressed CQE layout:
     /// - offset 0-55: mini CQE array (up to 7 mini CQEs, 8 bytes each)
-    /// - offset 56: sop_drop_qpn (4B) - QP number in [23:0]
+    /// - offset 56: sop_drop_qpn (4B) - QP number in \[23:0\]
     /// - offset 60: wqe_counter (2B) - base counter for responder format
-    /// - offset 62: mini_cqe_cnt (1B) - [7:6]=format, [5:2]=count-1, [1:0]=reserved
-    /// - offset 63: op_own (1B) - opcode[7:4]=0x0f (compression marker), owner[0]
+    /// - offset 62: mini_cqe_cnt (1B) - \[7:6\]=format, \[5:2\]=count-1, \[1:0\]=reserved
+    /// - offset 63: op_own (1B) - opcode\[7:4\]=0x0f (compression marker), owner\[0\]
     #[inline]
     pub unsafe fn from_ptr(ptr: *const u8, title_opcode: CqeOpcode) -> Self {
         let qp_num = u32::from_be(std::ptr::read_volatile(ptr.add(56) as *const u32)) & 0x00FF_FFFF;

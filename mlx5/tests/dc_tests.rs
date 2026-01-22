@@ -21,7 +21,7 @@ use std::rc::Rc;
 use mlx5::cq::CqConfig;
 use mlx5::dc::{DciConfig, DctConfig};
 use mlx5::srq::SrqConfig;
-use mlx5::wqe::{WqeFlags, WqeOpcode};
+use mlx5::wqe::WqeFlags;
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
@@ -108,7 +108,7 @@ fn test_dc_rdma_write() {
     require_dct!(&ctx);
 
     // Create CQ for DCI
-    let mut dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
+    let dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
     let dci_cq = Rc::new(dci_cq);
 
     // Create CQ for DCT
@@ -214,7 +214,7 @@ fn test_dc_rdma_read() {
     require_dct!(&ctx);
 
     // Create CQ for DCI
-    let mut dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
+    let dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
     let dci_cq = Rc::new(dci_cq);
 
     // Create CQ for DCT
@@ -320,7 +320,7 @@ fn test_dc_multiple_dci() {
     require_dct!(&ctx);
 
     // Create shared CQ for all DCIs
-    let mut dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
+    let dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
     let dci_cq = Rc::new(dci_cq);
 
     // Create CQ for DCT
@@ -347,10 +347,10 @@ fn test_dc_multiple_dci() {
             .dci_builder::<u64>(&ctx.pd, &dci_config)
             .sq_cq(dci_cq.clone(), |_cqe, _entry| {})
             .build()
-            .expect(&format!("Failed to create DCI {}", i));
+            .unwrap_or_else(|_| panic!("Failed to create DCI {}", i));
         dci.borrow_mut()
             .activate(ctx.port, 0, 4)
-            .expect(&format!("Failed to activate DCI {}", i));
+            .unwrap_or_else(|_| panic!("Failed to activate DCI {}", i));
         dcis.push(dci);
     }
 
@@ -372,7 +372,7 @@ fn test_dc_multiple_dci() {
 
     // Allocate buffers - one local per DCI, one shared remote
     let mut local_bufs: Vec<_> = (0..num_dcis).map(|_| AlignedBuffer::new(4096)).collect();
-    let mut remote_buf = AlignedBuffer::new(4096);
+    let remote_buf = AlignedBuffer::new(4096);
 
     // Register memory regions
     let local_mrs: Vec<_> = local_bufs
@@ -406,7 +406,7 @@ fn test_dc_multiple_dci() {
         dci.borrow().ring_sq_doorbell();
 
         // Poll for this DCI's completion
-        let cqe = poll_cq_timeout(&dci_cq, 5000).expect(&format!("CQE timeout for DCI {}", i));
+        let cqe = poll_cq_timeout(&dci_cq, 5000).unwrap_or_else(|| panic!("CQE timeout for DCI {}", i));
         assert_eq!(
             cqe.syndrome, 0,
             "CQE error for DCI {}: syndrome={}",
@@ -445,7 +445,7 @@ fn test_dc_inline_data() {
 
     require_dct!(&ctx);
 
-    let mut dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
+    let dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
     let dci_cq = Rc::new(dci_cq);
 
     let dct_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCT CQ");

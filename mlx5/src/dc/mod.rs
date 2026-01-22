@@ -10,6 +10,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::{io, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
+use crate::BuildResult;
 use crate::CompletionTarget;
 use crate::builder_common::register_with_send_cq;
 use crate::cq::{Cq, Cqe};
@@ -20,7 +21,7 @@ use crate::qp::QpInfo;
 use crate::srq::Srq;
 use crate::transport::IbRemoteDctInfo;
 use crate::wqe::{
-    CTRL_SEG_SIZE, InfiniBand, OrderedWqeTable, RoCE, WQEBB_SIZE, WqeFlags, WqeOpcode,
+    CtrlSegParams, InfiniBand, OrderedWqeTable, RoCE, WQEBB_SIZE, WqeFlags, WqeOpcode,
     write_ctrl_seg,
 };
 
@@ -134,13 +135,15 @@ impl<Entry, TableType> DciSendQueueState<Entry, TableType> {
         let ds_count = (nop_wqebb_cnt as u8) * 4;
         write_ctrl_seg(
             wqe_ptr,
-            0, // opmod = 0 for NOP
-            WqeOpcode::Nop as u8,
-            wqe_idx,
-            self.sqn,
-            ds_count,
-            WqeFlags::empty(),
-            0,
+            &CtrlSegParams {
+                opmod: 0,
+                opcode: WqeOpcode::Nop as u8,
+                wqe_idx,
+                qpn: self.sqn,
+                ds_cnt: ds_count,
+                flags: WqeFlags::empty(),
+                imm: 0,
+            },
         );
 
         self.advance_pi(nop_wqebb_cnt);
@@ -333,7 +336,7 @@ where
     OnComplete: Fn(Cqe, Entry) + 'static,
 {
     /// Build the DCI with normal CQ.
-    pub fn build(self) -> io::Result<Rc<RefCell<DciWithTable<Entry, OnComplete>>>> {
+    pub fn build(self) -> BuildResult<DciWithTable<Entry, OnComplete>> {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_DRIVER;
@@ -371,7 +374,7 @@ where
                 max_inline_data: self.config.max_inline_data,
                 sq: None,
                 callback: self.callback,
-                send_cq: self.send_cq_weak.clone().unwrap_or_else(|| Weak::new()),
+                send_cq: self.send_cq_weak.clone().unwrap_or_default(),
                 _pd: self.pd.clone(),
                 _transport: PhantomData,
             };
@@ -397,7 +400,7 @@ where
     Entry: 'static,
 {
     /// Build the DCI for MonoCq.
-    pub fn build(self) -> io::Result<Rc<RefCell<DciForMonoCq<Entry>>>> {
+    pub fn build(self) -> BuildResult<DciForMonoCq<Entry>> {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_DRIVER;

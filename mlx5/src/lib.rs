@@ -108,3 +108,8 @@ pub trait CompletionTarget {
     /// Called by Cq::poll() when a CQE for this queue is received.
     fn dispatch_cqe(&self, cqe: cq::Cqe);
 }
+
+/// Result type for QP/DCI builder's build() method.
+///
+/// Wraps the built queue in `Rc<RefCell<T>>` for shared ownership with interior mutability.
+pub type BuildResult<T> = std::io::Result<std::rc::Rc<std::cell::RefCell<T>>>;

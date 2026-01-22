@@ -80,57 +80,52 @@ macro_rules! udma_to_device_barrier {
 /// Equivalent to rdma-core's `mlx5_bf_copy()`.
 ///
 /// # Safety
+/// Must be called within an unsafe block. Caller must ensure:
 /// - `dst` must be a 64-byte aligned pointer to MMIO region
 /// - `src` must be a pointer to at least 64 bytes of readable memory
 #[cfg(target_arch = "x86_64")]
 macro_rules! mlx5_bf_copy {
-    ($dst:expr, $src:expr) => {
-        unsafe {
-            use std::arch::x86_64::{__m512i, _mm512_loadu_si512, _mm512_stream_si512};
-            let src = $src as *const __m512i;
-            let dst = $dst as *mut __m512i;
-            let data = _mm512_loadu_si512(src);
-            _mm512_stream_si512(dst, data);
-        }
-    };
+    ($dst:expr, $src:expr) => {{
+        use std::arch::x86_64::{__m512i, _mm512_loadu_si512, _mm512_stream_si512};
+        let src = $src as *const __m512i;
+        let dst = $dst as *mut __m512i;
+        let data = _mm512_loadu_si512(src);
+        _mm512_stream_si512(dst, data);
+    }};
 }
 
 #[cfg(target_arch = "aarch64")]
 macro_rules! mlx5_bf_copy {
-    ($dst:expr, $src:expr) => {
-        unsafe {
-            use std::arch::aarch64::*;
-            let src = $src as *const u8;
-            let dst = $dst as *mut u8;
-            let v0: uint8x16_t = vld1q_u8(src.add(0));
-            let v1: uint8x16_t = vld1q_u8(src.add(16));
-            let v2: uint8x16_t = vld1q_u8(src.add(32));
-            let v3: uint8x16_t = vld1q_u8(src.add(48));
-            std::arch::asm!(
-                "stnp {v0:q}, {v1:q}, [{dst}]",
-                "stnp {v2:q}, {v3:q}, [{dst}, #32]",
-                dst = in(reg) dst,
-                v0 = in(vreg) v0,
-                v1 = in(vreg) v1,
-                v2 = in(vreg) v2,
-                v3 = in(vreg) v3,
-                options(nostack, preserves_flags),
-            );
-        }
-    };
+    ($dst:expr, $src:expr) => {{
+        use std::arch::aarch64::*;
+        let src = $src as *const u8;
+        let dst = $dst as *mut u8;
+        let v0: uint8x16_t = vld1q_u8(src.add(0));
+        let v1: uint8x16_t = vld1q_u8(src.add(16));
+        let v2: uint8x16_t = vld1q_u8(src.add(32));
+        let v3: uint8x16_t = vld1q_u8(src.add(48));
+        std::arch::asm!(
+            "stnp {v0:q}, {v1:q}, [{dst}]",
+            "stnp {v2:q}, {v3:q}, [{dst}, #32]",
+            dst = in(reg) dst,
+            v0 = in(vreg) v0,
+            v1 = in(vreg) v1,
+            v2 = in(vreg) v2,
+            v3 = in(vreg) v3,
+            options(nostack, preserves_flags),
+        );
+    }};
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 macro_rules! mlx5_bf_copy {
-    ($dst:expr, $src:expr) => {
-        unsafe {
-            let src = $src as *const u64;
-            let dst = $dst as *mut u64;
-            for i in 0..8 {
-                std::ptr::write_volatile(dst.add(i), *src.add(i));
-            }
+    ($dst:expr, $src:expr) => {{
+        let src = $src as *const u64;
+        let dst = $dst as *mut u64;
+        for i in 0..8 {
+            std::ptr::write_volatile(dst.add(i), *src.add(i));
         }
-    };
+    }};
 }
 
 /// Prefetch memory for reading.

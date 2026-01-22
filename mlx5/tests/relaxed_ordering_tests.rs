@@ -613,7 +613,7 @@ fn test_relaxed_ordering_basic() {
 
     let relaxed_access = full_access() | AccessFlags::RELAXED_ORDERING;
 
-    let mut remote_buf = AlignedBuffer::new(4096);
+    let remote_buf = AlignedBuffer::new(4096);
     let mut local_buf = AlignedBuffer::new(4096);
 
     let remote_mr = unsafe {

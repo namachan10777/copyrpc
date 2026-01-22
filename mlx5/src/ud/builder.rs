@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 
 use crate::pd::AddressHandle;
 use crate::wqe::{
-    CTRL_SEG_SIZE, DATA_SEG_SIZE, HasData, NoData, OrderedWqeTable,
+    CTRL_SEG_SIZE, CtrlSegParams, DATA_SEG_SIZE, HasData, NoData, OrderedWqeTable,
     SubmissionError, WqeFlags, WQEBB_SIZE, WqeHandle, WqeOpcode, calc_wqebb_cnt,
     set_ctrl_seg_completion_flag, update_ctrl_seg_ds_cnt, update_ctrl_seg_wqe_idx,
     write_ctrl_seg, write_data_seg, write_inline_header,
@@ -75,13 +75,15 @@ impl<'a, Entry> UdWqeCore<'a, Entry> {
         unsafe {
             write_ctrl_seg(
                 self.wqe_ptr,
-                0,
-                opcode as u8,
-                self.wqe_idx,
-                self.sq.sqn,
-                0,
-                flags,
-                imm,
+                &CtrlSegParams {
+                    opmod: 0,
+                    opcode: opcode as u8,
+                    wqe_idx: self.wqe_idx,
+                    qpn: self.sq.sqn,
+                    ds_cnt: 0,
+                    flags,
+                    imm,
+                },
             );
         }
         self.offset = CTRL_SEG_SIZE;
@@ -414,11 +416,10 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIb<SqEntry, RqEntry, OnSq
     /// Call this after posting one or more WQEs to notify the HCA.
     #[inline]
     pub fn ring_sq_doorbell(&self) {
-        if let Some(sq) = self.sq.as_ref() {
-            if let Some((wqe_ptr, _)) = sq.last_wqe.get() {
+        if let Some(sq) = self.sq.as_ref()
+            && let Some((wqe_ptr, _)) = sq.last_wqe.get() {
                 sq.ring_db(wqe_ptr);
             }
-        }
     }
 
     /// Get a BlueFlame batch builder for low-latency WQE submission.
@@ -725,13 +726,15 @@ impl<'b, 'a, Entry> UdBlueflameWqeCore<'b, 'a, Entry> {
         unsafe {
             write_ctrl_seg(
                 self.batch.buffer.as_mut_ptr().add(self.offset),
-                0,
-                opcode as u8,
-                wqe_idx,
-                self.batch.sq.sqn,
-                0,
-                flags,
-                imm,
+                &CtrlSegParams {
+                    opmod: 0,
+                    opcode: opcode as u8,
+                    wqe_idx,
+                    qpn: self.batch.sq.sqn,
+                    ds_cnt: 0,
+                    flags,
+                    imm,
+                },
             );
         }
         self.offset += CTRL_SEG_SIZE;

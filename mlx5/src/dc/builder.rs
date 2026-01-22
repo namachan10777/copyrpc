@@ -5,12 +5,12 @@ use std::marker::PhantomData;
 
 use crate::types::GrhAttr;
 use crate::wqe::{
-    ADDRESS_VECTOR_SIZE, ATOMIC_SEG_SIZE, CTRL_SEG_SIZE, DATA_SEG_SIZE, HasData, NoData,
-    OrderedWqeTable, RDMA_SEG_SIZE, SubmissionError, WqeFlags, WQEBB_SIZE,
-    WqeHandle, WqeOpcode, calc_wqebb_cnt,
-    set_ctrl_seg_completion_flag, update_ctrl_seg_ds_cnt, update_ctrl_seg_wqe_idx,
-    write_address_vector_ib, write_address_vector_roce, write_atomic_seg_cas, write_atomic_seg_fa,
-    write_ctrl_seg, write_data_seg, write_inline_header, write_rdma_seg,
+    ADDRESS_VECTOR_SIZE, ATOMIC_SEG_SIZE, CTRL_SEG_SIZE, CtrlSegParams, DATA_SEG_SIZE, HasData,
+    NoData, OrderedWqeTable, RDMA_SEG_SIZE, SubmissionError, WqeFlags, WQEBB_SIZE, WqeHandle,
+    WqeOpcode, calc_wqebb_cnt, set_ctrl_seg_completion_flag, update_ctrl_seg_ds_cnt,
+    update_ctrl_seg_wqe_idx, write_address_vector_ib, write_address_vector_roce,
+    write_atomic_seg_cas, write_atomic_seg_fa, write_ctrl_seg, write_data_seg,
+    write_inline_header, write_rdma_seg,
 };
 
 use super::{DciIb, DciRoCE, DciSendQueueState};
@@ -165,13 +165,15 @@ impl<'a, Entry> DciWqeCore<'a, Entry> {
         unsafe {
             write_ctrl_seg(
                 self.wqe_ptr,
-                0,
-                opcode as u8,
-                self.wqe_idx,
-                self.sq.sqn,
-                0,
-                flags,
-                imm,
+                &CtrlSegParams {
+                    opmod: 0,
+                    opcode: opcode as u8,
+                    wqe_idx: self.wqe_idx,
+                    qpn: self.sq.sqn,
+                    ds_cnt: 0,
+                    flags,
+                    imm,
+                },
             );
         }
         self.offset = CTRL_SEG_SIZE;
@@ -1099,13 +1101,15 @@ impl<'b, 'a, Entry> DciBlueflameWqeCore<'b, 'a, Entry> {
         unsafe {
             write_ctrl_seg(
                 self.batch.buffer.as_mut_ptr().add(self.offset),
-                0,
-                opcode as u8,
-                wqe_idx,
-                self.batch.sq.sqn,
-                0,
-                flags,
-                imm,
+                &CtrlSegParams {
+                    opmod: 0,
+                    opcode: opcode as u8,
+                    wqe_idx,
+                    qpn: self.batch.sq.sqn,
+                    ds_cnt: 0,
+                    flags,
+                    imm,
+                },
             );
         }
         self.offset += CTRL_SEG_SIZE;
@@ -1444,13 +1448,15 @@ impl<'b, 'a, Entry> DciRoceBlueflameWqeCore<'b, 'a, Entry> {
         unsafe {
             write_ctrl_seg(
                 self.batch.buffer.as_mut_ptr().add(self.offset),
-                0,
-                opcode as u8,
-                wqe_idx,
-                self.batch.sq.sqn,
-                0,
-                flags,
-                imm,
+                &CtrlSegParams {
+                    opmod: 0,
+                    opcode: opcode as u8,
+                    wqe_idx,
+                    qpn: self.batch.sq.sqn,
+                    ds_cnt: 0,
+                    flags,
+                    imm,
+                },
             );
         }
         self.offset += CTRL_SEG_SIZE;

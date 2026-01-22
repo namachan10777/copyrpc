@@ -10,6 +10,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::{io, mem::MaybeUninit, ptr::NonNull};
 
+use crate::BuildResult;
 use crate::CompletionTarget;
 use crate::builder_common::{register_with_cqs, register_with_send_cq};
 use crate::cq::{Cq, Cqe};
@@ -19,7 +20,7 @@ use crate::srq::Srq;
 use crate::transport::{IbRemoteQpInfo, RoCERemoteQpInfo};
 use crate::types::GrhAttr;
 use crate::wqe::{
-    CTRL_SEG_SIZE, DATA_SEG_SIZE, OrderedWqeTable, SubmissionError, WQEBB_SIZE, WqeFlags, WqeOpcode,
+    CtrlSegParams, DATA_SEG_SIZE, OrderedWqeTable, SubmissionError, WQEBB_SIZE, WqeFlags, WqeOpcode,
     write_ctrl_seg, write_data_seg,
     // Transport type tags
     InfiniBand, RoCE,
@@ -189,13 +190,15 @@ impl<Entry, TableType> SendQueueState<Entry, TableType> {
         let ds_count = (nop_wqebb_cnt as u8) * 4;
         write_ctrl_seg(
             wqe_ptr,
-            0, // opmod = 0 for NOP
-            WqeOpcode::Nop as u8,
-            wqe_idx,
-            self.sqn,
-            ds_count,
-            WqeFlags::empty(),
-            0,
+            &CtrlSegParams {
+                opmod: 0,
+                opcode: WqeOpcode::Nop as u8,
+                wqe_idx,
+                qpn: self.sqn,
+                ds_cnt: ds_count,
+                flags: WqeFlags::empty(),
+                imm: 0,
+            },
         );
 
         self.advance_pi(nop_wqebb_cnt);
@@ -1358,7 +1361,7 @@ pub struct CqSet;
 /// - Monomorphization enables complete inlining
 /// - Use for high-throughput, low-latency scenarios
 ///
-/// Both are wrapped in Rc<T> and configured via builder methods.
+/// Both are wrapped in `Rc<T>` and configured via builder methods.
 ///
 /// # Type Parameters
 ///
@@ -1635,7 +1638,7 @@ where
     /// Build the RC QP.
     ///
     /// Only available when both SQ and RQ CQs are configured.
-    pub fn build(self) -> io::Result<Rc<RefCell<RcQpIb<SqEntry, RqEntry, OnSq, OnRq>>>> {
+    pub fn build(self) -> BuildResult<RcQpIb<SqEntry, RqEntry, OnSq, OnRq>> {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
@@ -1673,8 +1676,8 @@ where
                 rq: OwnedRq::new(None),
                 sq_callback: self.sq_callback,
                 rq_callback: self.rq_callback,
-                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
-                recv_cq: self.recv_cq_weak.unwrap_or_else(Weak::new),
+                send_cq: self.send_cq_weak.unwrap_or_default(),
+                recv_cq: self.recv_cq_weak.unwrap_or_default(),
                 _pd: self.pd.clone(),
                 _marker: std::marker::PhantomData,
             };
@@ -1707,7 +1710,7 @@ where
     /// Build the RC QP with SRQ.
     ///
     /// Only available when both SQ and RQ CQs are configured.
-    pub fn build(self) -> io::Result<Rc<RefCell<RcQpIbWithSrq<SqEntry, RqEntry, OnSq, OnRq>>>> {
+    pub fn build(self) -> BuildResult<RcQpIbWithSrq<SqEntry, RqEntry, OnSq, OnRq>> {
         let srq = self.srq.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "SRQ not set")
         })?;
@@ -1753,8 +1756,8 @@ where
                 rq: SharedRq::new(srq_inner),
                 sq_callback: self.sq_callback,
                 rq_callback: self.rq_callback,
-                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
-                recv_cq: self.recv_cq_weak.unwrap_or_else(Weak::new),
+                send_cq: self.send_cq_weak.unwrap_or_default(),
+                recv_cq: self.recv_cq_weak.unwrap_or_default(),
                 _pd: self.pd.clone(),
                 _marker: std::marker::PhantomData,
             };
@@ -1786,7 +1789,7 @@ where
     ///
     /// This variant is for when RQ uses MonoCq (callback on CQ side, not QP).
     /// Only available when SQ uses normal CQ with callback and RQ uses MonoCq.
-    pub fn build(self) -> io::Result<Rc<RefCell<RcQpForMonoCqWithSrq<Entry>>>> {
+    pub fn build(self) -> BuildResult<RcQpForMonoCqWithSrq<Entry>> {
         let srq = self.srq.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "SRQ not set")
         })?;
@@ -1831,7 +1834,7 @@ where
                 rq: SharedRq::new(srq_inner),
                 sq_callback: (),
                 rq_callback: (),
-                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
+                send_cq: self.send_cq_weak.unwrap_or_default(),
                 recv_cq: Weak::new(), // MonoCq doesn't need CQ registration
                 _pd: self.pd.clone(),
                 _marker: std::marker::PhantomData,
@@ -1868,7 +1871,7 @@ where
     /// Only available when both SQ and RQ CQs are configured.
     ///
     /// # NOTE: RoCE support is untested (IB-only hardware environment)
-    pub fn build(self) -> io::Result<Rc<RefCell<RcQpRoCE<SqEntry, RqEntry, OnSq, OnRq>>>> {
+    pub fn build(self) -> BuildResult<RcQpRoCE<SqEntry, RqEntry, OnSq, OnRq>> {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
@@ -1906,8 +1909,8 @@ where
                 rq: OwnedRq::new(None),
                 sq_callback: self.sq_callback,
                 rq_callback: self.rq_callback,
-                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
-                recv_cq: self.recv_cq_weak.unwrap_or_else(Weak::new),
+                send_cq: self.send_cq_weak.unwrap_or_default(),
+                recv_cq: self.recv_cq_weak.unwrap_or_default(),
                 _pd: self.pd.clone(),
                 _marker: std::marker::PhantomData,
             };
@@ -1943,7 +1946,7 @@ where
     /// Only available when both SQ and RQ CQs are configured.
     ///
     /// # NOTE: RoCE support is untested (IB-only hardware environment)
-    pub fn build(self) -> io::Result<Rc<RefCell<RcQpRoCEWithSrq<SqEntry, RqEntry, OnSq, OnRq>>>> {
+    pub fn build(self) -> BuildResult<RcQpRoCEWithSrq<SqEntry, RqEntry, OnSq, OnRq>> {
         let srq = self.srq.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "SRQ not set")
         })?;
@@ -1988,8 +1991,8 @@ where
                 rq: SharedRq::new(srq_inner),
                 sq_callback: self.sq_callback,
                 rq_callback: self.rq_callback,
-                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
-                recv_cq: self.recv_cq_weak.unwrap_or_else(Weak::new),
+                send_cq: self.send_cq_weak.unwrap_or_default(),
+                recv_cq: self.recv_cq_weak.unwrap_or_default(),
                 _pd: self.pd.clone(),
                 _marker: std::marker::PhantomData,
             };
@@ -2019,7 +2022,7 @@ where
     ///
     /// When using MonoCq, callbacks are stored in the MonoCq, not in the RcQp.
     /// This method is available when both SQ and RQ use MonoCq.
-    pub fn build(self) -> io::Result<Rc<RefCell<RcQpForMonoCq<Entry>>>> {
+    pub fn build(self) -> BuildResult<RcQpForMonoCq<Entry>> {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;

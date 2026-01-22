@@ -20,7 +20,7 @@ use std::rc::Rc;
 use mlx5::cq::CqConfig;
 use mlx5::pd::RemoteUdQpInfo;
 use mlx5::ud::{UdQpConfig, UdQpState};
-use mlx5::wqe::{WqeFlags, WqeOpcode};
+use mlx5::wqe::WqeFlags;
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
@@ -114,10 +114,10 @@ fn test_ud_send_recv() {
     };
 
     // Create CQs
-    let mut send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
+    let send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let mut recv_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ");
+    let recv_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ");
     let recv_cq = Rc::new(recv_cq);
 
     // Q_Key must have MSB=0 for non-privileged users (bit 31 indicates privileged Q_Key)
@@ -159,7 +159,7 @@ fn test_ud_send_recv() {
 
     // Allocate buffers
     let mut send_buf = AlignedBuffer::new(4096);
-    let mut recv_buf = AlignedBuffer::new(4096);
+    let recv_buf = AlignedBuffer::new(4096);
 
     // Register memory regions
     let send_mr = unsafe {
@@ -253,10 +253,10 @@ fn test_ud_send_raw_av() {
     };
 
     // Create CQs
-    let mut send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
+    let send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let mut recv_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ");
+    let recv_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ");
     let recv_cq = Rc::new(recv_cq);
 
     let qkey: u32 = 0x11111111;
@@ -297,7 +297,7 @@ fn test_ud_send_raw_av() {
 
     // Allocate buffers
     let mut send_buf = AlignedBuffer::new(4096);
-    let mut recv_buf = AlignedBuffer::new(4096);
+    let recv_buf = AlignedBuffer::new(4096);
 
     // Register memory regions
     let send_mr = unsafe {
@@ -390,10 +390,10 @@ fn test_ud_multiple_destinations() {
     };
 
     // Create CQs
-    let mut cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ");
+    let cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ");
     let cq = Rc::new(cq);
 
-    let mut recv_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ");
+    let recv_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ");
     let recv_cq = Rc::new(recv_cq);
 
     let qkey: u32 = 0x22222222;
@@ -428,11 +428,11 @@ fn test_ud_multiple_destinations() {
             .sq_cq(cq.clone(), |_cqe: mlx5::cq::Cqe, _entry: u64| {})
             .rq_cq(recv_cq.clone(), |_cqe: mlx5::cq::Cqe, _entry: u64| {})
             .build()
-            .expect(&format!("Failed to create receiver {}", i));
+            .unwrap_or_else(|_| panic!("Failed to create receiver {}", i));
         receiver
             .borrow_mut()
             .activate(ctx.port, 0)
-            .expect(&format!("Failed to activate receiver {}", i));
+            .unwrap_or_else(|_| panic!("Failed to activate receiver {}", i));
 
         let recv_buf = AlignedBuffer::new(4096);
         let recv_mr = unsafe {
@@ -489,7 +489,7 @@ fn test_ud_multiple_destinations() {
 
         // Poll send CQ
         let send_cqe =
-            poll_cq_timeout(&cq, 5000).expect(&format!("Send CQE timeout for receiver {}", i));
+            poll_cq_timeout(&cq, 5000).unwrap_or_else(|| panic!("Send CQE timeout for receiver {}", i));
         assert_eq!(
             send_cqe.syndrome, 0,
             "Send CQE error for receiver {}: syndrome={}",
@@ -498,7 +498,7 @@ fn test_ud_multiple_destinations() {
 
         // Poll recv CQ
         let recv_cqe =
-            poll_cq_timeout(&recv_cq, 5000).expect(&format!("Recv CQE timeout for receiver {}", i));
+            poll_cq_timeout(&recv_cq, 5000).unwrap_or_else(|| panic!("Recv CQE timeout for receiver {}", i));
         assert_eq!(
             recv_cqe.syndrome, 0,
             "Recv CQE error for receiver {}: syndrome={}",

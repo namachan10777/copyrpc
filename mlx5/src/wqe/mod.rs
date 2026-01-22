@@ -63,32 +63,43 @@ pub(crate) const WQEBB_SIZE: usize = 64;
 /// Size of the control segment in bytes.
 pub const CTRL_SEG_SIZE: usize = 16;
 
+/// Parameters for writing a control segment.
+#[derive(Debug, Clone, Copy)]
+pub struct CtrlSegParams {
+    /// Operation modifier.
+    pub opmod: u8,
+    /// Opcode.
+    pub opcode: u8,
+    /// WQE index.
+    pub wqe_idx: u16,
+    /// QP number.
+    pub qpn: u32,
+    /// Data segment count (initial value, can be updated later).
+    pub ds_cnt: u8,
+    /// WQE flags.
+    pub flags: WqeFlags,
+    /// Immediate data.
+    pub imm: u32,
+}
+
 /// Write the control segment to the given pointer.
 ///
 /// # Safety
 /// The pointer must point to at least 16 bytes of writable memory.
 #[inline]
-pub unsafe fn write_ctrl_seg(
-    ptr: *mut u8,
-    opmod: u8,
-    opcode: u8,
-    wqe_idx: u16,
-    qpn: u32,
-    ds_cnt: u8,
-    flags: WqeFlags,
-    imm: u32,
-) {
-    let opmod_idx_opcode = ((opmod as u32) << 24) | ((wqe_idx as u32) << 8) | (opcode as u32);
-    let qpn_ds = (qpn << 8) | (ds_cnt as u32);
+pub unsafe fn write_ctrl_seg(ptr: *mut u8, params: &CtrlSegParams) {
+    let opmod_idx_opcode =
+        ((params.opmod as u32) << 24) | ((params.wqe_idx as u32) << 8) | (params.opcode as u32);
+    let qpn_ds = (params.qpn << 8) | (params.ds_cnt as u32);
     // Combine sig (pcie_ctrl), dci_stream[15:8](0), dci_stream[7:0](0), fm_ce_se into single u32
     // Layout in big-endian: [sig/pcie_ctrl][stream_hi][stream_lo][fm_ce_se]
-    let sig_stream_fm = ((flags.pcie_ctrl() as u32) << 24) | (flags.fm_ce_se() as u32);
+    let sig_stream_fm = ((params.flags.pcie_ctrl() as u32) << 24) | (params.flags.fm_ce_se() as u32);
 
     let ptr32 = ptr as *mut u32;
     std::ptr::write_volatile(ptr32, opmod_idx_opcode.to_be());
     std::ptr::write_volatile(ptr32.add(1), qpn_ds.to_be());
     std::ptr::write_volatile(ptr32.add(2), sig_stream_fm.to_be());
-    std::ptr::write_volatile(ptr32.add(3), imm.to_be());
+    std::ptr::write_volatile(ptr32.add(3), params.imm.to_be());
 }
 
 /// Update the DS count after WQE is complete.
@@ -212,9 +223,9 @@ pub unsafe fn write_address_vector_ib(ptr: *mut u8, dc_key: u64, dctn: u32, dlid
 /// - offset 0-7: dc_key (8B)
 /// - offset 8-11: dqp_dct (4B) - bit 31 = ext, bits 23:0 = DCT number
 /// - offset 12-13: rlid (2B) - not used for RoCE
-/// - offset 14: stat_rate[3:0], sl[7:4] (1B)
-/// - offset 15: fl[0], mlid[7:1] (1B)
-/// - offset 16-19: fl_mlid + grh_gid_fl[3:0] (4B)
+/// - offset 14: stat_rate\[3:0\], sl\[7:4\] (1B)
+/// - offset 15: fl\[0\], mlid\[7:1\] (1B)
+/// - offset 16-19: fl_mlid + grh_gid_fl\[3:0\] (4B)
 /// - offset 20: reserved (1B)
 /// - offset 21: grh_hop_limit (1B)
 /// - offset 22: grh_traffic_class (1B)

@@ -183,8 +183,11 @@ impl<CmdEntry, CmdTableType> CmdQpState<CmdEntry, CmdTableType> {
         udma_to_device_barrier!();
 
         if self.bf_size > 0 {
-            let bf = unsafe { self.bf_reg.add(self.bf_offset.get() as usize) };
-            mlx5_bf_copy!(bf, wqe_ptr);
+            // Safety: bf_reg is a valid BlueFlame register pointer, wqe_ptr points to valid WQE
+            unsafe {
+                let bf = self.bf_reg.add(self.bf_offset.get() as usize);
+                mlx5_bf_copy!(bf, wqe_ptr);
+            }
             mmio_flush_writes!();
             self.bf_offset.set(self.bf_offset.get() ^ self.bf_size);
         } else {

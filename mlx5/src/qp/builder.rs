@@ -9,7 +9,7 @@ use std::marker::PhantomData;
 
 use crate::types::GrhAttr;
 use crate::wqe::{
-    ATOMIC_SEG_SIZE, CTRL_SEG_SIZE, DATA_SEG_SIZE, HasData, OrderedWqeTable,
+    ATOMIC_SEG_SIZE, CTRL_SEG_SIZE, CtrlSegParams, DATA_SEG_SIZE, HasData, OrderedWqeTable,
     RDMA_SEG_SIZE, SubmissionError, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
     set_ctrl_seg_completion_flag, update_ctrl_seg_ds_cnt, update_ctrl_seg_wqe_idx,
     write_atomic_seg_cas, write_atomic_seg_fa, write_ctrl_seg, write_data_seg, write_inline_header,
@@ -128,13 +128,15 @@ impl<'a, Entry> WqeCore<'a, Entry> {
         unsafe {
             write_ctrl_seg(
                 self.wqe_ptr,
-                0,
-                opcode as u8,
-                self.wqe_idx,
-                self.sq.sqn,
-                0,
-                flags,
-                imm,
+                &CtrlSegParams {
+                    opmod: 0,
+                    opcode: opcode as u8,
+                    wqe_idx: self.wqe_idx,
+                    qpn: self.sq.sqn,
+                    ds_cnt: 0,
+                    flags,
+                    imm,
+                },
             );
         }
         self.offset = CTRL_SEG_SIZE;
@@ -986,13 +988,15 @@ impl<'b, 'a, Entry> BlueflameWqeCore<'b, 'a, Entry> {
         unsafe {
             write_ctrl_seg(
                 self.batch.buffer.as_mut_ptr().add(self.offset),
-                0,
-                opcode as u8,
-                wqe_idx,
-                self.batch.sq.sqn,
-                0,
-                flags,
-                imm,
+                &CtrlSegParams {
+                    opmod: 0,
+                    opcode: opcode as u8,
+                    wqe_idx,
+                    qpn: self.batch.sq.sqn,
+                    ds_cnt: 0,
+                    flags,
+                    imm,
+                },
             );
         }
         self.offset += CTRL_SEG_SIZE;
@@ -1299,13 +1303,15 @@ impl<'b, 'a, Entry> RoceBlueflameWqeCore<'b, 'a, Entry> {
         unsafe {
             write_ctrl_seg(
                 self.batch.buffer.as_mut_ptr().add(self.offset),
-                0,
-                opcode as u8,
-                wqe_idx,
-                self.batch.sq.sqn,
-                0,
-                flags,
-                imm,
+                &CtrlSegParams {
+                    opmod: 0,
+                    opcode: opcode as u8,
+                    wqe_idx,
+                    qpn: self.batch.sq.sqn,
+                    ds_cnt: 0,
+                    flags,
+                    imm,
+                },
             );
         }
         self.offset += CTRL_SEG_SIZE;

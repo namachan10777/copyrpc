@@ -8,9 +8,9 @@
 use std::io;
 
 use crate::wqe::{
-    CTRL_SEG_SIZE, DATA_SEG_SIZE, HasData, Init, NeedsTmSeg, OrderedWqeTable, TmCmdWqeBuilder,
-    TM_SEG_SIZE, TmTagAddWqeBuilder, TmTagDelWqeBuilder, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode,
-    write_ctrl_seg, write_data_seg, write_tm_seg_add, write_tm_seg_del,
+    CTRL_SEG_SIZE, CtrlSegParams, DATA_SEG_SIZE, HasData, Init, NeedsTmSeg, OrderedWqeTable,
+    TmCmdWqeBuilder, TM_SEG_SIZE, TmTagAddWqeBuilder, TmTagDelWqeBuilder, WQEBB_SIZE, WqeFlags,
+    WqeHandle, WqeOpcode, write_ctrl_seg, write_data_seg, write_tm_seg_add, write_tm_seg_del,
 };
 
 use super::{CmdQpState, TmSrqState};
@@ -56,13 +56,15 @@ impl<'a, CmdEntry, CmdTableType> CmdQpWqeBuilder<'a, CmdEntry, CmdTableType, Ini
         unsafe {
             write_ctrl_seg(
                 self.wqe_ptr,
-                opmod,
-                WqeOpcode::TagMatching as u8,
-                self.wqe_idx,
-                self.cmd_qp.qpn,
-                0,
-                WqeFlags::COMPLETION,
-                0,
+                &CtrlSegParams {
+                    opmod,
+                    opcode: WqeOpcode::TagMatching as u8,
+                    wqe_idx: self.wqe_idx,
+                    qpn: self.cmd_qp.qpn,
+                    ds_cnt: 0,
+                    flags: WqeFlags::COMPLETION,
+                    imm: 0,
+                },
             );
         }
         self.offset = 16; // CTRL_SEG_SIZE
@@ -321,13 +323,15 @@ impl<'a, CmdEntry> TmCmdWqeBuilder<'a, CmdEntry> for TmCmdEntryPointImpl<'a, Cmd
         unsafe {
             write_ctrl_seg(
                 self.wqe_ptr,
-                0,
-                WqeOpcode::TagMatching as u8,
-                self.wqe_idx,
-                self.cmd_qp.qpn,
-                0,
-                WqeFlags::COMPLETION,
-                0,
+                &CtrlSegParams {
+                    opmod: 0,
+                    opcode: WqeOpcode::TagMatching as u8,
+                    wqe_idx: self.wqe_idx,
+                    qpn: self.cmd_qp.qpn,
+                    ds_cnt: 0,
+                    flags: WqeFlags::COMPLETION,
+                    imm: 0,
+                },
             );
         }
 
@@ -348,13 +352,15 @@ impl<'a, CmdEntry> TmCmdWqeBuilder<'a, CmdEntry> for TmCmdEntryPointImpl<'a, Cmd
         unsafe {
             write_ctrl_seg(
                 self.wqe_ptr,
-                0,
-                WqeOpcode::TagMatching as u8,
-                self.wqe_idx,
-                self.cmd_qp.qpn,
-                0,
-                WqeFlags::COMPLETION,
-                0,
+                &CtrlSegParams {
+                    opmod: 0,
+                    opcode: WqeOpcode::TagMatching as u8,
+                    wqe_idx: self.wqe_idx,
+                    qpn: self.cmd_qp.qpn,
+                    ds_cnt: 0,
+                    flags: WqeFlags::COMPLETION,
+                    imm: 0,
+                },
             );
 
             // Write TM segment for deletion
