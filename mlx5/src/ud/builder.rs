@@ -344,7 +344,7 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIb<SqEntry, RqEntry, OnSq
     /// qp.ring_sq_doorbell();
     /// ```
     #[inline]
-    pub fn sq_wqe<'a>(&'a self, ah: &'a AddressHandle) -> io::Result<UdSqWqeEntryPoint<'a, SqEntry>> {
+    pub fn sq_wqe<'a>(&'a mut self, ah: &'a AddressHandle) -> io::Result<UdSqWqeEntryPoint<'a, SqEntry>> {
         let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));

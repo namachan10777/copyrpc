@@ -198,7 +198,7 @@ fn test_ud_send_recv() {
 
     // Post UD SEND
     sender
-        .borrow()
+        .borrow_mut()
         .sq_wqe(&ah)
         .expect("sq_wqe failed")
         .send(WqeFlags::empty())
@@ -336,7 +336,7 @@ fn test_ud_send_raw_av() {
 
     // Post UD SEND with new API
     sender
-        .borrow()
+        .borrow_mut()
         .sq_wqe(&ah)
         .expect("sq_wqe failed")
         .send(WqeFlags::empty())
@@ -477,7 +477,7 @@ fn test_ud_multiple_destinations() {
             .expect("Failed to create AH");
 
         sender
-            .borrow()
+            .borrow_mut()
             .sq_wqe(&ah)
             .expect("sq_wqe failed")
             .send(WqeFlags::empty())

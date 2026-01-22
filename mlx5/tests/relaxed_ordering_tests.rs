@@ -167,7 +167,7 @@ fn test_fence_ordering() {
         local_read_buf.write_u64(0, 0xDEADBEEF);
 
         {
-            let qp_ref = pair.qp1.borrow();
+            let mut qp_ref = pair.qp1.borrow_mut();
 
             // First: RDMA READ (read current counter value)
             qp_ref
@@ -190,7 +190,7 @@ fn test_fence_ordering() {
         read_values.push(read_val);
 
         {
-            let qp_ref = pair.qp1.borrow();
+            let mut qp_ref = pair.qp1.borrow_mut();
 
             // Second: RDMA WRITE with FENCE (ensures READ completed before this WRITE starts)
             // FENCE waits for prior READ to complete
@@ -302,7 +302,7 @@ fn test_relaxed_ordering_variants() {
             local_read_buf.write_u64(0, 0);
 
             {
-                let qp_ref = pair.qp1.borrow();
+                let mut qp_ref = pair.qp1.borrow_mut();
 
                 // RDMA WRITE
                 qp_ref
@@ -320,7 +320,7 @@ fn test_relaxed_ordering_variants() {
             poll_cq_batch(&pair.send_cq, 1, 5000).expect("WRITE timeout");
 
             {
-                let qp_ref = pair.qp1.borrow();
+                let mut qp_ref = pair.qp1.borrow_mut();
 
                 // RDMA READ
                 qp_ref
@@ -412,7 +412,7 @@ fn test_fence_with_relaxed_mr() {
         local_read_buf.write_u64(0, 0xDEADBEEF);
 
         {
-            let qp_ref = pair.qp1.borrow();
+            let mut qp_ref = pair.qp1.borrow_mut();
 
             // READ with RELAXED_ORDERING
             qp_ref
@@ -437,7 +437,7 @@ fn test_fence_with_relaxed_mr() {
         read_values.push(read_val);
 
         {
-            let qp_ref = pair.qp1.borrow();
+            let mut qp_ref = pair.qp1.borrow_mut();
 
             // WRITE with FENCE and RELAXED_ORDERING
             // FENCE ensures the prior READ completes before this WRITE
@@ -540,7 +540,7 @@ fn test_fence_batched_read_write() {
     );
 
     {
-        let qp_ref = pair.qp1.borrow();
+        let mut qp_ref = pair.qp1.borrow_mut();
 
         // Submit batch: READ → WRITE(FENCE) pairs
         for i in 0..BATCH_SIZE {
@@ -630,7 +630,7 @@ fn test_relaxed_ordering_basic() {
     // Test WRITE with RELAXED_ORDERING
     local_buf.write_u64(0, 42);
     {
-        let qp_ref = pair.qp1.borrow();
+        let mut qp_ref = pair.qp1.borrow_mut();
         qp_ref
             .sq_wqe()
             .expect("sq_wqe failed")
@@ -653,7 +653,7 @@ fn test_relaxed_ordering_basic() {
     // Test READ with RELAXED_ORDERING
     local_buf.write_u64(0, 0);
     {
-        let qp_ref = pair.qp1.borrow();
+        let mut qp_ref = pair.qp1.borrow_mut();
         qp_ref
             .sq_wqe()
             .expect("sq_wqe failed")

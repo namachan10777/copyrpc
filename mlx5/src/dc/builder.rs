@@ -903,7 +903,7 @@ impl<Entry, OnComplete> DciIb<Entry, OnComplete> {
     /// dci.ring_sq_doorbell();
     /// ```
     #[inline]
-    pub fn sq_wqe(&self, dc_key: u64, dctn: u32, dlid: u16) -> io::Result<DciSqWqeEntryPoint<'_, Entry>> {
+    pub fn sq_wqe(&mut self, dc_key: u64, dctn: u32, dlid: u16) -> io::Result<DciSqWqeEntryPoint<'_, Entry>> {
         let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -924,7 +924,7 @@ impl<Entry, OnComplete> DciRoCE<Entry, OnComplete> {
     /// dci.ring_sq_doorbell();
     /// ```
     #[inline]
-    pub fn sq_wqe<'a>(&'a self, dc_key: u64, dctn: u32, grh: &'a GrhAttr) -> io::Result<DciRoceSqWqeEntryPoint<'a, Entry>> {
+    pub fn sq_wqe<'a>(&'a mut self, dc_key: u64, dctn: u32, grh: &'a GrhAttr) -> io::Result<DciRoceSqWqeEntryPoint<'a, Entry>> {
         let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));

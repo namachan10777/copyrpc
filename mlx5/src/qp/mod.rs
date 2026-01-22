@@ -1204,7 +1204,7 @@ impl<SqEntry, RqEntry, Rq, OnSqComplete, OnRqComplete> RcQp<SqEntry, RqEntry, In
     /// qp.ring_sq_doorbell();
     /// ```
     #[inline]
-    pub fn sq_wqe(&self) -> io::Result<SqWqeEntryPoint<'_, SqEntry, NoAv>> {
+    pub fn sq_wqe(&mut self) -> io::Result<SqWqeEntryPoint<'_, SqEntry, NoAv>> {
         let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -1225,7 +1225,7 @@ impl<SqEntry, RqEntry, Rq, OnSqComplete, OnRqComplete> RcQp<SqEntry, RqEntry, Ro
     /// qp.ring_sq_doorbell();
     /// ```
     #[inline]
-    pub fn sq_wqe<'a>(&'a self, grh: &'a GrhAttr) -> io::Result<SqWqeEntryPoint<'a, SqEntry, &'a GrhAttr>> {
+    pub fn sq_wqe<'a>(&'a mut self, grh: &'a GrhAttr) -> io::Result<SqWqeEntryPoint<'a, SqEntry, &'a GrhAttr>> {
         let sq = self.sq()?;
         if sq.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));

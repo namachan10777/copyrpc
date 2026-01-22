@@ -23,8 +23,9 @@ use mlx5::cq::{CqConfig, Cqe, CqeOpcode};
 use mlx5::device::{Context, DeviceList};
 use mlx5::mono_cq::MonoCqRc;
 use mlx5::pd::{AccessFlags, MemoryRegion, Pd};
-use mlx5::qp::{RcQpConfig, RcQpForMonoCq, RemoteQpInfo};
-use mlx5::wqe::TxFlags;
+use mlx5::qp::{RcQpConfig, RcQpForMonoCq};
+use mlx5::transport::IbRemoteQpInfo;
+use mlx5::wqe::WqeFlags;
 
 // =============================================================================
 // Constants
@@ -302,7 +303,7 @@ fn setup_mono_cq_benchmark() -> Option<MonoCqBenchmarkSetup<impl Fn(Cqe, u64), i
     }
 
     // Connect client QP
-    let server_remote = RemoteQpInfo {
+    let server_remote = IbRemoteQpInfo {
         qp_number: server_info.qpn,
         packet_sequence_number: 0,
         local_identifier: server_info.lid,
@@ -519,7 +520,7 @@ fn server_thread_main(
     };
 
     // Connect server QP to client
-    let client_remote = RemoteQpInfo {
+    let client_remote = IbRemoteQpInfo {
         qp_number: client_info.qpn,
         packet_sequence_number: 0,
         local_identifier: client_info.lid,
@@ -590,7 +591,7 @@ fn server_thread_main(
 
         // 4. TX リクエスト再補充: queue echo responses
         {
-            let qp_ref = qp.borrow();
+            let mut qp_ref = qp.borrow_mut();
             for i in 0..rx_count {
                 let idx = rx_indices[i];
                 let offset = (idx * 256) as u64;
@@ -601,7 +602,7 @@ fn server_thread_main(
                     let _ = qp_ref
                         .sq_wqe()
                         .unwrap()
-                        .write_imm(TxFlags::empty(), remote_addr + offset, remote_rkey, idx as u32)
+                        .write_imm(WqeFlags::empty(), remote_addr + offset, remote_rkey, idx as u32)
                         .unwrap()
                         .sge(send_buf.addr() + offset, size, send_mr.lkey())
                         .finish_signaled(idx as u64);
@@ -610,7 +611,7 @@ fn server_thread_main(
                     let _ = qp_ref
                         .sq_wqe()
                         .unwrap()
-                        .send(TxFlags::empty())
+                        .send(WqeFlags::empty())
                         .unwrap()
                         .sge(send_buf.addr() + offset, size, send_mr.lkey())
                         .finish_signaled(idx as u64);
@@ -649,7 +650,7 @@ where
 
     // Initial fill
     {
-        let qp = client.qp.borrow();
+        let mut qp = client.qp.borrow_mut();
         for batch in 0..(QUEUE_DEPTH / 4) {
             let base = batch * 4;
             for j in 0..3 {
@@ -657,7 +658,7 @@ where
                 let offset = (i * 256) as u64;
                 qp.sq_wqe()
                     .unwrap()
-                    .write_imm(TxFlags::empty(), remote_addr + offset, rkey, i as u32)
+                    .write_imm(WqeFlags::empty(), remote_addr + offset, rkey, i as u32)
                     .unwrap()
                     .sge(send_buf_addr + offset, size, lkey)
                     .finish_unsignaled()
@@ -667,7 +668,7 @@ where
             let offset = (i * 256) as u64;
             qp.sq_wqe()
                 .unwrap()
-                .write_imm(TxFlags::empty(), remote_addr + offset, rkey, i as u32)
+                .write_imm(WqeFlags::empty(), remote_addr + offset, rkey, i as u32)
                 .unwrap()
                 .sge(send_buf_addr + offset, size, lkey)
                 .finish_signaled(i as u64)
@@ -713,7 +714,7 @@ where
         let to_send = can_send.min(rx_count);
 
         if to_send > 0 {
-            let qp = client.qp.borrow();
+            let mut qp = client.qp.borrow_mut();
             let full_batches = to_send / 4;
             let remainder = to_send % 4;
 
@@ -724,7 +725,7 @@ where
                     let offset = (idx * 256) as u64;
                     qp.sq_wqe()
                         .unwrap()
-                        .write_imm(TxFlags::empty(), remote_addr + offset, rkey, idx as u32)
+                        .write_imm(WqeFlags::empty(), remote_addr + offset, rkey, idx as u32)
                         .unwrap()
                         .sge(send_buf_addr + offset, size, lkey)
                         .finish_unsignaled()
@@ -734,7 +735,7 @@ where
                 let offset = (idx * 256) as u64;
                 qp.sq_wqe()
                     .unwrap()
-                    .write_imm(TxFlags::empty(), remote_addr + offset, rkey, idx as u32)
+                    .write_imm(WqeFlags::empty(), remote_addr + offset, rkey, idx as u32)
                     .unwrap()
                     .sge(send_buf_addr + offset, size, lkey)
                     .finish_signaled(idx as u64)
@@ -747,7 +748,7 @@ where
                 let offset = (idx * 256) as u64;
                 qp.sq_wqe()
                     .unwrap()
-                    .write_imm(TxFlags::empty(), remote_addr + offset, rkey, idx as u32)
+                    .write_imm(WqeFlags::empty(), remote_addr + offset, rkey, idx as u32)
                     .unwrap()
                     .sge(send_buf_addr + offset, size, lkey)
                     .finish_signaled(idx as u64)
@@ -823,7 +824,7 @@ where
             let mut bf = qp.blueflame_sq_wqe().unwrap();
             bf.wqe()
                 .unwrap()
-                .write_imm(TxFlags::empty(), remote_addr + offset, rkey, imm)
+                .write_imm(WqeFlags::empty(), remote_addr + offset, rkey, imm)
                 .unwrap()
                 .sge(send_buf_addr + offset, size, lkey)
                 .unwrap()

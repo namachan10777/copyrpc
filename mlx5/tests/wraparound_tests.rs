@@ -575,7 +575,7 @@ fn test_ud_send_wraparound() {
 
         // Post send
         sender
-            .borrow()
+            .borrow_mut()
             .sq_wqe(&ah)
             .expect("sq_wqe failed")
             .send(WqeFlags::empty())
