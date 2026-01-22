@@ -507,6 +507,521 @@ fn test_rc_atomic_fa() {
 }
 
 // =============================================================================
+// Masked Atomic Tests (32-bit and 64-bit)
+// =============================================================================
+
+/// Test Masked Compare-and-Swap (32-bit) - success case
+///
+/// Note: Masked atomic operations require specific hardware support.
+/// This test verifies the API works and the operation completes without error.
+#[test]
+fn test_rc_masked_cas_32_success() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    // Check if masked atomics are supported
+    let caps = ctx.ctx.query_pci_atomic_caps();
+    println!("PCI Atomic Caps: {:?}", caps);
+
+    let pair = create_rc_loopback_pair(&ctx);
+    let qp1 = &pair.qp1;
+    let cq = &pair.send_cq;
+
+    // Allocate buffers (atomic operations work on aligned addresses)
+    let mut local_buf = AlignedBuffer::new(4096);
+    let mut remote_buf = AlignedBuffer::new(4096);
+
+    // Register memory regions
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
+
+    // Memory is accessed in native byte order, but extended atomics return values in big-endian
+    let initial_value: u32 = 100;
+    let compare_value: u32 = 100; // Should match
+    let compare_mask: u32 = 0xFFFF_FFFF;
+    let swap_value: u32 = 200;
+    let swap_mask: u32 = 0xFFFF_FFFF;
+
+    // Write initial value in native byte order
+    remote_buf.write_u32(0, initial_value);
+    remote_buf.write_u32(4, 0); // Clear upper 4 bytes
+    local_buf.fill(0);
+
+    // Post Masked CAS 32-bit
+    qp1.borrow_mut()
+        .sq_wqe()
+        .expect("sq_wqe failed")
+        .masked_cas_32(
+            WqeFlags::empty(),
+            remote_buf.addr(),
+            remote_mr.rkey(),
+            swap_value,
+            compare_value,
+            swap_mask,
+            compare_mask,
+        )
+        .expect("masked_cas_32 failed")
+        .sge(local_buf.addr(), 4, local_mr.lkey())
+        .finish_signaled(1u64)
+        .expect("finish failed");
+    qp1.borrow().ring_sq_doorbell();
+
+    // Poll CQ - operation should complete without error
+    let _cqe = poll_cq_timeout(&cq, 5000).expect("CQE timeout");
+    cq.flush();
+
+    // Debug: print raw buffer contents
+    println!("Local buffer (first 16 bytes): {:02x?}", local_buf.read_bytes(16));
+    println!("Remote buffer (first 16 bytes): {:02x?}", remote_buf.read_bytes(16));
+
+    // Extended atomics return values in big-endian (network byte order)
+    let returned_value = u32::from_be(local_buf.read_u32(0));
+    println!(
+        "Masked CAS 32-bit (success): initial={}, compare={}, swap={}, returned={}",
+        initial_value, compare_value, swap_value, returned_value
+    );
+    assert_eq!(
+        returned_value, initial_value,
+        "Masked CAS 32 should return original value. Expected {}, got {}",
+        initial_value, returned_value
+    );
+
+    // Remote value is in native byte order
+    let remote_value = remote_buf.read_u32(0);
+    println!(
+        "Remote value after CAS: expected={}, got={}",
+        swap_value, remote_value
+    );
+    assert_eq!(
+        remote_value, swap_value,
+        "Masked CAS 32 should swap remote value when compare matches. Expected {}, got {}",
+        swap_value, remote_value
+    );
+
+    println!("RC Masked CAS 32-bit (success) test passed");
+}
+
+/// Test Masked Compare-and-Swap (32-bit) - failure case
+///
+/// Note: Masked atomic operations require specific hardware support.
+/// This test verifies the API works and the operation completes without error.
+#[test]
+fn test_rc_masked_cas_32_failure() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    let pair = create_rc_loopback_pair(&ctx);
+    let qp1 = &pair.qp1;
+    let cq = &pair.send_cq;
+
+    let mut local_buf = AlignedBuffer::new(4096);
+    let mut remote_buf = AlignedBuffer::new(4096);
+
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
+
+    // Value that won't match
+    let initial_value: u32 = 100;
+    let compare_value: u32 = 999; // Won't match
+    let compare_mask: u32 = 0xFFFF_FFFF;
+    let swap_value: u32 = 200;
+    let swap_mask: u32 = 0xFFFF_FFFF;
+
+    // Write initial value in native byte order
+    remote_buf.write_u32(0, initial_value);
+    remote_buf.write_u32(4, 0); // Clear upper 4 bytes
+    local_buf.fill(0);
+
+    qp1.borrow_mut()
+        .sq_wqe()
+        .expect("sq_wqe failed")
+        .masked_cas_32(
+            WqeFlags::empty(),
+            remote_buf.addr(),
+            remote_mr.rkey(),
+            swap_value,
+            compare_value,
+            swap_mask,
+            compare_mask,
+        )
+        .expect("masked_cas_32 failed")
+        .sge(local_buf.addr(), 4, local_mr.lkey())
+        .finish_signaled(1u64)
+        .expect("finish failed");
+    qp1.borrow().ring_sq_doorbell();
+
+    let _cqe = poll_cq_timeout(&cq, 5000).expect("CQE timeout");
+    cq.flush();
+
+    // Debug: print raw buffer contents
+    println!("Local buffer (first 16 bytes): {:02x?}", local_buf.read_bytes(16));
+    println!("Remote buffer (first 16 bytes): {:02x?}", remote_buf.read_bytes(16));
+
+    // Extended atomics return values in big-endian (network byte order)
+    let returned_value = u32::from_be(local_buf.read_u32(0));
+    println!(
+        "Masked CAS 32-bit (failure): initial={}, compare={}, swap={}, returned={}",
+        initial_value, compare_value, swap_value, returned_value
+    );
+    assert_eq!(
+        returned_value, initial_value,
+        "Masked CAS 32 should return original value. Expected {}, got {}",
+        initial_value, returned_value
+    );
+
+    // Remote value is in native byte order, should be unchanged
+    let remote_value = remote_buf.read_u32(0);
+    println!(
+        "Remote value after CAS (should be unchanged): expected={}, got={}",
+        initial_value, remote_value
+    );
+    assert_eq!(
+        remote_value, initial_value,
+        "Masked CAS 32 should NOT swap remote value when compare fails. Expected {}, got {}",
+        initial_value, remote_value
+    );
+
+    println!("RC Masked CAS 32-bit (failure) test passed");
+}
+
+/// Test Masked Fetch-and-Add (32-bit)
+///
+/// Note: Masked atomic operations require specific hardware support.
+/// This test verifies the API works and the operation completes without error.
+#[test]
+fn test_rc_masked_fa_32() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    let pair = create_rc_loopback_pair(&ctx);
+    let qp1 = &pair.qp1;
+    let cq = &pair.send_cq;
+
+    let mut local_buf = AlignedBuffer::new(4096);
+    let mut remote_buf = AlignedBuffer::new(4096);
+
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
+
+    // Use native endian like regular atomic tests
+    let initial_value: u64 = 100;
+    let add_value: u32 = 42;
+    // field_boundary = 0 means treat the entire value as one field (normal add)
+    let field_boundary: u32 = 0;
+
+    // Write initial value in native endian (same as regular atomic tests)
+    remote_buf.write_u64(0, initial_value);
+    local_buf.fill(0);
+
+    // Try with 4-byte SGE for 32-bit extended atomic
+    qp1.borrow_mut()
+        .sq_wqe()
+        .expect("sq_wqe failed")
+        .masked_fa_32(
+            WqeFlags::empty(),
+            remote_buf.addr(),
+            remote_mr.rkey(),
+            add_value,
+            field_boundary,
+        )
+        .expect("masked_fa_32 failed")
+        .sge(local_buf.addr(), 4, local_mr.lkey())
+        .finish_signaled(1u64)
+        .expect("finish failed");
+    qp1.borrow().ring_sq_doorbell();
+
+    // Check CQE for errors - we use direct CQ polling to get CQE details
+    let mut cqe = mlx5::cq::Cqe::default();
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_millis(5000);
+    loop {
+        let count = cq.poll();
+        if count > 0 {
+            // Get the CQE from the callback - for now just use default
+            break;
+        }
+        if start.elapsed() > timeout {
+            panic!("CQE timeout");
+        }
+        std::hint::spin_loop();
+    }
+    cq.flush();
+
+    // Note: CQE syndrome is checked via callback in production code
+    // For debugging, we check buffer contents
+
+    // Debug: print raw buffer contents
+    println!("Local buffer (first 16 bytes): {:02x?}", local_buf.read_bytes(16));
+    println!("Remote buffer (first 16 bytes): {:02x?}", remote_buf.read_bytes(16));
+
+    // Extended atomics return values in big-endian (network byte order)
+    // Read the returned 32-bit value as big-endian
+    let returned_u32 = u32::from_be(local_buf.read_u32(0));
+    let remote_u32 = remote_buf.read_u64(0) as u32;
+    println!(
+        "Masked FA 32-bit: initial={}, add={}, field_boundary={:#x}",
+        initial_value, add_value, field_boundary
+    );
+    println!(
+        "Returned u32 (from BE): {}, Remote u32: {}",
+        returned_u32, remote_u32
+    );
+
+    // Verify remote value was updated correctly
+    let expected_remote = (initial_value as u32).wrapping_add(add_value);
+    assert_eq!(
+        remote_u32, expected_remote,
+        "Masked FA 32 should update remote value. Expected {}, got {}",
+        expected_remote, remote_u32
+    );
+
+    // Check returned value - it should be the original value
+    // Note: Extended atomics may have issues returning values on some devices
+    if returned_u32 != initial_value as u32 {
+        eprintln!(
+            "WARNING: Masked FA 32 returned value mismatch. Expected {}, got {}",
+            initial_value, returned_u32
+        );
+        eprintln!("This may indicate extended atomic return values are not supported on this device.");
+        // Still fail the test since returned value is critical for correct operation
+        assert_eq!(
+            returned_u32, initial_value as u32,
+            "Masked FA 32 should return original value. Expected {}, got {}",
+            initial_value, returned_u32
+        );
+    }
+
+    println!("RC Masked Fetch-and-Add 32-bit test passed");
+}
+
+/// Test Masked Compare-and-Swap (64-bit) - success case
+///
+/// Note: Masked atomic operations require specific hardware support.
+/// This test verifies the API works and the operation completes without error.
+#[test]
+fn test_rc_masked_cas_64_success() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    let pair = create_rc_loopback_pair(&ctx);
+    let qp1 = &pair.qp1;
+    let cq = &pair.send_cq;
+
+    let mut local_buf = AlignedBuffer::new(4096);
+    let mut remote_buf = AlignedBuffer::new(4096);
+
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
+
+    // Memory is accessed in native byte order, but extended atomics return values in big-endian
+    let initial_value: u64 = 1000;
+    let compare_value: u64 = 1000; // Should match
+    let compare_mask: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+    let swap_value: u64 = 2000;
+    let swap_mask: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
+    // Write initial value in native byte order
+    remote_buf.write_u64(0, initial_value);
+    local_buf.fill(0);
+
+    qp1.borrow_mut()
+        .sq_wqe()
+        .expect("sq_wqe failed")
+        .masked_cas_64(
+            WqeFlags::empty(),
+            remote_buf.addr(),
+            remote_mr.rkey(),
+            swap_value,
+            compare_value,
+            swap_mask,
+            compare_mask,
+        )
+        .expect("masked_cas_64 failed")
+        .sge(local_buf.addr(), 8, local_mr.lkey())
+        .finish_signaled(1u64)
+        .expect("finish failed");
+    qp1.borrow().ring_sq_doorbell();
+
+    let _cqe = poll_cq_timeout(&cq, 5000).expect("CQE timeout");
+    cq.flush();
+
+    // Debug: print raw buffer contents
+    println!("Local buffer (first 16 bytes): {:02x?}", local_buf.read_bytes(16));
+    println!("Remote buffer (first 16 bytes): {:02x?}", remote_buf.read_bytes(16));
+
+    // 64-bit extended atomics return values in native byte order (unlike 32-bit which uses BE)
+    let returned_value = local_buf.read_u64(0);
+    println!(
+        "Masked CAS 64-bit (success): initial={}, compare={}, swap={}, returned={}",
+        initial_value, compare_value, swap_value, returned_value
+    );
+    assert_eq!(
+        returned_value, initial_value,
+        "Masked CAS 64 should return original value. Expected {}, got {}",
+        initial_value, returned_value
+    );
+
+    // Remote value is in native byte order
+    let remote_value = remote_buf.read_u64(0);
+    println!(
+        "Remote value after CAS: expected={}, got={}",
+        swap_value, remote_value
+    );
+    assert_eq!(
+        remote_value, swap_value,
+        "Masked CAS 64 should swap remote value when compare matches. Expected {}, got {}",
+        swap_value, remote_value
+    );
+
+    println!("RC Masked CAS 64-bit (success) test passed");
+}
+
+/// Test Masked Fetch-and-Add (64-bit)
+///
+/// Note: Masked atomic operations require specific hardware support.
+/// This test verifies the API works and the operation completes without error.
+#[test]
+fn test_rc_masked_fa_64() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    let pair = create_rc_loopback_pair(&ctx);
+    let qp1 = &pair.qp1;
+    let cq = &pair.send_cq;
+
+    let mut local_buf = AlignedBuffer::new(4096);
+    let mut remote_buf = AlignedBuffer::new(4096);
+
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
+
+    // Memory is accessed in native byte order, but extended atomics return values in big-endian
+    let initial_value: u64 = 1000;
+    let add_value: u64 = 234;
+    // field_boundary = 0 means treat the entire value as one field (normal add)
+    let field_boundary: u64 = 0;
+
+    // Write initial value in native byte order
+    remote_buf.write_u64(0, initial_value);
+    local_buf.fill(0);
+
+    qp1.borrow_mut()
+        .sq_wqe()
+        .expect("sq_wqe failed")
+        .masked_fa_64(
+            WqeFlags::empty(),
+            remote_buf.addr(),
+            remote_mr.rkey(),
+            add_value,
+            field_boundary,
+        )
+        .expect("masked_fa_64 failed")
+        .sge(local_buf.addr(), 8, local_mr.lkey())
+        .finish_signaled(1u64)
+        .expect("finish failed");
+    qp1.borrow().ring_sq_doorbell();
+
+    let _cqe = poll_cq_timeout(&cq, 5000).expect("CQE timeout");
+    cq.flush();
+
+    // Debug: print raw buffer contents
+    println!("Local buffer (first 16 bytes): {:02x?}", local_buf.read_bytes(16));
+    println!("Remote buffer (first 16 bytes): {:02x?}", remote_buf.read_bytes(16));
+
+    // 64-bit extended atomics return values in native byte order (unlike 32-bit which uses BE)
+    let returned_value = local_buf.read_u64(0);
+    println!(
+        "Masked FA 64-bit: initial={}, add={}, returned={}",
+        initial_value, add_value, returned_value
+    );
+    assert_eq!(
+        returned_value, initial_value,
+        "Masked FA 64 should return original value. Expected {}, got {}",
+        initial_value, returned_value
+    );
+
+    // Remote value is in native byte order
+    let remote_value = remote_buf.read_u64(0);
+    let expected_remote = initial_value.wrapping_add(add_value);
+    println!(
+        "Remote value after FA: expected={}, got={}",
+        expected_remote, remote_value
+    );
+    assert_eq!(
+        remote_value, expected_remote,
+        "Masked FA 64 should update remote value. Expected {}, got {}",
+        expected_remote, remote_value
+    );
+
+    println!("RC Masked Fetch-and-Add 64-bit test passed");
+}
+
+// =============================================================================
 // RDMA WRITE with Immediate Tests
 // =============================================================================
 
@@ -1071,4 +1586,196 @@ fn test_rc_wqe_builder_unsignaled() {
     assert_eq!(&written[..], test_data, "Data mismatch with unsignaled WQE");
 
     println!("RC wqe_builder_unsignaled test passed!");
+}
+
+// =============================================================================
+// Masked Atomic 128-bit Tests
+// =============================================================================
+
+/// Test Masked Compare-and-Swap (128-bit) - successful swap
+///
+/// Note: 128-bit atomic operations require specific hardware support.
+/// This test verifies the API works and the operation completes.
+#[test]
+fn test_rc_masked_cas_128_success() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    let pair = create_rc_loopback_pair(&ctx);
+    let qp1 = &pair.qp1;
+    let cq = &pair.send_cq;
+
+    let mut local_buf = AlignedBuffer::new(4096);
+    let mut remote_buf = AlignedBuffer::new(4096);
+
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
+
+    // Test values
+    let initial_value: u128 = 1000;
+    let compare_value: u128 = 1000; // Should match
+    let compare_mask: u128 = u128::MAX;
+    let swap_value: u128 = 2000;
+    let swap_mask: u128 = u128::MAX;
+
+    // Write initial value to remote buffer (high/low format for 128-bit atomics)
+    remote_buf.write_u128_hilo(0, initial_value);
+    local_buf.fill(0);
+
+    qp1.borrow_mut()
+        .sq_wqe()
+        .expect("sq_wqe failed")
+        .masked_cas_128(
+            WqeFlags::empty(),
+            remote_buf.addr(),
+            remote_mr.rkey(),
+            swap_value,
+            compare_value,
+            swap_mask,
+            compare_mask,
+        )
+        .expect("masked_cas_128 failed")
+        .sge(local_buf.addr(), 16, local_mr.lkey())
+        .finish_signaled(1u64)
+        .expect("finish failed");
+    qp1.borrow().ring_sq_doorbell();
+
+    let _cqe = poll_cq_timeout(&cq, 5000).expect("CQE timeout");
+    cq.flush();
+
+    // Debug: print raw buffer contents
+    println!("Local buffer (first 32 bytes): {:02x?}", local_buf.read_bytes(32));
+    println!("Remote buffer (first 32 bytes): {:02x?}", remote_buf.read_bytes(32));
+
+    // 128-bit extended atomics return values in BE format [high_64_be][low_64_be]
+    let returned_value = local_buf.read_u128_be(0);
+    println!(
+        "Masked CAS 128-bit (success): initial={}, compare={}, swap={}, returned={}",
+        initial_value, compare_value, swap_value, returned_value
+    );
+    assert_eq!(
+        returned_value, initial_value,
+        "Masked CAS 128 should return original value. Expected {}, got {}",
+        initial_value, returned_value
+    );
+
+    // Remote value should be swapped (native format - high/low)
+    let remote_value = remote_buf.read_u128_hilo(0);
+    println!(
+        "Remote value after CAS: expected={}, got={}",
+        swap_value, remote_value
+    );
+    assert_eq!(
+        remote_value, swap_value,
+        "Masked CAS 128 should swap remote value when compare matches. Expected {}, got {}",
+        swap_value, remote_value
+    );
+
+    println!("RC Masked CAS 128-bit (success) test passed");
+}
+
+/// Test Masked Fetch-and-Add (128-bit)
+///
+/// Note: 128-bit atomic operations require specific hardware support.
+/// This test verifies the API works and the operation completes.
+#[test]
+fn test_rc_masked_fa_128() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    let pair = create_rc_loopback_pair(&ctx);
+    let qp1 = &pair.qp1;
+    let cq = &pair.send_cq;
+
+    let mut local_buf = AlignedBuffer::new(4096);
+    let mut remote_buf = AlignedBuffer::new(4096);
+
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
+
+    // Test values
+    let initial_value: u128 = 1000;
+    let add_value: u128 = 234;
+    // field_boundary = 0 means treat the entire value as one field (normal add)
+    let field_boundary: u128 = 0;
+
+    // Write initial value to remote buffer (high/low format for 128-bit atomics)
+    remote_buf.write_u128_hilo(0, initial_value);
+    local_buf.fill(0);
+
+    qp1.borrow_mut()
+        .sq_wqe()
+        .expect("sq_wqe failed")
+        .masked_fa_128(
+            WqeFlags::empty(),
+            remote_buf.addr(),
+            remote_mr.rkey(),
+            add_value,
+            field_boundary,
+        )
+        .expect("masked_fa_128 failed")
+        .sge(local_buf.addr(), 16, local_mr.lkey())
+        .finish_signaled(1u64)
+        .expect("finish failed");
+    qp1.borrow().ring_sq_doorbell();
+
+    let _cqe = poll_cq_timeout(&cq, 5000).expect("CQE timeout");
+    cq.flush();
+
+    // Debug: print raw buffer contents
+    println!("Local buffer (first 32 bytes): {:02x?}", local_buf.read_bytes(32));
+    println!("Remote buffer (first 32 bytes): {:02x?}", remote_buf.read_bytes(32));
+
+    // 128-bit extended atomics return values in BE format [high_64_be][low_64_be]
+    let returned_value = local_buf.read_u128_be(0);
+    println!(
+        "Masked FA 128-bit: initial={}, add={}, returned={}",
+        initial_value, add_value, returned_value
+    );
+    assert_eq!(
+        returned_value, initial_value,
+        "Masked FA 128 should return original value. Expected {}, got {}",
+        initial_value, returned_value
+    );
+
+    // Remote value should be updated (native format - high/low)
+    let remote_value = remote_buf.read_u128_hilo(0);
+    let expected_remote = initial_value.wrapping_add(add_value);
+    println!(
+        "Remote value after FA: expected={}, got={}",
+        expected_remote, remote_value
+    );
+    assert_eq!(
+        remote_value, expected_remote,
+        "Masked FA 128 should update remote value. Expected {}, got {}",
+        expected_remote, remote_value
+    );
+
+    println!("RC Masked Fetch-and-Add 128-bit test passed");
 }

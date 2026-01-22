@@ -10,9 +10,14 @@ use std::marker::PhantomData;
 use crate::types::GrhAttr;
 use crate::wqe::{
     ATOMIC_SEG_SIZE, CTRL_SEG_SIZE, DATA_SEG_SIZE, HasData, OrderedWqeTable,
+    MASKED_ATOMIC_SEG32_SIZE, MASKED_ATOMIC_SEG64_SIZE_CAS, MASKED_ATOMIC_SEG64_SIZE_FA,
+    MASKED_ATOMIC_SEG128_SIZE_CAS, MASKED_ATOMIC_SEG128_SIZE_FA,
     RDMA_SEG_SIZE, SubmissionError, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
     set_ctrl_seg_completion_flag, update_ctrl_seg_ds_cnt, update_ctrl_seg_wqe_idx,
     write_atomic_seg_cas, write_atomic_seg_fa, write_ctrl_seg, write_data_seg, write_inline_header,
+    write_masked_atomic_seg32_cas, write_masked_atomic_seg32_fa,
+    write_masked_atomic_seg64_cas, write_masked_atomic_seg64_fa,
+    write_masked_atomic_seg128_cas, write_masked_atomic_seg128_fa,
     write_rdma_seg,
     ADDRESS_VECTOR_SIZE, write_address_vector_roce,
     // Address Vector trait and types
@@ -77,6 +82,54 @@ fn calc_max_wqebb_nop() -> u16 {
     calc_wqebb_cnt(CTRL_SEG_SIZE)
 }
 
+/// Calculate maximum WQEBB count for Masked Atomic 32-bit operation.
+///
+/// Layout: ctrl(16) + AV + rdma(16) + masked_atomic_32(16) + sge(16)
+#[inline]
+fn calc_max_wqebb_masked_atomic_32(av_size: usize) -> u16 {
+    let size = CTRL_SEG_SIZE + av_size + RDMA_SEG_SIZE + MASKED_ATOMIC_SEG32_SIZE + DATA_SEG_SIZE;
+    calc_wqebb_cnt(size)
+}
+
+/// Calculate maximum WQEBB count for Masked Atomic 64-bit CAS operation.
+///
+/// Layout: ctrl(16) + AV + rdma(16) + masked_atomic_64_cas(32) + sge(16)
+/// Note: 64-bit CAS uses 2 segments (32 bytes total for atomic data)
+#[inline]
+fn calc_max_wqebb_masked_atomic_64_cas(av_size: usize) -> u16 {
+    let size = CTRL_SEG_SIZE + av_size + RDMA_SEG_SIZE + MASKED_ATOMIC_SEG64_SIZE_CAS + DATA_SEG_SIZE;
+    calc_wqebb_cnt(size)
+}
+
+/// Calculate maximum WQEBB count for Masked Atomic 64-bit FA operation.
+///
+/// Layout: ctrl(16) + AV + rdma(16) + masked_atomic_64_fa(16) + sge(16)
+#[inline]
+fn calc_max_wqebb_masked_atomic_64_fa(av_size: usize) -> u16 {
+    let size = CTRL_SEG_SIZE + av_size + RDMA_SEG_SIZE + MASKED_ATOMIC_SEG64_SIZE_FA + DATA_SEG_SIZE;
+    calc_wqebb_cnt(size)
+}
+
+/// Calculate maximum WQEBB count for Masked Atomic 128-bit CAS operation.
+///
+/// Layout: ctrl(16) + AV + rdma(16) + masked_atomic_128_cas(64) + sge(16)
+/// Note: 128-bit CAS uses 4 segments (64 bytes total for atomic data)
+#[inline]
+fn calc_max_wqebb_masked_atomic_128_cas(av_size: usize) -> u16 {
+    let size = CTRL_SEG_SIZE + av_size + RDMA_SEG_SIZE + MASKED_ATOMIC_SEG128_SIZE_CAS + DATA_SEG_SIZE;
+    calc_wqebb_cnt(size)
+}
+
+/// Calculate maximum WQEBB count for Masked Atomic 128-bit FA operation.
+///
+/// Layout: ctrl(16) + AV + rdma(16) + masked_atomic_128_fa(32) + sge(16)
+/// Note: 128-bit FA uses 2 segments (32 bytes total for atomic data)
+#[inline]
+fn calc_max_wqebb_masked_atomic_128_fa(av_size: usize) -> u16 {
+    let size = CTRL_SEG_SIZE + av_size + RDMA_SEG_SIZE + MASKED_ATOMIC_SEG128_SIZE_FA + DATA_SEG_SIZE;
+    calc_wqebb_cnt(size)
+}
+
 // =============================================================================
 // WqeCore
 // =============================================================================
@@ -120,6 +173,11 @@ impl<'a, Entry> WqeCore<'a, Entry> {
 
     #[inline]
     pub(super) fn write_ctrl(&mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) {
+        self.write_ctrl_with_opmod(opcode, flags, imm, 0)
+    }
+
+    #[inline]
+    pub(super) fn write_ctrl_with_opmod(&mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32, opmod: u8) {
         let flags = if self.signaled {
             flags | WqeFlags::COMPLETION
         } else {
@@ -128,7 +186,7 @@ impl<'a, Entry> WqeCore<'a, Entry> {
         unsafe {
             write_ctrl_seg(
                 self.wqe_ptr,
-                0,
+                opmod,
                 opcode as u8,
                 self.wqe_idx,
                 self.sq.sqn,
@@ -197,6 +255,95 @@ impl<'a, Entry> WqeCore<'a, Entry> {
         }
         self.offset += ATOMIC_SEG_SIZE;
         self.ds_count += 1;
+    }
+
+    #[inline]
+    pub(super) fn write_masked_atomic_cas_32(
+        &mut self,
+        swap: u32,
+        compare: u32,
+        swap_mask: u32,
+        compare_mask: u32,
+    ) {
+        unsafe {
+            write_masked_atomic_seg32_cas(
+                self.wqe_ptr.add(self.offset),
+                swap,
+                compare,
+                swap_mask,
+                compare_mask,
+            );
+        }
+        self.offset += MASKED_ATOMIC_SEG32_SIZE;
+        self.ds_count += 1;
+    }
+
+    #[inline]
+    pub(super) fn write_masked_atomic_fa_32(&mut self, add: u32, field_mask: u32) {
+        unsafe {
+            write_masked_atomic_seg32_fa(self.wqe_ptr.add(self.offset), add, field_mask);
+        }
+        self.offset += MASKED_ATOMIC_SEG32_SIZE;
+        self.ds_count += 1;
+    }
+
+    #[inline]
+    pub(super) fn write_masked_atomic_cas_64(
+        &mut self,
+        swap: u64,
+        compare: u64,
+        swap_mask: u64,
+        compare_mask: u64,
+    ) {
+        // 64-bit masked CAS uses 2 segments (32 bytes total)
+        let ptr1 = unsafe { self.wqe_ptr.add(self.offset) };
+        let ptr2 = unsafe { self.wqe_ptr.add(self.offset + 16) };
+        unsafe {
+            write_masked_atomic_seg64_cas(ptr1, ptr2, swap, compare, swap_mask, compare_mask);
+        }
+        self.offset += MASKED_ATOMIC_SEG64_SIZE_CAS;
+        self.ds_count += 2; // 2 segments
+    }
+
+    #[inline]
+    pub(super) fn write_masked_atomic_fa_64(&mut self, add: u64, field_mask: u64) {
+        unsafe {
+            write_masked_atomic_seg64_fa(self.wqe_ptr.add(self.offset), add, field_mask);
+        }
+        self.offset += MASKED_ATOMIC_SEG64_SIZE_FA;
+        self.ds_count += 1;
+    }
+
+    #[inline]
+    pub(super) fn write_masked_atomic_cas_128(
+        &mut self,
+        swap: u128,
+        compare: u128,
+        swap_mask: u128,
+        compare_mask: u128,
+    ) {
+        // 128-bit masked CAS uses 4 segments (64 bytes total)
+        unsafe {
+            write_masked_atomic_seg128_cas(
+                self.wqe_ptr.add(self.offset),
+                swap,
+                compare,
+                swap_mask,
+                compare_mask,
+            );
+        }
+        self.offset += MASKED_ATOMIC_SEG128_SIZE_CAS;
+        self.ds_count += 4; // 4 segments
+    }
+
+    #[inline]
+    pub(super) fn write_masked_atomic_fa_128(&mut self, add: u128, field_boundary: u128) {
+        // 128-bit masked FA uses 2 segments (32 bytes total)
+        unsafe {
+            write_masked_atomic_seg128_fa(self.wqe_ptr.add(self.offset), add, field_boundary);
+        }
+        self.offset += MASKED_ATOMIC_SEG128_SIZE_FA;
+        self.ds_count += 2; // 2 segments
     }
 
     #[inline]
@@ -416,6 +563,359 @@ impl<'a, Entry, A: Av> SqWqeEntryPoint<'a, Entry, A> {
         self.core.write_av(self.av);
         self.core.write_rdma(remote_addr, rkey);
         self.core.write_atomic_fa(add_value);
+        Ok(AtomicWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    // -------------------------------------------------------------------------
+    // Masked Atomic operations (32-bit and 64-bit)
+    // -------------------------------------------------------------------------
+
+    /// Start building a Masked Compare-and-Swap (32-bit) WQE.
+    ///
+    /// The masked CAS operation compares (remote_value & compare_mask) with
+    /// (compare & compare_mask). If equal, the remote value is updated to:
+    /// (remote_value & ~swap_mask) | (swap & swap_mask)
+    ///
+    /// The original remote value is returned to the local buffer.
+    ///
+    /// # Arguments
+    /// * `flags` - WQE flags
+    /// * `remote_addr` - Remote address (must be 4-byte aligned)
+    /// * `rkey` - Remote memory key
+    /// * `swap` - Value to swap in (32-bit)
+    /// * `compare` - Value to compare against (32-bit)
+    /// * `swap_mask` - Mask for swap operation
+    /// * `compare_mask` - Mask for compare operation
+    ///
+    /// # Important Notes
+    ///
+    /// **SGE Size**: The SGE must specify exactly **4 bytes** for the return buffer.
+    /// Using 8 bytes will result in incorrect return values.
+    ///
+    /// **Return Value Byte Order**: The returned value (original remote value) is
+    /// written in **big-endian** format. Use `u32::from_be()` to convert it to
+    /// native byte order.
+    ///
+    /// **Remote Memory Byte Order**: The remote memory is accessed in **native**
+    /// byte order. Write values to remote memory without byte swapping.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Read returned value
+    /// let returned = u32::from_be(local_buf.read_u32(0));
+    /// // Read remote value (native byte order)
+    /// let remote = remote_buf.read_u32(0);
+    /// ```
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
+    #[inline]
+    pub fn masked_cas_32(
+        mut self,
+        flags: WqeFlags,
+        remote_addr: u64,
+        rkey: u32,
+        swap: u32,
+        compare: u32,
+        swap_mask: u32,
+        compare_mask: u32,
+    ) -> io::Result<AtomicWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_max_wqebb_masked_atomic_32(A::SIZE);
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        // opmod = 8 for 32-bit extended atomics (UCX: (8) | (log2(4) - 2) = 8)
+        self.core.write_ctrl_with_opmod(WqeOpcode::AtomicMaskedCs, flags, 0, 8);
+        self.core.write_av(self.av);
+        self.core.write_rdma(remote_addr, rkey);
+        self.core.write_masked_atomic_cas_32(swap, compare, swap_mask, compare_mask);
+        Ok(AtomicWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    /// Start building a Masked Fetch-and-Add (32-bit) WQE.
+    ///
+    /// The masked FA operation adds `add` to the masked portion of the remote value:
+    /// result = remote_value
+    /// remote_value = (remote_value + add) & field_mask | (remote_value & ~field_mask)
+    ///
+    /// The original remote value is returned to the local buffer.
+    ///
+    /// # Arguments
+    /// * `flags` - WQE flags
+    /// * `remote_addr` - Remote address (must be 4-byte aligned)
+    /// * `rkey` - Remote memory key
+    /// * `add` - Value to add (32-bit)
+    /// * `field_mask` - Mask defining which bits are affected by the addition.
+    ///   Use `0` to treat the entire value as a single field (normal addition).
+    ///
+    /// # Important Notes
+    ///
+    /// **SGE Size**: The SGE must specify exactly **4 bytes** for the return buffer.
+    /// Using 8 bytes will result in incorrect return values.
+    ///
+    /// **Return Value Byte Order**: The returned value (original remote value) is
+    /// written in **big-endian** format. Use `u32::from_be()` to convert it to
+    /// native byte order.
+    ///
+    /// **Remote Memory Byte Order**: The remote memory is accessed in **native**
+    /// byte order. Write values to remote memory without byte swapping.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Read returned value
+    /// let returned = u32::from_be(local_buf.read_u32(0));
+    /// // Read remote value (native byte order)
+    /// let remote = remote_buf.read_u32(0);
+    /// ```
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
+    #[inline]
+    pub fn masked_fa_32(
+        mut self,
+        flags: WqeFlags,
+        remote_addr: u64,
+        rkey: u32,
+        add: u32,
+        field_mask: u32,
+    ) -> io::Result<AtomicWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_max_wqebb_masked_atomic_32(A::SIZE);
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        // opmod = 8 for 32-bit extended atomics (UCX: (8) | (log2(4) - 2) = 8)
+        self.core.write_ctrl_with_opmod(WqeOpcode::AtomicMaskedFa, flags, 0, 8);
+        self.core.write_av(self.av);
+        self.core.write_rdma(remote_addr, rkey);
+        self.core.write_masked_atomic_fa_32(add, field_mask);
+        Ok(AtomicWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    /// Start building a Masked Compare-and-Swap (64-bit) WQE.
+    ///
+    /// The masked CAS operation compares (remote_value & compare_mask) with
+    /// (compare & compare_mask). If equal, the remote value is updated to:
+    /// (remote_value & ~swap_mask) | (swap & swap_mask)
+    ///
+    /// The original remote value is returned to the local buffer.
+    ///
+    /// Note: 64-bit masked CAS uses 2 WQEBB segments (32 bytes for atomic data).
+    ///
+    /// # Arguments
+    /// * `flags` - WQE flags
+    /// * `remote_addr` - Remote address (must be 8-byte aligned)
+    /// * `rkey` - Remote memory key
+    /// * `swap` - Value to swap in (64-bit)
+    /// * `compare` - Value to compare against (64-bit)
+    /// * `swap_mask` - Mask for swap operation
+    /// * `compare_mask` - Mask for compare operation
+    ///
+    /// # Important Notes
+    ///
+    /// **SGE Size**: The SGE must specify exactly **8 bytes** for the return buffer.
+    ///
+    /// **Return Value Byte Order**: Unlike 32-bit masked atomics, the returned value
+    /// is written in **native** byte order. Read it directly without byte swapping.
+    ///
+    /// **Remote Memory Byte Order**: The remote memory is accessed in **native**
+    /// byte order. Write values to remote memory without byte swapping.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Read returned value (native byte order)
+    /// let returned = local_buf.read_u64(0);
+    /// // Read remote value (native byte order)
+    /// let remote = remote_buf.read_u64(0);
+    /// ```
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
+    #[inline]
+    pub fn masked_cas_64(
+        mut self,
+        flags: WqeFlags,
+        remote_addr: u64,
+        rkey: u32,
+        swap: u64,
+        compare: u64,
+        swap_mask: u64,
+        compare_mask: u64,
+    ) -> io::Result<AtomicWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_max_wqebb_masked_atomic_64_cas(A::SIZE);
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        // opmod = 9 for 64-bit extended atomics (UCX: (8) | (log2(8) - 2) = 9)
+        self.core.write_ctrl_with_opmod(WqeOpcode::AtomicMaskedCs, flags, 0, 9);
+        self.core.write_av(self.av);
+        self.core.write_rdma(remote_addr, rkey);
+        self.core.write_masked_atomic_cas_64(swap, compare, swap_mask, compare_mask);
+        Ok(AtomicWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    /// Start building a Masked Fetch-and-Add (64-bit) WQE.
+    ///
+    /// The masked FA operation adds `add` to the masked portion of the remote value:
+    /// result = remote_value
+    /// remote_value = (remote_value + add) & field_mask | (remote_value & ~field_mask)
+    ///
+    /// The original remote value is returned to the local buffer.
+    ///
+    /// # Arguments
+    /// * `flags` - WQE flags
+    /// * `remote_addr` - Remote address (must be 8-byte aligned)
+    /// * `rkey` - Remote memory key
+    /// * `add` - Value to add (64-bit)
+    /// * `field_mask` - Mask defining which bits are affected by the addition.
+    ///   Use `0` to treat the entire value as a single field (normal addition).
+    ///
+    /// # Important Notes
+    ///
+    /// **SGE Size**: The SGE must specify exactly **8 bytes** for the return buffer.
+    ///
+    /// **Return Value Byte Order**: Unlike 32-bit masked atomics, the returned value
+    /// is written in **native** byte order. Read it directly without byte swapping.
+    ///
+    /// **Remote Memory Byte Order**: The remote memory is accessed in **native**
+    /// byte order. Write values to remote memory without byte swapping.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Read returned value (native byte order)
+    /// let returned = local_buf.read_u64(0);
+    /// // Read remote value (native byte order)
+    /// let remote = remote_buf.read_u64(0);
+    /// ```
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
+    #[inline]
+    pub fn masked_fa_64(
+        mut self,
+        flags: WqeFlags,
+        remote_addr: u64,
+        rkey: u32,
+        add: u64,
+        field_mask: u64,
+    ) -> io::Result<AtomicWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_max_wqebb_masked_atomic_64_fa(A::SIZE);
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        // opmod = 9 for 64-bit extended atomics (UCX: (8) | (log2(8) - 2) = 9)
+        self.core.write_ctrl_with_opmod(WqeOpcode::AtomicMaskedFa, flags, 0, 9);
+        self.core.write_av(self.av);
+        self.core.write_rdma(remote_addr, rkey);
+        self.core.write_masked_atomic_fa_64(add, field_mask);
+        Ok(AtomicWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    // -------------------------------------------------------------------------
+    // Masked Atomic operations (128-bit)
+    // -------------------------------------------------------------------------
+
+    /// Start building a Masked Compare-and-Swap (128-bit) WQE.
+    ///
+    /// The masked CAS operation compares (remote_value & compare_mask) with
+    /// (compare & compare_mask). If equal, the remote value is updated to:
+    /// (remote_value & ~swap_mask) | (swap & swap_mask)
+    ///
+    /// The original remote value is returned to the local buffer.
+    ///
+    /// Note: 128-bit masked CAS uses 4 WQEBB segments (64 bytes for atomic data).
+    ///
+    /// # Arguments
+    /// * `flags` - WQE flags
+    /// * `remote_addr` - Remote address (must be 16-byte aligned)
+    /// * `rkey` - Remote memory key
+    /// * `swap` - Value to swap in (128-bit)
+    /// * `compare` - Value to compare against (128-bit)
+    /// * `swap_mask` - Mask for swap operation
+    /// * `compare_mask` - Mask for compare operation
+    ///
+    /// # Important Notes
+    ///
+    /// **SGE Size**: The SGE must specify exactly **16 bytes** for the return buffer.
+    ///
+    /// **Return Value Byte Order**: The returned value is expected to be in **native**
+    /// byte order. Read it directly without byte swapping.
+    ///
+    /// **Remote Memory Byte Order**: The remote memory is accessed in **native**
+    /// byte order. Write values to remote memory without byte swapping.
+    ///
+    /// **Device Support**: 128-bit atomics require specific hardware support.
+    /// Check `atomic_size_qp` capability bit 4 (0x10).
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
+    #[inline]
+    pub fn masked_cas_128(
+        mut self,
+        flags: WqeFlags,
+        remote_addr: u64,
+        rkey: u32,
+        swap: u128,
+        compare: u128,
+        swap_mask: u128,
+        compare_mask: u128,
+    ) -> io::Result<AtomicWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_max_wqebb_masked_atomic_128_cas(A::SIZE);
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        // opmod = 10 for 128-bit extended atomics (8 | (log2(16) - 2) = 8 | 2 = 10)
+        self.core.write_ctrl_with_opmod(WqeOpcode::AtomicMaskedCs, flags, 0, 10);
+        self.core.write_av(self.av);
+        self.core.write_rdma(remote_addr, rkey);
+        self.core.write_masked_atomic_cas_128(swap, compare, swap_mask, compare_mask);
+        Ok(AtomicWqeBuilder { core: self.core, _data: PhantomData })
+    }
+
+    /// Start building a Masked Fetch-and-Add (128-bit) WQE.
+    ///
+    /// The masked FA operation adds `add` to the masked portion of the remote value:
+    /// result = remote_value
+    /// remote_value = (remote_value + add) & field_boundary | (remote_value & ~field_boundary)
+    ///
+    /// The original remote value is returned to the local buffer.
+    ///
+    /// Note: 128-bit masked FA uses 2 WQEBB segments (32 bytes for atomic data).
+    ///
+    /// # Arguments
+    /// * `flags` - WQE flags
+    /// * `remote_addr` - Remote address (must be 16-byte aligned)
+    /// * `rkey` - Remote memory key
+    /// * `add` - Value to add (128-bit)
+    /// * `field_boundary` - Mask defining which bits are affected by the addition.
+    ///   Use `0` to treat the entire value as a single field (normal addition).
+    ///
+    /// # Important Notes
+    ///
+    /// **SGE Size**: The SGE must specify exactly **16 bytes** for the return buffer.
+    ///
+    /// **Return Value Byte Order**: The returned value is expected to be in **native**
+    /// byte order. Read it directly without byte swapping.
+    ///
+    /// **Remote Memory Byte Order**: The remote memory is accessed in **native**
+    /// byte order. Write values to remote memory without byte swapping.
+    ///
+    /// **Device Support**: 128-bit atomics require specific hardware support.
+    /// Check `atomic_size_qp` capability bit 4 (0x10).
+    ///
+    /// Returns `Err(WouldBlock)` if the SQ doesn't have enough space for the WQE.
+    #[inline]
+    pub fn masked_fa_128(
+        mut self,
+        flags: WqeFlags,
+        remote_addr: u64,
+        rkey: u32,
+        add: u128,
+        field_boundary: u128,
+    ) -> io::Result<AtomicWqeBuilder<'a, Entry, NoData>> {
+        let max_wqebb = calc_max_wqebb_masked_atomic_128_fa(A::SIZE);
+        if self.core.available() < max_wqebb {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        // opmod = 10 for 128-bit extended atomics (8 | (log2(16) - 2) = 8 | 2 = 10)
+        self.core.write_ctrl_with_opmod(WqeOpcode::AtomicMaskedFa, flags, 0, 10);
+        self.core.write_av(self.av);
+        self.core.write_rdma(remote_addr, rkey);
+        self.core.write_masked_atomic_fa_128(add, field_boundary);
         Ok(AtomicWqeBuilder { core: self.core, _data: PhantomData })
     }
 
