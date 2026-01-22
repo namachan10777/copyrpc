@@ -68,6 +68,7 @@ pub const CTRL_SEG_SIZE: usize = 16;
 /// # Safety
 /// The pointer must point to at least 16 bytes of writable memory.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn write_ctrl_seg(
     ptr: *mut u8,
     opmod: u8,
@@ -527,6 +528,28 @@ pub enum WqeOpcode {
     AtomicMaskedCs = 0x14,
     AtomicMaskedFa = 0x15,
     TagMatching = 0x28,
+}
+
+/// Parameters for Masked Compare-and-Swap operation.
+///
+/// A masked CAS compares the remote value against `compare` using `compare_mask`,
+/// and if they match, replaces the masked portion with `swap` using `swap_mask`.
+///
+/// The operation is:
+/// ```text
+/// if (remote_value & compare_mask) == (compare & compare_mask):
+///     remote_value = (remote_value & ~swap_mask) | (swap & swap_mask)
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct MaskedCasParams<T> {
+    /// Value to swap in if comparison succeeds.
+    pub swap: T,
+    /// Value to compare against.
+    pub compare: T,
+    /// Mask for swap operation (which bits to replace).
+    pub swap_mask: T,
+    /// Mask for compare operation (which bits to compare).
+    pub compare_mask: T,
 }
 
 bitflags! {

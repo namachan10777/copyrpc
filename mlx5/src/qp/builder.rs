@@ -9,7 +9,7 @@ use std::marker::PhantomData;
 
 use crate::types::GrhAttr;
 use crate::wqe::{
-    ATOMIC_SEG_SIZE, CTRL_SEG_SIZE, DATA_SEG_SIZE, HasData, OrderedWqeTable,
+    ATOMIC_SEG_SIZE, CTRL_SEG_SIZE, DATA_SEG_SIZE, HasData, MaskedCasParams, OrderedWqeTable,
     MASKED_ATOMIC_SEG32_SIZE, MASKED_ATOMIC_SEG64_SIZE_CAS, MASKED_ATOMIC_SEG64_SIZE_FA,
     MASKED_ATOMIC_SEG128_SIZE_CAS, MASKED_ATOMIC_SEG128_SIZE_FA,
     RDMA_SEG_SIZE, SubmissionError, WQEBB_SIZE, WqeFlags, WqeHandle, WqeOpcode, calc_wqebb_cnt,
@@ -582,10 +582,7 @@ impl<'a, Entry, A: Av> SqWqeEntryPoint<'a, Entry, A> {
     /// * `flags` - WQE flags
     /// * `remote_addr` - Remote address (must be 4-byte aligned)
     /// * `rkey` - Remote memory key
-    /// * `swap` - Value to swap in (32-bit)
-    /// * `compare` - Value to compare against (32-bit)
-    /// * `swap_mask` - Mask for swap operation
-    /// * `compare_mask` - Mask for compare operation
+    /// * `params` - Masked CAS parameters (swap, compare, swap_mask, compare_mask)
     ///
     /// # Important Notes
     ///
@@ -614,10 +611,7 @@ impl<'a, Entry, A: Av> SqWqeEntryPoint<'a, Entry, A> {
         flags: WqeFlags,
         remote_addr: u64,
         rkey: u32,
-        swap: u32,
-        compare: u32,
-        swap_mask: u32,
-        compare_mask: u32,
+        params: MaskedCasParams<u32>,
     ) -> io::Result<AtomicWqeBuilder<'a, Entry, NoData>> {
         let max_wqebb = calc_max_wqebb_masked_atomic_32(A::SIZE);
         if self.core.available() < max_wqebb {
@@ -627,7 +621,7 @@ impl<'a, Entry, A: Av> SqWqeEntryPoint<'a, Entry, A> {
         self.core.write_ctrl_with_opmod(WqeOpcode::AtomicMaskedCs, flags, 0, 8);
         self.core.write_av(self.av);
         self.core.write_rdma(remote_addr, rkey);
-        self.core.write_masked_atomic_cas_32(swap, compare, swap_mask, compare_mask);
+        self.core.write_masked_atomic_cas_32(params.swap, params.compare, params.swap_mask, params.compare_mask);
         Ok(AtomicWqeBuilder { core: self.core, _data: PhantomData })
     }
 
@@ -703,10 +697,7 @@ impl<'a, Entry, A: Av> SqWqeEntryPoint<'a, Entry, A> {
     /// * `flags` - WQE flags
     /// * `remote_addr` - Remote address (must be 8-byte aligned)
     /// * `rkey` - Remote memory key
-    /// * `swap` - Value to swap in (64-bit)
-    /// * `compare` - Value to compare against (64-bit)
-    /// * `swap_mask` - Mask for swap operation
-    /// * `compare_mask` - Mask for compare operation
+    /// * `params` - Masked CAS parameters (swap, compare, swap_mask, compare_mask)
     ///
     /// # Important Notes
     ///
@@ -733,10 +724,7 @@ impl<'a, Entry, A: Av> SqWqeEntryPoint<'a, Entry, A> {
         flags: WqeFlags,
         remote_addr: u64,
         rkey: u32,
-        swap: u64,
-        compare: u64,
-        swap_mask: u64,
-        compare_mask: u64,
+        params: MaskedCasParams<u64>,
     ) -> io::Result<AtomicWqeBuilder<'a, Entry, NoData>> {
         let max_wqebb = calc_max_wqebb_masked_atomic_64_cas(A::SIZE);
         if self.core.available() < max_wqebb {
@@ -746,7 +734,7 @@ impl<'a, Entry, A: Av> SqWqeEntryPoint<'a, Entry, A> {
         self.core.write_ctrl_with_opmod(WqeOpcode::AtomicMaskedCs, flags, 0, 9);
         self.core.write_av(self.av);
         self.core.write_rdma(remote_addr, rkey);
-        self.core.write_masked_atomic_cas_64(swap, compare, swap_mask, compare_mask);
+        self.core.write_masked_atomic_cas_64(params.swap, params.compare, params.swap_mask, params.compare_mask);
         Ok(AtomicWqeBuilder { core: self.core, _data: PhantomData })
     }
 
@@ -824,10 +812,7 @@ impl<'a, Entry, A: Av> SqWqeEntryPoint<'a, Entry, A> {
     /// * `flags` - WQE flags
     /// * `remote_addr` - Remote address (must be 16-byte aligned)
     /// * `rkey` - Remote memory key
-    /// * `swap` - Value to swap in (128-bit)
-    /// * `compare` - Value to compare against (128-bit)
-    /// * `swap_mask` - Mask for swap operation
-    /// * `compare_mask` - Mask for compare operation
+    /// * `params` - Masked CAS parameters (swap, compare, swap_mask, compare_mask)
     ///
     /// # Important Notes
     ///
@@ -849,10 +834,7 @@ impl<'a, Entry, A: Av> SqWqeEntryPoint<'a, Entry, A> {
         flags: WqeFlags,
         remote_addr: u64,
         rkey: u32,
-        swap: u128,
-        compare: u128,
-        swap_mask: u128,
-        compare_mask: u128,
+        params: MaskedCasParams<u128>,
     ) -> io::Result<AtomicWqeBuilder<'a, Entry, NoData>> {
         let max_wqebb = calc_max_wqebb_masked_atomic_128_cas(A::SIZE);
         if self.core.available() < max_wqebb {
@@ -862,7 +844,7 @@ impl<'a, Entry, A: Av> SqWqeEntryPoint<'a, Entry, A> {
         self.core.write_ctrl_with_opmod(WqeOpcode::AtomicMaskedCs, flags, 0, 10);
         self.core.write_av(self.av);
         self.core.write_rdma(remote_addr, rkey);
-        self.core.write_masked_atomic_cas_128(swap, compare, swap_mask, compare_mask);
+        self.core.write_masked_atomic_cas_128(params.swap, params.compare, params.swap_mask, params.compare_mask);
         Ok(AtomicWqeBuilder { core: self.core, _data: PhantomData })
     }
 

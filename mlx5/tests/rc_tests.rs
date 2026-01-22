@@ -19,7 +19,7 @@ use std::rc::Rc;
 use mlx5::cq::CqConfig;
 use mlx5::qp::{QpState, RcQpConfig, RcQpIb};
 use mlx5::transport::IbRemoteQpInfo;
-use mlx5::wqe::WqeFlags;
+use mlx5::wqe::{MaskedCasParams, WqeFlags};
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
@@ -568,10 +568,12 @@ fn test_rc_masked_cas_32_success() {
             WqeFlags::empty(),
             remote_buf.addr(),
             remote_mr.rkey(),
-            swap_value,
-            compare_value,
-            swap_mask,
-            compare_mask,
+            MaskedCasParams {
+                swap: swap_value,
+                compare: compare_value,
+                swap_mask,
+                compare_mask,
+            },
         )
         .expect("masked_cas_32 failed")
         .sge(local_buf.addr(), 4, local_mr.lkey())
@@ -665,10 +667,12 @@ fn test_rc_masked_cas_32_failure() {
             WqeFlags::empty(),
             remote_buf.addr(),
             remote_mr.rkey(),
-            swap_value,
-            compare_value,
-            swap_mask,
-            compare_mask,
+            MaskedCasParams {
+                swap: swap_value,
+                compare: compare_value,
+                swap_mask,
+                compare_mask,
+            },
         )
         .expect("masked_cas_32 failed")
         .sge(local_buf.addr(), 4, local_mr.lkey())
@@ -883,10 +887,12 @@ fn test_rc_masked_cas_64_success() {
             WqeFlags::empty(),
             remote_buf.addr(),
             remote_mr.rkey(),
-            swap_value,
-            compare_value,
-            swap_mask,
-            compare_mask,
+            MaskedCasParams {
+                swap: swap_value,
+                compare: compare_value,
+                swap_mask,
+                compare_mask,
+            },
         )
         .expect("masked_cas_64 failed")
         .sge(local_buf.addr(), 8, local_mr.lkey())
@@ -1640,10 +1646,12 @@ fn test_rc_masked_cas_128_success() {
             WqeFlags::empty(),
             remote_buf.addr(),
             remote_mr.rkey(),
-            swap_value,
-            compare_value,
-            swap_mask,
-            compare_mask,
+            MaskedCasParams {
+                swap: swap_value,
+                compare: compare_value,
+                swap_mask,
+                compare_mask,
+            },
         )
         .expect("masked_cas_128 failed")
         .sge(local_buf.addr(), 16, local_mr.lkey())
