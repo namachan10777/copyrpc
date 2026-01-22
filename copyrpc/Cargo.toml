@@ -14,3 +14,7 @@ libc = "0.2"
 [[bench]]
 name = "pingpong"
 harness = false
+
+[[bench]]
+name = "copyrpc_pingpong"
+harness = false

@@ -46,6 +46,10 @@ pub const HEADER_SIZE: usize = 12;
 /// Bit flag in call_id indicating this is a response (not a request).
 pub const RESPONSE_FLAG: u32 = 0x8000_0000;
 
+/// Special call_id indicating a padding marker for wrap-around.
+/// When the ring buffer wraps, we write this marker at the end and jump to the beginning.
+pub const PADDING_MARKER: u32 = 0xFFFF_FFFF;
+
 /// Encode a message header into the buffer.
 ///
 /// Header layout:
@@ -82,7 +86,13 @@ pub unsafe fn decode_header(buf: *const u8) -> (u32, u32, u32) {
 /// Check if a call_id indicates a response message.
 #[inline]
 pub fn is_response(call_id: u32) -> bool {
-    (call_id & RESPONSE_FLAG) != 0
+    call_id != PADDING_MARKER && (call_id & RESPONSE_FLAG) != 0
+}
+
+/// Check if a call_id indicates a padding marker (wrap-around).
+#[inline]
+pub fn is_padding_marker(call_id: u32) -> bool {
+    call_id == PADDING_MARKER
 }
 
 /// Convert a request call_id to a response call_id.
@@ -104,6 +114,23 @@ pub fn from_response_id(call_id: u32) -> u32 {
 pub fn padded_message_size(payload_len: u32) -> u64 {
     let total = HEADER_SIZE as u64 + payload_len as u64;
     (total + ALIGNMENT - 1) & !(ALIGNMENT - 1)
+}
+
+/// Write a padding marker at the given buffer position.
+///
+/// The padding marker fills the remaining space at the end of the ring buffer
+/// when a message would wrap around. The `remaining` parameter is the number
+/// of bytes from the current position to the end of the ring.
+///
+/// # Safety
+/// The buffer must have at least HEADER_SIZE bytes available.
+#[inline]
+pub unsafe fn write_padding_marker(buf: *mut u8, remaining: u32) {
+    let ptr = buf as *mut u32;
+    std::ptr::write(ptr, PADDING_MARKER.to_le());
+    // Store remaining space in piggyback field for receiver to know how much to skip
+    std::ptr::write(ptr.add(1), remaining.to_le());
+    std::ptr::write(ptr.add(2), 0u32.to_le()); // payload_len = 0
 }
 
 #[cfg(test)]
