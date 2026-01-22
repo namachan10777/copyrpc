@@ -19,10 +19,9 @@ mod common;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use mlx5::cq::{CqConfig, Cqe, CqeOpcode};
+use mlx5::cq::{CqConfig, Cqe};
 use mlx5::dc::DciConfig;
 use mlx5::tm_srq::{TmSrqCompletion, TmSrqConfig};
-use mlx5::wqe::WqeOpcode;
 
 use common::{AlignedBuffer, TestContext, full_access};
 
@@ -76,7 +75,7 @@ fn test_tm_srq_direct_access() {
 
     require_tm_srq!(&ctx);
 
-    let mut cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ");
+    let cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ");
     let cq = Rc::new(cq);
 
     let config = TmSrqConfig {
@@ -181,7 +180,7 @@ fn test_tm_tag_add_remove() {
     }
     cq.flush();
 
-    let add_cqe = captured_cqes.borrow()[0].clone();
+    let add_cqe = captured_cqes.borrow()[0];
     println!(
         "Add CQE: opcode={:?}, wqe_counter={}, qp_num=0x{:x}, syndrome={}",
         add_cqe.opcode, add_cqe.wqe_counter, add_cqe.qp_num, add_cqe.syndrome
@@ -224,7 +223,7 @@ fn test_tm_tag_add_remove() {
     }
     cq.flush();
 
-    let del_cqe = captured_cqes.borrow()[0].clone();
+    let del_cqe = captured_cqes.borrow()[0];
     println!(
         "Del CQE: opcode={:?}, wqe_counter={}, qp_num=0x{:x}, syndrome={}",
         del_cqe.opcode, del_cqe.wqe_counter, del_cqe.qp_num, del_cqe.syndrome
@@ -261,11 +260,11 @@ fn test_tm_tag_matching_with_dc() {
     require_tm_srq!(&ctx);
 
     // Create CQ for DCI
-    let mut dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
+    let dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
     let dci_cq = Rc::new(dci_cq);
 
     // Create CQ for TM-SRQ
-    let mut tm_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create TM CQ");
+    let tm_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create TM CQ");
     let tm_cq = Rc::new(tm_cq);
 
     // Create TM-SRQ
@@ -276,7 +275,7 @@ fn test_tm_tag_matching_with_dc() {
         max_ops: 8,
     };
 
-    let tm_srq = ctx
+    let _tm_srq = ctx
         .ctx
         .create_tm_srq::<u64, u64, _>(&ctx.pd, &tm_cq, &tm_config, |_| {})
         .expect("Failed to create TM-SRQ");
@@ -389,7 +388,7 @@ fn test_tm_multiple_tags() {
             std::hint::spin_loop();
         }
 
-        let cqe = captured_cqes.borrow().last().unwrap().clone();
+        let cqe = *captured_cqes.borrow().last().unwrap();
         // TM operations should complete without error (syndrome == 0)
         assert_eq!(
             cqe.syndrome, 0,
@@ -424,7 +423,7 @@ fn test_tm_multiple_tags() {
             std::hint::spin_loop();
         }
 
-        let cqe = captured_cqes.borrow().last().unwrap().clone();
+        let cqe = *captured_cqes.borrow().last().unwrap();
         // TM operations should complete without error (syndrome == 0)
         assert_eq!(
             cqe.syndrome, 0,
@@ -454,7 +453,7 @@ fn test_tm_unordered_recv() {
 
     require_tm_srq!(&ctx);
 
-    let mut cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ");
+    let cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ");
     let cq = Rc::new(cq);
 
     let config = TmSrqConfig {
@@ -511,7 +510,7 @@ fn test_tm_tag_via_verbs_api() {
 
     require_tm_srq!(&ctx);
 
-    let mut cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ");
+    let cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ");
     let cq = Rc::new(cq);
 
     let config = TmSrqConfig {

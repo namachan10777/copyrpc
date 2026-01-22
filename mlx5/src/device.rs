@@ -352,9 +352,9 @@ impl Context {
             }
             let attr = attr.assume_init();
             Some(PciAtomicCaps {
-                fetch_add: attr.pci_atomic_caps.fetch_add as u16,
-                swap: attr.pci_atomic_caps.swap as u16,
-                compare_swap: attr.pci_atomic_caps.compare_swap as u16,
+                fetch_add: attr.pci_atomic_caps.fetch_add,
+                swap: attr.pci_atomic_caps.swap,
+                compare_swap: attr.pci_atomic_caps.compare_swap,
             })
         }
     }

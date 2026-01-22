@@ -214,6 +214,7 @@ fn open_mlx5_device() -> Option<Context> {
     None
 }
 
+#[allow(clippy::type_complexity)]
 fn setup_mono_cq_benchmark() -> Option<MonoCqBenchmarkSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u64)>> {
     let ctx = open_mlx5_device()?;
     let port = 1u8;
@@ -580,8 +581,7 @@ fn server_thread_main(
         // 3. RX WQE再補充
         {
             let qp_ref = qp.borrow();
-            for i in 0..rx_count {
-                let idx = rx_indices[i];
+            for &idx in rx_indices.iter().take(rx_count) {
                 let offset = (idx * 256) as u64;
                 qp_ref
                     .post_recv(idx as u64, recv_buf.addr() + offset, 256, recv_mr.lkey())
@@ -701,8 +701,7 @@ where
 
         {
             let qp = client.qp.borrow();
-            for i in 0..rx_count {
-                let idx = rx_indices[i];
+            for &idx in rx_indices.iter().take(rx_count) {
                 let offset = (idx * 256) as u64;
                 qp.post_recv(idx as u64, client.recv_buf.addr() + offset, 256, client.recv_mr.lkey())
                     .unwrap();
@@ -777,8 +776,7 @@ where
 
         let rx_indices = *client.shared_state.rx_indices.borrow();
         let qp = client.qp.borrow();
-        for i in 0..rx_count {
-            let idx = rx_indices[i];
+        for &idx in rx_indices.iter().take(rx_count) {
             let offset = (idx * 256) as u64;
             qp.post_recv(idx as u64, client.recv_buf.addr() + offset, 256, client.recv_mr.lkey())
                 .unwrap();

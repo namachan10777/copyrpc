@@ -22,7 +22,7 @@ use crate::pd::{AddressHandle, Pd};
 use crate::qp::QpInfo;
 use crate::srq::Srq;
 use crate::transport::{InfiniBand, RoCE};
-use crate::wqe::{CTRL_SEG_SIZE, DATA_SEG_SIZE, OrderedWqeTable, WQEBB_SIZE, WqeFlags, WqeOpcode, write_ctrl_seg, write_data_seg};
+use crate::wqe::{OrderedWqeTable, WQEBB_SIZE, WqeFlags, WqeOpcode, write_ctrl_seg, write_data_seg};
 
 // =============================================================================
 // UD Configuration
@@ -434,6 +434,22 @@ pub type UdQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
 /// # NOTE: RoCE support is untested (IB-only hardware environment)
 pub type UdQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
     UdQp<SqEntry, RqEntry, RoCE, OrderedWqeTable<SqEntry>, UdSharedRq<RqEntry>, OnSqComplete, OnRqComplete>;
+
+/// Handle to UD QP (InfiniBand) wrapped in `Rc<RefCell<...>>`.
+pub type UdQpIbHandle<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
+    Rc<RefCell<UdQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>>;
+
+/// Handle to UD QP with SRQ (InfiniBand) wrapped in `Rc<RefCell<...>>`.
+pub type UdQpIbWithSrqHandle<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
+    Rc<RefCell<UdQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>>;
+
+/// Handle to UD QP (RoCE) wrapped in `Rc<RefCell<...>>`.
+pub type UdQpRoCEHandle<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
+    Rc<RefCell<UdQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>>;
+
+/// Handle to UD QP with SRQ (RoCE) wrapped in `Rc<RefCell<...>>`.
+pub type UdQpRoCEWithSrqHandle<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
+    Rc<RefCell<UdQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>>;
 
 /// UD (Unreliable Datagram) Queue Pair.
 ///
@@ -1199,7 +1215,7 @@ where
     OnRq: Fn(Cqe, RqEntry) + 'static,
 {
     /// Build the UD QP.
-    pub fn build(self) -> io::Result<Rc<RefCell<UdQpIb<SqEntry, RqEntry, OnSq, OnRq>>>> {
+    pub fn build(self) -> io::Result<UdQpIbHandle<SqEntry, RqEntry, OnSq, OnRq>> {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_UD;
@@ -1231,8 +1247,8 @@ where
                 rq: UdOwnedRq::new(None),
                 sq_callback: self.sq_callback,
                 rq_callback: self.rq_callback,
-                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
-                recv_cq: self.recv_cq_weak.unwrap_or_else(Weak::new),
+                send_cq: self.send_cq_weak.unwrap_or_default(),
+                recv_cq: self.recv_cq_weak.unwrap_or_default(),
                 _pd: self.pd.clone(),
                 _marker: std::marker::PhantomData,
             };
@@ -1268,7 +1284,7 @@ where
     OnRq: Fn(Cqe, RqEntry) + 'static,
 {
     /// Build the UD QP with SRQ.
-    pub fn build(self) -> io::Result<Rc<RefCell<UdQpIbWithSrq<SqEntry, RqEntry, OnSq, OnRq>>>> {
+    pub fn build(self) -> io::Result<UdQpIbWithSrqHandle<SqEntry, RqEntry, OnSq, OnRq>> {
         let srq = self.srq.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "SRQ not set")
         })?;
@@ -1307,8 +1323,8 @@ where
                 rq: UdSharedRq::new(srq_inner),
                 sq_callback: self.sq_callback,
                 rq_callback: self.rq_callback,
-                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
-                recv_cq: self.recv_cq_weak.unwrap_or_else(Weak::new),
+                send_cq: self.send_cq_weak.unwrap_or_default(),
+                recv_cq: self.recv_cq_weak.unwrap_or_default(),
                 _pd: self.pd.clone(),
                 _marker: std::marker::PhantomData,
             };
@@ -1346,7 +1362,7 @@ where
     /// Build the UD QP for RoCE.
     ///
     /// # NOTE: RoCE support is untested (IB-only hardware environment)
-    pub fn build(self) -> io::Result<Rc<RefCell<UdQpRoCE<SqEntry, RqEntry, OnSq, OnRq>>>> {
+    pub fn build(self) -> io::Result<UdQpRoCEHandle<SqEntry, RqEntry, OnSq, OnRq>> {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_UD;
@@ -1378,8 +1394,8 @@ where
                 rq: UdOwnedRq::new(None),
                 sq_callback: self.sq_callback,
                 rq_callback: self.rq_callback,
-                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
-                recv_cq: self.recv_cq_weak.unwrap_or_else(Weak::new),
+                send_cq: self.send_cq_weak.unwrap_or_default(),
+                recv_cq: self.recv_cq_weak.unwrap_or_default(),
                 _pd: self.pd.clone(),
                 _marker: std::marker::PhantomData,
             };
@@ -1417,7 +1433,7 @@ where
     /// Build the UD QP with SRQ for RoCE.
     ///
     /// # NOTE: RoCE support is untested (IB-only hardware environment)
-    pub fn build(self) -> io::Result<Rc<RefCell<UdQpRoCEWithSrq<SqEntry, RqEntry, OnSq, OnRq>>>> {
+    pub fn build(self) -> io::Result<UdQpRoCEWithSrqHandle<SqEntry, RqEntry, OnSq, OnRq>> {
         let srq = self.srq.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "SRQ not set")
         })?;
@@ -1456,8 +1472,8 @@ where
                 rq: UdSharedRq::new(srq_inner),
                 sq_callback: self.sq_callback,
                 rq_callback: self.rq_callback,
-                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
-                recv_cq: self.recv_cq_weak.unwrap_or_else(Weak::new),
+                send_cq: self.send_cq_weak.unwrap_or_default(),
+                recv_cq: self.recv_cq_weak.unwrap_or_default(),
                 _pd: self.pd.clone(),
                 _marker: std::marker::PhantomData,
             };

@@ -184,7 +184,7 @@ impl<CmdEntry, CmdTableType> CmdQpState<CmdEntry, CmdTableType> {
 
         if self.bf_size > 0 {
             let bf = unsafe { self.bf_reg.add(self.bf_offset.get() as usize) };
-            mlx5_bf_copy!(bf, wqe_ptr);
+            unsafe { mlx5_bf_copy!(bf, wqe_ptr) };
             mmio_flush_writes!();
             self.bf_offset.set(self.bf_offset.get() ^ self.bf_size);
         } else {

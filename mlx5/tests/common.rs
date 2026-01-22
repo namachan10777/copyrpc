@@ -2,6 +2,8 @@
 //!
 //! This module provides helper functions and types for writing RDMA tests.
 
+#![allow(dead_code)]
+
 use mlx5::cq::{Cq, CqConfig, Cqe};
 use mlx5::device::{Context, DeviceList};
 use mlx5::pd::{AccessFlags, Pd};

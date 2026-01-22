@@ -168,9 +168,11 @@ where
     send_cq: Rc<MonoCqRc<u64, SF>>,
     recv_cq: Rc<MonoCqRc<u64, RF>>,
     shared_state: SharedCqeState,
-    send_mr: MemoryRegion,
+    #[allow(dead_code)]
+    send_mr: MemoryRegion, // Kept for RAII - prevents early drop
     recv_mr: MemoryRegion,
-    send_buf: AlignedBuffer,
+    #[allow(dead_code)]
+    send_buf: AlignedBuffer, // Kept for RAII - prevents early drop
     recv_buf: AlignedBuffer,
 }
 
@@ -199,6 +201,7 @@ fn open_mlx5_device() -> Option<Context> {
     None
 }
 
+#[allow(clippy::type_complexity)]
 fn setup_benchmark(
     enable_scatter_to_cqe: bool,
 ) -> Option<BenchmarkSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u64)>> {

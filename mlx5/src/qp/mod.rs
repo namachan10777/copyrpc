@@ -18,7 +18,7 @@ use crate::srq::Srq;
 use crate::transport::{IbRemoteQpInfo, RoCERemoteQpInfo};
 use crate::types::GrhAttr;
 use crate::wqe::{
-    CTRL_SEG_SIZE, DATA_SEG_SIZE, OrderedWqeTable, SubmissionError, WQEBB_SIZE, WqeFlags, WqeOpcode,
+    DATA_SEG_SIZE, OrderedWqeTable, SubmissionError, WQEBB_SIZE, WqeFlags, WqeOpcode,
     write_ctrl_seg, write_data_seg,
     // Transport type tags
     InfiniBand, RoCE,
@@ -396,6 +396,22 @@ pub type RcQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = RcQp<SqEntry, 
 /// - `OnSqComplete`: SQ completion callback type `Fn(Cqe, SqEntry)`
 /// - `OnRqComplete`: RQ completion callback type `Fn(Cqe, RqEntry)`
 pub type RcQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = RcQp<SqEntry, RqEntry, RoCE, OrderedWqeTable<SqEntry>, SharedRq<RqEntry>, OnSqComplete, OnRqComplete>;
+
+/// Handle to RC QP (InfiniBand) wrapped in `Rc<RefCell<...>>`.
+pub type RcQpIbHandle<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
+    Rc<RefCell<RcQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>>;
+
+/// Handle to RC QP with SRQ (InfiniBand) wrapped in `Rc<RefCell<...>>`.
+pub type RcQpIbWithSrqHandle<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
+    Rc<RefCell<RcQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>>;
+
+/// Handle to RC QP (RoCE) wrapped in `Rc<RefCell<...>>`.
+pub type RcQpRoCEHandle<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
+    Rc<RefCell<RcQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>>;
+
+/// Handle to RC QP with SRQ (RoCE) wrapped in `Rc<RefCell<...>>`.
+pub type RcQpRoCEWithSrqHandle<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
+    Rc<RefCell<RcQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>>;
 
 /// RC (Reliable Connection) Queue Pair (internal implementation).
 ///
@@ -1587,7 +1603,7 @@ where
     /// Build the RC QP.
     ///
     /// Only available when both SQ and RQ CQs are configured.
-    pub fn build(self) -> io::Result<Rc<RefCell<RcQpIb<SqEntry, RqEntry, OnSq, OnRq>>>> {
+    pub fn build(self) -> io::Result<RcQpIbHandle<SqEntry, RqEntry, OnSq, OnRq>> {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
@@ -1625,8 +1641,8 @@ where
                 rq: OwnedRq::new(None),
                 sq_callback: self.sq_callback,
                 rq_callback: self.rq_callback,
-                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
-                recv_cq: self.recv_cq_weak.unwrap_or_else(Weak::new),
+                send_cq: self.send_cq_weak.unwrap_or_default(),
+                recv_cq: self.recv_cq_weak.unwrap_or_default(),
                 _pd: self.pd.clone(),
                 _marker: std::marker::PhantomData,
             };
@@ -1664,7 +1680,7 @@ where
     /// Build the RC QP with SRQ.
     ///
     /// Only available when both SQ and RQ CQs are configured.
-    pub fn build(self) -> io::Result<Rc<RefCell<RcQpIbWithSrq<SqEntry, RqEntry, OnSq, OnRq>>>> {
+    pub fn build(self) -> io::Result<RcQpIbWithSrqHandle<SqEntry, RqEntry, OnSq, OnRq>> {
         let srq = self.srq.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "SRQ not set")
         })?;
@@ -1710,8 +1726,8 @@ where
                 rq: SharedRq::new(srq_inner),
                 sq_callback: self.sq_callback,
                 rq_callback: self.rq_callback,
-                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
-                recv_cq: self.recv_cq_weak.unwrap_or_else(Weak::new),
+                send_cq: self.send_cq_weak.unwrap_or_default(),
+                recv_cq: self.recv_cq_weak.unwrap_or_default(),
                 _pd: self.pd.clone(),
                 _marker: std::marker::PhantomData,
             };
@@ -1751,7 +1767,7 @@ where
     /// Only available when both SQ and RQ CQs are configured.
     ///
     /// # NOTE: RoCE support is untested (IB-only hardware environment)
-    pub fn build(self) -> io::Result<Rc<RefCell<RcQpRoCE<SqEntry, RqEntry, OnSq, OnRq>>>> {
+    pub fn build(self) -> io::Result<RcQpRoCEHandle<SqEntry, RqEntry, OnSq, OnRq>> {
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
             qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
@@ -1789,8 +1805,8 @@ where
                 rq: OwnedRq::new(None),
                 sq_callback: self.sq_callback,
                 rq_callback: self.rq_callback,
-                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
-                recv_cq: self.recv_cq_weak.unwrap_or_else(Weak::new),
+                send_cq: self.send_cq_weak.unwrap_or_default(),
+                recv_cq: self.recv_cq_weak.unwrap_or_default(),
                 _pd: self.pd.clone(),
                 _marker: std::marker::PhantomData,
             };
@@ -1831,7 +1847,7 @@ where
     /// Only available when both SQ and RQ CQs are configured.
     ///
     /// # NOTE: RoCE support is untested (IB-only hardware environment)
-    pub fn build(self) -> io::Result<Rc<RefCell<RcQpRoCEWithSrq<SqEntry, RqEntry, OnSq, OnRq>>>> {
+    pub fn build(self) -> io::Result<RcQpRoCEWithSrqHandle<SqEntry, RqEntry, OnSq, OnRq>> {
         let srq = self.srq.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "SRQ not set")
         })?;
@@ -1876,8 +1892,8 @@ where
                 rq: SharedRq::new(srq_inner),
                 sq_callback: self.sq_callback,
                 rq_callback: self.rq_callback,
-                send_cq: self.send_cq_weak.unwrap_or_else(Weak::new),
-                recv_cq: self.recv_cq_weak.unwrap_or_else(Weak::new),
+                send_cq: self.send_cq_weak.unwrap_or_default(),
+                recv_cq: self.recv_cq_weak.unwrap_or_default(),
                 _pd: self.pd.clone(),
                 _marker: std::marker::PhantomData,
             };

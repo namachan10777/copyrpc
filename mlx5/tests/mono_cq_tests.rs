@@ -847,7 +847,7 @@ fn test_mono_cq_wraparound() {
     // Use a single CQ for both QPs
     let cq = Rc::new(ctx
         .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(cq_size as i32, callback, &CqConfig::default())
+        .create_mono_cq::<RcQpForMonoCq<u64>, _>(cq_size, callback, &CqConfig::default())
         .expect("Failed to create MonoCq"));
 
     let config = RcQpConfig::default();

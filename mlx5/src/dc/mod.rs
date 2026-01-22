@@ -19,7 +19,7 @@ use crate::qp::QpInfo;
 use crate::srq::Srq;
 use crate::transport::IbRemoteDctInfo;
 use crate::wqe::{
-    CTRL_SEG_SIZE, InfiniBand, OrderedWqeTable, RoCE, WQEBB_SIZE, WqeFlags, WqeOpcode,
+    InfiniBand, OrderedWqeTable, RoCE, WQEBB_SIZE, WqeFlags, WqeOpcode,
     write_ctrl_seg,
 };
 
@@ -370,7 +370,7 @@ where
                 max_inline_data: self.config.max_inline_data,
                 sq: None,
                 callback: self.callback,
-                send_cq: self.send_cq_weak.clone().unwrap_or_else(|| Weak::new()),
+                send_cq: self.send_cq_weak.clone().unwrap_or_default(),
                 _pd: self.pd.clone(),
                 _transport: PhantomData,
             };

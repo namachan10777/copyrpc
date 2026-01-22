@@ -18,7 +18,7 @@ use std::rc::Rc;
 use mlx5::cq::CqConfig;
 use mlx5::dc::{DciConfig, DctConfig};
 use mlx5::srq::SrqConfig;
-use mlx5::wqe::{WqeFlags, WqeOpcode};
+use mlx5::wqe::WqeFlags;
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
@@ -63,7 +63,7 @@ fn test_srq_direct_access() {
         max_sge: 1,
     };
 
-    let srq: mlx5::srq::Srq<u64> = ctx.pd.create_srq(&config).expect("Failed to create SRQ");
+    let _srq: mlx5::srq::Srq<u64> = ctx.pd.create_srq(&config).expect("Failed to create SRQ");
 
     // Initialize direct access
 
@@ -130,10 +130,10 @@ fn test_srq_with_dct_send() {
     require_dct!(&ctx);
 
     // Create CQs
-    let mut dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
+    let dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
     let dci_cq = Rc::new(dci_cq);
 
-    let mut dct_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCT CQ");
+    let dct_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCT CQ");
     let dct_cq = Rc::new(dct_cq);
 
     // Create SRQ
@@ -253,10 +253,10 @@ fn test_srq_shared_by_multiple_dcts() {
     require_dct!(&ctx);
 
     // Create CQs
-    let mut dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
+    let dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
     let dci_cq = Rc::new(dci_cq);
 
-    let mut dct_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCT CQ");
+    let dct_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCT CQ");
     let dct_cq = Rc::new(dct_cq);
 
     // Create shared SRQ
@@ -311,9 +311,9 @@ fn test_srq_shared_by_multiple_dcts() {
             .dct_builder(&ctx.pd, &srq, &dct_config)
             .recv_cq(&dct_cq)
             .build()
-            .expect(&format!("Failed to create DCT {}", i));
+            .unwrap_or_else(|_| panic!("Failed to create DCT {}", i));
         dct.activate(ctx.port, access, 4)
-            .expect(&format!("Failed to activate DCT {}", i));
+            .unwrap_or_else(|_| panic!("Failed to activate DCT {}", i));
         dcts.push(dct);
     }
 
@@ -344,7 +344,7 @@ fn test_srq_shared_by_multiple_dcts() {
 
         // Poll send completion
         let send_cqe =
-            poll_cq_timeout(&dci_cq, 5000).expect(&format!("Send CQE timeout for DCT {}", i));
+            poll_cq_timeout(&dci_cq, 5000).unwrap_or_else(|| panic!("Send CQE timeout for DCT {}", i));
         assert_eq!(
             send_cqe.syndrome, 0,
             "Send CQE error for DCT {}: syndrome={}",
@@ -353,7 +353,7 @@ fn test_srq_shared_by_multiple_dcts() {
 
         // Poll receive completion
         let recv_cqe =
-            poll_cq_timeout(&dct_cq, 5000).expect(&format!("Recv CQE timeout for DCT {}", i));
+            poll_cq_timeout(&dct_cq, 5000).unwrap_or_else(|| panic!("Recv CQE timeout for DCT {}", i));
         assert_eq!(
             recv_cqe.syndrome, 0,
             "Recv CQE error for DCT {}: syndrome={}",

@@ -414,10 +414,10 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIb<SqEntry, RqEntry, OnSq
     /// Call this after posting one or more WQEs to notify the HCA.
     #[inline]
     pub fn ring_sq_doorbell(&self) {
-        if let Some(sq) = self.sq.as_ref() {
-            if let Some((wqe_ptr, _)) = sq.last_wqe.get() {
-                sq.ring_db(wqe_ptr);
-            }
+        if let Some(sq) = self.sq.as_ref()
+            && let Some((wqe_ptr, _)) = sq.last_wqe.get()
+        {
+            sq.ring_db(wqe_ptr);
         }
     }
 

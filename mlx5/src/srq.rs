@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::{io, mem::MaybeUninit, ptr::NonNull};
 
 use crate::pd::Pd;
-use crate::wqe::{DATA_SEG_SIZE, SubmissionError, WQEBB_SIZE, write_data_seg};
+use crate::wqe::{SubmissionError, WQEBB_SIZE, write_data_seg};
 
 /// SRQ configuration.
 #[derive(Debug, Clone)]
