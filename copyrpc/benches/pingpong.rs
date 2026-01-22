@@ -1,9 +1,8 @@
-//! 8-Endpoint 128-concurrent ping-pong benchmark for copyrpc-style RDMA WRITE+IMM.
+//! 8-Endpoint 128-concurrent ping-pong benchmark comparing WRITE+IMM vs SEND-RECV.
 //!
-//! This benchmark simulates copyrpc's ring buffer architecture:
-//! - 8 endpoints (RC QPs)
-//! - 128 concurrent requests per endpoint (total 1024 in-flight)
-//! - RDMA WRITE+IMM for message delivery
+//! This benchmark compares two RDMA communication patterns:
+//! - RDMA WRITE+IMM: One-sided write with immediate data notification
+//! - SEND-RECV: Two-sided messaging
 //!
 //! Run with:
 //! ```bash
@@ -32,23 +31,22 @@ use mlx5::wqe::WqeFlags;
 // Constants
 // =============================================================================
 
-/// Number of endpoints.
 const NUM_ENDPOINTS: usize = 8;
-
-/// Concurrent requests per endpoint.
 const REQUESTS_PER_EP: usize = 128;
-
-/// Total queue depth (for CQ).
 const TOTAL_QUEUE_DEPTH: usize = NUM_ENDPOINTS * REQUESTS_PER_EP;
-
-/// Page size for alignment.
 const PAGE_SIZE: usize = 4096;
-
-/// Message size.
-const MESSAGE_SIZE: usize = 64;
-
-/// Ring buffer size per endpoint.
+const MESSAGE_SIZE: usize = 32;
 const RING_SIZE: usize = REQUESTS_PER_EP * 256;
+
+// =============================================================================
+// Benchmark Mode
+// =============================================================================
+
+#[derive(Clone, Copy, PartialEq)]
+enum BenchMode {
+    WriteImm,
+    SendRecv,
+}
 
 // =============================================================================
 // Aligned Buffer
@@ -130,20 +128,18 @@ struct MultiEndpointConnectionInfo {
 // Shared CQE State
 // =============================================================================
 
-/// Shared state for collecting CQEs from callback.
-/// Tracks which endpoint/slot received a completion.
 struct SharedCqeState {
-    /// Number of completions received.
     rx_count: Cell<usize>,
-    /// (endpoint_id, slot_id) pairs for each completion.
     rx_completions: RefCell<[(u8, u8); TOTAL_QUEUE_DEPTH]>,
+    mode: BenchMode,
 }
 
 impl SharedCqeState {
-    fn new() -> Self {
+    fn new(mode: BenchMode) -> Self {
         Self {
             rx_count: Cell::new(0),
             rx_completions: RefCell::new([(0, 0); TOTAL_QUEUE_DEPTH]),
+            mode,
         }
     }
 
@@ -151,13 +147,22 @@ impl SharedCqeState {
         self.rx_count.set(0);
     }
 
-    fn push(&self, cqe: &Cqe) {
+    fn push(&self, cqe: &Cqe, entry: u64) {
         let count = self.rx_count.get();
         if count < TOTAL_QUEUE_DEPTH {
-            // IMM encodes: (endpoint_id << 8) | slot_id
-            let imm = cqe.imm;
-            let ep_id = ((imm >> 8) & 0xFF) as u8;
-            let slot_id = (imm & 0xFF) as u8;
+            let (ep_id, slot_id) = match self.mode {
+                BenchMode::WriteImm => {
+                    // IMM encodes: (endpoint_id << 8) | slot_id
+                    let imm = cqe.imm;
+                    (((imm >> 8) & 0xFF) as u8, (imm & 0xFF) as u8)
+                }
+                BenchMode::SendRecv => {
+                    // For SEND-RECV, use the entry (wr_id) which contains ep_id << 8 | slot_id
+                    let slot_id = (entry & 0xFF) as u8;
+                    let ep_id = ((entry >> 8) & 0xFF) as u8;
+                    (ep_id, slot_id)
+                }
+            };
             self.rx_completions.borrow_mut()[count] = (ep_id, slot_id);
             self.rx_count.set(count + 1);
         }
@@ -192,6 +197,7 @@ where
     send_cq: Rc<MonoCqRc<u64, SF>>,
     recv_cq: Rc<MonoCqRc<u64, RF>>,
     shared_state: Rc<SharedCqeState>,
+    mode: BenchMode,
 }
 
 // =============================================================================
@@ -243,28 +249,23 @@ fn open_mlx5_device() -> Option<Context> {
     None
 }
 
-fn setup_benchmark() -> Option<BenchmarkSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u64)>> {
+fn setup_benchmark(mode: BenchMode) -> Option<BenchmarkSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u64)>> {
     let ctx = open_mlx5_device()?;
     let port = 1u8;
     let port_attr = ctx.query_port(port).ok()?;
     let pd = Rc::new(ctx.alloc_pd().ok()?);
 
-    // Create shared state for callback
-    let shared_state = Rc::new(SharedCqeState::new());
+    let shared_state = Rc::new(SharedCqeState::new(mode));
     let shared_state_for_recv = shared_state.clone();
 
-    // Create callbacks
-    let send_callback = move |_cqe: Cqe, _entry: u64| {
-        // SQ completions - no-op
-    };
+    let send_callback = move |_cqe: Cqe, _entry: u64| {};
 
-    let recv_callback = move |cqe: Cqe, _entry: u64| {
+    let recv_callback = move |cqe: Cqe, entry: u64| {
         if cqe.opcode.is_responder() && cqe.syndrome == 0 {
-            shared_state_for_recv.push(&cqe);
+            shared_state_for_recv.push(&cqe, entry);
         }
     };
 
-    // Create shared CQs for all endpoints
     let send_cq = Rc::new(
         ctx.create_mono_cq(TOTAL_QUEUE_DEPTH as i32, send_callback, &CqConfig::default())
             .ok()?,
@@ -283,7 +284,6 @@ fn setup_benchmark() -> Option<BenchmarkSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u6
         enable_scatter_to_cqe: false,
     };
 
-    // Create endpoints
     let mut endpoints = Vec::with_capacity(NUM_ENDPOINTS);
     let mut client_infos = Vec::with_capacity(NUM_ENDPOINTS);
 
@@ -325,7 +325,6 @@ fn setup_benchmark() -> Option<BenchmarkSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u6
         });
     }
 
-    // Channels for server communication
     let (server_info_tx, server_info_rx): (
         Sender<MultiEndpointConnectionInfo>,
         Receiver<MultiEndpointConnectionInfo>,
@@ -340,12 +339,10 @@ fn setup_benchmark() -> Option<BenchmarkSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u6
     let stop_flag = Arc::new(AtomicBool::new(false));
     let server_stop = stop_flag.clone();
 
-    // Start server thread
     let handle = thread::spawn(move || {
-        server_thread_main(server_info_tx, client_info_rx, server_ready_clone, server_stop);
+        server_thread_main(server_info_tx, client_info_rx, server_ready_clone, server_stop, mode);
     });
 
-    // Exchange connection info
     client_info_tx
         .send(MultiEndpointConnectionInfo {
             endpoints: client_infos,
@@ -357,7 +354,6 @@ fn setup_benchmark() -> Option<BenchmarkSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u6
         std::hint::spin_loop();
     }
 
-    // Connect endpoints and set remote info
     let access = full_access().bits();
     for (i, ep) in endpoints.iter_mut().enumerate() {
         let server_ep = &server_info.endpoints[i];
@@ -373,12 +369,13 @@ fn setup_benchmark() -> Option<BenchmarkSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u6
         ep.remote_addr = server_ep.buf_addr;
         ep.remote_rkey = server_ep.rkey;
 
-        // Pre-post receives
+        // Pre-post receives with wr_id = (ep_id << 8) | slot_id
         for slot in 0..REQUESTS_PER_EP {
             let offset = (slot * 256) as u64;
+            let wr_id = ((ep.endpoint_id as u64) << 8) | (slot as u64);
             ep.qp
                 .borrow()
-                .post_recv(slot as u64, ep.recv_buf.addr() + offset, 256, ep.recv_mr.lkey())
+                .post_recv(wr_id, ep.recv_buf.addr() + offset, 256, ep.recv_mr.lkey())
                 .unwrap();
         }
         ep.qp.borrow().ring_rq_doorbell();
@@ -395,6 +392,7 @@ fn setup_benchmark() -> Option<BenchmarkSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u6
             send_cq,
             recv_cq,
             shared_state,
+            mode,
         },
         _server_handle: server_handle,
         _pd: pd,
@@ -411,6 +409,7 @@ fn server_thread_main(
     info_rx: Receiver<MultiEndpointConnectionInfo>,
     ready_signal: Arc<AtomicU32>,
     stop_flag: Arc<AtomicBool>,
+    mode: BenchMode,
 ) {
     let ctx = match open_mlx5_device() {
         Some(c) => c,
@@ -428,14 +427,13 @@ fn server_thread_main(
         Err(_) => return,
     });
 
-    // Server shared state
-    let shared_state = Rc::new(SharedCqeState::new());
+    let shared_state = Rc::new(SharedCqeState::new(mode));
     let shared_state_for_recv = shared_state.clone();
 
     let send_callback = move |_cqe: Cqe, _entry: u64| {};
-    let recv_callback = move |cqe: Cqe, _entry: u64| {
+    let recv_callback = move |cqe: Cqe, entry: u64| {
         if cqe.opcode.is_responder() && cqe.syndrome == 0 {
-            shared_state_for_recv.push(&cqe);
+            shared_state_for_recv.push(&cqe, entry);
         }
     };
 
@@ -462,7 +460,6 @@ fn server_thread_main(
         enable_scatter_to_cqe: false,
     };
 
-    // Create server endpoints
     let mut endpoints: Vec<EndpointState> = Vec::with_capacity(NUM_ENDPOINTS);
     let mut server_infos = Vec::with_capacity(NUM_ENDPOINTS);
 
@@ -514,7 +511,6 @@ fn server_thread_main(
         });
     }
 
-    // Exchange connection info
     if info_tx
         .send(MultiEndpointConnectionInfo {
             endpoints: server_infos,
@@ -529,7 +525,6 @@ fn server_thread_main(
         Err(_) => return,
     };
 
-    // Connect and setup
     let access = full_access().bits();
     for (i, ep) in endpoints.iter_mut().enumerate() {
         let client_ep = &client_info.endpoints[i];
@@ -547,12 +542,13 @@ fn server_thread_main(
         ep.remote_addr = client_ep.buf_addr;
         ep.remote_rkey = client_ep.rkey;
 
-        // Pre-post receives
+        // Pre-post receives with wr_id = (ep_id << 8) | slot_id
         for slot in 0..REQUESTS_PER_EP {
             let offset = (slot * 256) as u64;
+            let wr_id = ((ep.endpoint_id as u64) << 8) | (slot as u64);
             ep.qp
                 .borrow()
-                .post_recv(slot as u64, ep.recv_buf.addr() + offset, 256, ep.recv_mr.lkey())
+                .post_recv(wr_id, ep.recv_buf.addr() + offset, 256, ep.recv_mr.lkey())
                 .unwrap();
         }
         ep.qp.borrow().ring_rq_doorbell();
@@ -576,42 +572,52 @@ fn server_thread_main(
 
         let completions = *shared_state.rx_completions.borrow();
 
-        // Repost receives and send responses
         for i in 0..rx_count {
             let (ep_id, slot_id) = completions[i];
             let ep = &endpoints[ep_id as usize];
             let offset = (slot_id as usize * 256) as u64;
 
             // Repost receive
+            let wr_id = ((ep_id as u64) << 8) | (slot_id as u64);
             ep.qp
                 .borrow()
-                .post_recv(
-                    slot_id as u64,
-                    ep.recv_buf.addr() + offset,
-                    256,
-                    ep.recv_mr.lkey(),
-                )
+                .post_recv(wr_id, ep.recv_buf.addr() + offset, 256, ep.recv_mr.lkey())
                 .unwrap();
 
-            // Send response (echo)
-            let imm = ((ep_id as u32) << 8) | (slot_id as u32);
-            ep.qp
-                .borrow_mut()
-                .sq_wqe()
-                .unwrap()
-                .write_imm(
-                    WqeFlags::empty(),
-                    ep.remote_addr + offset,
-                    ep.remote_rkey,
-                    imm,
-                )
-                .unwrap()
-                .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
-                .finish_signaled(slot_id as u64)
-                .unwrap();
+            // Send response
+            match mode {
+                BenchMode::WriteImm => {
+                    let imm = ((ep_id as u32) << 8) | (slot_id as u32);
+                    ep.qp
+                        .borrow_mut()
+                        .sq_wqe()
+                        .unwrap()
+                        .write_imm(
+                            WqeFlags::empty(),
+                            ep.remote_addr + offset,
+                            ep.remote_rkey,
+                            imm,
+                        )
+                        .unwrap()
+                        .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
+                        .finish_signaled(slot_id as u64)
+                        .unwrap();
+                }
+                BenchMode::SendRecv => {
+                    ep.qp
+                        .borrow_mut()
+                        .sq_wqe()
+                        .unwrap()
+                        .send(WqeFlags::empty())
+                        .unwrap()
+                        .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
+                        .finish_signaled(slot_id as u64)
+                        .unwrap();
+                }
+            }
         }
 
-        // Ring doorbells for all active endpoints
+        // Ring doorbells
         for i in 0..rx_count {
             let (ep_id, _) = completions[i];
             let ep = &endpoints[ep_id as usize];
@@ -625,7 +631,6 @@ fn server_thread_main(
 // Benchmark Functions
 // =============================================================================
 
-/// Throughput benchmark: 8 endpoints, 128 concurrent per endpoint.
 fn run_throughput_bench<SF, RF>(
     client: &mut MultiEndpointClient<SF, RF>,
     iters: u64,
@@ -634,30 +639,55 @@ where
     SF: Fn(Cqe, u64),
     RF: Fn(Cqe, u64),
 {
-    // Initial fill: send REQUESTS_PER_EP requests per endpoint
+    let mode = client.mode;
+
+    // Initial fill
     for ep in &client.endpoints {
         let mut qp = ep.qp.borrow_mut();
         for slot in 0..REQUESTS_PER_EP {
             let offset = (slot * 256) as u64;
-            let imm = ((ep.endpoint_id as u32) << 8) | (slot as u32);
+            let signaled = (slot % 4) == 3;
 
-            let signaled = (slot % 4) == 3; // Signal every 4th
-            if signaled {
-                qp.sq_wqe()
-                    .unwrap()
-                    .write_imm(WqeFlags::empty(), ep.remote_addr + offset, ep.remote_rkey, imm)
-                    .unwrap()
-                    .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
-                    .finish_signaled(slot as u64)
-                    .unwrap();
-            } else {
-                qp.sq_wqe()
-                    .unwrap()
-                    .write_imm(WqeFlags::empty(), ep.remote_addr + offset, ep.remote_rkey, imm)
-                    .unwrap()
-                    .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
-                    .finish_unsignaled()
-                    .unwrap();
+            match mode {
+                BenchMode::WriteImm => {
+                    let imm = ((ep.endpoint_id as u32) << 8) | (slot as u32);
+                    if signaled {
+                        qp.sq_wqe()
+                            .unwrap()
+                            .write_imm(WqeFlags::empty(), ep.remote_addr + offset, ep.remote_rkey, imm)
+                            .unwrap()
+                            .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
+                            .finish_signaled(slot as u64)
+                            .unwrap();
+                    } else {
+                        qp.sq_wqe()
+                            .unwrap()
+                            .write_imm(WqeFlags::empty(), ep.remote_addr + offset, ep.remote_rkey, imm)
+                            .unwrap()
+                            .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
+                            .finish_unsignaled()
+                            .unwrap();
+                    }
+                }
+                BenchMode::SendRecv => {
+                    if signaled {
+                        qp.sq_wqe()
+                            .unwrap()
+                            .send(WqeFlags::empty())
+                            .unwrap()
+                            .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
+                            .finish_signaled(slot as u64)
+                            .unwrap();
+                    } else {
+                        qp.sq_wqe()
+                            .unwrap()
+                            .send(WqeFlags::empty())
+                            .unwrap()
+                            .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
+                            .finish_unsignaled()
+                            .unwrap();
+                    }
+                }
             }
         }
         qp.ring_sq_doorbell();
@@ -690,13 +720,14 @@ where
             let (ep_id, slot_id) = completions[i];
             let ep = &client.endpoints[ep_id as usize];
             let offset = (slot_id as usize * 256) as u64;
+            let wr_id = ((ep_id as u64) << 8) | (slot_id as u64);
             ep.qp
                 .borrow()
-                .post_recv(slot_id as u64, ep.recv_buf.addr() + offset, 256, ep.recv_mr.lkey())
+                .post_recv(wr_id, ep.recv_buf.addr() + offset, 256, ep.recv_mr.lkey())
                 .unwrap();
         }
 
-        // Send new requests if we have room
+        // Send new requests
         let remaining = iters.saturating_sub(completed);
         let can_send = (TOTAL_QUEUE_DEPTH as u64).saturating_sub(inflight).min(remaining) as usize;
         let to_send = can_send.min(rx_count);
@@ -705,26 +736,49 @@ where
             let (ep_id, slot_id) = completions[i];
             let ep = &client.endpoints[ep_id as usize];
             let offset = (slot_id as usize * 256) as u64;
-            let imm = ((ep_id as u32) << 8) | (slot_id as u32);
-
             let signaled = (i % 4) == 3;
+
             let mut qp = ep.qp.borrow_mut();
-            if signaled {
-                qp.sq_wqe()
-                    .unwrap()
-                    .write_imm(WqeFlags::empty(), ep.remote_addr + offset, ep.remote_rkey, imm)
-                    .unwrap()
-                    .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
-                    .finish_signaled(slot_id as u64)
-                    .unwrap();
-            } else {
-                qp.sq_wqe()
-                    .unwrap()
-                    .write_imm(WqeFlags::empty(), ep.remote_addr + offset, ep.remote_rkey, imm)
-                    .unwrap()
-                    .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
-                    .finish_unsignaled()
-                    .unwrap();
+            match mode {
+                BenchMode::WriteImm => {
+                    let imm = ((ep_id as u32) << 8) | (slot_id as u32);
+                    if signaled {
+                        qp.sq_wqe()
+                            .unwrap()
+                            .write_imm(WqeFlags::empty(), ep.remote_addr + offset, ep.remote_rkey, imm)
+                            .unwrap()
+                            .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
+                            .finish_signaled(slot_id as u64)
+                            .unwrap();
+                    } else {
+                        qp.sq_wqe()
+                            .unwrap()
+                            .write_imm(WqeFlags::empty(), ep.remote_addr + offset, ep.remote_rkey, imm)
+                            .unwrap()
+                            .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
+                            .finish_unsignaled()
+                            .unwrap();
+                    }
+                }
+                BenchMode::SendRecv => {
+                    if signaled {
+                        qp.sq_wqe()
+                            .unwrap()
+                            .send(WqeFlags::empty())
+                            .unwrap()
+                            .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
+                            .finish_signaled(slot_id as u64)
+                            .unwrap();
+                    } else {
+                        qp.sq_wqe()
+                            .unwrap()
+                            .send(WqeFlags::empty())
+                            .unwrap()
+                            .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
+                            .finish_unsignaled()
+                            .unwrap();
+                    }
+                }
             }
         }
 
@@ -757,9 +811,10 @@ where
             let (ep_id, slot_id) = completions[i];
             let ep = &client.endpoints[ep_id as usize];
             let offset = (slot_id as usize * 256) as u64;
+            let wr_id = ((ep_id as u64) << 8) | (slot_id as u64);
             ep.qp
                 .borrow()
-                .post_recv(slot_id as u64, ep.recv_buf.addr() + offset, 256, ep.recv_mr.lkey())
+                .post_recv(wr_id, ep.recv_buf.addr() + offset, 256, ep.recv_mr.lkey())
                 .unwrap();
         }
 
@@ -767,7 +822,6 @@ where
         client.send_cq.flush();
     }
 
-    // Ring all RQ doorbells
     for ep in &client.endpoints {
         ep.qp.borrow().ring_rq_doorbell();
     }
@@ -775,45 +829,11 @@ where
     start.elapsed()
 }
 
-// =============================================================================
-// Criterion Benchmarks
-// =============================================================================
-
-fn benchmarks(c: &mut Criterion) {
-    let setup = match setup_benchmark() {
-        Some(s) => s,
-        None => {
-            eprintln!("Skipping benchmarks: no mlx5 device available");
-            return;
-        }
-    };
-
-    let _ctx = setup._ctx;
-    let _pd = setup._pd;
-    let client = RefCell::new(setup.client);
-    let mut server_handle = setup._server_handle;
-
-    let mut group = c.benchmark_group("copyrpc_pingpong");
-    group.sample_size(10);
-    group.measurement_time(Duration::from_secs(5));
-    group.throughput(Throughput::Elements(1));
-
-    group.bench_function(
-        BenchmarkId::new(
-            "8ep_128concurrent",
-            format!("{}msg", MESSAGE_SIZE),
-        ),
-        |b| {
-            b.iter_custom(|iters| run_throughput_bench(&mut client.borrow_mut(), iters));
-        },
-    );
-
-    group.finish();
-
-    // Cleanup
-    server_handle.stop();
-
-    let client = client.into_inner();
+fn cleanup_client<SF, RF>(client: MultiEndpointClient<SF, RF>)
+where
+    SF: Fn(Cqe, u64),
+    RF: Fn(Cqe, u64),
+{
     loop {
         let mut drained = false;
         client.shared_state.reset();
@@ -830,6 +850,59 @@ fn benchmarks(c: &mut Criterion) {
             break;
         }
     }
+}
+
+// =============================================================================
+// Criterion Benchmarks
+// =============================================================================
+
+fn benchmarks(c: &mut Criterion) {
+    let mut group = c.benchmark_group("copyrpc_pingpong");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(5));
+    group.throughput(Throughput::Elements(1));
+
+    // WRITE+IMM benchmark
+    if let Some(setup) = setup_benchmark(BenchMode::WriteImm) {
+        let _ctx = setup._ctx;
+        let _pd = setup._pd;
+        let client = RefCell::new(setup.client);
+        let mut server_handle = setup._server_handle;
+
+        group.bench_function(
+            BenchmarkId::new("write_imm", format!("8ep_128c_{}B", MESSAGE_SIZE)),
+            |b| {
+                b.iter_custom(|iters| run_throughput_bench(&mut client.borrow_mut(), iters));
+            },
+        );
+
+        server_handle.stop();
+        cleanup_client(client.into_inner());
+    } else {
+        eprintln!("Skipping WRITE+IMM benchmark: no mlx5 device available");
+    }
+
+    // SEND-RECV benchmark
+    if let Some(setup) = setup_benchmark(BenchMode::SendRecv) {
+        let _ctx = setup._ctx;
+        let _pd = setup._pd;
+        let client = RefCell::new(setup.client);
+        let mut server_handle = setup._server_handle;
+
+        group.bench_function(
+            BenchmarkId::new("send_recv", format!("8ep_128c_{}B", MESSAGE_SIZE)),
+            |b| {
+                b.iter_custom(|iters| run_throughput_bench(&mut client.borrow_mut(), iters));
+            },
+        );
+
+        server_handle.stop();
+        cleanup_client(client.into_inner());
+    } else {
+        eprintln!("Skipping SEND-RECV benchmark: no mlx5 device available");
+    }
+
+    group.finish();
 }
 
 criterion_group!(benches, benchmarks);
