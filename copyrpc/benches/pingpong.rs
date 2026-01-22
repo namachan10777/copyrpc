@@ -28,6 +28,26 @@ use mlx5::transport::IbRemoteQpInfo;
 use mlx5::wqe::WqeFlags;
 
 // =============================================================================
+// CPU Affinity
+// =============================================================================
+
+/// Set CPU affinity for current thread to the specified core.
+fn set_cpu_affinity(core_id: usize) {
+    unsafe {
+        let mut cpuset: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut cpuset);
+        libc::CPU_SET(core_id, &mut cpuset);
+        let result = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpuset);
+        if result != 0 {
+            eprintln!("Warning: Failed to set CPU affinity to core {}", core_id);
+        }
+    }
+}
+
+const CLIENT_CORE: usize = 0;
+const SERVER_CORE: usize = 1;
+
+// =============================================================================
 // Constants
 // =============================================================================
 
@@ -250,6 +270,9 @@ fn open_mlx5_device() -> Option<Context> {
 }
 
 fn setup_benchmark(mode: BenchMode) -> Option<BenchmarkSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u64)>> {
+    // Pin client thread to core 0 (NUMA node 0, same as NIC)
+    set_cpu_affinity(CLIENT_CORE);
+
     let ctx = open_mlx5_device()?;
     let port = 1u8;
     let port_attr = ctx.query_port(port).ok()?;
@@ -411,6 +434,9 @@ fn server_thread_main(
     stop_flag: Arc<AtomicBool>,
     mode: BenchMode,
 ) {
+    // Pin server thread to core 1 (NUMA node 0, same as NIC)
+    set_cpu_affinity(SERVER_CORE);
+
     let ctx = match open_mlx5_device() {
         Some(c) => c,
         None => return,
