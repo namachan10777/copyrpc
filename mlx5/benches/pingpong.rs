@@ -557,6 +557,9 @@ fn server_thread_main(
     let remote_addr = client_info.buf_addr;
     let remote_rkey = client_info.rkey;
 
+    // Pre-allocate echo data for inline sending
+    let echo_data = vec![0xBBu8; 32];
+
     while !stop_flag.load(Ordering::Relaxed) {
         // 1. RX CQE処理: poll recv CQ (callback collects completions)
         shared_state.reset();
@@ -589,31 +592,30 @@ fn server_thread_main(
             }
         }
 
-        // 4. TX リクエスト再補充: queue echo responses
+        // 4. TX リクエスト再補充: queue echo responses (using inline data)
         {
             let mut qp_ref = qp.borrow_mut();
             for i in 0..rx_count {
                 let idx = rx_indices[i];
                 let offset = (idx * 256) as u64;
-                let size = rx_sizes[i];
 
                 if rx_is_write_imm[i] {
-                    // Echo with WRITE+IMM
+                    // Echo with WRITE+IMM using inline data
                     let _ = qp_ref
                         .sq_wqe()
                         .unwrap()
                         .write_imm(WqeFlags::empty(), remote_addr + offset, remote_rkey, idx as u32)
                         .unwrap()
-                        .sge(send_buf.addr() + offset, size, send_mr.lkey())
+                        .inline(&echo_data)
                         .finish_signaled(idx as u64);
                 } else {
-                    // Echo with SEND
+                    // Echo with SEND using inline data
                     let _ = qp_ref
                         .sq_wqe()
                         .unwrap()
                         .send(WqeFlags::empty())
                         .unwrap()
-                        .sge(send_buf.addr() + offset, size, send_mr.lkey())
+                        .inline(&echo_data)
                         .finish_signaled(idx as u64);
                 }
             }
@@ -642,13 +644,14 @@ where
     SF: Fn(Cqe, u64),
     RF: Fn(Cqe, u64),
 {
-    let size = size.min(256) as u32;
-    let lkey = client.send_mr.lkey();
+    let size = size.min(256);
     let rkey = client.remote_rkey;
-    let send_buf_addr = client.send_buf.addr();
     let remote_addr = client.remote_addr;
 
-    // Initial fill
+    // Pre-allocate send data for inline
+    let send_data = vec![0xAAu8; size];
+
+    // Initial fill using inline data
     {
         let mut qp = client.qp.borrow_mut();
         for batch in 0..(QUEUE_DEPTH / 4) {
@@ -660,7 +663,7 @@ where
                     .unwrap()
                     .write_imm(WqeFlags::empty(), remote_addr + offset, rkey, i as u32)
                     .unwrap()
-                    .sge(send_buf_addr + offset, size, lkey)
+                    .inline(&send_data)
                     .finish_unsignaled()
                     .unwrap();
             }
@@ -670,7 +673,7 @@ where
                 .unwrap()
                 .write_imm(WqeFlags::empty(), remote_addr + offset, rkey, i as u32)
                 .unwrap()
-                .sge(send_buf_addr + offset, size, lkey)
+                .inline(&send_data)
                 .finish_signaled(i as u64)
                 .unwrap();
         }
@@ -727,7 +730,7 @@ where
                         .unwrap()
                         .write_imm(WqeFlags::empty(), remote_addr + offset, rkey, idx as u32)
                         .unwrap()
-                        .sge(send_buf_addr + offset, size, lkey)
+                        .inline(&send_data)
                         .finish_unsignaled()
                         .unwrap();
                 }
@@ -737,7 +740,7 @@ where
                     .unwrap()
                     .write_imm(WqeFlags::empty(), remote_addr + offset, rkey, idx as u32)
                     .unwrap()
-                    .sge(send_buf_addr + offset, size, lkey)
+                    .inline(&send_data)
                     .finish_signaled(idx as u64)
                     .unwrap();
             }
@@ -750,7 +753,7 @@ where
                     .unwrap()
                     .write_imm(WqeFlags::empty(), remote_addr + offset, rkey, idx as u32)
                     .unwrap()
-                    .sge(send_buf_addr + offset, size, lkey)
+                    .inline(&send_data)
                     .finish_signaled(idx as u64)
                     .unwrap();
             }
@@ -795,7 +798,7 @@ where
 // Criterion Benchmarks
 // =============================================================================
 
-/// Low-latency benchmark using MonoCq with builder + blueflame.
+/// Low-latency benchmark using MonoCq with builder + blueflame + inline data.
 fn run_lowlatency_bench_mono_cq<SF, RF>(
     client: &mut MonoCqEndpointState<SF, RF>,
     iters: u64,
@@ -805,11 +808,12 @@ where
     SF: Fn(Cqe, u64),
     RF: Fn(Cqe, u64),
 {
-    let size = size.min(256) as u32;
-    let lkey = client.send_mr.lkey();
+    let size = size.min(256);
     let rkey = client.remote_rkey;
-    let send_buf_addr = client.send_buf.addr();
     let remote_addr = client.remote_addr;
+
+    // Pre-allocate send data for inline
+    let send_data = vec![0xAAu8; size];
 
     let start = std::time::Instant::now();
 
@@ -818,7 +822,7 @@ where
         let offset = (idx * 256) as u64;
         let imm = idx as u32;
 
-        // Post single WRITE+IMM with blueflame using builder API
+        // Post single WRITE+IMM with blueflame using inline data
         {
             let qp = client.qp.borrow();
             let mut bf = qp.blueflame_sq_wqe().unwrap();
@@ -826,7 +830,7 @@ where
                 .unwrap()
                 .write_imm(WqeFlags::empty(), remote_addr + offset, rkey, imm)
                 .unwrap()
-                .sge(send_buf_addr + offset, size, lkey)
+                .inline(&send_data)
                 .unwrap()
                 .finish_signaled(idx as u64)
                 .unwrap();
