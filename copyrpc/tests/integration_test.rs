@@ -1978,3 +1978,280 @@ fn benchmark_pattern_server(
 
     eprintln!("Server: Benchmark pattern server exiting... (sent {} replies)", replies_sent.load(Ordering::SeqCst));
 }
+
+// =============================================================================
+// Test: emit_wqe wrap-around (batched sends that span ring boundary)
+// =============================================================================
+
+/// Test that emit_wqe correctly handles the case when batched data spans
+/// the ring buffer boundary.
+///
+/// This test sends multiple messages without poll(), accumulating them in the
+/// send buffer, then calls poll() which triggers emit_wqe(). If enough messages
+/// are batched, the data will span the ring boundary, triggering the two-part
+/// WQE split logic.
+///
+/// Before the fix, this would cause RDMA Local Length Error (syndrome=5).
+#[test]
+fn test_emit_wqe_boundary_split() {
+    // Use a tiny ring size to force wrap-around quickly
+    // With 1KB ring and 64B messages (32B data + 32B header/padding),
+    // about 16 messages fill the ring. Batching 8+ messages should
+    // eventually cause a boundary crossing.
+    const TINY_RING_SIZE: usize = 1024; // 1KB
+    const MESSAGE_SIZE: usize = 32;
+    const BATCH_SIZE: usize = 8; // Messages to batch before poll
+    const NUM_BATCHES: usize = 50; // Total batches to send
+
+    let completed = Arc::new(AtomicU32::new(0));
+    let completed_for_callback = completed.clone();
+
+    let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+        completed_for_callback.fetch_add(1, Ordering::SeqCst);
+    };
+
+    let ctx: Context<CallUserData, _> = ContextBuilder::new()
+        .device_index(0)
+        .port(1)
+        .srq_config(SrqConfig {
+            max_wr: 1024, // Enough for batched sends
+            max_sge: 1,
+        })
+        .cq_size(2048)
+        .on_response(on_response)
+        .build()
+        .expect("Failed to create client context");
+
+    let ep_config = EndpointConfig {
+        send_ring_size: TINY_RING_SIZE,
+        recv_ring_size: TINY_RING_SIZE,
+        ..Default::default()
+    };
+    let mut ep = ctx.create_endpoint(&ep_config).expect("Failed to create endpoint");
+
+    let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
+
+    let client_info = EndpointConnectionInfo {
+        qp_number: info.qp_number,
+        packet_sequence_number: 0,
+        local_identifier: lid,
+        recv_ring_addr: info.recv_ring_addr,
+        recv_ring_rkey: info.recv_ring_rkey,
+        recv_ring_size: info.recv_ring_size,
+        consumer_addr: info.consumer_addr,
+        consumer_rkey: info.consumer_rkey,
+    };
+
+    let (server_info_tx, server_info_rx): (
+        Sender<EndpointConnectionInfo>,
+        Receiver<EndpointConnectionInfo>,
+    ) = mpsc::channel();
+    let (client_info_tx, client_info_rx): (
+        Sender<EndpointConnectionInfo>,
+        Receiver<EndpointConnectionInfo>,
+    ) = mpsc::channel();
+    let server_ready = Arc::new(AtomicU32::new(0));
+    let server_ready_clone = server_ready.clone();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let server_stop = stop_flag.clone();
+
+    let handle: JoinHandle<()> = thread::spawn(move || {
+        emit_wqe_boundary_server_thread(server_info_tx, client_info_rx, server_ready_clone, server_stop, TINY_RING_SIZE);
+    });
+
+    client_info_tx.send(client_info).expect("Failed to send client info");
+    let server_info = server_info_rx.recv().expect("Failed to receive server info");
+
+    while server_ready.load(Ordering::Acquire) == 0 {
+        std::hint::spin_loop();
+    }
+
+    let remote = RemoteEndpointInfo {
+        qp_number: server_info.qp_number,
+        packet_sequence_number: server_info.packet_sequence_number,
+        local_identifier: server_info.local_identifier,
+        recv_ring_addr: server_info.recv_ring_addr,
+        recv_ring_rkey: server_info.recv_ring_rkey,
+        recv_ring_size: server_info.recv_ring_size,
+        consumer_addr: server_info.consumer_addr,
+        consumer_rkey: server_info.consumer_rkey,
+    };
+
+    ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
+
+    // Give server time to set up
+    std::thread::sleep(Duration::from_millis(10));
+
+    let request_data = vec![0u8; MESSAGE_SIZE];
+    let timeout = Duration::from_secs(30);
+    let start = std::time::Instant::now();
+    let mut total_sent: usize = 0;
+    let mut ringfull_count: usize = 0;
+
+    // Send batches of messages to trigger boundary-spanning emit_wqe
+    for batch in 0..NUM_BATCHES {
+        if start.elapsed() > timeout {
+            break;
+        }
+
+        // Batch multiple calls without poll - this accumulates data in send buffer
+        let mut batch_sent = 0;
+        for i in 0..BATCH_SIZE {
+            let user_data = CallUserData { call_id: (batch * BATCH_SIZE + i) as u32 };
+            match ep.call(&request_data, user_data) {
+                Ok(_) => {
+                    total_sent += 1;
+                    batch_sent += 1;
+                }
+                Err(copyrpc::error::Error::RingFull) => {
+                    ringfull_count += 1;
+                    // Need to poll and drain before continuing
+                    break;
+                }
+                Err(e) => {
+                    panic!("Unexpected error at batch {} msg {}: {:?}", batch, i, e);
+                }
+            }
+        }
+
+        // Poll to flush the batch - this triggers emit_wqe with accumulated data
+        // If the data spans the ring boundary, emit_wqe must split it correctly
+        ctx.poll();
+
+        // Wait for responses before continuing (to free up ring space)
+        let wait_start = std::time::Instant::now();
+        while completed.load(Ordering::SeqCst) < total_sent as u32 {
+            if wait_start.elapsed() > Duration::from_secs(5) {
+                eprintln!("Timeout waiting for responses at batch {} (sent={}, completed={})",
+                    batch, total_sent, completed.load(Ordering::SeqCst));
+                break;
+            }
+            ctx.poll();
+        }
+    }
+
+    // Drain any remaining
+    let drain_start = std::time::Instant::now();
+    while completed.load(Ordering::SeqCst) < total_sent as u32 && drain_start.elapsed() < Duration::from_secs(5) {
+        ctx.poll();
+    }
+
+    let final_completed = completed.load(Ordering::SeqCst);
+    eprintln!("emit_wqe boundary test: sent={}, completed={}, ringfull={}",
+        total_sent, final_completed, ringfull_count);
+
+    stop_flag.store(true, Ordering::SeqCst);
+    handle.join().expect("Server thread panicked");
+
+    // Verify we completed most of the sends
+    // Some might fail due to RingFull, but we should complete the majority
+    assert!(final_completed as usize >= total_sent.saturating_sub(BATCH_SIZE),
+        "Too many messages lost (sent={}, completed={})", total_sent, final_completed);
+}
+
+fn emit_wqe_boundary_server_thread(
+    info_tx: Sender<EndpointConnectionInfo>,
+    info_rx: Receiver<EndpointConnectionInfo>,
+    ready_signal: Arc<AtomicU32>,
+    stop_flag: Arc<AtomicBool>,
+    ring_size: usize,
+) {
+    let on_response: fn(CallUserData, &[u8]) = |_user_data, _data| {};
+
+    let ctx: Context<CallUserData, _> = match ContextBuilder::new()
+        .device_index(0)
+        .port(1)
+        .srq_config(SrqConfig {
+            max_wr: 1024,
+            max_sge: 1,
+        })
+        .cq_size(2048)
+        .on_response(on_response)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Server: Failed to create context: {:?}", e);
+            return;
+        }
+    };
+
+    let ep_config = EndpointConfig {
+        send_ring_size: ring_size,
+        recv_ring_size: ring_size,
+        ..Default::default()
+    };
+    let mut ep = match ctx.create_endpoint(&ep_config) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Server: Failed to create endpoint: {:?}", e);
+            return;
+        }
+    };
+
+    let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
+
+    let server_info = EndpointConnectionInfo {
+        qp_number: info.qp_number,
+        packet_sequence_number: 0,
+        local_identifier: lid,
+        recv_ring_addr: info.recv_ring_addr,
+        recv_ring_rkey: info.recv_ring_rkey,
+        recv_ring_size: info.recv_ring_size,
+        consumer_addr: info.consumer_addr,
+        consumer_rkey: info.consumer_rkey,
+    };
+
+    if info_tx.send(server_info).is_err() {
+        return;
+    }
+
+    let client_info = match info_rx.recv() {
+        Ok(info) => info,
+        Err(_) => return,
+    };
+
+    let remote = RemoteEndpointInfo {
+        qp_number: client_info.qp_number,
+        packet_sequence_number: client_info.packet_sequence_number,
+        local_identifier: client_info.local_identifier,
+        recv_ring_addr: client_info.recv_ring_addr,
+        recv_ring_rkey: client_info.recv_ring_rkey,
+        recv_ring_size: client_info.recv_ring_size,
+        consumer_addr: client_info.consumer_addr,
+        consumer_rkey: client_info.consumer_rkey,
+    };
+
+    if ep.connect(&remote, 0, ctx.port()).is_err() {
+        eprintln!("Server: Failed to connect");
+        return;
+    }
+
+    ready_signal.store(1, Ordering::Release);
+
+    let response_data = vec![0u8; 32];
+    let mut replies_sent = 0u64;
+
+    while !stop_flag.load(Ordering::Relaxed) {
+        ctx.poll();
+
+        while let Some(req) = ctx.recv() {
+            // Retry on RingFull
+            loop {
+                match req.reply(&response_data) {
+                    Ok(()) => {
+                        replies_sent += 1;
+                        break;
+                    }
+                    Err(copyrpc::error::Error::RingFull) => {
+                        ctx.poll();
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    eprintln!("Server: emit_wqe boundary test server exiting (sent {} replies)", replies_sent);
+}
