@@ -7,7 +7,7 @@
 //! │                         Context                                  │
 //! │  ┌─────────┐  ┌─────────┐  ┌────────────────────────────────┐   │
 //! │  │   CQ    │  │   SRQ   │  │  Endpoint Registry             │   │
-//! │  │(MonoCq) │  │ (shared)│  │  HashMap<QPN, Endpoint>        │   │
+//! │  │(MonoCq) │  │ (shared)│  │  FastMap<QPN, Endpoint>        │   │
 //! │  └─────────┘  └─────────┘  └────────────────────────────────┘   │
 //! │                                                                  │
 //! │  recv() → CQE's QPN identifies Endpoint → notify ring data       │
@@ -32,11 +32,14 @@ pub mod error;
 pub mod ring;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::io;
+
+use fastmap::FastMap;
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use slab::Slab;
 
 use mlx5::cq::{CqConfig, Cqe};
 use mlx5::device::Context as Mlx5Context;
@@ -222,7 +225,7 @@ where
     /// CQE buffer for send completions (for READ completion processing).
     send_cqe_buffer: Rc<CqeBuffer>,
     /// Registered endpoints by QPN.
-    endpoints: RefCell<HashMap<u32, Rc<RefCell<EndpointInner<U>>>>>,
+    endpoints: RefCell<FastMap<Rc<RefCell<EndpointInner<U>>>>>,
     /// Response callback.
     on_response: F,
     /// Port number (for connection establishment).
@@ -345,7 +348,7 @@ impl<U, F: Fn(U, &[u8])> ContextBuilder<U, F> {
             recv_cq,
             cqe_buffer,
             send_cqe_buffer,
-            endpoints: RefCell::new(HashMap::new()),
+            endpoints: RefCell::new(FastMap::new()),
             on_response,
             port: self.port,
             lid,
@@ -452,7 +455,7 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
             }
 
             // entry.qpn identifies which endpoint's READ completed
-            if let Some(ep) = self.endpoints.borrow().get(&entry.qpn) {
+            if let Some(ep) = self.endpoints.borrow().get(entry.qpn) {
                 let ep_ref = ep.borrow();
                 if ep_ref.read_inflight.get() {
                     // Read the consumer value from read_buffer
@@ -536,7 +539,7 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
         }
 
         let endpoints = self.endpoints.borrow();
-        let endpoint = match endpoints.get(&qpn) {
+        let endpoint = match endpoints.get(qpn) {
             Some(ep) => ep,
             None => return,
         };
@@ -593,7 +596,7 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
 
                 let (user_data, data_vec) = {
                     let endpoint_ref = endpoint.borrow();
-                    let user_data = endpoint_ref.pending_calls.borrow_mut().remove(&original_call_id);
+                    let user_data = endpoint_ref.pending_calls.borrow_mut().try_remove(original_call_id as usize);
 
                     if let Some(user_data) = user_data {
                         let data_offset = header_offset + HEADER_SIZE;
@@ -676,12 +679,10 @@ struct EndpointInner<U> {
     last_recv_pos: Cell<u64>,
     /// Remote consumer position (piggyback updates).
     remote_consumer: RemoteConsumer,
-    /// Next call ID for requests.
-    next_call_id: AtomicU32,
     /// Counter for unsignaled WQEs (for periodic signaling).
     unsignaled_count: Cell<u32>,
-    /// Pending calls waiting for responses.
-    pending_calls: RefCell<HashMap<u32, U>>,
+    /// Pending calls waiting for responses. Slab index is used as call_id.
+    pending_calls: RefCell<Slab<U>>,
     /// Flush start position (for WQE batching).
     flush_start_pos: Cell<u64>,
     /// READ operation is in-flight.
@@ -780,9 +781,8 @@ impl<U> EndpointInner<U> {
             recv_ring_producer: Cell::new(0),
             last_recv_pos: Cell::new(0),
             remote_consumer: RemoteConsumer::new(),
-            next_call_id: AtomicU32::new(1),
             unsignaled_count: Cell::new(0),
-            pending_calls: RefCell::new(HashMap::new()),
+            pending_calls: RefCell::new(Slab::new()),
             flush_start_pos: Cell::new(0),
             read_inflight: Cell::new(false),
             force_read: Cell::new(false),
@@ -1090,11 +1090,8 @@ impl<U> Endpoint<U> {
             return Err(Error::RingFull);
         }
 
-        // Allocate call ID
-        let call_id = inner.next_call_id.fetch_add(1, Ordering::Relaxed);
-
-        // Store pending call
-        inner.pending_calls.borrow_mut().insert(call_id, user_data);
+        // Allocate call ID from slab (index is the call_id)
+        let call_id = inner.pending_calls.borrow_mut().insert(user_data) as u32;
 
         // Prepare message in send ring
         let local_consumer = inner.last_recv_pos.get();

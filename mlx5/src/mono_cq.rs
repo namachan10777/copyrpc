@@ -35,6 +35,7 @@ use std::{io, mem::MaybeUninit};
 
 use crate::cq::{CqConfig, CqModeration, CqeCompressionFormat, CqeOpcode, CqeSize, Cqe, MiniCqeIterator};
 use crate::device::Context;
+use fastmap::FastMap;
 
 // =============================================================================
 // CompletionSource Trait
@@ -97,10 +98,6 @@ struct MonoCqState {
 // MonoCq
 // =============================================================================
 
-/// Direct queue lookup vector using QPN offset.
-/// QPNs are monotonically increasing, so we use base_qpn + offset mapping.
-type MonoQueueVec<Q> = Vec<Option<Weak<RefCell<Q>>>>;
-
 /// Monomorphic Completion Queue with inlined callback dispatch.
 ///
 /// Unlike `Cq` which uses `dyn CompletionTarget` for dynamic dispatch,
@@ -130,11 +127,8 @@ where
     state: MonoCqState,
     callback: F,
     /// Registered queues for completion dispatch.
-    /// Uses direct indexing: queues[qpn - base_qpn]
-    queues: RefCell<MonoQueueVec<Q>>,
-    /// Base QPN for offset calculation (first registered QP).
-    /// QPNs are monotonically increasing machine-wide.
-    base_qpn: Cell<u32>,
+    /// Uses FastMap for O(1) lookup without hash computation.
+    queues: RefCell<FastMap<Weak<RefCell<Q>>>>,
     /// Keep the context alive while this CQ exists.
     _ctx: Context,
 }
@@ -311,8 +305,7 @@ impl Context {
                     compressed_cqe_count: Cell::new(0),
                 },
                 callback,
-                queues: RefCell::new(Vec::new()),
-                base_qpn: Cell::new(u32::MAX),
+                queues: RefCell::new(FastMap::new()),
                 _ctx: self.clone(),
             })
         }
@@ -347,53 +340,21 @@ where
     /// The queue must implement `CompletionSource` with same entry type.
     pub fn register(&self, qp: &Rc<RefCell<Q>>) {
         let qpn = qp.borrow().qpn();
-        let base_qpn = self.base_qpn.get();
-
-        let mut queues = self.queues.borrow_mut();
-
-        let offset = if base_qpn == u32::MAX {
-            self.base_qpn.set(qpn);
-            0
-        } else if qpn >= base_qpn {
-            qpn - base_qpn
-        } else {
-            eprintln!("Warning: QPN {} is less than base QPN {}", qpn, base_qpn);
-            0
-        } as usize;
-
-        if offset >= queues.len() {
-            queues.resize(offset + 1, None);
-        }
-
-        queues[offset] = Some(Rc::downgrade(qp));
+        self.queues.borrow_mut().insert(qpn, Rc::downgrade(qp));
     }
 
     /// Unregister a queue.
     pub fn unregister(&self, qpn: u32) {
-        let base_qpn = self.base_qpn.get();
-        if qpn >= base_qpn {
-            let mut queues = self.queues.borrow_mut();
-            let offset = (qpn - base_qpn) as usize;
-            if offset < queues.len() {
-                queues[offset] = None;
-            }
-        }
+        self.queues.borrow_mut().remove(qpn);
     }
 
     /// Find queue by QPN using direct indexing.
     #[inline]
     fn find_queue(&self, qpn: u32) -> Option<Rc<RefCell<Q>>> {
-        let base_qpn = self.base_qpn.get();
-        if qpn < base_qpn {
-            return None;
-        }
-
-        let offset = (qpn - base_qpn) as usize;
-        let queues = self.queues.borrow();
-
-        queues
-            .get(offset)
-            .and_then(|w| w.as_ref().and_then(|weak| weak.upgrade()))
+        self.queues
+            .borrow()
+            .get(qpn)
+            .and_then(|weak| weak.upgrade())
     }
 
     /// Poll for completions and dispatch to registered queues with inlined callback.

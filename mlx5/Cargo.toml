@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 bitflags = "2"
+fastmap = { version = "0.1.0", path = "../fastmap" }
 mlx5_sys = { version = "0.1.0", path = "../mlx5_sys" }
 rapidhash = "1"
 

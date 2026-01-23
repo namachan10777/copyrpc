@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+fastmap = { version = "0.1.0", path = "../fastmap" }
 mlx5 = { version = "0.1.0", path = "../mlx5" }
 mlx5_sys = { version = "0.1.0", path = "../mlx5_sys" }
+slab = "0.4"
 
 [dev-dependencies]
 criterion = "0.5"

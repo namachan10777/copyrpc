@@ -9,7 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use mlx5::cq::{CqConfig, Cqe};
-use mlx5::qp::{RcQpConfig, RcQpForMonoCq, RcQpForMonoCqWithSrq};
+use mlx5::qp::{RcQpConfig, RcQpForMonoCq, RcQpForMonoCqWithSrqAndSqCb};
 use mlx5::srq::SrqConfig;
 use mlx5::transport::IbRemoteQpInfo;
 use mlx5::wqe::WqeFlags;
@@ -977,24 +977,28 @@ fn test_mono_cq_with_srq() {
     // Create send CQ (normal CQ)
     let send_cq = Rc::new(ctx.ctx.create_cq(256, &CqConfig::default()).expect("send_cq"));
 
-    // Create recv CQ (MonoCq for SRQ-based QP)
-    let recv_cq = Rc::new(
-        ctx.ctx
-            .create_mono_cq::<RcQpForMonoCqWithSrq<SrqEntry>, _>(256, recv_callback, &CqConfig::default())
-            .expect("recv_cq"),
-    );
-
     // Create SRQ
     let srq: mlx5::srq::Srq<SrqEntry> = ctx.pd.create_srq(&SrqConfig { max_wr: 256, max_sge: 1 }).expect("SRQ");
     let srq = Rc::new(srq);
 
     let config = RcQpConfig::default();
 
+    // Use function pointer type for SQ callback to avoid anonymous closure types
+    type SqCallback = fn(Cqe, SrqEntry);
+    fn empty_sq_callback(_cqe: Cqe, _entry: SrqEntry) {}
+
+    // Create recv CQ (MonoCq for SRQ-based QP with function pointer callback type)
+    let recv_cq: Rc<mlx5::mono_cq::MonoCq<RcQpForMonoCqWithSrqAndSqCb<SrqEntry, SqCallback>, _>> = Rc::new(
+        ctx.ctx
+            .create_mono_cq(256, recv_callback, &CqConfig::default())
+            .expect("recv_cq"),
+    );
+
     // Create QP1 with SRQ using MonoCq for recv
     let qp1 = ctx.ctx
         .rc_qp_builder::<SrqEntry, SrqEntry>(&ctx.pd, &config)
         .with_srq(srq.clone())
-        .sq_cq(send_cq.clone(), |_cqe, _entry| {})
+        .sq_cq(send_cq.clone(), empty_sq_callback as SqCallback)
         .rq_mono_cq(&recv_cq)
         .build()
         .expect("Failed to create QP1");
