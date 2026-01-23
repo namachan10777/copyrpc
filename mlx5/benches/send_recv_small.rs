@@ -19,12 +19,13 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
-use mlx5::cq::{Cqe, CqeOpcode};
+use mlx5::cq::{CqConfig, Cqe};
 use mlx5::device::{Context, DeviceList};
 use mlx5::mono_cq::MonoCqRc;
 use mlx5::pd::{AccessFlags, MemoryRegion, Pd};
-use mlx5::qp::{RcQpConfig, RcQpForMonoCq, RemoteQpInfo};
-use mlx5::wqe::{WqeFlags, WqeOpcode};
+use mlx5::qp::{RcQpConfig, RcQpForMonoCq};
+use mlx5::transport::IbRemoteQpInfo;
+use mlx5::wqe::WqeFlags;
 
 // =============================================================================
 // Constants
@@ -164,8 +165,8 @@ where
     RF: Fn(Cqe, u64),
 {
     qp: Rc<RefCell<RcQpForMonoCq<u64>>>,
-    send_cq: MonoCqRc<u64, SF>,
-    recv_cq: MonoCqRc<u64, RF>,
+    send_cq: Rc<MonoCqRc<u64, SF>>,
+    recv_cq: Rc<MonoCqRc<u64, RF>>,
     shared_state: SharedCqeState,
     send_mr: MemoryRegion,
     recv_mr: MemoryRegion,
@@ -214,8 +215,8 @@ fn setup_benchmark(
         shared_state_for_recv.push(&cqe);
     };
 
-    let send_cq = ctx.create_mono_cq(QUEUE_DEPTH as i32, send_callback).ok()?;
-    let recv_cq = ctx.create_mono_cq(QUEUE_DEPTH as i32, recv_callback).ok()?;
+    let send_cq = Rc::new(ctx.create_mono_cq(QUEUE_DEPTH as i32, send_callback, &CqConfig::default()).ok()?);
+    let recv_cq = Rc::new(ctx.create_mono_cq(QUEUE_DEPTH as i32, recv_callback, &CqConfig::default()).ok()?);
 
     let config = RcQpConfig {
         max_send_wr: QUEUE_DEPTH as u32,
@@ -227,7 +228,10 @@ fn setup_benchmark(
     };
 
     let qp = ctx
-        .create_rc_qp_for_mono_cq::<u64, _, _, _>(&pd, &send_cq, &recv_cq, &config)
+        .rc_qp_builder::<u64, u64>(&pd, &config)
+        .sq_mono_cq(&send_cq)
+        .rq_mono_cq(&recv_cq)
+        .build()
         .ok()?;
 
     send_cq.register(&qp);
@@ -271,7 +275,7 @@ fn setup_benchmark(
         std::hint::spin_loop();
     }
 
-    let server_remote = RemoteQpInfo {
+    let server_remote = IbRemoteQpInfo {
         qp_number: server_info.qpn,
         packet_sequence_number: 0,
         local_identifier: server_info.lid,
@@ -285,10 +289,8 @@ fn setup_benchmark(
     // Pre-post receives
     for i in 0..QUEUE_DEPTH {
         qp.borrow()
-            .recv_builder(i as u64)
-            .unwrap()
-            .sge(recv_buf.addr() + (i * 64) as u64, 64, recv_mr.lkey())
-            .finish();
+            .post_recv(i as u64, recv_buf.addr() + (i * 64) as u64, 64, recv_mr.lkey())
+            .unwrap();
     }
     qp.borrow().ring_rq_doorbell();
 
@@ -353,13 +355,13 @@ fn server_thread_main(
         }
     };
 
-    let send_cq = match ctx.create_mono_cq(QUEUE_DEPTH as i32, send_callback) {
-        Ok(cq) => cq,
+    let send_cq = match ctx.create_mono_cq::<RcQpForMonoCq<u64>, _>(QUEUE_DEPTH as i32, send_callback, &CqConfig::default()) {
+        Ok(cq) => Rc::new(cq),
         Err(_) => return,
     };
 
-    let recv_cq = match ctx.create_mono_cq(QUEUE_DEPTH as i32, recv_callback) {
-        Ok(cq) => cq,
+    let recv_cq = match ctx.create_mono_cq::<RcQpForMonoCq<u64>, _>(QUEUE_DEPTH as i32, recv_callback, &CqConfig::default()) {
+        Ok(cq) => Rc::new(cq),
         Err(_) => return,
     };
 
@@ -372,7 +374,12 @@ fn server_thread_main(
         enable_scatter_to_cqe,
     };
 
-    let qp = match ctx.create_rc_qp_for_mono_cq::<u64, _, _, _>(&pd, &send_cq, &recv_cq, &config) {
+    let qp = match ctx
+        .rc_qp_builder::<u64, u64>(&pd, &config)
+        .sq_mono_cq(&send_cq)
+        .rq_mono_cq(&recv_cq)
+        .build()
+    {
         Ok(q) => q,
         Err(_) => return,
     };
@@ -406,7 +413,7 @@ fn server_thread_main(
         Err(_) => return,
     };
 
-    let client_remote = RemoteQpInfo {
+    let client_remote = IbRemoteQpInfo {
         qp_number: client_info.qpn,
         packet_sequence_number: 0,
         local_identifier: client_info.lid,
@@ -424,10 +431,8 @@ fn server_thread_main(
     // Pre-post receives
     for i in 0..QUEUE_DEPTH {
         qp.borrow()
-            .recv_builder(i as u64)
-            .unwrap()
-            .sge(recv_buf.addr() + (i * 64) as u64, 64, recv_mr.lkey())
-            .finish();
+            .post_recv(i as u64, recv_buf.addr() + (i * 64) as u64, 64, recv_mr.lkey())
+            .unwrap();
     }
     qp.borrow().ring_rq_doorbell();
 
@@ -458,34 +463,42 @@ fn server_thread_main(
 
                 // Repost receive
                 qp_ref
-                    .recv_builder(idx as u64)
-                    .unwrap()
-                    .sge(recv_buf.addr() + (idx * 64) as u64, 64, recv_mr.lkey())
-                    .finish();
+                    .post_recv(idx as u64, recv_buf.addr() + (idx * 64) as u64, 64, recv_mr.lkey())
+                    .unwrap();
 
+                recv_idx += 1;
+            }
+        }
+
+        // Send echo responses
+        {
+            let mut qp_ref = qp.borrow_mut();
+            for _ in 0..count {
                 // Echo back with inline data (3:1 signaling ratio)
                 if send_count % 4 == 3 {
                     let _ = qp_ref
-                        .wqe_builder(idx as u64)
+                        .sq_wqe()
                         .unwrap()
-                        .ctrl_send(WqeFlags::COMPLETION)
-                        .inline_data(&echo_data)
-                        .finish();
+                        .send(WqeFlags::empty())
+                        .unwrap()
+                        .inline(&echo_data)
+                        .finish_signaled(send_count as u64);
                 } else {
                     let _ = qp_ref
-                        .wqe_builder_unsignaled()
+                        .sq_wqe()
                         .unwrap()
-                        .ctrl_send(WqeFlags::empty())
-                        .inline_data(&echo_data)
-                        .finish();
+                        .send(WqeFlags::empty())
+                        .unwrap()
+                        .inline(&echo_data)
+                        .finish_unsignaled();
                 }
-
-                recv_idx += 1;
                 send_count += 1;
             }
-            qp_ref.ring_rq_doorbell();
-            qp_ref.ring_sq_doorbell();
         }
+
+        let qp_ref = qp.borrow();
+        qp_ref.ring_rq_doorbell();
+        qp_ref.ring_sq_doorbell();
     }
 
     // Keep MRs alive until server exits
@@ -515,16 +528,19 @@ where
     for i in 0..iters {
         let idx = (i as usize) % QUEUE_DEPTH;
 
-        // Post Send with inline data
+        // Post Send with inline data using blueflame
         {
             let qp = client.qp.borrow();
-            let _ = qp
-                .wqe_builder(idx as u64)
+            let mut bf = qp.blueflame_sq_wqe().unwrap();
+            bf.wqe()
                 .unwrap()
-                .ctrl_send(WqeFlags::COMPLETION)
-                .inline_data(&send_data)
-                .finish();
-            qp.ring_sq_doorbell();
+                .send(WqeFlags::empty())
+                .unwrap()
+                .inline(&send_data)
+                .unwrap()
+                .finish_signaled(idx as u64)
+                .unwrap();
+            bf.finish();
         }
 
         // Wait for echo response
@@ -539,14 +555,8 @@ where
             if client.shared_state.rx_count.get() > 0 {
                 // Repost receive
                 let qp = client.qp.borrow();
-                qp.recv_builder(idx as u64)
-                    .unwrap()
-                    .sge(
-                        client.recv_buf.addr() + (idx * 64) as u64,
-                        64,
-                        client.recv_mr.lkey(),
-                    )
-                    .finish();
+                qp.post_recv(idx as u64, client.recv_buf.addr() + (idx * 64) as u64, 64, client.recv_mr.lkey())
+                    .unwrap();
                 qp.ring_rq_doorbell();
                 break;
             }
@@ -574,44 +584,46 @@ where
 
     // Initial fill with 3:1 signaling ratio
     {
-        let qp = client.qp.borrow();
+        let mut qp = client.qp.borrow_mut();
         let full_batches = initial_batch / 4;
         let remainder = initial_batch % 4;
 
         for batch in 0..full_batches {
             let base = batch * 4;
             // 3 unsignaled
-            for j in 0..3 {
-                let idx = base + j;
+            for _ in 0..3 {
                 let _ = qp
-                    .wqe_builder_unsignaled()
+                    .sq_wqe()
                     .unwrap()
-                    .ctrl_send(WqeFlags::empty())
-                    .inline_data(&send_data)
-                    .finish();
+                    .send(WqeFlags::empty())
+                    .unwrap()
+                    .inline(&send_data)
+                    .finish_unsignaled();
             }
             // 1 signaled
             let idx = base + 3;
             let _ = qp
-                .wqe_builder(idx as u64)
+                .sq_wqe()
                 .unwrap()
-                .ctrl_send(WqeFlags::COMPLETION)
-                .inline_data(&send_data)
-                .finish();
+                .send(WqeFlags::empty())
+                .unwrap()
+                .inline(&send_data)
+                .finish_signaled(idx as u64);
         }
 
         // Remainder (all signaled)
         for j in 0..remainder {
             let idx = full_batches * 4 + j;
             let _ = qp
-                .wqe_builder(idx as u64)
+                .sq_wqe()
                 .unwrap()
-                .ctrl_send(WqeFlags::COMPLETION)
-                .inline_data(&send_data)
-                .finish();
+                .send(WqeFlags::empty())
+                .unwrap()
+                .inline(&send_data)
+                .finish_signaled(idx as u64);
         }
-        qp.ring_sq_doorbell();
     }
+    client.qp.borrow().ring_sq_doorbell();
 
     let start = std::time::Instant::now();
     let mut completed = 0u64;
@@ -639,14 +651,8 @@ where
             let qp = client.qp.borrow();
             for _ in 0..rx_count {
                 let idx = recv_idx % QUEUE_DEPTH;
-                qp.recv_builder(idx as u64)
-                    .unwrap()
-                    .sge(
-                        client.recv_buf.addr() + (idx * 64) as u64,
-                        64,
-                        client.recv_mr.lkey(),
-                    )
-                    .finish();
+                qp.post_recv(idx as u64, client.recv_buf.addr() + (idx * 64) as u64, 64, client.recv_mr.lkey())
+                    .unwrap();
                 recv_idx += 1;
             }
         }
@@ -657,7 +663,7 @@ where
         let to_send = can_send.min(rx_count);
 
         if to_send > 0 {
-            let qp = client.qp.borrow();
+            let mut qp = client.qp.borrow_mut();
             let full_batches = to_send / 4;
             let remainder = to_send % 4;
 
@@ -665,29 +671,32 @@ where
                 // 3 unsignaled
                 for _ in 0..3 {
                     let _ = qp
-                        .wqe_builder_unsignaled()
+                        .sq_wqe()
                         .unwrap()
-                        .ctrl_send(WqeFlags::empty())
-                        .inline_data(&send_data)
-                        .finish();
+                        .send(WqeFlags::empty())
+                        .unwrap()
+                        .inline(&send_data)
+                        .finish_unsignaled();
                 }
                 // 1 signaled
                 let _ = qp
-                    .wqe_builder(batch as u64)
+                    .sq_wqe()
                     .unwrap()
-                    .ctrl_send(WqeFlags::COMPLETION)
-                    .inline_data(&send_data)
-                    .finish();
+                    .send(WqeFlags::empty())
+                    .unwrap()
+                    .inline(&send_data)
+                    .finish_signaled(batch as u64);
             }
 
             // Remainder (all signaled)
             for j in 0..remainder {
                 let _ = qp
-                    .wqe_builder(j as u64)
+                    .sq_wqe()
                     .unwrap()
-                    .ctrl_send(WqeFlags::COMPLETION)
-                    .inline_data(&send_data)
-                    .finish();
+                    .send(WqeFlags::empty())
+                    .unwrap()
+                    .inline(&send_data)
+                    .finish_signaled(j as u64);
             }
 
             inflight += to_send as u64;
