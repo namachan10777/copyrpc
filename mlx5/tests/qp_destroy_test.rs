@@ -4,6 +4,7 @@ mod common;
 
 use common::{TestContext, full_access};
 use mlx5::cq::CqConfig;
+use mlx5::emit_wqe;
 use mlx5::qp::RcQpConfig;
 use mlx5::transport::IbRemoteQpInfo;
 use std::rc::Rc;
@@ -601,19 +602,20 @@ fn test_qp_destroy_after_actual_send_recv() {
                 }
                 recv_count += 1;
 
-                // Echo back using direct verbs
+                // Echo back using emit_wqe!
                 let idx = (recv_count as usize - 1) % 32;
                 let offset = (idx * 64) as u64;
 
-                let _ = qp
-                    .borrow_mut()
-                    .sq_wqe()
-                    .and_then(|b| b.send(WqeFlags::empty()))
-                    .map(|b| {
-                        b.sge(buf.addr() + offset, 32, mr.lkey())
-                            .finish_signaled(idx as u64)
+                let qp_ref = qp.borrow();
+                if let Ok(ctx) = qp_ref.emit_ctx() {
+                    let _ = mlx5::emit_wqe!(&ctx, send {
+                        flags: mlx5::wqe::WqeFlags::empty(),
+                        sge: { addr: buf.addr() + offset, len: 32, lkey: mr.lkey() },
+                        signaled: idx as u64,
                     });
-                qp.borrow().ring_sq_doorbell();
+                }
+                qp_ref.ring_sq_doorbell();
+                drop(qp_ref);
 
                 // Repost recv
                 let _ = qp
@@ -722,19 +724,21 @@ fn test_qp_destroy_after_actual_send_recv() {
     let mut received = 0u64;
 
     // Initial burst of 32 SENDs
-    for i in 0..32.min(target) as usize {
-        let offset = (i * 64) as u64;
-        let _ = qp
-            .borrow_mut()
-            .sq_wqe()
-            .and_then(|b| b.send(WqeFlags::empty()))
-            .map(|b| {
-                b.sge(buf.addr() + offset, 32, mr.lkey())
-                    .finish_signaled(i as u64)
-            });
-        sent += 1;
+    {
+        let qp_ref = qp.borrow();
+        if let Ok(ctx) = qp_ref.emit_ctx() {
+            for i in 0..32.min(target) as usize {
+                let offset = (i * 64) as u64;
+                let _ = emit_wqe!(&ctx, send {
+                    flags: WqeFlags::empty(),
+                    sge: { addr: buf.addr() + offset, len: 32, lkey: mr.lkey() },
+                    signaled: i as u64,
+                });
+                sent += 1;
+            }
+        }
+        qp_ref.ring_sq_doorbell();
     }
-    qp.borrow().ring_sq_doorbell();
 
     // Ping-pong loop
     while received < target {
@@ -766,15 +770,16 @@ fn test_qp_destroy_after_actual_send_recv() {
 
             // Send more if needed
             if sent < target {
-                let _ = qp
-                    .borrow_mut()
-                    .sq_wqe()
-                    .and_then(|b| b.send(WqeFlags::empty()))
-                    .map(|b| {
-                        b.sge(buf.addr() + offset, 32, mr.lkey())
-                            .finish_signaled(idx as u64)
+                let qp_ref = qp.borrow();
+                if let Ok(ctx) = qp_ref.emit_ctx() {
+                    let _ = emit_wqe!(&ctx, send {
+                        flags: WqeFlags::empty(),
+                        sge: { addr: buf.addr() + offset, len: 32, lkey: mr.lkey() },
+                        signaled: idx as u64,
                     });
-                qp.borrow().ring_sq_doorbell();
+                }
+                qp_ref.ring_sq_doorbell();
+                drop(qp_ref);
                 sent += 1;
             }
         }

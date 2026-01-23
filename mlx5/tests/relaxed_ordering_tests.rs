@@ -17,6 +17,7 @@ mod common;
 use std::rc::Rc;
 
 use mlx5::cq::CqConfig;
+use mlx5::emit_wqe;
 use mlx5::pd::AccessFlags;
 use mlx5::qp::{RcQpConfig, RcQpIb};
 use mlx5::transport::IbRemoteQpInfo;
@@ -167,17 +168,17 @@ fn test_fence_ordering() {
         local_read_buf.write_u64(0, 0xDEADBEEF);
 
         {
-            let mut qp_ref = pair.qp1.borrow_mut();
+            let qp_ref = pair.qp1.borrow();
+            let ctx = qp_ref.emit_ctx().expect("emit_ctx failed");
 
             // First: RDMA READ (read current counter value)
-            qp_ref
-                .sq_wqe()
-                .expect("sq_wqe failed")
-                .read(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
-                .expect("read failed")
-                .sge(local_read_buf.addr(), 8, local_read_mr.lkey())
-                .finish_signaled(i * 2 - 1)
-                .expect("finish failed");
+            emit_wqe!(&ctx, read {
+                flags: WqeFlags::empty(),
+                remote_addr: remote_buf.addr(),
+                rkey: remote_mr.rkey(),
+                sge: { addr: local_read_buf.addr(), len: 8, lkey: local_read_mr.lkey() },
+                signaled: i * 2 - 1,
+            }).expect("emit_wqe failed");
 
             qp_ref.ring_sq_doorbell();
         }
@@ -190,18 +191,18 @@ fn test_fence_ordering() {
         read_values.push(read_val);
 
         {
-            let mut qp_ref = pair.qp1.borrow_mut();
+            let qp_ref = pair.qp1.borrow();
+            let ctx = qp_ref.emit_ctx().expect("emit_ctx failed");
 
             // Second: RDMA WRITE with FENCE (ensures READ completed before this WRITE starts)
             // FENCE waits for prior READ to complete
-            qp_ref
-                .sq_wqe()
-                .expect("sq_wqe failed")
-                .write(WqeFlags::FENCE, remote_buf.addr(), remote_mr.rkey())
-                .expect("write failed")
-                .sge(local_write_buf.addr(), 8, local_write_mr.lkey())
-                .finish_signaled(i * 2)
-                .expect("finish failed");
+            emit_wqe!(&ctx, write {
+                flags: WqeFlags::FENCE,
+                remote_addr: remote_buf.addr(),
+                rkey: remote_mr.rkey(),
+                sge: { addr: local_write_buf.addr(), len: 8, lkey: local_write_mr.lkey() },
+                signaled: i * 2,
+            }).expect("emit_wqe failed");
 
             qp_ref.ring_sq_doorbell();
         }
@@ -302,17 +303,17 @@ fn test_relaxed_ordering_variants() {
             local_read_buf.write_u64(0, 0);
 
             {
-                let mut qp_ref = pair.qp1.borrow_mut();
+                let qp_ref = pair.qp1.borrow();
+                let ctx = qp_ref.emit_ctx().expect("emit_ctx failed");
 
                 // RDMA WRITE
-                qp_ref
-                    .sq_wqe()
-                    .expect("sq_wqe failed")
-                    .write(wqe_flags, remote_buf.addr(), remote_mr.rkey())
-                    .expect("write failed")
-                    .sge(local_write_buf.addr(), 8, local_write_mr.lkey())
-                    .finish_signaled(i * 2 - 1)
-                    .expect("finish failed");
+                emit_wqe!(&ctx, write {
+                    flags: wqe_flags,
+                    remote_addr: remote_buf.addr(),
+                    rkey: remote_mr.rkey(),
+                    sge: { addr: local_write_buf.addr(), len: 8, lkey: local_write_mr.lkey() },
+                    signaled: i * 2 - 1,
+                }).expect("emit_wqe failed");
 
                 qp_ref.ring_sq_doorbell();
             }
@@ -320,17 +321,17 @@ fn test_relaxed_ordering_variants() {
             poll_cq_batch(&pair.send_cq, 1, 5000).expect("WRITE timeout");
 
             {
-                let mut qp_ref = pair.qp1.borrow_mut();
+                let qp_ref = pair.qp1.borrow();
+                let ctx = qp_ref.emit_ctx().expect("emit_ctx failed");
 
                 // RDMA READ
-                qp_ref
-                    .sq_wqe()
-                    .expect("sq_wqe failed")
-                    .read(wqe_flags, remote_buf.addr(), remote_mr.rkey())
-                    .expect("read failed")
-                    .sge(local_read_buf.addr(), 8, local_read_mr.lkey())
-                    .finish_signaled(i * 2)
-                    .expect("finish failed");
+                emit_wqe!(&ctx, read {
+                    flags: wqe_flags,
+                    remote_addr: remote_buf.addr(),
+                    rkey: remote_mr.rkey(),
+                    sge: { addr: local_read_buf.addr(), len: 8, lkey: local_read_mr.lkey() },
+                    signaled: i * 2,
+                }).expect("emit_wqe failed");
 
                 qp_ref.ring_sq_doorbell();
             }
@@ -412,21 +413,17 @@ fn test_fence_with_relaxed_mr() {
         local_read_buf.write_u64(0, 0xDEADBEEF);
 
         {
-            let mut qp_ref = pair.qp1.borrow_mut();
+            let qp_ref = pair.qp1.borrow();
+            let ctx = qp_ref.emit_ctx().expect("emit_ctx failed");
 
             // READ with RELAXED_ORDERING
-            qp_ref
-                .sq_wqe()
-                .expect("sq_wqe failed")
-                .read(
-                    WqeFlags::RELAXED_ORDERING,
-                    remote_buf.addr(),
-                    remote_mr.rkey(),
-                )
-                .expect("read failed")
-                .sge(local_read_buf.addr(), 8, local_read_mr.lkey())
-                .finish_signaled(i * 2 - 1)
-                .expect("finish failed");
+            emit_wqe!(&ctx, read {
+                flags: WqeFlags::RELAXED_ORDERING,
+                remote_addr: remote_buf.addr(),
+                rkey: remote_mr.rkey(),
+                sge: { addr: local_read_buf.addr(), len: 8, lkey: local_read_mr.lkey() },
+                signaled: i * 2 - 1,
+            }).expect("emit_wqe failed");
 
             qp_ref.ring_sq_doorbell();
         }
@@ -437,22 +434,18 @@ fn test_fence_with_relaxed_mr() {
         read_values.push(read_val);
 
         {
-            let mut qp_ref = pair.qp1.borrow_mut();
+            let qp_ref = pair.qp1.borrow();
+            let ctx = qp_ref.emit_ctx().expect("emit_ctx failed");
 
             // WRITE with FENCE and RELAXED_ORDERING
             // FENCE ensures the prior READ completes before this WRITE
-            qp_ref
-                .sq_wqe()
-                .expect("sq_wqe failed")
-                .write(
-                    WqeFlags::FENCE | WqeFlags::RELAXED_ORDERING,
-                    remote_buf.addr(),
-                    remote_mr.rkey(),
-                )
-                .expect("write failed")
-                .sge(local_write_buf.addr(), 8, local_write_mr.lkey())
-                .finish_signaled(i * 2)
-                .expect("finish failed");
+            emit_wqe!(&ctx, write {
+                flags: WqeFlags::FENCE | WqeFlags::RELAXED_ORDERING,
+                remote_addr: remote_buf.addr(),
+                rkey: remote_mr.rkey(),
+                sge: { addr: local_write_buf.addr(), len: 8, lkey: local_write_mr.lkey() },
+                signaled: i * 2,
+            }).expect("emit_wqe failed");
 
             qp_ref.ring_sq_doorbell();
         }
@@ -540,29 +533,28 @@ fn test_fence_batched_read_write() {
     );
 
     {
-        let mut qp_ref = pair.qp1.borrow_mut();
+        let qp_ref = pair.qp1.borrow();
+        let ctx = qp_ref.emit_ctx().expect("emit_ctx failed");
 
         // Submit batch: READ → WRITE(FENCE) pairs
         for i in 0..BATCH_SIZE {
             // READ current counter value
-            qp_ref
-                .sq_wqe()
-                .expect("sq_wqe failed")
-                .read(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
-                .expect("read failed")
-                .sge(local_read_bufs[i].addr(), 8, local_read_mrs[i].lkey())
-                .finish_signaled((i * 2) as u64)
-                .expect("finish failed");
+            emit_wqe!(&ctx, read {
+                flags: WqeFlags::empty(),
+                remote_addr: remote_buf.addr(),
+                rkey: remote_mr.rkey(),
+                sge: { addr: local_read_bufs[i].addr(), len: 8, lkey: local_read_mrs[i].lkey() },
+                signaled: (i * 2) as u64,
+            }).expect("emit_wqe failed");
 
             // WRITE new value with FENCE (ensures READ completed)
-            qp_ref
-                .sq_wqe()
-                .expect("sq_wqe failed")
-                .write(WqeFlags::FENCE, remote_buf.addr(), remote_mr.rkey())
-                .expect("write failed")
-                .sge(local_write_bufs[i].addr(), 8, local_write_mrs[i].lkey())
-                .finish_signaled((i * 2 + 1) as u64)
-                .expect("finish failed");
+            emit_wqe!(&ctx, write {
+                flags: WqeFlags::FENCE,
+                remote_addr: remote_buf.addr(),
+                rkey: remote_mr.rkey(),
+                sge: { addr: local_write_bufs[i].addr(), len: 8, lkey: local_write_mrs[i].lkey() },
+                signaled: (i * 2 + 1) as u64,
+            }).expect("emit_wqe failed");
         }
 
         qp_ref.ring_sq_doorbell();
@@ -630,19 +622,15 @@ fn test_relaxed_ordering_basic() {
     // Test WRITE with RELAXED_ORDERING
     local_buf.write_u64(0, 42);
     {
-        let mut qp_ref = pair.qp1.borrow_mut();
-        qp_ref
-            .sq_wqe()
-            .expect("sq_wqe failed")
-            .write(
-                WqeFlags::RELAXED_ORDERING,
-                remote_buf.addr(),
-                remote_mr.rkey(),
-            )
-            .expect("write failed")
-            .sge(local_buf.addr(), 8, local_mr.lkey())
-            .finish_signaled(1u64)
-            .expect("finish failed");
+        let qp_ref = pair.qp1.borrow();
+        let ctx = qp_ref.emit_ctx().expect("emit_ctx failed");
+        emit_wqe!(&ctx, write {
+            flags: WqeFlags::RELAXED_ORDERING,
+            remote_addr: remote_buf.addr(),
+            rkey: remote_mr.rkey(),
+            sge: { addr: local_buf.addr(), len: 8, lkey: local_mr.lkey() },
+            signaled: 1u64,
+        }).expect("emit_wqe failed");
         qp_ref.ring_sq_doorbell();
     }
     poll_cq_batch(&pair.send_cq, 1, 5000).expect("WRITE timeout");
@@ -653,19 +641,15 @@ fn test_relaxed_ordering_basic() {
     // Test READ with RELAXED_ORDERING
     local_buf.write_u64(0, 0);
     {
-        let mut qp_ref = pair.qp1.borrow_mut();
-        qp_ref
-            .sq_wqe()
-            .expect("sq_wqe failed")
-            .read(
-                WqeFlags::RELAXED_ORDERING,
-                remote_buf.addr(),
-                remote_mr.rkey(),
-            )
-            .expect("read failed")
-            .sge(local_buf.addr(), 8, local_mr.lkey())
-            .finish_signaled(2u64)
-            .expect("finish failed");
+        let qp_ref = pair.qp1.borrow();
+        let ctx = qp_ref.emit_ctx().expect("emit_ctx failed");
+        emit_wqe!(&ctx, read {
+            flags: WqeFlags::RELAXED_ORDERING,
+            remote_addr: remote_buf.addr(),
+            rkey: remote_mr.rkey(),
+            sge: { addr: local_buf.addr(), len: 8, lkey: local_mr.lkey() },
+            signaled: 2u64,
+        }).expect("emit_wqe failed");
         qp_ref.ring_sq_doorbell();
     }
     poll_cq_batch(&pair.send_cq, 1, 5000).expect("READ timeout");

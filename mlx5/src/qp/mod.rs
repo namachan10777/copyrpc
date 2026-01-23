@@ -26,6 +26,8 @@ use crate::wqe::{
     InfiniBand, RoCE,
     // Address Vector trait and types (needed for sq_wqe)
     NoAv,
+    // Macro-based emission
+    emit::{EmitContext, SqCapability},
 };
 
 /// RC QP configuration.
@@ -249,6 +251,30 @@ impl<Entry> SendQueueState<Entry, OrderedWqeTable<Entry>> {
         self.ci.set(entry.ci_delta);
         Some(entry.data)
     }
+
+    /// Get an EmitContext for macro-based WQE emission.
+    #[inline]
+    pub(crate) fn emit_ctx(&self) -> EmitContext<'_, Entry> {
+        EmitContext {
+            buf: self.buf,
+            wqe_cnt: self.wqe_cnt,
+            sqn: self.sqn,
+            pi: &self.pi,
+            ci: &self.ci,
+            last_wqe: &self.last_wqe,
+            table: &self.table,
+        }
+    }
+}
+
+/// RC QP Send Queue capability.
+///
+/// RC QPはAV不要で、SEND/WRITE/READ/Atomicを全てサポート。
+impl<Entry> SqCapability for SendQueueState<Entry, OrderedWqeTable<Entry>> {
+    const REQUIRES_AV: bool = false;
+    const SUPPORTS_SEND: bool = true;
+    const SUPPORTS_RDMA: bool = true;
+    const SUPPORTS_ATOMIC: bool = true;
 }
 
 // =============================================================================
@@ -1290,6 +1316,29 @@ impl<SqEntry, RqEntry, Rq, OnSqComplete, OnRqComplete> RcQp<SqEntry, RqEntry, In
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
         }
         Ok(SqWqeEntryPoint::new(sq, NoAv))
+    }
+
+    /// Get an EmitContext for macro-based WQE emission.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use mlx5::emit_wqe;
+    ///
+    /// let ctx = qp.emit_ctx()?;
+    /// emit_wqe!(ctx, write {
+    ///     flags: WqeFlags::empty(),
+    ///     remote_addr: dest,
+    ///     rkey: rkey,
+    ///     sge: { addr: local_addr, len: 64, lkey },
+    ///     signaled: entry,
+    /// })?;
+    /// qp.ring_sq_doorbell();
+    /// ```
+    #[inline]
+    pub fn emit_ctx(&self) -> io::Result<EmitContext<'_, SqEntry>> {
+        let sq = self.sq.as_ref()
+            .ok_or_else(|| io::Error::other("direct access not initialized"))?;
+        Ok(sq.emit_ctx())
     }
 }
 

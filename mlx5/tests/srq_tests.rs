@@ -17,8 +17,10 @@ use std::rc::Rc;
 
 use mlx5::cq::CqConfig;
 use mlx5::dc::{DciConfig, DctConfig};
+use mlx5::emit_dci_wqe;
 use mlx5::srq::SrqConfig;
 use mlx5::wqe::WqeFlags;
+use mlx5::wqe::emit::DcAvIb;
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
@@ -198,15 +200,16 @@ fn test_srq_with_dct_send() {
     send_buf.fill_bytes(test_data);
 
     // Post DC SEND
-    dci.borrow_mut()
-        .sq_wqe(dc_key, dctn, dlid)
-        .expect("sq_wqe failed")
-        .send(WqeFlags::empty())
-        .expect("send failed")
-        .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-        .finish_signaled(1u64)
-        .expect("finish failed");
-    dci.borrow().ring_sq_doorbell();
+    let dci_ref = dci.borrow();
+    let ctx = dci_ref.emit_ctx().expect("emit_ctx failed");
+    emit_dci_wqe!(&ctx, send {
+        av: DcAvIb::new(dc_key, dctn, dlid),
+        flags: WqeFlags::empty(),
+        sge: { addr: send_buf.addr(), len: test_data.len() as u32, lkey: send_mr.lkey() },
+        signaled: 1u64,
+    }).expect("emit_dci_wqe failed");
+    dci_ref.ring_sq_doorbell();
+    drop(dci_ref);
 
     // Poll DCI CQ for send completion
     let send_cqe = poll_cq_timeout(&dci_cq, 5000).expect("Send CQE timeout");
@@ -332,15 +335,16 @@ fn test_srq_shared_by_multiple_dcts() {
         let test_data = format!("Message to DCT {}", i);
         send_buf.fill_bytes(test_data.as_bytes());
 
-        dci.borrow_mut()
-            .sq_wqe(dct.dc_key(), dct.dctn(), dlid)
-            .expect("sq_wqe failed")
-            .send(WqeFlags::empty())
-            .expect("send failed")
-            .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-            .finish_signaled((i + 1) as u64)
-            .expect("finish failed");
-        dci.borrow().ring_sq_doorbell();
+        let dci_ref = dci.borrow();
+        let ctx = dci_ref.emit_ctx().expect("emit_ctx failed");
+        emit_dci_wqe!(&ctx, send {
+            av: DcAvIb::new(dct.dc_key(), dct.dctn(), dlid),
+            flags: WqeFlags::empty(),
+            sge: { addr: send_buf.addr(), len: test_data.len() as u32, lkey: send_mr.lkey() },
+            signaled: (i + 1) as u64,
+        }).expect("emit_dci_wqe failed");
+        dci_ref.ring_sq_doorbell();
+        drop(dci_ref);
 
         // Poll send completion
         let send_cqe =

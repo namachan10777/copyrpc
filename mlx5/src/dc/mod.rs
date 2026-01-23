@@ -23,6 +23,7 @@ use crate::transport::IbRemoteDctInfo;
 use crate::wqe::{
     CtrlSegParams, InfiniBand, OrderedWqeTable, RoCE, WQEBB_SIZE, WqeFlags, WqeOpcode,
     write_ctrl_seg,
+    emit::{DciEmitContext, SqCapability},
 };
 
 /// DCI configuration.
@@ -186,6 +187,30 @@ impl<Entry> DciSendQueueState<Entry, OrderedWqeTable<Entry>> {
         self.ci.set(entry.ci_delta);
         Some(entry.data)
     }
+
+    /// Get a DciEmitContext for macro-based WQE emission.
+    #[inline]
+    pub(crate) fn emit_ctx(&self) -> DciEmitContext<'_, Entry> {
+        DciEmitContext {
+            buf: self.buf,
+            wqe_cnt: self.wqe_cnt,
+            sqn: self.sqn,
+            pi: &self.pi,
+            ci: &self.ci,
+            last_wqe: &self.last_wqe,
+            table: &self.table,
+        }
+    }
+}
+
+/// DCI Send Queue capability.
+///
+/// DCIはAV必須で、SEND/WRITE/READ/Atomicを全てサポート。
+impl<Entry> SqCapability for DciSendQueueState<Entry, OrderedWqeTable<Entry>> {
+    const REQUIRES_AV: bool = true;
+    const SUPPORTS_SEND: bool = true;
+    const SUPPORTS_RDMA: bool = true;
+    const SUPPORTS_ATOMIC: bool = true;
 }
 
 // =============================================================================
@@ -623,6 +648,37 @@ impl<Entry, Transport, TableType, OnComplete> Dci<Entry, Transport, TableType, O
         }
     }
 
+}
+
+impl<Entry, OnComplete> DciWithTable<Entry, OnComplete> {
+    /// Get a DciEmitContext for macro-based WQE emission.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use mlx5::wqe::emit::{DcAvIb, emit_dci_write_ib, DciWriteParamsIb};
+    ///
+    /// let ctx = dci.emit_ctx()?;
+    /// emit_dci_write_ib(&ctx, &DciWriteParamsIb {
+    ///     av: DcAvIb::new(dc_key, dctn, dlid),
+    ///     flags: WqeFlags::empty(),
+    ///     remote_addr: dest,
+    ///     rkey: rkey,
+    ///     sge_addr: local_addr,
+    ///     sge_len: 64,
+    ///     sge_lkey: lkey,
+    ///     signaled: true,
+    ///     inline_data: None,
+    ///     imm: 0,
+    /// })?;
+    /// ctx.table.store(wqe_idx, entry, ctx.pi.get());
+    /// dci.ring_sq_doorbell();
+    /// ```
+    #[inline]
+    pub fn emit_ctx(&self) -> io::Result<DciEmitContext<'_, Entry>> {
+        let sq = self.sq.as_ref()
+            .ok_or_else(|| io::Error::other("direct access not initialized"))?;
+        Ok(sq.emit_ctx())
+    }
 }
 
 impl<Entry, OnComplete> DciWithTable<Entry, OnComplete> {

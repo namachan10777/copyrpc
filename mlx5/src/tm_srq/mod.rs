@@ -44,7 +44,7 @@ use crate::cq::{Cq, Cqe, CqeOpcode};
 use crate::device::Context;
 use crate::pd::Pd;
 use crate::srq::SrqInfo;
-use crate::wqe::{Init, OrderedWqeTable, UnorderedWqeTable, WQEBB_SIZE};
+use crate::wqe::{Init, OrderedWqeTable, UnorderedWqeTable, WQEBB_SIZE, emit::TmCmdEmitContext};
 
 // =============================================================================
 // TM-SRQ Completion Types
@@ -214,6 +214,24 @@ impl<CmdEntry> CmdQpState<CmdEntry, OrderedWqeTable<CmdEntry>> {
         // ci_delta is the accumulated PI value at completion
         self.ci.set(entry.ci_delta);
         Some(entry.data)
+    }
+
+    /// Get an emit context for macro-based WQE emission.
+    ///
+    /// Returns `Err` if the Command QP is full.
+    pub fn emit_ctx(&self) -> io::Result<TmCmdEmitContext<'_, CmdEntry>> {
+        if !self.table.is_available(self.pi.get()) {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Command QP full"));
+        }
+        Ok(TmCmdEmitContext {
+            buf: self.sq_buf,
+            wqe_cnt: self.sq_wqe_cnt,
+            qpn: self.qpn,
+            pi: &self.pi,
+            ci: &self.ci,
+            last_wqe: &self.last_wqe,
+            table: &self.table,
+        })
     }
 }
 
@@ -637,6 +655,25 @@ impl<CmdEntry, RecvEntry, OnComplete> TmSrq<CmdEntry, RecvEntry, OnComplete> {
     /// Process a Command QP completion (internal use by dispatch_cqe).
     fn process_cmd_completion(&self, wqe_idx: u16) -> Option<CmdEntry> {
         self.cmd_qp().process_completion(wqe_idx)
+    }
+
+    /// Get an emit context for macro-based Command QP WQE emission.
+    ///
+    /// This context can be used with the `emit_tm_wqe!` macro for tag operations.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let ctx = tm_srq.cmd_emit_ctx()?;
+    /// emit_tm_wqe!(&ctx, tag_add {
+    ///     index: tag_index,
+    ///     tag: tag_value,
+    ///     sge: { addr: buf_addr, len: buf_len, lkey: lkey },
+    ///     signaled: entry,
+    /// })?;
+    /// tm_srq.ring_cmd_doorbell();
+    /// ```
+    pub fn cmd_emit_ctx(&self) -> io::Result<TmCmdEmitContext<'_, CmdEntry>> {
+        self.cmd_qp().emit_ctx()
     }
 }
 

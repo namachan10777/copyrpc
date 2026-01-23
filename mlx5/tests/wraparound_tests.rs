@@ -14,12 +14,16 @@ use std::rc::Rc;
 
 use mlx5::cq::CqConfig;
 use mlx5::dc::{DciConfig, DctConfig};
+use mlx5::emit_dci_wqe;
+use mlx5::emit_ud_wqe;
+use mlx5::emit_wqe;
 use mlx5::pd::RemoteUdQpInfo;
 use mlx5::qp::RcQpConfig;
 use mlx5::srq::SrqConfig;
 use mlx5::transport::IbRemoteQpInfo;
 use mlx5::ud::UdQpConfig;
 use mlx5::wqe::WqeFlags;
+use mlx5::wqe::emit::{DcAvIb, UdAvIb};
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
@@ -124,15 +128,17 @@ fn test_rc_rdma_write_wraparound() {
         remote_buf.fill(0xAA); // Clear remote buffer with pattern
 
         // Post RDMA WRITE
-        qp1.borrow_mut()
-            .sq_wqe()
-            .expect("sq_wqe failed")
-            .write(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
-            .expect("write failed")
-            .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-            .finish_signaled(i as u64)
-            .expect("finish failed");
-        qp1.borrow().ring_sq_doorbell();
+        let qp1_ref = qp1.borrow();
+        let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
+        emit_wqe!(&ctx, write {
+            flags: WqeFlags::empty(),
+            remote_addr: remote_buf.addr(),
+            rkey: remote_mr.rkey(),
+            sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
+            signaled: i as u64,
+        }).expect("emit_wqe failed");
+        qp1_ref.ring_sq_doorbell();
+        drop(qp1_ref);
 
         // Wait for completion
         let cqe =
@@ -236,18 +242,20 @@ fn test_rc_ring_sq_doorbell() {
     local_buf.fill_bytes(test_data);
     remote_buf.fill(0);
 
-    // Use finish_signaled() instead of finish_signaled_with_blueflame(), then ring doorbell manually
-    let _ = qp1
-        .borrow_mut()
-        .sq_wqe()
-        .expect("sq_wqe failed")
-        .write(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
-        .expect("write failed")
-        .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-        .finish_signaled(1u64);
+    // Use emit_wqe! then ring doorbell manually
+    let qp1_ref = qp1.borrow();
+    let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
+    emit_wqe!(&ctx, write {
+        flags: WqeFlags::empty(),
+        remote_addr: remote_buf.addr(),
+        rkey: remote_mr.rkey(),
+        sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
+        signaled: 1u64,
+    }).expect("emit_wqe failed");
 
     // Ring doorbell manually
-    qp1.borrow().ring_sq_doorbell();
+    qp1_ref.ring_sq_doorbell();
+    drop(qp1_ref);
 
     // Wait for completion
     let cqe = poll_cq_timeout(&send_cq, 5000).expect("CQE timeout");
@@ -350,15 +358,18 @@ fn test_dc_rdma_write_wraparound() {
         local_buf.fill_bytes(test_data.as_bytes());
         remote_buf.fill(0xBB);
 
-        dci.borrow_mut()
-            .sq_wqe(dc_key, dctn, dlid)
-            .expect("sq_wqe failed")
-            .write(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
-            .expect("write failed")
-            .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-            .finish_signaled(i as u64)
-            .expect("finish failed");
-        dci.borrow().ring_sq_doorbell();
+        let dci_ref = dci.borrow();
+        let ctx = dci_ref.emit_ctx().expect("emit_ctx failed");
+        emit_dci_wqe!(&ctx, write {
+            av: DcAvIb::new(dc_key, dctn, dlid),
+            flags: WqeFlags::empty(),
+            remote_addr: remote_buf.addr(),
+            rkey: remote_mr.rkey(),
+            sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
+            signaled: i as u64,
+        }).expect("emit_dci_wqe failed");
+        dci_ref.ring_sq_doorbell();
+        drop(dci_ref);
 
         let cqe = poll_cq_timeout(&dci_cq, 5000).unwrap_or_else(|| panic!("CQE timeout at iteration {}", i));
         assert_eq!(
@@ -454,17 +465,20 @@ fn test_dc_ring_sq_doorbell() {
     local_buf.fill_bytes(test_data);
     remote_buf.fill(0);
 
-    // Use finish_signaled() + ring_sq_doorbell() instead of finish_signaled_with_blueflame()
-    let _ = dci
-        .borrow_mut()
-        .sq_wqe(dc_key, dctn, dlid)
-        .expect("sq_wqe failed")
-        .write(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
-        .expect("write failed")
-        .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-        .finish_signaled(1u64);
+    // Use emit_dci_wqe! + ring_sq_doorbell()
+    let dci_ref = dci.borrow();
+    let ctx = dci_ref.emit_ctx().expect("emit_ctx failed");
+    emit_dci_wqe!(&ctx, write {
+        av: DcAvIb::new(dc_key, dctn, dlid),
+        flags: WqeFlags::empty(),
+        remote_addr: remote_buf.addr(),
+        rkey: remote_mr.rkey(),
+        sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
+        signaled: 1u64,
+    }).expect("emit_dci_wqe failed");
 
-    dci.borrow().ring_sq_doorbell();
+    dci_ref.ring_sq_doorbell();
+    drop(dci_ref);
 
     let cqe = poll_cq_timeout(&dci_cq, 5000).expect("CQE timeout");
     assert_eq!(cqe.syndrome, 0, "CQE error: syndrome={}", cqe.syndrome);
@@ -576,16 +590,16 @@ fn test_ud_send_wraparound() {
         receiver.borrow().ring_rq_doorbell();
 
         // Post send
-        sender
-            .borrow_mut()
-            .sq_wqe(&ah)
-            .expect("sq_wqe failed")
-            .send(WqeFlags::empty())
-            .expect("send failed")
-            .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-            .finish_signaled(i as u64)
-            .expect("finish failed");
-        sender.borrow().ring_sq_doorbell();
+        let sender_ref = sender.borrow();
+        let ctx = sender_ref.emit_ctx().expect("emit_ctx failed");
+        emit_ud_wqe!(&ctx, send {
+            av: UdAvIb::new(ah.qpn(), ah.qkey(), ah.dlid()),
+            flags: WqeFlags::empty(),
+            sge: { addr: send_buf.addr(), len: test_data.len() as u32, lkey: send_mr.lkey() },
+            signaled: i as u64,
+        }).expect("emit_ud_wqe failed");
+        sender_ref.ring_sq_doorbell();
+        drop(sender_ref);
 
         // Wait for send completion
         let send_cqe =
@@ -719,16 +733,16 @@ fn test_rc_inline_wraparound() {
         qp2.borrow().ring_rq_doorbell();
 
         // Post SEND with inline data
-        let handle = qp1
-            .borrow_mut()
-            .sq_wqe()
-            .expect("sq_wqe failed")
-            .send(WqeFlags::empty())
-            .expect("send failed")
-            .inline(&test_data)
-            .finish_signaled(i as u64)
-            .expect("finish failed");
-        qp1.borrow().ring_sq_doorbell();
+        let qp1_ref = qp1.borrow();
+        let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
+        let result = emit_wqe!(&ctx, send {
+            flags: WqeFlags::empty(),
+            inline: &test_data,
+            signaled: i as u64,
+        }).expect("emit_wqe failed");
+        qp1_ref.ring_sq_doorbell();
+        drop(qp1_ref);
+        let handle = result;
 
         // Detect wrap-around: wqe_idx decreased or jumped significantly
         if let Some(prev) = prev_wqe_idx
@@ -862,15 +876,15 @@ fn test_rc_inline_variable_size_wraparound() {
         qp2.borrow().ring_rq_doorbell();
 
         // Post SEND with inline data
-        qp1.borrow_mut()
-            .sq_wqe()
-            .expect("sq_wqe failed")
-            .send(WqeFlags::empty())
-            .expect("send failed")
-            .inline(&test_data)
-            .finish_signaled(i as u64)
-            .expect("finish failed");
-        qp1.borrow().ring_sq_doorbell();
+        let qp1_ref = qp1.borrow();
+        let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
+        emit_wqe!(&ctx, send {
+            flags: WqeFlags::empty(),
+            inline: &test_data,
+            signaled: i as u64,
+        }).expect("emit_wqe failed");
+        qp1_ref.ring_sq_doorbell();
+        drop(qp1_ref);
 
         // Poll CQs
         let send_cqe = poll_cq_timeout(&send_cq, 5000).expect("Send CQE timeout");

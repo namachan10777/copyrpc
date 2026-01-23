@@ -26,6 +26,7 @@ use crate::srq::Srq;
 use crate::transport::{InfiniBand, RoCE};
 use crate::wqe::{
     CtrlSegParams, OrderedWqeTable, WQEBB_SIZE, WqeFlags, WqeOpcode, write_ctrl_seg, write_data_seg,
+    emit::{SqCapability, UdEmitContext},
 };
 
 // =============================================================================
@@ -176,6 +177,31 @@ impl<Entry> UdSendQueueState<Entry, OrderedWqeTable<Entry>> {
         self.ci.set(entry.ci_delta);
         Some(entry.data)
     }
+
+    /// Get an emit context for macro-based WQE emission.
+    ///
+    /// Returns `None` if the SQ is full.
+    pub fn emit_ctx(&self) -> Result<UdEmitContext<'_, Entry>, io::Error> {
+        if self.available() == 0 {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        Ok(UdEmitContext {
+            buf: self.buf,
+            wqe_cnt: self.wqe_cnt,
+            sqn: self.sqn,
+            pi: &self.pi,
+            ci: &self.ci,
+            last_wqe: &self.last_wqe,
+            table: &self.table,
+        })
+    }
+}
+
+impl<Entry> SqCapability for UdSendQueueState<Entry, OrderedWqeTable<Entry>> {
+    const REQUIRES_AV: bool = true;
+    const SUPPORTS_SEND: bool = true;
+    const SUPPORTS_RDMA: bool = false;
+    const SUPPORTS_ATOMIC: bool = false;
 }
 
 // =============================================================================
@@ -720,6 +746,11 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIb<SqEntry, RqEntry, OnSq
         self.modify_to_rts(sq_psn)?;
         Ok(())
     }
+
+    /// Get an emit context for macro-based WQE emission.
+    pub fn emit_ctx(&self) -> io::Result<UdEmitContext<'_, SqEntry>> {
+        self.sq()?.emit_ctx()
+    }
 }
 
 impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> {
@@ -761,6 +792,10 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIbWithSrq<SqEntry, RqEntr
         Ok(())
     }
 
+    /// Get an emit context for macro-based WQE emission.
+    pub fn emit_ctx(&self) -> io::Result<UdEmitContext<'_, SqEntry>> {
+        self.sq()?.emit_ctx()
+    }
 }
 
 // =============================================================================

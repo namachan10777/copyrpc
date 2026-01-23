@@ -22,6 +22,8 @@ use mlx5::cq::CqConfig;
 use mlx5::dc::{DciConfig, DctConfig};
 use mlx5::srq::SrqConfig;
 use mlx5::wqe::WqeFlags;
+use mlx5::wqe::emit::DcAvIb;
+use mlx5::emit_dci_wqe;
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
@@ -174,15 +176,19 @@ fn test_dc_rdma_write() {
     local_buf.fill_bytes(test_data);
     remote_buf.fill(0);
 
-    // Post RDMA WRITE via DCI
-    dci.borrow_mut()
-        .sq_wqe(dc_key, dctn, dlid)
-        .expect("sq_wqe failed")
-        .write(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
-        .expect("write failed")
-        .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-        .finish_signaled(1u64)
-        .expect("finish failed");
+    // Post RDMA WRITE via DCI using emit_dci_wqe! macro
+    {
+        let dci_ref = dci.borrow();
+        let ctx = dci_ref.emit_ctx().expect("emit_ctx failed");
+        emit_dci_wqe!(&ctx, write {
+            av: DcAvIb::new(dc_key, dctn, dlid),
+            flags: WqeFlags::empty(),
+            remote_addr: remote_buf.addr(),
+            rkey: remote_mr.rkey(),
+            sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
+            signaled: 1u64,
+        }).expect("emit_dci_wqe failed");
+    }
     dci.borrow().ring_sq_doorbell();
 
     // Poll CQ
@@ -280,15 +286,19 @@ fn test_dc_rdma_read() {
     remote_buf.fill_bytes(test_data);
     local_buf.fill(0);
 
-    // Post RDMA READ via DCI
-    dci.borrow_mut()
-        .sq_wqe(dc_key, dctn, dlid)
-        .expect("sq_wqe failed")
-        .read(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
-        .expect("read failed")
-        .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-        .finish_signaled(1u64)
-        .expect("finish failed");
+    // Post RDMA READ via DCI using emit_dci_wqe! macro
+    {
+        let dci_ref = dci.borrow();
+        let ctx = dci_ref.emit_ctx().expect("emit_ctx failed");
+        emit_dci_wqe!(&ctx, read {
+            av: DcAvIb::new(dc_key, dctn, dlid),
+            flags: WqeFlags::empty(),
+            remote_addr: remote_buf.addr(),
+            rkey: remote_mr.rkey(),
+            sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
+            signaled: 1u64,
+        }).expect("emit_dci_wqe failed");
+    }
     dci.borrow().ring_sq_doorbell();
 
     // Poll CQ
@@ -391,18 +401,18 @@ fn test_dc_multiple_dci() {
         let offset = i * 64;
         local_bufs[i].fill_bytes(test_data.as_bytes());
 
-        dci.borrow_mut()
-            .sq_wqe(dc_key, dctn, dlid)
-            .expect("sq_wqe failed")
-            .write(WqeFlags::empty(), remote_buf.addr() + offset as u64, remote_mr.rkey())
-            .expect("write failed")
-            .sge(
-                local_bufs[i].addr(),
-                test_data.len() as u32,
-                local_mrs[i].lkey(),
-            )
-            .finish_signaled((i + 1) as u64)
-            .expect("finish failed");
+        {
+            let dci_ref = dci.borrow();
+            let ctx = dci_ref.emit_ctx().unwrap_or_else(|_| panic!("emit_ctx failed for DCI {}", i));
+            emit_dci_wqe!(&ctx, write {
+                av: DcAvIb::new(dc_key, dctn, dlid),
+                flags: WqeFlags::empty(),
+                remote_addr: remote_buf.addr() + offset as u64,
+                rkey: remote_mr.rkey(),
+                sge: { addr: local_bufs[i].addr(), len: test_data.len() as u32, lkey: local_mrs[i].lkey() },
+                signaled: (i + 1) as u64,
+            }).unwrap_or_else(|_| panic!("emit_dci_wqe failed for DCI {}", i));
+        }
         dci.borrow().ring_sq_doorbell();
 
         // Poll for this DCI's completion
@@ -494,17 +504,21 @@ fn test_dc_inline_data() {
 
     remote_buf.fill(0xBB);
 
-    // Use inline_data - data is embedded directly in WQE
+    // Use inline_data - data is embedded directly in WQE using emit_dci_wqe! macro
     let test_data = b"DC inline_data test!";
 
-    dci.borrow_mut()
-        .sq_wqe(dc_key, dctn, dlid)
-        .expect("sq_wqe failed")
-        .write(WqeFlags::COMPLETION, remote_buf.addr(), remote_mr.rkey())
-        .expect("write failed")
-        .inline(test_data)
-        .finish_signaled(1u64)
-        .expect("finish failed");
+    {
+        let dci_ref = dci.borrow();
+        let ctx = dci_ref.emit_ctx().expect("emit_ctx failed");
+        emit_dci_wqe!(&ctx, write {
+            av: DcAvIb::new(dc_key, dctn, dlid),
+            flags: WqeFlags::COMPLETION,
+            remote_addr: remote_buf.addr(),
+            rkey: remote_mr.rkey(),
+            inline: test_data,
+            signaled: 1u64,
+        }).expect("emit_dci_wqe failed");
+    }
     dci.borrow().ring_sq_doorbell();
 
     let cqe = poll_cq_timeout(&dci_cq, 5000).expect("CQE timeout");

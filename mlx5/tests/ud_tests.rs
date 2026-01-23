@@ -18,9 +18,11 @@ mod common;
 use std::rc::Rc;
 
 use mlx5::cq::CqConfig;
+use mlx5::emit_ud_wqe;
 use mlx5::pd::RemoteUdQpInfo;
 use mlx5::ud::{UdQpConfig, UdQpState};
 use mlx5::wqe::WqeFlags;
+use mlx5::wqe::emit::UdAvIb;
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
@@ -197,16 +199,16 @@ fn test_ud_send_recv() {
         .expect("Failed to create AH");
 
     // Post UD SEND
-    sender
-        .borrow_mut()
-        .sq_wqe(&ah)
-        .expect("sq_wqe failed")
-        .send(WqeFlags::empty())
-        .expect("send failed")
-        .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-        .finish_signaled(1u64)
-        .expect("finish failed");
-    sender.borrow().ring_sq_doorbell();
+    let sender_ref = sender.borrow();
+    let ctx = sender_ref.emit_ctx().expect("emit_ctx failed");
+    emit_ud_wqe!(&ctx, send {
+        av: UdAvIb::new(ah.qpn(), ah.qkey(), ah.dlid()),
+        flags: WqeFlags::empty(),
+        sge: { addr: send_buf.addr(), len: test_data.len() as u32, lkey: send_mr.lkey() },
+        signaled: 1u64,
+    }).expect("emit_ud_wqe failed");
+    sender_ref.ring_sq_doorbell();
+    drop(sender_ref);
 
     // Poll send CQ
     let send_cqe = poll_cq_timeout(&send_cq, 5000).expect("Send CQE timeout");
@@ -335,16 +337,16 @@ fn test_ud_send_raw_av() {
         .expect("Failed to create AH");
 
     // Post UD SEND with new API
-    sender
-        .borrow_mut()
-        .sq_wqe(&ah)
-        .expect("sq_wqe failed")
-        .send(WqeFlags::empty())
-        .expect("send failed")
-        .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-        .finish_signaled(1u64)
-        .expect("finish failed");
-    sender.borrow().ring_sq_doorbell();
+    let sender_ref = sender.borrow();
+    let ctx = sender_ref.emit_ctx().expect("emit_ctx failed");
+    emit_ud_wqe!(&ctx, send {
+        av: UdAvIb::new(ah.qpn(), ah.qkey(), ah.dlid()),
+        flags: WqeFlags::empty(),
+        sge: { addr: send_buf.addr(), len: test_data.len() as u32, lkey: send_mr.lkey() },
+        signaled: 1u64,
+    }).expect("emit_ud_wqe failed");
+    sender_ref.ring_sq_doorbell();
+    drop(sender_ref);
 
     // Poll send CQ
     let send_cqe = poll_cq_timeout(&send_cq, 5000).expect("Send CQE timeout");
@@ -476,16 +478,17 @@ fn test_ud_multiple_destinations() {
             .create_ah(ctx.port, &remote_info)
             .expect("Failed to create AH");
 
-        sender
-            .borrow_mut()
-            .sq_wqe(&ah)
-            .expect("sq_wqe failed")
-            .send(WqeFlags::empty())
-            .expect("send failed")
-            .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-            .finish_signaled((i + 1) as u64)
-            .expect("finish failed");
-        sender.borrow().ring_sq_doorbell();
+        {
+            let sender_ref = sender.borrow();
+            let ctx = sender_ref.emit_ctx().expect("emit_ctx failed");
+            emit_ud_wqe!(&ctx, send {
+                av: UdAvIb::new(ah.qpn(), ah.qkey(), ah.dlid()),
+                flags: WqeFlags::empty(),
+                sge: { addr: send_buf.addr(), len: test_data.len() as u32, lkey: send_mr.lkey() },
+                signaled: (i + 1) as u64,
+            }).expect("emit_ud_wqe failed");
+            sender_ref.ring_sq_doorbell();
+        }
 
         // Poll send CQ
         let send_cqe =

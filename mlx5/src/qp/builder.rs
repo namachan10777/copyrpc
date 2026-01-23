@@ -865,6 +865,35 @@ impl<'a, Entry> BlueflameWqeBatch<'a, Entry> {
         })
     }
 
+    /// Get an emit context for macro-based WQE emission.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use mlx5::emit_wqe_bf;
+    ///
+    /// let mut bf = qp.blueflame_sq_wqe()?;
+    /// let ctx = bf.emit_ctx();
+    /// emit_wqe_bf!(&ctx, write {
+    ///     flags: WqeFlags::empty(),
+    ///     remote_addr: dest,
+    ///     rkey: rkey,
+    ///     sge: { addr: local_addr, len: 64, lkey },
+    ///     signaled: entry,
+    /// })?;
+    /// bf.finish();
+    /// ```
+    #[inline]
+    pub fn emit_ctx(&mut self) -> crate::wqe::emit::BlueflameEmitContext<'_, Entry> {
+        crate::wqe::emit::BlueflameEmitContext {
+            buffer: unsafe { &mut *(&mut self.buffer as *mut [u8; BLUEFLAME_BUFFER_SIZE]) },
+            offset: &mut self.offset,
+            sqn: self.sq.sqn,
+            wqe_cnt: self.sq.wqe_cnt,
+            pi: &self.sq.pi,
+            table: &self.sq.table,
+        }
+    }
+
     /// Finish the batch and submit all WQEs via BlueFlame doorbell.
     ///
     /// This method copies the accumulated WQEs to the BlueFlame register

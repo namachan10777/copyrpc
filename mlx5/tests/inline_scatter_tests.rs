@@ -24,6 +24,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use mlx5::cq::{CqConfig, Cqe};
+use mlx5::emit_wqe;
 use mlx5::qp::RcQpConfig;
 use mlx5::transport::IbRemoteQpInfo;
 use mlx5::wqe::WqeFlags;
@@ -149,15 +150,15 @@ fn test_scatter_to_cqe_diagnostic() {
         qp2.borrow().ring_rq_doorbell();
 
         // Post SGE-based Send on QP1
-        let _ = qp1
-            .borrow_mut()
-            .sq_wqe()
-            .expect("sq_wqe failed")
-            .send(WqeFlags::empty())
-            .expect("send failed")
-            .sge(send_buf.addr(), size as u32, send_mr.lkey())
-            .finish_signaled(i as u64);
-        qp1.borrow().ring_sq_doorbell();
+        let qp1_ref = qp1.borrow();
+        let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
+        emit_wqe!(&ctx, send {
+            flags: WqeFlags::empty(),
+            sge: { addr: send_buf.addr(), len: size as u32, lkey: send_mr.lkey() },
+            signaled: i as u64,
+        }).expect("emit_wqe failed");
+        qp1_ref.ring_sq_doorbell();
+        drop(qp1_ref);
 
         // Wait for send completion
         let send_cqe =
@@ -339,15 +340,15 @@ fn test_scatter_to_cqe_disabled() {
         qp2.borrow().ring_rq_doorbell();
 
         // Post inline send
-        let _ = qp1
-            .borrow_mut()
-            .sq_wqe()
-            .expect("sq_wqe failed")
-            .send(WqeFlags::empty())
-            .expect("send failed")
-            .inline(&test_data)
-            .finish_signaled(i as u64);
-        qp1.borrow().ring_sq_doorbell();
+        let qp1_ref = qp1.borrow();
+        let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
+        emit_wqe!(&ctx, send {
+            flags: WqeFlags::empty(),
+            inline: &test_data,
+            signaled: i as u64,
+        }).expect("emit_wqe failed");
+        qp1_ref.ring_sq_doorbell();
+        drop(qp1_ref);
 
         // Wait for completions
         let _ = poll_cq_timeout(&send_cq, 5000).expect("Send CQE timeout");
@@ -486,15 +487,15 @@ fn test_small_inline_wraparound() {
             qp2.borrow().ring_rq_doorbell();
 
             // Post small inline send
-            let _ = qp1
-                .borrow_mut()
-                .sq_wqe()
-                .expect("sq_wqe failed")
-                .send(WqeFlags::empty())
-                .expect("send failed")
-                .inline(&test_data)
-                .finish_signaled((size * 100 + i) as u64);
-            qp1.borrow().ring_sq_doorbell();
+            let qp1_ref = qp1.borrow();
+            let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
+            emit_wqe!(&ctx, send {
+                flags: WqeFlags::empty(),
+                inline: &test_data,
+                signaled: (size * 100 + i) as u64,
+            }).expect("emit_wqe failed");
+            qp1_ref.ring_sq_doorbell();
+            drop(qp1_ref);
 
             // Wait for completions
             let send_cqe = poll_cq_timeout(&send_cq, 5000).unwrap_or_else(|| panic!("Send CQE timeout at size={}, iter={}",

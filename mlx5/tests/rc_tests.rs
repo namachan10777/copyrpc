@@ -20,6 +20,7 @@ use mlx5::cq::CqConfig;
 use mlx5::qp::{QpState, RcQpConfig, RcQpIb};
 use mlx5::transport::IbRemoteQpInfo;
 use mlx5::wqe::WqeFlags;
+use mlx5::{emit_wqe, emit_wqe_bf};
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
@@ -176,18 +177,18 @@ fn test_rc_rdma_write() {
     );
     println!("QP1 QPN: 0x{:x}", qp1.borrow().qpn());
 
-    // Post RDMA WRITE via BlueFlame batch builder
+    // Post RDMA WRITE via BlueFlame batch builder using emit_wqe_bf! macro
     {
         let qp1_ref = qp1.borrow();
         let mut bf = qp1_ref.blueflame_sq_wqe().expect("blueflame_sq_wqe failed");
-        bf.wqe()
-            .expect("wqe failed")
-            .write(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
-            .expect("write failed")
-            .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-            .expect("sge failed")
-            .finish_signaled(1u64)
-            .expect("finish failed");
+        let mut ctx = bf.emit_ctx();
+        emit_wqe_bf!(&mut ctx, write {
+            flags: WqeFlags::empty(),
+            remote_addr: remote_buf.addr(),
+            rkey: remote_mr.rkey(),
+            sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
+            signaled: 1u64,
+        }).expect("emit_wqe_bf failed");
         bf.finish();
     }
 
@@ -248,15 +249,18 @@ fn test_rc_rdma_read() {
     remote_buf.fill_bytes(test_data);
     local_buf.fill(0); // Clear local buffer
 
-    // Post RDMA READ (uses regular doorbell, not BlueFlame batch builder)
-    qp1.borrow_mut()
-        .sq_wqe()
-        .expect("sq_wqe failed")
-        .read(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
-        .expect("read failed")
-        .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-        .finish_signaled(1u64)
-        .expect("finish failed");
+    // Post RDMA READ using emit_wqe! macro
+    {
+        let qp1_ref = qp1.borrow();
+        let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
+        emit_wqe!(&ctx, read {
+            flags: WqeFlags::empty(),
+            remote_addr: remote_buf.addr(),
+            rkey: remote_mr.rkey(),
+            sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
+            signaled: 1u64,
+        }).expect("emit_wqe failed");
+    }
     qp1.borrow().ring_sq_doorbell();
 
     // Poll CQ
@@ -313,15 +317,20 @@ fn test_rc_atomic_cas_success() {
     remote_buf.write_u64(0, initial_value);
     local_buf.fill(0); // Result buffer
 
-    // Post Atomic CAS (uses regular doorbell)
-    qp1.borrow_mut()
-        .sq_wqe()
-        .expect("sq_wqe failed")
-        .cas(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey(), swap_value, compare_value)
-        .expect("cas failed")
-        .sge(local_buf.addr(), 8, local_mr.lkey())
-        .finish_signaled(1u64)
-        .expect("finish failed");
+    // Post Atomic CAS using emit_wqe! macro
+    {
+        let qp1_ref = qp1.borrow();
+        let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
+        emit_wqe!(&ctx, cas {
+            flags: WqeFlags::empty(),
+            remote_addr: remote_buf.addr(),
+            rkey: remote_mr.rkey(),
+            swap: swap_value,
+            compare: compare_value,
+            sge: { addr: local_buf.addr(), lkey: local_mr.lkey() },
+            signaled: 1u64,
+        }).expect("emit_wqe failed");
+    }
     qp1.borrow().ring_sq_doorbell();
 
     // Poll CQ
@@ -390,15 +399,20 @@ fn test_rc_atomic_cas_failure() {
     remote_buf.write_u64(0, initial_value);
     local_buf.fill(0); // Result buffer
 
-    // Post Atomic CAS
-    qp1.borrow_mut()
-        .sq_wqe()
-        .expect("sq_wqe failed")
-        .cas(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey(), swap_value, compare_value)
-        .expect("cas failed")
-        .sge(local_buf.addr(), 8, local_mr.lkey())
-        .finish_signaled(1u64)
-        .expect("finish failed");
+    // Post Atomic CAS using emit_wqe! macro
+    {
+        let qp1_ref = qp1.borrow();
+        let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
+        emit_wqe!(&ctx, cas {
+            flags: WqeFlags::empty(),
+            remote_addr: remote_buf.addr(),
+            rkey: remote_mr.rkey(),
+            swap: swap_value,
+            compare: compare_value,
+            sge: { addr: local_buf.addr(), lkey: local_mr.lkey() },
+            signaled: 1u64,
+        }).expect("emit_wqe failed");
+    }
     qp1.borrow().ring_sq_doorbell();
 
     // Poll CQ
@@ -464,15 +478,19 @@ fn test_rc_atomic_fa() {
     remote_buf.write_u64(0, initial_value);
     local_buf.fill(0); // Result buffer
 
-    // Post Atomic FA
-    qp1.borrow_mut()
-        .sq_wqe()
-        .expect("sq_wqe failed")
-        .fetch_add(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey(), add_value)
-        .expect("fetch_add failed")
-        .sge(local_buf.addr(), 8, local_mr.lkey())
-        .finish_signaled(1u64)
-        .expect("finish failed");
+    // Post Atomic FA using emit_wqe! macro
+    {
+        let qp1_ref = qp1.borrow();
+        let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
+        emit_wqe!(&ctx, fetch_add {
+            flags: WqeFlags::empty(),
+            remote_addr: remote_buf.addr(),
+            rkey: remote_mr.rkey(),
+            add_value: add_value,
+            sge: { addr: local_buf.addr(), lkey: local_mr.lkey() },
+            signaled: 1u64,
+        }).expect("emit_wqe failed");
+    }
     qp1.borrow().ring_sq_doorbell();
 
     // Poll CQ
@@ -570,15 +588,19 @@ fn test_rc_rdma_write_imm() {
     // For now, let's just test the send side works
     let imm_data: u32 = 0x12345678;
 
-    // Post RDMA WRITE with immediate from QP1 to QP2's memory
-    qp1.borrow_mut()
-        .sq_wqe()
-        .expect("sq_wqe failed")
-        .write_imm(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey(), imm_data)
-        .expect("write_imm failed")
-        .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-        .finish_signaled(1u64)
-        .expect("finish failed");
+    // Post RDMA WRITE with immediate using emit_wqe! macro
+    {
+        let qp1_ref = qp1.borrow();
+        let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
+        emit_wqe!(&ctx, write_imm {
+            flags: WqeFlags::empty(),
+            remote_addr: remote_buf.addr(),
+            rkey: remote_mr.rkey(),
+            imm: imm_data,
+            sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
+            signaled: 1u64,
+        }).expect("emit_wqe failed");
+    }
     qp1.borrow().ring_sq_doorbell();
 
     // Poll send CQ for completion
@@ -718,15 +740,16 @@ fn test_rc_send_recv() {
         .expect("post_recv failed");
     qp2.borrow().ring_rq_doorbell();
 
-    // QP1 sends data
-    qp1.borrow_mut()
-        .sq_wqe()
-        .expect("sq_wqe failed")
-        .send(WqeFlags::empty())
-        .expect("send failed")
-        .sge(send_buf.addr(), test_data.len() as u32, send_mr.lkey())
-        .finish_signaled(1u64)
-        .expect("finish failed");
+    // QP1 sends data using emit_wqe! macro
+    {
+        let qp1_ref = qp1.borrow();
+        let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
+        emit_wqe!(&ctx, send {
+            flags: WqeFlags::empty(),
+            sge: { addr: send_buf.addr(), len: test_data.len() as u32, lkey: send_mr.lkey() },
+            signaled: 1u64,
+        }).expect("emit_wqe failed");
+    }
     qp1.borrow().ring_sq_doorbell();
 
     // Poll send CQ for send completion
@@ -879,15 +902,16 @@ fn test_rc_send_recv_pingpong() {
             .post_recv(i as u64, buf2.addr(), 64, mr2.lkey());
         qp2.borrow().ring_rq_doorbell();
 
-        // QP1 sends (signaled to get CQE)
-        qp1.borrow_mut()
-            .sq_wqe()
-            .expect("sq_wqe")
-            .send(WqeFlags::COMPLETION)
-            .expect("send")
-            .sge(buf1.addr(), 32, mr1.lkey())
-            .finish_signaled(i as u64)
-            .expect("finish");
+        // QP1 sends (signaled to get CQE) using emit_wqe! macro
+        {
+            let qp1_ref = qp1.borrow();
+            let ctx = qp1_ref.emit_ctx().expect("emit_ctx");
+            emit_wqe!(&ctx, send {
+                flags: WqeFlags::COMPLETION,
+                sge: { addr: buf1.addr(), len: 32, lkey: mr1.lkey() },
+                signaled: i as u64,
+            }).expect("emit_wqe");
+        }
         qp1.borrow().ring_sq_doorbell();
 
         // Wait for send completion
@@ -918,15 +942,16 @@ fn test_rc_send_recv_pingpong() {
             .post_recv(i as u64, buf1.addr(), 64, mr1.lkey());
         qp1.borrow().ring_rq_doorbell();
 
-        // QP2 sends back (signaled to get CQE)
-        qp2.borrow_mut()
-            .sq_wqe()
-            .expect("sq_wqe")
-            .send(WqeFlags::COMPLETION)
-            .expect("send")
-            .sge(buf2.addr(), 32, mr2.lkey())
-            .finish_signaled(i as u64)
-            .expect("finish");
+        // QP2 sends back (signaled to get CQE) using emit_wqe! macro
+        {
+            let qp2_ref = qp2.borrow();
+            let ctx = qp2_ref.emit_ctx().expect("emit_ctx");
+            emit_wqe!(&ctx, send {
+                flags: WqeFlags::COMPLETION,
+                sge: { addr: buf2.addr(), len: 32, lkey: mr2.lkey() },
+                signaled: i as u64,
+            }).expect("emit_wqe");
+        }
         qp2.borrow().ring_sq_doorbell();
 
         // Wait for send completion
@@ -985,14 +1010,18 @@ fn test_rc_inline_data() {
     // Use inline_data - data is embedded directly in WQE
     let test_data = b"inline_data test!";
 
-    qp1.borrow_mut()
-        .sq_wqe()
-        .expect("sq_wqe failed")
-        .write(WqeFlags::COMPLETION, remote_buf.addr(), remote_mr.rkey())
-        .expect("write failed")
-        .inline(test_data)
-        .finish_signaled(1u64)
-        .expect("finish failed");
+    // Use emit_wqe! macro with inline data
+    {
+        let qp1_ref = qp1.borrow();
+        let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
+        emit_wqe!(&ctx, write {
+            flags: WqeFlags::COMPLETION,
+            remote_addr: remote_buf.addr(),
+            rkey: remote_mr.rkey(),
+            inline: test_data,
+            signaled: 1u64,
+        }).expect("emit_wqe failed");
+    }
     qp1.borrow().ring_sq_doorbell();
 
     // Wait for completion
@@ -1038,26 +1067,31 @@ fn test_rc_wqe_builder_unsignaled() {
     local_buf.fill_bytes(test_data);
     remote_buf.fill(0);
 
-    // Post unsignaled WQE (no CQE will be generated)
-    qp1.borrow_mut()
-        .sq_wqe()
-        .expect("sq_wqe failed")
-        .write(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
-        .expect("write failed")
-        .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-        .finish_unsignaled()
-        .expect("finish failed");
+    // Post unsignaled WQE using emit_wqe! macro (no CQE will be generated)
+    {
+        let qp1_ref = qp1.borrow();
+        let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
+        emit_wqe!(&ctx, write {
+            flags: WqeFlags::empty(),
+            remote_addr: remote_buf.addr(),
+            rkey: remote_mr.rkey(),
+            sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
+        }).expect("emit_wqe failed");
+    }
     qp1.borrow().ring_sq_doorbell();
 
     // Post a signaled WQE to ensure the unsignaled one completed
-    qp1.borrow_mut()
-        .sq_wqe()
-        .expect("sq_wqe failed")
-        .write(WqeFlags::COMPLETION, remote_buf.addr(), remote_mr.rkey())
-        .expect("write failed")
-        .sge(local_buf.addr(), 1, local_mr.lkey())
-        .finish_signaled(1u64)
-        .expect("finish failed");
+    {
+        let qp1_ref = qp1.borrow();
+        let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
+        emit_wqe!(&ctx, write {
+            flags: WqeFlags::COMPLETION,
+            remote_addr: remote_buf.addr(),
+            rkey: remote_mr.rkey(),
+            sge: { addr: local_buf.addr(), len: 1, lkey: local_mr.lkey() },
+            signaled: 1u64,
+        }).expect("emit_wqe failed");
+    }
     qp1.borrow().ring_sq_doorbell();
 
     // Wait for the signaled completion (implies unsignaled completed too)

@@ -21,6 +21,7 @@ use std::rc::Rc;
 
 use mlx5::cq::{CqConfig, Cqe};
 use mlx5::dc::DciConfig;
+use mlx5::emit_tm_wqe;
 use mlx5::tm_srq::{TmSrqCompletion, TmSrqConfig};
 
 use common::{AlignedBuffer, TestContext, full_access};
@@ -157,16 +158,18 @@ fn test_tm_tag_add_remove() {
         tm_srq.borrow().cmd_optimistic_available()
     );
 
-    let handle = tm_srq
-        .borrow_mut()
-        .cmd_wqe_builder(1u64)
-        .expect("cmd_wqe_builder failed")
-        .ctrl_tag_matching(0)
-        .tag_add(tag_index, tag, recv_buf.addr(), 256, mr.lkey(), true)
-        .finish();
-    tm_srq.borrow_mut().ring_cmd_doorbell();
+    let tm_ref = tm_srq.borrow();
+    let ctx = tm_ref.cmd_emit_ctx().expect("cmd_emit_ctx failed");
+    let result = emit_tm_wqe!(&ctx, tag_add {
+        index: tag_index,
+        tag: tag,
+        sge: { addr: recv_buf.addr(), len: 256, lkey: mr.lkey() },
+        signaled: 1u64,
+    }).expect("emit_tm_wqe failed");
+    tm_ref.ring_cmd_doorbell();
+    drop(tm_ref);
 
-    println!("WQE handle: idx={}, size={}", handle.wqe_idx, handle.size);
+    println!("WQE handle: idx={}", result.wqe_idx);
 
     // Poll for add completion
     let start = std::time::Instant::now();
@@ -203,14 +206,14 @@ fn test_tm_tag_add_remove() {
     captured_cqes.borrow_mut().clear();
 
     // Remove the tag
-    tm_srq
-        .borrow_mut()
-        .cmd_wqe_builder(2u64)
-        .expect("cmd_wqe_builder failed")
-        .ctrl_tag_matching(0)
-        .tag_del(tag_index, true)
-        .finish();
-    tm_srq.borrow_mut().ring_cmd_doorbell();
+    let tm_ref = tm_srq.borrow();
+    let ctx = tm_ref.cmd_emit_ctx().expect("cmd_emit_ctx failed");
+    emit_tm_wqe!(&ctx, tag_del {
+        index: tag_index,
+        signaled: 2u64,
+    }).expect("emit_tm_wqe failed");
+    tm_ref.ring_cmd_doorbell();
+    drop(tm_ref);
 
     // Poll for delete completion
     let start = std::time::Instant::now();
@@ -362,21 +365,17 @@ fn test_tm_multiple_tags() {
         let tag = base_tag + i as u64;
         let prev_count = captured_cqes.borrow().len();
 
-        tm_srq
-            .borrow_mut()
-            .cmd_wqe_builder((i + 1) as u64)
-            .expect("cmd_wqe_builder failed")
-            .ctrl_tag_matching(0)
-            .tag_add(
-                i,
-                tag,
-                recv_bufs[i as usize].addr(),
-                256,
-                mrs[i as usize].lkey(),
-                true,
-            )
-            .finish();
-        tm_srq.borrow_mut().ring_cmd_doorbell();
+        {
+            let tm_ref = tm_srq.borrow();
+            let ctx = tm_ref.cmd_emit_ctx().expect("cmd_emit_ctx failed");
+            emit_tm_wqe!(&ctx, tag_add {
+                index: i,
+                tag: tag,
+                sge: { addr: recv_bufs[i as usize].addr(), len: 256, lkey: mrs[i as usize].lkey() },
+                signaled: (i + 1) as u64,
+            }).expect("emit_tm_wqe failed");
+            tm_ref.ring_cmd_doorbell();
+        }
 
         // Poll for completion
         let start = std::time::Instant::now();
@@ -404,14 +403,15 @@ fn test_tm_multiple_tags() {
     for i in 0..8u16 {
         let prev_count = captured_cqes.borrow().len();
 
-        tm_srq
-            .borrow_mut()
-            .cmd_wqe_builder((i + 100) as u64)
-            .expect("cmd_wqe_builder failed")
-            .ctrl_tag_matching(0)
-            .tag_del(i, true)
-            .finish();
-        tm_srq.borrow_mut().ring_cmd_doorbell();
+        {
+            let tm_ref = tm_srq.borrow();
+            let ctx = tm_ref.cmd_emit_ctx().expect("cmd_emit_ctx failed");
+            emit_tm_wqe!(&ctx, tag_del {
+                index: i,
+                signaled: (i + 100) as u64,
+            }).expect("emit_tm_wqe failed");
+            tm_ref.ring_cmd_doorbell();
+        }
 
         // Poll for completion
         let start = std::time::Instant::now();

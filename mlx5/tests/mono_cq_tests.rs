@@ -9,6 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use mlx5::cq::{CqConfig, Cqe};
+use mlx5::emit_wqe;
 use mlx5::qp::{RcQpConfig, RcQpForMonoCq, RcQpForMonoCqWithSrqAndSqCb};
 use mlx5::srq::SrqConfig;
 use mlx5::transport::IbRemoteQpInfo;
@@ -131,15 +132,17 @@ fn test_mono_cq_with_rc_qp() {
     remote_buf.fill(0);
 
     // Post RDMA WRITE with entry = 42
-    qp1.borrow_mut()
-        .sq_wqe()
-        .expect("sq_wqe failed")
-        .write(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
-        .expect("write failed")
-        .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-        .finish_signaled(42u64)
-        .expect("finish_with_blueflame failed");
-    qp1.borrow().ring_sq_doorbell();
+    let qp1_ref = qp1.borrow();
+    let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
+    emit_wqe!(&ctx, write {
+        flags: WqeFlags::empty(),
+        remote_addr: remote_buf.addr(),
+        rkey: remote_mr.rkey(),
+        sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
+        signaled: 42u64,
+    }).expect("emit_wqe failed");
+    qp1_ref.ring_sq_doorbell();
+    drop(qp1_ref);
 
     // Poll for completion
     let start = std::time::Instant::now();
@@ -289,17 +292,20 @@ fn test_mono_cq_multiple_completions() {
 
     // Post multiple WQEs
     let num_ops = 5;
-    for i in 0..num_ops {
-        qp1.borrow_mut()
-            .sq_wqe()
-            .expect("sq_wqe failed")
-            .write(WqeFlags::empty(), remote_buf.addr(), remote_mr.rkey())
-            .expect("write failed")
-            .sge(local_buf.addr(), test_data.len() as u32, local_mr.lkey())
-            .finish_signaled(100 + i as u64)
-            .expect("finish_with_blueflame failed");
+    {
+        let qp1_ref = qp1.borrow();
+        let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
+        for i in 0..num_ops {
+            emit_wqe!(&ctx, write {
+                flags: WqeFlags::empty(),
+                remote_addr: remote_buf.addr(),
+                rkey: remote_mr.rkey(),
+                sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
+                signaled: 100 + i as u64,
+            }).expect("emit_wqe failed");
+        }
+        qp1_ref.ring_sq_doorbell();
     }
-    qp1.borrow().ring_sq_doorbell();
 
     // Poll until all completions are received
     let start = std::time::Instant::now();
@@ -427,18 +433,21 @@ fn test_mono_cq_high_load() {
 
     println!("Posting {} RDMA WRITEs...", num_ops);
 
-    for i in 0..num_ops {
-        let offset = (i as u64) * (chunk_size as u64);
-        qp1.borrow_mut()
-            .sq_wqe()
-            .expect("sq_wqe failed")
-            .write(WqeFlags::empty(), remote_buf.addr() + offset, remote_mr.rkey())
-            .expect("write failed")
-            .sge(local_buf.addr() + offset, chunk_size, local_mr.lkey())
-            .finish_signaled(i as u64)
-            .expect("finish_with_blueflame failed");
+    {
+        let qp1_ref = qp1.borrow();
+        let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
+        for i in 0..num_ops {
+            let offset = (i as u64) * (chunk_size as u64);
+            emit_wqe!(&ctx, write {
+                flags: WqeFlags::empty(),
+                remote_addr: remote_buf.addr() + offset,
+                rkey: remote_mr.rkey(),
+                sge: { addr: local_buf.addr() + offset, len: chunk_size, lkey: local_mr.lkey() },
+                signaled: i as u64,
+            }).expect("emit_wqe failed");
+        }
+        qp1_ref.ring_sq_doorbell();
     }
-    qp1.borrow().ring_sq_doorbell();
 
     // Poll until all completions are received
     let start = std::time::Instant::now();
@@ -585,19 +594,23 @@ fn test_mono_cq_recv_rdma_write_imm() {
 
     // QP2 sends RDMA WRITE with IMM to QP1
     println!("Posting {} RDMA WRITE IMM operations...", num_ops);
-    for i in 0..num_ops {
-        let offset = (i * 64) as u64;
-        let imm_data = (i + 100) as u32;
-        qp2.borrow_mut()
-            .sq_wqe()
-            .expect("sq_wqe failed")
-            .write_imm(WqeFlags::empty(), recv_buf.addr() + offset, recv_mr.rkey(), imm_data)
-            .expect("write_imm failed")
-            .sge(send_buf.addr() + offset, 64, send_mr.lkey())
-            .finish_signaled(i as u64)
-            .expect("finish_with_blueflame failed");
+    {
+        let qp2_ref = qp2.borrow();
+        let ctx = qp2_ref.emit_ctx().expect("emit_ctx failed");
+        for i in 0..num_ops {
+            let offset = (i * 64) as u64;
+            let imm_data = (i + 100) as u32;
+            emit_wqe!(&ctx, write_imm {
+                flags: WqeFlags::empty(),
+                remote_addr: recv_buf.addr() + offset,
+                rkey: recv_mr.rkey(),
+                imm: imm_data,
+                sge: { addr: send_buf.addr() + offset, len: 64, lkey: send_mr.lkey() },
+                signaled: i as u64,
+            }).expect("emit_wqe failed");
+        }
+        qp2_ref.ring_sq_doorbell();
     }
-    qp2.borrow().ring_sq_doorbell();
 
     // Poll both CQs
     let start = std::time::Instant::now();
@@ -749,15 +762,19 @@ fn test_mono_cq_bidirectional_pingpong() {
         let imm = i as u32;
 
         // QP1 -> QP2
-        qp1.borrow_mut()
-            .sq_wqe()
-            .expect("sq_wqe")
-            .write_imm(WqeFlags::empty(), buf2.addr() + offset, mr2.rkey(), imm)
-            .expect("write_imm")
-            .sge(buf1.addr() + offset, msg_size, mr1.lkey())
-            .finish_signaled(i as u64)
-            .expect("finish");
-        qp1.borrow().ring_sq_doorbell();
+        {
+            let qp1_ref = qp1.borrow();
+            let ctx = qp1_ref.emit_ctx().expect("emit_ctx");
+            emit_wqe!(&ctx, write_imm {
+                flags: WqeFlags::empty(),
+                remote_addr: buf2.addr() + offset,
+                rkey: mr2.rkey(),
+                imm: imm,
+                sge: { addr: buf1.addr() + offset, len: msg_size, lkey: mr1.lkey() },
+                signaled: i as u64,
+            }).expect("emit_wqe");
+            qp1_ref.ring_sq_doorbell();
+        }
 
         // Wait for QP2 to receive (poll returns number of completions)
         while qp2_count.get() <= i {
@@ -778,15 +795,19 @@ fn test_mono_cq_bidirectional_pingpong() {
         }
 
         // QP2 -> QP1
-        qp2.borrow_mut()
-            .sq_wqe()
-            .expect("sq_wqe")
-            .write_imm(WqeFlags::empty(), buf1.addr() + offset, mr1.rkey(), imm)
-            .expect("write_imm")
-            .sge(buf2.addr() + offset, msg_size, mr2.lkey())
-            .finish_signaled(i as u64)
-            .expect("finish");
-        qp2.borrow().ring_sq_doorbell();
+        {
+            let qp2_ref = qp2.borrow();
+            let ctx = qp2_ref.emit_ctx().expect("emit_ctx");
+            emit_wqe!(&ctx, write_imm {
+                flags: WqeFlags::empty(),
+                remote_addr: buf1.addr() + offset,
+                rkey: mr1.rkey(),
+                imm: imm,
+                sge: { addr: buf2.addr() + offset, len: msg_size, lkey: mr2.lkey() },
+                signaled: i as u64,
+            }).expect("emit_wqe");
+            qp2_ref.ring_sq_doorbell();
+        }
 
         // Wait for QP1 to receive
         while qp1_count.get() <= i {
@@ -907,16 +928,17 @@ fn test_mono_cq_wraparound() {
     while submitted < num_operations as u64 {
         // Submit a batch of operations
         {
-            let mut qp = qp1.borrow_mut();
+            let qp = qp1.borrow();
+            let ctx = qp.emit_ctx().unwrap();
             for i in 0..batch_size.min((num_operations as u64 - submitted) as usize) {
                 let offset = (i * 32) as u64;
-                let _ = qp
-                    .sq_wqe()
-                    .unwrap()
-                    .write(WqeFlags::empty(), buf.addr() + offset, mr.lkey())
-                    .unwrap()
-                    .sge(buf.addr() + offset, 32, mr.lkey())
-                    .finish_signaled(submitted + i as u64);
+                emit_wqe!(&ctx, write {
+                    flags: WqeFlags::empty(),
+                    remote_addr: buf.addr() + offset,
+                    rkey: mr.lkey(),
+                    sge: { addr: buf.addr() + offset, len: 32, lkey: mr.lkey() },
+                    signaled: submitted + i as u64,
+                }).unwrap();
             }
             qp.ring_sq_doorbell();
         }
@@ -1055,19 +1077,23 @@ fn test_mono_cq_with_srq() {
 
     // QP2 sends RDMA WRITE+IMM to QP1
     eprintln!("Posting {} RDMA WRITE IMM operations...", num_ops);
-    for i in 0..num_ops {
-        let offset = (i * 64) as u64;
-        let imm_data = (i + 100) as u32;
-        qp2.borrow_mut()
-            .sq_wqe()
-            .expect("sq_wqe")
-            .write_imm(WqeFlags::empty(), recv_buf.addr() + offset, recv_mr.rkey(), imm_data)
-            .expect("write_imm")
-            .sge(send_buf.addr() + offset, 64, send_mr.lkey())
-            .finish_signaled(i as u64)
-            .expect("finish");
+    {
+        let qp2_ref = qp2.borrow();
+        let ctx = qp2_ref.emit_ctx().expect("emit_ctx");
+        for i in 0..num_ops {
+            let offset = (i * 64) as u64;
+            let imm_data = (i + 100) as u32;
+            emit_wqe!(&ctx, write_imm {
+                flags: WqeFlags::empty(),
+                remote_addr: recv_buf.addr() + offset,
+                rkey: recv_mr.rkey(),
+                imm: imm_data,
+                sge: { addr: send_buf.addr() + offset, len: 64, lkey: send_mr.lkey() },
+                signaled: i as u64,
+            }).expect("emit_wqe");
+        }
+        qp2_ref.ring_sq_doorbell();
     }
-    qp2.borrow().ring_sq_doorbell();
 
     // Poll for completions
     let start = std::time::Instant::now();
