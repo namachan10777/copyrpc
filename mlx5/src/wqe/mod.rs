@@ -2,6 +2,7 @@
 //!
 //! Provides segment definitions, opcodes, WQE table, and traits shared across QP types.
 
+pub mod emit;
 pub mod traits;
 
 // =============================================================================
@@ -37,6 +38,17 @@ impl std::fmt::Display for SubmissionError {
 }
 
 impl std::error::Error for SubmissionError {}
+
+impl From<SubmissionError> for std::io::Error {
+    fn from(e: SubmissionError) -> Self {
+        match e {
+            SubmissionError::SqFull | SubmissionError::RqFull => {
+                std::io::Error::new(std::io::ErrorKind::WouldBlock, e)
+            }
+            _ => std::io::Error::other(e),
+        }
+    }
+}
 
 pub use traits::{
     // Transport type tags
@@ -542,6 +554,46 @@ impl WqeFlags {
 #[inline]
 pub(crate) fn calc_wqebb_cnt(wqe_size: usize) -> u16 {
     wqe_size.div_ceil(WQEBB_SIZE) as u16
+}
+
+// =============================================================================
+// Helper Functions for Direct WQE Emission
+// =============================================================================
+
+/// Cold function to mark unlikely branches.
+#[inline(always)]
+#[cold]
+fn cold() {}
+
+/// Branch hint for unlikely conditions.
+///
+/// This helps the compiler optimize the hot path by marking
+/// error conditions and edge cases as unlikely.
+#[inline(always)]
+pub fn unlikely(b: bool) -> bool {
+    if b {
+        cold()
+    }
+    b
+}
+
+/// Calculate inline data padded size (16-byte aligned).
+///
+/// Inline data consists of a 4-byte header followed by the data,
+/// padded to 16-byte boundary.
+#[inline(always)]
+pub const fn inline_padded_size(data_len: usize) -> usize {
+    (4 + data_len + 15) & !15
+}
+
+/// Copy inline data to WQE buffer.
+///
+/// # Safety
+/// - `dst` must point to at least `len` bytes of writable memory
+/// - `src` must point to at least `len` bytes of readable memory
+#[inline(always)]
+pub unsafe fn copy_inline_data(dst: *mut u8, src: *const u8, len: usize) {
+    std::ptr::copy_nonoverlapping(src, dst, len);
 }
 
 // =============================================================================
