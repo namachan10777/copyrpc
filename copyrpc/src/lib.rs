@@ -216,6 +216,10 @@ where
     pd: Pd,
     /// Shared receive queue.
     srq: Rc<Srq<SrqEntry>>,
+    /// Number of recv buffers currently posted to SRQ.
+    srq_posted: Cell<u32>,
+    /// Maximum SRQ work requests.
+    srq_max_wr: u32,
     /// Send completion queue.
     send_cq: Rc<mlx5::cq::Cq>,
     /// Receive completion queue (MonoCq for SRQ-based completion processing).
@@ -318,7 +322,14 @@ impl<U, F: Fn(U, &[u8])> ContextBuilder<U, F> {
         let pd = mlx5_ctx.alloc_pd()?;
 
         let srq: Srq<SrqEntry> = pd.create_srq(&self.srq_config)?;
+        let srq_max_wr = self.srq_config.max_wr;
         let srq = Rc::new(srq);
+
+        // Pre-post recv buffers to SRQ
+        for _ in 0..srq_max_wr {
+            let _ = srq.post_recv(SrqEntry { qpn: 0, is_read: false }, 0, 0, 0);
+        }
+        srq.ring_doorbell();
 
         let send_cq = Rc::new(mlx5_ctx.create_cq(self.cq_size, &CqConfig::default())?);
 
@@ -344,6 +355,8 @@ impl<U, F: Fn(U, &[u8])> ContextBuilder<U, F> {
             mlx5_ctx,
             pd,
             srq,
+            srq_posted: Cell::new(srq_max_wr),
+            srq_max_wr,
             send_cq,
             recv_cq,
             cqe_buffer,
@@ -426,13 +439,18 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
             self.process_cqe(cqe, cqe.qp_num);
         }
 
-        // 3. Repost recvs to SRQ (one per CQE processed)
-        // Use QPN 0 since the actual QPN is determined at completion time
-        for _ in 0..num_cqes {
-            let _ = self.srq.post_recv(SrqEntry { qpn: 0, is_read: false }, 0, 0, 0);
-        }
-        if num_cqes > 0 {
+        // 3. Repost recvs to SRQ when below 2/3 threshold
+        let posted = self.srq_posted.get().saturating_sub(num_cqes as u32);
+        self.srq_posted.set(posted);
+
+        let threshold = self.srq_max_wr * 2 / 3;
+        if posted < threshold {
+            let to_post = self.srq_max_wr - posted;
+            for _ in 0..to_post {
+                let _ = self.srq.post_recv(SrqEntry { qpn: 0, is_read: false }, 0, 0, 0);
+            }
             self.srq.ring_doorbell();
+            self.srq_posted.set(self.srq_max_wr);
         }
 
         // 4. Poll send CQ for READ completions
@@ -595,29 +613,16 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
                 // This is a response - invoke callback
                 let original_call_id = from_response_id(call_id);
 
-                let (user_data, data_vec) = {
-                    let endpoint_ref = endpoint.borrow();
-                    let user_data = endpoint_ref.pending_calls.borrow_mut().try_remove(original_call_id as usize);
+                let endpoint_ref = endpoint.borrow();
+                let user_data = endpoint_ref.pending_calls.borrow_mut().try_remove(original_call_id as usize);
 
-                    if let Some(user_data) = user_data {
-                        let data_offset = header_offset + HEADER_SIZE;
-                        let data_slice = &endpoint_ref.recv_ring[data_offset..data_offset + payload_len as usize];
-                        let data_vec = data_slice.to_vec();
-
-                        let msg_size = padded_message_size(payload_len);
-                        endpoint_ref.last_recv_pos.set(recv_pos + msg_size);
-
-                        (Some(user_data), data_vec)
-                    } else {
-                        // No pending call found - still advance position to avoid infinite loop
-                        let msg_size = padded_message_size(payload_len);
-                        endpoint_ref.last_recv_pos.set(recv_pos + msg_size);
-                        (None, Vec::new())
-                    }
-                };
+                let msg_size = padded_message_size(payload_len);
+                endpoint_ref.last_recv_pos.set(recv_pos + msg_size);
 
                 if let Some(user_data) = user_data {
-                    (self.on_response)(user_data, &data_vec);
+                    let data_offset = header_offset + HEADER_SIZE;
+                    let data_slice = &endpoint_ref.recv_ring[data_offset..data_offset + payload_len as usize];
+                    (self.on_response)(user_data, data_slice);
                 }
             } else {
                 // This is a request - push to recv_stack
@@ -794,15 +799,7 @@ impl<U> EndpointInner<U> {
             remote_consumer_mr: Cell::new(None),
         }));
 
-        // Post initial SRQ recvs with QPN
-        // Post enough recvs to handle concurrent requests without SRQ exhaustion.
-        // Use 4x max_send_wr to provide buffer for burst traffic.
-        // This ensures we have enough recv buffers even if responses arrive before processing.
-        let initial_recv_count = (config.qp_config.max_send_wr as usize) * 4;
-        for _ in 0..initial_recv_count {
-            let _ = srq.post_recv(SrqEntry { qpn, is_read: false }, 0, 0, 0);
-        }
-        srq.ring_doorbell();
+        // SRQ recv buffers are pre-posted in Context::build() and replenished in poll()
 
         Ok(inner)
     }
