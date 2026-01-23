@@ -70,23 +70,13 @@ struct MultiEndpointConnectionInfo {
 }
 
 // =============================================================================
-// User Data for RPC calls
-// =============================================================================
-
-#[derive(Clone, Copy)]
-struct CallUserData {
-    endpoint_id: u8,
-    slot_id: u8,
-}
-
-// =============================================================================
 // Response Counter
 // =============================================================================
 
 /// Global response counter using atomic.
 static RESPONSE_COUNT: AtomicU32 = AtomicU32::new(0);
 
-fn on_response_callback(_user_data: CallUserData, _data: &[u8]) {
+fn on_response_callback(_user_data: (), _data: &[u8]) {
     RESPONSE_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -94,20 +84,16 @@ fn get_and_reset_response_count() -> usize {
     RESPONSE_COUNT.swap(0, Ordering::Relaxed) as usize
 }
 
-#[allow(dead_code)]
-fn get_response_count() -> usize {
-    RESPONSE_COUNT.load(Ordering::Relaxed) as usize
-}
 
 // =============================================================================
 // Client State
 // =============================================================================
 
-type OnResponseFn = fn(CallUserData, &[u8]);
+type OnResponseFn = fn((), &[u8]);
 
 struct CopyrpcClient {
-    ctx: Context<CallUserData, OnResponseFn>,
-    endpoints: Vec<Endpoint<CallUserData>>,
+    ctx: Context<(), OnResponseFn>,
+    endpoints: Vec<Endpoint<()>>,
 }
 
 // =============================================================================
@@ -149,11 +135,14 @@ fn setup_copyrpc_benchmark() -> Option<BenchmarkSetup> {
     // Reset response counter
     get_and_reset_response_count();
 
-    let ctx: Context<CallUserData, OnResponseFn> = ContextBuilder::new()
+    let ctx: Context<(), OnResponseFn> = ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
-            max_wr: (NUM_ENDPOINTS * REQUESTS_PER_EP * 2).max(256) as u32,
+            // SRQ must be large enough to handle burst traffic
+            // Each endpoint needs 4x max_send_wr recv buffers
+            // For 8 endpoints with 256 max_send_wr: 8 * 256 * 4 = 8192, plus margin
+            max_wr: 16384,
             max_sge: 1,
         })
         .cq_size(4096)
@@ -241,6 +230,9 @@ fn setup_copyrpc_benchmark() -> Option<BenchmarkSetup> {
         handle: Some(handle),
     };
 
+    // Small delay to ensure SRQ doorbells are processed by NIC
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
     Some(BenchmarkSetup {
         client: CopyrpcClient {
             ctx,
@@ -262,13 +254,16 @@ fn server_thread_main(
 ) {
     set_cpu_affinity(SERVER_CORE);
 
-    let on_response: fn(CallUserData, &[u8]) = |_user_data, _data| {};
+    let on_response: fn((), &[u8]) = |_user_data, _data| {};
 
-    let ctx: Context<CallUserData, _> = match ContextBuilder::new()
+    let ctx: Context<(), _> = match ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
-            max_wr: (NUM_ENDPOINTS * REQUESTS_PER_EP * 2).max(256) as u32,
+            // SRQ must be large enough to handle burst traffic
+            // Each endpoint needs 4x max_send_wr recv buffers
+            // For 8 endpoints with 256 max_send_wr: 8 * 256 * 4 = 8192, plus margin
+            max_wr: 16384,
             max_sge: 1,
         })
         .cq_size(4096)
@@ -359,7 +354,6 @@ fn server_thread_main(
                 match req.reply(&response_data) {
                     Ok(()) => break,
                     Err(copyrpc::error::Error::RingFull) => {
-                        // Poll to update consumer position and retry
                         ctx.poll();
                         continue;
                     }
@@ -383,13 +377,9 @@ fn run_copyrpc_bench(client: &mut CopyrpcClient, iters: u64) -> Duration {
     get_and_reset_response_count();
 
     // Initial fill: send initial requests on each endpoint
-    for (ep_id, ep) in client.endpoints.iter().enumerate() {
-        for slot_id in 0..REQUESTS_PER_EP {
-            let user_data = CallUserData {
-                endpoint_id: ep_id as u8,
-                slot_id: slot_id as u8,
-            };
-            if ep.call(&request_data, user_data).is_ok() {
+    for ep in client.endpoints.iter() {
+        for _ in 0..REQUESTS_PER_EP {
+            if ep.call(&request_data, ()).is_ok() {
                 inflight += 1;
             }
         }
@@ -417,15 +407,9 @@ fn run_copyrpc_bench(client: &mut CopyrpcClient, iters: u64) -> Duration {
 
         for i in 0..can_send {
             let ep_id = i % NUM_ENDPOINTS;
-            let slot_id = i / NUM_ENDPOINTS;
             let ep = &client.endpoints[ep_id];
 
-            let user_data = CallUserData {
-                endpoint_id: ep_id as u8,
-                slot_id: slot_id as u8,
-            };
-
-            if ep.call(&request_data, user_data).is_ok() {
+            if ep.call(&request_data, ()).is_ok() {
                 inflight += 1;
             }
         }
