@@ -484,23 +484,20 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
             }
         }
 
-        // 6. Flush all endpoints' accumulated data
-        for (_, ep) in self.endpoints.borrow().iter() {
-            let _ = ep.borrow().flush();
-        }
-
-        // 7. Issue READ operations for endpoints that need consumer updates
-        // (READ抑制: only issue if not already inflight)
+        // 6. Flush all endpoints and issue READ operations if needed
         for (_, ep) in self.endpoints.borrow().iter() {
             let ep_ref = ep.borrow();
+
+            // Flush accumulated data
+            let _ = ep_ref.flush();
+
+            // Issue READ if needed or forced, and not already in-flight
             let needs = ep_ref.needs_read();
             let force = ep_ref.force_read.get();
             let inflight = ep_ref.read_inflight.get();
 
-            // Issue READ if needed or forced, and not already in-flight
             if !inflight && (needs || force) {
                 if let Some(remote_mr) = ep_ref.remote_consumer_mr.get() {
-                    // Issue RDMA READ to get remote consumer position
                     let mut qp = ep_ref.qp.borrow_mut();
                     if let Ok(builder) = qp.sq_wqe() {
                         let result = builder
@@ -516,7 +513,7 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
 
                         if result.is_ok() {
                             ep_ref.read_inflight.set(true);
-                            ep_ref.force_read.set(false); // Clear force flag
+                            ep_ref.force_read.set(false);
                             qp.ring_sq_doorbell();
                         }
                     }
