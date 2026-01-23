@@ -531,6 +531,7 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
     /// all messages from last_recv_pos up to recv_ring_producer.
     /// For requests, pushes to recv_stack.
     /// For responses, invokes callback.
+    #[inline(always)]
     fn process_cqe(&self, cqe: Cqe, qpn: u32) {
         // Skip error CQEs
         use mlx5::cq::CqeOpcode;
@@ -825,6 +826,7 @@ impl<U> EndpointInner<U> {
     /// Emit WQE for accumulated data (without doorbell).
     ///
     /// Returns Ok(true) if WQE was emitted, Ok(false) if nothing to emit.
+    #[inline(always)]
     fn emit_wqe(&self) -> Result<bool> {
         let remote_ring = self
             .remote_recv_ring
@@ -935,6 +937,7 @@ impl<U> EndpointInner<U> {
     }
 
     /// Emit WQE and ring doorbell.
+    #[inline(always)]
     fn flush(&self) -> Result<()> {
         self.emit_wqe()?;
         self.qp.borrow().ring_sq_doorbell();
