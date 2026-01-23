@@ -42,7 +42,7 @@ use mlx5::cq::{CqConfig, Cqe};
 use mlx5::device::Context as Mlx5Context;
 use mlx5::mono_cq::MonoCq;
 use mlx5::pd::{AccessFlags, MemoryRegion, Pd};
-use mlx5::qp::{RcQpConfig, RcQpForMonoCqWithSrq};
+use mlx5::qp::{RcQpConfig, RcQpForMonoCqWithSrqAndSqCb};
 use mlx5::srq::{Srq, SrqConfig};
 use mlx5::transport::IbRemoteQpInfo;
 use mlx5::wqe::WqeFlags;
@@ -145,10 +145,15 @@ struct RemoteConsumerMr {
 pub struct SrqEntry {
     /// QPN of the QP that posted this receive.
     pub qpn: u32,
+    /// Flag to distinguish READ completions from WRITE+IMM completions in send CQ.
+    pub is_read: bool,
 }
 
+/// Type alias for the SQ callback used in copyrpc.
+type SqCqCallback = Box<dyn Fn(Cqe, SrqEntry)>;
+
 /// Type alias for the RC QP with SRQ used in copyrpc (for MonoCq).
-type CopyrpcQp = RcQpForMonoCqWithSrq<SrqEntry>;
+type CopyrpcQp = RcQpForMonoCqWithSrqAndSqCb<SrqEntry, SqCqCallback>;
 
 /// CQE buffer for storing receive completions.
 /// MonoCq callback pushes CQEs here, then poll() processes them.
@@ -323,6 +328,11 @@ impl<U, F: Fn(U, &[u8])> ContextBuilder<U, F> {
 
         // Create MonoCq for recv with callback that pushes to buffer
         let recv_callback: RecvCqCallback = Box::new(move |cqe, entry| {
+            // Log error CQEs
+            if cqe.opcode == mlx5::cq::CqeOpcode::ReqErr || cqe.opcode == mlx5::cq::CqeOpcode::RespErr {
+                eprintln!("[recv_cq ERROR] qpn={}, opcode={:?}, syndrome={}", entry.qpn, cqe.opcode, cqe.syndrome);
+                return;
+            }
             cqe_buffer_for_callback.push(cqe, entry);
         });
         let recv_cq = Rc::new(mlx5_ctx.create_mono_cq(self.cq_size, recv_callback, &CqConfig::default())?);
@@ -408,6 +418,7 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
         // (SRQ entries are returned in FIFO order, not per-endpoint)
         let cqes = self.cqe_buffer.drain();
         let num_cqes = cqes.len();
+
         for (cqe, _entry) in cqes {
             self.process_cqe(cqe, cqe.qp_num);
         }
@@ -415,13 +426,13 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
         // 3. Repost recvs to SRQ (one per CQE processed)
         // Use QPN 0 since the actual QPN is determined at completion time
         for _ in 0..num_cqes {
-            let _ = self.srq.post_recv(SrqEntry { qpn: 0 }, 0, 0, 0);
+            let _ = self.srq.post_recv(SrqEntry { qpn: 0, is_read: false }, 0, 0, 0);
         }
         if num_cqes > 0 {
             self.srq.ring_doorbell();
         }
 
-        // 3. Poll send CQ for READ completions
+        // 4. Poll send CQ for READ completions
         loop {
             let count = self.send_cq.poll();
             if count == 0 {
@@ -430,9 +441,16 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
         }
         self.send_cq.flush();
 
-        // 4. Process send CQEs (READ completions)
+        // 5. Process send CQEs (READ completions)
         let send_cqes = self.send_cqe_buffer.drain();
+
         for (_cqe, entry) in send_cqes {
+            // Only process READ completions (is_read=true)
+            // WRITE+IMM completions (is_read=false) are just for SQ progress tracking
+            if !entry.is_read {
+                continue;
+            }
+
             // entry.qpn identifies which endpoint's READ completed
             if let Some(ep) = self.endpoints.borrow().get(&entry.qpn) {
                 let ep_ref = ep.borrow();
@@ -445,16 +463,21 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
             }
         }
 
-        // 5. Flush all endpoints' accumulated data
+        // 6. Flush all endpoints' accumulated data
         for (_, ep) in self.endpoints.borrow().iter() {
             let _ = ep.borrow().flush();
         }
 
-        // 6. Issue READ operations for endpoints that need consumer updates
+        // 7. Issue READ operations for endpoints that need consumer updates
         // (READ抑制: only issue if not already inflight)
         for (_, ep) in self.endpoints.borrow().iter() {
             let ep_ref = ep.borrow();
-            if !ep_ref.read_inflight.get() && ep_ref.needs_read() {
+            let needs = ep_ref.needs_read();
+            let force = ep_ref.force_read.get();
+            let inflight = ep_ref.read_inflight.get();
+
+            // Issue READ if needed or forced, and not already in-flight
+            if !inflight && (needs || force) {
                 if let Some(remote_mr) = ep_ref.remote_consumer_mr.get() {
                     // Issue RDMA READ to get remote consumer position
                     let mut qp = ep_ref.qp.borrow_mut();
@@ -467,11 +490,12 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
                                     8,
                                     ep_ref.read_buffer_mr.lkey(),
                                 )
-                                .finish_signaled(SrqEntry { qpn: ep_ref.qpn() })
+                                .finish_signaled(SrqEntry { qpn: ep_ref.qpn(), is_read: true })
                             });
 
                         if result.is_ok() {
                             ep_ref.read_inflight.set(true);
+                            ep_ref.force_read.set(false); // Clear force flag
                             qp.ring_sq_doorbell();
                         }
                     }
@@ -505,6 +529,12 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
     /// For requests, pushes to recv_stack.
     /// For responses, invokes callback.
     fn process_cqe(&self, cqe: Cqe, qpn: u32) {
+        // Skip error CQEs
+        use mlx5::cq::CqeOpcode;
+        if cqe.opcode == CqeOpcode::ReqErr || cqe.opcode == CqeOpcode::RespErr {
+            return;
+        }
+
         let endpoints = self.endpoints.borrow();
         let endpoint = match endpoints.get(&qpn) {
             Some(ep) => ep,
@@ -656,6 +686,8 @@ struct EndpointInner<U> {
     flush_start_pos: Cell<u64>,
     /// READ operation is in-flight.
     read_inflight: Cell<bool>,
+    /// Force READ on next poll (set when RingFull occurs).
+    force_read: Cell<bool>,
     /// Consumer position for RDMA READ (8-byte aligned).
     consumer_position: Box<AtomicU64>,
     /// Consumer position memory region.
@@ -716,12 +748,18 @@ impl<U> EndpointInner<U> {
 
         // Create QP with SRQ using MonoCq for recv
         let send_cqe_buffer_clone = send_cqe_buffer.clone();
+        let sq_callback: SqCqCallback = Box::new(move |cqe, entry| {
+            // Log error CQEs
+            if cqe.opcode == mlx5::cq::CqeOpcode::ReqErr || cqe.opcode == mlx5::cq::CqeOpcode::RespErr {
+                eprintln!("[send_cq ERROR] qpn={}, opcode={:?}, syndrome={}", entry.qpn, cqe.opcode, cqe.syndrome);
+                return;
+            }
+            send_cqe_buffer_clone.push(cqe, entry);
+        });
         let qp = ctx
             .rc_qp_builder::<SrqEntry, SrqEntry>(pd, &config.qp_config)
             .with_srq(srq.clone())
-            .sq_cq(send_cq.clone(), move |cqe, entry| {
-                send_cqe_buffer_clone.push(cqe, entry);
-            })
+            .sq_cq(send_cq.clone(), sq_callback)
             .rq_mono_cq(recv_cq)
             .build()?;
 
@@ -747,6 +785,7 @@ impl<U> EndpointInner<U> {
             pending_calls: RefCell::new(HashMap::new()),
             flush_start_pos: Cell::new(0),
             read_inflight: Cell::new(false),
+            force_read: Cell::new(false),
             consumer_position,
             consumer_position_mr,
             read_buffer,
@@ -755,10 +794,12 @@ impl<U> EndpointInner<U> {
         }));
 
         // Post initial SRQ recvs with QPN
-        // Post multiple recvs to allow concurrent message reception
-        const INITIAL_RECV_COUNT: usize = 16;
-        for _ in 0..INITIAL_RECV_COUNT {
-            srq.post_recv(SrqEntry { qpn }, 0, 0, 0)?;
+        // Post enough recvs to handle concurrent requests without SRQ exhaustion.
+        // Use 4x max_send_wr to provide buffer for burst traffic.
+        // This ensures we have enough recv buffers even if responses arrive before processing.
+        let initial_recv_count = (config.qp_config.max_send_wr as usize) * 4;
+        for _ in 0..initial_recv_count {
+            let _ = srq.post_recv(SrqEntry { qpn, is_read: false }, 0, 0, 0);
         }
         srq.ring_doorbell();
 
@@ -803,14 +844,74 @@ impl<U> EndpointInner<U> {
         let start_offset = (start & (self.send_ring.len() as u64 - 1)) as usize;
         let remote_offset = start & (remote_ring.size - 1);
         let remote_addr = remote_ring.addr + remote_offset;
+        let ring_len = self.send_ring.len();
+
+        // Check for wrap-around: if data spans ring boundary, emit in two parts
+        if start_offset + delta as usize > ring_len {
+            // Part 1: from start_offset to end of ring
+            let part1_len = ring_len - start_offset;
+            let part1_imm = encode_imm(part1_len as u64);
+
+            let qpn = self.qpn();
+            let count = self.unsignaled_count.get();
+
+            // Emit part 1
+            {
+                let mut qp = self.qp.borrow_mut();
+                let builder = qp.sq_wqe().map_err(Error::Io)?;
+                let builder = builder
+                    .write_imm(WqeFlags::empty(), remote_addr, remote_ring.rkey, part1_imm)?
+                    .sge(
+                        self.send_ring_mr.addr() as u64 + start_offset as u64,
+                        part1_len as u32,
+                        self.send_ring_mr.lkey(),
+                    );
+                builder.finish_unsignaled()?;
+            }
+
+            // Part 2: from beginning of ring
+            let part2_len = delta as usize - part1_len;
+            let part2_imm = encode_imm(part2_len as u64);
+            let part2_remote_addr = remote_ring.addr + ((remote_offset + part1_len as u64) & (remote_ring.size - 1));
+
+            // Determine if part 2 should be signaled
+            let should_signal = (count + 1) >= SIGNAL_INTERVAL;
+
+            {
+                let mut qp = self.qp.borrow_mut();
+                let builder = qp.sq_wqe().map_err(Error::Io)?;
+                let builder = builder
+                    .write_imm(WqeFlags::empty(), part2_remote_addr, remote_ring.rkey, part2_imm)?
+                    .sge(
+                        self.send_ring_mr.addr() as u64, // Start of ring
+                        part2_len as u32,
+                        self.send_ring_mr.lkey(),
+                    );
+
+                if should_signal {
+                    builder.finish_signaled(SrqEntry { qpn, is_read: false })?;
+                    self.unsignaled_count.set(0);
+                } else {
+                    builder.finish_unsignaled()?;
+                    self.unsignaled_count.set(count + 2); // 2 WQEs emitted
+                }
+            }
+
+            self.flush_start_pos.set(end);
+            return Ok(true);
+        }
 
         // Determine if this WQE should be signaled
         let count = self.unsignaled_count.get();
         let should_signal = count >= SIGNAL_INTERVAL;
 
+        // Get QPN before borrowing qp mutably to avoid borrow conflict
+        let qpn = self.qpn();
+
         {
             let mut qp = self.qp.borrow_mut();
-            let builder = qp.sq_wqe()?
+            let builder = qp.sq_wqe().map_err(Error::Io)?;
+            let builder = builder
                 .write_imm(WqeFlags::empty(), remote_addr, remote_ring.rkey, imm)?
                 .sge(
                     self.send_ring_mr.addr() as u64 + start_offset as u64,
@@ -820,7 +921,8 @@ impl<U> EndpointInner<U> {
 
             if should_signal {
                 // Signal this WQE to allow SQ progress tracking
-                builder.finish_signaled(SrqEntry { qpn: 0 })?;
+                // Mark with is_read=false to distinguish from READ completions
+                builder.finish_signaled(SrqEntry { qpn, is_read: false })?;
                 self.unsignaled_count.set(0);
             } else {
                 builder.finish_unsignaled()?;
@@ -982,8 +1084,9 @@ impl<U> Endpoint<U> {
         let available = remote_ring.size - (producer - consumer);
 
         if available < msg_size {
-            // No space: flush and return error
+            // No space: flush and set force_read flag to trigger RDMA READ
             inner.flush()?;
+            inner.force_read.set(true);
             return Err(Error::RingFull);
         }
 
@@ -1098,8 +1201,9 @@ impl<U, F: Fn(U, &[u8])> RecvHandle<'_, U, F> {
         let available = remote_ring.size - (producer - consumer);
 
         if available < msg_size {
-            // No space: flush and return error
+            // No space: flush and set force_read flag to trigger RDMA READ
             inner.flush()?;
+            inner.force_read.set(true);
             return Err(Error::RingFull);
         }
 

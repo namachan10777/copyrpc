@@ -1124,11 +1124,19 @@ pub type RcQpForMonoCq<Entry> = RcQp<Entry, Entry, InfiniBand, OrderedWqeTable<E
 /// The RQ completions are processed via the SRQ.
 pub type RcQpForMonoCqWithSrq<Entry> = RcQp<Entry, Entry, InfiniBand, OrderedWqeTable<Entry>, SharedRq<Entry>, (), ()>;
 
+/// RcQp type for use with MonoCq with Shared Receive Queue (with SQ callback).
+///
+/// Uses a single Entry type for both SQ and SRQ completions.
+/// The RQ completions are processed via the SRQ.
+/// SQ completions trigger the OnSq callback.
+pub type RcQpForMonoCqWithSrqAndSqCb<Entry, OnSq> = RcQp<Entry, Entry, InfiniBand, OrderedWqeTable<Entry>, SharedRq<Entry>, OnSq, ()>;
+
 // =============================================================================
 // CompletionSource impl for RcQp with SharedRq (for use with MonoCq)
 // =============================================================================
 
-impl<Entry: Clone + 'static> CompletionSource for RcQpForMonoCqWithSrq<Entry> {
+// CompletionSource for RcQpForMonoCqWithSrqAndSqCb (also covers RcQpForMonoCqWithSrq when OnSq = ())
+impl<Entry: Clone + 'static, OnSq> CompletionSource for RcQpForMonoCqWithSrqAndSqCb<Entry, OnSq> {
     type Entry = Entry;
 
     fn qpn(&self) -> u32 {
@@ -1160,6 +1168,27 @@ impl<Entry: Clone + 'static> CompletionTarget for RcQpForMonoCqWithSrq<Entry> {
             // SQ completion - update ci to free SQ slots
             if let Some(sq) = self.sq.as_ref() {
                 let _ = sq.process_completion(cqe.wqe_counter);
+            }
+        }
+        // RQ completions are handled by MonoCq via CompletionSource, not this method
+    }
+}
+
+// CompletionTarget impl for RcQpForMonoCqWithSrqAndSqCb (with SQ callback)
+//
+// This implementation calls the SQ callback when SQ completions arrive.
+impl<Entry: Clone + 'static, OnSq: Fn(Cqe, Entry)> CompletionTarget for RcQpForMonoCqWithSrqAndSqCb<Entry, OnSq> {
+    fn qpn(&self) -> u32 {
+        RcQp::qpn(self)
+    }
+
+    fn dispatch_cqe(&self, cqe: Cqe) {
+        if !cqe.opcode.is_responder() {
+            // SQ completion - get entry and call callback
+            if let Some(sq) = self.sq.as_ref() {
+                if let Some(entry) = sq.process_completion(cqe.wqe_counter) {
+                    (self.sq_callback)(cqe, entry);
+                }
             }
         }
         // RQ completions are handled by MonoCq via CompletionSource, not this method
@@ -1789,10 +1818,13 @@ where
     ///
     /// This variant is for when RQ uses MonoCq (callback on CQ side, not QP).
     /// Only available when SQ uses normal CQ with callback and RQ uses MonoCq.
-    pub fn build(self) -> BuildResult<RcQpForMonoCqWithSrq<Entry>> {
+    /// The SQ callback will be invoked for SQ completions (e.g., RDMA READ).
+    pub fn build(self) -> BuildResult<RcQpForMonoCqWithSrqAndSqCb<Entry, OnSq>> {
         let srq = self.srq.as_ref().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "SRQ not set")
         })?;
+
+        let sq_callback = self.sq_callback;
 
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
@@ -1832,7 +1864,7 @@ where
                 max_inline_data: self.config.max_inline_data,
                 sq: None,
                 rq: SharedRq::new(srq_inner),
-                sq_callback: (),
+                sq_callback,
                 rq_callback: (),
                 send_cq: self.send_cq_weak.unwrap_or_default(),
                 recv_cq: Weak::new(), // MonoCq doesn't need CQ registration
@@ -1840,12 +1872,12 @@ where
                 _marker: std::marker::PhantomData,
             };
 
-            RcQpForMonoCqWithSrq::<Entry>::init_direct_access_internal(&mut result)?;
+            RcQpForMonoCqWithSrqAndSqCb::<Entry, OnSq>::init_direct_access_internal(&mut result)?;
 
             let qp_rc = Rc::new(RefCell::new(result));
             let qpn = qp_rc.borrow().qpn();
 
-            // Register with send CQ for SQ completion processing (updates ci to free SQ slots)
+            // Register with send CQ for SQ completion processing
             // recv_cq (MonoCq) registration is done separately by caller via MonoCq::register()
             register_with_send_cq(qpn, &send_cq_for_register, &qp_rc);
 

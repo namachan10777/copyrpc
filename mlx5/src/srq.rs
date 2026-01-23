@@ -154,9 +154,19 @@ impl Pd {
             let srq = mlx5_sys::ibv_create_srq(self.as_ptr(), &attr as *const _ as *mut _);
             let srq = NonNull::new(srq).ok_or_else(io::Error::last_os_error)?;
 
+            // Query the actual allocated size
+            let mut query_attr: MaybeUninit<mlx5_sys::ibv_srq_attr> = MaybeUninit::zeroed();
+            let ret = mlx5_sys::ibv_query_srq(srq.as_ptr(), query_attr.as_mut_ptr());
+            if ret != 0 {
+                mlx5_sys::ibv_destroy_srq(srq.as_ptr());
+                return Err(io::Error::from_raw_os_error(-ret));
+            }
+            let actual_max_wr = query_attr.assume_init().max_wr;
+
             let result = Srq(Rc::new(RefCell::new(SrqInner {
                 srq,
-                wqe_cnt: config.max_wr.next_power_of_two(),
+                // Use the actual allocated size, rounded to power of 2 for index masking
+                wqe_cnt: actual_max_wr.next_power_of_two(),
                 state: None,
                 _pd: self.clone(),
             })));
