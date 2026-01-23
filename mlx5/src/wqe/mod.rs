@@ -57,9 +57,9 @@ pub use traits::{
     Av, NoAv,
     // Data state marker (NoData)
     NoData,
-    // TM-SRQ builder traits
-    TmCmdWqeBuilder, TmTagAddWqeBuilder, TmTagDelWqeBuilder,
 };
+
+pub use emit::{SqState, BlueframeBatch};
 
 use bitflags::bitflags;
 
@@ -877,32 +877,6 @@ impl<T> UnorderedWqeTable<T> {
 // =============================================================================
 // Type-State Markers for WQE Builder
 // =============================================================================
-
-/// Sealed trait module to prevent external implementation of WqeState.
-mod sealed {
-    pub trait Sealed {}
-}
-
-/// Marker trait for WQE builder states.
-///
-/// This trait is sealed to prevent external implementations.
-pub trait WqeState: sealed::Sealed {}
-
-/// Initial state: control segment not yet written.
-pub struct Init;
-impl sealed::Sealed for Init {}
-impl WqeState for Init {}
-
-
-/// Data segment has been written, finish() available.
-pub struct HasData;
-impl sealed::Sealed for HasData {}
-impl WqeState for HasData {}
-
-/// TM-SRQ: Tag matching segment required.
-pub struct NeedsTmSeg;
-impl sealed::Sealed for NeedsTmSeg {}
-impl WqeState for NeedsTmSeg {}
 
 // =============================================================================
 // Unit Tests

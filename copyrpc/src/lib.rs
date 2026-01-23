@@ -48,6 +48,7 @@ use mlx5::pd::{AccessFlags, MemoryRegion, Pd};
 use mlx5::qp::{RcQpConfig, RcQpForMonoCqWithSrqAndSqCb};
 use mlx5::srq::{Srq, SrqConfig};
 use mlx5::transport::IbRemoteQpInfo;
+use mlx5::emit_wqe;
 use mlx5::wqe::WqeFlags;
 
 use encoding::{
@@ -498,18 +499,15 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
 
             if !inflight && (needs || force) {
                 if let Some(remote_mr) = ep_ref.remote_consumer_mr.get() {
-                    let mut qp = ep_ref.qp.borrow_mut();
-                    if let Ok(builder) = qp.sq_wqe() {
-                        let result = builder
-                            .read(WqeFlags::empty(), remote_mr.addr, remote_mr.rkey)
-                            .and_then(|b| {
-                                b.sge(
-                                    ep_ref.read_buffer_mr.addr() as u64,
-                                    8,
-                                    ep_ref.read_buffer_mr.lkey(),
-                                )
-                                .finish_signaled(SrqEntry { qpn: ep_ref.qpn(), is_read: true })
-                            });
+                    let qp = ep_ref.qp.borrow();
+                    if let Ok(ctx) = qp.emit_ctx() {
+                        let result = emit_wqe!(&ctx, read {
+                            flags: WqeFlags::empty(),
+                            remote_addr: remote_mr.addr,
+                            rkey: remote_mr.rkey,
+                            sge: { addr: ep_ref.read_buffer_mr.addr() as u64, len: 8, lkey: ep_ref.read_buffer_mr.lkey() },
+                            signaled: SrqEntry { qpn: ep_ref.qpn(), is_read: true },
+                        });
 
                         if result.is_ok() {
                             ep_ref.read_inflight.set(true);
@@ -853,16 +851,15 @@ impl<U> EndpointInner<U> {
 
             // Emit part 1
             {
-                let mut qp = self.qp.borrow_mut();
-                let builder = qp.sq_wqe().map_err(Error::Io)?;
-                let builder = builder
-                    .write_imm(WqeFlags::empty(), remote_addr, remote_ring.rkey, part1_imm)?
-                    .sge(
-                        self.send_ring_mr.addr() as u64 + start_offset as u64,
-                        part1_len as u32,
-                        self.send_ring_mr.lkey(),
-                    );
-                builder.finish_unsignaled()?;
+                let qp = self.qp.borrow();
+                let ctx = qp.emit_ctx().map_err(Error::Io)?;
+                emit_wqe!(&ctx, write_imm {
+                    flags: WqeFlags::empty(),
+                    remote_addr: remote_addr,
+                    rkey: remote_ring.rkey,
+                    imm: part1_imm,
+                    sge: { addr: self.send_ring_mr.addr() as u64 + start_offset as u64, len: part1_len as u32, lkey: self.send_ring_mr.lkey() },
+                }).map_err(|e| Error::Io(e.into()))?;
             }
 
             // Part 2: from beginning of ring
@@ -874,21 +871,26 @@ impl<U> EndpointInner<U> {
             let should_signal = (count + 1) >= SIGNAL_INTERVAL;
 
             {
-                let mut qp = self.qp.borrow_mut();
-                let builder = qp.sq_wqe().map_err(Error::Io)?;
-                let builder = builder
-                    .write_imm(WqeFlags::empty(), part2_remote_addr, remote_ring.rkey, part2_imm)?
-                    .sge(
-                        self.send_ring_mr.addr() as u64, // Start of ring
-                        part2_len as u32,
-                        self.send_ring_mr.lkey(),
-                    );
-
+                let qp = self.qp.borrow();
+                let ctx = qp.emit_ctx().map_err(Error::Io)?;
                 if should_signal {
-                    builder.finish_signaled(SrqEntry { qpn, is_read: false })?;
+                    emit_wqe!(&ctx, write_imm {
+                        flags: WqeFlags::empty(),
+                        remote_addr: part2_remote_addr,
+                        rkey: remote_ring.rkey,
+                        imm: part2_imm,
+                        sge: { addr: self.send_ring_mr.addr() as u64, len: part2_len as u32, lkey: self.send_ring_mr.lkey() },
+                        signaled: SrqEntry { qpn, is_read: false },
+                    }).map_err(|e| Error::Io(e.into()))?;
                     self.unsignaled_count.set(0);
                 } else {
-                    builder.finish_unsignaled()?;
+                    emit_wqe!(&ctx, write_imm {
+                        flags: WqeFlags::empty(),
+                        remote_addr: part2_remote_addr,
+                        rkey: remote_ring.rkey,
+                        imm: part2_imm,
+                        sge: { addr: self.send_ring_mr.addr() as u64, len: part2_len as u32, lkey: self.send_ring_mr.lkey() },
+                    }).map_err(|e| Error::Io(e.into()))?;
                     self.unsignaled_count.set(count + 2); // 2 WQEs emitted
                 }
             }
@@ -901,27 +903,32 @@ impl<U> EndpointInner<U> {
         let count = self.unsignaled_count.get();
         let should_signal = count >= SIGNAL_INTERVAL;
 
-        // Get QPN before borrowing qp mutably to avoid borrow conflict
+        // Get QPN before borrowing qp to avoid borrow conflict
         let qpn = self.qpn();
 
         {
-            let mut qp = self.qp.borrow_mut();
-            let builder = qp.sq_wqe().map_err(Error::Io)?;
-            let builder = builder
-                .write_imm(WqeFlags::empty(), remote_addr, remote_ring.rkey, imm)?
-                .sge(
-                    self.send_ring_mr.addr() as u64 + start_offset as u64,
-                    delta as u32,
-                    self.send_ring_mr.lkey(),
-                );
-
+            let qp = self.qp.borrow();
+            let ctx = qp.emit_ctx().map_err(Error::Io)?;
             if should_signal {
                 // Signal this WQE to allow SQ progress tracking
                 // Mark with is_read=false to distinguish from READ completions
-                builder.finish_signaled(SrqEntry { qpn, is_read: false })?;
+                emit_wqe!(&ctx, write_imm {
+                    flags: WqeFlags::empty(),
+                    remote_addr: remote_addr,
+                    rkey: remote_ring.rkey,
+                    imm: imm,
+                    sge: { addr: self.send_ring_mr.addr() as u64 + start_offset as u64, len: delta as u32, lkey: self.send_ring_mr.lkey() },
+                    signaled: SrqEntry { qpn, is_read: false },
+                }).map_err(|e| Error::Io(e.into()))?;
                 self.unsignaled_count.set(0);
             } else {
-                builder.finish_unsignaled()?;
+                emit_wqe!(&ctx, write_imm {
+                    flags: WqeFlags::empty(),
+                    remote_addr: remote_addr,
+                    rkey: remote_ring.rkey,
+                    imm: imm,
+                    sge: { addr: self.send_ring_mr.addr() as u64 + start_offset as u64, len: delta as u32, lkey: self.send_ring_mr.lkey() },
+                }).map_err(|e| Error::Io(e.into()))?;
                 self.unsignaled_count.set(count + 1);
             }
         }

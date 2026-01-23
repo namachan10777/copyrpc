@@ -21,6 +21,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 
 use mlx5::cq::{CqConfig, Cqe, CqeOpcode};
 use mlx5::device::{Context, DeviceList};
+use mlx5::emit_wqe;
 use mlx5::mono_cq::MonoCqRc;
 use mlx5::pd::{AccessFlags, MemoryRegion, Pd};
 use mlx5::qp::{RcQpConfig, RcQpForMonoCq};
@@ -594,29 +595,29 @@ fn server_thread_main(
 
         // 4. TX リクエスト再補充: queue echo responses (using inline data)
         {
-            let mut qp_ref = qp.borrow_mut();
+            let qp_ref = qp.borrow();
+            let ctx = qp_ref.emit_ctx().expect("emit_ctx failed");
             for i in 0..rx_count {
                 let idx = rx_indices[i];
                 let offset = (idx * 256) as u64;
 
                 if rx_is_write_imm[i] {
                     // Echo with WRITE+IMM using inline data
-                    let _ = qp_ref
-                        .sq_wqe()
-                        .unwrap()
-                        .write_imm(WqeFlags::empty(), remote_addr + offset, remote_rkey, idx as u32)
-                        .unwrap()
-                        .inline(&echo_data)
-                        .finish_signaled(idx as u64);
+                    let _ = emit_wqe!(&ctx, write_imm {
+                        flags: WqeFlags::empty(),
+                        remote_addr: remote_addr + offset,
+                        rkey: remote_rkey,
+                        imm: idx as u32,
+                        inline: echo_data.as_slice(),
+                        signaled: idx as u64,
+                    });
                 } else {
                     // Echo with SEND using inline data
-                    let _ = qp_ref
-                        .sq_wqe()
-                        .unwrap()
-                        .send(WqeFlags::empty())
-                        .unwrap()
-                        .inline(&echo_data)
-                        .finish_signaled(idx as u64);
+                    let _ = emit_wqe!(&ctx, send {
+                        flags: WqeFlags::empty(),
+                        inline: echo_data.as_slice(),
+                        signaled: idx as u64,
+                    });
                 }
             }
         }
@@ -653,29 +654,31 @@ where
 
     // Initial fill using inline data
     {
-        let mut qp = client.qp.borrow_mut();
+        let qp = client.qp.borrow();
+        let ctx = qp.emit_ctx().expect("emit_ctx failed");
         for batch in 0..(QUEUE_DEPTH / 4) {
             let base = batch * 4;
             for j in 0..3 {
                 let i = base + j;
                 let offset = (i * 256) as u64;
-                qp.sq_wqe()
-                    .unwrap()
-                    .write_imm(WqeFlags::empty(), remote_addr + offset, rkey, i as u32)
-                    .unwrap()
-                    .inline(&send_data)
-                    .finish_unsignaled()
-                    .unwrap();
+                emit_wqe!(&ctx, write_imm {
+                    flags: WqeFlags::empty(),
+                    remote_addr: remote_addr + offset,
+                    rkey: rkey,
+                    imm: i as u32,
+                    inline: send_data.as_slice(),
+                }).expect("emit_wqe failed");
             }
             let i = base + 3;
             let offset = (i * 256) as u64;
-            qp.sq_wqe()
-                .unwrap()
-                .write_imm(WqeFlags::empty(), remote_addr + offset, rkey, i as u32)
-                .unwrap()
-                .inline(&send_data)
-                .finish_signaled(i as u64)
-                .unwrap();
+            emit_wqe!(&ctx, write_imm {
+                flags: WqeFlags::empty(),
+                remote_addr: remote_addr + offset,
+                rkey: rkey,
+                imm: i as u32,
+                inline: send_data.as_slice(),
+                signaled: i as u64,
+            }).expect("emit_wqe failed");
         }
         qp.ring_sq_doorbell();
     }
@@ -717,7 +720,8 @@ where
         let to_send = can_send.min(rx_count);
 
         if to_send > 0 {
-            let mut qp = client.qp.borrow_mut();
+            let qp = client.qp.borrow();
+            let ctx = qp.emit_ctx().expect("emit_ctx failed");
             let full_batches = to_send / 4;
             let remainder = to_send % 4;
 
@@ -726,36 +730,38 @@ where
                 for j in 0..3 {
                     let idx = rx_indices[base + j];
                     let offset = (idx * 256) as u64;
-                    qp.sq_wqe()
-                        .unwrap()
-                        .write_imm(WqeFlags::empty(), remote_addr + offset, rkey, idx as u32)
-                        .unwrap()
-                        .inline(&send_data)
-                        .finish_unsignaled()
-                        .unwrap();
+                    emit_wqe!(&ctx, write_imm {
+                        flags: WqeFlags::empty(),
+                        remote_addr: remote_addr + offset,
+                        rkey: rkey,
+                        imm: idx as u32,
+                        inline: send_data.as_slice(),
+                    }).expect("emit_wqe failed");
                 }
                 let idx = rx_indices[base + 3];
                 let offset = (idx * 256) as u64;
-                qp.sq_wqe()
-                    .unwrap()
-                    .write_imm(WqeFlags::empty(), remote_addr + offset, rkey, idx as u32)
-                    .unwrap()
-                    .inline(&send_data)
-                    .finish_signaled(idx as u64)
-                    .unwrap();
+                emit_wqe!(&ctx, write_imm {
+                    flags: WqeFlags::empty(),
+                    remote_addr: remote_addr + offset,
+                    rkey: rkey,
+                    imm: idx as u32,
+                    inline: send_data.as_slice(),
+                    signaled: idx as u64,
+                }).expect("emit_wqe failed");
             }
 
             let base = full_batches * 4;
             for j in 0..remainder {
                 let idx = rx_indices[base + j];
                 let offset = (idx * 256) as u64;
-                qp.sq_wqe()
-                    .unwrap()
-                    .write_imm(WqeFlags::empty(), remote_addr + offset, rkey, idx as u32)
-                    .unwrap()
-                    .inline(&send_data)
-                    .finish_signaled(idx as u64)
-                    .unwrap();
+                emit_wqe!(&ctx, write_imm {
+                    flags: WqeFlags::empty(),
+                    remote_addr: remote_addr + offset,
+                    rkey: rkey,
+                    imm: idx as u32,
+                    inline: send_data.as_slice(),
+                    signaled: idx as u64,
+                }).expect("emit_wqe failed");
             }
 
             inflight += to_send as u64;
@@ -822,19 +828,19 @@ where
         let offset = (idx * 256) as u64;
         let imm = idx as u32;
 
-        // Post single WRITE+IMM with blueflame using inline data
+        // Post single WRITE+IMM using inline data
         {
             let qp = client.qp.borrow();
-            let mut bf = qp.blueflame_sq_wqe().unwrap();
-            bf.wqe()
-                .unwrap()
-                .write_imm(WqeFlags::empty(), remote_addr + offset, rkey, imm)
-                .unwrap()
-                .inline(&send_data)
-                .unwrap()
-                .finish_signaled(idx as u64)
-                .unwrap();
-            bf.finish();
+            let ctx = qp.emit_ctx().expect("emit_ctx failed");
+            emit_wqe!(&ctx, write_imm {
+                flags: WqeFlags::empty(),
+                remote_addr: remote_addr + offset,
+                rkey: rkey,
+                imm: imm,
+                inline: send_data.as_slice(),
+                signaled: idx as u64,
+            }).expect("emit_wqe failed");
+            qp.ring_sq_doorbell();
         }
 
         // Wait for completion

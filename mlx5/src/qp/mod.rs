@@ -3,9 +3,6 @@
 //! Queue Pairs are the fundamental communication endpoints in RDMA.
 //! This module provides RC (Reliable Connection) QP creation using mlx5dv_create_qp.
 
-pub mod builder;
-
-use builder::{BlueflameWqeBatch, RoceBlueflameWqeBatch, RqBlueflameWqeBatch, SqWqeEntryPoint};
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::{io, mem::MaybeUninit, ptr::NonNull};
@@ -18,16 +15,13 @@ use crate::device::Context;
 use crate::pd::Pd;
 use crate::srq::Srq;
 use crate::transport::{IbRemoteQpInfo, RoCERemoteQpInfo};
-use crate::types::GrhAttr;
 use crate::wqe::{
     CtrlSegParams, DATA_SEG_SIZE, OrderedWqeTable, SubmissionError, WQEBB_SIZE, WqeFlags, WqeOpcode,
     write_ctrl_seg, write_data_seg,
     // Transport type tags
     InfiniBand, RoCE,
-    // Address Vector trait and types (needed for sq_wqe)
-    NoAv,
     // Macro-based emission
-    emit::{EmitContext, SqCapability},
+    emit::{EmitContext, SqCapability, SqState},
 };
 
 /// RC QP configuration.
@@ -275,6 +269,69 @@ impl<Entry> SqCapability for SendQueueState<Entry, OrderedWqeTable<Entry>> {
     const SUPPORTS_SEND: bool = true;
     const SUPPORTS_RDMA: bool = true;
     const SUPPORTS_ATOMIC: bool = true;
+}
+
+/// SqState implementation for SendQueueState.
+///
+/// This allows the `emit_wqe!` macro to work directly with SendQueueState
+/// via the SqState trait.
+impl<Entry> SqState for SendQueueState<Entry, OrderedWqeTable<Entry>> {
+    type Entry = Entry;
+
+    #[inline]
+    fn sq_buf(&self) -> *mut u8 {
+        self.buf
+    }
+
+    #[inline]
+    fn wqe_cnt(&self) -> u16 {
+        self.wqe_cnt
+    }
+
+    #[inline]
+    fn sqn(&self) -> u32 {
+        self.sqn
+    }
+
+    #[inline]
+    fn pi(&self) -> &Cell<u16> {
+        &self.pi
+    }
+
+    #[inline]
+    fn ci(&self) -> &Cell<u16> {
+        &self.ci
+    }
+
+    #[inline]
+    fn last_wqe(&self) -> &Cell<Option<(*mut u8, usize)>> {
+        &self.last_wqe
+    }
+
+    #[inline]
+    fn table(&self) -> &OrderedWqeTable<Entry> {
+        &self.table
+    }
+
+    #[inline]
+    fn dbrec(&self) -> *mut u32 {
+        self.dbrec
+    }
+
+    #[inline]
+    fn bf_reg(&self) -> *mut u8 {
+        self.bf_reg
+    }
+
+    #[inline]
+    fn bf_size(&self) -> u32 {
+        self.bf_size
+    }
+
+    #[inline]
+    fn bf_offset(&self) -> &Cell<u32> {
+        &self.bf_offset
+    }
 }
 
 // =============================================================================
@@ -1222,6 +1279,140 @@ impl<Entry: Clone + 'static, OnSq: Fn(Cqe, Entry)> CompletionTarget for RcQpForM
 }
 
 // =============================================================================
+// RQ BlueFlame Batch Builder
+// =============================================================================
+
+/// BlueFlame buffer size in bytes (256B doorbell window).
+const BLUEFLAME_BUFFER_SIZE: usize = 256;
+
+/// RQ WQE size in bytes (single DataSeg).
+const RQ_WQE_SIZE: usize = DATA_SEG_SIZE;
+
+/// BlueFlame WQE batch builder for RC RQ.
+///
+/// Allows posting multiple receive WQEs efficiently using BlueFlame MMIO.
+/// WQEs are accumulated in an internal buffer and submitted together
+/// via BlueFlame doorbell when `finish()` is called.
+///
+/// RQ WQE size is 16 bytes (single DataSeg), so up to 16 WQEs can fit in a batch.
+///
+/// # Example
+/// ```ignore
+/// let mut batch = qp.blueflame_rq_batch()?;
+/// batch.post(entry1, addr1, len1, lkey1)?;
+/// batch.post(entry2, addr2, len2, lkey2)?;
+/// batch.finish();
+/// ```
+pub struct RqBlueflameWqeBatch<'a, Entry> {
+    rq: &'a ReceiveQueueState<Entry>,
+    buffer: [u8; BLUEFLAME_BUFFER_SIZE],
+    offset: usize,
+    wqe_count: u16,
+    bf_reg: *mut u8,
+    bf_size: u32,
+    bf_offset: &'a Cell<u32>,
+}
+
+impl<'a, Entry> RqBlueflameWqeBatch<'a, Entry> {
+    /// Create a new RQ BlueFlame batch builder.
+    pub(crate) fn new(
+        rq: &'a ReceiveQueueState<Entry>,
+        bf_reg: *mut u8,
+        bf_size: u32,
+        bf_offset: &'a Cell<u32>,
+    ) -> Self {
+        Self {
+            rq,
+            buffer: [0u8; BLUEFLAME_BUFFER_SIZE],
+            offset: 0,
+            wqe_count: 0,
+            bf_reg,
+            bf_size,
+            bf_offset,
+        }
+    }
+
+    /// Post a receive WQE to the batch.
+    ///
+    /// # Arguments
+    /// * `entry` - User entry to associate with this receive operation
+    /// * `addr` - Address of the receive buffer
+    /// * `len` - Length of the receive buffer
+    /// * `lkey` - Local key for the memory region
+    ///
+    /// # Errors
+    /// Returns `RqFull` if the receive queue is full.
+    /// Returns `BlueflameOverflow` if the batch buffer is full.
+    #[inline]
+    pub fn post(&mut self, entry: Entry, addr: u64, len: u32, lkey: u32) -> Result<(), SubmissionError> {
+        if self.rq.available() == 0 {
+            return Err(SubmissionError::RqFull);
+        }
+        if self.offset + RQ_WQE_SIZE > BLUEFLAME_BUFFER_SIZE {
+            return Err(SubmissionError::BlueflameOverflow);
+        }
+
+        // Write data segment to buffer
+        unsafe {
+            write_data_seg(self.buffer.as_mut_ptr().add(self.offset), len, lkey, addr);
+        }
+
+        // Store entry in RQ table
+        let wqe_idx = self.rq.pi.get();
+        let idx = (wqe_idx as usize) & (self.rq.table.len() - 1);
+        self.rq.table[idx].set(Some(entry));
+
+        // Advance state
+        self.offset += RQ_WQE_SIZE;
+        self.wqe_count += 1;
+        self.rq.advance_pi(1);
+
+        Ok(())
+    }
+
+    /// Finish the batch and submit all WQEs via BlueFlame doorbell.
+    #[inline]
+    pub fn finish(self) {
+        if self.wqe_count == 0 {
+            return; // No WQEs to submit
+        }
+
+        mmio_flush_writes!();
+
+        // Update doorbell record
+        unsafe {
+            std::ptr::write_volatile(
+                self.rq.dbrec,
+                (self.rq.pi.get() as u32).to_be(),
+            );
+        }
+
+        udma_to_device_barrier!();
+
+        // Copy buffer to BlueFlame register
+        if self.bf_size > 0 {
+            let bf_offset = self.bf_offset.get();
+            let bf = unsafe { self.bf_reg.add(bf_offset as usize) };
+
+            let mut src = self.buffer.as_ptr();
+            let mut dst = bf;
+            let mut remaining = self.offset;
+            while remaining > 0 {
+                unsafe {
+                    mlx5_bf_copy!(dst, src);
+                    src = src.add(WQEBB_SIZE);
+                    dst = dst.add(WQEBB_SIZE);
+                }
+                remaining = remaining.saturating_sub(WQEBB_SIZE);
+            }
+
+            mmio_flush_writes!();
+            self.bf_offset.set(bf_offset ^ self.bf_size);
+        }
+    }
+}
+
+// =============================================================================
 // QP Entry Points (OwnedRq - RQ methods)
 // =============================================================================
 
@@ -1295,123 +1486,16 @@ impl<SqEntry, RqEntry, Transport, OnSqComplete, OnRqComplete> RcQp<SqEntry, RqEn
 }
 
 // =============================================================================
-// QP Entry Points (sq_wqe - IB)
+// QP Entry Points (emit_ctx - IB)
 // =============================================================================
 
 impl<SqEntry, RqEntry, Rq, OnSqComplete, OnRqComplete> RcQp<SqEntry, RqEntry, InfiniBand, OrderedWqeTable<SqEntry>, Rq, OnSqComplete, OnRqComplete> {
-    /// Get a SQ WQE builder for InfiniBand transport.
-    ///
-    /// # Example
-    /// ```ignore
-    /// qp.sq_wqe()?
-    ///     .write(TxFlags::empty(), remote_addr, rkey)
-    ///     .sge(local_addr, len, lkey)
-    ///     .finish_signaled(entry)?;
-    /// qp.ring_sq_doorbell();
-    /// ```
-    #[inline]
-    pub fn sq_wqe(&mut self) -> io::Result<SqWqeEntryPoint<'_, SqEntry, NoAv>> {
-        let sq = self.sq()?;
-        if sq.available() == 0 {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
-        }
-        Ok(SqWqeEntryPoint::new(sq, NoAv))
-    }
-
-    /// Get an EmitContext for macro-based WQE emission.
-    ///
-    /// # Example
-    /// ```ignore
-    /// use mlx5::emit_wqe;
-    ///
-    /// let ctx = qp.emit_ctx()?;
-    /// emit_wqe!(ctx, write {
-    ///     flags: WqeFlags::empty(),
-    ///     remote_addr: dest,
-    ///     rkey: rkey,
-    ///     sge: { addr: local_addr, len: 64, lkey },
-    ///     signaled: entry,
-    /// })?;
-    /// qp.ring_sq_doorbell();
-    /// ```
+    #[doc(hidden)]
     #[inline]
     pub fn emit_ctx(&self) -> io::Result<EmitContext<'_, SqEntry>> {
         let sq = self.sq.as_ref()
             .ok_or_else(|| io::Error::other("direct access not initialized"))?;
         Ok(sq.emit_ctx())
-    }
-}
-
-impl<SqEntry, RqEntry, Rq, OnSqComplete, OnRqComplete> RcQp<SqEntry, RqEntry, RoCE, OrderedWqeTable<SqEntry>, Rq, OnSqComplete, OnRqComplete> {
-    /// Get a SQ WQE builder for RoCE transport.
-    ///
-    /// # Example
-    /// ```ignore
-    /// qp.sq_wqe(&grh)?
-    ///     .write(TxFlags::empty(), remote_addr, rkey)
-    ///     .sge(local_addr, len, lkey)
-    ///     .finish_signaled(entry)?;
-    /// qp.ring_sq_doorbell();
-    /// ```
-    #[inline]
-    pub fn sq_wqe<'a>(&'a mut self, grh: &'a GrhAttr) -> io::Result<SqWqeEntryPoint<'a, SqEntry, &'a GrhAttr>> {
-        let sq = self.sq()?;
-        if sq.available() == 0 {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
-        }
-        Ok(SqWqeEntryPoint::new(sq, grh))
-    }
-}
-
-impl<SqEntry, RqEntry, Rq, OnSqComplete, OnRqComplete> RcQp<SqEntry, RqEntry, InfiniBand, OrderedWqeTable<SqEntry>, Rq, OnSqComplete, OnRqComplete> {
-    /// Get a BlueFlame batch builder for low-latency WQE submission.
-    ///
-    /// Multiple WQEs can be accumulated in the BlueFlame buffer (up to 256 bytes)
-    /// and submitted together via a single BlueFlame doorbell.
-    ///
-    /// # Example
-    /// ```ignore
-    /// let mut bf = qp.blueflame_sq_wqe()?;
-    /// bf.wqe()?.send(TxFlags::empty()).inline(&data).finish()?;
-    /// bf.wqe()?.send(TxFlags::empty()).inline(&data).finish()?;
-    /// bf.finish();
-    /// ```
-    ///
-    /// # Errors
-    /// Returns `BlueflameNotAvailable` if BlueFlame is not supported on this device.
-    #[inline]
-    pub fn blueflame_sq_wqe(&self) -> Result<BlueflameWqeBatch<'_, SqEntry>, SubmissionError> {
-        let sq = self.sq.as_ref().ok_or(SubmissionError::SqFull)?;
-        if sq.bf_size == 0 {
-            return Err(SubmissionError::BlueflameNotAvailable);
-        }
-        Ok(BlueflameWqeBatch::new(sq))
-    }
-}
-
-impl<SqEntry, RqEntry, Rq, OnSqComplete, OnRqComplete> RcQp<SqEntry, RqEntry, RoCE, OrderedWqeTable<SqEntry>, Rq, OnSqComplete, OnRqComplete> {
-    /// Get a BlueFlame batch builder for low-latency WQE submission (RoCE).
-    ///
-    /// Multiple WQEs can be accumulated in the BlueFlame buffer (up to 256 bytes)
-    /// and submitted together via a single BlueFlame doorbell.
-    ///
-    /// # Example
-    /// ```ignore
-    /// let mut bf = qp.blueflame_sq_wqe(&grh)?;
-    /// bf.wqe()?.send(TxFlags::empty()).inline(&data)?.finish()?;
-    /// bf.wqe()?.send(TxFlags::empty()).inline(&data)?.finish()?;
-    /// bf.finish();
-    /// ```
-    ///
-    /// # Errors
-    /// Returns `BlueflameNotAvailable` if BlueFlame is not supported on this device.
-    #[inline]
-    pub fn blueflame_sq_wqe<'a>(&'a self, grh: &'a GrhAttr) -> Result<RoceBlueflameWqeBatch<'a, SqEntry>, SubmissionError> {
-        let sq = self.sq.as_ref().ok_or(SubmissionError::SqFull)?;
-        if sq.bf_size == 0 {
-            return Err(SubmissionError::BlueflameNotAvailable);
-        }
-        Ok(RoceBlueflameWqeBatch::new(sq, grh))
     }
 }
 

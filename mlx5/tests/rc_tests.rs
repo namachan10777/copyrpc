@@ -20,7 +20,7 @@ use mlx5::cq::CqConfig;
 use mlx5::qp::{QpState, RcQpConfig, RcQpIb};
 use mlx5::transport::IbRemoteQpInfo;
 use mlx5::wqe::WqeFlags;
-use mlx5::{emit_wqe, emit_wqe_bf};
+use mlx5::emit_wqe;
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
@@ -177,22 +177,21 @@ fn test_rc_rdma_write() {
     );
     println!("QP1 QPN: 0x{:x}", qp1.borrow().qpn());
 
-    // Post RDMA WRITE via BlueFlame batch builder using emit_wqe_bf! macro
+    // Post RDMA WRITE using emit_wqe! macro
     {
         let qp1_ref = qp1.borrow();
-        let mut bf = qp1_ref.blueflame_sq_wqe().expect("blueflame_sq_wqe failed");
-        let mut ctx = bf.emit_ctx();
-        emit_wqe_bf!(&mut ctx, write {
+        let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
+        emit_wqe!(&ctx, write {
             flags: WqeFlags::empty(),
             remote_addr: remote_buf.addr(),
             rkey: remote_mr.rkey(),
             sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
             signaled: 1u64,
-        }).expect("emit_wqe_bf failed");
-        bf.finish();
+        }).expect("emit_wqe failed");
+        qp1_ref.ring_sq_doorbell();
     }
 
-    println!("WQE posted via BlueFlame");
+    println!("WQE posted via emit_wqe! macro");
 
     // Poll CQ
     let cqe = poll_cq_timeout(cq, 5000).expect("CQE timeout");

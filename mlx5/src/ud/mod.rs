@@ -9,8 +9,6 @@
 //! - Unordered: No message ordering guarantees
 //! - One-to-many: Single QP can send to multiple destinations
 
-pub mod builder;
-
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::{io, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
@@ -25,8 +23,9 @@ use crate::qp::QpInfo;
 use crate::srq::Srq;
 use crate::transport::{InfiniBand, RoCE};
 use crate::wqe::{
-    CtrlSegParams, OrderedWqeTable, WQEBB_SIZE, WqeFlags, WqeOpcode, write_ctrl_seg, write_data_seg,
-    emit::{SqCapability, UdEmitContext},
+    CtrlSegParams, DATA_SEG_SIZE, OrderedWqeTable, SubmissionError, WQEBB_SIZE, WqeFlags, WqeOpcode,
+    write_ctrl_seg, write_data_seg,
+    emit::{SqCapability, SqState, UdEmitContext},
 };
 
 // =============================================================================
@@ -181,6 +180,7 @@ impl<Entry> UdSendQueueState<Entry, OrderedWqeTable<Entry>> {
     /// Get an emit context for macro-based WQE emission.
     ///
     /// Returns `None` if the SQ is full.
+    #[doc(hidden)]
     pub fn emit_ctx(&self) -> Result<UdEmitContext<'_, Entry>, io::Error> {
         if self.available() == 0 {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
@@ -202,6 +202,66 @@ impl<Entry> SqCapability for UdSendQueueState<Entry, OrderedWqeTable<Entry>> {
     const SUPPORTS_SEND: bool = true;
     const SUPPORTS_RDMA: bool = false;
     const SUPPORTS_ATOMIC: bool = false;
+}
+
+/// SqState implementation for UdSendQueueState.
+impl<Entry> SqState for UdSendQueueState<Entry, OrderedWqeTable<Entry>> {
+    type Entry = Entry;
+
+    #[inline]
+    fn sq_buf(&self) -> *mut u8 {
+        self.buf
+    }
+
+    #[inline]
+    fn wqe_cnt(&self) -> u16 {
+        self.wqe_cnt
+    }
+
+    #[inline]
+    fn sqn(&self) -> u32 {
+        self.sqn
+    }
+
+    #[inline]
+    fn pi(&self) -> &Cell<u16> {
+        &self.pi
+    }
+
+    #[inline]
+    fn ci(&self) -> &Cell<u16> {
+        &self.ci
+    }
+
+    #[inline]
+    fn last_wqe(&self) -> &Cell<Option<(*mut u8, usize)>> {
+        &self.last_wqe
+    }
+
+    #[inline]
+    fn table(&self) -> &OrderedWqeTable<Entry> {
+        &self.table
+    }
+
+    #[inline]
+    fn dbrec(&self) -> *mut u32 {
+        self.dbrec
+    }
+
+    #[inline]
+    fn bf_reg(&self) -> *mut u8 {
+        self.bf_reg
+    }
+
+    #[inline]
+    fn bf_size(&self) -> u32 {
+        self.bf_size
+    }
+
+    #[inline]
+    fn bf_offset(&self) -> &Cell<u32> {
+        &self.bf_offset
+    }
 }
 
 // =============================================================================
@@ -667,6 +727,144 @@ impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> UdQ
 }
 
 // =============================================================================
+// UD RQ BlueFlame Batch Builder
+// =============================================================================
+
+/// BlueFlame buffer size in bytes (256B doorbell window).
+const BLUEFLAME_BUFFER_SIZE: usize = 256;
+
+/// RQ WQE size in bytes (single DataSeg).
+const RQ_WQE_SIZE: usize = DATA_SEG_SIZE;
+
+/// BlueFlame WQE batch builder for UD RQ.
+///
+/// Allows posting multiple receive WQEs efficiently using BlueFlame MMIO.
+/// WQEs are accumulated in an internal buffer and submitted together
+/// via BlueFlame doorbell when `finish()` is called.
+///
+/// RQ WQE size is 16 bytes (single DataSeg), so up to 16 WQEs can fit in a batch.
+///
+/// # Example
+/// ```ignore
+/// let mut batch = qp.blueflame_rq_batch()?;
+/// batch.post(entry1, addr1, len1, lkey1)?;
+/// batch.post(entry2, addr2, len2, lkey2)?;
+/// batch.finish();
+/// ```
+pub struct UdRqBlueflameWqeBatch<'a, Entry> {
+    rq: &'a UdRecvQueueState<Entry>,
+    buffer: [u8; BLUEFLAME_BUFFER_SIZE],
+    offset: usize,
+    wqe_count: u16,
+    bf_reg: *mut u8,
+    bf_size: u32,
+    bf_offset: &'a Cell<u32>,
+}
+
+impl<'a, Entry> UdRqBlueflameWqeBatch<'a, Entry> {
+    /// Create a new UD RQ BlueFlame batch builder.
+    pub(crate) fn new(
+        rq: &'a UdRecvQueueState<Entry>,
+        bf_reg: *mut u8,
+        bf_size: u32,
+        bf_offset: &'a Cell<u32>,
+    ) -> Self {
+        Self {
+            rq,
+            buffer: [0u8; BLUEFLAME_BUFFER_SIZE],
+            offset: 0,
+            wqe_count: 0,
+            bf_reg,
+            bf_size,
+            bf_offset,
+        }
+    }
+
+    /// Post a receive WQE to the batch.
+    ///
+    /// # Arguments
+    /// * `entry` - User entry to associate with this receive operation
+    /// * `addr` - Address of the receive buffer
+    /// * `len` - Length of the receive buffer
+    /// * `lkey` - Local key for the memory region
+    ///
+    /// # Errors
+    /// Returns `RqFull` if the receive queue doesn't have enough space.
+    /// Returns `BlueflameOverflow` if the batch buffer is full.
+    #[inline]
+    pub fn post(&mut self, entry: Entry, addr: u64, len: u32, lkey: u32) -> Result<(), SubmissionError> {
+        if self.rq.available() <= self.wqe_count as u32 {
+            return Err(SubmissionError::RqFull);
+        }
+        if self.offset + RQ_WQE_SIZE > BLUEFLAME_BUFFER_SIZE {
+            return Err(SubmissionError::BlueflameOverflow);
+        }
+
+        // Write WQE to RQ buffer
+        let wqe_idx = self.rq.pi.get().wrapping_add(self.wqe_count);
+        unsafe {
+            let wqe_ptr = self.rq.get_wqe_ptr(wqe_idx);
+            write_data_seg(wqe_ptr, len, lkey, addr);
+
+            // Also write to batch buffer for BlueFlame copy
+            write_data_seg(self.buffer.as_mut_ptr().add(self.offset), len, lkey, addr);
+        }
+
+        // Store entry in table
+        let idx = (wqe_idx as usize) & ((self.rq.wqe_cnt - 1) as usize);
+        self.rq.table[idx].set(Some(entry));
+
+        self.offset += RQ_WQE_SIZE;
+        self.wqe_count += 1;
+        Ok(())
+    }
+
+    /// Finish the batch and submit all WQEs via BlueFlame doorbell.
+    ///
+    /// This method updates the producer index, writes to the doorbell record,
+    /// and copies the WQEs to the BlueFlame register.
+    #[inline]
+    pub fn finish(self) {
+        if self.wqe_count == 0 {
+            return; // No WQEs to submit
+        }
+
+        // Advance RQ producer index
+        self.rq.pi.set(self.rq.pi.get().wrapping_add(self.wqe_count));
+
+        mmio_flush_writes!();
+
+        // Update doorbell record
+        unsafe {
+            std::ptr::write_volatile(self.rq.dbrec, (self.rq.pi.get() as u32).to_be());
+        }
+
+        udma_to_device_barrier!();
+
+        // Copy buffer to BlueFlame register
+        if self.bf_size > 0 {
+            let bf_offset = self.bf_offset.get();
+            let bf = unsafe { self.bf_reg.add(bf_offset as usize) };
+
+            let mut src = self.buffer.as_ptr();
+            let mut dst = bf;
+            let mut remaining = self.offset;
+            while remaining > 0 {
+                unsafe {
+                    mlx5_bf_copy!(dst, src);
+                    src = src.add(WQEBB_SIZE);
+                    dst = dst.add(WQEBB_SIZE);
+                }
+                remaining = remaining.saturating_sub(WQEBB_SIZE);
+            }
+
+            mmio_flush_writes!();
+            self.bf_offset.set(bf_offset ^ self.bf_size);
+        }
+    }
+}
+
+// =============================================================================
 // OwnedRq-specific methods
 // =============================================================================
 
@@ -748,8 +946,77 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIb<SqEntry, RqEntry, OnSq
     }
 
     /// Get an emit context for macro-based WQE emission.
+    #[doc(hidden)]
     pub fn emit_ctx(&self) -> io::Result<UdEmitContext<'_, SqEntry>> {
         self.sq()?.emit_ctx()
+    }
+
+    /// Post a receive WQE with a single scatter/gather entry.
+    ///
+    /// # Arguments
+    /// * `entry` - User entry to associate with this receive operation
+    /// * `addr` - Address of the receive buffer
+    /// * `len` - Length of the receive buffer
+    /// * `lkey` - Local key for the memory region
+    ///
+    /// # Example
+    /// ```ignore
+    /// qp.post_recv(entry, addr, len, lkey)?;
+    /// qp.ring_rq_doorbell();
+    /// ```
+    #[inline]
+    pub fn post_recv(&self, entry: RqEntry, addr: u64, len: u32, lkey: u32) -> io::Result<()> {
+        let rq = self.rq()?;
+        if rq.available() == 0 {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "RQ full"));
+        }
+        let wqe_idx = rq.pi.get();
+        unsafe {
+            let wqe_ptr = rq.get_wqe_ptr(wqe_idx);
+            write_data_seg(wqe_ptr, len, lkey, addr);
+        }
+        let idx = (wqe_idx as usize) & ((rq.wqe_cnt - 1) as usize);
+        rq.table[idx].set(Some(entry));
+        rq.pi.set(rq.pi.get().wrapping_add(1));
+        Ok(())
+    }
+
+    /// Get a BlueFlame batch builder for low-latency RQ WQE submission.
+    ///
+    /// Multiple receive WQEs can be accumulated in the BlueFlame buffer (up to 256 bytes)
+    /// and submitted together via a single BlueFlame doorbell.
+    ///
+    /// RQ WQE size is 16 bytes (single DataSeg), so up to 16 WQEs can fit in a batch.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut batch = qp.blueflame_rq_batch()?;
+    /// batch.post(entry1, addr1, len1, lkey1)?;
+    /// batch.post(entry2, addr2, len2, lkey2)?;
+    /// batch.finish();
+    /// ```
+    ///
+    /// # Errors
+    /// Returns `BlueflameNotAvailable` if BlueFlame is not supported on this device.
+    #[inline]
+    pub fn blueflame_rq_batch(&self) -> Result<UdRqBlueflameWqeBatch<'_, RqEntry>, SubmissionError> {
+        let rq = self.rq.as_ref().ok_or(SubmissionError::RqFull)?;
+        let sq = self.sq.as_ref().ok_or(SubmissionError::BlueflameNotAvailable)?;
+        if sq.bf_size == 0 {
+            return Err(SubmissionError::BlueflameNotAvailable);
+        }
+        Ok(UdRqBlueflameWqeBatch::new(rq, sq.bf_reg, sq.bf_size, &sq.bf_offset))
+    }
+
+    /// Ring the send queue doorbell.
+    ///
+    /// Call this after posting one or more WQEs to notify the HCA.
+    #[inline]
+    pub fn ring_sq_doorbell(&self) {
+        if let Some(sq) = self.sq.as_ref()
+            && let Some((wqe_ptr, _)) = sq.last_wqe.get() {
+                sq.ring_db(wqe_ptr);
+            }
     }
 }
 
@@ -793,6 +1060,7 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIbWithSrq<SqEntry, RqEntr
     }
 
     /// Get an emit context for macro-based WQE emission.
+    #[doc(hidden)]
     pub fn emit_ctx(&self) -> io::Result<UdEmitContext<'_, SqEntry>> {
         self.sq()?.emit_ctx()
     }

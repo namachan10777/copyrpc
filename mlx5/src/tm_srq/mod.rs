@@ -6,34 +6,36 @@
 //! # Direct Verbs Interface
 //!
 //! This implementation provides direct WQE posting for:
-//! - Tag operations (add/remove) via the internal Command QP
+//! - Tag operations (add/remove) via the `emit_tm_wqe!` macro
 //! - Unordered receive WQE posting to the SRQ
 //!
 //! # Example
 //!
 //! ```ignore
-//! // Add a tagged receive using Command QP
-//! let builder = tm_srq.cmd_wqe_builder(my_entry)?;
-//! builder
-//!     .ctrl_tag_matching(0)
-//!     .tag_add(index, tag, addr, len, lkey, true)
-//!     .finish();
+//! use mlx5::emit_tm_wqe;
+//!
+//! // Add a tagged receive using emit_tm_wqe! macro
+//! let ctx = tm_srq.cmd_emit_ctx()?;
+//! emit_tm_wqe!(&ctx, tag_add {
+//!     index: tag_index,
+//!     tag: tag_value,
+//!     sge: { addr: buf_addr, len: buf_len, lkey: lkey },
+//!     signaled: entry,
+//! })?;
 //! tm_srq.ring_cmd_doorbell();
 //!
 //! // Post unordered receive (for unexpected messages)
 //! tm_srq.post_unordered_recv(addr, len, lkey, entry)?;
 //! tm_srq.ring_srq_doorbell();
 //!
-//! // Remove a tag using Command QP
-//! let builder = tm_srq.cmd_wqe_builder(my_entry)?;
-//! builder
-//!     .ctrl_tag_matching(0)
-//!     .tag_del(index, true)
-//!     .finish();
+//! // Remove a tag using emit_tm_wqe! macro
+//! let ctx = tm_srq.cmd_emit_ctx()?;
+//! emit_tm_wqe!(&ctx, tag_del {
+//!     index: tag_index,
+//!     signaled: entry,
+//! })?;
 //! tm_srq.ring_cmd_doorbell();
 //! ```
-
-pub mod builder;
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
@@ -44,7 +46,7 @@ use crate::cq::{Cq, Cqe, CqeOpcode};
 use crate::device::Context;
 use crate::pd::Pd;
 use crate::srq::SrqInfo;
-use crate::wqe::{Init, OrderedWqeTable, UnorderedWqeTable, WQEBB_SIZE, emit::TmCmdEmitContext};
+use crate::wqe::{OrderedWqeTable, UnorderedWqeTable, WQEBB_SIZE, emit::{SqState, TmCmdEmitContext}};
 
 // =============================================================================
 // TM-SRQ Completion Types
@@ -219,6 +221,7 @@ impl<CmdEntry> CmdQpState<CmdEntry, OrderedWqeTable<CmdEntry>> {
     /// Get an emit context for macro-based WQE emission.
     ///
     /// Returns `Err` if the Command QP is full.
+    #[doc(hidden)]
     pub fn emit_ctx(&self) -> io::Result<TmCmdEmitContext<'_, CmdEntry>> {
         if !self.table.is_available(self.pi.get()) {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "Command QP full"));
@@ -232,6 +235,66 @@ impl<CmdEntry> CmdQpState<CmdEntry, OrderedWqeTable<CmdEntry>> {
             last_wqe: &self.last_wqe,
             table: &self.table,
         })
+    }
+}
+
+/// SqState implementation for CmdQpState.
+impl<CmdEntry> SqState for CmdQpState<CmdEntry, OrderedWqeTable<CmdEntry>> {
+    type Entry = CmdEntry;
+
+    #[inline]
+    fn sq_buf(&self) -> *mut u8 {
+        self.sq_buf
+    }
+
+    #[inline]
+    fn wqe_cnt(&self) -> u16 {
+        self.sq_wqe_cnt
+    }
+
+    #[inline]
+    fn sqn(&self) -> u32 {
+        self.qpn
+    }
+
+    #[inline]
+    fn pi(&self) -> &Cell<u16> {
+        &self.pi
+    }
+
+    #[inline]
+    fn ci(&self) -> &Cell<u16> {
+        &self.ci
+    }
+
+    #[inline]
+    fn last_wqe(&self) -> &Cell<Option<(*mut u8, usize)>> {
+        &self.last_wqe
+    }
+
+    #[inline]
+    fn table(&self) -> &OrderedWqeTable<CmdEntry> {
+        &self.table
+    }
+
+    #[inline]
+    fn dbrec(&self) -> *mut u32 {
+        self.dbrec
+    }
+
+    #[inline]
+    fn bf_reg(&self) -> *mut u8 {
+        self.bf_reg
+    }
+
+    #[inline]
+    fn bf_size(&self) -> u32 {
+        self.bf_size
+    }
+
+    #[inline]
+    fn bf_offset(&self) -> &Cell<u32> {
+        &self.bf_offset
     }
 }
 
@@ -545,11 +608,22 @@ impl<CmdEntry, RecvEntry, OnComplete> TmSrq<CmdEntry, RecvEntry, OnComplete> {
         self.srq_state().table.available_wqebbs()
     }
 
-    /// Get a WQE builder for RQ unordered receive operations.
+    /// Post an unordered receive WQE with a single data segment.
     ///
-    /// Entry is required for completion tracking.
-    pub fn rq_wqe_builder(&self, entry: RecvEntry) -> io::Result<RqWqeBuilder<'_, RecvEntry>> {
+    /// This posts a receive WQE to the SRQ for unexpected (unmatched) messages.
+    /// Call `ring_srq_doorbell()` after posting one or more receive WQEs.
+    ///
+    /// # Arguments
+    /// * `addr` - Address of the receive buffer
+    /// * `len` - Length of the receive buffer
+    /// * `lkey` - Local key for the memory region
+    /// * `entry` - User entry to associate with this receive operation
+    pub fn post_unordered_recv(&self, addr: u64, len: u32, lkey: u32, entry: RecvEntry) -> io::Result<()> {
+        use crate::wqe::write_data_seg;
+
         let srq_state = self.srq_state();
+
+        // Allocate 1 WQEBB (Next Segment 16B + Data Segment 16B = 32B fits in 64B WQEBB)
         let wqebb_start = srq_state
             .table
             .try_allocate_first()
@@ -558,28 +632,18 @@ impl<CmdEntry, RecvEntry, OnComplete> TmSrq<CmdEntry, RecvEntry, OnComplete> {
         let wqe_idx = srq_state.head.get();
         let wqe_ptr = srq_state.get_wqe_ptr(wqe_idx);
 
-        // Clear Next Segment (16 bytes)
-        unsafe { std::ptr::write_bytes(wqe_ptr, 0, 16) };
+        unsafe {
+            // Clear Next Segment (16 bytes)
+            std::ptr::write_bytes(wqe_ptr, 0, 16);
 
-        Ok(RqWqeBuilder {
-            srq_state,
-            wqe_ptr,
-            wqe_idx,
-            wqebb_start,
-            wqebb_count: 1,
-            offset: 16, // Start after Next Segment
-            entry,
-        })
-    }
+            // Write Data Segment after Next Segment (offset 16)
+            write_data_seg(wqe_ptr.add(16), len, lkey, addr);
+        }
 
-    /// Post a simple unordered receive WQE with a single data segment.
-    ///
-    /// This is a convenience method for the common case.
-    /// Call `ring_srq_doorbell()` after posting one or more receive WQEs.
-    pub fn post_unordered_recv(&self, addr: u64, len: u32, lkey: u32, entry: RecvEntry) -> io::Result<()> {
-        self.rq_wqe_builder(entry)?
-            .data_seg(addr, len, lkey)?
-            .finish();
+        // Store entry in table and advance head
+        srq_state.table.store(wqe_idx as u16, wqebb_start, 1, entry);
+        srq_state.head.set(wqe_idx.wrapping_add(1));
+
         Ok(())
     }
 
@@ -623,33 +687,6 @@ impl<CmdEntry, RecvEntry, OnComplete> TmSrq<CmdEntry, RecvEntry, OnComplete> {
     /// Check if a specific Command QP slot is available.
     pub fn cmd_is_slot_available(&self, idx: u16) -> bool {
         self.cmd_qp().table.is_available(idx)
-    }
-
-    /// Get a WQE builder for Command QP tag operations (sparse mode).
-    ///
-    /// Returns a builder in `Init` state. Call `ctrl_tag_matching()` to start building.
-    pub fn cmd_wqe_builder(
-        &self,
-        entry: CmdEntry,
-    ) -> io::Result<CmdQpWqeBuilder<'_, CmdEntry, OrderedWqeTable<CmdEntry>, Init>> {
-        let cmd_qp = self.cmd_qp();
-        if !cmd_qp.table.is_available(cmd_qp.pi.get()) {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Command QP full"));
-        }
-
-        let wqe_idx = cmd_qp.pi.get();
-        let wqe_ptr = cmd_qp.get_wqe_ptr(wqe_idx);
-
-        Ok(CmdQpWqeBuilder {
-            cmd_qp,
-            wqe_ptr,
-            wqe_idx,
-            offset: 0,
-            ds_count: 0,
-            entry,
-            signaled: false,
-            _state: std::marker::PhantomData,
-        })
     }
 
     /// Process a Command QP completion (internal use by dispatch_cqe).
@@ -722,54 +759,3 @@ where
     }
 }
 
-// =============================================================================
-// New API Entry Points for TM-SRQ
-// =============================================================================
-
-use builder::{CmdQpWqeBuilder, RqWqeBuilder, TmCmdEntryPointImpl};
-use crate::wqe::TmCmdWqeBuilder;
-
-impl<CmdEntry, RecvEntry, OnComplete> TmSrq<CmdEntry, RecvEntry, OnComplete> {
-    /// Get a Command Queue WQE builder using the new trait-based API.
-    ///
-    /// # Example
-    /// ```ignore
-    /// tm_srq.cmd_wqe(entry)
-    ///     .tag_add(index, tag)
-    ///     .sge(addr, len, lkey)
-    ///     .signal(entry)
-    ///     .finish();
-    /// tm_srq.ring_cmd_doorbell();
-    /// ```
-    #[inline]
-    pub fn cmd_wqe(&self, entry: CmdEntry) -> io::Result<impl TmCmdWqeBuilder<'_, CmdEntry> + '_> {
-        let cmd_qp = self.cmd_qp();
-        if !cmd_qp.table.is_available(cmd_qp.pi.get()) {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Command QP full"));
-        }
-
-        let wqe_idx = cmd_qp.pi.get();
-        let wqe_ptr = cmd_qp.get_wqe_ptr(wqe_idx);
-
-        Ok(TmCmdEntryPointImpl {
-            cmd_qp,
-            wqe_ptr,
-            wqe_idx,
-            entry,
-        })
-    }
-
-    /// Get a RQ WQE builder.
-    ///
-    /// # Example
-    /// ```ignore
-    /// tm_srq.rq_wqe(entry)?
-    ///     .data_seg(addr, len, lkey)?
-    ///     .finish();
-    /// tm_srq.ring_srq_doorbell();
-    /// ```
-    #[inline]
-    pub fn rq_wqe(&self, entry: RecvEntry) -> io::Result<RqWqeBuilder<'_, RecvEntry>> {
-        self.rq_wqe_builder(entry)
-    }
-}

@@ -4,8 +4,6 @@
 //! - DCI (DC Initiator): Sends RDMA operations to DCTs
 //! - DCT (DC Target): Receives RDMA operations via SRQ
 
-pub mod builder;
-
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::{io, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
@@ -23,7 +21,7 @@ use crate::transport::IbRemoteDctInfo;
 use crate::wqe::{
     CtrlSegParams, InfiniBand, OrderedWqeTable, RoCE, WQEBB_SIZE, WqeFlags, WqeOpcode,
     write_ctrl_seg,
-    emit::{DciEmitContext, SqCapability},
+    emit::{DciEmitContext, SqCapability, SqState},
 };
 
 /// DCI configuration.
@@ -211,6 +209,66 @@ impl<Entry> SqCapability for DciSendQueueState<Entry, OrderedWqeTable<Entry>> {
     const SUPPORTS_SEND: bool = true;
     const SUPPORTS_RDMA: bool = true;
     const SUPPORTS_ATOMIC: bool = true;
+}
+
+/// SqState implementation for DciSendQueueState.
+impl<Entry> SqState for DciSendQueueState<Entry, OrderedWqeTable<Entry>> {
+    type Entry = Entry;
+
+    #[inline]
+    fn sq_buf(&self) -> *mut u8 {
+        self.buf
+    }
+
+    #[inline]
+    fn wqe_cnt(&self) -> u16 {
+        self.wqe_cnt
+    }
+
+    #[inline]
+    fn sqn(&self) -> u32 {
+        self.sqn
+    }
+
+    #[inline]
+    fn pi(&self) -> &Cell<u16> {
+        &self.pi
+    }
+
+    #[inline]
+    fn ci(&self) -> &Cell<u16> {
+        &self.ci
+    }
+
+    #[inline]
+    fn last_wqe(&self) -> &Cell<Option<(*mut u8, usize)>> {
+        &self.last_wqe
+    }
+
+    #[inline]
+    fn table(&self) -> &OrderedWqeTable<Entry> {
+        &self.table
+    }
+
+    #[inline]
+    fn dbrec(&self) -> *mut u32 {
+        self.dbrec
+    }
+
+    #[inline]
+    fn bf_reg(&self) -> *mut u8 {
+        self.bf_reg
+    }
+
+    #[inline]
+    fn bf_size(&self) -> u32 {
+        self.bf_size
+    }
+
+    #[inline]
+    fn bf_offset(&self) -> &Cell<u32> {
+        &self.bf_offset
+    }
 }
 
 // =============================================================================
@@ -651,28 +709,7 @@ impl<Entry, Transport, TableType, OnComplete> Dci<Entry, Transport, TableType, O
 }
 
 impl<Entry, OnComplete> DciWithTable<Entry, OnComplete> {
-    /// Get a DciEmitContext for macro-based WQE emission.
-    ///
-    /// # Example
-    /// ```ignore
-    /// use mlx5::wqe::emit::{DcAvIb, emit_dci_write_ib, DciWriteParamsIb};
-    ///
-    /// let ctx = dci.emit_ctx()?;
-    /// emit_dci_write_ib(&ctx, &DciWriteParamsIb {
-    ///     av: DcAvIb::new(dc_key, dctn, dlid),
-    ///     flags: WqeFlags::empty(),
-    ///     remote_addr: dest,
-    ///     rkey: rkey,
-    ///     sge_addr: local_addr,
-    ///     sge_len: 64,
-    ///     sge_lkey: lkey,
-    ///     signaled: true,
-    ///     inline_data: None,
-    ///     imm: 0,
-    /// })?;
-    /// ctx.table.store(wqe_idx, entry, ctx.pi.get());
-    /// dci.ring_sq_doorbell();
-    /// ```
+    #[doc(hidden)]
     #[inline]
     pub fn emit_ctx(&self) -> io::Result<DciEmitContext<'_, Entry>> {
         let sq = self.sq.as_ref()
