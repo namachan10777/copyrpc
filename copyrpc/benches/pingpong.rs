@@ -21,6 +21,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 
 use mlx5::cq::{CqConfig, Cqe};
 use mlx5::device::{Context, DeviceList};
+use mlx5::emit_wqe;
 use mlx5::mono_cq::MonoCqRc;
 use mlx5::pd::{AccessFlags, MemoryRegion, Pd};
 use mlx5::qp::{RcQpConfig, RcQpForMonoCq};
@@ -614,31 +615,25 @@ fn server_thread_main(
             match mode {
                 BenchMode::WriteImm => {
                     let imm = ((ep_id as u32) << 8) | (slot_id as u32);
-                    ep.qp
-                        .borrow_mut()
-                        .sq_wqe()
-                        .unwrap()
-                        .write_imm(
-                            WqeFlags::empty(),
-                            ep.remote_addr + offset,
-                            ep.remote_rkey,
-                            imm,
-                        )
-                        .unwrap()
-                        .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
-                        .finish_signaled(slot_id as u64)
-                        .unwrap();
+                    let qp = ep.qp.borrow();
+                    let ctx = qp.emit_ctx().expect("emit_ctx failed");
+                    emit_wqe!(&ctx, write_imm {
+                        flags: WqeFlags::empty(),
+                        remote_addr: ep.remote_addr + offset,
+                        rkey: ep.remote_rkey,
+                        imm: imm,
+                        sge: { addr: ep.send_buf.addr() + offset, len: MESSAGE_SIZE as u32, lkey: ep.send_mr.lkey() },
+                        signaled: slot_id as u64,
+                    }).expect("emit_wqe failed");
                 }
                 BenchMode::SendRecv => {
-                    ep.qp
-                        .borrow_mut()
-                        .sq_wqe()
-                        .unwrap()
-                        .send(WqeFlags::empty())
-                        .unwrap()
-                        .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
-                        .finish_signaled(slot_id as u64)
-                        .unwrap();
+                    let qp = ep.qp.borrow();
+                    let ctx = qp.emit_ctx().expect("emit_ctx failed");
+                    emit_wqe!(&ctx, send {
+                        flags: WqeFlags::empty(),
+                        sge: { addr: ep.send_buf.addr() + offset, len: MESSAGE_SIZE as u32, lkey: ep.send_mr.lkey() },
+                        signaled: slot_id as u64,
+                    }).expect("emit_wqe failed");
                 }
             }
         }
@@ -669,7 +664,8 @@ where
 
     // Initial fill
     for ep in &client.endpoints {
-        let mut qp = ep.qp.borrow_mut();
+        let qp = ep.qp.borrow();
+        let ctx = qp.emit_ctx().expect("emit_ctx failed");
         for slot in 0..REQUESTS_PER_EP {
             let offset = (slot * 256) as u64;
             let signaled = (slot % 4) == 3;
@@ -678,40 +674,36 @@ where
                 BenchMode::WriteImm => {
                     let imm = ((ep.endpoint_id as u32) << 8) | (slot as u32);
                     if signaled {
-                        qp.sq_wqe()
-                            .unwrap()
-                            .write_imm(WqeFlags::empty(), ep.remote_addr + offset, ep.remote_rkey, imm)
-                            .unwrap()
-                            .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
-                            .finish_signaled(slot as u64)
-                            .unwrap();
+                        emit_wqe!(&ctx, write_imm {
+                            flags: WqeFlags::empty(),
+                            remote_addr: ep.remote_addr + offset,
+                            rkey: ep.remote_rkey,
+                            imm: imm,
+                            sge: { addr: ep.send_buf.addr() + offset, len: MESSAGE_SIZE as u32, lkey: ep.send_mr.lkey() },
+                            signaled: slot as u64,
+                        }).expect("emit_wqe failed");
                     } else {
-                        qp.sq_wqe()
-                            .unwrap()
-                            .write_imm(WqeFlags::empty(), ep.remote_addr + offset, ep.remote_rkey, imm)
-                            .unwrap()
-                            .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
-                            .finish_unsignaled()
-                            .unwrap();
+                        emit_wqe!(&ctx, write_imm {
+                            flags: WqeFlags::empty(),
+                            remote_addr: ep.remote_addr + offset,
+                            rkey: ep.remote_rkey,
+                            imm: imm,
+                            sge: { addr: ep.send_buf.addr() + offset, len: MESSAGE_SIZE as u32, lkey: ep.send_mr.lkey() },
+                        }).expect("emit_wqe failed");
                     }
                 }
                 BenchMode::SendRecv => {
                     if signaled {
-                        qp.sq_wqe()
-                            .unwrap()
-                            .send(WqeFlags::empty())
-                            .unwrap()
-                            .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
-                            .finish_signaled(slot as u64)
-                            .unwrap();
+                        emit_wqe!(&ctx, send {
+                            flags: WqeFlags::empty(),
+                            sge: { addr: ep.send_buf.addr() + offset, len: MESSAGE_SIZE as u32, lkey: ep.send_mr.lkey() },
+                            signaled: slot as u64,
+                        }).expect("emit_wqe failed");
                     } else {
-                        qp.sq_wqe()
-                            .unwrap()
-                            .send(WqeFlags::empty())
-                            .unwrap()
-                            .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
-                            .finish_unsignaled()
-                            .unwrap();
+                        emit_wqe!(&ctx, send {
+                            flags: WqeFlags::empty(),
+                            sge: { addr: ep.send_buf.addr() + offset, len: MESSAGE_SIZE as u32, lkey: ep.send_mr.lkey() },
+                        }).expect("emit_wqe failed");
                     }
                 }
             }
@@ -764,45 +756,42 @@ where
             let offset = (slot_id as usize * 256) as u64;
             let signaled = (i % 4) == 3;
 
-            let mut qp = ep.qp.borrow_mut();
+            let qp = ep.qp.borrow_mut();
+            let ctx = qp.emit_ctx().expect("emit_ctx failed");
             match mode {
                 BenchMode::WriteImm => {
                     let imm = ((ep_id as u32) << 8) | (slot_id as u32);
                     if signaled {
-                        qp.sq_wqe()
-                            .unwrap()
-                            .write_imm(WqeFlags::empty(), ep.remote_addr + offset, ep.remote_rkey, imm)
-                            .unwrap()
-                            .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
-                            .finish_signaled(slot_id as u64)
-                            .unwrap();
+                        emit_wqe!(&ctx, write_imm {
+                            flags: WqeFlags::empty(),
+                            remote_addr: ep.remote_addr + offset,
+                            rkey: ep.remote_rkey,
+                            imm: imm,
+                            sge: { addr: ep.send_buf.addr() + offset, len: MESSAGE_SIZE as u32, lkey: ep.send_mr.lkey() },
+                            signaled: slot_id as u64,
+                        }).expect("emit_wqe failed");
                     } else {
-                        qp.sq_wqe()
-                            .unwrap()
-                            .write_imm(WqeFlags::empty(), ep.remote_addr + offset, ep.remote_rkey, imm)
-                            .unwrap()
-                            .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
-                            .finish_unsignaled()
-                            .unwrap();
+                        emit_wqe!(&ctx, write_imm {
+                            flags: WqeFlags::empty(),
+                            remote_addr: ep.remote_addr + offset,
+                            rkey: ep.remote_rkey,
+                            imm: imm,
+                            sge: { addr: ep.send_buf.addr() + offset, len: MESSAGE_SIZE as u32, lkey: ep.send_mr.lkey() },
+                        }).expect("emit_wqe failed");
                     }
                 }
                 BenchMode::SendRecv => {
                     if signaled {
-                        qp.sq_wqe()
-                            .unwrap()
-                            .send(WqeFlags::empty())
-                            .unwrap()
-                            .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
-                            .finish_signaled(slot_id as u64)
-                            .unwrap();
+                        emit_wqe!(&ctx, send {
+                            flags: WqeFlags::empty(),
+                            sge: { addr: ep.send_buf.addr() + offset, len: MESSAGE_SIZE as u32, lkey: ep.send_mr.lkey() },
+                            signaled: slot_id as u64,
+                        }).expect("emit_wqe failed");
                     } else {
-                        qp.sq_wqe()
-                            .unwrap()
-                            .send(WqeFlags::empty())
-                            .unwrap()
-                            .sge(ep.send_buf.addr() + offset, MESSAGE_SIZE as u32, ep.send_mr.lkey())
-                            .finish_unsignaled()
-                            .unwrap();
+                        emit_wqe!(&ctx, send {
+                            flags: WqeFlags::empty(),
+                            sge: { addr: ep.send_buf.addr() + offset, len: MESSAGE_SIZE as u32, lkey: ep.send_mr.lkey() },
+                        }).expect("emit_wqe failed");
                     }
                 }
             }

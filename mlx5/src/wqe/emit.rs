@@ -154,7 +154,6 @@ pub struct BlueframeBatch<'a, Q: SqState> {
     buffer: [u8; 256],
     offset: usize,
     wqe_count: usize,
-    first_wqe_idx: u16,
 }
 
 impl<'a, Q: SqState> BlueframeBatch<'a, Q> {
@@ -171,7 +170,6 @@ impl<'a, Q: SqState> BlueframeBatch<'a, Q> {
             buffer: [0u8; 256],
             offset: 0,
             wqe_count: 0,
-            first_wqe_idx: qp.pi().get(),
         })
     }
 

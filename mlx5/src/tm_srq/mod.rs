@@ -46,7 +46,7 @@ use crate::cq::{Cq, Cqe, CqeOpcode};
 use crate::device::Context;
 use crate::pd::Pd;
 use crate::srq::SrqInfo;
-use crate::wqe::{OrderedWqeTable, UnorderedWqeTable, WQEBB_SIZE, emit::{SqState, TmCmdEmitContext}};
+use crate::wqe::{OrderedWqeTable, UnorderedWqeTable, emit::{SqState, TmCmdEmitContext}};
 
 // =============================================================================
 // TM-SRQ Completion Types
@@ -137,19 +137,6 @@ pub(super) struct CmdQpState<CmdEntry, CmdTableType> {
 }
 
 impl<CmdEntry, CmdTableType> CmdQpState<CmdEntry, CmdTableType> {
-    pub(super) fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
-        let offset = ((idx & (self.sq_wqe_cnt - 1)) as usize) * WQEBB_SIZE;
-        unsafe { self.sq_buf.add(offset) }
-    }
-
-    pub(super) fn advance_pi(&self, count: u16) {
-        self.pi.set(self.pi.get().wrapping_add(count));
-    }
-
-    pub(super) fn set_last_wqe(&self, ptr: *mut u8, size: usize) {
-        self.last_wqe.set(Some((ptr, size)));
-    }
-
     pub(super) fn optimistic_available(&self) -> u16 {
         self.sq_wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
     }
@@ -171,31 +158,6 @@ impl<CmdEntry, CmdTableType> CmdQpState<CmdEntry, CmdTableType> {
         udma_to_device_barrier!();
 
         self.ring_db(wqe_ptr);
-    }
-
-    /// Ring the doorbell using BlueFlame (low latency, single WQE).
-    pub(super) fn ring_blueflame(&self, wqe_ptr: *mut u8) {
-        mmio_flush_writes!();
-
-        // Update doorbell record (dbrec[1] is SQ doorbell)
-        unsafe {
-            std::ptr::write_volatile(self.dbrec.add(1), (self.pi.get() as u32).to_be());
-        }
-
-        udma_to_device_barrier!();
-
-        if self.bf_size > 0 {
-            // Safety: bf_reg is a valid BlueFlame register pointer, wqe_ptr points to valid WQE
-            unsafe {
-                let bf = self.bf_reg.add(self.bf_offset.get() as usize);
-                mlx5_bf_copy!(bf, wqe_ptr);
-            }
-            mmio_flush_writes!();
-            self.bf_offset.set(self.bf_offset.get() ^ self.bf_size);
-        } else {
-            // Fallback to regular doorbell if BlueFlame not available
-            self.ring_db(wqe_ptr);
-        }
     }
 
     fn ring_db(&self, wqe_ptr: *mut u8) {

@@ -19,8 +19,7 @@ use crate::qp::QpInfo;
 use crate::srq::Srq;
 use crate::transport::IbRemoteDctInfo;
 use crate::wqe::{
-    CtrlSegParams, InfiniBand, OrderedWqeTable, RoCE, WQEBB_SIZE, WqeFlags, WqeOpcode,
-    write_ctrl_seg,
+    InfiniBand, OrderedWqeTable, RoCE,
     emit::{DciEmitContext, SqCapability, SqState},
 };
 
@@ -74,8 +73,6 @@ pub(super) struct DciSendQueueState<Entry, TableType> {
     pub(super) buf: *mut u8,
     pub(super) wqe_cnt: u16,
     pub(super) sqn: u32,
-    /// Maximum inline data size (from DCI config)
-    pub(super) max_inline_data: u32,
     pub(super) pi: Cell<u16>,
     pub(super) ci: Cell<u16>,
     pub(super) last_wqe: Cell<Option<(*mut u8, usize)>>,
@@ -92,61 +89,6 @@ pub(super) struct DciSendQueueState<Entry, TableType> {
 impl<Entry, TableType> DciSendQueueState<Entry, TableType> {
     pub(super) fn available(&self) -> u16 {
         self.wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
-    }
-
-    pub(super) fn max_inline_data(&self) -> u32 {
-        self.max_inline_data
-    }
-
-    pub(super) fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
-        let offset = ((idx & (self.wqe_cnt - 1)) as usize) * WQEBB_SIZE;
-        unsafe { self.buf.add(offset) }
-    }
-
-    /// Returns the number of WQEBBs from current PI to the end of the ring buffer.
-    pub(super) fn slots_to_end(&self) -> u16 {
-        self.wqe_cnt - (self.pi.get() & (self.wqe_cnt - 1))
-    }
-
-    pub(super) fn advance_pi(&self, count: u16) {
-        self.pi.set(self.pi.get().wrapping_add(count));
-    }
-
-    pub(super) fn set_last_wqe(&self, ptr: *mut u8, size: usize) {
-        self.last_wqe.set(Some((ptr, size)));
-    }
-
-    /// Post a NOP WQE to fill the remaining slots until the ring end.
-    ///
-    /// # Safety
-    /// Caller must ensure there are enough available slots for the NOP WQE.
-    pub(super) unsafe fn post_nop(&self, nop_wqebb_cnt: u16) {
-        debug_assert!(nop_wqebb_cnt >= 1, "NOP must be at least 1 WQEBB");
-        debug_assert!(
-            self.available() >= nop_wqebb_cnt,
-            "Not enough slots for NOP"
-        );
-
-        let wqe_idx = self.pi.get();
-        let wqe_ptr = self.get_wqe_ptr(wqe_idx);
-
-        // Write NOP control segment
-        let ds_count = (nop_wqebb_cnt as u8) * 4;
-        write_ctrl_seg(
-            wqe_ptr,
-            &CtrlSegParams {
-                opmod: 0,
-                opcode: WqeOpcode::Nop as u8,
-                wqe_idx,
-                qpn: self.sqn,
-                ds_cnt: ds_count,
-                flags: WqeFlags::empty(),
-                imm: 0,
-            },
-        );
-
-        self.advance_pi(nop_wqebb_cnt);
-        self.set_last_wqe(wqe_ptr, (nop_wqebb_cnt as usize) * WQEBB_SIZE);
     }
 
     /// Ring the doorbell using regular doorbell write.
@@ -298,8 +240,6 @@ pub type DciRoCE<Entry, OnComplete> = Dci<Entry, RoCE, OrderedWqeTable<Entry>, O
 pub struct Dci<Entry, Transport, TableType, OnComplete> {
     qp: NonNull<mlx5_sys::ibv_qp>,
     state: Cell<DcQpState>,
-    /// Maximum inline data size (from DCI config)
-    max_inline_data: u32,
     sq: Option<DciSendQueueState<Entry, TableType>>,
     callback: OnComplete,
     /// Weak reference to the CQ for unregistration on drop
@@ -454,7 +394,6 @@ where
             let mut result = Dci {
                 qp,
                 state: Cell::new(DcQpState::Reset),
-                max_inline_data: self.config.max_inline_data,
                 sq: None,
                 callback: self.callback,
                 send_cq: self.send_cq_weak.clone().unwrap_or_default(),
@@ -518,7 +457,6 @@ where
             let mut result = Dci {
                 qp,
                 state: Cell::new(DcQpState::Reset),
-                max_inline_data: self.config.max_inline_data,
                 sq: None,
                 callback: (),
                 send_cq: Weak::new(),
@@ -688,12 +626,6 @@ impl<Entry, Transport, TableType, OnComplete> Dci<Entry, Transport, TableType, O
         Ok(())
     }
 
-    fn sq(&self) -> io::Result<&DciSendQueueState<Entry, TableType>> {
-        self.sq
-            .as_ref()
-            .ok_or_else(|| io::Error::other("direct access not initialized"))
-    }
-
     /// Get the number of available WQEBBs in the Send Queue.
     pub fn sq_available(&self) -> u16 {
         self.sq.as_ref().map(|sq| sq.available()).unwrap_or(0)
@@ -732,7 +664,6 @@ impl<Entry, OnComplete> DciWithTable<Entry, OnComplete> {
             buf: info.sq_buf,
             wqe_cnt,
             sqn: info.sqn,
-            max_inline_data: self.max_inline_data,
             pi: Cell::new(0),
             ci: Cell::new(0),
             last_wqe: Cell::new(None),

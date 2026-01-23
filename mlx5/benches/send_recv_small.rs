@@ -21,6 +21,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 
 use mlx5::cq::{CqConfig, Cqe};
 use mlx5::device::{Context, DeviceList};
+use mlx5::emit_wqe;
 use mlx5::mono_cq::MonoCqRc;
 use mlx5::pd::{AccessFlags, MemoryRegion, Pd};
 use mlx5::qp::{RcQpConfig, RcQpForMonoCq};
@@ -472,25 +473,21 @@ fn server_thread_main(
 
         // Send echo responses
         {
-            let mut qp_ref = qp.borrow_mut();
+            let qp_ref = qp.borrow();
+            let ctx = qp_ref.emit_ctx().expect("emit_ctx failed");
             for _ in 0..count {
                 // Echo back with inline data (3:1 signaling ratio)
                 if send_count % 4 == 3 {
-                    let _ = qp_ref
-                        .sq_wqe()
-                        .unwrap()
-                        .send(WqeFlags::empty())
-                        .unwrap()
-                        .inline(&echo_data)
-                        .finish_signaled(send_count as u64);
+                    let _ = emit_wqe!(&ctx, send {
+                        flags: WqeFlags::empty(),
+                        inline: echo_data.as_slice(),
+                        signaled: send_count as u64,
+                    });
                 } else {
-                    let _ = qp_ref
-                        .sq_wqe()
-                        .unwrap()
-                        .send(WqeFlags::empty())
-                        .unwrap()
-                        .inline(&echo_data)
-                        .finish_unsignaled();
+                    let _ = emit_wqe!(&ctx, send {
+                        flags: WqeFlags::empty(),
+                        inline: echo_data.as_slice(),
+                    });
                 }
                 send_count += 1;
             }
@@ -528,19 +525,16 @@ where
     for i in 0..iters {
         let idx = (i as usize) % QUEUE_DEPTH;
 
-        // Post Send with inline data using blueflame
+        // Post Send with inline data
         {
             let qp = client.qp.borrow();
-            let mut bf = qp.blueflame_sq_wqe().unwrap();
-            bf.wqe()
-                .unwrap()
-                .send(WqeFlags::empty())
-                .unwrap()
-                .inline(&send_data)
-                .unwrap()
-                .finish_signaled(idx as u64)
-                .unwrap();
-            bf.finish();
+            let ctx = qp.emit_ctx().expect("emit_ctx failed");
+            emit_wqe!(&ctx, send {
+                flags: WqeFlags::empty(),
+                inline: send_data.as_slice(),
+                signaled: idx as u64,
+            }).expect("emit_wqe failed");
+            qp.ring_sq_doorbell();
         }
 
         // Wait for echo response
@@ -584,7 +578,8 @@ where
 
     // Initial fill with 3:1 signaling ratio
     {
-        let mut qp = client.qp.borrow_mut();
+        let qp = client.qp.borrow();
+        let ctx = qp.emit_ctx().expect("emit_ctx failed");
         let full_batches = initial_batch / 4;
         let remainder = initial_batch % 4;
 
@@ -592,38 +587,31 @@ where
             let base = batch * 4;
             // 3 unsignaled
             for _ in 0..3 {
-                let _ = qp
-                    .sq_wqe()
-                    .unwrap()
-                    .send(WqeFlags::empty())
-                    .unwrap()
-                    .inline(&send_data)
-                    .finish_unsignaled();
+                let _ = emit_wqe!(&ctx, send {
+                    flags: WqeFlags::empty(),
+                    inline: send_data.as_slice(),
+                });
             }
             // 1 signaled
             let idx = base + 3;
-            let _ = qp
-                .sq_wqe()
-                .unwrap()
-                .send(WqeFlags::empty())
-                .unwrap()
-                .inline(&send_data)
-                .finish_signaled(idx as u64);
+            let _ = emit_wqe!(&ctx, send {
+                flags: WqeFlags::empty(),
+                inline: send_data.as_slice(),
+                signaled: idx as u64,
+            });
         }
 
         // Remainder (all signaled)
         for j in 0..remainder {
             let idx = full_batches * 4 + j;
-            let _ = qp
-                .sq_wqe()
-                .unwrap()
-                .send(WqeFlags::empty())
-                .unwrap()
-                .inline(&send_data)
-                .finish_signaled(idx as u64);
+            let _ = emit_wqe!(&ctx, send {
+                flags: WqeFlags::empty(),
+                inline: send_data.as_slice(),
+                signaled: idx as u64,
+            });
         }
+        qp.ring_sq_doorbell();
     }
-    client.qp.borrow().ring_sq_doorbell();
 
     let start = std::time::Instant::now();
     let mut completed = 0u64;
@@ -663,40 +651,34 @@ where
         let to_send = can_send.min(rx_count);
 
         if to_send > 0 {
-            let mut qp = client.qp.borrow_mut();
+            let qp = client.qp.borrow();
+            let ctx = qp.emit_ctx().expect("emit_ctx failed");
             let full_batches = to_send / 4;
             let remainder = to_send % 4;
 
             for batch in 0..full_batches {
                 // 3 unsignaled
                 for _ in 0..3 {
-                    let _ = qp
-                        .sq_wqe()
-                        .unwrap()
-                        .send(WqeFlags::empty())
-                        .unwrap()
-                        .inline(&send_data)
-                        .finish_unsignaled();
+                    let _ = emit_wqe!(&ctx, send {
+                        flags: WqeFlags::empty(),
+                        inline: send_data.as_slice(),
+                    });
                 }
                 // 1 signaled
-                let _ = qp
-                    .sq_wqe()
-                    .unwrap()
-                    .send(WqeFlags::empty())
-                    .unwrap()
-                    .inline(&send_data)
-                    .finish_signaled(batch as u64);
+                let _ = emit_wqe!(&ctx, send {
+                    flags: WqeFlags::empty(),
+                    inline: send_data.as_slice(),
+                    signaled: batch as u64,
+                });
             }
 
             // Remainder (all signaled)
             for j in 0..remainder {
-                let _ = qp
-                    .sq_wqe()
-                    .unwrap()
-                    .send(WqeFlags::empty())
-                    .unwrap()
-                    .inline(&send_data)
-                    .finish_signaled(j as u64);
+                let _ = emit_wqe!(&ctx, send {
+                    flags: WqeFlags::empty(),
+                    inline: send_data.as_slice(),
+                    signaled: j as u64,
+                });
             }
 
             inflight += to_send as u64;

@@ -23,8 +23,8 @@ use crate::qp::QpInfo;
 use crate::srq::Srq;
 use crate::transport::{InfiniBand, RoCE};
 use crate::wqe::{
-    CtrlSegParams, DATA_SEG_SIZE, OrderedWqeTable, SubmissionError, WQEBB_SIZE, WqeFlags, WqeOpcode,
-    write_ctrl_seg, write_data_seg,
+    DATA_SEG_SIZE, OrderedWqeTable, SubmissionError, WQEBB_SIZE,
+    write_data_seg,
     emit::{SqCapability, SqState, UdEmitContext},
 };
 
@@ -90,8 +90,6 @@ pub(super) struct UdSendQueueState<Entry, TableType> {
     pub(super) bf_reg: *mut u8,
     pub(super) bf_size: u32,
     pub(super) bf_offset: Cell<u32>,
-    /// Maximum inline data size.
-    pub(super) max_inline_data: u32,
     /// WQE table for tracking in-flight operations.
     /// Uses interior mutability (Cell<Option<Entry>>) so no RefCell needed.
     pub(super) table: TableType,
@@ -101,61 +99,6 @@ pub(super) struct UdSendQueueState<Entry, TableType> {
 impl<Entry, TableType> UdSendQueueState<Entry, TableType> {
     pub(super) fn available(&self) -> u16 {
         self.wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
-    }
-
-    pub(super) fn max_inline_data(&self) -> u32 {
-        self.max_inline_data
-    }
-
-    pub(super) fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
-        let offset = ((idx & (self.wqe_cnt - 1)) as usize) * WQEBB_SIZE;
-        unsafe { self.buf.add(offset) }
-    }
-
-    /// Returns the number of WQEBBs from current PI to the end of the ring buffer.
-    pub(super) fn slots_to_end(&self) -> u16 {
-        self.wqe_cnt - (self.pi.get() & (self.wqe_cnt - 1))
-    }
-
-    pub(super) fn advance_pi(&self, count: u16) {
-        self.pi.set(self.pi.get().wrapping_add(count));
-    }
-
-    pub(super) fn set_last_wqe(&self, ptr: *mut u8, size: usize) {
-        self.last_wqe.set(Some((ptr, size)));
-    }
-
-    /// Post a NOP WQE to fill the remaining slots until the ring end.
-    ///
-    /// # Safety
-    /// Caller must ensure there are enough available slots for the NOP WQE.
-    pub(super) unsafe fn post_nop(&self, nop_wqebb_cnt: u16) {
-        debug_assert!(nop_wqebb_cnt >= 1, "NOP must be at least 1 WQEBB");
-        debug_assert!(
-            self.available() >= nop_wqebb_cnt,
-            "Not enough slots for NOP"
-        );
-
-        let wqe_idx = self.pi.get();
-        let wqe_ptr = self.get_wqe_ptr(wqe_idx);
-
-        // Write NOP control segment
-        let ds_count = (nop_wqebb_cnt as u8) * 4;
-        write_ctrl_seg(
-            wqe_ptr,
-            &CtrlSegParams {
-                opmod: 0,
-                opcode: WqeOpcode::Nop as u8,
-                wqe_idx,
-                qpn: self.sqn,
-                ds_cnt: ds_count,
-                flags: WqeFlags::empty(),
-                imm: 0,
-            },
-        );
-
-        self.advance_pi(nop_wqebb_cnt);
-        self.set_last_wqe(wqe_ptr, (nop_wqebb_cnt as usize) * WQEBB_SIZE);
     }
 
     fn ring_db(&self, wqe_ptr: *mut u8) {
@@ -556,7 +499,6 @@ pub struct UdQp<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqCo
     qp: NonNull<mlx5_sys::ibv_qp>,
     state: Cell<UdQpState>,
     qkey: u32,
-    max_inline_data: u32,
     sq: Option<UdSendQueueState<SqEntry, TableType>>,
     rq: Rq,
     sq_callback: OnSqComplete,
@@ -917,7 +859,6 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIb<SqEntry, RqEntry, OnSq
             bf_reg: info.bf_reg,
             bf_size: info.bf_size,
             bf_offset: Cell::new(0),
-            max_inline_data: self.max_inline_data,
             table: OrderedWqeTable::new(wqe_cnt),
             _marker: PhantomData,
         });
@@ -1041,7 +982,6 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIbWithSrq<SqEntry, RqEntr
             bf_reg: info.bf_reg,
             bf_size: info.bf_size,
             bf_offset: Cell::new(0),
-            max_inline_data: self.max_inline_data,
             table: OrderedWqeTable::new(wqe_cnt),
             _marker: PhantomData,
         });
@@ -1154,7 +1094,6 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpRoCE<SqEntry, RqEntry, On
             bf_reg: info.bf_reg,
             bf_size: info.bf_size,
             bf_offset: Cell::new(0),
-            max_inline_data: self.max_inline_data,
             table: OrderedWqeTable::new(wqe_cnt),
             _marker: PhantomData,
         });
@@ -1195,7 +1134,6 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpRoCEWithSrq<SqEntry, RqEn
             bf_reg: info.bf_reg,
             bf_size: info.bf_size,
             bf_offset: Cell::new(0),
-            max_inline_data: self.max_inline_data,
             table: OrderedWqeTable::new(wqe_cnt),
             _marker: PhantomData,
         });
@@ -1548,7 +1486,6 @@ where
                 qp,
                 state: Cell::new(UdQpState::Reset),
                 qkey: self.config.qkey,
-                max_inline_data: self.config.max_inline_data,
                 sq: None,
                 rq: UdOwnedRq::new(None),
                 sq_callback: self.sq_callback,
@@ -1619,7 +1556,6 @@ where
                 qp,
                 state: Cell::new(UdQpState::Reset),
                 qkey: self.config.qkey,
-                max_inline_data: self.config.max_inline_data,
                 sq: None,
                 rq: UdSharedRq::new(srq_inner),
                 sq_callback: self.sq_callback,
@@ -1685,7 +1621,6 @@ where
                 qp,
                 state: Cell::new(UdQpState::Reset),
                 qkey: self.config.qkey,
-                max_inline_data: self.config.max_inline_data,
                 sq: None,
                 rq: UdOwnedRq::new(None),
                 sq_callback: self.sq_callback,
@@ -1758,7 +1693,6 @@ where
                 qp,
                 state: Cell::new(UdQpState::Reset),
                 qkey: self.config.qkey,
-                max_inline_data: self.config.max_inline_data,
                 sq: None,
                 rq: UdSharedRq::new(srq_inner),
                 sq_callback: self.sq_callback,
@@ -1817,7 +1751,6 @@ where
                 qp,
                 state: Cell::new(UdQpState::Reset),
                 qkey: self.config.qkey,
-                max_inline_data: self.config.max_inline_data,
                 sq: None,
                 rq: UdOwnedRq::new(None),
                 sq_callback: (),
@@ -1873,7 +1806,6 @@ where
                 qp,
                 state: Cell::new(UdQpState::Reset),
                 qkey: self.config.qkey,
-                max_inline_data: self.config.max_inline_data,
                 sq: None,
                 rq: UdOwnedRq::new(None),
                 sq_callback: (),

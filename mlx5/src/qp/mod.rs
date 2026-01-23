@@ -16,8 +16,8 @@ use crate::pd::Pd;
 use crate::srq::Srq;
 use crate::transport::{IbRemoteQpInfo, RoCERemoteQpInfo};
 use crate::wqe::{
-    CtrlSegParams, DATA_SEG_SIZE, OrderedWqeTable, SubmissionError, WQEBB_SIZE, WqeFlags, WqeOpcode,
-    write_ctrl_seg, write_data_seg,
+    DATA_SEG_SIZE, OrderedWqeTable, SubmissionError, WQEBB_SIZE,
+    write_data_seg,
     // Transport type tags
     InfiniBand, RoCE,
     // Macro-based emission
@@ -106,8 +106,6 @@ pub(crate) struct SendQueueState<Entry, TableType> {
     pub(super) wqe_cnt: u16,
     /// SQ number
     pub(super) sqn: u32,
-    /// Maximum inline data size (from QP config)
-    max_inline_data: u32,
     /// Producer index (next WQE slot)
     pub(super) pi: Cell<u16>,
     /// Consumer index (last completed WQE)
@@ -133,77 +131,6 @@ impl<Entry, TableType> SendQueueState<Entry, TableType> {
     #[inline]
     pub(super) fn available(&self) -> u16 {
         self.wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
-    }
-
-    #[inline]
-    pub(super) fn max_inline_data(&self) -> u32 {
-        self.max_inline_data
-    }
-
-    #[inline]
-    pub(super) fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
-        let offset = ((idx & (self.wqe_cnt - 1)) as usize) * WQEBB_SIZE;
-        unsafe { self.buf.add(offset) }
-    }
-
-    /// Returns the number of WQEBBs from current PI to the end of the ring buffer.
-    ///
-    /// This is used to check if a WQE would wrap around the ring boundary.
-    #[inline]
-    pub(super) fn slots_to_end(&self) -> u16 {
-        self.wqe_cnt - (self.pi.get() & (self.wqe_cnt - 1))
-    }
-
-    #[inline]
-    pub(super) fn advance_pi(&self, count: u16) {
-        self.pi.set(self.pi.get().wrapping_add(count));
-    }
-
-    /// Post a NOP WQE to fill the remaining slots until the ring end.
-    ///
-    /// This is used when a variable-length WQE would wrap around the ring boundary.
-    /// The NOP WQE consumes the remaining slots, allowing the next WQE to start
-    /// at the ring beginning.
-    ///
-    /// # Arguments
-    /// * `nop_wqebb_cnt` - Number of WQEBBs to consume with NOP (must be >= 1)
-    ///
-    /// # Safety
-    /// Caller must ensure there are enough available slots for the NOP WQE.
-    #[inline]
-    pub(super) unsafe fn post_nop(&self, nop_wqebb_cnt: u16) {
-        debug_assert!(nop_wqebb_cnt >= 1, "NOP must be at least 1 WQEBB");
-        debug_assert!(
-            self.available() >= nop_wqebb_cnt,
-            "Not enough slots for NOP"
-        );
-
-        let wqe_idx = self.pi.get();
-        let wqe_ptr = self.get_wqe_ptr(wqe_idx);
-
-        // Write NOP control segment
-        // ds_count = nop_wqebb_cnt * 4 (each WQEBB = 4 data segments of 16 bytes)
-        let ds_count = (nop_wqebb_cnt as u8) * 4;
-        write_ctrl_seg(
-            wqe_ptr,
-            &CtrlSegParams {
-                opmod: 0,
-                opcode: WqeOpcode::Nop as u8,
-                wqe_idx,
-                qpn: self.sqn,
-                ds_cnt: ds_count,
-                flags: WqeFlags::empty(),
-                imm: 0,
-            },
-        );
-
-        self.advance_pi(nop_wqebb_cnt);
-        self.set_last_wqe(wqe_ptr, (nop_wqebb_cnt as usize) * WQEBB_SIZE);
-    }
-
-    #[inline]
-    pub(super) fn set_last_wqe(&self, ptr: *mut u8, size: usize) {
-        self.last_wqe.set(Some((ptr, size)));
     }
 
     /// Ring the doorbell using regular doorbell write.
@@ -499,8 +426,6 @@ pub type RcQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = RcQp<Sq
 pub struct RcQp<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> {
     qp: NonNull<mlx5_sys::ibv_qp>,
     state: Cell<QpState>,
-    /// Maximum inline data size (from QP config)
-    max_inline_data: u32,
     sq: Option<SendQueueState<SqEntry, TableType>>,
     rq: Rq,
     sq_callback: OnSqComplete,
@@ -666,12 +591,6 @@ impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> RcQ
 
         self.state.set(QpState::Error);
         Ok(())
-    }
-
-    fn sq(&self) -> io::Result<&SendQueueState<SqEntry, TableType>> {
-        self.sq
-            .as_ref()
-            .ok_or_else(|| io::Error::other("direct access not initialized"))
     }
 
     /// Get the number of available WQE slots in the send queue.
@@ -854,7 +773,6 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> RcQpIb<SqEntry, RqEntry, OnSq
             buf: info.sq_buf,
             wqe_cnt,
             sqn: info.sqn,
-            max_inline_data: self.max_inline_data,
             pi: Cell::new(0),
             ci: Cell::new(0),
             last_wqe: Cell::new(None),
@@ -895,7 +813,6 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> RcQpIbWithSrq<SqEntry, RqEntr
             buf: info.sq_buf,
             wqe_cnt,
             sqn: info.sqn,
-            max_inline_data: self.max_inline_data,
             pi: Cell::new(0),
             ci: Cell::new(0),
             last_wqe: Cell::new(None),
@@ -930,7 +847,6 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> RcQpRoCE<SqEntry, RqEntry, On
             buf: info.sq_buf,
             wqe_cnt,
             sqn: info.sqn,
-            max_inline_data: self.max_inline_data,
             pi: Cell::new(0),
             ci: Cell::new(0),
             last_wqe: Cell::new(None),
@@ -971,7 +887,6 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> RcQpRoCEWithSrq<SqEntry, RqEn
             buf: info.sq_buf,
             wqe_cnt,
             sqn: info.sqn,
-            max_inline_data: self.max_inline_data,
             pi: Cell::new(0),
             ci: Cell::new(0),
             last_wqe: Cell::new(None),
@@ -1833,7 +1748,6 @@ where
             let mut result = RcQp {
                 qp,
                 state: Cell::new(QpState::Reset),
-                max_inline_data: self.config.max_inline_data,
                 sq: None,
                 rq: OwnedRq::new(None),
                 sq_callback: self.sq_callback,
@@ -1913,7 +1827,6 @@ where
             let mut result = RcQp {
                 qp,
                 state: Cell::new(QpState::Reset),
-                max_inline_data: self.config.max_inline_data,
                 sq: None,
                 rq: SharedRq::new(srq_inner),
                 sq_callback: self.sq_callback,
@@ -1994,7 +1907,6 @@ where
             let mut result = RcQp {
                 qp,
                 state: Cell::new(QpState::Reset),
-                max_inline_data: self.config.max_inline_data,
                 sq: None,
                 rq: SharedRq::new(srq_inner),
                 sq_callback,
@@ -2069,7 +1981,6 @@ where
             let mut result = RcQp {
                 qp,
                 state: Cell::new(QpState::Reset),
-                max_inline_data: self.config.max_inline_data,
                 sq: None,
                 rq: OwnedRq::new(None),
                 sq_callback: self.sq_callback,
@@ -2151,7 +2062,6 @@ where
             let mut result = RcQp {
                 qp,
                 state: Cell::new(QpState::Reset),
-                max_inline_data: self.config.max_inline_data,
                 sq: None,
                 rq: SharedRq::new(srq_inner),
                 sq_callback: self.sq_callback,
@@ -2216,7 +2126,6 @@ where
             let mut result = RcQp {
                 qp,
                 state: Cell::new(QpState::Reset),
-                max_inline_data: self.config.max_inline_data,
                 sq: None,
                 rq: OwnedRq::new(None),
                 sq_callback: (),
