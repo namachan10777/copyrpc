@@ -8,7 +8,7 @@
 //! cargo bench --package copyrpc --bench copyrpc_pingpong
 //! ```
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -73,15 +73,16 @@ struct MultiEndpointConnectionInfo {
 // Response Counter
 // =============================================================================
 
-/// Global response counter using atomic.
-static RESPONSE_COUNT: AtomicU32 = AtomicU32::new(0);
+thread_local! {
+    static RESPONSE_COUNT: Cell<u32> = const { Cell::new(0) };
+}
 
 fn on_response_callback(_user_data: (), _data: &[u8]) {
-    RESPONSE_COUNT.fetch_add(1, Ordering::Relaxed);
+    RESPONSE_COUNT.with(|c| c.set(c.get() + 1));
 }
 
 fn get_and_reset_response_count() -> usize {
-    RESPONSE_COUNT.swap(0, Ordering::Relaxed) as usize
+    RESPONSE_COUNT.with(|c| c.replace(0)) as usize
 }
 
 
