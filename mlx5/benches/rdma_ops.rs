@@ -38,10 +38,10 @@ use mlx5::wqe::WqeFlags;
 
 // Send/Recv benchmark constants
 const SEND_RECV_QUEUE_DEPTH: usize = 1024;
-const SEND_RECV_SIGNAL_INTERVAL: usize = 8; // 1/8 signaled
-// RQ is 4x queue depth for better batching
-const SEND_RECV_RQ_SIZE: usize = SEND_RECV_QUEUE_DEPTH * 4;
-const SEND_RECV_BUFFER_SIZE: usize = SEND_RECV_RQ_SIZE * 64;
+const SEND_RECV_SIGNAL_INTERVAL: usize = 4; // 1/4 signaled (like previous)
+// RQ matches queue depth (like previous implementation)
+const SEND_RECV_RQ_SIZE: usize = SEND_RECV_QUEUE_DEPTH;
+const SEND_RECV_BUFFER_SIZE: usize = SEND_RECV_QUEUE_DEPTH * 64; // 64 bytes per entry (like send_recv_small.rs)
 
 // RDMA WRITE/READ benchmark constants
 const RDMA_QUEUE_DEPTH: usize = 128;
@@ -124,8 +124,6 @@ fn full_access_relaxed() -> AccessFlags {
 struct ConnectionInfo {
     qpn: u32,
     lid: u16,
-    buf_addr: u64,
-    rkey: u32,
 }
 
 // =============================================================================
@@ -148,7 +146,7 @@ impl SharedCqeState {
         self.rx_count.set(0);
     }
 
-    fn inc(&self) {
+    fn push(&self, _cqe: &Cqe) {
         self.rx_count.set(self.rx_count.get() + 1);
     }
 }
@@ -194,10 +192,7 @@ where
     recv_mr: MemoryRegion,
     _send_buf: AlignedBuffer,
     recv_buf: AlignedBuffer,
-    remote_addr: u64,
-    remote_rkey: u32,
-    // RQ replenish tracking
-    rq_pending_replenish: usize,
+    // RQ replenish tracking (for latency benchmark)
     rq_next_idx: usize,
 }
 
@@ -266,7 +261,7 @@ fn setup_send_recv_benchmark() -> Option<SendRecvBenchmarkSetup<impl Fn(Cqe, u64
     let send_callback = move |_cqe: Cqe, _entry: u64| {};
     let recv_callback = move |cqe: Cqe, _entry: u64| {
         if cqe.opcode.is_responder() && cqe.syndrome == 0 {
-            shared_state_for_recv.inc();
+            shared_state_for_recv.push(&cqe);
         }
     };
 
@@ -301,8 +296,6 @@ fn setup_send_recv_benchmark() -> Option<SendRecvBenchmarkSetup<impl Fn(Cqe, u64
     let client_info = ConnectionInfo {
         qpn: qp.borrow().qpn(),
         lid: port_attr.lid,
-        buf_addr: recv_buf.addr(),
-        rkey: recv_mr.rkey(),
     };
 
     let (server_info_tx, server_info_rx): (Sender<ConnectionInfo>, Receiver<ConnectionInfo>) =
@@ -342,7 +335,7 @@ fn setup_send_recv_benchmark() -> Option<SendRecvBenchmarkSetup<impl Fn(Cqe, u64
         .connect(&server_remote, port, 0, 4, 4, access)
         .ok()?;
 
-    // Pre-post all receives (4x queue depth)
+    // Pre-post all receives
     for i in 0..SEND_RECV_RQ_SIZE {
         let offset = (i * 64) as u64;
         qp.borrow()
@@ -360,9 +353,6 @@ fn setup_send_recv_benchmark() -> Option<SendRecvBenchmarkSetup<impl Fn(Cqe, u64
         recv_mr,
         _send_buf: send_buf,
         recv_buf,
-        remote_addr: server_info.buf_addr,
-        remote_rkey: server_info.rkey,
-        rq_pending_replenish: 0,
         rq_next_idx: 0,
     };
 
@@ -483,7 +473,7 @@ impl ServerSharedState {
         self.rx_count.set(0);
     }
 
-    fn inc(&self) {
+    fn push(&self, _cqe: &Cqe) {
         self.rx_count.set(self.rx_count.get() + 1);
     }
 }
@@ -516,7 +506,7 @@ fn server_thread_main(
     let send_callback = move |_cqe: Cqe, _entry: u64| {};
     let recv_callback = move |cqe: Cqe, _entry: u64| {
         if cqe.opcode.is_responder() && cqe.syndrome == 0 {
-            shared_state_for_recv.inc();
+            shared_state_for_recv.push(&cqe);
         }
     };
 
@@ -568,8 +558,6 @@ fn server_thread_main(
     let server_info = ConnectionInfo {
         qpn: qp.borrow().qpn(),
         lid: port_attr.lid,
-        buf_addr: recv_buf.addr(),
-        rkey: recv_mr.rkey(),
     };
     if info_tx.send(server_info).is_err() {
         return;
@@ -595,7 +583,7 @@ fn server_thread_main(
         return;
     }
 
-    // Pre-post all receives (4x queue depth)
+    // Pre-post all receives
     for i in 0..SEND_RECV_RQ_SIZE {
         let offset = (i * 64) as u64;
         qp.borrow()
@@ -606,75 +594,63 @@ fn server_thread_main(
 
     ready_signal.store(1, Ordering::Release);
 
-    let remote_addr = client_info.buf_addr;
-    let remote_rkey = client_info.rkey;
+    // Echo server loop with 3:1 signaling ratio (like send_recv_small.rs)
     let echo_data = vec![0xBBu8; SMALL_MSG_SIZE];
-
-    // RQ replenish tracking
-    let mut rq_pending_replenish = 0usize;
-    let mut rq_next_idx = 0usize;
+    let mut recv_idx = 0usize;
     let mut send_count = 0usize;
 
     while !stop_flag.load(Ordering::Relaxed) {
         shared_state.reset();
         recv_cq.poll();
         recv_cq.flush();
-        let rx_count = shared_state.rx_count.get();
+        let count = shared_state.rx_count.get();
 
-        if rx_count == 0 {
+        if count == 0 {
             continue;
         }
 
         send_cq.poll();
         send_cq.flush();
 
-        // Track pending RQ replenish
-        rq_pending_replenish += rx_count;
+        // Repost receives and send echoes
+        {
+            let qp_ref = qp.borrow();
+            for _ in 0..count {
+                let idx = recv_idx % SEND_RECV_QUEUE_DEPTH;
+                let offset = (idx * 64) as u64;
+                // Repost receive
+                qp_ref
+                    .post_recv(idx as u64, recv_buf.addr() + offset, 64, recv_mr.lkey())
+                    .unwrap();
+                recv_idx += 1;
+            }
+        }
 
-        // Send echo responses with 1/8 signaling
+        // Send echo responses
         {
             let qp_ref = qp.borrow();
             let ctx = qp_ref.emit_ctx().expect("emit_ctx failed");
-            for _ in 0..rx_count {
-                let offset = (send_count % SEND_RECV_RQ_SIZE * 64) as u64;
-                if send_count % SEND_RECV_SIGNAL_INTERVAL == (SEND_RECV_SIGNAL_INTERVAL - 1) {
-                    let _ = emit_wqe!(&ctx, write_imm {
+            for _ in 0..count {
+                // Echo back with inline data (3:1 signaling ratio)
+                if send_count % SEND_RECV_SIGNAL_INTERVAL == SEND_RECV_SIGNAL_INTERVAL - 1 {
+                    let _ = emit_wqe!(&ctx, send {
                         flags: WqeFlags::empty(),
-                        remote_addr: remote_addr + offset,
-                        rkey: remote_rkey,
-                        imm: send_count as u32,
                         inline: echo_data.as_slice(),
                         signaled: send_count as u64,
                     });
                 } else {
-                    let _ = emit_wqe!(&ctx, write_imm {
+                    let _ = emit_wqe!(&ctx, send {
                         flags: WqeFlags::empty(),
-                        remote_addr: remote_addr + offset,
-                        rkey: remote_rkey,
-                        imm: send_count as u32,
                         inline: echo_data.as_slice(),
                     });
                 }
                 send_count += 1;
             }
-            // Ring doorbell after each poll's refill
-            qp_ref.ring_sq_doorbell();
         }
 
-        // RQ replenish when below 1/2 threshold (batch + single doorbell)
-        if rq_pending_replenish >= SEND_RECV_RQ_SIZE / 2 {
-            let qp_ref = qp.borrow();
-            for _ in 0..rq_pending_replenish {
-                let idx = rq_next_idx % SEND_RECV_RQ_SIZE;
-                let offset = (idx * 64) as u64;
-                qp_ref
-                    .post_recv(idx as u64, recv_buf.addr() + offset, 64, recv_mr.lkey())
-                    .unwrap();
-                rq_next_idx += 1;
-            }
-            qp_ref.ring_rq_doorbell();
-            rq_pending_replenish = 0;
-        }
+        let qp_ref = qp.borrow();
+        qp_ref.ring_rq_doorbell();
+        qp_ref.ring_sq_doorbell();
     }
 }
 
@@ -682,7 +658,7 @@ fn server_thread_main(
 // Benchmark Functions
 // =============================================================================
 
-/// 32B inline send throughput benchmark (queue depth = 1024, 1/8 signaling ratio).
+/// 32B inline send throughput benchmark (queue depth = 1024, 1/4 signaling ratio).
 fn run_send_inline_throughput<SF, RF>(
     client: &mut SendRecvEndpoint<SF, RF>,
     iters: u64,
@@ -691,47 +667,53 @@ where
     SF: Fn(Cqe, u64),
     RF: Fn(Cqe, u64),
 {
-    let rkey = client.remote_rkey;
-    let remote_addr = client.remote_addr;
     let send_data = vec![0xAAu8; SMALL_MSG_SIZE];
     // Use min of configured interval and iters to handle small iteration counts
     let signal_interval = SEND_RECV_SIGNAL_INTERVAL.min(iters as usize).max(1);
 
-    // Initial fill - only up to min(iters, QUEUE_DEPTH)
+    // Initial fill with 3:1 signaling ratio (like send_recv_small.rs)
     let initial_fill = (iters as usize).min(SEND_RECV_QUEUE_DEPTH);
     {
         let qp = client.qp.borrow();
         let ctx = qp.emit_ctx().expect("emit_ctx failed");
-        for i in 0..initial_fill {
-            let offset = (i % SEND_RECV_RQ_SIZE * 64) as u64;
-            let is_interval_end = (i + 1) % signal_interval == 0;
-            let is_last = i + 1 == iters as usize;
-            if is_interval_end || is_last {
-                emit_wqe!(&ctx, write_imm {
+        let full_batches = initial_fill / signal_interval;
+        let remainder = initial_fill % signal_interval;
+
+        for batch in 0..full_batches {
+            let base = batch * signal_interval;
+            // (signal_interval - 1) unsignaled
+            for _ in 0..(signal_interval - 1) {
+                let _ = emit_wqe!(&ctx, send {
                     flags: WqeFlags::empty(),
-                    remote_addr: remote_addr + offset,
-                    rkey: rkey,
-                    imm: i as u32,
                     inline: send_data.as_slice(),
-                    signaled: i as u64,
-                }).expect("emit_wqe failed");
-            } else {
-                emit_wqe!(&ctx, write_imm {
-                    flags: WqeFlags::empty(),
-                    remote_addr: remote_addr + offset,
-                    rkey: rkey,
-                    imm: i as u32,
-                    inline: send_data.as_slice(),
-                }).expect("emit_wqe failed");
+                });
             }
+            // 1 signaled
+            let idx = base + signal_interval - 1;
+            let _ = emit_wqe!(&ctx, send {
+                flags: WqeFlags::empty(),
+                inline: send_data.as_slice(),
+                signaled: idx as u64,
+            });
+        }
+
+        // Remainder (all signaled for correctness)
+        for j in 0..remainder {
+            let idx = full_batches * signal_interval + j;
+            let _ = emit_wqe!(&ctx, send {
+                flags: WqeFlags::empty(),
+                inline: send_data.as_slice(),
+                signaled: idx as u64,
+            });
         }
         qp.ring_sq_doorbell();
     }
 
     let start = std::time::Instant::now();
     let mut completed = 0u64;
-    let mut posted = initial_fill as u64;
-    let mut send_idx = initial_fill;
+    let mut inflight = initial_fill as u64;
+    let mut sent = initial_fill as u64;
+    let mut recv_idx = 0usize;
 
     while completed < iters {
         client.shared_state.reset();
@@ -740,6 +722,7 @@ where
         let rx_count = client.shared_state.rx_count.get();
 
         completed += rx_count as u64;
+        inflight -= rx_count as u64;
 
         if rx_count == 0 {
             continue;
@@ -748,72 +731,77 @@ where
         client.send_cq.poll();
         client.send_cq.flush();
 
-        // Track pending RQ replenish
-        client.rq_pending_replenish += rx_count;
-
-        let inflight = posted - completed;
-        let remaining = iters.saturating_sub(posted);
-        let can_send = (SEND_RECV_QUEUE_DEPTH as u64).saturating_sub(inflight).min(remaining) as usize;
-
-        if can_send > 0 {
+        // Repost receives
+        {
             let qp = client.qp.borrow();
-            let ctx = qp.emit_ctx().expect("emit_ctx failed");
-            for _ in 0..can_send {
-                let offset = (send_idx % SEND_RECV_RQ_SIZE * 64) as u64;
-                let is_interval_end = (send_idx + 1) % signal_interval == 0;
-                let is_last = posted + 1 == iters;
-                if is_interval_end || is_last {
-                    emit_wqe!(&ctx, write_imm {
-                        flags: WqeFlags::empty(),
-                        remote_addr: remote_addr + offset,
-                        rkey: rkey,
-                        imm: send_idx as u32,
-                        inline: send_data.as_slice(),
-                        signaled: send_idx as u64,
-                    }).expect("emit_wqe failed");
-                } else {
-                    emit_wqe!(&ctx, write_imm {
-                        flags: WqeFlags::empty(),
-                        remote_addr: remote_addr + offset,
-                        rkey: rkey,
-                        imm: send_idx as u32,
-                        inline: send_data.as_slice(),
-                    }).expect("emit_wqe failed");
-                }
-                send_idx += 1;
-                posted += 1;
-            }
-            // Ring doorbell after each poll's refill
-            qp.ring_sq_doorbell();
-        }
-
-        // RQ replenish when below 1/2 threshold (batch + single doorbell)
-        if client.rq_pending_replenish >= SEND_RECV_RQ_SIZE / 2 {
-            let qp = client.qp.borrow();
-            for _ in 0..client.rq_pending_replenish {
-                let idx = client.rq_next_idx % SEND_RECV_RQ_SIZE;
+            for _ in 0..rx_count {
+                let idx = recv_idx % SEND_RECV_QUEUE_DEPTH;
                 let offset = (idx * 64) as u64;
                 qp.post_recv(idx as u64, client.recv_buf.addr() + offset, 64, client.recv_mr.lkey())
                     .unwrap();
-                client.rq_next_idx += 1;
+                recv_idx += 1;
             }
+        }
+
+        // Send more if needed with 3:1 signaling ratio
+        let remaining = iters.saturating_sub(sent);
+        let can_send = (SEND_RECV_QUEUE_DEPTH as u64).saturating_sub(inflight).min(remaining) as usize;
+        let to_send = can_send.min(rx_count);
+
+        if to_send > 0 {
+            let qp = client.qp.borrow();
+            let ctx = qp.emit_ctx().expect("emit_ctx failed");
+            let full_batches = to_send / signal_interval;
+            let remainder = to_send % signal_interval;
+
+            for batch in 0..full_batches {
+                // (signal_interval - 1) unsignaled
+                for _ in 0..(signal_interval - 1) {
+                    let _ = emit_wqe!(&ctx, send {
+                        flags: WqeFlags::empty(),
+                        inline: send_data.as_slice(),
+                    });
+                }
+                // 1 signaled
+                let _ = emit_wqe!(&ctx, send {
+                    flags: WqeFlags::empty(),
+                    inline: send_data.as_slice(),
+                    signaled: batch as u64,
+                });
+            }
+
+            // Remainder (all signaled)
+            for j in 0..remainder {
+                let _ = emit_wqe!(&ctx, send {
+                    flags: WqeFlags::empty(),
+                    inline: send_data.as_slice(),
+                    signaled: j as u64,
+                });
+            }
+
+            inflight += to_send as u64;
+            sent += to_send as u64;
+        }
+
+        // Ring doorbells
+        {
+            let qp = client.qp.borrow();
             qp.ring_rq_doorbell();
-            client.rq_pending_replenish = 0;
+            if to_send > 0 {
+                qp.ring_sq_doorbell();
+            }
         }
     }
 
-    // Final RQ replenish
-    if client.rq_pending_replenish > 0 {
-        let qp = client.qp.borrow();
-        for _ in 0..client.rq_pending_replenish {
-            let idx = client.rq_next_idx % SEND_RECV_RQ_SIZE;
-            let offset = (idx * 64) as u64;
-            qp.post_recv(idx as u64, client.recv_buf.addr() + offset, 64, client.recv_mr.lkey())
-                .unwrap();
-            client.rq_next_idx += 1;
-        }
-        qp.ring_rq_doorbell();
-        client.rq_pending_replenish = 0;
+    // Drain remaining inflight
+    while inflight > 0 {
+        client.shared_state.reset();
+        client.recv_cq.poll();
+        client.recv_cq.flush();
+        inflight -= client.shared_state.rx_count.get() as u64;
+
+        client.send_cq.poll();
+        client.send_cq.flush();
     }
 
     start.elapsed()
@@ -828,33 +816,26 @@ where
     SF: Fn(Cqe, u64),
     RF: Fn(Cqe, u64),
 {
-    let rkey = client.remote_rkey;
-    let remote_addr = client.remote_addr;
     let send_data = vec![0xAAu8; SMALL_MSG_SIZE];
 
     let start = std::time::Instant::now();
 
     for i in 0..iters {
-        let idx = (i as usize) % SEND_RECV_RQ_SIZE;
-        let offset = (idx * 64) as u64;
-        let imm = idx as u32;
+        let idx = (i as usize) % SEND_RECV_QUEUE_DEPTH;
 
-        // Post single WRITE+IMM with doorbell
+        // Post single Send with doorbell
         {
             let qp = client.qp.borrow();
             let ctx = qp.emit_ctx().expect("emit_ctx failed");
-            emit_wqe!(&ctx, write_imm {
+            emit_wqe!(&ctx, send {
                 flags: WqeFlags::empty(),
-                remote_addr: remote_addr + offset,
-                rkey: rkey,
-                imm: imm,
                 inline: send_data.as_slice(),
                 signaled: idx as u64,
             }).expect("emit_wqe failed");
             qp.ring_sq_doorbell();
         }
 
-        // Wait for response
+        // Wait for echo response
         loop {
             client.send_cq.poll();
             client.send_cq.flush();
@@ -862,16 +843,14 @@ where
             client.recv_cq.poll();
             client.recv_cq.flush();
             if client.shared_state.rx_count.get() > 0 {
-                client.rq_pending_replenish += 1;
                 // Immediate replenish for latency benchmark
                 let qp = client.qp.borrow();
-                let replenish_idx = client.rq_next_idx % SEND_RECV_RQ_SIZE;
+                let replenish_idx = client.rq_next_idx % SEND_RECV_QUEUE_DEPTH;
                 let replenish_offset = (replenish_idx * 64) as u64;
                 qp.post_recv(replenish_idx as u64, client.recv_buf.addr() + replenish_offset, 64, client.recv_mr.lkey())
                     .unwrap();
                 qp.ring_rq_doorbell();
                 client.rq_next_idx += 1;
-                client.rq_pending_replenish = 0;
                 break;
             }
         }
