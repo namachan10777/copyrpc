@@ -14,9 +14,5 @@ libc = "0.2"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
-name = "pingpong"
-harness = false
-
-[[bench]]
-name = "send_recv_small"
+name = "rdma_ops"
 harness = false
