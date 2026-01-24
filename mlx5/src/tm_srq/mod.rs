@@ -276,14 +276,6 @@ pub(super) struct TmSrqState<RecvEntry> {
     pub(super) head: Cell<u32>,
     /// Doorbell record pointer.
     pub(super) dbrec: *mut u32,
-    /// BlueFlame register pointer (borrowed from Command QP).
-    pub(super) bf_reg: *mut u8,
-    /// BlueFlame size (64 or 0 if not available).
-    pub(super) bf_size: u32,
-    /// Current BlueFlame offset (alternates between 0 and bf_size).
-    pub(super) bf_offset: Cell<u32>,
-    /// Last posted WQE pointer and size (for BlueFlame doorbell).
-    pub(super) last_wqe: Cell<Option<(*mut u8, usize)>>,
     /// RQ WQE table for unordered completion tracking.
     pub(super) table: UnorderedWqeTable<RecvEntry>,
 }
@@ -294,41 +286,11 @@ impl<RecvEntry> TmSrqState<RecvEntry> {
         unsafe { self.buf.add(offset as usize) }
     }
 
-    /// Ring the doorbell using BlueFlame if available.
-    ///
-    /// Falls back to DBREC-only if BlueFlame is not configured.
     fn ring_doorbell(&self) {
-        let last_wqe = self.last_wqe.take();
-
         mmio_flush_writes!();
-
         unsafe {
             std::ptr::write_volatile(self.dbrec, self.head.get().to_be());
         }
-
-        // If BlueFlame is available and we have a last WQE, write to BF register
-        if self.bf_size > 0 {
-            if let Some((last_wqe_ptr, _)) = last_wqe {
-                udma_to_device_barrier!();
-
-                // Write first 8 bytes of WQE to BlueFlame register
-                let bf_offset = self.bf_offset.get();
-                let bf = unsafe { self.bf_reg.add(bf_offset as usize) as *mut u64 };
-                let ctrl = last_wqe_ptr as *const u64;
-                unsafe {
-                    std::ptr::write_volatile(bf, *ctrl);
-                }
-
-                mmio_flush_writes!();
-                self.bf_offset.set(bf_offset ^ self.bf_size);
-            }
-        }
-    }
-
-    /// Set the last WQE pointer for BlueFlame doorbell.
-    #[inline]
-    fn set_last_wqe(&self, wqe_ptr: *mut u8, wqe_size: usize) {
-        self.last_wqe.set(Some((wqe_ptr, wqe_size)));
     }
 
     fn process_completion(&self, wqe_idx: u16) -> Option<RecvEntry> {
@@ -414,11 +376,6 @@ impl Context {
                     stride: srq_info.stride,
                     head: Cell::new(0),
                     dbrec: srq_info.doorbell_record,
-                    // Borrow BlueFlame from Command QP
-                    bf_reg: cmd_info.bf_reg,
-                    bf_size: cmd_info.bf_size,
-                    bf_offset: Cell::new(0),
-                    last_wqe: Cell::new(None),
                     table: UnorderedWqeTable::new(wqe_cnt as u16),
                 }),
                 cmd_qp: Some(CmdQpState {
@@ -637,9 +594,6 @@ impl<CmdEntry, RecvEntry, OnComplete> TmSrq<CmdEntry, RecvEntry, OnComplete> {
         let wqe_idx = srq_state.head.get();
         let wqe_ptr = srq_state.get_wqe_ptr(wqe_idx);
 
-        // SRQ WQE size: Next Segment (16 bytes) + Data Segment (16 bytes)
-        const SRQ_WQE_SIZE: usize = 32;
-
         unsafe {
             // Clear Next Segment (16 bytes)
             std::ptr::write_bytes(wqe_ptr, 0, 16);
@@ -651,7 +605,6 @@ impl<CmdEntry, RecvEntry, OnComplete> TmSrq<CmdEntry, RecvEntry, OnComplete> {
         // Store entry in table and advance head
         srq_state.table.store(wqe_idx as u16, wqebb_start, 1, entry);
         srq_state.head.set(wqe_idx.wrapping_add(1));
-        srq_state.set_last_wqe(wqe_ptr, SRQ_WQE_SIZE);
 
         Ok(())
     }

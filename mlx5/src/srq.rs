@@ -53,14 +53,6 @@ struct SrqState<T> {
     pi: Cell<u32>,
     ci: Cell<u32>,
     dbrec: *mut u32,
-    /// BlueFlame register pointer
-    bf_reg: *mut u8,
-    /// BlueFlame size (64 or 0 if not available)
-    bf_size: u32,
-    /// Current BlueFlame offset (alternates between 0 and bf_size)
-    bf_offset: Cell<u32>,
-    /// Last posted WQE pointer and size (for BlueFlame doorbell)
-    last_wqe: Cell<Option<(*mut u8, usize)>>,
     /// Entry table for tracking in-flight receives.
     table: Box<[Cell<Option<T>>]>,
 }
@@ -71,42 +63,11 @@ impl<T> SrqState<T> {
         unsafe { self.buf.add(offset as usize) }
     }
 
-    /// Ring the doorbell using BlueFlame if available.
-    ///
-    /// Writes the first 8 bytes (control segment) of the last WQE to the BlueFlame register.
-    /// Falls back to DBREC-only if BlueFlame is not configured.
     fn ring_doorbell(&self) {
-        let last_wqe = self.last_wqe.take();
-
         mmio_flush_writes!();
-
         unsafe {
             std::ptr::write_volatile(self.dbrec, self.pi.get().to_be());
         }
-
-        // If BlueFlame is available and we have a last WQE, write to BF register
-        if self.bf_size > 0 {
-            if let Some((last_wqe_ptr, _)) = last_wqe {
-                udma_to_device_barrier!();
-
-                // Write first 8 bytes of WQE to BlueFlame register
-                let bf_offset = self.bf_offset.get();
-                let bf = unsafe { self.bf_reg.add(bf_offset as usize) as *mut u64 };
-                let ctrl = last_wqe_ptr as *const u64;
-                unsafe {
-                    std::ptr::write_volatile(bf, *ctrl);
-                }
-
-                mmio_flush_writes!();
-                self.bf_offset.set(bf_offset ^ self.bf_size);
-            }
-        }
-    }
-
-    /// Set the last WQE pointer for BlueFlame doorbell.
-    #[inline]
-    fn set_last_wqe(&self, wqe_ptr: *mut u8, wqe_size: usize) {
-        self.last_wqe.set(Some((wqe_ptr, wqe_size)));
     }
 
     /// Available slots based on pi - ci difference.
@@ -271,12 +232,6 @@ impl<T> Srq<T> {
             pi: Cell::new(0),
             ci: Cell::new(0),
             dbrec: info.doorbell_record,
-            // SRQ doesn't have its own BlueFlame register - it's borrowed from the associated QP
-            // when using blueflame_rq_batch(). For ring_doorbell(), we fall back to DBREC-only.
-            bf_reg: std::ptr::null_mut(),
-            bf_size: 0,
-            bf_offset: Cell::new(0),
-            last_wqe: Cell::new(None),
             table: (0..wqe_cnt).map(|_| Cell::new(None)).collect(),
         });
 
@@ -318,10 +273,7 @@ impl<T> Srq<T> {
 
         let wqe_idx = state.pi.get();
 
-        // SRQ WQE size: Next Segment (16 bytes) + Data Segment (16 bytes)
-        const SRQ_WQE_SIZE: usize = 32;
-
-        let wqe_ptr = unsafe {
+        unsafe {
             let wqe_ptr = state.get_wqe_ptr(wqe_idx);
 
             // SRQ WQE format: Next Segment (16 bytes) + Data Segment (16 bytes)
@@ -329,13 +281,11 @@ impl<T> Srq<T> {
 
             // Write Data Segment at offset 16
             write_data_seg(wqe_ptr.add(16), len, lkey, addr);
-            wqe_ptr
-        };
+        }
 
         let idx = (wqe_idx as usize) & ((state.wqe_cnt - 1) as usize);
         state.table[idx].set(Some(entry));
         state.pi.set(state.pi.get().wrapping_add(1));
-        state.set_last_wqe(wqe_ptr, SRQ_WQE_SIZE);
 
         Ok(())
     }
