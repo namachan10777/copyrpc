@@ -59,7 +59,7 @@ pub use traits::{
     NoData,
 };
 
-pub use emit::{SqState, BlueframeBatch, DirectBlueflame};
+pub use emit::{SqState, BlueframeBatch};
 
 use bitflags::bitflags;
 
@@ -960,98 +960,8 @@ impl<T> UnorderedWqeTable<T> {
 }
 
 // =============================================================================
-// WriteImmParams for Direct BlueFlame WQE Construction
+// Type-State Markers for WQE Builder
 // =============================================================================
-
-/// Parameters for building RDMA WRITE with Immediate WQE.
-///
-/// Used with the `emit_wqe_bf!` macro for direct SIMD construction
-/// and BlueFlame register writes.
-#[derive(Debug, Clone, Copy)]
-pub struct WriteImmParams {
-    /// WQE index in the SQ.
-    pub wqe_idx: u16,
-    /// QP number (SQN).
-    pub qpn: u32,
-    /// WQE flags.
-    pub flags: WqeFlags,
-    /// Immediate data to send with the write.
-    pub imm: u32,
-    /// Remote memory address to write to.
-    pub remote_addr: u64,
-    /// Remote memory region key.
-    pub rkey: u32,
-    /// Local memory address (source).
-    pub local_addr: u64,
-    /// Number of bytes to transfer.
-    pub byte_count: u32,
-    /// Local memory region key.
-    pub lkey: u32,
-}
-
-impl WriteImmParams {
-    /// Create new WriteImmParams.
-    #[inline]
-    pub fn new(
-        wqe_idx: u16,
-        qpn: u32,
-        flags: WqeFlags,
-        imm: u32,
-        remote_addr: u64,
-        rkey: u32,
-        local_addr: u64,
-        byte_count: u32,
-        lkey: u32,
-    ) -> Self {
-        Self {
-            wqe_idx,
-            qpn,
-            flags,
-            imm,
-            remote_addr,
-            rkey,
-            local_addr,
-            byte_count,
-            lkey,
-        }
-    }
-
-    /// Build the opmod_idx_opcode field (big-endian u32).
-    ///
-    /// Layout: [opmod:8][wqe_idx_hi:8][wqe_idx_lo:8][opcode:8]
-    #[inline(always)]
-    pub fn opmod_idx_opcode(&self) -> u32 {
-        ((self.wqe_idx as u32) << 8) | (WqeOpcode::RdmaWriteImm as u32)
-    }
-
-    /// Build the qpn_ds field (big-endian u32).
-    ///
-    /// Layout: [qpn:24][ds_cnt:8]
-    /// For WRITE_IMM with SGE: ds_cnt = 3 (Ctrl + RDMA + Data = 48 bytes / 16)
-    #[inline(always)]
-    pub fn qpn_ds(&self) -> u32 {
-        (self.qpn << 8) | 3 // Ctrl + RDMA + Data = 3 data segments
-    }
-
-    /// Build the sig_stream_fm field (big-endian u32).
-    ///
-    /// Layout: [pcie_ctrl:8][stream_hi:8][stream_lo:8][fm_ce_se:8]
-    #[inline(always)]
-    pub fn sig_stream_fm(&self) -> u32 {
-        ((self.flags.pcie_ctrl() as u32) << 24) | (self.flags.fm_ce_se() as u32)
-    }
-}
-
-// =============================================================================
-// Result Type for Direct BlueFlame Operations
-// =============================================================================
-
-/// Result of a direct BlueFlame WQE emission.
-#[derive(Debug, Clone, Copy)]
-pub struct DirectBfResult {
-    /// WQE index.
-    pub wqe_idx: u16,
-}
 
 // =============================================================================
 // Unit Tests

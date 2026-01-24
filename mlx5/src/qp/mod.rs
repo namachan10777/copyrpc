@@ -1440,38 +1440,6 @@ impl<SqEntry, RqEntry, Rq, OnSqComplete, OnRqComplete> RcQp<SqEntry, RqEntry, In
             .ok_or_else(|| io::Error::other("direct access not initialized"))?;
         Ok(sq.emit_ctx())
     }
-
-    /// Emit RDMA WRITE with Immediate directly via BlueFlame.
-    ///
-    /// Constructs WQE using SIMD registers and writes directly to the
-    /// BlueFlame register. Doorbell is integrated - no separate call needed.
-    ///
-    /// # Arguments
-    /// * `params` - WQE parameters (see `WriteImmParams`)
-    ///
-    /// # Returns
-    /// * `Ok(DirectBfResult)` on success
-    /// * `Err(SubmissionError::SqFull)` if SQ is full
-    /// * `Err(SubmissionError::BlueflameNotAvailable)` if BlueFlame not supported
-    #[inline]
-    pub fn emit_write_imm_direct(&self, params: crate::wqe::WriteImmParams) -> Result<crate::wqe::DirectBfResult, SubmissionError> {
-        use crate::wqe::DirectBlueflame;
-        let sq = self.sq.as_ref()
-            .ok_or(SubmissionError::BlueflameNotAvailable)?;
-        sq.emit_write_imm_direct(params)
-    }
-
-    /// Emit RDMA WRITE with Immediate directly via BlueFlame (signaled).
-    ///
-    /// Same as `emit_write_imm_direct` but stores an entry in the WQE table
-    /// for completion tracking.
-    #[inline]
-    pub fn emit_write_imm_direct_signaled(&self, params: crate::wqe::WriteImmParams, entry: SqEntry) -> Result<crate::wqe::DirectBfResult, SubmissionError> {
-        use crate::wqe::DirectBlueflame;
-        let sq = self.sq.as_ref()
-            .ok_or(SubmissionError::BlueflameNotAvailable)?;
-        sq.emit_write_imm_direct_signaled(params, entry)
-    }
 }
 
 // =============================================================================
