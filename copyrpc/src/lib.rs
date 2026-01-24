@@ -49,7 +49,7 @@ use mlx5::qp::{RcQpConfig, RcQpForMonoCqWithSrqAndSqCb};
 use mlx5::srq::{Srq, SrqConfig};
 use mlx5::transport::IbRemoteQpInfo;
 use mlx5::emit_wqe;
-use mlx5::wqe::WqeFlags;
+use mlx5::wqe::{WqeFlags, WriteImmParams};
 
 use encoding::{
     HEADER_SIZE, decode_header, decode_imm, encode_header, encode_imm,
@@ -937,11 +937,73 @@ impl<U> EndpointInner<U> {
         Ok(true)
     }
 
-    /// Emit WQE and ring doorbell.
+    /// Emit WQE and ring doorbell using direct BlueFlame.
+    ///
+    /// For single-WQE (non-wrap-around) cases, uses the optimized
+    /// `emit_write_imm_direct()` which writes to SQ buffer and BlueFlame
+    /// register in a single operation with integrated doorbell.
+    ///
+    /// For wrap-around cases (multiple WQEs), falls back to the standard
+    /// emit_wqe! + ring_sq_doorbell() path.
     #[inline(always)]
     fn flush(&self) -> Result<()> {
-        self.emit_wqe()?;
-        self.qp.borrow().ring_sq_doorbell();
+        let remote_ring = self
+            .remote_recv_ring
+            .get()
+            .ok_or(Error::RemoteConsumerUnknown)?;
+
+        let start = self.flush_start_pos.get();
+        let end = self.send_ring_producer.get();
+
+        if start == end {
+            return Ok(());
+        }
+
+        let delta = end - start;
+        let imm = encode_imm(delta);
+
+        let start_offset = (start & (self.send_ring.len() as u64 - 1)) as usize;
+        let remote_offset = start & (remote_ring.size - 1);
+        let remote_addr = remote_ring.addr + remote_offset;
+        let ring_len = self.send_ring.len();
+
+        // Check for wrap-around: if data spans ring boundary, use fallback path
+        if start_offset + delta as usize > ring_len {
+            // Wrap-around case: use existing emit_wqe! + ring_sq_doorbell()
+            self.emit_wqe()?;
+            self.qp.borrow().ring_sq_doorbell();
+            return Ok(());
+        }
+
+        // Hot path: single WQE, use direct BlueFlame
+        let count = self.unsignaled_count.get();
+        let should_signal = count >= SIGNAL_INTERVAL;
+        let qpn = self.qpn();
+
+        let params = WriteImmParams {
+            wqe_idx: 0, // Set by emit_write_imm_direct
+            qpn: 0,     // Set by emit_write_imm_direct
+            flags: WqeFlags::empty(),
+            imm,
+            remote_addr,
+            rkey: remote_ring.rkey,
+            local_addr: self.send_ring_mr.addr() as u64 + start_offset as u64,
+            byte_count: delta as u32,
+            lkey: self.send_ring_mr.lkey(),
+        };
+
+        let qp = self.qp.borrow();
+        if should_signal {
+            qp.emit_write_imm_direct_signaled(params, SrqEntry { qpn, is_read: false })
+                .map_err(|e| Error::Io(e.into()))?;
+            self.unsignaled_count.set(0);
+        } else {
+            qp.emit_write_imm_direct(params)
+                .map_err(|e| Error::Io(e.into()))?;
+            self.unsignaled_count.set(count + 1);
+        }
+
+        self.flush_start_pos.set(end);
         Ok(())
     }
 

@@ -624,6 +624,188 @@ fn test_rc_rdma_write_imm() {
     println!("  Immediate data: 0x{:08x}", imm_data);
 }
 
+#[test]
+fn test_rc_rdma_write_imm_direct() {
+    use mlx5::wqe::{WriteImmParams, WqeFlags};
+
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    let pair = create_rc_loopback_pair(&ctx);
+    let qp1 = &pair.qp1;
+    let qp2 = &pair.qp2;
+    let send_cq = &pair.send_cq;
+
+    // Allocate buffers
+    let mut local_buf = AlignedBuffer::new(4096);
+    let remote_buf = AlignedBuffer::new(4096);
+
+    // Register memory regions
+    let local_mr = unsafe {
+        ctx.pd
+            .register(local_buf.as_ptr(), local_buf.size(), full_access())
+    }
+    .expect("Failed to register local MR");
+    let remote_mr = unsafe {
+        ctx.pd
+            .register(remote_buf.as_ptr(), remote_buf.size(), full_access())
+    }
+    .expect("Failed to register remote MR");
+
+    // Prepare test data
+    let test_data = b"RDMA WRITE IMM direct test!";
+    local_buf.fill_bytes(test_data);
+
+    // QP2 posts a receive (needed for WRITE+IMM)
+    let recv_buf = AlignedBuffer::new(4096);
+    let recv_mr = unsafe {
+        ctx.pd
+            .register(recv_buf.as_ptr(), recv_buf.size(), full_access())
+    }
+    .expect("Failed to register recv MR");
+
+    qp2.borrow()
+        .post_recv(0u64, recv_buf.addr(), 256, recv_mr.lkey())
+        .expect("post_recv failed");
+    qp2.borrow().ring_rq_doorbell();
+
+    let imm_data: u32 = 0xDEADBEEF;
+
+    // First test: use emit_wqe! (known working) and dump the WQE
+    println!("=== emit_wqe! test (baseline) ===");
+    let emit_wqe_bytes: [u8; 64];
+    {
+        let qp1_ref = qp1.borrow();
+        let ctx_emit = qp1_ref.emit_ctx().expect("emit_ctx failed");
+        println!("Before emit_wqe!: PI={}", ctx_emit.pi().get());
+        let result = emit_wqe!(&ctx_emit, write_imm {
+            flags: WqeFlags::COMPLETION,
+            remote_addr: remote_buf.addr(),
+            rkey: remote_mr.rkey(),
+            imm: imm_data,
+            sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
+            signaled: 1u64,
+        }).expect("emit_wqe failed");
+        println!("emit_wqe! result: wqe_idx={}, After PI={}", result.wqe_idx, ctx_emit.pi().get());
+
+        // Dump WQE bytes
+        emit_wqe_bytes = unsafe {
+            let wqe_ptr = ctx_emit.sq_buf().add((result.wqe_idx as usize) * 64);
+            std::ptr::read(wqe_ptr as *const [u8; 64])
+        };
+        println!("emit_wqe! WQE bytes at idx={}:", result.wqe_idx);
+        for (i, chunk) in emit_wqe_bytes.chunks(16).enumerate() {
+            println!("  {:02}: {:02x?}", i * 16, chunk);
+        }
+    }
+    qp1.borrow().ring_sq_doorbell();
+    println!("After ring_sq_doorbell (emit_wqe!)");
+
+    // Poll send CQ for completion
+    let cqe = poll_cq_timeout(send_cq, 5000).expect("Send CQE timeout (emit_wqe)");
+    println!(
+        "emit_wqe! CQE: opcode={:?}, syndrome={}, wqe_counter={}",
+        cqe.opcode, cqe.syndrome, cqe.wqe_counter
+    );
+    assert_eq!(cqe.syndrome, 0, "Send CQE error (emit_wqe)");
+    send_cq.flush();
+
+    // Verify data was written
+    let written = remote_buf.read_bytes(test_data.len());
+    assert_eq!(&written[..], test_data, "emit_wqe! data mismatch");
+    println!("emit_wqe! test passed!");
+
+    // Clear remote buffer for next test
+    unsafe {
+        std::ptr::write_bytes(remote_buf.as_ptr(), 0, test_data.len());
+    }
+
+    // Post another receive for QP2
+    qp2.borrow()
+        .post_recv(1u64, recv_buf.addr(), 256, recv_mr.lkey())
+        .expect("post_recv failed");
+    qp2.borrow().ring_rq_doorbell();
+
+    // Second test: use emit_write_imm_direct()
+    println!("\n=== emit_write_imm_direct() test ===");
+    println!("local_addr=0x{:x}, len={}, lkey=0x{:x}",
+             local_buf.addr(), test_data.len(), local_mr.lkey());
+    println!("remote_addr=0x{:x}, rkey=0x{:x}",
+             remote_buf.addr(), remote_mr.rkey());
+    let direct_wqe_bytes: [u8; 64];
+    {
+        let qp1_ref = qp1.borrow();
+        // Check PI before calling emit_write_imm_direct
+        let ctx_emit = qp1_ref.emit_ctx().expect("emit_ctx failed");
+        println!("Before emit_write_imm_direct: PI={}", ctx_emit.pi().get());
+
+        let params = WriteImmParams {
+            wqe_idx: 0,
+            qpn: 0,
+            flags: WqeFlags::empty(),
+            imm: imm_data,
+            remote_addr: remote_buf.addr(),
+            rkey: remote_mr.rkey(),
+            local_addr: local_buf.addr(),
+            byte_count: test_data.len() as u32,
+            lkey: local_mr.lkey(),
+        };
+        let result = qp1_ref.emit_write_imm_direct_signaled(params, 2u64)
+            .expect("emit_write_imm_direct_signaled failed");
+
+        let ctx_emit_after = qp1_ref.emit_ctx().expect("emit_ctx failed");
+        println!("emit_write_imm_direct returned wqe_idx={}, After PI={}", result.wqe_idx, ctx_emit_after.pi().get());
+
+        // Dump WQE bytes
+        direct_wqe_bytes = unsafe {
+            let wqe_ptr = ctx_emit_after.sq_buf().add((result.wqe_idx as usize) * 64);
+            std::ptr::read(wqe_ptr as *const [u8; 64])
+        };
+        println!("emit_write_imm_direct WQE bytes at idx={}:", result.wqe_idx);
+        for (i, chunk) in direct_wqe_bytes.chunks(16).enumerate() {
+            println!("  {:02}: {:02x?}", i * 16, chunk);
+        }
+    }
+    // Note: No ring_sq_doorbell() needed - it's integrated
+
+    // Poll send CQ for completion
+    let cqe = poll_cq_timeout(send_cq, 5000).expect("Send CQE timeout (direct)");
+    println!(
+        "Direct CQE: opcode={:?}, syndrome={}, wqe_counter={}",
+        cqe.opcode, cqe.syndrome, cqe.wqe_counter
+    );
+    assert_eq!(cqe.syndrome, 0, "Send CQE error (direct)");
+    send_cq.flush();
+
+    // Compare WQE bytes (accounting for different wqe_idx values)
+    println!("\n=== WQE Comparison ===");
+    // Bytes 0-3: opmod_idx_opcode - idx differs
+    // Bytes 4-7: qpn_ds - should match
+    // Bytes 8-15: should match
+    // Bytes 16-63: should match
+    let mut mismatch = false;
+    for i in 4..64 {
+        if emit_wqe_bytes[i] != direct_wqe_bytes[i] {
+            println!("MISMATCH at byte {}: emit_wqe=0x{:02x}, direct=0x{:02x}", i, emit_wqe_bytes[i], direct_wqe_bytes[i]);
+            mismatch = true;
+        }
+    }
+    if !mismatch {
+        println!("WQE bytes match (except wqe_idx)!");
+    }
+
+    // Verify data was written
+    let written = remote_buf.read_bytes(test_data.len());
+    assert_eq!(&written[..], test_data, "emit_write_imm_direct data mismatch");
+
+    println!("RC RDMA WRITE IMM direct test passed!");
+}
+
 // =============================================================================
 // SEND/RECV Tests
 // =============================================================================

@@ -7,8 +7,8 @@ use std::cell::Cell;
 
 use crate::types::GrhAttr;
 use crate::wqe::{
-    calc_wqebb_cnt, copy_inline_data, inline_padded_size, CtrlSegParams, OrderedWqeTable, SubmissionError, WqeFlags,
-    WqeOpcode, ADDRESS_VECTOR_SIZE, ATOMIC_SEG_SIZE, CTRL_SEG_SIZE, DATA_SEG_SIZE, RDMA_SEG_SIZE, WQEBB_SIZE,
+    calc_wqebb_cnt, copy_inline_data, inline_padded_size, CtrlSegParams, DirectBfResult, OrderedWqeTable, SubmissionError, WqeFlags,
+    WqeOpcode, WriteImmParams, ADDRESS_VECTOR_SIZE, ATOMIC_SEG_SIZE, CTRL_SEG_SIZE, DATA_SEG_SIZE, RDMA_SEG_SIZE, WQEBB_SIZE,
     write_address_vector_ib,
     write_atomic_seg_cas, write_atomic_seg_fa, write_ctrl_seg, write_data_seg, write_inline_header,
     write_rdma_seg,
@@ -4358,3 +4358,495 @@ macro_rules! emit_wqe_bf {
 }
 
 pub use emit_wqe_bf;
+
+// =============================================================================
+// SIMD WQE Construction for Direct BlueFlame Writes
+// =============================================================================
+
+/// Build RDMA WRITE_IMM WQE (64 bytes) directly in AVX-512 register.
+///
+/// Constructs the complete WQE on-register without intermediate memory stores:
+/// - Control Segment (16B): opmod_idx_opcode, qpn_ds, sig_stream_fm, imm
+/// - RDMA Segment (16B): remote_addr, rkey, reserved
+/// - Data Segment (16B): byte_count, lkey, local_addr
+/// - Padding (16B): zeros
+///
+/// # Safety
+/// - Requires AVX-512F support (caller must verify)
+/// - Target feature must be enabled
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx512f")]
+pub unsafe fn build_write_imm_wqe_avx512(params: &WriteImmParams) -> std::arch::x86_64::__m512i {
+    use std::arch::x86_64::*;
+
+    // Build WQE fields (all converted to big-endian for network byte order)
+    let opmod_idx_opcode = params.opmod_idx_opcode().to_be();
+    let qpn_ds = params.qpn_ds().to_be();
+    let sig_stream_fm = params.sig_stream_fm().to_be();
+    let imm = params.imm.to_be();
+
+    let remote_addr = params.remote_addr.to_be();
+    let rkey = params.rkey.to_be();
+
+    let byte_count = params.byte_count.to_be();
+    let lkey = params.lkey.to_be();
+    let local_addr = params.local_addr.to_be();
+
+    // Pack into 8 x i64 for __m512i
+    // Memory layout (little-endian x86, but fields are big-endian):
+    //   q0 = [opmod_idx_opcode:32][qpn_ds:32]
+    //   q1 = [sig_stream_fm:32][imm:32]
+    //   q2 = remote_addr
+    //   q3 = [rkey:32][reserved:32]
+    //   q4 = [byte_count:32][lkey:32]
+    //   q5 = local_addr
+    //   q6 = 0 (padding)
+    //   q7 = 0 (padding)
+    let q0 = ((qpn_ds as u64) << 32) | (opmod_idx_opcode as u64);
+    let q1 = ((imm as u64) << 32) | (sig_stream_fm as u64);
+    let q2 = remote_addr;
+    let q3 = rkey as u64; // upper 32 bits are reserved (0)
+    let q4 = ((lkey as u64) << 32) | (byte_count as u64);
+    let q5 = local_addr;
+    let q6 = 0u64;
+    let q7 = 0u64;
+
+    // _mm512_set_epi64 takes arguments in reverse order (q7, q6, ..., q0)
+    _mm512_set_epi64(
+        q7 as i64, q6 as i64, q5 as i64, q4 as i64,
+        q3 as i64, q2 as i64, q1 as i64, q0 as i64,
+    )
+}
+
+/// Stream WQE to BlueFlame register using non-temporal store.
+///
+/// # Safety
+/// - `bf_reg` must be 64-byte aligned and point to valid MMIO region
+/// - Requires AVX-512F support
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx512f")]
+pub unsafe fn stream_to_blueflame_avx512(bf_reg: *mut u8, wqe: std::arch::x86_64::__m512i) {
+    use std::arch::x86_64::*;
+    _mm512_stream_si512(bf_reg as *mut __m512i, wqe);
+}
+
+/// Build RDMA WRITE_IMM WQE for ARM64 NEON.
+///
+/// Since ARM NEON lacks efficient scalar-to-vector construction like AVX-512's
+/// `_mm512_set_epi64`, we build the WQE on the stack and load into NEON registers.
+///
+/// Returns an array of 4 x uint8x16_t (4 x 16B = 64B total).
+///
+/// # Safety
+/// - Requires NEON support (standard on AArch64)
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn build_write_imm_wqe_neon(params: &WriteImmParams) -> [std::arch::aarch64::uint8x16_t; 4] {
+    use std::arch::aarch64::*;
+
+    // Build WQE on stack (64 bytes, 16-byte aligned)
+    #[repr(C, align(16))]
+    struct WqeBuffer([u8; 64]);
+    let mut buf = WqeBuffer([0u8; 64]);
+    let ptr = buf.0.as_mut_ptr();
+
+    // Control Segment (16B)
+    let opmod_idx_opcode = params.opmod_idx_opcode().to_be();
+    let qpn_ds = params.qpn_ds().to_be();
+    let sig_stream_fm = params.sig_stream_fm().to_be();
+    let imm = params.imm.to_be();
+
+    std::ptr::write(ptr as *mut u32, opmod_idx_opcode);
+    std::ptr::write((ptr as *mut u32).add(1), qpn_ds);
+    std::ptr::write((ptr as *mut u32).add(2), sig_stream_fm);
+    std::ptr::write((ptr as *mut u32).add(3), imm);
+
+    // RDMA Segment (16B)
+    let remote_addr = params.remote_addr.to_be();
+    let rkey = params.rkey.to_be();
+
+    std::ptr::write(ptr.add(16) as *mut u64, remote_addr);
+    std::ptr::write(ptr.add(24) as *mut u32, rkey);
+    std::ptr::write(ptr.add(28) as *mut u32, 0); // reserved
+
+    // Data Segment (16B)
+    let byte_count = params.byte_count.to_be();
+    let lkey = params.lkey.to_be();
+    let local_addr = params.local_addr.to_be();
+
+    std::ptr::write(ptr.add(32) as *mut u32, byte_count);
+    std::ptr::write(ptr.add(36) as *mut u32, lkey);
+    std::ptr::write(ptr.add(40) as *mut u64, local_addr);
+
+    // Padding (16B) - already zero from initialization
+
+    // Load into NEON registers
+    [
+        vld1q_u8(ptr),
+        vld1q_u8(ptr.add(16)),
+        vld1q_u8(ptr.add(32)),
+        vld1q_u8(ptr.add(48)),
+    ]
+}
+
+/// Stream WQE to BlueFlame register using non-temporal stores (STNP).
+///
+/// # Safety
+/// - `bf_reg` must be 64-byte aligned and point to valid MMIO region
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn stream_to_blueflame_neon(bf_reg: *mut u8, wqe: [std::arch::aarch64::uint8x16_t; 4]) {
+    std::arch::asm!(
+        "stnp {v0:q}, {v1:q}, [{dst}]",
+        "stnp {v2:q}, {v3:q}, [{dst}, #32]",
+        dst = in(reg) bf_reg,
+        v0 = in(vreg) wqe[0],
+        v1 = in(vreg) wqe[1],
+        v2 = in(vreg) wqe[2],
+        v3 = in(vreg) wqe[3],
+        options(nostack, preserves_flags),
+    );
+}
+
+// =============================================================================
+// DirectBlueflame Trait
+// =============================================================================
+
+/// Trait for direct BlueFlame WQE emission.
+///
+/// Provides methods to emit WQEs directly to the BlueFlame register
+/// using SIMD construction, bypassing the normal SQ buffer path.
+///
+/// This is optimal for latency-critical single-WQE operations where
+/// the WQE can be built entirely in registers and streamed to the NIC.
+pub trait DirectBlueflame: SqState {
+    /// Emit RDMA WRITE with Immediate directly via BlueFlame.
+    ///
+    /// Constructs WQE using SIMD registers and writes directly to the
+    /// BlueFlame register. Handles wrap-around by emitting NOP WQEs.
+    ///
+    /// # Arguments
+    /// * `params` - WQE parameters (see `WriteImmParams`)
+    ///
+    /// # Returns
+    /// * `Ok(DirectBfResult)` on success
+    /// * `Err(SubmissionError::SqFull)` if SQ is full
+    /// * `Err(SubmissionError::BlueflameNotAvailable)` if BlueFlame not supported
+    fn emit_write_imm_direct(&self, params: WriteImmParams) -> Result<DirectBfResult, SubmissionError>;
+
+    /// Emit RDMA WRITE with Immediate directly via BlueFlame (signaled).
+    ///
+    /// Same as `emit_write_imm_direct` but stores an entry in the WQE table
+    /// for completion tracking.
+    fn emit_write_imm_direct_signaled(&self, params: WriteImmParams, entry: Self::Entry) -> Result<DirectBfResult, SubmissionError>;
+}
+
+/// Implementation of DirectBlueflame for types implementing SqState.
+///
+/// This provides the actual SIMD WQE construction and BlueFlame write logic.
+impl<T: SqState> DirectBlueflame for T {
+    fn emit_write_imm_direct(&self, mut params: WriteImmParams) -> Result<DirectBfResult, SubmissionError> {
+        // Check BlueFlame availability
+        if self.bf_size() == 0 {
+            return Err(SubmissionError::BlueflameNotAvailable);
+        }
+
+        const WQEBB_CNT: u16 = 1; // WRITE_IMM with SGE is exactly 64B = 1 WQEBB
+        const WQE_SIZE: usize = 64;
+
+        // Check SQ space
+        if self.available() < WQEBB_CNT {
+            return Err(SubmissionError::SqFull);
+        }
+
+        // Handle wrap-around: if WQE would span ring boundary, emit NOP to fill
+        let slots_to_end = self.slots_to_end();
+        if slots_to_end < WQEBB_CNT {
+            // Post NOP to fill remaining slots
+            unsafe {
+                self.post_nop(slots_to_end);
+            }
+            // Re-check space after NOP
+            if self.available() < WQEBB_CNT {
+                return Err(SubmissionError::SqFull);
+            }
+        }
+
+        // Get WQE index and update params
+        let wqe_idx = self.pi().get();
+        params.wqe_idx = wqe_idx;
+        params.qpn = self.sqn();
+
+        // Get SQ buffer pointer for this WQE
+        let wqe_ptr = self.get_wqe_ptr(wqe_idx);
+
+        // Write WQE to SQ buffer using standard functions
+        unsafe {
+            write_ctrl_seg(wqe_ptr, &CtrlSegParams {
+                opmod: 0,
+                opcode: WqeOpcode::RdmaWriteImm as u8,
+                wqe_idx: params.wqe_idx,
+                qpn: params.qpn,
+                ds_cnt: 3, // Ctrl + RDMA + Data = 48 bytes = 3 DS
+                flags: params.flags,
+                imm: params.imm,
+            });
+            write_rdma_seg(wqe_ptr.add(CTRL_SEG_SIZE), params.remote_addr, params.rkey);
+            write_data_seg(wqe_ptr.add(CTRL_SEG_SIZE + RDMA_SEG_SIZE), params.byte_count, params.lkey, params.local_addr);
+        }
+
+        // Update PI first (like emit_wqe! does)
+        let new_pi = wqe_idx.wrapping_add(WQEBB_CNT);
+        self.pi().set(new_pi);
+        self.last_wqe().set(Some((wqe_ptr, WQE_SIZE)));
+
+        // Now ring doorbell (following the same pattern as ring_doorbell())
+        mmio_flush_writes!();
+
+        // Update doorbell record with current PI
+        unsafe {
+            std::ptr::write_volatile(self.dbrec().add(1), (new_pi as u32).to_be());
+        }
+
+        udma_to_device_barrier!();
+
+        // Copy WQE to BlueFlame register (up to bf_size bytes)
+        let bf_offset = self.bf_offset().get();
+        let bf = unsafe { self.bf_reg().add(bf_offset as usize) };
+        let copy_size = WQE_SIZE.min(self.bf_size() as usize);
+
+        // Copy WQE data in 64-bit chunks (same as ring_doorbell)
+        let wqe_u64 = wqe_ptr as *const u64;
+        let bf_u64 = bf as *mut u64;
+        let copy_count = (copy_size + 7) / 8;
+        for i in 0..copy_count {
+            unsafe {
+                std::ptr::write_volatile(bf_u64.add(i), *wqe_u64.add(i));
+            }
+        }
+
+        mmio_flush_writes!();
+
+        // Toggle BF offset for next operation
+        self.bf_offset().set(bf_offset ^ self.bf_size());
+
+        Ok(DirectBfResult { wqe_idx })
+    }
+
+    fn emit_write_imm_direct_signaled(&self, mut params: WriteImmParams, entry: Self::Entry) -> Result<DirectBfResult, SubmissionError> {
+        // Add COMPLETION flag
+        params.flags = params.flags | WqeFlags::COMPLETION;
+
+        // Emit WQE
+        let result = self.emit_write_imm_direct(params)?;
+
+        // Store entry in table for completion tracking
+        self.table().store(result.wqe_idx, entry, self.pi().get());
+
+        Ok(result)
+    }
+}
+
+// =============================================================================
+// Tests for SIMD WQE Construction
+// =============================================================================
+
+#[cfg(test)]
+mod simd_tests {
+    use super::*;
+
+    #[test]
+    fn test_write_imm_params_field_construction() {
+        let params = WriteImmParams {
+            wqe_idx: 5,
+            qpn: 0x123456,
+            flags: WqeFlags::COMPLETION | WqeFlags::FENCE,
+            imm: 0xDEADBEEF,
+            remote_addr: 0x1234_5678_9ABC_DEF0,
+            rkey: 0xAABBCCDD,
+            local_addr: 0xFEDC_BA98_7654_3210,
+            byte_count: 1024,
+            lkey: 0x11223344,
+        };
+
+        // opmod_idx_opcode: [opmod:0][wqe_idx:5][opcode:0x09]
+        let expected_opmod_idx_opcode = (5u32 << 8) | 0x09;
+        assert_eq!(params.opmod_idx_opcode(), expected_opmod_idx_opcode);
+
+        // qpn_ds: [qpn:0x123456][ds_cnt:3]
+        let expected_qpn_ds = (0x123456u32 << 8) | 3;
+        assert_eq!(params.qpn_ds(), expected_qpn_ds);
+
+        // sig_stream_fm: [pcie_ctrl:0][stream:0][fm_ce_se:0x48]
+        // COMPLETION = 0x08, FENCE = 0x40
+        let expected_fm_ce_se = 0x48u8;
+        assert_eq!(params.flags.fm_ce_se(), expected_fm_ce_se);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_avx512_wqe_layout() {
+        if !std::arch::is_x86_feature_detected!("avx512f") {
+            eprintln!("Skipping AVX-512 test: not supported on this CPU");
+            return;
+        }
+
+        let params = WriteImmParams {
+            wqe_idx: 1,
+            qpn: 0x100,
+            flags: WqeFlags::empty(),
+            imm: 0x12345678,
+            remote_addr: 0x0000_0001_0000_0000,
+            rkey: 0x00001000,
+            local_addr: 0x0000_0002_0000_0000,
+            byte_count: 64,
+            lkey: 0x00002000,
+        };
+
+        // Build WQE and extract bytes
+        let wqe = unsafe { build_write_imm_wqe_avx512(&params) };
+
+        // Extract bytes from __m512i
+        let mut buf = [0u8; 64];
+        unsafe {
+            std::arch::x86_64::_mm512_storeu_si512(buf.as_mut_ptr() as *mut std::arch::x86_64::__m512i, wqe);
+        }
+
+        // Verify Control Segment (bytes 0-15)
+        // opmod_idx_opcode at offset 0-3 (big-endian)
+        let opmod_idx_opcode = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        assert_eq!(opmod_idx_opcode, params.opmod_idx_opcode());
+
+        // qpn_ds at offset 4-7
+        let qpn_ds = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        assert_eq!(qpn_ds, params.qpn_ds());
+
+        // imm at offset 12-15
+        let imm = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        assert_eq!(imm, params.imm);
+
+        // Verify RDMA Segment (bytes 16-31)
+        let remote_addr = u64::from_be_bytes([
+            buf[16], buf[17], buf[18], buf[19],
+            buf[20], buf[21], buf[22], buf[23],
+        ]);
+        assert_eq!(remote_addr, params.remote_addr);
+
+        let rkey = u32::from_be_bytes([buf[24], buf[25], buf[26], buf[27]]);
+        assert_eq!(rkey, params.rkey);
+
+        // Verify Data Segment (bytes 32-47)
+        let byte_count = u32::from_be_bytes([buf[32], buf[33], buf[34], buf[35]]);
+        assert_eq!(byte_count, params.byte_count);
+
+        let lkey = u32::from_be_bytes([buf[36], buf[37], buf[38], buf[39]]);
+        assert_eq!(lkey, params.lkey);
+
+        let local_addr = u64::from_be_bytes([
+            buf[40], buf[41], buf[42], buf[43],
+            buf[44], buf[45], buf[46], buf[47],
+        ]);
+        assert_eq!(local_addr, params.local_addr);
+
+        // Verify padding (bytes 48-63 should be zero)
+        for i in 48..64 {
+            assert_eq!(buf[i], 0, "Padding byte {} should be zero", i);
+        }
+    }
+}
+
+// =============================================================================
+// emit_wqe_bf_direct! Macro - Direct BlueFlame WQE Emission
+// =============================================================================
+
+/// Emit a WQE directly to BlueFlame register using SIMD construction.
+///
+/// This macro provides a convenient interface for the `DirectBlueflame` trait,
+/// constructing WQEs in SIMD registers and streaming directly to the BlueFlame
+/// register without intermediate memory copies.
+///
+/// Unlike `emit_wqe!` which writes to the SQ buffer and requires a separate
+/// doorbell ring, `emit_wqe_bf_direct!` combines WQE construction and doorbell
+/// into a single operation.
+///
+/// # Syntax
+///
+/// ```ignore
+/// // WRITE_IMM with SGE (unsignaled)
+/// emit_wqe_bf_direct!(qp, write_imm {
+///     flags: WqeFlags::empty(),
+///     remote_addr: dest,
+///     rkey: rkey,
+///     imm: imm_data,
+///     sge: { addr: local, len: 64, lkey },
+/// })?;
+///
+/// // WRITE_IMM with SGE (signaled)
+/// emit_wqe_bf_direct!(qp, write_imm {
+///     flags: WqeFlags::empty(),
+///     remote_addr: dest,
+///     rkey: rkey,
+///     imm: imm_data,
+///     sge: { addr: local, len: 64, lkey },
+///     signaled: entry,
+/// })?;
+/// ```
+///
+/// # Returns
+///
+/// * `Ok(DirectBfResult)` - WQE was successfully emitted
+/// * `Err(SubmissionError::SqFull)` - Send Queue is full
+/// * `Err(SubmissionError::BlueflameNotAvailable)` - BlueFlame not supported
+#[macro_export]
+macro_rules! emit_wqe_bf_direct {
+    // WRITE_IMM with SGE (unsignaled)
+    ($qp:expr, write_imm {
+        flags: $flags:expr,
+        remote_addr: $raddr:expr,
+        rkey: $rkey:expr,
+        imm: $imm:expr,
+        sge: { addr: $addr:expr, len: $len:expr, lkey: $lkey:expr $(,)? } $(,)?
+    }) => {{
+        use $crate::wqe::DirectBlueflame;
+        let params = $crate::wqe::WriteImmParams {
+            wqe_idx: 0, // Will be set by emit_write_imm_direct
+            qpn: 0,     // Will be set by emit_write_imm_direct
+            flags: $flags,
+            imm: $imm,
+            remote_addr: $raddr,
+            rkey: $rkey,
+            local_addr: $addr,
+            byte_count: $len,
+            lkey: $lkey,
+        };
+        $qp.emit_write_imm_direct(params)
+    }};
+
+    // WRITE_IMM with SGE (signaled)
+    ($qp:expr, write_imm {
+        flags: $flags:expr,
+        remote_addr: $raddr:expr,
+        rkey: $rkey:expr,
+        imm: $imm:expr,
+        sge: { addr: $addr:expr, len: $len:expr, lkey: $lkey:expr $(,)? },
+        signaled: $entry:expr $(,)?
+    }) => {{
+        use $crate::wqe::DirectBlueflame;
+        let params = $crate::wqe::WriteImmParams {
+            wqe_idx: 0, // Will be set by emit_write_imm_direct_signaled
+            qpn: 0,     // Will be set by emit_write_imm_direct_signaled
+            flags: $flags,
+            imm: $imm,
+            remote_addr: $raddr,
+            rkey: $rkey,
+            local_addr: $addr,
+            byte_count: $len,
+            lkey: $lkey,
+        };
+        $qp.emit_write_imm_direct_signaled(params, $entry)
+    }};
+}
+
+pub use emit_wqe_bf_direct;
