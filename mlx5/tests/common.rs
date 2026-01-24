@@ -106,6 +106,20 @@ impl AlignedBuffer {
         buf
     }
 
+    /// Read a u32 value at the given offset.
+    pub fn read_u32(&self, offset: usize) -> u32 {
+        assert!(offset + 4 <= self.size);
+        unsafe { std::ptr::read_volatile((self.ptr.add(offset)) as *const u32) }
+    }
+
+    /// Write a u32 value at the given offset.
+    pub fn write_u32(&mut self, offset: usize, value: u32) {
+        assert!(offset + 4 <= self.size);
+        unsafe {
+            std::ptr::write_volatile((self.ptr.add(offset)) as *mut u32, value);
+        }
+    }
+
     /// Read a u64 value at the given offset.
     pub fn read_u64(&self, offset: usize) -> u64 {
         assert!(offset + 8 <= self.size);
@@ -117,6 +131,63 @@ impl AlignedBuffer {
         assert!(offset + 8 <= self.size);
         unsafe {
             std::ptr::write_volatile((self.ptr.add(offset)) as *mut u64, value);
+        }
+    }
+
+    /// Read a u128 value at the given offset.
+    pub fn read_u128(&self, offset: usize) -> u128 {
+        assert!(offset + 16 <= self.size);
+        unsafe { std::ptr::read_volatile((self.ptr.add(offset)) as *const u128) }
+    }
+
+    /// Write a u128 value at the given offset.
+    pub fn write_u128(&mut self, offset: usize, value: u128) {
+        assert!(offset + 16 <= self.size);
+        unsafe {
+            std::ptr::write_volatile((self.ptr.add(offset)) as *mut u128, value);
+        }
+    }
+
+    /// Read a u128 value at the given offset as two native u64 values (high first, low second).
+    /// Used for reading remote memory accessed by 128-bit atomics.
+    pub fn read_u128_hilo(&self, offset: usize) -> u128 {
+        assert!(offset + 16 <= self.size);
+        unsafe {
+            // Layout: [high_64_native][low_64_native]
+            let ptr64 = self.ptr.add(offset) as *const u64;
+            let high = std::ptr::read_volatile(ptr64);
+            let low = std::ptr::read_volatile(ptr64.add(1));
+            ((high as u128) << 64) | (low as u128)
+        }
+    }
+
+    /// Write a u128 value at the given offset as two native u64 values (high first, low second).
+    /// Used for writing remote memory accessed by 128-bit atomics.
+    pub fn write_u128_hilo(&mut self, offset: usize, value: u128) {
+        assert!(offset + 16 <= self.size);
+        unsafe {
+            // Layout: [high_64_native][low_64_native]
+            let ptr64 = self.ptr.add(offset) as *mut u64;
+            let high = (value >> 64) as u64;
+            let low = value as u64;
+            std::ptr::write_volatile(ptr64, high);
+            std::ptr::write_volatile(ptr64.add(1), low);
+        }
+    }
+
+    /// Read a u128 value at the given offset where each 64-bit part is in big-endian format.
+    /// 128-bit atomic operations return values in this format.
+    pub fn read_u128_be(&self, offset: usize) -> u128 {
+        assert!(offset + 16 <= self.size);
+        unsafe {
+            // Layout: [high_64_be][low_64_be]
+            // Read native u64, then interpret as BE and convert to native
+            let ptr64 = self.ptr.add(offset) as *const u64;
+            let high_raw = std::ptr::read_volatile(ptr64);
+            let low_raw = std::ptr::read_volatile(ptr64.add(1));
+            let high = u64::from_be(high_raw);
+            let low = u64::from_be(low_raw);
+            ((high as u128) << 64) | (low as u128)
         }
     }
 }

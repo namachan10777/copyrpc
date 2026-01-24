@@ -93,6 +93,55 @@ pub enum AtomicCap {
     Glob = 2,
 }
 
+/// PCI Atomic capabilities.
+///
+/// Reports which sizes of PCI atomic operations are supported by the device.
+/// Each field is a bitmask where bit N indicates support for 2^N byte operations.
+///
+/// Common values:
+/// - 0x0: No support
+/// - 0x8: 8-byte support (bit 3 = 2^3 = 8)
+/// - 0x4: 4-byte support (bit 2 = 2^2 = 4)
+/// - 0xC: 4-byte and 8-byte support (bits 2 and 3)
+///
+/// Masked atomic operations typically require extended atomic support
+/// which can be queried via ibv_device_attr_ex.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PciAtomicCaps {
+    /// Supported sizes for Fetch-and-Add operations (bitmask).
+    pub fetch_add: u16,
+    /// Supported sizes for Swap operations (bitmask).
+    pub swap: u16,
+    /// Supported sizes for Compare-and-Swap operations (bitmask).
+    pub compare_swap: u16,
+}
+
+impl PciAtomicCaps {
+    /// Check if 4-byte (32-bit) Fetch-and-Add is supported.
+    #[inline]
+    pub fn supports_fa_32(&self) -> bool {
+        self.fetch_add & 0x4 != 0
+    }
+
+    /// Check if 8-byte (64-bit) Fetch-and-Add is supported.
+    #[inline]
+    pub fn supports_fa_64(&self) -> bool {
+        self.fetch_add & 0x8 != 0
+    }
+
+    /// Check if 4-byte (32-bit) Compare-and-Swap is supported.
+    #[inline]
+    pub fn supports_cas_32(&self) -> bool {
+        self.compare_swap & 0x4 != 0
+    }
+
+    /// Check if 8-byte (64-bit) Compare-and-Swap is supported.
+    #[inline]
+    pub fn supports_cas_64(&self) -> bool {
+        self.compare_swap & 0x8 != 0
+    }
+}
+
 impl From<u32> for AtomicCap {
     fn from(v: u32) -> Self {
         match v {

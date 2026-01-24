@@ -5,7 +5,7 @@
 use std::rc::Rc;
 use std::{io, mem::MaybeUninit, ops::Deref, ptr::NonNull};
 
-use crate::types::{Gid, LinkLayer};
+use crate::types::{Gid, LinkLayer, PciAtomicCaps};
 
 /// An RDMA device.
 ///
@@ -307,6 +307,54 @@ impl Context {
                 flags: attr.tm_caps.flags,
                 max_ops: attr.tm_caps.max_ops,
                 max_sge: attr.tm_caps.max_sge,
+            })
+        }
+    }
+
+    /// Query PCI Atomic capabilities.
+    ///
+    /// Returns the PCI atomic operation capabilities of the device, indicating
+    /// which sizes of atomic operations are supported:
+    /// - `fetch_add`: Supported sizes for Fetch-and-Add (bitmask)
+    /// - `swap`: Supported sizes for Swap (bitmask)
+    /// - `compare_swap`: Supported sizes for Compare-and-Swap (bitmask)
+    ///
+    /// Each bitmask has bit N set if 2^N byte operations are supported.
+    /// For example, `fetch_add = 0xC` means both 4-byte (bit 2) and 8-byte (bit 3)
+    /// Fetch-and-Add are supported.
+    ///
+    /// Note: Masked atomic operations (32-bit and 64-bit extended atomics) require
+    /// device support. ConnectX-5 and later generally support these operations.
+    ///
+    /// Returns `None` if the query fails or PCI atomics are not supported.
+    ///
+    /// # Example
+    /// ```ignore
+    /// if let Some(caps) = ctx.query_pci_atomic_caps() {
+    ///     if caps.supports_cas_32() {
+    ///         println!("32-bit masked CAS supported");
+    ///     }
+    ///     if caps.supports_cas_64() {
+    ///         println!("64-bit masked CAS supported");
+    ///     }
+    /// }
+    /// ```
+    pub fn query_pci_atomic_caps(&self) -> Option<PciAtomicCaps> {
+        unsafe {
+            let mut attr: MaybeUninit<mlx5_sys::ibv_device_attr_ex> = MaybeUninit::zeroed();
+            let ret = mlx5_sys::ibv_query_device_ex_ex(
+                self.as_ptr(),
+                std::ptr::null(),
+                attr.as_mut_ptr(),
+            );
+            if ret != 0 {
+                return None;
+            }
+            let attr = attr.assume_init();
+            Some(PciAtomicCaps {
+                fetch_add: attr.pci_atomic_caps.fetch_add,
+                swap: attr.pci_atomic_caps.swap,
+                compare_swap: attr.pci_atomic_caps.compare_swap,
             })
         }
     }

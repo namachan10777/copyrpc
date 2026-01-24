@@ -368,6 +368,11 @@ pub const MASKED_ATOMIC_SEG64_SIZE_CAS: usize = 32;
 /// Size of masked atomic segment for 64-bit FA operations (1 segment).
 pub const MASKED_ATOMIC_SEG64_SIZE_FA: usize = 16;
 
+/// Size of masked atomic segment for 128-bit CAS operations (4 segments).
+pub const MASKED_ATOMIC_SEG128_SIZE_CAS: usize = 64;
+/// Size of masked atomic segment for 128-bit FA operations (2 segments).
+pub const MASKED_ATOMIC_SEG128_SIZE_FA: usize = 32;
+
 /// Write masked Compare-and-Swap segment (64-bit, 2 segments).
 ///
 /// # Safety
@@ -399,6 +404,64 @@ pub unsafe fn write_masked_atomic_seg64_fa(ptr: *mut u8, add: u64, field_mask: u
     let ptr64 = ptr as *mut u64;
     std::ptr::write_volatile(ptr64, add.to_be());
     std::ptr::write_volatile(ptr64.add(1), field_mask.to_be());
+}
+
+/// Write masked Compare-and-Swap segment (128-bit, 4 segments = 64 bytes).
+///
+/// Layout: [swap 16B][compare 16B][swap_mask 16B][compare_mask 16B]
+///
+/// Each 128-bit value is written as two 64-bit big-endian values:
+/// [high_64_be][low_64_be]
+///
+/// # Safety
+/// The pointer must point to at least 64 bytes of writable memory.
+#[inline]
+pub unsafe fn write_masked_atomic_seg128_cas(
+    ptr: *mut u8,
+    swap: u128,
+    compare: u128,
+    swap_mask: u128,
+    compare_mask: u128,
+) {
+    let ptr64 = ptr as *mut u64;
+
+    // swap (16 bytes): high 64 bits (BE) + low 64 bits (BE)
+    std::ptr::write_volatile(ptr64, ((swap >> 64) as u64).to_be());
+    std::ptr::write_volatile(ptr64.add(1), (swap as u64).to_be());
+
+    // compare (16 bytes)
+    std::ptr::write_volatile(ptr64.add(2), ((compare >> 64) as u64).to_be());
+    std::ptr::write_volatile(ptr64.add(3), (compare as u64).to_be());
+
+    // swap_mask (16 bytes)
+    std::ptr::write_volatile(ptr64.add(4), ((swap_mask >> 64) as u64).to_be());
+    std::ptr::write_volatile(ptr64.add(5), (swap_mask as u64).to_be());
+
+    // compare_mask (16 bytes)
+    std::ptr::write_volatile(ptr64.add(6), ((compare_mask >> 64) as u64).to_be());
+    std::ptr::write_volatile(ptr64.add(7), (compare_mask as u64).to_be());
+}
+
+/// Write masked Fetch-and-Add segment (128-bit, 2 segments = 32 bytes).
+///
+/// Layout: [add 16B][field_boundary 16B]
+///
+/// Each 128-bit value is written as two 64-bit big-endian values:
+/// [high_64_be][low_64_be]
+///
+/// # Safety
+/// The pointer must point to at least 32 bytes of writable memory.
+#[inline]
+pub unsafe fn write_masked_atomic_seg128_fa(ptr: *mut u8, add: u128, field_boundary: u128) {
+    let ptr64 = ptr as *mut u64;
+
+    // add (16 bytes): high 64 bits (BE) + low 64 bits (BE)
+    std::ptr::write_volatile(ptr64, ((add >> 64) as u64).to_be());
+    std::ptr::write_volatile(ptr64.add(1), (add as u64).to_be());
+
+    // field_boundary (16 bytes)
+    std::ptr::write_volatile(ptr64.add(2), ((field_boundary >> 64) as u64).to_be());
+    std::ptr::write_volatile(ptr64.add(3), (field_boundary as u64).to_be());
 }
 
 /// Size of the TM segment in bytes.
@@ -487,6 +550,28 @@ pub enum WqeOpcode {
     AtomicMaskedCs = 0x14,
     AtomicMaskedFa = 0x15,
     TagMatching = 0x28,
+}
+
+/// Parameters for Masked Compare-and-Swap operation.
+///
+/// A masked CAS compares the remote value against `compare` using `compare_mask`,
+/// and if they match, replaces the masked portion with `swap` using `swap_mask`.
+///
+/// The operation is:
+/// ```text
+/// if (remote_value & compare_mask) == (compare & compare_mask):
+///     remote_value = (remote_value & ~swap_mask) | (swap & swap_mask)
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct MaskedCasParams<T> {
+    /// Value to swap in if comparison succeeds.
+    pub swap: T,
+    /// Value to compare against.
+    pub compare: T,
+    /// Mask for swap operation (which bits to replace).
+    pub swap_mask: T,
+    /// Mask for compare operation (which bits to compare).
+    pub compare_mask: T,
 }
 
 bitflags! {

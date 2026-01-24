@@ -419,6 +419,22 @@ pub type RcQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = RcQp<SqEntry, 
 /// - `OnRqComplete`: RQ completion callback type `Fn(Cqe, RqEntry)`
 pub type RcQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = RcQp<SqEntry, RqEntry, RoCE, OrderedWqeTable<SqEntry>, SharedRq<RqEntry>, OnSqComplete, OnRqComplete>;
 
+/// Handle to RC QP (InfiniBand) wrapped in `Rc<RefCell<...>>`.
+pub type RcQpIbHandle<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
+    Rc<RefCell<RcQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>>;
+
+/// Handle to RC QP with SRQ (InfiniBand) wrapped in `Rc<RefCell<...>>`.
+pub type RcQpIbWithSrqHandle<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
+    Rc<RefCell<RcQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>>;
+
+/// Handle to RC QP (RoCE) wrapped in `Rc<RefCell<...>>`.
+pub type RcQpRoCEHandle<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
+    Rc<RefCell<RcQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>>;
+
+/// Handle to RC QP with SRQ (RoCE) wrapped in `Rc<RefCell<...>>`.
+pub type RcQpRoCEWithSrqHandle<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
+    Rc<RefCell<RcQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>>>;
+
 /// RC (Reliable Connection) Queue Pair (internal implementation).
 ///
 /// Created using mlx5dv_create_qp for direct hardware access.
