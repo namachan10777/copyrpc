@@ -131,48 +131,6 @@ pub trait SqState {
         self.advance_pi(nop_wqebb_cnt);
         self.set_last_wqe(wqe_ptr, (nop_wqebb_cnt as usize) * WQEBB_SIZE);
     }
-
-    /// Emit WRITE_IMM WQE to BlueFlame register using scalar operations.
-    ///
-    /// Fallback path when SIMD (AVX-512/NEON) is not available.
-    ///
-    /// # Safety
-    /// - `bf` must be 64-byte aligned and point to valid MMIO region
-    #[inline]
-    unsafe fn emit_write_imm_to_bf_scalar(&self, bf: *mut u8, params: &WriteImmParams) {
-        // Build WQE fields (all in big-endian for network byte order)
-        let opmod_idx_opcode = params.opmod_idx_opcode().to_be();
-        let qpn_ds = params.qpn_ds().to_be();
-        let sig_stream_fm = params.sig_stream_fm().to_be();
-        let imm = params.imm.to_be();
-        let remote_addr = params.remote_addr.to_be();
-        let rkey = params.rkey.to_be();
-        let byte_count = params.byte_count.to_be();
-        let lkey = params.lkey.to_be();
-        let local_addr = params.local_addr.to_be();
-
-        // Write as 64-bit chunks using volatile writes
-        let bf_u64 = bf as *mut u64;
-
-        // Control Segment (16 bytes = 2 x u64)
-        let q0 = ((qpn_ds as u64) << 32) | (opmod_idx_opcode as u64);
-        let q1 = ((imm as u64) << 32) | (sig_stream_fm as u64);
-        std::ptr::write_volatile(bf_u64, q0);
-        std::ptr::write_volatile(bf_u64.add(1), q1);
-
-        // RDMA Segment (16 bytes = 2 x u64)
-        std::ptr::write_volatile(bf_u64.add(2), remote_addr);
-        std::ptr::write_volatile(bf_u64.add(3), rkey as u64);
-
-        // Data Segment (16 bytes = 2 x u64)
-        let q4 = ((lkey as u64) << 32) | (byte_count as u64);
-        std::ptr::write_volatile(bf_u64.add(4), q4);
-        std::ptr::write_volatile(bf_u64.add(5), local_addr);
-
-        // Padding (16 bytes = 2 x u64)
-        std::ptr::write_volatile(bf_u64.add(6), 0);
-        std::ptr::write_volatile(bf_u64.add(7), 0);
-    }
 }
 
 // =============================================================================
@@ -4588,7 +4546,6 @@ pub trait DirectBlueflame: SqState {
 /// Implementation of DirectBlueflame for types implementing SqState.
 ///
 /// This provides the actual SIMD WQE construction and BlueFlame write logic.
-/// Optimized to bypass SQ buffer entirely and write directly to BlueFlame register.
 impl<T: SqState> DirectBlueflame for T {
     fn emit_write_imm_direct(&self, mut params: WriteImmParams) -> Result<DirectBfResult, SubmissionError> {
         // Check BlueFlame availability
@@ -4597,21 +4554,20 @@ impl<T: SqState> DirectBlueflame for T {
         }
 
         const WQEBB_CNT: u16 = 1; // WRITE_IMM with SGE is exactly 64B = 1 WQEBB
+        const WQE_SIZE: usize = 64;
 
-        // Check SQ space (PI management still required even though we don't write to SQ)
+        // Check SQ space
         if self.available() < WQEBB_CNT {
             return Err(SubmissionError::SqFull);
         }
 
-        // Handle wrap-around: if at ring boundary, emit NOP to fill and wrap PI
+        // Handle wrap-around: if WQE would span ring boundary, emit NOP to fill
         let slots_to_end = self.slots_to_end();
         if slots_to_end < WQEBB_CNT {
-            // Post NOP to fill remaining slots (writes to SQ buffer)
+            // Post NOP to fill remaining slots
             unsafe {
                 self.post_nop(slots_to_end);
             }
-            // Ring doorbell for NOP
-            self.ring_sq_doorbell();
             // Re-check space after NOP
             if self.available() < WQEBB_CNT {
                 return Err(SubmissionError::SqFull);
@@ -4623,11 +4579,30 @@ impl<T: SqState> DirectBlueflame for T {
         params.wqe_idx = wqe_idx;
         params.qpn = self.sqn();
 
-        // Update PI (WQE index advances even though we don't write to SQ buffer)
+        // Get SQ buffer pointer for this WQE
+        let wqe_ptr = self.get_wqe_ptr(wqe_idx);
+
+        // Write WQE to SQ buffer using standard functions
+        unsafe {
+            write_ctrl_seg(wqe_ptr, &CtrlSegParams {
+                opmod: 0,
+                opcode: WqeOpcode::RdmaWriteImm as u8,
+                wqe_idx: params.wqe_idx,
+                qpn: params.qpn,
+                ds_cnt: 3, // Ctrl + RDMA + Data = 48 bytes = 3 DS
+                flags: params.flags,
+                imm: params.imm,
+            });
+            write_rdma_seg(wqe_ptr.add(CTRL_SEG_SIZE), params.remote_addr, params.rkey);
+            write_data_seg(wqe_ptr.add(CTRL_SEG_SIZE + RDMA_SEG_SIZE), params.byte_count, params.lkey, params.local_addr);
+        }
+
+        // Update PI first (like emit_wqe! does)
         let new_pi = wqe_idx.wrapping_add(WQEBB_CNT);
         self.pi().set(new_pi);
+        self.last_wqe().set(Some((wqe_ptr, WQE_SIZE)));
 
-        // Flush any pending writes before updating doorbell record
+        // Now ring doorbell (following the same pattern as ring_doorbell())
         mmio_flush_writes!();
 
         // Update doorbell record with current PI
@@ -4635,39 +4610,23 @@ impl<T: SqState> DirectBlueflame for T {
             std::ptr::write_volatile(self.dbrec().add(1), (new_pi as u32).to_be());
         }
 
-        // On ARM64, barrier required between dbrec write and BF write
         udma_to_device_barrier!();
 
-        // Get BlueFlame register pointer
+        // Copy WQE to BlueFlame register (up to bf_size bytes)
         let bf_offset = self.bf_offset().get();
         let bf = unsafe { self.bf_reg().add(bf_offset as usize) };
+        let copy_size = WQE_SIZE.min(self.bf_size() as usize);
 
-        // Build WQE using SIMD and stream directly to BlueFlame register
-        #[cfg(target_arch = "x86_64")]
-        {
-            // Check AVX-512 support at runtime
-            if is_x86_feature_detected!("avx512f") {
-                unsafe {
-                    let wqe = build_write_imm_wqe_avx512(&params);
-                    stream_to_blueflame_avx512(bf, wqe);
-                }
-            } else {
-                // Fallback: build on stack and copy
-                unsafe {
-                    self.emit_write_imm_to_bf_scalar(bf, &params);
-                }
+        // Copy WQE data in 64-bit chunks (same as ring_doorbell)
+        let wqe_u64 = wqe_ptr as *const u64;
+        let bf_u64 = bf as *mut u64;
+        let copy_count = (copy_size + 7) / 8;
+        for i in 0..copy_count {
+            unsafe {
+                std::ptr::write_volatile(bf_u64.add(i), *wqe_u64.add(i));
             }
         }
 
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            let wqe = build_write_imm_wqe_neon(&params);
-            stream_to_blueflame_neon(bf, wqe);
-        }
-
-        // Flush write combining buffer
-        // On x86_64: sfence ensures non-temporal stores are visible
-        // On ARM64: dsb st ensures stores are ordered
         mmio_flush_writes!();
 
         // Toggle BF offset for next operation

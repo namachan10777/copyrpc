@@ -939,11 +939,12 @@ impl<U> EndpointInner<U> {
 
     /// Emit WQE and ring doorbell using direct BlueFlame.
     ///
-    /// Uses the optimized `emit_write_imm_direct()` which constructs WQE
-    /// using SIMD and writes directly to BlueFlame register.
+    /// For single-WQE (non-wrap-around) cases, uses the optimized
+    /// `emit_write_imm_direct()` which writes to SQ buffer and BlueFlame
+    /// register in a single operation with integrated doorbell.
     ///
-    /// For wrap-around cases (data spans ring boundary), emits two WQEs
-    /// sequentially via direct BlueFlame.
+    /// For wrap-around cases (multiple WQEs), falls back to the standard
+    /// emit_wqe! + ring_sq_doorbell() path.
     #[inline(always)]
     fn flush(&self) -> Result<()> {
         let remote_ring = self
@@ -959,71 +960,22 @@ impl<U> EndpointInner<U> {
         }
 
         let delta = end - start;
+        let imm = encode_imm(delta);
+
         let start_offset = (start & (self.send_ring.len() as u64 - 1)) as usize;
         let remote_offset = start & (remote_ring.size - 1);
         let remote_addr = remote_ring.addr + remote_offset;
         let ring_len = self.send_ring.len();
 
-        // Check for wrap-around: if data spans ring boundary, emit two WQEs
+        // Check for wrap-around: if data spans ring boundary, use fallback path
         if start_offset + delta as usize > ring_len {
-            // Wrap-around case: emit two WQEs directly via BlueFlame
-            let part1_len = ring_len - start_offset;
-            let part1_imm = encode_imm(part1_len as u64);
-
-            let count = self.unsignaled_count.get();
-            let qpn = self.qpn();
-            let qp = self.qp.borrow();
-
-            // Part 1: from start_offset to end of ring (always unsignaled)
-            let params1 = WriteImmParams {
-                wqe_idx: 0,
-                qpn: 0,
-                flags: WqeFlags::empty(),
-                imm: part1_imm,
-                remote_addr,
-                rkey: remote_ring.rkey,
-                local_addr: self.send_ring_mr.addr() as u64 + start_offset as u64,
-                byte_count: part1_len as u32,
-                lkey: self.send_ring_mr.lkey(),
-            };
-            qp.emit_write_imm_direct(params1)
-                .map_err(|e| Error::Io(e.into()))?;
-
-            // Part 2: from beginning of ring
-            let part2_len = delta as usize - part1_len;
-            let part2_imm = encode_imm(part2_len as u64);
-            let part2_remote_addr = remote_ring.addr + ((remote_offset + part1_len as u64) & (remote_ring.size - 1));
-
-            let params2 = WriteImmParams {
-                wqe_idx: 0,
-                qpn: 0,
-                flags: WqeFlags::empty(),
-                imm: part2_imm,
-                remote_addr: part2_remote_addr,
-                rkey: remote_ring.rkey,
-                local_addr: self.send_ring_mr.addr() as u64,
-                byte_count: part2_len as u32,
-                lkey: self.send_ring_mr.lkey(),
-            };
-
-            // Signal on part 2 if needed
-            let should_signal = (count + 1) >= SIGNAL_INTERVAL;
-            if should_signal {
-                qp.emit_write_imm_direct_signaled(params2, SrqEntry { qpn, is_read: false })
-                    .map_err(|e| Error::Io(e.into()))?;
-                self.unsignaled_count.set(0);
-            } else {
-                qp.emit_write_imm_direct(params2)
-                    .map_err(|e| Error::Io(e.into()))?;
-                self.unsignaled_count.set(count + 2); // 2 WQEs emitted
-            }
-
-            self.flush_start_pos.set(end);
+            // Wrap-around case: use existing emit_wqe! + ring_sq_doorbell()
+            self.emit_wqe()?;
+            self.qp.borrow().ring_sq_doorbell();
             return Ok(());
         }
 
         // Hot path: single WQE, use direct BlueFlame
-        let imm = encode_imm(delta);
         let count = self.unsignaled_count.get();
         let should_signal = count >= SIGNAL_INTERVAL;
         let qpn = self.qpn();
