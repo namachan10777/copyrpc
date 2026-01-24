@@ -229,6 +229,14 @@ pub(super) struct UdRecvQueueState<Entry> {
     pub(super) pi: Cell<u16>,
     pub(super) ci: Cell<u16>,
     pub(super) dbrec: *mut u32,
+    /// BlueFlame register pointer
+    pub(super) bf_reg: *mut u8,
+    /// BlueFlame size (64 or 0 if not available)
+    pub(super) bf_size: u32,
+    /// Current BlueFlame offset (alternates between 0 and bf_size)
+    pub(super) bf_offset: Cell<u32>,
+    /// Last posted WQE pointer and size (for BlueFlame doorbell)
+    pub(super) last_wqe: Cell<Option<(*mut u8, usize)>>,
     /// Entry table (all WQEs are signaled, uses Cell for interior mutability)
     pub(super) table: Box<[Cell<Option<Entry>>]>,
 }
@@ -251,11 +259,42 @@ impl<Entry> UdRecvQueueState<Entry> {
         (self.wqe_cnt as u32) - (self.pi.get().wrapping_sub(self.ci.get()) as u32)
     }
 
+    /// Ring the doorbell using BlueFlame.
+    ///
+    /// Writes the first 8 bytes (control segment) of the last WQE to the BlueFlame register.
+    /// Falls back to DBREC-only if BlueFlame is not available or no WQE was posted.
     fn ring_doorbell(&self) {
+        let last_wqe = self.last_wqe.take();
+
         mmio_flush_writes!();
+
         unsafe {
             std::ptr::write_volatile(self.dbrec, (self.pi.get() as u32).to_be());
         }
+
+        // If BlueFlame is available and we have a last WQE, write to BF register
+        if self.bf_size > 0 {
+            if let Some((last_wqe_ptr, _)) = last_wqe {
+                udma_to_device_barrier!();
+
+                // Write first 8 bytes of WQE to BlueFlame register
+                let bf_offset = self.bf_offset.get();
+                let bf = unsafe { self.bf_reg.add(bf_offset as usize) as *mut u64 };
+                let ctrl = last_wqe_ptr as *const u64;
+                unsafe {
+                    std::ptr::write_volatile(bf, *ctrl);
+                }
+
+                mmio_flush_writes!();
+                self.bf_offset.set(bf_offset ^ self.bf_size);
+            }
+        }
+    }
+
+    /// Set the last WQE pointer for BlueFlame doorbell.
+    #[inline]
+    pub(super) fn set_last_wqe(&self, wqe_ptr: *mut u8, wqe_size: usize) {
+        self.last_wqe.set(Some((wqe_ptr, wqe_size)));
     }
 }
 
@@ -871,6 +910,10 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIb<SqEntry, RqEntry, OnSq
             pi: Cell::new(0),
             ci: Cell::new(0),
             dbrec: info.dbrec,
+            bf_reg: info.bf_reg,
+            bf_size: info.bf_size,
+            bf_offset: Cell::new(0),
+            last_wqe: Cell::new(None),
             table: (0..rq_wqe_cnt).map(|_| Cell::new(None)).collect(),
         }));
 
@@ -912,13 +955,15 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIb<SqEntry, RqEntry, OnSq
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "RQ full"));
         }
         let wqe_idx = rq.pi.get();
-        unsafe {
+        let wqe_ptr = unsafe {
             let wqe_ptr = rq.get_wqe_ptr(wqe_idx);
             write_data_seg(wqe_ptr, len, lkey, addr);
-        }
+            wqe_ptr
+        };
         let idx = (wqe_idx as usize) & ((rq.wqe_cnt - 1) as usize);
         rq.table[idx].set(Some(entry));
         rq.pi.set(rq.pi.get().wrapping_add(1));
+        rq.set_last_wqe(wqe_ptr, DATA_SEG_SIZE);
         Ok(())
     }
 
@@ -1106,6 +1151,10 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpRoCE<SqEntry, RqEntry, On
             pi: Cell::new(0),
             ci: Cell::new(0),
             dbrec: info.dbrec,
+            bf_reg: info.bf_reg,
+            bf_size: info.bf_size,
+            bf_offset: Cell::new(0),
+            last_wqe: Cell::new(None),
             table: (0..rq_wqe_cnt).map(|_| Cell::new(None)).collect(),
         }));
 
