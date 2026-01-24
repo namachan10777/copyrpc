@@ -44,14 +44,14 @@ const SEND_RECV_RQ_SIZE: usize = SEND_RECV_QUEUE_DEPTH;
 const SEND_RECV_BUFFER_SIZE: usize = SEND_RECV_QUEUE_DEPTH * 64; // 64 bytes per entry (like send_recv_small.rs)
 
 // RDMA WRITE/READ benchmark constants
-const RDMA_QUEUE_DEPTH: usize = 128;
+const RDMA_QUEUE_DEPTH: usize = 1024;
 const RDMA_SIGNAL_INTERVAL: usize = 4; // 1/4 signaled
+const RDMA_MSG_SIZE: usize = 1024 * 1024; // 1MiB per WQE
+const RDMA_BUFFER_SIZE: usize = 1024 * 1024; // 1MiB total (WQEs write to same buffer)
 
 // Common constants
 const SMALL_MSG_SIZE: usize = 32;
-const LARGE_MSG_SIZE: usize = 4096;
 const PAGE_SIZE: usize = 4096;
-const RDMA_BUFFER_SIZE: usize = RDMA_QUEUE_DEPTH * LARGE_MSG_SIZE;
 
 // =============================================================================
 // Aligned Buffer
@@ -860,7 +860,7 @@ where
 }
 
 /// 4KiB WRITE benchmark.
-fn run_write_4k<SF, RF>(
+fn run_write_1m<SF, RF>(
     endpoint: &mut RdmaLoopbackEndpoint<SF, RF>,
     iters: u64,
     relaxed: bool,
@@ -913,26 +913,24 @@ where
             let ctx = qp.emit_ctx().expect("emit_ctx failed");
 
             for _ in 0..can_send {
-                let i = send_idx % RDMA_QUEUE_DEPTH;
-                let offset = (i * LARGE_MSG_SIZE) as u64;
                 // Signal at the end of each interval
                 let is_interval_end = (send_idx + 1) % signal_interval == 0;
                 let is_last = posted + 1 == iters;
                 if is_interval_end || is_last {
                     emit_wqe!(&ctx, write {
                         flags: wqe_flags,
-                        remote_addr: remote_addr + offset,
+                        remote_addr: remote_addr,
                         rkey: rkey,
-                        sge: { addr: local_addr + offset, len: LARGE_MSG_SIZE as u32, lkey: lkey },
+                        sge: { addr: local_addr, len: RDMA_MSG_SIZE as u32, lkey: lkey },
                         signaled: send_idx as u64,
                     }).expect("emit_wqe failed");
                     signals_posted += 1;
                 } else {
                     emit_wqe!(&ctx, write {
                         flags: wqe_flags,
-                        remote_addr: remote_addr + offset,
+                        remote_addr: remote_addr,
                         rkey: rkey,
-                        sge: { addr: local_addr + offset, len: LARGE_MSG_SIZE as u32, lkey: lkey },
+                        sge: { addr: local_addr, len: RDMA_MSG_SIZE as u32, lkey: lkey },
                     }).expect("emit_wqe failed");
                 }
                 send_idx += 1;
@@ -947,7 +945,7 @@ where
 }
 
 /// 4KiB READ benchmark.
-fn run_read_4k<SF, RF>(
+fn run_read_1m<SF, RF>(
     endpoint: &mut RdmaLoopbackEndpoint<SF, RF>,
     iters: u64,
     relaxed: bool,
@@ -1000,26 +998,24 @@ where
             let ctx = qp.emit_ctx().expect("emit_ctx failed");
 
             for _ in 0..can_send {
-                let i = send_idx % RDMA_QUEUE_DEPTH;
-                let offset = (i * LARGE_MSG_SIZE) as u64;
                 // Signal at the end of each interval
                 let is_interval_end = (send_idx + 1) % signal_interval == 0;
                 let is_last = posted + 1 == iters;
                 if is_interval_end || is_last {
                     emit_wqe!(&ctx, read {
                         flags: wqe_flags,
-                        remote_addr: remote_addr + offset,
+                        remote_addr: remote_addr,
                         rkey: rkey,
-                        sge: { addr: local_addr + offset, len: LARGE_MSG_SIZE as u32, lkey: lkey },
+                        sge: { addr: local_addr, len: RDMA_MSG_SIZE as u32, lkey: lkey },
                         signaled: send_idx as u64,
                     }).expect("emit_wqe failed");
                     signals_posted += 1;
                 } else {
                     emit_wqe!(&ctx, read {
                         flags: wqe_flags,
-                        remote_addr: remote_addr + offset,
+                        remote_addr: remote_addr,
                         rkey: rkey,
-                        sge: { addr: local_addr + offset, len: LARGE_MSG_SIZE as u32, lkey: lkey },
+                        sge: { addr: local_addr, len: RDMA_MSG_SIZE as u32, lkey: lkey },
                     }).expect("emit_wqe failed");
                 }
                 send_idx += 1;
@@ -1093,7 +1089,7 @@ fn bench_send_latency_32b(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_write_4k(c: &mut Criterion) {
+fn bench_write_1m(c: &mut Criterion) {
     let setup = match setup_rdma_loopback_benchmark(false) {
         Some(s) => s,
         None => {
@@ -1106,21 +1102,21 @@ fn bench_write_4k(c: &mut Criterion) {
     let _pd = setup._pd;
     let endpoint = RefCell::new(setup.endpoint);
 
-    let mut group = c.benchmark_group("write_4k");
+    let mut group = c.benchmark_group("write_1m");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(3));
-    group.throughput(Throughput::Bytes(LARGE_MSG_SIZE as u64));
+    group.throughput(Throughput::Bytes(RDMA_MSG_SIZE as u64));
 
     group.bench_function("normal", |b| {
         b.iter_custom(|iters| {
-            run_write_4k(&mut endpoint.borrow_mut(), iters, false)
+            run_write_1m(&mut endpoint.borrow_mut(), iters, false)
         });
     });
 
     group.finish();
 }
 
-fn bench_write_4k_relaxed(c: &mut Criterion) {
+fn bench_write_1m_relaxed(c: &mut Criterion) {
     let setup = match setup_rdma_loopback_benchmark(true) {
         Some(s) => s,
         None => {
@@ -1133,21 +1129,21 @@ fn bench_write_4k_relaxed(c: &mut Criterion) {
     let _pd = setup._pd;
     let endpoint = RefCell::new(setup.endpoint);
 
-    let mut group = c.benchmark_group("write_4k");
+    let mut group = c.benchmark_group("write_1m");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(3));
-    group.throughput(Throughput::Bytes(LARGE_MSG_SIZE as u64));
+    group.throughput(Throughput::Bytes(RDMA_MSG_SIZE as u64));
 
     group.bench_function("relaxed", |b| {
         b.iter_custom(|iters| {
-            run_write_4k(&mut endpoint.borrow_mut(), iters, true)
+            run_write_1m(&mut endpoint.borrow_mut(), iters, true)
         });
     });
 
     group.finish();
 }
 
-fn bench_read_4k(c: &mut Criterion) {
+fn bench_read_1m(c: &mut Criterion) {
     let setup = match setup_rdma_loopback_benchmark(false) {
         Some(s) => s,
         None => {
@@ -1160,21 +1156,21 @@ fn bench_read_4k(c: &mut Criterion) {
     let _pd = setup._pd;
     let endpoint = RefCell::new(setup.endpoint);
 
-    let mut group = c.benchmark_group("read_4k");
+    let mut group = c.benchmark_group("read_1m");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(3));
-    group.throughput(Throughput::Bytes(LARGE_MSG_SIZE as u64));
+    group.throughput(Throughput::Bytes(RDMA_MSG_SIZE as u64));
 
     group.bench_function("normal", |b| {
         b.iter_custom(|iters| {
-            run_read_4k(&mut endpoint.borrow_mut(), iters, false)
+            run_read_1m(&mut endpoint.borrow_mut(), iters, false)
         });
     });
 
     group.finish();
 }
 
-fn bench_read_4k_relaxed(c: &mut Criterion) {
+fn bench_read_1m_relaxed(c: &mut Criterion) {
     let setup = match setup_rdma_loopback_benchmark(true) {
         Some(s) => s,
         None => {
@@ -1187,14 +1183,14 @@ fn bench_read_4k_relaxed(c: &mut Criterion) {
     let _pd = setup._pd;
     let endpoint = RefCell::new(setup.endpoint);
 
-    let mut group = c.benchmark_group("read_4k");
+    let mut group = c.benchmark_group("read_1m");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(3));
-    group.throughput(Throughput::Bytes(LARGE_MSG_SIZE as u64));
+    group.throughput(Throughput::Bytes(RDMA_MSG_SIZE as u64));
 
     group.bench_function("relaxed", |b| {
         b.iter_custom(|iters| {
-            run_read_4k(&mut endpoint.borrow_mut(), iters, true)
+            run_read_1m(&mut endpoint.borrow_mut(), iters, true)
         });
     });
 
@@ -1205,9 +1201,9 @@ criterion_group!(
     benches,
     bench_send_inline_32b,
     bench_send_latency_32b,
-    bench_write_4k,
-    bench_write_4k_relaxed,
-    bench_read_4k,
-    bench_read_4k_relaxed,
+    bench_write_1m,
+    bench_write_1m_relaxed,
+    bench_read_1m,
+    bench_read_1m_relaxed,
 );
 criterion_main!(benches);
