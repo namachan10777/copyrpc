@@ -133,10 +133,14 @@ impl<Entry, TableType> SendQueueState<Entry, TableType> {
         self.wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
     }
 
-    /// Ring the doorbell using regular doorbell write.
+    /// Ring the doorbell using BlueFlame.
+    ///
+    /// Copies the last WQE (up to bf_size bytes) to the BlueFlame register.
+    /// For WQEs larger than bf_size, only the first bf_size bytes are copied via BF,
+    /// and the NIC reads the rest from host memory.
     #[inline]
     fn ring_doorbell(&self) {
-        let Some((last_wqe_ptr, _)) = self.last_wqe.take() else {
+        let Some((last_wqe_ptr, wqe_size)) = self.last_wqe.take() else {
             return;
         };
 
@@ -148,17 +152,21 @@ impl<Entry, TableType> SendQueueState<Entry, TableType> {
 
         udma_to_device_barrier!();
 
-        self.ring_db(last_wqe_ptr);
-    }
-
-    #[inline]
-    fn ring_db(&self, wqe_ptr: *mut u8) {
+        // Copy as much of the WQE as fits in BF buffer
         let bf_offset = self.bf_offset.get();
-        let bf = unsafe { self.bf_reg.add(bf_offset as usize) as *mut u64 };
-        let ctrl = wqe_ptr as *const u64;
-        unsafe {
-            std::ptr::write_volatile(bf, *ctrl);
+        let bf = unsafe { self.bf_reg.add(bf_offset as usize) };
+        let copy_size = wqe_size.min(self.bf_size as usize);
+
+        // Copy WQE data in 64-bit chunks
+        let wqe_u64 = last_wqe_ptr as *const u64;
+        let bf_u64 = bf as *mut u64;
+        let copy_count = (copy_size + 7) / 8;
+        for i in 0..copy_count {
+            unsafe {
+                std::ptr::write_volatile(bf_u64.add(i), *wqe_u64.add(i));
+            }
         }
+
         mmio_flush_writes!();
         self.bf_offset.set(bf_offset ^ self.bf_size);
     }
@@ -598,7 +606,11 @@ impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> RcQ
         self.sq.as_ref().map(|sq| sq.available()).unwrap_or(0)
     }
 
-    /// Ring the SQ doorbell to notify HCA of new WQEs.
+    /// Ring the SQ doorbell using BlueFlame.
+    ///
+    /// Copies the last WQE (up to bf_size bytes) to the BlueFlame register.
+    /// For WQEs larger than bf_size, only the first bf_size bytes are copied via BF,
+    /// and the NIC reads the rest from host memory.
     pub fn ring_sq_doorbell(&self) {
         if let Some(sq) = self.sq.as_ref() {
             sq.ring_doorbell();

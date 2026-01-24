@@ -808,7 +808,7 @@ where
 }
 
 /// 32B inline send latency benchmark (ping-pong, queue depth = 1).
-fn run_blueflame_latency<SF, RF>(
+fn run_send_latency<SF, RF>(
     client: &mut SendRecvEndpoint<SF, RF>,
     iters: u64,
 ) -> Duration
@@ -1065,7 +1065,7 @@ fn bench_send_inline_32b(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_send_blueflame_32b(c: &mut Criterion) {
+fn bench_send_latency_32b(c: &mut Criterion) {
     let setup = match setup_send_recv_benchmark() {
         Some(s) => s,
         None => {
@@ -1079,14 +1079,14 @@ fn bench_send_blueflame_32b(c: &mut Criterion) {
     let client = RefCell::new(setup.client);
     let _server_handle = setup._server_handle;
 
-    let mut group = c.benchmark_group("blueflame");
+    let mut group = c.benchmark_group("latency");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(1));
     group.throughput(Throughput::Elements(1));
 
-    group.bench_function("32B_latency", |b| {
+    group.bench_function("32B", |b| {
         b.iter_custom(|iters| {
-            run_blueflame_latency(&mut client.borrow_mut(), iters)
+            run_send_latency(&mut client.borrow_mut(), iters)
         });
     });
 
@@ -1204,7 +1204,7 @@ fn bench_read_4k_relaxed(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_send_inline_32b,
-    bench_send_blueflame_32b,
+    bench_send_latency_32b,
     bench_write_4k,
     bench_write_4k_relaxed,
     bench_read_4k,
