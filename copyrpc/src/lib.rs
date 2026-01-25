@@ -561,58 +561,52 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
         // Decode the immediate value to get the offset delta
         let delta = decode_imm(cqe.imm);
 
-        // Update recv_ring_producer
-        {
-            let endpoint_ref = endpoint.borrow();
-            endpoint_ref.recv_ring_producer.set(endpoint_ref.recv_ring_producer.get() + delta);
-        }
+        // Borrow endpoint once to update producer and get ring metadata
+        let endpoint_ref = endpoint.borrow();
+        let new_producer = endpoint_ref.recv_ring_producer.get() + delta;
+        endpoint_ref.recv_ring_producer.set(new_producer);
+        let recv_ring_len = endpoint_ref.recv_ring.len();
+        let recv_ring_mask = recv_ring_len as u64 - 1;
+        drop(endpoint_ref);
 
         // Process all messages in the batch
-        // Loop while there are unprocessed messages (last_recv_pos < recv_ring_producer)
         loop {
-            let (call_id, _piggyback, payload_len, recv_pos, header_offset, recv_ring_len, _producer) = {
-                let endpoint_ref = endpoint.borrow();
-                let pos = endpoint_ref.last_recv_pos.get();
-                let producer = endpoint_ref.recv_ring_producer.get();
+            let endpoint_ref = endpoint.borrow();
+            let pos = endpoint_ref.last_recv_pos.get();
+            let producer = endpoint_ref.recv_ring_producer.get();
 
-                // Check if there are more messages to process
-                if pos >= producer {
-                    break;
-                }
+            // Check if there are more messages to process
+            if pos >= producer {
+                // Update consumer_position for RDMA READ by remote
+                endpoint_ref.consumer_position.store(pos, Ordering::Release);
+                break;
+            }
 
-                let header_offset = (pos & (endpoint_ref.recv_ring.len() as u64 - 1)) as usize;
-                let header_slice = &endpoint_ref.recv_ring[header_offset..header_offset + HEADER_SIZE];
+            let header_offset = (pos & recv_ring_mask) as usize;
+            let header_slice = &endpoint_ref.recv_ring[header_offset..header_offset + HEADER_SIZE];
 
-                let (call_id, piggyback, payload_len) = unsafe {
-                    decode_header(header_slice.as_ptr())
-                };
-
-                endpoint_ref.remote_consumer.update(piggyback as u64);
-
-                (call_id, piggyback, payload_len, pos, header_offset, endpoint_ref.recv_ring.len(), producer)
+            let (call_id, piggyback, payload_len) = unsafe {
+                decode_header(header_slice.as_ptr())
             };
 
-            // Check for padding marker first
+            endpoint_ref.remote_consumer.update(piggyback as u64);
+
+            // Check for padding marker (rare case)
             if is_padding_marker(call_id) {
-                // Padding marker: skip to ring start
-                // piggyback contains the remaining bytes to skip (including header)
-                let remaining = _piggyback as u64;
-                let endpoint_ref = endpoint.borrow();
-                // Advance last_recv_pos by remaining bytes to jump to ring start
-                endpoint_ref.last_recv_pos.set(recv_pos + remaining);
-                // Continue to process next message
+                endpoint_ref.last_recv_pos.set(pos + piggyback as u64);
+                drop(endpoint_ref);
                 continue;
             }
 
+            // Compute message size once
+            let msg_size = padded_message_size(payload_len);
+            let new_pos = pos + msg_size;
+
             if is_response(call_id) {
-                // This is a response - invoke callback
+                // Response - invoke callback
                 let original_call_id = from_response_id(call_id);
-
-                let endpoint_ref = endpoint.borrow();
                 let user_data = endpoint_ref.pending_calls.borrow_mut().try_remove(original_call_id as usize);
-
-                let msg_size = padded_message_size(payload_len);
-                endpoint_ref.last_recv_pos.set(recv_pos + msg_size);
+                endpoint_ref.last_recv_pos.set(new_pos);
 
                 if let Some(user_data) = user_data {
                     let data_offset = header_offset + HEADER_SIZE;
@@ -620,33 +614,20 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
                     (self.on_response)(user_data, data_slice);
                 }
             } else {
-                // This is a request - push to recv_stack
-                let data_offset = header_offset + HEADER_SIZE;
-
-                // Advance last_recv_pos first
-                {
-                    let endpoint_ref = endpoint.borrow();
-                    let msg_size = padded_message_size(payload_len);
-                    endpoint_ref.last_recv_pos.set(recv_pos + msg_size);
-                }
+                // Request - push to recv_stack
+                endpoint_ref.last_recv_pos.set(new_pos);
+                drop(endpoint_ref);
 
                 self.recv_stack.borrow_mut().push(RecvMessage {
                     endpoint: endpoint.clone(),
                     qpn,
                     call_id,
-                    data_offset,
+                    data_offset: header_offset + HEADER_SIZE,
                     data_len: payload_len as usize,
-                    recv_pos,
+                    recv_pos: pos,
                     recv_ring_len,
                 });
             }
-        }
-
-        // Update consumer_position for RDMA READ by remote
-        {
-            let endpoint_ref = endpoint.borrow();
-            let final_pos = endpoint_ref.last_recv_pos.get();
-            endpoint_ref.consumer_position.store(final_pos, Ordering::Release);
         }
     }
 }
