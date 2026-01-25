@@ -1,0 +1,18 @@
+[package]
+name = "erpc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mlx5 = { path = "../mlx5" }
+libc = "0.2"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "rpc_bench"
+harness = false
+
+[lints.clippy]
+type_complexity = "allow"
