@@ -10,7 +10,6 @@
 //! ```
 
 use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -53,8 +52,8 @@ const SMALL_MSG_SIZE: usize = 32;
 const LARGE_MSG_SIZE: usize = 4000;
 
 // Multi-QP benchmark parameters
-const NUM_QPS: usize = 1;
-const PIPELINE_DEPTH_PER_QP: usize = 256;
+const NUM_QPS: usize = 8;
+const PIPELINE_DEPTH_PER_QP: usize = 1024;
 
 // =============================================================================
 // Connection Info
@@ -116,15 +115,20 @@ fn open_mlx5_device() -> Option<(mlx5::device::Context, u8, PortAttr)> {
 // =============================================================================
 
 struct BenchmarkSetup {
-    client: Rpc,
+    client: Rpc<()>,
     session: erpc::SessionHandle,
     _server_handle: ServerHandle,
 }
 
 struct MultiQpBenchmarkSetup {
-    clients: Vec<Rpc>,
+    clients: Vec<Rpc<usize>>,
     sessions: Vec<erpc::SessionHandle>,
     _server_handles: Vec<ServerHandle>,
+}
+
+// Shared completion counter for client callbacks
+thread_local! {
+    static COMPLETED: RefCell<u64> = RefCell::new(0);
 }
 
 fn setup_benchmark() -> Option<BenchmarkSetup> {
@@ -140,7 +144,10 @@ fn setup_benchmark() -> Option<BenchmarkSetup> {
         .with_max_send_wr((pipeline_depth * 2) as u32)
         .with_max_recv_wr((pipeline_depth * 2) as u32);
 
-    let client = Rpc::new(&ctx, port, config.clone()).ok()?;
+    // Create client with on_response callback that increments counter
+    let client: Rpc<()> = Rpc::new(&ctx, port, config.clone(), |_, _| {
+        COMPLETED.with(|c| *c.borrow_mut() += 1);
+    }).ok()?;
     let client_info = client.local_info();
     let client_conn_info = ConnectionInfo {
         qpn: client_info.qpn,
@@ -159,8 +166,9 @@ fn setup_benchmark() -> Option<BenchmarkSetup> {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let server_stop = stop_flag.clone();
 
+    let server_config = config.clone();
     let handle = thread::spawn(move || {
-        server_thread_main(server_info_tx, client_info_rx, server_ready_clone, server_stop);
+        server_thread_main_with_config(server_info_tx, client_info_rx, server_ready_clone, server_stop, server_config);
     });
 
     client_info_tx.send(client_conn_info).ok()?;
@@ -206,103 +214,210 @@ fn setup_benchmark() -> Option<BenchmarkSetup> {
     })
 }
 
+// Per-QP completion counters for multi-QP benchmark
+thread_local! {
+    static MULTI_QP_COMPLETED: RefCell<Vec<u64>> = RefCell::new(Vec::new());
+}
+
 fn setup_multi_qp_benchmark(num_qps: usize, pipeline_depth: usize) -> Option<MultiQpBenchmarkSetup> {
     set_cpu_affinity(CLIENT_CORE);
 
     let (ctx, port, _port_attr) = open_mlx5_device()?;
 
-    let mut clients = Vec::with_capacity(num_qps);
-    let mut sessions = Vec::with_capacity(num_qps);
-    let mut server_handles = Vec::with_capacity(num_qps);
+    let config = RpcConfig::default()
+        .with_req_window(pipeline_depth)
+        .with_session_credits(pipeline_depth * 2)
+        .with_num_recv_buffers(pipeline_depth * 4)
+        .with_max_send_wr((pipeline_depth * 4) as u32)
+        .with_max_recv_wr((pipeline_depth * 4) as u32);
 
-    for i in 0..num_qps {
-        let config = RpcConfig::default()
-            .with_req_window(pipeline_depth)
-            .with_session_credits(pipeline_depth + 64)
-            .with_num_recv_buffers(pipeline_depth * 2)
-            .with_max_send_wr((pipeline_depth * 2) as u32)
-            .with_max_recv_wr((pipeline_depth * 2) as u32);
+    // Initialize per-QP completion counters
+    MULTI_QP_COMPLETED.with(|c| {
+        let mut v = c.borrow_mut();
+        v.clear();
+        v.resize(num_qps, 0);
+    });
 
-        let client = Rpc::new(&ctx, port, config.clone()).ok()?;
-        let client_info = client.local_info();
-        let client_conn_info = ConnectionInfo {
-            qpn: client_info.qpn,
-            qkey: client_info.qkey,
-            lid: client_info.lid,
-        };
-
-        let (server_info_tx, server_info_rx): (Sender<ConnectionInfo>, Receiver<ConnectionInfo>) =
-            mpsc::channel();
-        let (client_info_tx, client_info_rx): (Sender<ConnectionInfo>, Receiver<ConnectionInfo>) =
-            mpsc::channel();
-        let server_ready = Arc::new(AtomicU32::new(0));
-        let server_ready_clone = server_ready.clone();
-
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let server_stop = stop_flag.clone();
-
-        let server_config = config.clone();
-        let handle = thread::spawn(move || {
-            server_thread_main_with_config(
-                server_info_tx,
-                client_info_rx,
-                server_ready_clone,
-                server_stop,
-                server_config,
-            );
+    // Create all clients first
+    let mut clients: Vec<Rpc<usize>> = Vec::with_capacity(num_qps);
+    let mut client_infos = Vec::with_capacity(num_qps);
+    for qp_idx in 0..num_qps {
+        // Each client gets a callback that increments its specific counter
+        let client: Rpc<usize> = Rpc::new(&ctx, port, config.clone(), move |_, _| {
+            MULTI_QP_COMPLETED.with(|c| {
+                let mut v = c.borrow_mut();
+                if qp_idx < v.len() {
+                    v[qp_idx] += 1;
+                }
+            });
+        }).ok()?;
+        let info = client.local_info();
+        client_infos.push(ConnectionInfo {
+            qpn: info.qpn,
+            qkey: info.qkey,
+            lid: info.lid,
         });
+        clients.push(client);
+    }
 
-        client_info_tx.send(client_conn_info).ok()?;
-        let server_info = server_info_rx.recv().ok()?;
+    // Setup channels for server thread (single thread handles all QPs)
+    let (client_infos_tx, client_infos_rx): (Sender<Vec<ConnectionInfo>>, Receiver<Vec<ConnectionInfo>>) =
+        mpsc::channel();
+    let (server_infos_tx, server_infos_rx): (Sender<Vec<ConnectionInfo>>, Receiver<Vec<ConnectionInfo>>) =
+        mpsc::channel();
+    let server_ready = Arc::new(AtomicU32::new(0));
+    let server_ready_clone = server_ready.clone();
 
-        while server_ready.load(Ordering::Acquire) == 0 {
-            std::hint::spin_loop();
-        }
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let server_stop = stop_flag.clone();
 
+    let server_config = config.clone();
+    let handle = thread::spawn(move || {
+        multi_qp_server_thread(
+            server_infos_tx,
+            client_infos_rx,
+            server_ready_clone,
+            server_stop,
+            server_config,
+            num_qps,
+        );
+    });
+
+    // Send all client infos to server
+    client_infos_tx.send(client_infos).ok()?;
+    let server_infos = server_infos_rx.recv().ok()?;
+
+    // Wait for server to be ready
+    while server_ready.load(Ordering::Acquire) == 0 {
+        std::hint::spin_loop();
+    }
+
+    // Create sessions for all clients
+    let mut sessions = Vec::with_capacity(num_qps);
+    for (i, client) in clients.iter().enumerate() {
         let server_remote = RemoteInfo {
-            qpn: server_info.qpn,
-            qkey: server_info.qkey,
-            lid: server_info.lid,
+            qpn: server_infos[i].qpn,
+            qkey: server_infos[i].qkey,
+            lid: server_infos[i].lid,
         };
         let session = client.create_session(&server_remote).ok()?;
+        sessions.push(session);
+    }
 
-        let server_handle = ServerHandle {
-            stop_flag,
-            handle: Some(handle),
-        };
-
-        // Wait for session handshake
-        let handshake_start = std::time::Instant::now();
-        let handshake_timeout = Duration::from_secs(5);
-        while handshake_start.elapsed() < handshake_timeout {
-            client.run_event_loop_once();
-            if client.is_session_connected(session) {
-                break;
-            }
-            std::thread::sleep(Duration::from_micros(100));
-        }
-
-        if !client.is_session_connected(session) {
-            eprintln!("Session {} handshake failed", i);
+    // Wait for all session handshakes
+    let handshake_start = std::time::Instant::now();
+    let handshake_timeout = Duration::from_secs(5);
+    loop {
+        if handshake_start.elapsed() >= handshake_timeout {
+            eprintln!("Session handshake timeout");
             return None;
         }
 
-        clients.push(client);
-        sessions.push(session);
-        server_handles.push(server_handle);
+        let mut all_connected = true;
+        for (i, client) in clients.iter().enumerate() {
+            client.run_event_loop_once();
+            if !client.is_session_connected(sessions[i]) {
+                all_connected = false;
+            }
+        }
+        if all_connected {
+            break;
+        }
+        std::hint::spin_loop();
     }
+
+    let server_handle = ServerHandle {
+        stop_flag,
+        handle: Some(handle),
+    };
 
     Some(MultiQpBenchmarkSetup {
         clients,
         sessions,
-        _server_handles: server_handles,
+        _server_handles: vec![server_handle],
     })
+}
+
+/// Single server thread handling multiple QPs (async-style event loop).
+fn multi_qp_server_thread(
+    infos_tx: Sender<Vec<ConnectionInfo>>,
+    infos_rx: Receiver<Vec<ConnectionInfo>>,
+    ready_signal: Arc<AtomicU32>,
+    stop_flag: Arc<AtomicBool>,
+    config: RpcConfig,
+    num_qps: usize,
+) {
+    set_cpu_affinity(SERVER_CORE);
+
+    let (ctx, port, _port_attr) = match open_mlx5_device() {
+        Some(c) => c,
+        None => return,
+    };
+
+    // Create all server Rpc instances (server doesn't need response callback)
+    let mut servers: Vec<Rpc<()>> = Vec::with_capacity(num_qps);
+    let mut server_infos: Vec<ConnectionInfo> = Vec::with_capacity(num_qps);
+
+    for _ in 0..num_qps {
+        let server: Rpc<()> = match Rpc::new(&ctx, port, config.clone(), |_, _| {}) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        let info = server.local_info();
+        server_infos.push(ConnectionInfo {
+            qpn: info.qpn,
+            qkey: info.qkey,
+            lid: info.lid,
+        });
+        servers.push(server);
+    }
+
+    // Send server infos to client
+    if infos_tx.send(server_infos).is_err() {
+        return;
+    }
+
+    // Receive client infos
+    let client_infos = match infos_rx.recv() {
+        Ok(infos) => infos,
+        Err(_) => return,
+    };
+
+    // Create sessions to clients
+    for (i, server) in servers.iter().enumerate() {
+        let client_remote = RemoteInfo {
+            qpn: client_infos[i].qpn,
+            qkey: client_infos[i].qkey,
+            lid: client_infos[i].lid,
+        };
+        if server.create_session(&client_remote).is_err() {
+            return;
+        }
+    }
+
+    ready_signal.store(1, Ordering::Release);
+
+    // Single event loop for all QPs - poll recv() and reply()
+    while !stop_flag.load(Ordering::Relaxed) {
+        for server in &servers {
+            server.run_event_loop_once();
+            // Process incoming requests and echo back
+            while let Some(req) = server.recv() {
+                if let Err(e) = server.reply(&req, &req.data) {
+                    eprintln!("Server failed to respond: {:?}", e);
+                }
+            }
+        }
+        std::hint::spin_loop();
+    }
 }
 
 // =============================================================================
 // Server Thread
 // =============================================================================
 
+#[allow(dead_code)]
 fn server_thread_main(
     info_tx: Sender<ConnectionInfo>,
     info_rx: Receiver<ConnectionInfo>,
@@ -329,18 +444,11 @@ fn server_thread_main_with_config(
         None => return,
     };
 
-    let server = match Rpc::new(&ctx, port, config) {
+    // Server doesn't need response callback
+    let server: Rpc<()> = match Rpc::new(&ctx, port, config, |_, _| {}) {
         Ok(s) => s,
         Err(_) => return,
     };
-
-    // Echo handler
-    server.set_req_handler(|ctx, resp| {
-        // Echo back the payload
-        if let Err(e) = resp.respond(ctx.data) {
-            eprintln!("Server failed to respond: {:?}", e);
-        }
-    });
 
     let server_info = server.local_info();
     let conn_info = ConnectionInfo {
@@ -370,9 +478,15 @@ fn server_thread_main_with_config(
 
     ready_signal.store(1, Ordering::Release);
 
-    // Server loop
+    // Server loop - poll recv() and reply()
     while !stop_flag.load(Ordering::Relaxed) {
         server.run_event_loop_once();
+        // Process incoming requests and echo back
+        while let Some(req) = server.recv() {
+            if let Err(e) = server.reply(&req, &req.data) {
+                eprintln!("Server failed to respond: {:?}", e);
+            }
+        }
         std::hint::spin_loop();
     }
 }
@@ -383,32 +497,31 @@ fn server_thread_main_with_config(
 
 /// Ping-pong latency benchmark (single request, wait for response).
 fn run_latency_bench(
-    client: &Rpc,
+    client: &Rpc<()>,
     session: erpc::SessionHandle,
     msg_size: usize,
     iters: u64,
 ) -> Duration {
     let request_data = vec![0xAAu8; msg_size];
-    let completed = Rc::new(RefCell::new(0u64));
+
+    // Reset completion counter
+    COMPLETED.with(|c| *c.borrow_mut() = 0);
 
     let start = std::time::Instant::now();
 
-    for _ in 0..iters {
-        let completed_clone = completed.clone();
-
-        if client
-            .enqueue_request(session, 1, &request_data, move |_, _| {
-                *completed_clone.borrow_mut() += 1;
-            })
-            .is_err()
-        {
+    for i in 0..iters {
+        if client.call(session, 1, &request_data, ()).is_err() {
             continue;
         }
 
         // Wait for response
-        let target = *completed.borrow() + 1;
-        while *completed.borrow() < target {
+        let target = i + 1;
+        loop {
             client.run_event_loop_once();
+            let completed = COMPLETED.with(|c| *c.borrow());
+            if completed >= target {
+                break;
+            }
             std::hint::spin_loop();
         }
     }
@@ -418,46 +531,39 @@ fn run_latency_bench(
 
 /// Throughput benchmark (pipelined requests).
 fn run_throughput_bench(
-    client: &Rpc,
+    client: &Rpc<()>,
     session: erpc::SessionHandle,
     msg_size: usize,
     iters: u64,
     pipeline_depth: usize,
 ) -> Duration {
     let request_data = vec![0xAAu8; msg_size];
-    let completed = Rc::new(RefCell::new(0u64));
     let mut sent = 0u64;
+
+    // Reset completion counter
+    COMPLETED.with(|c| *c.borrow_mut() = 0);
 
     let start = std::time::Instant::now();
 
     // Initial fill
     for _ in 0..pipeline_depth.min(iters as usize) {
-        let completed_clone = completed.clone();
-
-        if client
-            .enqueue_request(session, 1, &request_data, move |_, _| {
-                *completed_clone.borrow_mut() += 1;
-            })
-            .is_ok()
-        {
+        if client.call(session, 1, &request_data, ()).is_ok() {
             sent += 1;
         }
     }
 
     // Main loop
-    while *completed.borrow() < iters {
+    loop {
         client.run_event_loop_once();
 
-        // Send more requests if we have capacity
-        while sent < iters && sent - *completed.borrow() < pipeline_depth as u64 {
-            let completed_clone = completed.clone();
+        let completed = COMPLETED.with(|c| *c.borrow());
+        if completed >= iters {
+            break;
+        }
 
-            if client
-                .enqueue_request(session, 1, &request_data, move |_, _| {
-                    *completed_clone.borrow_mut() += 1;
-                })
-                .is_ok()
-            {
+        // Send more requests if we have capacity
+        while sent < iters && sent - completed < pipeline_depth as u64 {
+            if client.call(session, 1, &request_data, ()).is_ok() {
                 sent += 1;
             } else {
                 break;
@@ -472,7 +578,7 @@ fn run_throughput_bench(
 
 /// Multi-QP throughput benchmark (8 QPs, 1024 pipeline depth each).
 fn run_multi_qp_throughput_bench(
-    clients: &[Rpc],
+    clients: &[Rpc<usize>],
     sessions: &[erpc::SessionHandle],
     msg_size: usize,
     iters: u64,
@@ -482,10 +588,16 @@ fn run_multi_qp_throughput_bench(
     let num_qps = clients.len();
     let iters_per_qp = iters / num_qps as u64;
 
-    // Per-QP completion counters
-    let completeds: Vec<Rc<RefCell<u64>>> = (0..num_qps)
-        .map(|_| Rc::new(RefCell::new(0u64)))
-        .collect();
+    // Reset per-QP completion counters
+    MULTI_QP_COMPLETED.with(|c| {
+        let mut v = c.borrow_mut();
+        for i in 0..num_qps {
+            if i < v.len() {
+                v[i] = 0;
+            }
+        }
+    });
+
     let mut sents: Vec<u64> = vec![0; num_qps];
 
     let start = std::time::Instant::now();
@@ -493,12 +605,8 @@ fn run_multi_qp_throughput_bench(
     // Initial fill for all QPs
     for qp_idx in 0..num_qps {
         for _ in 0..pipeline_depth.min(iters_per_qp as usize) {
-            let completed_clone = completeds[qp_idx].clone();
-
             if clients[qp_idx]
-                .enqueue_request(sessions[qp_idx], 1, &request_data, move |_, _| {
-                    *completed_clone.borrow_mut() += 1;
-                })
+                .call(sessions[qp_idx], 1, &request_data, qp_idx)
                 .is_ok()
             {
                 sents[qp_idx] += 1;
@@ -507,25 +615,20 @@ fn run_multi_qp_throughput_bench(
     }
 
     // Main loop - round-robin across all QPs
-    let mut total_completed = 0u64;
     let total_target = iters_per_qp * num_qps as u64;
 
-    while total_completed < total_target {
+    loop {
         // Process all QPs
         for qp_idx in 0..num_qps {
             clients[qp_idx].run_event_loop_once();
 
             // Send more requests if we have capacity
-            let completed = *completeds[qp_idx].borrow();
+            let completed = MULTI_QP_COMPLETED.with(|c| c.borrow()[qp_idx]);
             while sents[qp_idx] < iters_per_qp
                 && sents[qp_idx] - completed < pipeline_depth as u64
             {
-                let completed_clone = completeds[qp_idx].clone();
-
                 if clients[qp_idx]
-                    .enqueue_request(sessions[qp_idx], 1, &request_data, move |_, _| {
-                        *completed_clone.borrow_mut() += 1;
-                    })
+                    .call(sessions[qp_idx], 1, &request_data, qp_idx)
                     .is_ok()
                 {
                     sents[qp_idx] += 1;
@@ -536,7 +639,10 @@ fn run_multi_qp_throughput_bench(
         }
 
         // Update total completed
-        total_completed = completeds.iter().map(|c| *c.borrow()).sum();
+        let total_completed: u64 = MULTI_QP_COMPLETED.with(|c| c.borrow().iter().sum());
+        if total_completed >= total_target {
+            break;
+        }
 
         std::hint::spin_loop();
     }

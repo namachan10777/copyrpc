@@ -17,50 +17,40 @@ use crate::transport::{BufferType, GRH_SIZE, RemoteInfo, TransportEntry, UdTrans
 /// Reserved request type for Session Management packets.
 const SM_REQ_TYPE: u8 = 0xFF;
 
-/// Request context passed to the request handler.
-pub struct ReqContext<'a> {
-    /// Request type.
+/// Response callback type (copyrpc-style).
+pub type OnResponse<U> = Box<dyn Fn(U, &[u8])>;
+
+/// Incoming request from a client (copyrpc-style API).
+pub struct IncomingRequest {
+    /// Request type (application-defined).
     pub req_type: u8,
-    /// Request data (excluding header).
-    pub data: &'a [u8],
-    /// Session number.
+    /// Request data (payload).
+    pub data: Vec<u8>,
+    /// Session number that sent this request.
     pub session_num: u16,
-    /// Request number.
+    /// Request number for correlating with response.
     pub req_num: u64,
 }
-
-/// Response handle for sending responses.
-pub struct RespHandle<'a> {
-    rpc: &'a Rpc,
-    session_num: u16,
-    req_num: u64,
-    req_type: u8,
-}
-
-impl RespHandle<'_> {
-    /// Send the response.
-    pub fn respond(self, data: &[u8]) -> Result<()> {
-        self.rpc.send_response(self.session_num, self.req_num, self.req_type, data)
-    }
-}
-
-/// Continuation for asynchronous response handling.
-pub type Continuation<U> = Box<dyn FnOnce(U, &[u8])>;
-
-/// Request handler function type.
-pub type ReqHandler = Box<dyn Fn(ReqContext<'_>, RespHandle<'_>)>;
 
 /// eRPC instance.
 ///
 /// The main struct for eRPC operations. Manages sessions, buffers,
 /// and the event loop.
-pub struct Rpc {
+///
+/// Generic parameter `U` is the user data type passed to call() and
+/// returned in the on_response callback.
+pub struct Rpc<U>
+where
+    U: 'static,
+{
     /// UD transport layer.
     transport: UdTransport,
     /// Session table.
-    sessions: RefCell<SessionTable<PendingRequest>>,
-    /// Request handler callback.
-    req_handler: RefCell<Option<ReqHandler>>,
+    sessions: RefCell<SessionTable<PendingRequest<U>>>,
+    /// Response callback (copyrpc-style).
+    on_response: OnResponse<U>,
+    /// Receive queue for incoming requests.
+    recv_queue: RefCell<Vec<IncomingRequest>>,
     /// Configuration.
     config: RpcConfig,
     /// Timing wheel for retransmission timeouts.
@@ -74,9 +64,9 @@ pub struct Rpc {
 }
 
 /// Pending request state.
-struct PendingRequest {
-    /// Continuation to call when response is received.
-    continuation: Option<Continuation<()>>,
+struct PendingRequest<U> {
+    /// User data to pass to on_response callback.
+    user_data: Option<U>,
     /// Request buffer indices for all packets (for retransmission).
     req_buf_indices: Vec<usize>,
 }
@@ -86,9 +76,18 @@ struct BufInfo {
     idx: usize,
 }
 
-impl Rpc {
+impl<U: 'static> Rpc<U> {
     /// Create a new RPC instance.
-    pub fn new(ctx: &Context, port: u8, config: RpcConfig) -> Result<Self> {
+    ///
+    /// # Arguments
+    /// * `ctx` - RDMA device context
+    /// * `port` - Port number
+    /// * `config` - RPC configuration
+    /// * `on_response` - Callback invoked when a response is received for a call()
+    pub fn new<F>(ctx: &Context, port: u8, config: RpcConfig, on_response: F) -> Result<Self>
+    where
+        F: Fn(U, &[u8]) + 'static,
+    {
         let transport = UdTransport::new(ctx, port, &config)?;
         let mtu = transport.mtu();
         let pd = transport.pd();
@@ -104,7 +103,8 @@ impl Rpc {
         let rpc = Self {
             transport,
             sessions: RefCell::new(SessionTable::new(config.max_sessions)),
-            req_handler: RefCell::new(None),
+            on_response: Box::new(on_response),
+            recv_queue: RefCell::new(Vec::new()),
             config,
             timing_wheel: RefCell::new(timing_wheel),
             recv_buffers: RefCell::new(recv_buffers),
@@ -116,14 +116,6 @@ impl Rpc {
         rpc.post_recv_buffers()?;
 
         Ok(rpc)
-    }
-
-    /// Set the request handler.
-    pub fn set_req_handler<F>(&self, handler: F)
-    where
-        F: Fn(ReqContext<'_>, RespHandle<'_>) + 'static,
-    {
-        *self.req_handler.borrow_mut() = Some(Box::new(handler));
     }
 
     /// Get the local endpoint information.
@@ -298,20 +290,25 @@ impl Rpc {
         }
     }
 
-    /// Enqueue a request.
+    /// Send an asynchronous RPC request (copyrpc-style API).
     ///
-    /// The continuation will be called when the response is received.
-    /// Supports multi-packet requests for messages larger than MTU.
-    pub fn enqueue_request<F>(
+    /// When the response is received, the `on_response` callback (passed to `Rpc::new()`)
+    /// will be called with the `user_data` and response payload.
+    ///
+    /// Returns the request number (req_num) on success.
+    ///
+    /// # Arguments
+    /// * `session` - Session handle for the target endpoint
+    /// * `req_type` - Application-defined request type
+    /// * `data` - Request payload
+    /// * `user_data` - User data to be passed to on_response callback
+    pub fn call(
         &self,
         session: SessionHandle,
         req_type: u8,
-        req_data: &[u8],
-        cont: F,
-    ) -> Result<()>
-    where
-        F: FnOnce((), &[u8]) + 'static,
-    {
+        data: &[u8],
+        user_data: U,
+    ) -> Result<u64> {
         // Phase 1: Session setup
         let (req_num, sslot_idx, remote_session_num) = {
             let mut sessions = self.sessions.borrow_mut();
@@ -337,7 +334,7 @@ impl Rpc {
         };
 
         // Phase 2: Calculate packet count and prepare buffers
-        let msg_size = req_data.len();
+        let msg_size = data.len();
         let data_per_pkt = self.mtu - PKT_HDR_SIZE;
         let num_pkts = PktHdr::calc_num_pkts(msg_size, self.mtu);
 
@@ -351,7 +348,7 @@ impl Rpc {
             } else {
                 data_per_pkt
             };
-            let pkt_data = &req_data[offset..offset + pkt_data_len];
+            let pkt_data = &data[offset..offset + pkt_data_len];
 
             // Determine packet type
             let pkt_type = if num_pkts == 1 {
@@ -379,7 +376,7 @@ impl Rpc {
             let sess = sessions.get_mut(session).unwrap();
 
             let pending = PendingRequest {
-                continuation: Some(Box::new(cont)),
+                user_data: Some(user_data),
                 req_buf_indices: buf_indices.clone(),
             };
 
@@ -435,7 +432,24 @@ impl Rpc {
         };
         self.timing_wheel.borrow_mut().insert(timer_entry);
 
-        Ok(())
+        Ok(req_num)
+    }
+
+    /// Poll for an incoming request (non-blocking, copyrpc-style API).
+    ///
+    /// Returns `Some(IncomingRequest)` if a request is available,
+    /// `None` if the queue is empty.
+    pub fn recv(&self) -> Option<IncomingRequest> {
+        self.recv_queue.borrow_mut().pop()
+    }
+
+    /// Send a response to a request (copyrpc-style API).
+    ///
+    /// # Arguments
+    /// * `request` - The incoming request to respond to
+    /// * `data` - Response payload
+    pub fn reply(&self, request: &IncomingRequest, data: &[u8]) -> Result<()> {
+        self.send_response(request.session_num, request.req_num, request.req_type, data)
     }
 
     /// Send a response to a request.
@@ -772,27 +786,14 @@ impl Rpc {
         Ok(())
     }
 
-    /// Handle an incoming request.
+    /// Handle an incoming request by pushing it to the recv_queue.
     fn handle_request(&self, hdr: &PktHdr, payload: &[u8]) -> Result<()> {
-        let handler = self.req_handler.borrow();
-        if let Some(ref h) = *handler {
-            let ctx = ReqContext {
-                req_type: hdr.req_type(),
-                data: payload,
-                session_num: hdr.dest_session_num(),
-                req_num: hdr.req_num(),
-            };
-
-            let resp_handle = RespHandle {
-                rpc: self,
-                session_num: hdr.dest_session_num(),
-                req_num: hdr.req_num(),
-                req_type: hdr.req_type(),
-            };
-
-            h(ctx, resp_handle);
-        }
-
+        self.recv_queue.borrow_mut().push(IncomingRequest {
+            req_type: hdr.req_type(),
+            data: payload.to_vec(),
+            session_num: hdr.dest_session_num(),
+            req_num: hdr.req_num(),
+        });
         Ok(())
     }
 
@@ -803,7 +804,7 @@ impl Rpc {
         let msg_size = hdr.msg_size();
         let num_pkts = PktHdr::calc_num_pkts(msg_size, self.mtu);
 
-        let (is_complete, continuation, data, req_buf_indices) = {
+        let (is_complete, user_data, data, req_buf_indices) = {
             let mut sessions = self.sessions.borrow_mut();
             let handle = SessionHandle(dest_session);
             let sess = sessions.get_mut(handle).ok_or(Error::SessionNotFound(dest_session))?;
@@ -865,9 +866,9 @@ impl Rpc {
                     let pending = sslot.user_data.take();
                     let resp_data = sslot.take_resp_buf();
 
-                    // Extract request buffer indices and continuation from pending
-                    let (cont, req_bufs) = pending
-                        .map(|p| (p.continuation, p.req_buf_indices))
+                    // Extract request buffer indices and user_data from pending
+                    let (ud, req_bufs) = pending
+                        .map(|p| (p.user_data, p.req_buf_indices))
                         .unwrap_or((None, Vec::new()));
 
                     // Mark slot as free
@@ -881,7 +882,7 @@ impl Rpc {
                         }
                     }
 
-                    (true, cont, resp_data, req_bufs)
+                    (true, ud, resp_data, req_bufs)
                 } else {
                     (false, None, None, Vec::new())
                 }
@@ -897,14 +898,14 @@ impl Rpc {
                 // Return credit
                 sess.return_credit();
 
-                // Get the slot and extract continuation
+                // Get the slot and extract user_data
                 let sslot = sess.sslot_mut(sslot_idx).unwrap();
                 let tx_ts = sslot.tx_ts;
                 let pending = sslot.user_data.take();
 
-                // Extract request buffer indices and continuation from pending
-                let (cont, req_bufs) = pending
-                    .map(|p| (p.continuation, p.req_buf_indices))
+                // Extract request buffer indices and user_data from pending
+                let (ud, req_bufs) = pending
+                    .map(|p| (p.user_data, p.req_buf_indices))
                     .unwrap_or((None, Vec::new()));
 
                 // Mark slot as free
@@ -918,7 +919,7 @@ impl Rpc {
                     }
                 }
 
-                (true, cont, None, req_bufs)
+                (true, ud, None, req_bufs)
             }
         };
 
@@ -930,15 +931,15 @@ impl Rpc {
             }
         }
 
-        // Call continuation outside of borrow
+        // Call on_response callback outside of borrow
         if is_complete {
-            if let Some(cont) = continuation {
-                if let Some(data) = data {
+            if let Some(ud) = user_data {
+                if let Some(resp_data) = data {
                     // Multi-packet response
-                    cont((), &data);
+                    (self.on_response)(ud, &resp_data);
                 } else {
                     // Single-packet response
-                    cont((), payload);
+                    (self.on_response)(ud, payload);
                 }
             }
         }
@@ -979,6 +980,8 @@ impl Rpc {
 
                         if sslot.retries > self.config.max_retries {
                             // Max retries exceeded, fail the request
+                            // Note: user_data is dropped here without calling on_response
+                            // (timeout failure case)
                             let pending = sslot.user_data.take();
                             sslot.reset();
 

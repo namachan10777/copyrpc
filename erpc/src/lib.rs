@@ -25,26 +25,26 @@
 //!     .with_req_window(8)
 //!     .with_session_credits(32);
 //!
-//! // Create RPC instance
-//! let rpc = Rpc::new(&ctx, 1, config)?;
-//!
-//! // Set request handler
-//! rpc.set_req_handler(|ctx, resp| {
-//!     // Process request and send response
-//!     resp.respond(&[1, 2, 3]).unwrap();
-//! });
-//!
-//! // Create session
-//! let session = rpc.create_session(&remote_info)?;
-//!
-//! // Send request
-//! rpc.enqueue_request(session, 0, &request_data, |_, response| {
-//!     println!("Got response: {:?}", response);
+//! // Create client RPC instance with on_response callback
+//! let client: Rpc<u64> = Rpc::new(&ctx, 1, config.clone(), |user_data, response| {
+//!     println!("Got response for request {}: {:?}", user_data, response);
 //! })?;
 //!
-//! // Run event loop
+//! // Create server RPC instance (no response callback needed for server)
+//! let server: Rpc<()> = Rpc::new(&ctx, 1, config, |_, _| {})?;
+//!
+//! // Create session
+//! let session = client.create_session(&remote_info)?;
+//!
+//! // Client: Send request with user_data
+//! let req_num = client.call(session, 0, &request_data, 42u64)?;
+//!
+//! // Server event loop: poll for incoming requests and reply
 //! loop {
-//!     rpc.run_event_loop_once();
+//!     server.run_event_loop_once();
+//!     while let Some(req) = server.recv() {
+//!         server.reply(&req, &response_data)?;
+//!     }
 //! }
 //! ```
 //!
@@ -82,6 +82,6 @@ pub use buffer::{MsgBuffer, ZeroCopyPool};
 pub use config::{RpcConfig, SessionConfig};
 pub use error::{Error, Result};
 pub use packet::{PktHdr, PktType, PKT_HDR_SIZE};
-pub use rpc::{Continuation, ReqContext, ReqHandler, RespHandle, Rpc};
+pub use rpc::{IncomingRequest, OnResponse, Rpc};
 pub use session::{Session, SessionHandle, SessionState, SSlot, SSlotState};
 pub use transport::{LocalInfo, RecvCompletion, RemoteInfo, SendCompletion, UdTransport};
