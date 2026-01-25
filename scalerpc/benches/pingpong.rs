@@ -147,12 +147,6 @@ fn setup_benchmark() -> Option<BenchmarkSetup> {
             num_slots: NUM_SLOTS,
             slot_data_size: 4080,
         },
-        group: GroupConfig {
-            max_active_per_group: 8,
-            num_groups: 4,
-            time_slice_us: 100,
-            max_endpoint_entries: 256,
-        },
         timeout_ms: 10000,
     };
 

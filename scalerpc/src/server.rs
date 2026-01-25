@@ -746,10 +746,8 @@ impl RpcServer {
     pub fn poll_request(&self) -> Option<IncomingRequest> {
         let num_slots = self.processing_pool.num_slots();
 
-        // Scan a limited number of slots per poll call
-        let slots_to_check = num_slots.min(64);
-
-        for _ in 0..slots_to_check {
+        // Scan all slots to find any pending request
+        for _ in 0..num_slots {
             let slot_index = self.next_check_slot.get();
             self.next_check_slot.set((slot_index + 1) % num_slots);
 
@@ -766,7 +764,16 @@ impl RpcServer {
         let slot = self.processing_pool.get_slot(slot_index)?;
         let data_ptr = slot.data_ptr();
 
-        // Read and validate request header
+        // Use volatile read for magic to see RDMA writes from client
+        let magic = unsafe { std::ptr::read_volatile(data_ptr as *const u32) };
+        if magic != crate::protocol::REQUEST_MAGIC {
+            return None;
+        }
+
+        // Memory fence to ensure we see the complete header
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+
+        // Read the full request header
         let header = unsafe { RequestHeader::read_from(data_ptr) };
 
         if !header.is_valid() {
@@ -809,9 +816,8 @@ impl RpcServer {
     /// Checks the Valid field in the message trailer for new messages.
     pub fn poll_request_trailer(&self) -> Option<IncomingRequest> {
         let num_slots = self.processing_pool.num_slots();
-        let slots_to_check = num_slots.min(64);
 
-        for _ in 0..slots_to_check {
+        for _ in 0..num_slots {
             let slot_index = self.next_check_slot.get();
             self.next_check_slot.set((slot_index + 1) % num_slots);
 
@@ -879,6 +885,10 @@ impl RpcServer {
     /// * `request` - The original request
     /// * `status` - Response status code
     /// * `payload` - Response payload data
+    ///
+    /// Per the ScaleRPC paper (Section 3.3), the message pool is "stateless" and
+    /// slots become obsolete immediately after a request is processed. Therefore,
+    /// we reuse the same slot where the request was received for sending the response.
     pub fn send_response(
         &self,
         request: &IncomingRequest,
@@ -892,15 +902,28 @@ impl RpcServer {
             .and_then(|c| c.as_ref())
             .ok_or(Error::ConnectionNotFound(request.conn_id))?;
 
-        // Allocate a temporary slot for the response
-        let slot = self.processing_pool.alloc()?;
+        // Reuse the request slot for the response (per ScaleRPC paper Section 3.3)
+        let slot = self
+            .processing_pool
+            .get_slot(request.slot_index)
+            .ok_or(Error::Protocol(format!(
+                "slot {} not found",
+                request.slot_index
+            )))?;
+        let slot_data_addr = self
+            .processing_pool
+            .slot_data_addr(request.slot_index)
+            .ok_or(Error::Protocol(format!(
+                "slot {} addr not found",
+                request.slot_index
+            )))?;
 
         // Build response header
         let response_header =
             ResponseHeader::new(request.req_id, status, payload.len() as u32);
 
         // Write response to slot
-        let slot_data_ptr = slot.slot().data_ptr();
+        let slot_data_ptr = slot.data_ptr();
         unsafe {
             response_header.write_to(slot_data_ptr);
             if !payload.is_empty() {
@@ -925,7 +948,7 @@ impl RpcServer {
                 remote_addr: request.client_slot_addr,
                 rkey: request.client_slot_rkey,
                 sge: {
-                    addr: slot.data_addr(),
+                    addr: slot_data_addr,
                     len: total_len as u32,
                     lkey: self.processing_pool.lkey()
                 },
@@ -1125,7 +1148,7 @@ impl RpcServer {
 
         // Wait for read completion
         let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_millis(1000);
+        let timeout = std::time::Duration::from_millis(10);
         loop {
             if conn.poll_send_cq() > 0 {
                 break;

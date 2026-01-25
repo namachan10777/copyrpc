@@ -53,8 +53,6 @@ impl Default for GroupConfig {
 pub struct ClientConfig {
     /// Message pool configuration.
     pub pool: PoolConfig,
-    /// Connection grouping configuration.
-    pub group: GroupConfig,
     /// Timeout for RPC calls in milliseconds.
     pub timeout_ms: u64,
 }
@@ -63,7 +61,6 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             pool: PoolConfig::default(),
-            group: GroupConfig::default(),
             timeout_ms: 5000,
         }
     }

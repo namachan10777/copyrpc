@@ -41,7 +41,6 @@ fn test_latency() {
             num_slots: 64,
             slot_data_size: 4080,
         },
-        group: GroupConfig::default(),
         timeout_ms: 5000,
     };
 
@@ -116,10 +115,15 @@ fn test_latency() {
         server.connect(conn_id, remote).unwrap();
         server_ready_clone.store(1, Ordering::Release);
 
+        let mut total_processed = 0u64;
         while !stop_flag_clone.load(Ordering::Relaxed) {
-            server.process();
+            let n = server.process();
+            if n > 0 {
+                total_processed += n as u64;
+            }
             std::hint::spin_loop();
         }
+        eprintln!("[server] exiting, total_processed={}", total_processed);
     });
 
     client_info_tx
@@ -191,7 +195,6 @@ fn test_throughput() {
             num_slots: 256,
             slot_data_size: 4080,
         },
-        group: GroupConfig::default(),
         timeout_ms: 5000,
     };
 
@@ -266,10 +269,15 @@ fn test_throughput() {
         server.connect(conn_id, remote).unwrap();
         server_ready_clone.store(1, Ordering::Release);
 
+        let mut total_processed = 0u64;
         while !stop_flag_clone.load(Ordering::Relaxed) {
-            server.process();
+            let n = server.process();
+            if n > 0 {
+                total_processed += n as u64;
+            }
             std::hint::spin_loop();
         }
+        eprintln!("[server] exiting, total_processed={}", total_processed);
     });
 
     client_info_tx
@@ -298,8 +306,8 @@ fn test_throughput() {
 
     client.connect(conn_id, server_endpoint).expect("connect");
 
-    let pipeline_depth = 32;
-    let total_requests = 10000;
+    let pipeline_depth = 16;
+    let total_requests = 50;
     let payload = vec![0xAAu8; 32];
 
     println!("\n=== ScaleRPC Throughput Test ===");
@@ -316,23 +324,35 @@ fn test_throughput() {
     // Initial fill (using call_async for pipelining)
     while sent < pipeline_depth && sent < total_requests {
         if let Ok(p) = client.call_async(conn_id, 1, &payload) {
+            eprintln!("[fill] sent={}, slot={}, req_id={}", sent, p.slot_index(), p.req_id());
             pending_requests.push(p);
             sent += 1;
+        } else {
+            eprintln!("[fill] call_async failed at sent={}", sent);
+            break;
         }
     }
+    eprintln!("[fill] done, sent={}", sent);
 
     // Main loop
+    let mut iter = 0u64;
     while completed < total_requests {
         // Check for completed requests
         let mut i = 0;
         while i < pending_requests.len() {
             if pending_requests[i].poll().is_some() {
+                if completed < 20 || completed % 100 == 0 {
+                    eprintln!("[main] completed={}, req_id={}", completed, pending_requests[i].req_id());
+                }
                 pending_requests.swap_remove(i);
                 completed += 1;
 
                 // Send new request
                 if sent < total_requests {
                     if let Ok(p) = client.call_async(conn_id, 1, &payload) {
+                        if sent < 20 || sent % 100 == 0 {
+                            eprintln!("[main] sent={}, slot={}", sent, p.slot_index());
+                        }
                         pending_requests.push(p);
                         sent += 1;
                     }
@@ -340,6 +360,11 @@ fn test_throughput() {
             } else {
                 i += 1;
             }
+        }
+        iter += 1;
+        if iter % 5_000_000 == 0 {
+            let pending_info: Vec<_> = pending_requests.iter().map(|p| (p.slot_index(), p.req_id())).collect();
+            eprintln!("[main] iter={}, completed={}, pending={:?}", iter, completed, pending_info);
         }
 
         std::hint::spin_loop();

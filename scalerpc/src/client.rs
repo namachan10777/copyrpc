@@ -40,7 +40,6 @@ use mlx5::wqe::WqeFlags;
 use crate::config::ClientConfig;
 use crate::connection::{Connection, ConnectionId, RemoteEndpoint};
 use crate::error::{Error, Result, SlotState};
-use crate::group::GroupManager;
 use crate::mapping::VirtualMapping;
 use crate::pool::MessagePool;
 use crate::protocol::{
@@ -297,9 +296,6 @@ struct ConnectionState {
     event_buffer: EventBuffer,
     /// Endpoint entry to register with server.
     endpoint_entry: RefCell<EndpointEntry>,
-    /// Group ID this connection belongs to.
-    #[allow(dead_code)]
-    group_id: usize,
     /// Server's endpoint entry address (for registering warmup info).
     server_endpoint_entry_addr: Cell<u64>,
     /// Server's endpoint entry rkey.
@@ -313,8 +309,6 @@ struct ConnectionState {
 pub struct RpcClient {
     /// Message pool for request/response data.
     pool: MessagePool,
-    /// Connection grouping manager.
-    groups: GroupManager,
     /// Virtual mapping table.
     mapping: VirtualMapping,
     /// Connections indexed by ID.
@@ -336,12 +330,10 @@ impl RpcClient {
     /// * `config` - Client configuration
     pub fn new(pd: &Pd, config: ClientConfig) -> Result<Self> {
         let pool = MessagePool::new(pd, &config.pool)?;
-        let groups = GroupManager::new(&config.group);
         let mapping = VirtualMapping::new();
 
         Ok(Self {
             pool,
-            groups,
             mapping,
             connections: Vec::new(),
             connection_states: Vec::new(),
@@ -395,8 +387,7 @@ impl RpcClient {
 
         let conn = Connection::new(ctx, pd, conn_id, port, sq_callback, rq_callback)?;
 
-        // Register with group manager and mapping
-        let group_id = self.groups.add_connection(conn_id);
+        // Register with mapping
         self.mapping.register_connection(conn_id);
 
         // Create per-connection state with warmup and event buffers
@@ -408,7 +399,6 @@ impl RpcClient {
             warmup_buffer: RefCell::new(warmup_buffer),
             event_buffer,
             endpoint_entry: RefCell::new(EndpointEntry::default()),
-            group_id,
             server_endpoint_entry_addr: Cell::new(0),
             server_endpoint_entry_rkey: Cell::new(0),
         };
@@ -519,6 +509,7 @@ impl RpcClient {
     ) -> Result<PendingRpc<'_>> {
         // Allocate a slot for this request
         let slot = self.pool.alloc()?;
+        let slot_index = slot.index();
 
         // Get connection and remote info
         let conn = self
@@ -532,7 +523,10 @@ impl RpcClient {
             .get_connection(conn_id)
             .ok_or(Error::ConnectionNotFound(conn_id))?;
 
-        let remote_addr = mapping_entry.remote_slot_addr;
+        // Calculate remote slot address based on client slot index
+        // This ensures each request goes to a different server slot
+        let remote_base_addr = mapping_entry.remote_slot_addr;
+        let remote_addr = remote_base_addr + (slot_index * MESSAGE_BLOCK_SIZE) as u64;
         let remote_rkey = mapping_entry.remote_slot_rkey;
 
         // Generate request ID
@@ -549,8 +543,12 @@ impl RpcClient {
         );
 
         // Write header and payload to slot
+        // First, clear any previous response magic to avoid false positives in poll()
         let slot_data_ptr = slot.slot().data_ptr();
         unsafe {
+            // Clear response magic (first 4 bytes)
+            std::ptr::write_volatile(slot_data_ptr as *mut u32, 0);
+
             header.write_to(slot_data_ptr);
             if !payload.is_empty() {
                 std::ptr::copy_nonoverlapping(
@@ -846,10 +844,21 @@ impl<'a> PendingRpc<'a> {
         let slot = self.pool.get_slot(self.slot_index)?;
 
         // Check if response magic is present
+        // Use volatile read to ensure we see RDMA writes from the NIC
         let data_ptr = slot.data_ptr();
+
+        // Read magic and req_id with volatile to prevent caching/optimization
+        let magic = unsafe { std::ptr::read_volatile(data_ptr as *const u32) };
+        if magic != crate::protocol::RESPONSE_MAGIC {
+            return None;
+        }
+
+        // Read the full header now that we know it's valid
+        // Add a memory fence to ensure ordering
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
         let header = unsafe { ResponseHeader::read_from(data_ptr) };
 
-        if header.is_valid() && header.req_id == self.req_id {
+        if header.req_id == self.req_id {
             Some(RpcResponse {
                 header,
                 payload_ptr: unsafe { data_ptr.add(ResponseHeader::SIZE) },

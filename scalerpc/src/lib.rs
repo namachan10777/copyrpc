@@ -31,7 +31,6 @@
 
 pub mod config;
 pub mod error;
-pub mod group;
 pub mod mapping;
 pub mod pool;
 pub mod protocol;
@@ -41,7 +40,6 @@ pub mod server;
 
 pub use config::{ClientConfig, GroupConfig, PoolConfig, ServerConfig};
 pub use error::{Error, Result, SlotState};
-pub use group::{ConnectionGroup, ConnectionGuard, GroupManager};
 pub use mapping::VirtualMapping;
 pub use pool::{MessagePool, MessageSlot, SlotHandle};
 pub use protocol::{
