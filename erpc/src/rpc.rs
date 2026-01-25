@@ -388,6 +388,9 @@ impl<U: 'static> Rpc<U> {
             sslot.req_buf_indices = buf_indices.clone();
             sslot.tx_ts = current_time_us();
             sslot.wait_response(1); // Will be updated when response arrives
+
+            // Register req_num -> sslot_idx for O(1) lookup
+            sess.register_req_num(req_num, sslot_idx);
         }
 
         // Phase 4: Post send for all packets
@@ -626,19 +629,23 @@ impl<U: 'static> Rpc<U> {
             let hdr = unsafe { PktHdr::read_from(hdr_ptr) };
             hdr.validate()?;
 
-            // Copy payload
+            // Copy payload (single copy, no zero-init)
             let payload_offset = GRH_SIZE + PKT_HDR_SIZE;
             let payload_len = (byte_cnt as usize).saturating_sub(payload_offset);
-            let mut payload = vec![0u8; payload_len];
-            if payload_len > 0 {
+            let payload = if payload_len > 0 {
+                let mut payload = Vec::with_capacity(payload_len);
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         buf.as_ptr().add(payload_offset),
                         payload.as_mut_ptr(),
                         payload_len,
                     );
+                    payload.set_len(payload_len);
                 }
-            }
+                payload
+            } else {
+                Vec::new()
+            };
 
             (hdr, payload)
         };
@@ -657,7 +664,8 @@ impl<U: 'static> Rpc<U> {
         // Process based on packet type
         match hdr.pkt_type() {
             PktType::Req | PktType::ReqForResp => {
-                self.handle_request(&hdr, &payload)?;
+                // Pass payload by value - avoids second copy in handle_request
+                self.handle_request(&hdr, payload)?;
             }
             PktType::Resp => {
                 self.handle_response(&hdr, &payload)?;
@@ -787,10 +795,10 @@ impl<U: 'static> Rpc<U> {
     }
 
     /// Handle an incoming request by pushing it to the recv_queue.
-    fn handle_request(&self, hdr: &PktHdr, payload: &[u8]) -> Result<()> {
+    fn handle_request(&self, hdr: &PktHdr, payload: Vec<u8>) -> Result<()> {
         self.recv_queue.borrow_mut().push(IncomingRequest {
             req_type: hdr.req_type(),
-            data: payload.to_vec(),
+            data: payload,  // Move, no copy
             session_num: hdr.dest_session_num(),
             req_num: hdr.req_num(),
         });
@@ -863,6 +871,7 @@ impl<U: 'static> Rpc<U> {
                     // Get the slot again and extract data
                     let sslot = sess.sslot_mut(sslot_idx).unwrap();
                     let tx_ts = sslot.tx_ts;
+                    let req_num_for_unregister = sslot.req_num;
                     let pending = sslot.user_data.take();
                     let resp_data = sslot.take_resp_buf();
 
@@ -873,6 +882,9 @@ impl<U: 'static> Rpc<U> {
 
                     // Mark slot as free
                     sslot.reset();
+
+                    // Unregister req_num from HashMap
+                    sess.unregister_req_num(req_num_for_unregister);
 
                     // Update Timely congestion control with RTT measurement
                     if tx_ts > 0 {
@@ -901,6 +913,7 @@ impl<U: 'static> Rpc<U> {
                 // Get the slot and extract user_data
                 let sslot = sess.sslot_mut(sslot_idx).unwrap();
                 let tx_ts = sslot.tx_ts;
+                let req_num_for_unregister = sslot.req_num;
                 let pending = sslot.user_data.take();
 
                 // Extract request buffer indices and user_data from pending
@@ -910,6 +923,9 @@ impl<U: 'static> Rpc<U> {
 
                 // Mark slot as free
                 sslot.reset();
+
+                // Unregister req_num from HashMap
+                sess.unregister_req_num(req_num_for_unregister);
 
                 // Update Timely congestion control with RTT measurement
                 if tx_ts > 0 {
@@ -984,6 +1000,9 @@ impl<U: 'static> Rpc<U> {
                             // (timeout failure case)
                             let pending = sslot.user_data.take();
                             sslot.reset();
+
+                            // Unregister req_num from HashMap
+                            sess.unregister_req_num(entry.req_num);
 
                             if let Some(p) = pending {
                                 let mut send_buffers = self.send_buffers.borrow_mut();

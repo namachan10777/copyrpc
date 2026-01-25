@@ -4,6 +4,7 @@
 //! SSlots (session slots) track individual request/response transactions.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 
 use mlx5::pd::AddressHandle;
 
@@ -255,6 +256,8 @@ pub struct Session<U> {
     pub ah: Option<AddressHandle>,
     /// Session slots for concurrent requests.
     pub sslots: Vec<SSlot<U>>,
+    /// Fast lookup: req_num -> sslot index (O(1) instead of linear search).
+    req_num_to_sslot: HashMap<u64, usize>,
     /// Available credits for sending.
     pub credits: Cell<usize>,
     /// Next request number.
@@ -290,6 +293,7 @@ impl<U> Session<U> {
             remote,
             ah: None,
             sslots,
+            req_num_to_sslot: HashMap::with_capacity(req_window),
             credits: Cell::new(config.session_credits),
             next_req_num: Cell::new(0),
             cc_state,
@@ -345,14 +349,45 @@ impl<U> Session<U> {
         self.sslots.get_mut(idx)
     }
 
+    /// Threshold for using HashMap vs linear search.
+    /// For small req_window, linear search is faster due to better cache locality.
+    /// Set to 8 to enable HashMap for req_window > 8 (most concurrent workloads).
+    const HASHMAP_THRESHOLD: usize = 8;
+
     /// Find an SSlot by request number.
+    /// Uses linear search for small req_window, HashMap for larger.
+    #[inline]
     pub fn find_sslot_by_req_num(&self, req_num: u64) -> Option<usize> {
-        for (i, slot) in self.sslots.iter().enumerate() {
-            if !slot.is_free() && slot.req_num == req_num {
-                return Some(i);
+        if self.req_window <= Self::HASHMAP_THRESHOLD {
+            // Linear search for small req_window (better cache locality)
+            for (i, slot) in self.sslots.iter().enumerate() {
+                if !slot.is_free() && slot.req_num == req_num {
+                    return Some(i);
+                }
             }
+            None
+        } else {
+            // HashMap lookup for large req_window (O(1))
+            self.req_num_to_sslot.get(&req_num).copied()
         }
-        None
+    }
+
+    /// Register a request number to sslot mapping.
+    /// Only used when req_window > HASHMAP_THRESHOLD.
+    #[inline]
+    pub fn register_req_num(&mut self, req_num: u64, sslot_idx: usize) {
+        if self.req_window > Self::HASHMAP_THRESHOLD {
+            self.req_num_to_sslot.insert(req_num, sslot_idx);
+        }
+    }
+
+    /// Unregister a request number mapping (call when slot is freed).
+    /// Only used when req_window > HASHMAP_THRESHOLD.
+    #[inline]
+    pub fn unregister_req_num(&mut self, req_num: u64) {
+        if self.req_window > Self::HASHMAP_THRESHOLD {
+            self.req_num_to_sslot.remove(&req_num);
+        }
     }
 
     /// Get the next request number.
