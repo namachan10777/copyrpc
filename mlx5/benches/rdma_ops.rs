@@ -26,11 +26,14 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use mlx5::cq::{CqConfig, Cqe};
 use mlx5::device::{Context, DeviceList};
 use mlx5::emit_wqe;
+use mlx5::emit_ud_wqe;
 use mlx5::mono_cq::MonoCqRc;
 use mlx5::pd::{AccessFlags, MemoryRegion, Pd};
 use mlx5::qp::{RcQpConfig, RcQpForMonoCq};
+use mlx5::ud::{UdQpConfig, UdQpIb};
 use mlx5::transport::IbRemoteQpInfo;
 use mlx5::wqe::WqeFlags;
+use mlx5::wqe::emit::UdAvIb;
 
 // =============================================================================
 // Constants
@@ -52,6 +55,12 @@ const RDMA_BUFFER_SIZE: usize = 1024 * 1024; // 1MiB total (WQEs write to same b
 // Common constants
 const SMALL_MSG_SIZE: usize = 32;
 const PAGE_SIZE: usize = 4096;
+
+// UD Send/Recv benchmark constants
+const UD_QUEUE_DEPTH: usize = 1024;
+// Each UD recv buffer needs: GRH (40) + payload (32) + alignment = 128 bytes minimum
+const UD_RECV_ENTRY_SIZE: usize = 128;
+const UD_BUFFER_SIZE: usize = UD_QUEUE_DEPTH * UD_RECV_ENTRY_SIZE;
 
 // =============================================================================
 // Aligned Buffer
@@ -202,6 +211,38 @@ where
     RF: Fn(Cqe, u64),
 {
     client: SendRecvEndpoint<SF, RF>,
+    _server_handle: ServerHandle,
+    _pd: Rc<Pd>,
+    _ctx: Context,
+}
+
+// =============================================================================
+// UD Send/Recv Endpoint State (using regular Cq with callbacks)
+// =============================================================================
+
+use mlx5::cq::Cq;
+
+type UdSendCallback = Box<dyn Fn(Cqe, u64)>;
+type UdRecvCallback = Box<dyn Fn(Cqe, u64)>;
+
+struct UdSendRecvEndpoint {
+    qp: Rc<RefCell<UdQpIb<u64, u64, UdSendCallback, UdRecvCallback>>>,
+    send_cq: Rc<Cq>,
+    recv_cq: Rc<Cq>,
+    shared_state: SharedCqeState,
+    _send_mr: MemoryRegion,
+    recv_mr: MemoryRegion,
+    _send_buf: AlignedBuffer,
+    recv_buf: AlignedBuffer,
+    rq_next_idx: usize,
+    // Remote QP info for sending
+    remote_qpn: u32,
+    remote_lid: u16,
+    qkey: u32,
+}
+
+struct UdSendRecvBenchmarkSetup {
+    client: UdSendRecvEndpoint,
     _server_handle: ServerHandle,
     _pd: Rc<Pd>,
     _ctx: Context,
@@ -655,6 +696,297 @@ fn server_thread_main(
 }
 
 // =============================================================================
+// UD Server Thread
+// =============================================================================
+
+#[derive(Clone)]
+struct UdConnectionInfo {
+    qpn: u32,
+    lid: u16,
+    qkey: u32,
+}
+
+fn ud_server_thread_main(
+    info_tx: Sender<UdConnectionInfo>,
+    info_rx: Receiver<UdConnectionInfo>,
+    ready_signal: Arc<AtomicU32>,
+    stop_flag: Arc<AtomicBool>,
+) {
+    let ctx = match open_mlx5_device() {
+        Some(c) => c,
+        None => return,
+    };
+
+    let port = 1u8;
+    let port_attr = match ctx.query_port(port) {
+        Ok(attr) => attr,
+        Err(_) => return,
+    };
+
+    let pd = Rc::new(match ctx.alloc_pd() {
+        Ok(p) => p,
+        Err(_) => return,
+    });
+
+    let shared_state = Rc::new(ServerSharedState::new());
+    let shared_state_for_recv = shared_state.clone();
+
+    let send_callback: UdSendCallback = Box::new(move |_cqe: Cqe, _entry: u64| {});
+    let recv_callback: UdRecvCallback = Box::new(move |cqe: Cqe, _entry: u64| {
+        if cqe.opcode.is_responder() && cqe.syndrome == 0 {
+            shared_state_for_recv.push(&cqe);
+        }
+    });
+
+    let send_cq = match ctx.create_cq(UD_QUEUE_DEPTH as i32, &CqConfig::default()) {
+        Ok(cq) => Rc::new(cq),
+        Err(_) => return,
+    };
+
+    let recv_cq = match ctx.create_cq(UD_QUEUE_DEPTH as i32, &CqConfig::default()) {
+        Ok(cq) => Rc::new(cq),
+        Err(_) => return,
+    };
+
+    let qkey = 0x11111111u32;
+    let ud_config = UdQpConfig {
+        max_send_wr: UD_QUEUE_DEPTH as u32,
+        max_recv_wr: UD_QUEUE_DEPTH as u32,
+        max_send_sge: 1,
+        max_recv_sge: 1,
+        max_inline_data: 256,
+        qkey,
+    };
+
+    let qp = match ctx
+        .ud_qp_builder::<u64, u64>(&pd, &ud_config)
+        .sq_cq(send_cq.clone(), send_callback)
+        .rq_cq(recv_cq.clone(), recv_callback)
+        .build()
+    {
+        Ok(q) => q,
+        Err(_) => return,
+    };
+
+    // Activate UD QP
+    if qp.borrow_mut().activate(port, 0).is_err() {
+        return;
+    }
+
+    let send_buf = AlignedBuffer::new(UD_BUFFER_SIZE);
+    let recv_buf = AlignedBuffer::new(UD_BUFFER_SIZE);
+
+    let _send_mr = match unsafe { pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) } {
+        Ok(mr) => mr,
+        Err(_) => return,
+    };
+
+    let recv_mr = match unsafe { pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) } {
+        Ok(mr) => mr,
+        Err(_) => return,
+    };
+
+    let server_info = UdConnectionInfo {
+        qpn: qp.borrow().qpn(),
+        lid: port_attr.lid,
+        qkey,
+    };
+    if info_tx.send(server_info).is_err() {
+        return;
+    }
+
+    let client_info = match info_rx.recv() {
+        Ok(info) => info,
+        Err(_) => return,
+    };
+
+    // Pre-post all receives (UD needs GRH header space: 40 bytes + data)
+    let recv_buf_size = UD_RECV_ENTRY_SIZE as u32;
+    for i in 0..UD_QUEUE_DEPTH {
+        let offset = (i * UD_RECV_ENTRY_SIZE) as u64;
+        qp.borrow()
+            .post_recv(i as u64, recv_buf.addr() + offset, recv_buf_size, recv_mr.lkey())
+            .unwrap();
+    }
+    qp.borrow().ring_rq_doorbell();
+
+    ready_signal.store(1, Ordering::Release);
+
+    // Echo server loop
+    let echo_data = vec![0xBBu8; SMALL_MSG_SIZE];
+    let mut recv_idx = 0usize;
+    let mut send_count = 0usize;
+
+    while !stop_flag.load(Ordering::Relaxed) {
+        shared_state.reset();
+        recv_cq.poll();
+        recv_cq.flush();
+        let count = shared_state.rx_count.get();
+
+        if count == 0 {
+            continue;
+        }
+
+        send_cq.poll();
+        send_cq.flush();
+
+        // Repost receives
+        {
+            let qp_ref = qp.borrow();
+            for _ in 0..count {
+                let idx = recv_idx % UD_QUEUE_DEPTH;
+                let offset = (idx * UD_RECV_ENTRY_SIZE) as u64;
+                qp_ref
+                    .post_recv(idx as u64, recv_buf.addr() + offset, recv_buf_size, recv_mr.lkey())
+                    .unwrap();
+                recv_idx += 1;
+            }
+        }
+
+        // Send echo responses using emit_ud_wqe! macro
+        {
+            let qp_ref = qp.borrow();
+            let ctx = qp_ref.emit_ctx().expect("emit_ctx failed");
+            let av = UdAvIb::new(client_info.qpn, client_info.qkey, client_info.lid);
+
+            for _ in 0..count {
+                // UD macro only supports signaled mode
+                let _ = emit_ud_wqe!(&ctx, send {
+                    av: av,
+                    flags: WqeFlags::empty(),
+                    inline: echo_data.as_slice(),
+                    signaled: send_count as u64,
+                });
+                send_count += 1;
+            }
+        }
+
+        let qp_ref = qp.borrow();
+        qp_ref.ring_rq_doorbell();
+        qp_ref.ring_sq_doorbell();
+    }
+}
+
+// =============================================================================
+// UD Send/Recv Benchmark Setup
+// =============================================================================
+
+fn setup_ud_send_recv_benchmark() -> Option<UdSendRecvBenchmarkSetup> {
+    let ctx = open_mlx5_device()?;
+    let port = 1u8;
+    let port_attr = ctx.query_port(port).ok()?;
+    let pd = Rc::new(ctx.alloc_pd().ok()?);
+
+    let shared_state = SharedCqeState::new();
+    let shared_state_for_recv = shared_state.clone();
+
+    let send_callback: UdSendCallback = Box::new(move |_cqe: Cqe, _entry: u64| {});
+    let recv_callback: UdRecvCallback = Box::new(move |cqe: Cqe, _entry: u64| {
+        if cqe.opcode.is_responder() && cqe.syndrome == 0 {
+            shared_state_for_recv.push(&cqe);
+        }
+    });
+
+    let send_cq = Rc::new(ctx.create_cq(UD_QUEUE_DEPTH as i32, &CqConfig::default()).ok()?);
+    let recv_cq = Rc::new(ctx.create_cq(UD_QUEUE_DEPTH as i32, &CqConfig::default()).ok()?);
+
+    let qkey = 0x11111111u32;
+    let ud_config = UdQpConfig {
+        max_send_wr: UD_QUEUE_DEPTH as u32,
+        max_recv_wr: UD_QUEUE_DEPTH as u32,
+        max_send_sge: 1,
+        max_recv_sge: 1,
+        max_inline_data: 256,
+        qkey,
+    };
+
+    let qp = ctx
+        .ud_qp_builder::<u64, u64>(&pd, &ud_config)
+        .sq_cq(send_cq.clone(), send_callback)
+        .rq_cq(recv_cq.clone(), recv_callback)
+        .build()
+        .ok()?;
+
+    // Activate UD QP
+    qp.borrow_mut().activate(port, 0).ok()?;
+
+    let send_buf = AlignedBuffer::new(UD_BUFFER_SIZE);
+    let recv_buf = AlignedBuffer::new(UD_BUFFER_SIZE);
+
+    let send_mr = unsafe { pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }.ok()?;
+    let recv_mr = unsafe { pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }.ok()?;
+
+    let client_info = UdConnectionInfo {
+        qpn: qp.borrow().qpn(),
+        lid: port_attr.lid,
+        qkey,
+    };
+
+    let (server_info_tx, server_info_rx): (Sender<UdConnectionInfo>, Receiver<UdConnectionInfo>) =
+        mpsc::channel();
+    let (client_info_tx, client_info_rx): (Sender<UdConnectionInfo>, Receiver<UdConnectionInfo>) =
+        mpsc::channel();
+    let server_ready = Arc::new(AtomicU32::new(0));
+    let server_ready_clone = server_ready.clone();
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let server_stop = stop_flag.clone();
+
+    let handle = thread::spawn(move || {
+        ud_server_thread_main(
+            server_info_tx,
+            client_info_rx,
+            server_ready_clone,
+            server_stop,
+        );
+    });
+
+    client_info_tx.send(client_info.clone()).ok()?;
+    let server_info = server_info_rx.recv().ok()?;
+
+    while server_ready.load(Ordering::Acquire) == 0 {
+        std::hint::spin_loop();
+    }
+
+    // Pre-post all receives (UD needs GRH header space)
+    let recv_buf_size = UD_RECV_ENTRY_SIZE as u32;
+    for i in 0..UD_QUEUE_DEPTH {
+        let offset = (i * UD_RECV_ENTRY_SIZE) as u64;
+        qp.borrow()
+            .post_recv(i as u64, recv_buf.addr() + offset, recv_buf_size, recv_mr.lkey())
+            .unwrap();
+    }
+    qp.borrow().ring_rq_doorbell();
+
+    let client = UdSendRecvEndpoint {
+        qp,
+        send_cq,
+        recv_cq,
+        shared_state,
+        _send_mr: send_mr,
+        recv_mr,
+        _send_buf: send_buf,
+        recv_buf,
+        rq_next_idx: 0,
+        remote_qpn: server_info.qpn,
+        remote_lid: server_info.lid,
+        qkey: server_info.qkey,
+    };
+
+    let server_handle = ServerHandle {
+        stop_flag,
+        handle: Some(handle),
+    };
+
+    Some(UdSendRecvBenchmarkSetup {
+        client,
+        _server_handle: server_handle,
+        _pd: pd,
+        _ctx: ctx,
+    })
+}
+
+// =============================================================================
 // Benchmark Functions
 // =============================================================================
 
@@ -848,6 +1180,169 @@ where
                 let replenish_idx = client.rq_next_idx % SEND_RECV_QUEUE_DEPTH;
                 let replenish_offset = (replenish_idx * 64) as u64;
                 qp.post_recv(replenish_idx as u64, client.recv_buf.addr() + replenish_offset, 64, client.recv_mr.lkey())
+                    .unwrap();
+                qp.ring_rq_doorbell();
+                client.rq_next_idx += 1;
+                break;
+            }
+        }
+    }
+
+    start.elapsed()
+}
+
+// =============================================================================
+// UD Benchmark Functions
+// =============================================================================
+
+/// UD 32B inline send throughput benchmark (queue depth = 1024, all signaled).
+/// Note: emit_ud_wqe! macro only supports signaled mode, so all WQEs are signaled.
+fn run_ud_send_inline_throughput(
+    client: &mut UdSendRecvEndpoint,
+    iters: u64,
+) -> Duration {
+    let send_data = vec![0xAAu8; SMALL_MSG_SIZE];
+    let recv_buf_size = UD_RECV_ENTRY_SIZE as u32;
+
+    // Create address vector for remote QP
+    let av = UdAvIb::new(client.remote_qpn, client.qkey, client.remote_lid);
+
+    // Initial fill (all signaled - macro limitation)
+    let initial_fill = (iters as usize).min(UD_QUEUE_DEPTH);
+    {
+        let qp = client.qp.borrow();
+        let ctx = qp.emit_ctx().expect("emit_ctx failed");
+
+        for i in 0..initial_fill {
+            let _ = emit_ud_wqe!(&ctx, send {
+                av: av,
+                flags: WqeFlags::empty(),
+                inline: send_data.as_slice(),
+                signaled: i as u64,
+            });
+        }
+        qp.ring_sq_doorbell();
+    }
+
+    let start = std::time::Instant::now();
+    let mut completed = 0u64;
+    let mut inflight = initial_fill as u64;
+    let mut sent = initial_fill as u64;
+    let mut recv_idx = 0usize;
+
+    while completed < iters {
+        client.shared_state.reset();
+        client.recv_cq.poll();
+        client.recv_cq.flush();
+        let rx_count = client.shared_state.rx_count.get();
+
+        completed += rx_count as u64;
+        inflight -= rx_count as u64;
+
+        if rx_count == 0 {
+            continue;
+        }
+
+        client.send_cq.poll();
+        client.send_cq.flush();
+
+        // Repost receives
+        {
+            let qp = client.qp.borrow();
+            for _ in 0..rx_count {
+                let idx = recv_idx % UD_QUEUE_DEPTH;
+                let offset = (idx * UD_RECV_ENTRY_SIZE) as u64;
+                qp.post_recv(idx as u64, client.recv_buf.addr() + offset, recv_buf_size, client.recv_mr.lkey())
+                    .unwrap();
+                recv_idx += 1;
+            }
+        }
+
+        // Send more if needed (all signaled)
+        let remaining = iters.saturating_sub(sent);
+        let can_send = (UD_QUEUE_DEPTH as u64).saturating_sub(inflight).min(remaining) as usize;
+        let to_send = can_send.min(rx_count);
+
+        if to_send > 0 {
+            let qp = client.qp.borrow();
+            let ctx = qp.emit_ctx().expect("emit_ctx failed");
+
+            for i in 0..to_send {
+                let _ = emit_ud_wqe!(&ctx, send {
+                    av: av,
+                    flags: WqeFlags::empty(),
+                    inline: send_data.as_slice(),
+                    signaled: i as u64,
+                });
+            }
+
+            inflight += to_send as u64;
+            sent += to_send as u64;
+        }
+
+        // Ring doorbells
+        {
+            let qp = client.qp.borrow();
+            qp.ring_rq_doorbell();
+            if to_send > 0 {
+                qp.ring_sq_doorbell();
+            }
+        }
+    }
+
+    // Drain remaining inflight
+    while inflight > 0 {
+        client.shared_state.reset();
+        client.recv_cq.poll();
+        client.recv_cq.flush();
+        inflight -= client.shared_state.rx_count.get() as u64;
+
+        client.send_cq.poll();
+        client.send_cq.flush();
+    }
+
+    start.elapsed()
+}
+
+/// UD 32B inline send latency benchmark (ping-pong, queue depth = 1).
+fn run_ud_send_latency(
+    client: &mut UdSendRecvEndpoint,
+    iters: u64,
+) -> Duration {
+    let send_data = vec![0xAAu8; SMALL_MSG_SIZE];
+    let recv_buf_size = UD_RECV_ENTRY_SIZE as u32;
+    let av = UdAvIb::new(client.remote_qpn, client.qkey, client.remote_lid);
+
+    let start = std::time::Instant::now();
+
+    for i in 0..iters {
+        let idx = (i as usize) % UD_QUEUE_DEPTH;
+
+        // Post single Send with doorbell
+        {
+            let qp = client.qp.borrow();
+            let ctx = qp.emit_ctx().expect("emit_ctx failed");
+            emit_ud_wqe!(&ctx, send {
+                av: av,
+                flags: WqeFlags::empty(),
+                inline: send_data.as_slice(),
+                signaled: idx as u64,
+            }).expect("emit_wqe failed");
+            qp.ring_sq_doorbell();
+        }
+
+        // Wait for echo response
+        loop {
+            client.send_cq.poll();
+            client.send_cq.flush();
+            client.shared_state.reset();
+            client.recv_cq.poll();
+            client.recv_cq.flush();
+            if client.shared_state.rx_count.get() > 0 {
+                let qp = client.qp.borrow();
+                let replenish_idx = client.rq_next_idx % UD_QUEUE_DEPTH;
+                let replenish_offset = (replenish_idx * UD_RECV_ENTRY_SIZE) as u64;
+                qp.post_recv(replenish_idx as u64, client.recv_buf.addr() + replenish_offset, recv_buf_size, client.recv_mr.lkey())
                     .unwrap();
                 qp.ring_rq_doorbell();
                 client.rq_next_idx += 1;
@@ -1197,10 +1692,72 @@ fn bench_read_1m_relaxed(c: &mut Criterion) {
     group.finish();
 }
 
+// =============================================================================
+// UD Criterion Benchmarks
+// =============================================================================
+
+fn bench_ud_send_inline_32b(c: &mut Criterion) {
+    let setup = match setup_ud_send_recv_benchmark() {
+        Some(s) => s,
+        None => {
+            eprintln!("Skipping benchmark: no mlx5 device available");
+            return;
+        }
+    };
+
+    let _ctx = setup._ctx;
+    let _pd = setup._pd;
+    let client = RefCell::new(setup.client);
+    let _server_handle = setup._server_handle;
+
+    let mut group = c.benchmark_group("ud_send_inline");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(3));
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("32B", |b| {
+        b.iter_custom(|iters| {
+            run_ud_send_inline_throughput(&mut client.borrow_mut(), iters)
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_ud_send_latency_32b(c: &mut Criterion) {
+    let setup = match setup_ud_send_recv_benchmark() {
+        Some(s) => s,
+        None => {
+            eprintln!("Skipping benchmark: no mlx5 device available");
+            return;
+        }
+    };
+
+    let _ctx = setup._ctx;
+    let _pd = setup._pd;
+    let client = RefCell::new(setup.client);
+    let _server_handle = setup._server_handle;
+
+    let mut group = c.benchmark_group("ud_latency");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(1));
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("32B", |b| {
+        b.iter_custom(|iters| {
+            run_ud_send_latency(&mut client.borrow_mut(), iters)
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_send_inline_32b,
     bench_send_latency_32b,
+    bench_ud_send_inline_32b,
+    bench_ud_send_latency_32b,
     bench_write_1m,
     bench_write_1m_relaxed,
     bench_read_1m,
