@@ -301,6 +301,7 @@ impl<RecvEntry> TmSrqState<RecvEntry> {
     /// Updates DBREC and writes minimum 8 bytes to BlueFlame register if configured.
     /// The NIC fetches remaining WQE data via DMA.
     fn ring_doorbell(&self) {
+        mmio_flush_writes!();
         unsafe {
             std::ptr::write_volatile(self.dbrec, self.head.get().to_be());
         }

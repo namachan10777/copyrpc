@@ -82,6 +82,7 @@ impl<T> SrqState<T> {
     /// Note: SRQ does not have its own BlueFlame register, so this falls back
     /// to DBREC-only doorbell if BF is not configured.
     fn ring_doorbell(&self) {
+        mmio_flush_writes!();
         unsafe {
             std::ptr::write_volatile(self.dbrec, self.pi.get().to_be());
         }

@@ -324,6 +324,7 @@ impl<Entry> UdRecvQueueState<Entry> {
     /// The NIC fetches remaining WQE data via DMA.
     /// Also resets pending WQE tracking.
     fn ring_doorbell(&self) {
+        mmio_flush_writes!();
         unsafe {
             std::ptr::write_volatile(self.dbrec, (self.pi.get() as u32).to_be());
         }

@@ -375,6 +375,7 @@ impl<Entry> ReceiveQueueState<Entry> {
     /// Also resets pending WQE tracking.
     #[inline]
     fn ring_doorbell(&self) {
+        mmio_flush_writes!();
         unsafe {
             std::ptr::write_volatile(self.dbrec, (self.pi.get() as u32).to_be());
         }
