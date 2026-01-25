@@ -461,5 +461,297 @@ fn bench_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_latency, bench_throughput);
+// =============================================================================
+// Multi-QP Benchmark (8 QPs, 1024 concurrent requests)
+// =============================================================================
+
+const NUM_QPS: usize = 8;
+const MULTI_QP_PIPELINE_DEPTH: usize = 1024;
+const MULTI_QP_NUM_SLOTS: usize = 2048; // Need enough slots for 1024 concurrent + headroom
+
+struct MultiQpBenchmarkSetup {
+    client: RpcClient,
+    conn_ids: Vec<usize>,
+    _server_handle: ServerHandle,
+    _test_ctx: TestContext,
+}
+
+fn setup_multi_qp_benchmark() -> Option<MultiQpBenchmarkSetup> {
+    set_cpu_affinity(CLIENT_CORE);
+
+    let test_ctx = TestContext::new()?;
+
+    let client_config = ClientConfig {
+        pool: PoolConfig {
+            num_slots: MULTI_QP_NUM_SLOTS,
+            slot_data_size: 4080,
+        },
+        timeout_ms: 10000,
+    };
+
+    let mut client = RpcClient::new(&test_ctx.pd, client_config).ok()?;
+
+    // Create NUM_QPS connections
+    let mut conn_ids = Vec::with_capacity(NUM_QPS);
+    let mut client_infos = Vec::with_capacity(NUM_QPS);
+
+    for _ in 0..NUM_QPS {
+        let conn_id = client.add_connection(&test_ctx.ctx, &test_ctx.pd, test_ctx.port).ok()?;
+        let endpoint = client.local_endpoint(conn_id).ok()?;
+        conn_ids.push(conn_id);
+        client_infos.push(ConnectionInfo {
+            qpn: endpoint.qpn,
+            lid: endpoint.lid,
+            slot_addr: endpoint.slot_addr,
+            slot_rkey: endpoint.slot_rkey,
+        });
+    }
+
+    // Setup communication channels for multi-QP
+    let (server_info_tx, server_info_rx): (Sender<Vec<ConnectionInfo>>, Receiver<Vec<ConnectionInfo>>) =
+        mpsc::channel();
+    let (client_info_tx, client_info_rx): (Sender<Vec<ConnectionInfo>>, Receiver<Vec<ConnectionInfo>>) =
+        mpsc::channel();
+    let server_ready = Arc::new(AtomicU32::new(0));
+    let server_ready_clone = server_ready.clone();
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let server_stop = stop_flag.clone();
+
+    let handle = thread::spawn(move || {
+        multi_qp_server_thread_main(server_info_tx, client_info_rx, server_ready_clone, server_stop);
+    });
+
+    client_info_tx.send(client_infos).ok()?;
+    let server_infos = server_info_rx.recv().ok()?;
+
+    while server_ready.load(Ordering::Acquire) == 0 {
+        std::hint::spin_loop();
+    }
+
+    // Connect all QPs
+    for (i, conn_id) in conn_ids.iter().enumerate() {
+        let server_info = &server_infos[i];
+        let server_endpoint = RemoteEndpoint {
+            qpn: server_info.qpn,
+            psn: 0,
+            lid: server_info.lid,
+            slot_addr: server_info.slot_addr,
+            slot_rkey: server_info.slot_rkey,
+            ..Default::default()
+        };
+        client.connect(*conn_id, server_endpoint).ok()?;
+    }
+
+    let server_handle = ServerHandle {
+        stop_flag,
+        handle: Some(handle),
+    };
+
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    Some(MultiQpBenchmarkSetup {
+        client,
+        conn_ids,
+        _server_handle: server_handle,
+        _test_ctx: test_ctx,
+    })
+}
+
+fn multi_qp_server_thread_main(
+    info_tx: Sender<Vec<ConnectionInfo>>,
+    info_rx: Receiver<Vec<ConnectionInfo>>,
+    ready_signal: Arc<AtomicU32>,
+    stop_flag: Arc<AtomicBool>,
+) {
+    set_cpu_affinity(SERVER_CORE);
+
+    let ctx = match open_mlx5_device() {
+        Some(c) => c,
+        None => return,
+    };
+
+    let port = 1u8;
+    let _port_attr = match ctx.query_port(port) {
+        Ok(attr) => attr,
+        Err(_) => return,
+    };
+
+    let pd = match ctx.alloc_pd() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    let server_config = ServerConfig {
+        pool: PoolConfig {
+            num_slots: MULTI_QP_NUM_SLOTS,
+            slot_data_size: 4080,
+        },
+        num_recv_slots: 256,
+        group: GroupConfig::default(),
+        enable_scheduler: false,
+    };
+
+    let mut server = match RpcServer::new(&pd, server_config) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    server.set_handler(|_rpc_type, payload| (0, payload.to_vec()));
+
+    // Create NUM_QPS connections on server side
+    let mut server_infos = Vec::with_capacity(NUM_QPS);
+    let mut server_conn_ids = Vec::with_capacity(NUM_QPS);
+
+    for _ in 0..NUM_QPS {
+        let conn_id = match server.add_connection(&ctx, &pd, port) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let endpoint = match server.local_endpoint(conn_id) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        server_conn_ids.push(conn_id);
+        server_infos.push(ConnectionInfo {
+            qpn: endpoint.qpn,
+            lid: endpoint.lid,
+            slot_addr: endpoint.slot_addr,
+            slot_rkey: endpoint.slot_rkey,
+        });
+    }
+
+    if info_tx.send(server_infos).is_err() {
+        return;
+    }
+
+    let client_infos = match info_rx.recv() {
+        Ok(info) => info,
+        Err(_) => return,
+    };
+
+    // Connect all server QPs to client QPs
+    for (i, conn_id) in server_conn_ids.iter().enumerate() {
+        let client_info = &client_infos[i];
+        let client_endpoint = RemoteEndpoint {
+            qpn: client_info.qpn,
+            psn: 0,
+            lid: client_info.lid,
+            slot_addr: client_info.slot_addr,
+            slot_rkey: client_info.slot_rkey,
+            ..Default::default()
+        };
+        if server.connect(*conn_id, client_endpoint).is_err() {
+            return;
+        }
+    }
+
+    ready_signal.store(1, Ordering::Release);
+
+    while !stop_flag.load(Ordering::Relaxed) {
+        server.process();
+        std::hint::spin_loop();
+    }
+}
+
+/// Throughput benchmark with multiple QPs (8 QPs, 1024 concurrent requests).
+fn run_multi_qp_throughput_bench(
+    client: &RpcClient,
+    conn_ids: &[usize],
+    msg_size: usize,
+    iters: u64,
+    pipeline_depth: usize,
+) -> Duration {
+    let request_data = vec![0xAAu8; msg_size];
+    let mut pending_requests: Vec<(usize, scalerpc::PendingRpc<'_>)> = Vec::with_capacity(pipeline_depth);
+    let mut completed = 0u64;
+    let mut sent = 0u64;
+    let num_qps = conn_ids.len();
+
+    let start = std::time::Instant::now();
+
+    // Initial fill - distribute across QPs round-robin
+    for i in 0..pipeline_depth.min(iters as usize) {
+        let conn_id = conn_ids[i % num_qps];
+        match client.call_async(conn_id, 1, &request_data) {
+            Ok(p) => {
+                pending_requests.push((conn_id, p));
+                sent += 1;
+            }
+            Err(_) => {}
+        }
+    }
+
+    // Main loop
+    while completed < iters {
+        let mut i = 0;
+        while i < pending_requests.len() {
+            if pending_requests[i].1.poll().is_some() {
+                pending_requests.swap_remove(i);
+                completed += 1;
+
+                if sent < iters {
+                    let conn_id = conn_ids[(sent as usize) % num_qps];
+                    match client.call_async(conn_id, 1, &request_data) {
+                        Ok(p) => {
+                            pending_requests.push((conn_id, p));
+                            sent += 1;
+                        }
+                        Err(_) => {}
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+
+        std::hint::spin_loop();
+    }
+
+    start.elapsed()
+}
+
+fn bench_multi_qp_throughput(c: &mut Criterion) {
+    let setup = match setup_multi_qp_benchmark() {
+        Some(s) => s,
+        None => {
+            eprintln!("Skipping benchmark: no mlx5 device available");
+            return;
+        }
+    };
+
+    let client = setup.client;
+    let conn_ids = setup.conn_ids;
+    let _server = setup._server_handle;
+    let _ctx = setup._test_ctx;
+
+    let mut group = c.benchmark_group("scalerpc_multi_qp");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(5));
+    group.throughput(Throughput::Elements(1));
+
+    // 8 QPs, 1024 concurrent, 32B messages
+    group.bench_function(
+        BenchmarkId::new("8qp_1024concurrent", "32B"),
+        |b| {
+            b.iter_custom(|iters| {
+                run_multi_qp_throughput_bench(&client, &conn_ids, SMALL_MSG_SIZE, iters, MULTI_QP_PIPELINE_DEPTH)
+            });
+        },
+    );
+
+    // 8 QPs, 1024 concurrent, 4KB messages
+    group.bench_function(
+        BenchmarkId::new("8qp_1024concurrent", "4KB"),
+        |b| {
+            b.iter_custom(|iters| {
+                run_multi_qp_throughput_bench(&client, &conn_ids, LARGE_MSG_SIZE, iters, MULTI_QP_PIPELINE_DEPTH)
+            });
+        },
+    );
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_latency, bench_throughput, bench_multi_qp_throughput);
 criterion_main!(benches);
