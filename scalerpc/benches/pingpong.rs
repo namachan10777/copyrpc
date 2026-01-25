@@ -51,7 +51,7 @@ const SERVER_CORE: usize = 1;
 
 const NUM_SLOTS: usize = 1024;
 const SMALL_MSG_SIZE: usize = 32;
-const LARGE_MSG_SIZE: usize = 4096;
+const LARGE_MSG_SIZE: usize = 4000; // Max payload is 4056 (4096 - 8 trailer - 32 header)
 
 // =============================================================================
 // Connection Info
