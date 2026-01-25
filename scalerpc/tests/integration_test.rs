@@ -220,6 +220,9 @@ fn test_loopback_rpc() {
 
     println!("Request sent, req_id={}", pending.req_id());
 
+    // Flush doorbell to send the request
+    client.poll();
+
     // Server processes request
     // In a real scenario, this would be in a separate thread/process
     // For loopback test, we manually drive both sides
@@ -246,6 +249,10 @@ fn test_loopback_rpc() {
             server
                 .reply(&request, status, &response_payload)
                 .expect("send response");
+
+            // Flush doorbell to send the response
+            server.flush_doorbells();
+            server.clear_needs_flush();
 
             println!("Server sent response");
             break;

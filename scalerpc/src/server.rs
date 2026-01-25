@@ -25,7 +25,7 @@
 //! - The next group prepares requests in the Warmup pool
 //! - On context switch, pools are swapped and clients are notified
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::time::Instant;
 
 use mlx5::cq::Cqe;
@@ -391,6 +391,8 @@ pub struct RpcServer {
     scheduler: Option<GroupScheduler>,
     /// Per-connection event buffer addresses for context switch notification.
     event_buffer_addrs: Vec<Option<(u64, u32)>>,
+    /// Connections that need doorbell flush (for batching).
+    needs_flush: RefCell<Vec<ConnectionId>>,
 }
 
 impl RpcServer {
@@ -425,6 +427,7 @@ impl RpcServer {
             next_check_slot: Cell::new(0),
             scheduler,
             event_buffer_addrs: Vec::new(),
+            needs_flush: RefCell::new(Vec::new()),
         })
     }
 
@@ -796,9 +799,8 @@ impl RpcServer {
             std::ptr::write_volatile(data_ptr as *mut u32, 0);
         }
 
-        // Determine connection ID from slot owner or use a default
-        // In a real implementation, we'd track this more carefully
-        let conn_id = slot.owner().unwrap_or(0) as usize;
+        // Use sender_conn_id from the request header for multi-QP routing
+        let conn_id = { header.sender_conn_id } as usize;
 
         Some(IncomingRequest {
             req_id: header.req_id,
@@ -866,7 +868,8 @@ impl RpcServer {
             std::ptr::write_volatile(valid_ptr, 0);
         }
 
-        let conn_id = slot.owner().unwrap_or(0) as usize;
+        // Use sender_conn_id from the request header for multi-QP routing
+        let conn_id = { header.sender_conn_id } as usize;
 
         Some(IncomingRequest {
             req_id: header.req_id,
@@ -956,11 +959,9 @@ impl RpcServer {
             })
             .map_err(|e| Error::Protocol(format!("emit_wqe failed: {:?}", e)))?;
         }
-        conn.ring_sq_doorbell();
 
-        // Drain any completed send operations (non-blocking)
-        // This prevents CQ overflow without blocking on each response
-        conn.poll_send_cq();
+        // Mark connection as needing doorbell flush (batched in poll())
+        self.mark_needs_flush(request.conn_id);
 
         Ok(())
     }
@@ -968,6 +969,7 @@ impl RpcServer {
     /// Process incoming requests using the registered handler.
     ///
     /// Polls for requests and processes them with the handler.
+    /// Flushes doorbells and drains CQs after processing.
     /// Returns the number of requests processed.
     pub fn process(&self) -> usize {
         let handler = match &self.handler {
@@ -981,13 +983,18 @@ impl RpcServer {
             // Call handler
             let (status, response_payload) = handler(request.rpc_type, &request.payload);
 
-            // Send response
+            // Send response (WQE only, no doorbell)
             if let Err(e) = self.send_response(&request, status, &response_payload) {
                 eprintln!("Failed to send response: {}", e);
             }
 
             processed += 1;
         }
+
+        // Batch flush doorbells and drain CQs
+        self.flush_doorbells();
+        self.needs_flush.borrow_mut().clear();
+        self.poll_cqs();
 
         processed
     }
@@ -1000,6 +1007,34 @@ impl RpcServer {
             total += conn.poll_recv_cq();
         }
         total
+    }
+
+    /// Mark a connection as needing doorbell flush.
+    ///
+    /// The doorbell will be batched and issued in the next `poll()` call.
+    fn mark_needs_flush(&self, conn_id: ConnectionId) {
+        let mut needs_flush = self.needs_flush.borrow_mut();
+        if !needs_flush.contains(&conn_id) {
+            needs_flush.push(conn_id);
+        }
+    }
+
+    /// Flush all pending doorbells.
+    ///
+    /// Issues doorbells for all connections with pending WQEs.
+    /// This can be called directly to flush without draining CQs.
+    pub fn flush_doorbells(&self) {
+        let needs_flush = self.needs_flush.borrow();
+        for &conn_id in needs_flush.iter() {
+            if let Some(Some(conn)) = self.connections.get(conn_id) {
+                conn.ring_sq_doorbell();
+            }
+        }
+    }
+
+    /// Clear the needs_flush list.
+    pub fn clear_needs_flush(&self) {
+        self.needs_flush.borrow_mut().clear();
     }
 
     /// Receive the next incoming request.
@@ -1025,13 +1060,20 @@ impl RpcServer {
     /// Main server loop - one iteration.
     ///
     /// This is the simplified API for running the server. It handles:
+    /// - Flushing pending doorbells (batch doorbell)
+    /// - Draining CQs
     /// - Context switch when scheduler is enabled
     /// - Fetching warmup requests
     /// - Processing incoming requests (if handler is set)
     ///
-    /// Returns the number of requests processed.
+    /// Returns the number of CQ entries processed (or requests if handler is set).
     pub fn poll(&mut self) -> usize {
-        let mut processed = 0;
+        // 1. Flush all pending doorbells
+        self.flush_doorbells();
+        self.needs_flush.borrow_mut().clear();
+
+        // 2. Drain all CQs
+        let cq_processed = self.poll_cqs();
 
         // Handle scheduler tasks if enabled
         if self.scheduler.is_some() {
@@ -1045,18 +1087,23 @@ impl RpcServer {
         }
 
         // Process requests if handler is set
+        let mut requests_processed = 0;
         if self.handler.is_some() {
             while let Some(request) = self.recv() {
                 if let Some(handler) = &self.handler {
                     let (status, response) = handler(request.rpc_type, &request.payload);
                     if self.reply(&request, status, &response).is_ok() {
-                        processed += 1;
+                        requests_processed += 1;
                     }
                 }
             }
         }
 
-        processed
+        if requests_processed > 0 {
+            requests_processed
+        } else {
+            cq_processed
+        }
     }
 
     /// Fetch warmup requests from clients via RDMA READ.
@@ -1203,7 +1250,8 @@ impl RpcServer {
                 std::ptr::write_volatile(data_ptr as *mut u32, 0);
             }
 
-            let conn_id = slot.owner().unwrap_or(0) as usize;
+            // Use sender_conn_id from the request header for multi-QP routing
+            let conn_id = { header.sender_conn_id } as usize;
 
             return Some(IncomingRequest {
                 req_id: header.req_id,
@@ -1241,7 +1289,8 @@ impl RpcServer {
             std::ptr::write_volatile(valid_ptr, 0);
         }
 
-        let conn_id = slot.owner().unwrap_or(0) as usize;
+        // Use sender_conn_id from the request header for multi-QP routing
+        let conn_id = { header.sender_conn_id } as usize;
 
         Some(IncomingRequest {
             req_id: header.req_id,

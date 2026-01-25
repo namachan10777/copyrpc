@@ -150,8 +150,8 @@ pub struct RequestHeader {
     pub client_slot_addr: u64,
     /// Client's slot rkey for response write-back.
     pub client_slot_rkey: u32,
-    /// Padding for alignment.
-    _pad: u32,
+    /// Sender's connection ID (for multi-QP routing).
+    pub sender_conn_id: u32,
 }
 
 impl RequestHeader {
@@ -165,6 +165,7 @@ impl RequestHeader {
         payload_len: u16,
         client_slot_addr: u64,
         client_slot_rkey: u32,
+        sender_conn_id: u32,
     ) -> Self {
         Self {
             magic: REQUEST_MAGIC,
@@ -173,7 +174,7 @@ impl RequestHeader {
             payload_len,
             client_slot_addr,
             client_slot_rkey,
-            _pad: 0,
+            sender_conn_id,
         }
     }
 
@@ -410,7 +411,7 @@ mod tests {
 
     #[test]
     fn test_request_header_serialization() {
-        let header = RequestHeader::new(123, 1, 100, 0x1000, 0xABCD);
+        let header = RequestHeader::new(123, 1, 100, 0x1000, 0xABCD, 5);
         assert!(header.is_valid());
 
         let mut buf = [0u8; RequestHeader::SIZE];
@@ -424,12 +425,14 @@ mod tests {
             let payload_len = { read_back.payload_len };
             let client_slot_addr = { read_back.client_slot_addr };
             let client_slot_rkey = { read_back.client_slot_rkey };
+            let sender_conn_id = { read_back.sender_conn_id };
             assert_eq!(magic, REQUEST_MAGIC);
             assert_eq!(req_id, 123);
             assert_eq!(rpc_type, 1);
             assert_eq!(payload_len, 100);
             assert_eq!(client_slot_addr, 0x1000);
             assert_eq!(client_slot_rkey, 0xABCD);
+            assert_eq!(sender_conn_id, 5);
         }
     }
 

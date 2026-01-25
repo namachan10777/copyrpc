@@ -320,6 +320,8 @@ pub struct RpcClient {
     /// Protection domain reference for buffer allocation.
     #[allow(dead_code)]
     pd_ptr: *const Pd,
+    /// Connections that need doorbell flush (for batching).
+    needs_flush: RefCell<Vec<ConnectionId>>,
 }
 
 impl RpcClient {
@@ -339,6 +341,7 @@ impl RpcClient {
             connection_states: Vec::new(),
             config,
             pd_ptr: pd as *const Pd,
+            needs_flush: RefCell::new(Vec::new()),
         })
     }
 
@@ -494,6 +497,8 @@ impl RpcClient {
         payload: &[u8],
     ) -> Result<RpcResponse> {
         let pending = self.call_async(conn_id, rpc_type, payload)?;
+        // Flush doorbell immediately for blocking call
+        self.poll();
         pending.wait()
     }
 
@@ -540,6 +545,7 @@ impl RpcClient {
             payload.len() as u16,
             slot.data_addr(),
             self.pool.rkey(),
+            conn_id as u32,
         );
 
         // Write header and payload to slot
@@ -583,11 +589,9 @@ impl RpcClient {
             })
             .map_err(|e| Error::Protocol(format!("emit_wqe failed: {:?}", e)))?;
         }
-        conn.ring_sq_doorbell();
 
-        // Drain any completed send operations (non-blocking)
-        // This prevents CQ overflow without blocking on each request
-        conn.poll_send_cq();
+        // Mark connection as needing doorbell flush (batched in poll())
+        self.mark_needs_flush(conn_id);
 
         Ok(PendingRpc {
             pool: &self.pool,
@@ -605,6 +609,40 @@ impl RpcClient {
             total += conn.poll_recv_cq();
         }
         total
+    }
+
+    /// Mark a connection as needing doorbell flush.
+    ///
+    /// The doorbell will be batched and issued in the next `poll()` call.
+    fn mark_needs_flush(&self, conn_id: ConnectionId) {
+        let mut needs_flush = self.needs_flush.borrow_mut();
+        if !needs_flush.contains(&conn_id) {
+            needs_flush.push(conn_id);
+        }
+    }
+
+    /// Batch doorbell flush and CQ drain.
+    ///
+    /// This is the main polling method that should be called periodically.
+    /// It:
+    /// 1. Issues doorbells for all connections with pending WQEs
+    /// 2. Drains all connection CQs
+    ///
+    /// Returns the total number of CQ entries processed.
+    pub fn poll(&self) -> usize {
+        // 1. Flush all pending doorbells
+        {
+            let needs_flush = self.needs_flush.borrow();
+            for &conn_id in needs_flush.iter() {
+                if let Some(Some(conn)) = self.connections.get(conn_id) {
+                    conn.ring_sq_doorbell();
+                }
+            }
+        }
+        self.needs_flush.borrow_mut().clear();
+
+        // 2. Drain all CQs
+        self.poll_cqs()
     }
 
     /// Check for context switch events on a specific connection.
@@ -728,6 +766,7 @@ impl RpcClient {
             payload.len() as u16,
             response_slot.data_addr(),
             self.pool.rkey(),
+            conn_id as u32,
         );
 
         // Write to warmup buffer

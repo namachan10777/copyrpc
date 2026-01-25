@@ -334,6 +334,9 @@ fn test_throughput() {
     }
     eprintln!("[fill] done, sent={}", sent);
 
+    // Batch doorbell for initial fill
+    client.poll();
+
     // Main loop
     let mut iter = 0u64;
     while completed < total_requests {
@@ -367,7 +370,8 @@ fn test_throughput() {
             eprintln!("[main] iter={}, completed={}, pending={:?}", iter, completed, pending_info);
         }
 
-        std::hint::spin_loop();
+        // Batch doorbell + CQ drain
+        client.poll();
     }
 
     let elapsed = start.elapsed();
@@ -536,6 +540,9 @@ fn test_throughput_4kb() {
     }
     eprintln!("[fill] done, sent={}", sent);
 
+    // Batch doorbell for initial fill
+    client.poll();
+
     // Main loop with timeout
     let timeout = std::time::Duration::from_secs(10);
     let mut iter = 0u64;
@@ -573,7 +580,8 @@ fn test_throughput_4kb() {
             eprintln!("[main] iter={}, completed={}, pending={:?}", iter, completed, pending_info);
         }
 
-        std::hint::spin_loop();
+        // Batch doorbell + CQ drain
+        client.poll();
     }
 
     let elapsed = start.elapsed();

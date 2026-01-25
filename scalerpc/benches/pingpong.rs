@@ -329,7 +329,7 @@ fn run_latency_bench(client: &RpcClient, conn_id: usize, msg_size: usize, iters:
     start.elapsed()
 }
 
-/// Throughput benchmark (pipelined requests).
+/// Throughput benchmark (pipelined requests with doorbell batching).
 fn run_throughput_bench(
     client: &RpcClient,
     conn_id: usize,
@@ -355,6 +355,9 @@ fn run_throughput_bench(
         }
     }
 
+    // Batch doorbell for initial fill
+    client.poll();
+
     // Main loop
     while completed < iters {
         // Check for completed requests
@@ -379,7 +382,8 @@ fn run_throughput_bench(
             }
         }
 
-        std::hint::spin_loop();
+        // Batch doorbell + CQ drain
+        client.poll();
     }
 
     start.elapsed()
@@ -466,8 +470,8 @@ fn bench_throughput(c: &mut Criterion) {
 // =============================================================================
 
 const NUM_QPS: usize = 8;
-const MULTI_QP_PIPELINE_DEPTH: usize = 1024;
-const MULTI_QP_NUM_SLOTS: usize = 2048; // Need enough slots for 1024 concurrent + headroom
+const MULTI_QP_PIPELINE_DEPTH: usize = 64; // Balanced for performance
+const MULTI_QP_NUM_SLOTS: usize = 256; // Enough slots for 64 concurrent + headroom
 
 struct MultiQpBenchmarkSetup {
     client: RpcClient,
@@ -654,7 +658,7 @@ fn multi_qp_server_thread_main(
     }
 }
 
-/// Throughput benchmark with multiple QPs (8 QPs, 1024 concurrent requests).
+/// Throughput benchmark with multiple QPs (8 QPs, 1024 concurrent requests with doorbell batching).
 fn run_multi_qp_throughput_bench(
     client: &RpcClient,
     conn_ids: &[usize],
@@ -682,6 +686,9 @@ fn run_multi_qp_throughput_bench(
         }
     }
 
+    // Batch doorbell for initial fill
+    client.poll();
+
     // Main loop
     while completed < iters {
         let mut i = 0;
@@ -705,7 +712,8 @@ fn run_multi_qp_throughput_bench(
             }
         }
 
-        std::hint::spin_loop();
+        // Batch doorbell + CQ drain
+        client.poll();
     }
 
     start.elapsed()
