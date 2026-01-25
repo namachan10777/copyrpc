@@ -75,10 +75,16 @@ pub struct SSlot<U> {
     pub resp_msg_size: usize,
     /// Multi-packet response reassembly buffer.
     pub resp_buf: Option<Vec<u8>>,
-    /// Received packet bitmap for multi-packet responses (up to 64 packets).
-    pub recv_bitmap: u64,
+    /// Next expected packet number for Go-Back-N protocol.
+    pub expected_pkt_num: u16,
     /// Request message size (for multi-packet requests).
     pub req_msg_size: usize,
+    /// Total number of packets in the request (for multi-packet requests).
+    pub req_num_pkts: u16,
+    /// Number of request packets sent so far.
+    pub req_pkts_sent: u16,
+    /// Request buffer indices for all packets (for retransmission).
+    pub req_buf_indices: Vec<usize>,
 }
 
 impl<U> SSlot<U> {
@@ -99,8 +105,11 @@ impl<U> SSlot<U> {
             resp_buf_idx: None,
             resp_msg_size: 0,
             resp_buf: None,
-            recv_bitmap: 0,
+            expected_pkt_num: 0,
             req_msg_size: 0,
+            req_num_pkts: 0,
+            req_pkts_sent: 0,
+            req_buf_indices: Vec::new(),
         }
     }
 
@@ -124,8 +133,11 @@ impl<U> SSlot<U> {
         self.resp_buf_idx = None;
         self.resp_msg_size = 0;
         self.resp_buf = None;
-        self.recv_bitmap = 0;
+        self.expected_pkt_num = 0;
         self.req_msg_size = 0;
+        self.req_num_pkts = 0;
+        self.req_pkts_sent = 0;
+        self.req_buf_indices.clear();
     }
 
     /// Start a new request.
@@ -156,27 +168,15 @@ impl<U> SSlot<U> {
         }
     }
 
-    /// Record a received packet with packet number (for multi-packet responses).
-    ///
-    /// Returns true if this is a new packet (not a duplicate).
-    pub fn record_recv_pkt(&mut self, pkt_num: u16) -> bool {
-        if pkt_num >= 64 {
-            // For packets beyond bitmap range, always accept
-            self.pkts_recvd += 1;
-            if self.pkts_recvd >= self.num_pkts_total {
-                self.state = SSlotState::Complete;
-            } else {
-                self.state = SSlotState::RxResponse;
-            }
-            return true;
-        }
+    /// Check if the given packet number is the expected one (Go-Back-N).
+    #[inline]
+    pub fn is_expected_pkt(&self, pkt_num: u16) -> bool {
+        pkt_num == self.expected_pkt_num
+    }
 
-        let mask = 1u64 << pkt_num;
-        if self.recv_bitmap & mask != 0 {
-            return false; // Duplicate
-        }
-
-        self.recv_bitmap |= mask;
+    /// Advance the expected packet number and record receipt (Go-Back-N).
+    pub fn advance_expected(&mut self) {
+        self.expected_pkt_num += 1;
         self.pkts_recvd += 1;
 
         if self.pkts_recvd >= self.num_pkts_total {
@@ -184,7 +184,19 @@ impl<U> SSlot<U> {
         } else {
             self.state = SSlotState::RxResponse;
         }
+    }
 
+    /// Record a received packet with packet number (Go-Back-N protocol).
+    ///
+    /// Returns true if this is the expected packet and was accepted.
+    /// Out-of-order packets are rejected (Go-Back-N semantics).
+    pub fn record_recv_pkt(&mut self, pkt_num: u16) -> bool {
+        // Go-Back-N: Only accept packets with the expected sequence number
+        if !self.is_expected_pkt(pkt_num) {
+            return false; // Out-of-order or duplicate, discard
+        }
+
+        self.advance_expected();
         true
     }
 
@@ -199,7 +211,7 @@ impl<U> SSlot<U> {
         self.resp_buf = Some(vec![0u8; msg_size]);
         self.resp_msg_size = msg_size;
         self.num_pkts_total = num_pkts;
-        self.recv_bitmap = 0;
+        self.expected_pkt_num = 0;
         self.pkts_recvd = 0;
     }
 
@@ -251,6 +263,8 @@ pub struct Session<U> {
     pub cc_state: Option<TimelyState>,
     /// Request window size.
     pub req_window: usize,
+    /// Next allowed send time (μs) for rate limiting.
+    pub next_send_time_us: Cell<u64>,
 }
 
 impl<U> Session<U> {
@@ -280,6 +294,7 @@ impl<U> Session<U> {
             next_req_num: Cell::new(0),
             cc_state,
             req_window,
+            next_send_time_us: Cell::new(0),
         }
     }
 

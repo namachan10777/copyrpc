@@ -106,6 +106,24 @@ impl RpcConfig {
         self.max_sessions = max_sessions;
         self
     }
+
+    /// Set the maximum send queue depth.
+    pub fn with_max_send_wr(mut self, max_send_wr: u32) -> Self {
+        self.max_send_wr = max_send_wr;
+        self
+    }
+
+    /// Set the maximum receive queue depth.
+    pub fn with_max_recv_wr(mut self, max_recv_wr: u32) -> Self {
+        self.max_recv_wr = max_recv_wr;
+        self
+    }
+
+    /// Set the number of receive buffers.
+    pub fn with_num_recv_buffers(mut self, num_recv_buffers: usize) -> Self {
+        self.num_recv_buffers = num_recv_buffers;
+        self
+    }
 }
 
 /// Session-specific configuration.
