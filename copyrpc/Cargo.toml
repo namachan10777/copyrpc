@@ -16,3 +16,6 @@ libc = "0.2"
 [[bench]]
 name = "copyrpc_pingpong"
 harness = false
+
+[lints.clippy]
+manual_div_ceil = "allow"

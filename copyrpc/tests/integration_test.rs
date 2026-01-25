@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use copyrpc::{Context, ContextBuilder, Endpoint, EndpointConfig, RemoteEndpointInfo};
+use copyrpc::{Context, ContextBuilder, EndpointConfig, RemoteEndpointInfo};
 use mlx5::srq::SrqConfig;
 
 // =============================================================================
@@ -30,6 +30,7 @@ struct EndpointConnectionInfo {
 // =============================================================================
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 struct CallUserData {
     call_id: u32,
 }
@@ -427,7 +428,7 @@ fn test_multi_endpoint_pingpong() {
             break;
         }
 
-        if start.elapsed().as_secs() % 2 == 0 {
+        if start.elapsed().as_secs().is_multiple_of(2) {
             // Print progress every 2 seconds
         }
     }
@@ -2095,13 +2096,13 @@ fn test_emit_wqe_boundary_split() {
         }
 
         // Batch multiple calls without poll - this accumulates data in send buffer
-        let mut batch_sent = 0;
+        let mut _batch_sent = 0;
         for i in 0..BATCH_SIZE {
             let user_data = CallUserData { call_id: (batch * BATCH_SIZE + i) as u32 };
             match ep.call(&request_data, user_data) {
                 Ok(_) => {
                     total_sent += 1;
-                    batch_sent += 1;
+                    _batch_sent += 1;
                 }
                 Err(copyrpc::error::Error::RingFull) => {
                     ringfull_count += 1;

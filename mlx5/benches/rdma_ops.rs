@@ -914,7 +914,7 @@ where
 
             for _ in 0..can_send {
                 // Signal at the end of each interval
-                let is_interval_end = (send_idx + 1) % signal_interval == 0;
+                let is_interval_end = (send_idx + 1).is_multiple_of(signal_interval);
                 let is_last = posted + 1 == iters;
                 if is_interval_end || is_last {
                     emit_wqe!(&ctx, write {
@@ -999,7 +999,7 @@ where
 
             for _ in 0..can_send {
                 // Signal at the end of each interval
-                let is_interval_end = (send_idx + 1) % signal_interval == 0;
+                let is_interval_end = (send_idx + 1).is_multiple_of(signal_interval);
                 let is_last = posted + 1 == iters;
                 if is_interval_end || is_last {
                     emit_wqe!(&ctx, read {

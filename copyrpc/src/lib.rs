@@ -497,23 +497,24 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
             let force = ep_ref.force_read.get();
             let inflight = ep_ref.read_inflight.get();
 
-            if !inflight && (needs || force) {
-                if let Some(remote_mr) = ep_ref.remote_consumer_mr.get() {
-                    let qp = ep_ref.qp.borrow();
-                    if let Ok(ctx) = qp.emit_ctx() {
-                        let result = emit_wqe!(&ctx, read {
-                            flags: WqeFlags::empty(),
-                            remote_addr: remote_mr.addr,
-                            rkey: remote_mr.rkey,
-                            sge: { addr: ep_ref.read_buffer_mr.addr() as u64, len: 8, lkey: ep_ref.read_buffer_mr.lkey() },
-                            signaled: SrqEntry { qpn: ep_ref.qpn(), is_read: true },
-                        });
+            if !inflight
+                && (needs || force)
+                && let Some(remote_mr) = ep_ref.remote_consumer_mr.get()
+            {
+                let qp = ep_ref.qp.borrow();
+                if let Ok(ctx) = qp.emit_ctx() {
+                    let result = emit_wqe!(&ctx, read {
+                        flags: WqeFlags::empty(),
+                        remote_addr: remote_mr.addr,
+                        rkey: remote_mr.rkey,
+                        sge: { addr: ep_ref.read_buffer_mr.addr() as u64, len: 8, lkey: ep_ref.read_buffer_mr.lkey() },
+                        signaled: SrqEntry { qpn: ep_ref.qpn(), is_read: true },
+                    });
 
-                        if result.is_ok() {
-                            ep_ref.read_inflight.set(true);
-                            ep_ref.force_read.set(false);
-                            qp.ring_sq_doorbell_bf();
-                        }
+                    if result.is_ok() {
+                        ep_ref.read_inflight.set(true);
+                        ep_ref.force_read.set(false);
+                        qp.ring_sq_doorbell_bf();
                     }
                 }
             }
@@ -745,8 +746,6 @@ impl<U> EndpointInner<U> {
             .sq_cq(send_cq.clone(), sq_callback)
             .rq_mono_cq(recv_cq)
             .build()?;
-
-        let qpn = qp.borrow().qpn();
 
         // Register QP with MonoCq for completion dispatch
         recv_cq.register(&qp);
@@ -1112,6 +1111,7 @@ where
     call_id: u32,
     data_offset: usize,
     data_len: usize,
+    #[allow(dead_code)]
     recv_pos: u64,
     #[allow(dead_code)]
     recv_ring_len: usize,

@@ -20,7 +20,7 @@ pub const ALIGNMENT: u64 = 32;
 #[inline]
 pub fn encode_imm(delta: u64) -> u32 {
     debug_assert!(
-        delta % ALIGNMENT == 0,
+        delta.is_multiple_of(ALIGNMENT),
         "delta must be aligned to {}",
         ALIGNMENT
     );

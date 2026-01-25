@@ -1351,10 +1351,10 @@ impl<Entry: Clone + 'static, OnSq: Fn(Cqe, Entry)> CompletionTarget for RcQpForM
     fn dispatch_cqe(&self, cqe: Cqe) {
         if !cqe.opcode.is_responder() {
             // SQ completion - get entry and call callback
-            if let Some(sq) = self.sq.as_ref() {
-                if let Some(entry) = sq.process_completion(cqe.wqe_counter) {
-                    (self.sq_callback)(cqe, entry);
-                }
+            if let Some(sq) = self.sq.as_ref()
+                && let Some(entry) = sq.process_completion(cqe.wqe_counter)
+            {
+                (self.sq_callback)(cqe, entry);
             }
         }
         // RQ completions are handled by MonoCq via CompletionSource, not this method

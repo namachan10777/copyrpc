@@ -15,6 +15,30 @@ use crate::wqe::{
 };
 
 // =============================================================================
+// Parameter Structs for WQE Emission
+// =============================================================================
+
+/// Scatter/Gather Entry parameters for local memory access.
+#[derive(Debug, Clone, Copy)]
+pub struct SgeParams {
+    /// Local buffer address.
+    pub addr: u64,
+    /// Data length in bytes.
+    pub len: u32,
+    /// Local memory region key.
+    pub lkey: u32,
+}
+
+/// RDMA remote memory parameters.
+#[derive(Debug, Clone, Copy)]
+pub struct RdmaParams {
+    /// Remote buffer address.
+    pub remote_addr: u64,
+    /// Remote memory region key.
+    pub rkey: u32,
+}
+
+// =============================================================================
 // SqState Trait - Core trait for direct QP access
 // =============================================================================
 
@@ -510,9 +534,7 @@ pub struct EmitResult {
 pub fn emit_send_wrap<Q: SqState>(
     ctx: &Q,
     flags: WqeFlags,
-    sge_addr: u64,
-    sge_len: u32,
-    sge_lkey: u32,
+    sge: SgeParams,
     signaled: bool,
     inline_data: Option<&[u8]>,
     imm: u32,
@@ -569,7 +591,7 @@ pub fn emit_send_wrap<Q: SqState>(
             write_inline_header(ptr, data.len() as u32);
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
         } else {
-            write_data_seg(wqe_ptr.add(CTRL_SEG_SIZE), sge_len, sge_lkey, sge_addr);
+            write_data_seg(wqe_ptr.add(CTRL_SEG_SIZE), sge.len, sge.lkey, sge.addr);
         }
     }
 
@@ -590,14 +612,12 @@ pub fn emit_send_wrap<Q: SqState>(
 
 /// Wrap-around helper for WRITE WQE (cold path).
 #[cold]
+#[allow(clippy::too_many_arguments)]
 pub fn emit_write_wrap<Q: SqState>(
     ctx: &Q,
     flags: WqeFlags,
-    remote_addr: u64,
-    rkey: u32,
-    sge_addr: u64,
-    sge_len: u32,
-    sge_lkey: u32,
+    rdma: RdmaParams,
+    sge: SgeParams,
     signaled: bool,
     inline_data: Option<&[u8]>,
     imm: u32,
@@ -648,7 +668,7 @@ pub fn emit_write_wrap<Q: SqState>(
             },
         );
 
-        write_rdma_seg(wqe_ptr.add(CTRL_SEG_SIZE), remote_addr, rkey);
+        write_rdma_seg(wqe_ptr.add(CTRL_SEG_SIZE), rdma.remote_addr, rdma.rkey);
 
         let data_offset = CTRL_SEG_SIZE + RDMA_SEG_SIZE;
         if let Some(data) = inline_data {
@@ -656,7 +676,7 @@ pub fn emit_write_wrap<Q: SqState>(
             write_inline_header(ptr, data.len() as u32);
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
         } else {
-            write_data_seg(wqe_ptr.add(data_offset), sge_len, sge_lkey, sge_addr);
+            write_data_seg(wqe_ptr.add(data_offset), sge.len, sge.lkey, sge.addr);
         }
     }
 
@@ -680,11 +700,8 @@ pub fn emit_write_wrap<Q: SqState>(
 pub fn emit_read_wrap<Q: SqState>(
     ctx: &Q,
     flags: WqeFlags,
-    remote_addr: u64,
-    rkey: u32,
-    sge_addr: u64,
-    sge_len: u32,
-    sge_lkey: u32,
+    rdma: RdmaParams,
+    sge: SgeParams,
     signaled: bool,
 ) -> Result<EmitResult, SubmissionError> {
     const WQE_SIZE: usize = CTRL_SEG_SIZE + RDMA_SEG_SIZE + DATA_SEG_SIZE;
@@ -723,12 +740,12 @@ pub fn emit_read_wrap<Q: SqState>(
             },
         );
 
-        write_rdma_seg(wqe_ptr.add(CTRL_SEG_SIZE), remote_addr, rkey);
+        write_rdma_seg(wqe_ptr.add(CTRL_SEG_SIZE), rdma.remote_addr, rdma.rkey);
         write_data_seg(
             wqe_ptr.add(CTRL_SEG_SIZE + RDMA_SEG_SIZE),
-            sge_len,
-            sge_lkey,
-            sge_addr,
+            sge.len,
+            sge.lkey,
+            sge.addr,
         );
     }
 
@@ -753,11 +770,11 @@ pub fn emit_read_wrap<Q: SqState>(
 
 /// Wrap-around helper for CAS WQE (cold path).
 #[cold]
+#[allow(clippy::too_many_arguments)]
 pub fn emit_cas_wrap<Q: SqState>(
     ctx: &Q,
     flags: WqeFlags,
-    remote_addr: u64,
-    rkey: u32,
+    rdma: RdmaParams,
     swap: u64,
     compare: u64,
     sge_addr: u64,
@@ -800,7 +817,7 @@ pub fn emit_cas_wrap<Q: SqState>(
             },
         );
 
-        write_rdma_seg(wqe_ptr.add(CTRL_SEG_SIZE), remote_addr, rkey);
+        write_rdma_seg(wqe_ptr.add(CTRL_SEG_SIZE), rdma.remote_addr, rdma.rkey);
         write_atomic_seg_cas(wqe_ptr.add(CTRL_SEG_SIZE + RDMA_SEG_SIZE), swap, compare);
         write_data_seg(
             wqe_ptr.add(CTRL_SEG_SIZE + RDMA_SEG_SIZE + ATOMIC_SEG_SIZE),
@@ -830,8 +847,7 @@ pub fn emit_cas_wrap<Q: SqState>(
 pub fn emit_fetch_add_wrap<Q: SqState>(
     ctx: &Q,
     flags: WqeFlags,
-    remote_addr: u64,
-    rkey: u32,
+    rdma: RdmaParams,
     add_value: u64,
     sge_addr: u64,
     sge_lkey: u32,
@@ -873,7 +889,7 @@ pub fn emit_fetch_add_wrap<Q: SqState>(
             },
         );
 
-        write_rdma_seg(wqe_ptr.add(CTRL_SEG_SIZE), remote_addr, rkey);
+        write_rdma_seg(wqe_ptr.add(CTRL_SEG_SIZE), rdma.remote_addr, rdma.rkey);
         write_atomic_seg_fa(wqe_ptr.add(CTRL_SEG_SIZE + RDMA_SEG_SIZE), add_value);
         write_data_seg(
             wqe_ptr.add(CTRL_SEG_SIZE + RDMA_SEG_SIZE + ATOMIC_SEG_SIZE),
@@ -969,7 +985,7 @@ macro_rules! emit_wqe {
         } else {
             let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
             if $crate::wqe::unlikely(WQEBB_CNT > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
-                $crate::wqe::emit::emit_send_wrap(ctx, $flags, $addr, $len, $lkey, false, None, 0, $crate::wqe::WqeOpcode::Send)
+                $crate::wqe::emit::emit_send_wrap(ctx, $flags, $crate::wqe::emit::SgeParams { addr: $addr, len: $len, lkey: $lkey }, false, None, 0, $crate::wqe::WqeOpcode::Send)
             } else {
                 let wqe_idx = ctx.pi().get();
                 let wqe_ptr = unsafe { ctx.sq_buf().add(((wqe_idx & (ctx.wqe_cnt() - 1)) as usize) * 64) };
@@ -1017,7 +1033,7 @@ macro_rules! emit_wqe {
         } else {
             let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
             if $crate::wqe::unlikely(WQEBB_CNT > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
-                let result = $crate::wqe::emit::emit_send_wrap(ctx, $flags | $crate::wqe::WqeFlags::COMPLETION, $addr, $len, $lkey, true, None, 0, $crate::wqe::WqeOpcode::Send);
+                let result = $crate::wqe::emit::emit_send_wrap(ctx, $flags | $crate::wqe::WqeFlags::COMPLETION, $crate::wqe::emit::SgeParams { addr: $addr, len: $len, lkey: $lkey }, true, None, 0, $crate::wqe::WqeOpcode::Send);
                 if let Ok(ref res) = result {
                     ctx.table().store(res.wqe_idx, $entry, ctx.pi.get());
                 }
@@ -1071,7 +1087,7 @@ macro_rules! emit_wqe {
         } else {
             let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
             if $crate::wqe::unlikely(wqebb_cnt > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
-                $crate::wqe::emit::emit_send_wrap(ctx, $flags, 0, 0, 0, false, Some(data), 0, $crate::wqe::WqeOpcode::Send)
+                $crate::wqe::emit::emit_send_wrap(ctx, $flags, $crate::wqe::emit::SgeParams { addr: 0, len: 0, lkey: 0 }, false, Some(data), 0, $crate::wqe::WqeOpcode::Send)
             } else {
                 let wqe_idx = ctx.pi().get();
                 let wqe_ptr = unsafe { ctx.sq_buf().add(((wqe_idx & (ctx.wqe_cnt() - 1)) as usize) * 64) };
@@ -1122,7 +1138,7 @@ macro_rules! emit_wqe {
         } else {
             let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
             if $crate::wqe::unlikely(wqebb_cnt > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
-                let result = $crate::wqe::emit::emit_send_wrap(ctx, $flags | $crate::wqe::WqeFlags::COMPLETION, 0, 0, 0, true, Some(data), 0, $crate::wqe::WqeOpcode::Send);
+                let result = $crate::wqe::emit::emit_send_wrap(ctx, $flags | $crate::wqe::WqeFlags::COMPLETION, $crate::wqe::emit::SgeParams { addr: 0, len: 0, lkey: 0 }, true, Some(data), 0, $crate::wqe::WqeOpcode::Send);
                 if let Ok(ref res) = result {
                     ctx.table().store(res.wqe_idx, $entry, ctx.pi.get());
                 }
@@ -1181,7 +1197,7 @@ macro_rules! emit_wqe {
         } else {
             let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
             if $crate::wqe::unlikely(WQEBB_CNT > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
-                $crate::wqe::emit::emit_write_wrap(ctx, $flags, $raddr, $rkey, $addr, $len, $lkey, false, None, 0, $crate::wqe::WqeOpcode::RdmaWrite)
+                $crate::wqe::emit::emit_write_wrap(ctx, $flags, $crate::wqe::emit::RdmaParams { remote_addr: $raddr, rkey: $rkey }, $crate::wqe::emit::SgeParams { addr: $addr, len: $len, lkey: $lkey }, false, None, 0, $crate::wqe::WqeOpcode::RdmaWrite)
             } else {
                 let wqe_idx = ctx.pi().get();
                 let wqe_ptr = unsafe { ctx.sq_buf().add(((wqe_idx & (ctx.wqe_cnt() - 1)) as usize) * 64) };
@@ -1232,7 +1248,7 @@ macro_rules! emit_wqe {
         } else {
             let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
             if $crate::wqe::unlikely(WQEBB_CNT > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
-                let result = $crate::wqe::emit::emit_write_wrap(ctx, $flags | $crate::wqe::WqeFlags::COMPLETION, $raddr, $rkey, $addr, $len, $lkey, true, None, 0, $crate::wqe::WqeOpcode::RdmaWrite);
+                let result = $crate::wqe::emit::emit_write_wrap(ctx, $flags | $crate::wqe::WqeFlags::COMPLETION, $crate::wqe::emit::RdmaParams { remote_addr: $raddr, rkey: $rkey }, $crate::wqe::emit::SgeParams { addr: $addr, len: $len, lkey: $lkey }, true, None, 0, $crate::wqe::WqeOpcode::RdmaWrite);
                 if let Ok(ref res) = result {
                     ctx.table().store(res.wqe_idx, $entry, ctx.pi.get());
                 }
@@ -1289,7 +1305,7 @@ macro_rules! emit_wqe {
         } else {
             let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
             if $crate::wqe::unlikely(wqebb_cnt > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
-                $crate::wqe::emit::emit_write_wrap(ctx, $flags, $raddr, $rkey, 0, 0, 0, false, Some(data), 0, $crate::wqe::WqeOpcode::RdmaWrite)
+                $crate::wqe::emit::emit_write_wrap(ctx, $flags, $crate::wqe::emit::RdmaParams { remote_addr: $raddr, rkey: $rkey }, $crate::wqe::emit::SgeParams { addr: 0, len: 0, lkey: 0 }, false, Some(data), 0, $crate::wqe::WqeOpcode::RdmaWrite)
             } else {
                 let wqe_idx = ctx.pi().get();
                 let wqe_ptr = unsafe { ctx.sq_buf().add(((wqe_idx & (ctx.wqe_cnt() - 1)) as usize) * 64) };
@@ -1343,7 +1359,7 @@ macro_rules! emit_wqe {
         } else {
             let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
             if $crate::wqe::unlikely(wqebb_cnt > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
-                let result = $crate::wqe::emit::emit_write_wrap(ctx, $flags | $crate::wqe::WqeFlags::COMPLETION, $raddr, $rkey, 0, 0, 0, true, Some(data), 0, $crate::wqe::WqeOpcode::RdmaWrite);
+                let result = $crate::wqe::emit::emit_write_wrap(ctx, $flags | $crate::wqe::WqeFlags::COMPLETION, $crate::wqe::emit::RdmaParams { remote_addr: $raddr, rkey: $rkey }, $crate::wqe::emit::SgeParams { addr: 0, len: 0, lkey: 0 }, true, Some(data), 0, $crate::wqe::WqeOpcode::RdmaWrite);
                 if let Ok(ref res) = result {
                     ctx.table().store(res.wqe_idx, $entry, ctx.pi.get());
                 }
@@ -1404,7 +1420,7 @@ macro_rules! emit_wqe {
         } else {
             let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
             if $crate::wqe::unlikely(WQEBB_CNT > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
-                $crate::wqe::emit::emit_write_wrap(ctx, $flags, $raddr, $rkey, $addr, $len, $lkey, false, None, $imm, $crate::wqe::WqeOpcode::RdmaWriteImm)
+                $crate::wqe::emit::emit_write_wrap(ctx, $flags, $crate::wqe::emit::RdmaParams { remote_addr: $raddr, rkey: $rkey }, $crate::wqe::emit::SgeParams { addr: $addr, len: $len, lkey: $lkey }, false, None, $imm, $crate::wqe::WqeOpcode::RdmaWriteImm)
             } else {
                 let wqe_idx = ctx.pi().get();
                 let wqe_ptr = unsafe { ctx.sq_buf().add(((wqe_idx & (ctx.wqe_cnt() - 1)) as usize) * 64) };
@@ -1456,7 +1472,7 @@ macro_rules! emit_wqe {
         } else {
             let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
             if $crate::wqe::unlikely(WQEBB_CNT > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
-                let result = $crate::wqe::emit::emit_write_wrap(ctx, $flags | $crate::wqe::WqeFlags::COMPLETION, $raddr, $rkey, $addr, $len, $lkey, true, None, $imm, $crate::wqe::WqeOpcode::RdmaWriteImm);
+                let result = $crate::wqe::emit::emit_write_wrap(ctx, $flags | $crate::wqe::WqeFlags::COMPLETION, $crate::wqe::emit::RdmaParams { remote_addr: $raddr, rkey: $rkey }, $crate::wqe::emit::SgeParams { addr: $addr, len: $len, lkey: $lkey }, true, None, $imm, $crate::wqe::WqeOpcode::RdmaWriteImm);
                 if let Ok(ref res) = result {
                     ctx.table().store(res.wqe_idx, $entry, ctx.pi.get());
                 }
@@ -1514,7 +1530,7 @@ macro_rules! emit_wqe {
         } else {
             let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
             if $crate::wqe::unlikely(wqebb_cnt > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
-                $crate::wqe::emit::emit_write_wrap(ctx, $flags, $raddr, $rkey, 0, 0, 0, false, Some(data), $imm, $crate::wqe::WqeOpcode::RdmaWriteImm)
+                $crate::wqe::emit::emit_write_wrap(ctx, $flags, $crate::wqe::emit::RdmaParams { remote_addr: $raddr, rkey: $rkey }, $crate::wqe::emit::SgeParams { addr: 0, len: 0, lkey: 0 }, false, Some(data), $imm, $crate::wqe::WqeOpcode::RdmaWriteImm)
             } else {
                 let wqe_idx = ctx.pi().get();
                 let wqe_ptr = unsafe { ctx.sq_buf().add(((wqe_idx & (ctx.wqe_cnt() - 1)) as usize) * 64) };
@@ -1569,7 +1585,7 @@ macro_rules! emit_wqe {
         } else {
             let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
             if $crate::wqe::unlikely(wqebb_cnt > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
-                let result = $crate::wqe::emit::emit_write_wrap(ctx, $flags | $crate::wqe::WqeFlags::COMPLETION, $raddr, $rkey, 0, 0, 0, true, Some(data), $imm, $crate::wqe::WqeOpcode::RdmaWriteImm);
+                let result = $crate::wqe::emit::emit_write_wrap(ctx, $flags | $crate::wqe::WqeFlags::COMPLETION, $crate::wqe::emit::RdmaParams { remote_addr: $raddr, rkey: $rkey }, $crate::wqe::emit::SgeParams { addr: 0, len: 0, lkey: 0 }, true, Some(data), $imm, $crate::wqe::WqeOpcode::RdmaWriteImm);
                 if let Ok(ref res) = result {
                     ctx.table().store(res.wqe_idx, $entry, ctx.pi().get());
                 }
@@ -1629,7 +1645,7 @@ macro_rules! emit_wqe {
         } else {
             let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
             if $crate::wqe::unlikely(WQEBB_CNT > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
-                $crate::wqe::emit::emit_read_wrap(ctx, $flags, $raddr, $rkey, $addr, $len, $lkey, false)
+                $crate::wqe::emit::emit_read_wrap(ctx, $flags, $crate::wqe::emit::RdmaParams { remote_addr: $raddr, rkey: $rkey }, $crate::wqe::emit::SgeParams { addr: $addr, len: $len, lkey: $lkey }, false)
             } else {
                 let wqe_idx = ctx.pi().get();
                 let wqe_ptr = unsafe { ctx.sq_buf().add(((wqe_idx & (ctx.wqe_cnt() - 1)) as usize) * 64) };
@@ -1680,7 +1696,7 @@ macro_rules! emit_wqe {
         } else {
             let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
             if $crate::wqe::unlikely(WQEBB_CNT > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
-                let result = $crate::wqe::emit::emit_read_wrap(ctx, $flags | $crate::wqe::WqeFlags::COMPLETION, $raddr, $rkey, $addr, $len, $lkey, true);
+                let result = $crate::wqe::emit::emit_read_wrap(ctx, $flags | $crate::wqe::WqeFlags::COMPLETION, $crate::wqe::emit::RdmaParams { remote_addr: $raddr, rkey: $rkey }, $crate::wqe::emit::SgeParams { addr: $addr, len: $len, lkey: $lkey }, true);
                 if let Ok(ref res) = result {
                     ctx.table().store(res.wqe_idx, $entry, ctx.pi.get());
                 }
@@ -1740,7 +1756,7 @@ macro_rules! emit_wqe {
         } else {
             let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
             if $crate::wqe::unlikely(WQEBB_CNT > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
-                $crate::wqe::emit::emit_cas_wrap(ctx, $flags, $raddr, $rkey, $swap, $compare, $addr, $lkey, false)
+                $crate::wqe::emit::emit_cas_wrap(ctx, $flags, $crate::wqe::emit::RdmaParams { remote_addr: $raddr, rkey: $rkey }, $swap, $compare, $addr, $lkey, false)
             } else {
                 let wqe_idx = ctx.pi().get();
                 let wqe_ptr = unsafe { ctx.sq_buf().add(((wqe_idx & (ctx.wqe_cnt() - 1)) as usize) * 64) };
@@ -1794,7 +1810,7 @@ macro_rules! emit_wqe {
         } else {
             let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
             if $crate::wqe::unlikely(WQEBB_CNT > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
-                let result = $crate::wqe::emit::emit_cas_wrap(ctx, $flags | $crate::wqe::WqeFlags::COMPLETION, $raddr, $rkey, $swap, $compare, $addr, $lkey, true);
+                let result = $crate::wqe::emit::emit_cas_wrap(ctx, $flags | $crate::wqe::WqeFlags::COMPLETION, $crate::wqe::emit::RdmaParams { remote_addr: $raddr, rkey: $rkey }, $swap, $compare, $addr, $lkey, true);
                 if let Ok(ref res) = result {
                     ctx.table().store(res.wqe_idx, $entry, ctx.pi.get());
                 }
@@ -1854,7 +1870,7 @@ macro_rules! emit_wqe {
         } else {
             let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
             if $crate::wqe::unlikely(WQEBB_CNT > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
-                $crate::wqe::emit::emit_fetch_add_wrap(ctx, $flags, $raddr, $rkey, $add, $addr, $lkey, false)
+                $crate::wqe::emit::emit_fetch_add_wrap(ctx, $flags, $crate::wqe::emit::RdmaParams { remote_addr: $raddr, rkey: $rkey }, $add, $addr, $lkey, false)
             } else {
                 let wqe_idx = ctx.pi().get();
                 let wqe_ptr = unsafe { ctx.sq_buf().add(((wqe_idx & (ctx.wqe_cnt() - 1)) as usize) * 64) };
@@ -1907,7 +1923,7 @@ macro_rules! emit_wqe {
         } else {
             let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
             if $crate::wqe::unlikely(WQEBB_CNT > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
-                let result = $crate::wqe::emit::emit_fetch_add_wrap(ctx, $flags | $crate::wqe::WqeFlags::COMPLETION, $raddr, $rkey, $add, $addr, $lkey, true);
+                let result = $crate::wqe::emit::emit_fetch_add_wrap(ctx, $flags | $crate::wqe::WqeFlags::COMPLETION, $crate::wqe::emit::RdmaParams { remote_addr: $raddr, rkey: $rkey }, $add, $addr, $lkey, true);
                 if let Ok(ref res) = result {
                     ctx.table().store(res.wqe_idx, $entry, ctx.pi.get());
                 }
@@ -2243,15 +2259,13 @@ impl<'a, Entry> SqState for DciEmitContext<'a, Entry> {
 
 /// Cold path: emit DCI WRITE WQE with wrap-around handling.
 #[cold]
+#[allow(clippy::too_many_arguments)]
 pub fn emit_dci_write_wrap<'a, Entry>(
     ctx: &DciEmitContext<'a, Entry>,
     av: DcAvIb,
     flags: WqeFlags,
-    remote_addr: u64,
-    rkey: u32,
-    sge_addr: u64,
-    sge_len: u32,
-    sge_lkey: u32,
+    rdma: RdmaParams,
+    sge: SgeParams,
     inline_data: Option<&[u8]>,
     imm: u32,
     opcode: WqeOpcode,
@@ -2301,7 +2315,7 @@ pub fn emit_dci_write_wrap<'a, Entry>(
         );
 
         let rdma_offset = CTRL_SEG_SIZE + ADDRESS_VECTOR_SIZE;
-        write_rdma_seg(wqe_ptr.add(rdma_offset), remote_addr, rkey);
+        write_rdma_seg(wqe_ptr.add(rdma_offset), rdma.remote_addr, rdma.rkey);
 
         let data_offset = rdma_offset + RDMA_SEG_SIZE;
         if let Some(data) = inline_data {
@@ -2309,7 +2323,7 @@ pub fn emit_dci_write_wrap<'a, Entry>(
             write_inline_header(ptr, data.len() as u32);
             copy_inline_data(ptr.add(4), data.as_ptr(), data.len());
         } else {
-            write_data_seg(wqe_ptr.add(data_offset), sge_len, sge_lkey, sge_addr);
+            write_data_seg(wqe_ptr.add(data_offset), sge.len, sge.lkey, sge.addr);
         }
     }
 
@@ -2330,11 +2344,8 @@ pub fn emit_dci_read_wrap<'a, Entry>(
     ctx: &DciEmitContext<'a, Entry>,
     av: DcAvIb,
     flags: WqeFlags,
-    remote_addr: u64,
-    rkey: u32,
-    sge_addr: u64,
-    sge_len: u32,
-    sge_lkey: u32,
+    rdma: RdmaParams,
+    sge: SgeParams,
     wqebb_cnt: u16,
     slots_to_end: u16,
 ) -> Result<EmitResult, SubmissionError> {
@@ -2374,8 +2385,8 @@ pub fn emit_dci_read_wrap<'a, Entry>(
         );
 
         let rdma_offset = CTRL_SEG_SIZE + ADDRESS_VECTOR_SIZE;
-        write_rdma_seg(wqe_ptr.add(rdma_offset), remote_addr, rkey);
-        write_data_seg(wqe_ptr.add(rdma_offset + RDMA_SEG_SIZE), sge_len, sge_lkey, sge_addr);
+        write_rdma_seg(wqe_ptr.add(rdma_offset), rdma.remote_addr, rdma.rkey);
+        write_data_seg(wqe_ptr.add(rdma_offset + RDMA_SEG_SIZE), sge.len, sge.lkey, sge.addr);
     }
 
     ctx.advance_pi(wqebb_cnt);
@@ -2391,13 +2402,12 @@ pub fn emit_dci_read_wrap<'a, Entry>(
 
 /// Cold path: emit DCI SEND WQE with wrap-around handling.
 #[cold]
+#[allow(clippy::too_many_arguments)]
 pub fn emit_dci_send_wrap<'a, Entry>(
     ctx: &DciEmitContext<'a, Entry>,
     av: DcAvIb,
     flags: WqeFlags,
-    sge_addr: u64,
-    sge_len: u32,
-    sge_lkey: u32,
+    sge: SgeParams,
     inline_data: Option<&[u8]>,
     imm: u32,
     opcode: WqeOpcode,
@@ -2452,7 +2462,7 @@ pub fn emit_dci_send_wrap<'a, Entry>(
             write_inline_header(ptr, data.len() as u32);
             copy_inline_data(ptr.add(4), data.as_ptr(), data.len());
         } else {
-            write_data_seg(wqe_ptr.add(data_offset), sge_len, sge_lkey, sge_addr);
+            write_data_seg(wqe_ptr.add(data_offset), sge.len, sge.lkey, sge.addr);
         }
     }
 
@@ -2695,13 +2705,12 @@ impl<'a, Entry> SqState for UdEmitContext<'a, Entry> {
 
 /// Cold path: emit UD SEND WQE with wrap-around handling.
 #[cold]
+#[allow(clippy::too_many_arguments)]
 pub fn emit_ud_send_wrap<'a, Entry>(
     ctx: &UdEmitContext<'a, Entry>,
     av: UdAvIb,
     flags: WqeFlags,
-    sge_addr: u64,
-    sge_len: u32,
-    sge_lkey: u32,
+    sge: SgeParams,
     inline_data: Option<&[u8]>,
     imm: u32,
     opcode: WqeOpcode,
@@ -2751,7 +2760,7 @@ pub fn emit_ud_send_wrap<'a, Entry>(
             write_inline_header(ptr, data.len() as u32);
             copy_inline_data(ptr.add(4), data.as_ptr(), data.len());
         } else {
-            write_data_seg(wqe_ptr.add(data_offset), sge_len, sge_lkey, sge_addr);
+            write_data_seg(wqe_ptr.add(data_offset), sge.len, sge.lkey, sge.addr);
         }
     }
 
@@ -3220,7 +3229,8 @@ macro_rules! emit_dci_wqe {
             if $crate::wqe::unlikely(WQEBB_CNT > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
                 let result = $crate::wqe::emit::emit_dci_write_wrap(
                     ctx, av, $flags | $crate::wqe::WqeFlags::COMPLETION,
-                    $raddr, $rkey, $addr, $len, $lkey,
+                    $crate::wqe::emit::RdmaParams { remote_addr: $raddr, rkey: $rkey },
+                    $crate::wqe::emit::SgeParams { addr: $addr, len: $len, lkey: $lkey },
                     None, 0, $crate::wqe::WqeOpcode::RdmaWrite,
                     WQEBB_CNT, slots_to_end,
                 );
@@ -3300,7 +3310,8 @@ macro_rules! emit_dci_wqe {
             if $crate::wqe::unlikely(wqebb_cnt > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
                 let result = $crate::wqe::emit::emit_dci_write_wrap(
                     ctx, av, $flags | $crate::wqe::WqeFlags::COMPLETION,
-                    $raddr, $rkey, 0, 0, 0,
+                    $crate::wqe::emit::RdmaParams { remote_addr: $raddr, rkey: $rkey },
+                    $crate::wqe::emit::SgeParams { addr: 0, len: 0, lkey: 0 },
                     Some(data), 0, $crate::wqe::WqeOpcode::RdmaWrite,
                     wqebb_cnt, slots_to_end,
                 );
@@ -3378,7 +3389,8 @@ macro_rules! emit_dci_wqe {
             if $crate::wqe::unlikely(WQEBB_CNT > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
                 let result = $crate::wqe::emit::emit_dci_read_wrap(
                     ctx, av, $flags | $crate::wqe::WqeFlags::COMPLETION,
-                    $raddr, $rkey, $addr, $len, $lkey,
+                    $crate::wqe::emit::RdmaParams { remote_addr: $raddr, rkey: $rkey },
+                    $crate::wqe::emit::SgeParams { addr: $addr, len: $len, lkey: $lkey },
                     WQEBB_CNT, slots_to_end,
                 );
                 if let Ok(ref res) = result {
@@ -3451,7 +3463,7 @@ macro_rules! emit_dci_wqe {
             if $crate::wqe::unlikely(WQEBB_CNT > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
                 let result = $crate::wqe::emit::emit_dci_send_wrap(
                     ctx, av, $flags | $crate::wqe::WqeFlags::COMPLETION,
-                    $addr, $len, $lkey,
+                    $crate::wqe::emit::SgeParams { addr: $addr, len: $len, lkey: $lkey },
                     None, 0, $crate::wqe::WqeOpcode::Send,
                     WQEBB_CNT, slots_to_end,
                 );
@@ -3524,7 +3536,7 @@ macro_rules! emit_dci_wqe {
             if $crate::wqe::unlikely(wqebb_cnt > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
                 let result = $crate::wqe::emit::emit_dci_send_wrap(
                     ctx, av, $flags | $crate::wqe::WqeFlags::COMPLETION,
-                    0, 0, 0,
+                    $crate::wqe::emit::SgeParams { addr: 0, len: 0, lkey: 0 },
                     Some(data), 0, $crate::wqe::WqeOpcode::Send,
                     wqebb_cnt, slots_to_end,
                 );
@@ -3626,7 +3638,7 @@ macro_rules! emit_ud_wqe {
             if $crate::wqe::unlikely(WQEBB_CNT > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
                 let result = $crate::wqe::emit::emit_ud_send_wrap(
                     ctx, av, $flags | $crate::wqe::WqeFlags::COMPLETION,
-                    $addr, $len, $lkey,
+                    $crate::wqe::emit::SgeParams { addr: $addr, len: $len, lkey: $lkey },
                     None, 0, $crate::wqe::WqeOpcode::Send,
                     WQEBB_CNT, slots_to_end,
                 );
@@ -3699,7 +3711,7 @@ macro_rules! emit_ud_wqe {
             if $crate::wqe::unlikely(wqebb_cnt > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
                 let result = $crate::wqe::emit::emit_ud_send_wrap(
                     ctx, av, $flags | $crate::wqe::WqeFlags::COMPLETION,
-                    0, 0, 0,
+                    $crate::wqe::emit::SgeParams { addr: 0, len: 0, lkey: 0 },
                     Some(data), 0, $crate::wqe::WqeOpcode::Send,
                     wqebb_cnt, slots_to_end,
                 );

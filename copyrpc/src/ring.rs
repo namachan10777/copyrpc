@@ -85,7 +85,7 @@ impl RingBufferState {
     /// * `delta` - Number of bytes written (must be aligned to ALIGNMENT)
     #[inline]
     pub fn advance_producer(&self, delta: u64) {
-        debug_assert!(delta % ALIGNMENT == 0);
+        debug_assert!(delta.is_multiple_of(ALIGNMENT));
         self.producer.set(self.producer.get() + delta);
     }
 
@@ -95,7 +95,7 @@ impl RingBufferState {
     /// * `delta` - Number of bytes consumed (must be aligned to ALIGNMENT)
     #[inline]
     pub fn advance_consumer(&self, delta: u64) {
-        debug_assert!(delta % ALIGNMENT == 0);
+        debug_assert!(delta.is_multiple_of(ALIGNMENT));
         self.consumer.set(self.consumer.get() + delta);
     }
 
@@ -168,6 +168,12 @@ impl RingBuffer {
     #[inline]
     pub fn len(&self) -> usize {
         self.buf.len()
+    }
+
+    /// Check if the buffer is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
     }
 
     /// Get a reference to the ring buffer state.
