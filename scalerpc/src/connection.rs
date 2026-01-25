@@ -1,0 +1,223 @@
+//! Connection wrapper for RC QP.
+//!
+//! This module wraps mlx5 RC QP for ScaleRPC use.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use mlx5::cq::{Cq, CqConfig, Cqe};
+use mlx5::device::Context;
+use mlx5::pd::{AccessFlags, Pd};
+use mlx5::qp::{RcQpConfig, RcQpIb};
+use mlx5::transport::IbRemoteQpInfo;
+use mlx5::types::PortAttr;
+
+use crate::error::Result;
+
+/// Connection ID type.
+pub type ConnectionId = usize;
+
+/// Remote endpoint information for establishing a connection.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteEndpoint {
+    /// Remote QP number.
+    pub qpn: u32,
+    /// Remote PSN.
+    pub psn: u32,
+    /// Remote LID.
+    pub lid: u16,
+    /// Remote slot base address for RDMA WRITE.
+    pub slot_addr: u64,
+    /// Remote slot rkey.
+    pub slot_rkey: u32,
+    /// Remote endpoint entry address for warmup registration.
+    pub endpoint_entry_addr: u64,
+    /// Remote endpoint entry rkey.
+    pub endpoint_entry_rkey: u32,
+    /// Remote event buffer address for context switch notification.
+    pub event_buffer_addr: u64,
+    /// Remote event buffer rkey.
+    pub event_buffer_rkey: u32,
+}
+
+/// Callback type for SQ completions.
+pub type SqCallback = fn(Cqe, u64);
+
+/// Callback type for RQ completions.
+pub type RqCallback = fn(Cqe, u64);
+
+/// RC QP connection wrapper.
+///
+/// Wraps an mlx5 RC QP with associated CQs and provides
+/// a simplified interface for ScaleRPC operations.
+pub struct Connection {
+    /// Connection identifier.
+    conn_id: ConnectionId,
+    /// The underlying RC QP.
+    qp: Rc<RefCell<RcQpIb<u64, u64, SqCallback, RqCallback>>>,
+    /// Send completion queue.
+    send_cq: Rc<Cq>,
+    /// Receive completion queue.
+    recv_cq: Rc<Cq>,
+    /// Local port number.
+    port: u8,
+    /// Port attributes.
+    port_attr: PortAttr,
+    /// Remote endpoint information.
+    remote: Option<RemoteEndpoint>,
+}
+
+impl Connection {
+    /// Create a new connection.
+    ///
+    /// # Arguments
+    /// * `ctx` - Device context
+    /// * `pd` - Protection domain
+    /// * `conn_id` - Unique connection identifier
+    /// * `port` - Local port number
+    /// * `sq_callback` - Callback for send completions
+    /// * `rq_callback` - Callback for receive completions
+    pub fn new(
+        ctx: &Context,
+        pd: &Pd,
+        conn_id: ConnectionId,
+        port: u8,
+        sq_callback: SqCallback,
+        rq_callback: RqCallback,
+    ) -> Result<Self> {
+        let port_attr = ctx.query_port(port)?;
+
+        // Create CQs
+        let cq_config = CqConfig::default();
+        let send_cq = Rc::new(ctx.create_cq(256, &cq_config)?);
+        let recv_cq = Rc::new(ctx.create_cq(256, &cq_config)?);
+
+        // Create QP
+        let qp_config = RcQpConfig {
+            max_send_wr: 256,
+            max_recv_wr: 256,
+            max_send_sge: 4,
+            max_recv_sge: 4,
+            max_inline_data: 64,
+            enable_scatter_to_cqe: false,
+        };
+
+        let qp = ctx
+            .rc_qp_builder::<u64, u64>(pd, &qp_config)
+            .sq_cq(send_cq.clone(), sq_callback)
+            .rq_cq(recv_cq.clone(), rq_callback)
+            .build()?;
+
+        Ok(Self {
+            conn_id,
+            qp,
+            send_cq,
+            recv_cq,
+            port,
+            port_attr,
+            remote: None,
+        })
+    }
+
+    /// Get the connection ID.
+    pub fn conn_id(&self) -> ConnectionId {
+        self.conn_id
+    }
+
+    /// Get the local QP number.
+    pub fn qpn(&self) -> u32 {
+        self.qp.borrow().qpn()
+    }
+
+    /// Get the local LID.
+    pub fn lid(&self) -> u16 {
+        self.port_attr.lid
+    }
+
+    /// Get local endpoint information for exchange with remote.
+    pub fn local_endpoint(&self) -> RemoteEndpoint {
+        RemoteEndpoint {
+            qpn: self.qpn(),
+            psn: 0,
+            lid: self.lid(),
+            slot_addr: 0,            // To be filled by caller
+            slot_rkey: 0,            // To be filled by caller
+            endpoint_entry_addr: 0,  // To be filled by caller (server only)
+            endpoint_entry_rkey: 0,  // To be filled by caller (server only)
+            event_buffer_addr: 0,    // To be filled by caller (client only)
+            event_buffer_rkey: 0,    // To be filled by caller (client only)
+        }
+    }
+
+    /// Connect to a remote endpoint.
+    pub fn connect(&mut self, remote: RemoteEndpoint) -> Result<()> {
+        let remote_qp_info = IbRemoteQpInfo {
+            qp_number: remote.qpn,
+            packet_sequence_number: remote.psn,
+            local_identifier: remote.lid,
+        };
+
+        let access = (AccessFlags::LOCAL_WRITE
+            | AccessFlags::REMOTE_WRITE
+            | AccessFlags::REMOTE_READ
+            | AccessFlags::REMOTE_ATOMIC)
+            .bits();
+
+        self.qp
+            .borrow_mut()
+            .connect(&remote_qp_info, self.port, 0, 4, 4, access)?;
+
+        self.remote = Some(remote);
+        Ok(())
+    }
+
+    /// Get the remote endpoint information.
+    pub fn remote(&self) -> Option<&RemoteEndpoint> {
+        self.remote.as_ref()
+    }
+
+    /// Get a reference to the QP for WQE emission.
+    pub fn qp(&self) -> &Rc<RefCell<RcQpIb<u64, u64, SqCallback, RqCallback>>> {
+        &self.qp
+    }
+
+    /// Get a reference to the send CQ.
+    pub fn send_cq(&self) -> &Rc<Cq> {
+        &self.send_cq
+    }
+
+    /// Get a reference to the receive CQ.
+    pub fn recv_cq(&self) -> &Rc<Cq> {
+        &self.recv_cq
+    }
+
+    /// Poll the send CQ.
+    pub fn poll_send_cq(&self) -> usize {
+        let count = self.send_cq.poll();
+        self.send_cq.flush();
+        count
+    }
+
+    /// Poll the receive CQ.
+    pub fn poll_recv_cq(&self) -> usize {
+        let count = self.recv_cq.poll();
+        self.recv_cq.flush();
+        count
+    }
+
+    /// Ring the SQ doorbell.
+    pub fn ring_sq_doorbell(&self) {
+        self.qp.borrow().ring_sq_doorbell();
+    }
+
+    /// Ring the RQ doorbell.
+    pub fn ring_rq_doorbell(&self) {
+        self.qp.borrow().ring_rq_doorbell();
+    }
+
+    /// Post a receive buffer.
+    pub fn post_recv(&self, entry: u64, addr: u64, len: u32, lkey: u32) -> Result<()> {
+        self.qp.borrow().post_recv(entry, addr, len, lkey)?;
+        Ok(())
+    }
+}
