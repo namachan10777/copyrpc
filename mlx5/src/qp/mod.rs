@@ -164,7 +164,8 @@ impl<Entry, TableType> SendQueueState<Entry, TableType> {
 
     /// Ring the doorbell with BlueFlame write of entire WQE.
     ///
-    /// Copies the last WQE (up to bf_size bytes) to the BlueFlame register.
+    /// Copies the last WQE (up to bf_size bytes) to the BlueFlame register
+    /// using non-temporal (streaming) stores.
     /// For WQEs larger than bf_size, only the first bf_size bytes are copied via BF,
     /// and the NIC reads the rest from host memory.
     #[inline]
@@ -181,19 +182,20 @@ impl<Entry, TableType> SendQueueState<Entry, TableType> {
 
         udma_to_device_barrier!();
 
-        // Copy as much of the WQE as fits in BF buffer
+        // Copy WQE to BF register using non-temporal stores (64 bytes at a time)
         let bf_offset = self.bf_offset.get();
-        let bf = unsafe { self.bf_reg.add(bf_offset as usize) };
+        let mut bf = unsafe { self.bf_reg.add(bf_offset as usize) };
+        let mut src = last_wqe_ptr;
         let copy_size = wqe_size.min(self.bf_size as usize);
+        let mut remaining = copy_size;
 
-        // Copy WQE data in 64-bit chunks
-        let wqe_u64 = last_wqe_ptr as *const u64;
-        let bf_u64 = bf as *mut u64;
-        let copy_count = (copy_size + 7) / 8;
-        for i in 0..copy_count {
+        while remaining > 0 {
             unsafe {
-                std::ptr::write_volatile(bf_u64.add(i), *wqe_u64.add(i));
+                mlx5_bf_copy!(bf, src);
+                src = src.add(WQEBB_SIZE);
+                bf = bf.add(WQEBB_SIZE);
             }
+            remaining = remaining.saturating_sub(WQEBB_SIZE);
         }
 
         mmio_flush_writes!();
