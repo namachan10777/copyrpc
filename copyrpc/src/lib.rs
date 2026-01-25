@@ -512,7 +512,7 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
                         if result.is_ok() {
                             ep_ref.read_inflight.set(true);
                             ep_ref.force_read.set(false);
-                            qp.ring_sq_doorbell();
+                            qp.ring_sq_doorbell_bf();
                         }
                     }
                 }
@@ -941,7 +941,7 @@ impl<U> EndpointInner<U> {
     #[inline(always)]
     fn flush(&self) -> Result<()> {
         self.emit_wqe()?;
-        self.qp.borrow().ring_sq_doorbell();
+        self.qp.borrow().ring_sq_doorbell_bf();
         Ok(())
     }
 

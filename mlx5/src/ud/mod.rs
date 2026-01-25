@@ -110,6 +110,63 @@ impl<Entry, TableType> UdSendQueueState<Entry, TableType> {
         mmio_flush_writes!();
         self.bf_offset.set(self.bf_offset.get() ^ self.bf_size);
     }
+
+    /// Ring the doorbell with minimum 8-byte BlueFlame write.
+    ///
+    /// Updates DBREC and writes minimum 8 bytes (Control Segment) to BlueFlame register.
+    /// The NIC fetches remaining WQE data via DMA.
+    fn ring_doorbell(&self) {
+        let Some((last_wqe_ptr, _wqe_size)) = self.last_wqe.take() else {
+            return;
+        };
+
+        mmio_flush_writes!();
+
+        unsafe {
+            std::ptr::write_volatile(self.dbrec.add(1), (self.pi.get() as u32).to_be());
+        }
+
+        udma_to_device_barrier!();
+
+        self.ring_db(last_wqe_ptr);
+    }
+
+    /// Ring the doorbell with BlueFlame write of entire WQE.
+    ///
+    /// Copies the last WQE (up to bf_size bytes) to the BlueFlame register.
+    /// For WQEs larger than bf_size, only the first bf_size bytes are copied via BF,
+    /// and the NIC reads the rest from host memory.
+    fn ring_doorbell_bf(&self) {
+        let Some((last_wqe_ptr, wqe_size)) = self.last_wqe.take() else {
+            return;
+        };
+
+        mmio_flush_writes!();
+
+        unsafe {
+            std::ptr::write_volatile(self.dbrec.add(1), (self.pi.get() as u32).to_be());
+        }
+
+        udma_to_device_barrier!();
+
+        // Copy as much of the WQE as fits in BF buffer
+        let bf_offset = self.bf_offset.get();
+        let bf = unsafe { self.bf_reg.add(bf_offset as usize) };
+        let copy_size = wqe_size.min(self.bf_size as usize);
+
+        // Copy WQE data in 64-bit chunks
+        let wqe_u64 = last_wqe_ptr as *const u64;
+        let bf_u64 = bf as *mut u64;
+        let copy_count = (copy_size + 7) / 8;
+        for i in 0..copy_count {
+            unsafe {
+                std::ptr::write_volatile(bf_u64.add(i), *wqe_u64.add(i));
+            }
+        }
+
+        mmio_flush_writes!();
+        self.bf_offset.set(bf_offset ^ self.bf_size);
+    }
 }
 
 impl<Entry> UdSendQueueState<Entry, OrderedWqeTable<Entry>> {
@@ -229,6 +286,16 @@ pub(super) struct UdRecvQueueState<Entry> {
     pub(super) pi: Cell<u16>,
     pub(super) ci: Cell<u16>,
     pub(super) dbrec: *mut u32,
+    /// BlueFlame register pointer
+    bf_reg: *mut u8,
+    /// BlueFlame size
+    bf_size: u32,
+    /// Current BlueFlame offset (alternates between 0 and bf_size)
+    bf_offset: Cell<u32>,
+    /// Pointer to the first pending WQE (for ring_doorbell_bf)
+    pending_start_ptr: Cell<Option<*mut u8>>,
+    /// Number of pending WQEs (for ring_doorbell_bf)
+    pending_wqe_count: Cell<u32>,
     /// Entry table (all WQEs are signaled, uses Cell for interior mutability)
     pub(super) table: Box<[Cell<Option<Entry>>]>,
 }
@@ -251,11 +318,75 @@ impl<Entry> UdRecvQueueState<Entry> {
         (self.wqe_cnt as u32) - (self.pi.get().wrapping_sub(self.ci.get()) as u32)
     }
 
+    /// Ring the doorbell with minimum 8-byte BlueFlame write.
+    ///
+    /// Updates DBREC and writes minimum 8 bytes to BlueFlame register.
+    /// The NIC fetches remaining WQE data via DMA.
+    /// Also resets pending WQE tracking.
     fn ring_doorbell(&self) {
+        unsafe {
+            std::ptr::write_volatile(self.dbrec, (self.pi.get() as u32).to_be());
+        }
+        udma_to_device_barrier!();
+
+        // Minimum 8-byte BF write (first 8 bytes of last WQE)
+        let bf_offset = self.bf_offset.get();
+        let bf = unsafe { self.bf_reg.add(bf_offset as usize) as *mut u64 };
+        let last_wqe = self.get_wqe_ptr(self.pi.get().wrapping_sub(1));
+        unsafe {
+            std::ptr::write_volatile(bf, *(last_wqe as *const u64));
+        }
+
+        mmio_flush_writes!();
+        self.bf_offset.set(bf_offset ^ self.bf_size);
+
+        // Reset pending tracking
+        self.pending_wqe_count.set(0);
+        self.pending_start_ptr.set(None);
+    }
+
+    /// Ring the doorbell with BlueFlame write of all pending WQEs.
+    ///
+    /// Copies pending WQEs to BlueFlame register for higher throughput.
+    /// Falls back to minimum doorbell if no pending WQEs.
+    fn ring_doorbell_bf(&self) {
+        let wqe_count = self.pending_wqe_count.get();
+        if wqe_count == 0 {
+            return;
+        }
+
         mmio_flush_writes!();
         unsafe {
             std::ptr::write_volatile(self.dbrec, (self.pi.get() as u32).to_be());
         }
+        udma_to_device_barrier!();
+
+        // Copy pending WQEs to BlueFlame register
+        let bf_offset = self.bf_offset.get();
+        let bf = unsafe { self.bf_reg.add(bf_offset as usize) };
+        let copy_size = (wqe_count as usize * self.stride as usize).min(256);
+
+        if let Some(start_ptr) = self.pending_start_ptr.get() {
+            // Copy in 64-byte chunks
+            let mut src = start_ptr;
+            let mut dst = bf;
+            let mut remaining = copy_size;
+            while remaining > 0 {
+                unsafe {
+                    mlx5_bf_copy!(dst, src);
+                    src = src.add(WQEBB_SIZE);
+                    dst = dst.add(WQEBB_SIZE);
+                }
+                remaining = remaining.saturating_sub(WQEBB_SIZE);
+            }
+        }
+
+        mmio_flush_writes!();
+        self.bf_offset.set(bf_offset ^ self.bf_size);
+
+        // Reset pending tracking
+        self.pending_wqe_count.set(0);
+        self.pending_start_ptr.set(None);
     }
 }
 
@@ -817,10 +948,23 @@ impl<SqEntry, RqEntry, Transport, TableType, OnSqComplete, OnRqComplete> UdQp<Sq
             .ok_or_else(|| io::Error::other("direct access not initialized"))
     }
 
-    /// Ring the receive queue doorbell.
+    /// Ring the RQ doorbell with minimum 8-byte BlueFlame write.
+    ///
+    /// Updates DBREC and writes minimum 8 bytes to BlueFlame register.
+    /// The NIC fetches remaining WQE data via DMA.
     pub fn ring_rq_doorbell(&self) {
         if let Some(rq) = self.rq.as_ref() {
             rq.ring_doorbell();
+        }
+    }
+
+    /// Ring the RQ doorbell with BlueFlame write of all pending WQEs.
+    ///
+    /// Copies pending WQEs to BlueFlame register for higher throughput.
+    /// Up to 256 bytes of WQE data can be copied in a single doorbell.
+    pub fn ring_rq_doorbell_bf(&self) {
+        if let Some(rq) = self.rq.as_ref() {
+            rq.ring_doorbell_bf();
         }
     }
 }
@@ -871,6 +1015,11 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIb<SqEntry, RqEntry, OnSq
             pi: Cell::new(0),
             ci: Cell::new(0),
             dbrec: info.dbrec,
+            bf_reg: info.bf_reg,
+            bf_size: info.bf_size,
+            bf_offset: Cell::new(0),
+            pending_start_ptr: Cell::new(None),
+            pending_wqe_count: Cell::new(0),
             table: (0..rq_wqe_cnt).map(|_| Cell::new(None)).collect(),
         }));
 
@@ -912,13 +1061,20 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIb<SqEntry, RqEntry, OnSq
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "RQ full"));
         }
         let wqe_idx = rq.pi.get();
+        let wqe_ptr = rq.get_wqe_ptr(wqe_idx);
         unsafe {
-            let wqe_ptr = rq.get_wqe_ptr(wqe_idx);
             write_data_seg(wqe_ptr, len, lkey, addr);
         }
         let idx = (wqe_idx as usize) & ((rq.wqe_cnt - 1) as usize);
         rq.table[idx].set(Some(entry));
         rq.pi.set(rq.pi.get().wrapping_add(1));
+
+        // Update pending tracking for ring_doorbell_bf
+        if rq.pending_start_ptr.get().is_none() {
+            rq.pending_start_ptr.set(Some(wqe_ptr));
+        }
+        rq.pending_wqe_count.set(rq.pending_wqe_count.get() + 1);
+
         Ok(())
     }
 
@@ -949,15 +1105,27 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIb<SqEntry, RqEntry, OnSq
         Ok(UdRqBlueflameWqeBatch::new(rq, sq.bf_reg, sq.bf_size, &sq.bf_offset))
     }
 
-    /// Ring the send queue doorbell.
+    /// Ring the SQ doorbell with minimum 8-byte BlueFlame write.
     ///
-    /// Call this after posting one or more WQEs to notify the HCA.
+    /// Updates DBREC and writes minimum 8 bytes (Control Segment) to BlueFlame register.
+    /// The NIC fetches remaining WQE data via DMA.
     #[inline]
     pub fn ring_sq_doorbell(&self) {
-        if let Some(sq) = self.sq.as_ref()
-            && let Some((wqe_ptr, _)) = sq.last_wqe.get() {
-                sq.ring_db(wqe_ptr);
-            }
+        if let Some(sq) = self.sq.as_ref() {
+            sq.ring_doorbell();
+        }
+    }
+
+    /// Ring the SQ doorbell with BlueFlame write of entire WQE.
+    ///
+    /// Copies the last WQE (up to bf_size bytes) to the BlueFlame register.
+    /// For WQEs larger than bf_size, only the first bf_size bytes are copied via BF,
+    /// and the NIC reads the rest from host memory.
+    #[inline]
+    pub fn ring_sq_doorbell_bf(&self) {
+        if let Some(sq) = self.sq.as_ref() {
+            sq.ring_doorbell_bf();
+        }
     }
 }
 
@@ -1106,6 +1274,11 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpRoCE<SqEntry, RqEntry, On
             pi: Cell::new(0),
             ci: Cell::new(0),
             dbrec: info.dbrec,
+            bf_reg: info.bf_reg,
+            bf_size: info.bf_size,
+            bf_offset: Cell::new(0),
+            pending_start_ptr: Cell::new(None),
+            pending_wqe_count: Cell::new(0),
             table: (0..rq_wqe_cnt).map(|_| Cell::new(None)).collect(),
         }));
 
