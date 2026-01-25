@@ -958,18 +958,9 @@ impl RpcServer {
         }
         conn.ring_sq_doorbell();
 
-        // Poll for send completion
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_millis(5000);
-        loop {
-            if conn.poll_send_cq() > 0 {
-                break;
-            }
-            if start.elapsed() > timeout {
-                return Err(Error::Protocol("response send timeout".to_string()));
-            }
-            std::hint::spin_loop();
-        }
+        // Drain any completed send operations (non-blocking)
+        // This prevents CQ overflow without blocking on each response
+        conn.poll_send_cq();
 
         Ok(())
     }
