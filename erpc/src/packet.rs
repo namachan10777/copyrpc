@@ -34,6 +34,144 @@ pub enum PktType {
     CreditReturn = 3,
 }
 
+/// Session Management (SM) packet type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SmPktType {
+    /// Connect request from client to server.
+    ConnectRequest = 0,
+    /// Connect response from server to client.
+    ConnectResponse = 1,
+    /// Disconnect request.
+    DisconnectRequest = 2,
+    /// Disconnect response.
+    DisconnectResponse = 3,
+}
+
+impl TryFrom<u8> for SmPktType {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(SmPktType::ConnectRequest),
+            1 => Ok(SmPktType::ConnectResponse),
+            2 => Ok(SmPktType::DisconnectRequest),
+            3 => Ok(SmPktType::DisconnectResponse),
+            _ => Err(Error::InvalidPacketType(value)),
+        }
+    }
+}
+
+/// SM packet header size (simpler than data packet).
+pub const SM_PKT_HDR_SIZE: usize = 16;
+
+/// Session Management packet header.
+///
+/// Layout:
+/// ```text
+/// Offset  Size  Field
+/// 0       1     sm_pkt_type
+/// 1       1     reserved
+/// 2       2     client_session_num
+/// 4       2     server_session_num
+/// 6       2     reserved
+/// 8       4     qpn (QP number)
+/// 12      2     lid (Local ID)
+/// 14      1     reserved
+/// 15      1     magic
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C, packed)]
+pub struct SmPktHdr {
+    /// SM packet type.
+    pub sm_pkt_type: u8,
+    /// Reserved byte.
+    reserved1: u8,
+    /// Client session number.
+    pub client_session_num: u16,
+    /// Server session number.
+    pub server_session_num: u16,
+    /// Reserved bytes.
+    reserved2: u16,
+    /// QP number of the sender.
+    pub qpn: u32,
+    /// LID of the sender.
+    pub lid: u16,
+    /// Reserved byte.
+    reserved3: u8,
+    /// Magic number for validation.
+    pub magic: u8,
+}
+
+impl SmPktHdr {
+    /// Create a new SM packet header.
+    pub fn new(
+        sm_pkt_type: SmPktType,
+        client_session_num: u16,
+        server_session_num: u16,
+        qpn: u32,
+        lid: u16,
+    ) -> Self {
+        Self {
+            sm_pkt_type: sm_pkt_type as u8,
+            reserved1: 0,
+            client_session_num,
+            server_session_num,
+            reserved2: 0,
+            qpn,
+            lid,
+            reserved3: 0,
+            magic: ERPC_MAGIC,
+        }
+    }
+
+    /// Get the SM packet type.
+    pub fn pkt_type(&self) -> Result<SmPktType> {
+        SmPktType::try_from(self.sm_pkt_type)
+    }
+
+    /// Check if the magic number is valid.
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.magic == ERPC_MAGIC
+    }
+
+    /// Validate the packet header.
+    pub fn validate(&self) -> Result<()> {
+        if self.magic != ERPC_MAGIC {
+            return Err(Error::InvalidMagic {
+                expected: ERPC_MAGIC,
+                got: self.magic,
+            });
+        }
+        Ok(())
+    }
+
+    /// Serialize the header to a byte slice.
+    ///
+    /// # Safety
+    /// The destination buffer must be at least SM_PKT_HDR_SIZE bytes.
+    #[inline]
+    pub unsafe fn write_to(&self, dst: *mut u8) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(self as *const Self as *const u8, dst, SM_PKT_HDR_SIZE);
+        }
+    }
+
+    /// Deserialize a header from a byte slice.
+    ///
+    /// # Safety
+    /// The source buffer must be at least SM_PKT_HDR_SIZE bytes.
+    #[inline]
+    pub unsafe fn read_from(src: *const u8) -> Self {
+        unsafe {
+            let mut hdr = std::mem::MaybeUninit::<Self>::uninit();
+            std::ptr::copy_nonoverlapping(src, hdr.as_mut_ptr() as *mut u8, SM_PKT_HDR_SIZE);
+            hdr.assume_init()
+        }
+    }
+}
+
 impl TryFrom<u8> for PktType {
     type Error = Error;
 

@@ -17,6 +17,19 @@ use crate::config::RpcConfig;
 use crate::error::{Error, Result};
 use crate::packet::{PktHdr, PKT_HDR_SIZE};
 
+/// Buffer type for distinguishing request vs response buffers.
+///
+/// Request buffers must be retained until response is received (for retransmission).
+/// Response buffers can be freed immediately on send completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BufferType {
+    /// Request buffer - keep until response received (for retransmission).
+    #[default]
+    Request,
+    /// Response buffer - free on send completion.
+    Response,
+}
+
 /// Receive completion information.
 #[derive(Debug, Clone, Copy)]
 pub struct RecvCompletion {
@@ -31,6 +44,8 @@ pub struct RecvCompletion {
 pub struct SendCompletion {
     /// Buffer index in the buffer pool.
     pub buf_idx: usize,
+    /// Buffer type (request or response).
+    pub buf_type: BufferType,
 }
 
 /// UD transport send/receive entry.
@@ -44,6 +59,8 @@ pub struct TransportEntry {
     pub session_num: u16,
     /// Additional context (application-defined).
     pub context: u64,
+    /// Buffer type (request or response).
+    pub buf_type: BufferType,
 }
 
 impl Default for TransportEntry {
@@ -52,6 +69,7 @@ impl Default for TransportEntry {
             buf_idx: 0,
             session_num: 0,
             context: 0,
+            buf_type: BufferType::Request,
         }
     }
 }
@@ -168,6 +186,7 @@ impl UdTransport {
         let send_callback: SendCallback = Box::new(move |_cqe, entry| {
             send_completions.borrow_mut().send_completions.push(SendCompletion {
                 buf_idx: entry.buf_idx,
+                buf_type: entry.buf_type,
             });
         });
 
