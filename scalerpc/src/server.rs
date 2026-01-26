@@ -27,7 +27,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::time::Instant;
+
+use fastant::Instant;
 
 use mlx5::cq::{Cq, Cqe};
 use mlx5::device::Context;
@@ -1204,7 +1205,7 @@ impl RpcServer {
         conn.ring_sq_doorbell();
 
         // Wait for read completion
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let timeout = std::time::Duration::from_millis(10);
         loop {
             if self.poll_cqs() > 0 {

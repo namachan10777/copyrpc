@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 mlx5 = { version = "0.1.0", path = "../mlx5" }
 libc = "0.2"
+fastant = "0.1"
 
 [dev-dependencies]
 criterion = "0.5"
