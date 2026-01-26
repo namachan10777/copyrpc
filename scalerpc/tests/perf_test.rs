@@ -84,7 +84,11 @@ fn test_latency() {
             Err(_) => return,
         };
 
-        server.set_handler(|_rpc_type, payload| (0, payload.to_vec()));
+        server.set_handler(|_rpc_type, payload, response_buf| {
+            let len = payload.len().min(response_buf.len());
+            response_buf[..len].copy_from_slice(&payload[..len]);
+            (0, len)
+        });
 
         let conn_id = match server.add_connection(&ctx.ctx, &ctx.pd, ctx.port) {
             Ok(c) => c,
@@ -239,7 +243,11 @@ fn test_throughput() {
             Err(_) => return,
         };
 
-        server.set_handler(|_rpc_type, payload| (0, payload.to_vec()));
+        server.set_handler(|_rpc_type, payload, response_buf| {
+            let len = payload.len().min(response_buf.len());
+            response_buf[..len].copy_from_slice(&payload[..len]);
+            (0, len)
+        });
 
         let conn_id = match server.add_connection(&ctx.ctx, &ctx.pd, ctx.port) {
             Ok(c) => c,
@@ -446,7 +454,11 @@ fn test_throughput_4kb() {
             Err(_) => return,
         };
 
-        server.set_handler(|_rpc_type, payload| (0, payload.to_vec()));
+        server.set_handler(|_rpc_type, payload, response_buf| {
+            let len = payload.len().min(response_buf.len());
+            response_buf[..len].copy_from_slice(&payload[..len]);
+            (0, len)
+        });
 
         let conn_id = match server.add_connection(&ctx.ctx, &ctx.pd, ctx.port) {
             Ok(c) => c,

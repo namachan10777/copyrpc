@@ -125,10 +125,12 @@ fn test_server_creation() {
 
     let mut server = RpcServer::new(&ctx.pd, config).expect("Failed to create server");
 
-    // Set a simple handler
-    server.set_handler(|_rpc_type, payload| {
+    // Set a simple handler (zero-copy)
+    server.set_handler(|_rpc_type, payload, response_buf| {
         // Echo handler
-        (0, payload.to_vec())
+        let len = payload.len().min(response_buf.len());
+        response_buf[..len].copy_from_slice(&payload[..len]);
+        (0, len)
     });
 
     // Add a connection
@@ -183,13 +185,16 @@ fn test_loopback_rpc() {
     };
     let mut server = RpcServer::new(&ctx.pd, server_config).expect("Failed to create server");
 
-    // Set echo handler
-    server.set_handler(|rpc_type, payload| {
+    // Set echo handler (zero-copy)
+    server.set_handler(|rpc_type, payload, response_buf| {
         println!("Server received RPC type={}, payload_len={}", rpc_type, payload.len());
         // Echo back with prefix
-        let mut response = b"ECHO: ".to_vec();
-        response.extend_from_slice(payload);
-        (0, response)
+        let prefix = b"ECHO: ";
+        let prefix_len = prefix.len();
+        let payload_len = payload.len().min(response_buf.len() - prefix_len);
+        response_buf[..prefix_len].copy_from_slice(prefix);
+        response_buf[prefix_len..prefix_len + payload_len].copy_from_slice(&payload[..payload_len]);
+        (0, prefix_len + payload_len)
     });
 
     // Add connections

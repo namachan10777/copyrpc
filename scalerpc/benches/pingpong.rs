@@ -312,10 +312,12 @@ fn server_thread_main(
         Err(_) => return,
     };
 
-    // Echo handler
-    server.set_handler(|_rpc_type, payload| {
-        // Echo back the payload
-        (0, payload.to_vec())
+    // Echo handler (zero-copy)
+    server.set_handler(|_rpc_type, payload, response_buf| {
+        // Echo back the payload (zero-copy)
+        let len = payload.len().min(response_buf.len());
+        response_buf[..len].copy_from_slice(&payload[..len]);
+        (0, len)
     });
 
     let conn_id = match server.add_connection(&ctx, &pd, port) {
@@ -673,7 +675,12 @@ fn multi_qp_server_thread_main(
         Err(_) => return,
     };
 
-    server.set_handler(|_rpc_type, payload| (0, payload.to_vec()));
+    // Echo handler (zero-copy)
+    server.set_handler(|_rpc_type, payload, response_buf| {
+        let len = payload.len().min(response_buf.len());
+        response_buf[..len].copy_from_slice(&payload[..len]);
+        (0, len)
+    });
 
     // Create num_qps connections on server side
     let mut server_infos = Vec::with_capacity(num_qps);

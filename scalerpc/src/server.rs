@@ -45,10 +45,12 @@ use crate::protocol::{
     MESSAGE_BLOCK_SIZE,
 };
 
-/// Request handler function type.
+/// Request handler function type (zero-copy).
 ///
-/// Takes RPC type, request payload, and returns (status, response_payload).
-pub type RequestHandler = Box<dyn Fn(u16, &[u8]) -> (u32, Vec<u8>)>;
+/// Takes RPC type, request payload, and a mutable response buffer.
+/// Writes response directly to the buffer and returns (status, response_length).
+/// This avoids memory allocation on every request.
+pub type RequestHandler = Box<dyn Fn(u16, &[u8], &mut [u8]) -> (u32, usize)>;
 
 /// Group ID type.
 pub type GroupId = usize;
@@ -465,9 +467,23 @@ impl RpcServer {
         let mut processed = 0;
 
         for request in requests {
-            let (status, response_payload) = handler(request.rpc_type, &request.payload);
+            // Get the slot for zero-copy response
+            let slot = match self.processing_pool.get_slot(request.slot_index) {
+                Some(s) => s,
+                None => continue,
+            };
 
-            if let Err(e) = self.send_response(&request, status, &response_payload) {
+            // Get response buffer
+            let slot_ptr = slot.data_ptr();
+            let response_buf = unsafe {
+                let buf_ptr = slot_ptr.add(ResponseHeader::SIZE);
+                let buf_len = MESSAGE_BLOCK_SIZE - ResponseHeader::SIZE - 8;
+                std::slice::from_raw_parts_mut(buf_ptr, buf_len)
+            };
+
+            let (status, response_len) = handler(request.rpc_type, &request.payload, response_buf);
+
+            if let Err(e) = self.send_response_zero_copy(&request, status, response_len) {
                 eprintln!("Failed to send response: {}", e);
             } else {
                 processed += 1;
@@ -550,10 +566,13 @@ impl RpcServer {
         Ok(())
     }
 
-    /// Set the request handler.
+    /// Set the request handler (zero-copy).
+    ///
+    /// The handler receives (rpc_type, request_payload, response_buffer) and
+    /// writes the response directly to the buffer, returning (status, response_length).
     pub fn set_handler<F>(&mut self, handler: F)
     where
-        F: Fn(u16, &[u8]) -> (u32, Vec<u8>) + 'static,
+        F: Fn(u16, &[u8], &mut [u8]) -> (u32, usize) + 'static,
     {
         self.handler = Some(Box::new(handler));
     }
@@ -857,6 +876,79 @@ impl RpcServer {
         Ok(())
     }
 
+    /// Send a response for a request (zero-copy version).
+    ///
+    /// The response payload is assumed to already be written in the slot
+    /// (after ResponseHeader::SIZE offset). Only the header is written here.
+    ///
+    /// # Arguments
+    /// * `request` - The original request
+    /// * `status` - Response status code
+    /// * `payload_len` - Length of response payload already in slot
+    fn send_response_zero_copy(
+        &self,
+        request: &IncomingRequest,
+        status: u32,
+        payload_len: usize,
+    ) -> Result<()> {
+        // Get the connection
+        let conn = self
+            .connections
+            .get(request.conn_id)
+            .and_then(|c| c.as_ref())
+            .ok_or(Error::ConnectionNotFound(request.conn_id))?;
+
+        // Reuse the request slot for the response
+        let slot = self
+            .processing_pool
+            .get_slot(request.slot_index)
+            .ok_or(Error::Protocol(format!(
+                "slot {} not found",
+                request.slot_index
+            )))?;
+        let slot_data_addr = self
+            .processing_pool
+            .slot_data_addr(request.slot_index)
+            .ok_or(Error::Protocol(format!(
+                "slot {} addr not found",
+                request.slot_index
+            )))?;
+
+        // Build and write response header only (payload already in place)
+        let response_header =
+            ResponseHeader::new(request.req_id, status, payload_len as u32);
+        unsafe {
+            response_header.write_to(slot.data_ptr());
+        }
+
+        // Send response via RDMA WRITE
+        let total_len = ResponseHeader::SIZE + payload_len;
+        {
+            let qp_ref = conn.qp().borrow();
+            let emit_ctx = qp_ref
+                .emit_ctx()
+                .map_err(|e| Error::Protocol(format!("emit_ctx failed: {:?}", e)))?;
+
+            emit_wqe!(&emit_ctx, write {
+                flags: WqeFlags::COMPLETION,
+                remote_addr: request.client_slot_addr,
+                rkey: request.client_slot_rkey,
+                sge: {
+                    addr: slot_data_addr,
+                    len: total_len as u32,
+                    lkey: self.processing_pool.lkey()
+                },
+                signaled: request.req_id,
+            })
+            .map_err(|e| Error::Protocol(format!("emit_wqe failed: {:?}", e)))?;
+        }
+
+        // Mark connection as needing doorbell flush (batched in poll())
+        self.mark_needs_flush(request.conn_id);
+
+        Ok(())
+    }
+
     /// Process incoming requests using the registered handler.
     ///
     /// Polls for requests and processes them with the handler.
@@ -872,11 +964,25 @@ impl RpcServer {
         let mut processed = 0;
 
         while let Some(request) = self.poll_request() {
-            // Call handler
-            let (status, response_payload) = handler(request.rpc_type, &request.payload);
+            // Get the slot for zero-copy response
+            let slot = match self.processing_pool.get_slot(request.slot_index) {
+                Some(s) => s,
+                None => continue,
+            };
 
-            // Send response (WQE only, no doorbell)
-            if let Err(e) = self.send_response(&request, status, &response_payload) {
+            // Get response buffer (after ResponseHeader)
+            let slot_ptr = slot.data_ptr();
+            let response_buf = unsafe {
+                let buf_ptr = slot_ptr.add(ResponseHeader::SIZE);
+                let buf_len = MESSAGE_BLOCK_SIZE - ResponseHeader::SIZE - 8; // -8 for trailer
+                std::slice::from_raw_parts_mut(buf_ptr, buf_len)
+            };
+
+            // Call handler with zero-copy buffer
+            let (status, response_len) = handler(request.rpc_type, &request.payload, response_buf);
+
+            // Send response (header only, payload already in slot)
+            if let Err(e) = self.send_response_zero_copy(&request, status, response_len) {
                 eprintln!("Failed to send response: {}", e);
             }
 
@@ -961,6 +1067,13 @@ impl RpcServer {
         self.send_response(request, status, payload)
     }
 
+    /// Reply to a request (zero-copy version).
+    ///
+    /// The response payload is assumed to already be written in the slot.
+    pub fn reply_zero_copy(&self, request: &IncomingRequest, status: u32, payload_len: usize) -> Result<()> {
+        self.send_response_zero_copy(request, status, payload_len)
+    }
+
     /// Main server loop - one iteration.
     ///
     /// This is the simplified API for running the server. It handles:
@@ -991,9 +1104,23 @@ impl RpcServer {
         let mut requests_processed = 0;
         if self.handler.is_some() {
             while let Some(request) = self.recv() {
+                // Get the slot for zero-copy response
+                let slot = match self.processing_pool.get_slot(request.slot_index) {
+                    Some(s) => s,
+                    None => continue,
+                };
+
+                // Get response buffer
+                let slot_ptr = slot.data_ptr();
+                let response_buf = unsafe {
+                    let buf_ptr = slot_ptr.add(ResponseHeader::SIZE);
+                    let buf_len = MESSAGE_BLOCK_SIZE - ResponseHeader::SIZE - 8;
+                    std::slice::from_raw_parts_mut(buf_ptr, buf_len)
+                };
+
                 if let Some(handler) = &self.handler {
-                    let (status, response) = handler(request.rpc_type, &request.payload);
-                    if self.reply(&request, status, &response).is_ok() {
+                    let (status, response_len) = handler(request.rpc_type, &request.payload, response_buf);
+                    if self.reply_zero_copy(&request, status, response_len).is_ok() {
                         requests_processed += 1;
                     }
                 }
