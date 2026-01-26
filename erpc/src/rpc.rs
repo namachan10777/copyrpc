@@ -2,7 +2,7 @@
 //!
 //! The Rpc struct provides the primary API for eRPC operations.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use mlx5::device::Context;
 
@@ -61,6 +61,12 @@ where
     send_buffers: RefCell<BufferPool>,
     /// MTU in bytes.
     mtu: usize,
+    /// Number of currently posted receive buffers.
+    posted_recv_count: Cell<usize>,
+    /// Threshold for batch reposting receive buffers (num_recv_buffers / 2).
+    recv_repost_threshold: usize,
+    /// Reusable buffer for batch recv posting to avoid allocation.
+    recv_post_buf: RefCell<Vec<(usize, u64, u32, u32)>>,
 }
 
 /// Pending request state.
@@ -102,6 +108,10 @@ impl<U: 'static> Rpc<U> {
         let mut timing_wheel = TimingWheel::default_for_rpc();
         timing_wheel.init(current_time_us());
 
+        let num_recv_buffers = config.num_recv_buffers;
+        // Repost threshold: when posted count drops to 1/4, batch repost all free buffers
+        // Balance between batch efficiency and avoiding RQ starvation
+        let recv_repost_threshold = num_recv_buffers / 4;
         let rpc = Self {
             transport,
             sessions: RefCell::new(SessionTable::new(config.max_sessions)),
@@ -112,10 +122,15 @@ impl<U: 'static> Rpc<U> {
             recv_buffers: RefCell::new(recv_buffers),
             send_buffers: RefCell::new(send_buffers),
             mtu,
+            posted_recv_count: Cell::new(0),
+            recv_repost_threshold,
+            recv_post_buf: RefCell::new(Vec::with_capacity(num_recv_buffers)),
         };
 
         // Post initial receive buffers
         rpc.post_recv_buffers()?;
+        // After initial post, all buffers are posted
+        rpc.posted_recv_count.set(num_recv_buffers);
 
         Ok(rpc)
     }
@@ -686,8 +701,8 @@ impl<U: 'static> Rpc<U> {
         // Return buffer to pool
         self.recv_buffers.borrow_mut().free(buf_idx);
 
-        // Repost a receive buffer
-        self.repost_recv_buffer()?;
+        // Decrement posted recv count (batch repost will be done in run_event_loop_once)
+        self.posted_recv_count.set(self.posted_recv_count.get().saturating_sub(1));
 
         // Check if this is an SM (Session Management) packet
         if hdr.req_type() == SM_REQ_TYPE {
@@ -796,35 +811,40 @@ impl<U: 'static> Rpc<U> {
         Ok(())
     }
 
-    /// Repost a single receive buffer.
-    fn repost_recv_buffer(&self) -> Result<()> {
-        let buf_info = {
-            let mut recv_buffers = self.recv_buffers.borrow_mut();
-            if let Some((idx, buf)) = recv_buffers.alloc() {
-                let lkey = buf.lkey().ok_or_else(|| {
-                    Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "Buffer not registered",
-                    ))
-                })?;
-                Some((idx, buf.addr(), buf.capacity() as u32, lkey))
-            } else {
-                None
-            }
-        };
+    /// Batch repost all free receive buffers.
+    /// Called when posted_recv_count drops below recv_repost_threshold.
+    fn batch_repost_recv_buffers(&self) {
+        // Use pre-allocated buffer to avoid allocation
+        let mut buf_infos = self.recv_post_buf.borrow_mut();
+        buf_infos.clear();
 
-        if let Some((idx, addr, capacity, lkey)) = buf_info {
+        // Collect buffer info first to avoid holding borrow during post
+        {
+            let mut recv_buffers = self.recv_buffers.borrow_mut();
+            while let Some((idx, buf)) = recv_buffers.alloc() {
+                if let Some(lkey) = buf.lkey() {
+                    buf_infos.push((idx, buf.addr(), buf.capacity() as u32, lkey));
+                }
+            }
+        }
+
+        // Post receives using the collected info
+        let mut count = 0;
+        for &(idx, addr, capacity, lkey) in buf_infos.iter() {
             let entry = TransportEntry {
                 buf_idx: idx,
                 session_num: 0,
                 context: 0,
                 buf_type: BufferType::Request, // Receive buffers use default type
             };
-            self.transport.post_recv_raw(addr, capacity, lkey, entry)?;
-            // Doorbell is batched in run_event_loop_once()
+            if self.transport.post_recv_raw(addr, capacity, lkey, entry).is_ok() {
+                count += 1;
+            }
         }
 
-        Ok(())
+        // Update posted count
+        self.posted_recv_count.set(self.posted_recv_count.get() + count);
+        // RQ doorbell is batched in run_event_loop_once()
     }
 
     /// Handle an incoming request by pushing it to the recv_queue.
@@ -1129,6 +1149,11 @@ impl<U: 'static> Rpc<U> {
                 eprintln!("process_recv error: {:?}", e);
             }
             events += 1;
+        }
+
+        // Batch repost receive buffers when below threshold
+        if self.posted_recv_count.get() <= self.recv_repost_threshold {
+            self.batch_repost_recv_buffers();
         }
 
         // Process timeouts
