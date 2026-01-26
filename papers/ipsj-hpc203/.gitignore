@@ -17,8 +17,3 @@
 
 # Output
 *.pdf
-
-# IPSJ style files (downloaded via setup-ipsj.sh)
-*.cls
-*.sty
-*.bst

@@ -1,7 +1,7 @@
 DOCKER_IMAGE = ipsj-latex
 DOCKER_RUN = docker run --rm -v $(PWD):/workdir $(DOCKER_IMAGE)
 
-.PHONY: all build docker-build clean watch setup
+.PHONY: all build docker-build clean watch
 
 all: build
 
@@ -20,14 +20,3 @@ watch: docker-build
 # Clean auxiliary files
 clean:
 	$(DOCKER_RUN) latexmk -C
-
-# Download IPSJ style files
-setup:
-	./setup-ipsj.sh
-
-# Build locally (without Docker)
-local:
-	latexmk -pdf main.tex
-
-local-clean:
-	latexmk -C
