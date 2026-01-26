@@ -26,16 +26,17 @@
 //! - On context switch, pools are swapped and clients are notified
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::time::Instant;
 
-use mlx5::cq::Cqe;
+use mlx5::cq::{Cq, Cqe};
 use mlx5::device::Context;
 use mlx5::emit_wqe;
 use mlx5::pd::Pd;
 use mlx5::wqe::WqeFlags;
 
 use crate::config::ServerConfig;
-use crate::connection::{Connection, ConnectionId, RemoteEndpoint};
+use crate::connection::{create_shared_cqs, Connection, ConnectionId, RemoteEndpoint};
 use crate::error::{Error, Result};
 use crate::mapping::VirtualMapping;
 use crate::pool::MessagePool;
@@ -315,6 +316,10 @@ pub struct RpcServer {
     needs_flush: RefCell<Vec<ConnectionId>>,
     /// Per-connection warmup buffer info for RDMA READ.
     warmup_buffer_infos: Vec<Option<WarmupBufferInfo>>,
+    /// Shared send completion queue (all QPs share this).
+    shared_send_cq: Option<Rc<Cq>>,
+    /// Shared receive completion queue (all QPs share this).
+    shared_recv_cq: Option<Rc<Cq>>,
 }
 
 impl RpcServer {
@@ -344,6 +349,8 @@ impl RpcServer {
             event_buffer_addrs: Vec::new(),
             needs_flush: RefCell::new(Vec::new()),
             warmup_buffer_infos: Vec::new(),
+            shared_send_cq: None,
+            shared_recv_cq: None,
         })
     }
 
@@ -571,10 +578,21 @@ impl RpcServer {
             )));
         }
 
+        // Create shared CQs on first connection
+        if self.shared_send_cq.is_none() {
+            // Size CQ to handle all connections: max_connections * 256 WQEs each
+            let cq_size = self.config.max_connections * 256;
+            let (send_cq, recv_cq) = create_shared_cqs(ctx, cq_size)?;
+            self.shared_send_cq = Some(send_cq);
+            self.shared_recv_cq = Some(recv_cq);
+        }
+
         fn sq_callback(_cqe: Cqe, _entry: u64) {}
         fn rq_callback(_cqe: Cqe, _entry: u64) {}
 
-        let conn = Connection::new(ctx, pd, conn_id, port, sq_callback, rq_callback)?;
+        let send_cq = self.shared_send_cq.as_ref().unwrap().clone();
+        let recv_cq = self.shared_recv_cq.as_ref().unwrap().clone();
+        let conn = Connection::new(ctx, pd, conn_id, port, send_cq, recv_cq, sq_callback, rq_callback)?;
 
         self.mapping.register_connection(conn_id);
 
@@ -878,12 +896,19 @@ impl RpcServer {
         processed
     }
 
-    /// Poll all connection CQs.
+    /// Poll shared CQs.
+    ///
+    /// All connections share the same CQs, so we only need to poll twice
+    /// regardless of the number of connections.
     pub fn poll_cqs(&self) -> usize {
         let mut total = 0;
-        for conn in self.connections.iter().flatten() {
-            total += conn.poll_send_cq();
-            total += conn.poll_recv_cq();
+        if let Some(cq) = &self.shared_send_cq {
+            total += cq.poll();
+            cq.flush();
+        }
+        if let Some(cq) = &self.shared_recv_cq {
+            total += cq.poll();
+            cq.flush();
         }
         total
     }
@@ -1055,7 +1080,7 @@ impl RpcServer {
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_millis(10);
         loop {
-            if conn.poll_send_cq() > 0 {
+            if self.poll_cqs() > 0 {
                 break;
             }
             if start.elapsed() > timeout {

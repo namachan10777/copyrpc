@@ -28,17 +28,18 @@
 //! 7. Client prepares next request, transitions to Warmup
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use mlx5::cq::Cqe;
+use mlx5::cq::{Cq, Cqe};
 use mlx5::device::Context;
 use mlx5::emit_wqe;
 use mlx5::pd::{AccessFlags, MemoryRegion, Pd};
 use mlx5::wqe::WqeFlags;
 
 use crate::config::ClientConfig;
-use crate::connection::{Connection, ConnectionId, RemoteEndpoint};
+use crate::connection::{create_shared_cqs, Connection, ConnectionId, RemoteEndpoint};
 use crate::error::{Error, Result, SlotState};
 use crate::mapping::VirtualMapping;
 use crate::pool::MessagePool;
@@ -319,6 +320,10 @@ pub struct RpcClient {
     pd_ptr: *const Pd,
     /// Connections that need doorbell flush (for batching).
     needs_flush: RefCell<Vec<ConnectionId>>,
+    /// Shared send completion queue (all QPs share this).
+    shared_send_cq: Option<Rc<Cq>>,
+    /// Shared receive completion queue (all QPs share this).
+    shared_recv_cq: Option<Rc<Cq>>,
 }
 
 impl RpcClient {
@@ -339,6 +344,8 @@ impl RpcClient {
             config,
             pd_ptr: pd as *const Pd,
             needs_flush: RefCell::new(Vec::new()),
+            shared_send_cq: None,
+            shared_recv_cq: None,
         })
     }
 
@@ -386,6 +393,15 @@ impl RpcClient {
             )));
         }
 
+        // Create shared CQs on first connection
+        if self.shared_send_cq.is_none() {
+            // Size CQ to handle all connections: max_connections * 256 WQEs each
+            let cq_size = self.config.max_connections * 256;
+            let (send_cq, recv_cq) = create_shared_cqs(ctx, cq_size)?;
+            self.shared_send_cq = Some(send_cq);
+            self.shared_recv_cq = Some(recv_cq);
+        }
+
         fn sq_callback(_cqe: Cqe, _entry: u64) {
             // Entry contains request ID - we could track completions here
         }
@@ -393,7 +409,9 @@ impl RpcClient {
             // RQ completions not used in client (one-sided)
         }
 
-        let conn = Connection::new(ctx, pd, conn_id, port, sq_callback, rq_callback)?;
+        let send_cq = self.shared_send_cq.as_ref().unwrap().clone();
+        let recv_cq = self.shared_recv_cq.as_ref().unwrap().clone();
+        let conn = Connection::new(ctx, pd, conn_id, port, send_cq, recv_cq, sq_callback, rq_callback)?;
 
         // Register with mapping
         self.mapping.register_connection(conn_id);
@@ -637,12 +655,19 @@ impl RpcClient {
         })
     }
 
-    /// Poll all connection CQs.
+    /// Poll shared CQs.
+    ///
+    /// All connections share the same CQs, so we only need to poll twice
+    /// regardless of the number of connections.
     pub fn poll_cqs(&self) -> usize {
         let mut total = 0;
-        for conn in self.connections.iter().flatten() {
-            total += conn.poll_send_cq();
-            total += conn.poll_recv_cq();
+        if let Some(cq) = &self.shared_send_cq {
+            total += cq.poll();
+            cq.flush();
+        }
+        if let Some(cq) = &self.shared_recv_cq {
+            total += cq.poll();
+            cq.flush();
         }
         total
     }

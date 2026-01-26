@@ -57,10 +57,6 @@ pub struct Connection {
     conn_id: ConnectionId,
     /// The underlying RC QP.
     qp: Rc<RefCell<RcQpIb<u64, u64, SqCallback, RqCallback>>>,
-    /// Send completion queue.
-    send_cq: Rc<Cq>,
-    /// Receive completion queue.
-    recv_cq: Rc<Cq>,
     /// Local port number.
     port: u8,
     /// Port attributes.
@@ -69,14 +65,26 @@ pub struct Connection {
     remote: Option<RemoteEndpoint>,
 }
 
+/// Create shared CQs for multiple connections.
+///
+/// Returns (send_cq, recv_cq) that can be shared across all connections.
+pub fn create_shared_cqs(ctx: &Context, cq_size: usize) -> Result<(Rc<Cq>, Rc<Cq>)> {
+    let cq_config = CqConfig::default();
+    let send_cq = Rc::new(ctx.create_cq(cq_size as i32, &cq_config)?);
+    let recv_cq = Rc::new(ctx.create_cq(cq_size as i32, &cq_config)?);
+    Ok((send_cq, recv_cq))
+}
+
 impl Connection {
-    /// Create a new connection.
+    /// Create a new connection with shared CQs.
     ///
     /// # Arguments
     /// * `ctx` - Device context
     /// * `pd` - Protection domain
     /// * `conn_id` - Unique connection identifier
     /// * `port` - Local port number
+    /// * `send_cq` - Shared send completion queue
+    /// * `recv_cq` - Shared receive completion queue
     /// * `sq_callback` - Callback for send completions
     /// * `rq_callback` - Callback for receive completions
     pub fn new(
@@ -84,17 +92,14 @@ impl Connection {
         pd: &Pd,
         conn_id: ConnectionId,
         port: u8,
+        send_cq: Rc<Cq>,
+        recv_cq: Rc<Cq>,
         sq_callback: SqCallback,
         rq_callback: RqCallback,
     ) -> Result<Self> {
         let port_attr = ctx.query_port(port)?;
 
-        // Create CQs
-        let cq_config = CqConfig::default();
-        let send_cq = Rc::new(ctx.create_cq(256, &cq_config)?);
-        let recv_cq = Rc::new(ctx.create_cq(256, &cq_config)?);
-
-        // Create QP
+        // Create QP with shared CQs
         let qp_config = RcQpConfig {
             max_send_wr: 256,
             max_recv_wr: 256,
@@ -106,15 +111,13 @@ impl Connection {
 
         let qp = ctx
             .rc_qp_builder::<u64, u64>(pd, &qp_config)
-            .sq_cq(send_cq.clone(), sq_callback)
-            .rq_cq(recv_cq.clone(), rq_callback)
+            .sq_cq(send_cq, sq_callback)
+            .rq_cq(recv_cq, rq_callback)
             .build()?;
 
         Ok(Self {
             conn_id,
             qp,
-            send_cq,
-            recv_cq,
             port,
             port_attr,
             remote: None,
@@ -182,30 +185,6 @@ impl Connection {
     /// Get a reference to the QP for WQE emission.
     pub fn qp(&self) -> &Rc<RefCell<RcQpIb<u64, u64, SqCallback, RqCallback>>> {
         &self.qp
-    }
-
-    /// Get a reference to the send CQ.
-    pub fn send_cq(&self) -> &Rc<Cq> {
-        &self.send_cq
-    }
-
-    /// Get a reference to the receive CQ.
-    pub fn recv_cq(&self) -> &Rc<Cq> {
-        &self.recv_cq
-    }
-
-    /// Poll the send CQ.
-    pub fn poll_send_cq(&self) -> usize {
-        let count = self.send_cq.poll();
-        self.send_cq.flush();
-        count
-    }
-
-    /// Poll the receive CQ.
-    pub fn poll_recv_cq(&self) -> usize {
-        let count = self.recv_cq.poll();
-        self.recv_cq.flush();
-        count
     }
 
     /// Ring the SQ doorbell.
