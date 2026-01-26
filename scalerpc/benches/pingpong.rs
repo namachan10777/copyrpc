@@ -8,6 +8,14 @@
 //! ```bash
 //! cargo bench --package scalerpc --bench pingpong
 //! ```
+//!
+//! Environment variables for configuration:
+//! - `SCALERPC_CLIENT_CORE`: CPU core for client (default: 0)
+//! - `SCALERPC_SERVER_CORE`: CPU core for server (default: 1)
+//! - `SCALERPC_NUM_SLOTS`: Number of slots for single QP tests (default: 1024)
+//! - `SCALERPC_PIPELINE_DEPTH`: Pipeline depth for throughput test (default: 16)
+//! - `SCALERPC_NUM_QPS`: Number of QPs for multi-QP test (default: 64)
+//! - `SCALERPC_MULTI_QP_PIPELINE_DEPTH`: Pipeline depth for multi-QP test (default: 64)
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -27,6 +35,47 @@ use scalerpc::{
 use scalerpc::connection::RemoteEndpoint;
 
 // =============================================================================
+// BenchConfig - Environment Variable Configuration
+// =============================================================================
+
+fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+#[derive(Clone)]
+struct BenchConfig {
+    // CPU affinity
+    client_core: usize,
+    server_core: usize,
+    // Single QP
+    num_slots: usize,
+    pipeline_depth: usize,
+    // Multi QP
+    num_qps: usize,
+    multi_qp_pipeline_depth: usize,
+}
+
+impl BenchConfig {
+    fn load() -> Self {
+        Self {
+            client_core: env_or("SCALERPC_CLIENT_CORE", 0),
+            server_core: env_or("SCALERPC_SERVER_CORE", 1),
+            num_slots: env_or("SCALERPC_NUM_SLOTS", 1024),
+            pipeline_depth: env_or("SCALERPC_PIPELINE_DEPTH", 16),
+            num_qps: env_or("SCALERPC_NUM_QPS", 64),
+            multi_qp_pipeline_depth: env_or("SCALERPC_MULTI_QP_PIPELINE_DEPTH", 64),
+        }
+    }
+
+    fn multi_qp_num_slots(&self) -> usize {
+        self.num_qps * 16 // 16 slots per connection
+    }
+}
+
+// =============================================================================
 // CPU Affinity
 // =============================================================================
 
@@ -42,14 +91,10 @@ fn set_cpu_affinity(core_id: usize) {
     }
 }
 
-const CLIENT_CORE: usize = 0;
-const SERVER_CORE: usize = 1;
-
 // =============================================================================
 // Constants
 // =============================================================================
 
-const NUM_SLOTS: usize = 1024;
 const SMALL_MSG_SIZE: usize = 32;
 const LARGE_MSG_SIZE: usize = 4000; // Max payload is 4056 (4096 - 8 trailer - 32 header)
 
@@ -137,18 +182,18 @@ struct BenchmarkSetup {
     _test_ctx: TestContext,
 }
 
-fn setup_benchmark() -> Option<BenchmarkSetup> {
-    set_cpu_affinity(CLIENT_CORE);
+fn setup_benchmark(config: &BenchConfig) -> Option<BenchmarkSetup> {
+    set_cpu_affinity(config.client_core);
 
     let test_ctx = TestContext::new()?;
 
     let client_config = ClientConfig {
         pool: PoolConfig {
-            num_slots: NUM_SLOTS,
+            num_slots: config.num_slots,
             slot_data_size: 4080,
         },
         timeout_ms: 10000,
-        max_connections: 64, // 1024 / 64 = 16 slots per connection
+        max_connections: 64, // 16 slots per connection
     };
 
     let mut client = RpcClient::new(&test_ctx.pd, client_config).ok()?;
@@ -173,8 +218,9 @@ fn setup_benchmark() -> Option<BenchmarkSetup> {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let server_stop = stop_flag.clone();
 
+    let server_config = config.clone();
     let handle = thread::spawn(move || {
-        server_thread_main(server_info_tx, client_info_rx, server_ready_clone, server_stop);
+        server_thread_main(&server_config, server_info_tx, client_info_rx, server_ready_clone, server_stop);
     });
 
     client_info_tx.send(client_info).ok()?;
@@ -217,12 +263,13 @@ fn setup_benchmark() -> Option<BenchmarkSetup> {
 // =============================================================================
 
 fn server_thread_main(
+    config: &BenchConfig,
     info_tx: Sender<ConnectionInfo>,
     info_rx: Receiver<ConnectionInfo>,
     ready_signal: Arc<AtomicU32>,
     stop_flag: Arc<AtomicBool>,
 ) {
-    set_cpu_affinity(SERVER_CORE);
+    set_cpu_affinity(config.server_core);
 
     let ctx = match open_mlx5_device() {
         Some(c) => c,
@@ -230,7 +277,7 @@ fn server_thread_main(
     };
 
     let port = 1u8;
-    let port_attr = match ctx.query_port(port) {
+    let _port_attr = match ctx.query_port(port) {
         Ok(attr) => attr,
         Err(_) => return,
     };
@@ -242,12 +289,12 @@ fn server_thread_main(
 
     let server_config = ServerConfig {
         pool: PoolConfig {
-            num_slots: NUM_SLOTS,
+            num_slots: config.num_slots,
             slot_data_size: 4080,
         },
         num_recv_slots: 256,
         group: GroupConfig::default(),
-        max_connections: 64, // 1024 / 64 = 16 slots per connection
+        max_connections: 64, // 16 slots per connection
     };
 
     let mut server = match RpcServer::new(&pd, server_config) {
@@ -395,7 +442,9 @@ fn run_throughput_bench(
 // =============================================================================
 
 fn bench_latency(c: &mut Criterion) {
-    let setup = match setup_benchmark() {
+    let config = BenchConfig::load();
+
+    let setup = match setup_benchmark(&config) {
         Some(s) => s,
         None => {
             eprintln!("Skipping benchmark: no mlx5 device available");
@@ -422,7 +471,9 @@ fn bench_latency(c: &mut Criterion) {
 }
 
 fn bench_throughput(c: &mut Criterion) {
-    let setup = match setup_benchmark() {
+    let config = BenchConfig::load();
+
+    let setup = match setup_benchmark(&config) {
         Some(s) => s,
         None => {
             eprintln!("Skipping benchmark: no mlx5 device available");
@@ -440,8 +491,7 @@ fn bench_throughput(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(3));
     group.throughput(Throughput::Elements(1));
 
-    // Pipeline depth 16
-    let pipeline_depth = 16;
+    let pipeline_depth = config.pipeline_depth;
 
     // 32B message throughput
     group.bench_function(
@@ -467,12 +517,8 @@ fn bench_throughput(c: &mut Criterion) {
 }
 
 // =============================================================================
-// Multi-QP Benchmark
+// Multi-QP Benchmark (configurable QPs for time-sharing scalability test)
 // =============================================================================
-
-const NUM_QPS: usize = 64;
-const MULTI_QP_PIPELINE_DEPTH: usize = 64;
-const MULTI_QP_NUM_SLOTS: usize = 1024; // NUM_QPS * 16 slots/QP
 
 struct MultiQpBenchmarkSetup {
     client: RpcClient,
@@ -481,27 +527,30 @@ struct MultiQpBenchmarkSetup {
     _test_ctx: TestContext,
 }
 
-fn setup_multi_qp_benchmark() -> Option<MultiQpBenchmarkSetup> {
-    set_cpu_affinity(CLIENT_CORE);
+fn setup_multi_qp_benchmark(config: &BenchConfig) -> Option<MultiQpBenchmarkSetup> {
+    set_cpu_affinity(config.client_core);
 
     let test_ctx = TestContext::new()?;
 
+    let num_qps = config.num_qps;
+    let multi_qp_num_slots = config.multi_qp_num_slots();
+
     let client_config = ClientConfig {
         pool: PoolConfig {
-            num_slots: MULTI_QP_NUM_SLOTS,
+            num_slots: multi_qp_num_slots,
             slot_data_size: 4080,
         },
         timeout_ms: 10000,
-        max_connections: NUM_QPS, // 256 / 8 = 32 slots per connection
+        max_connections: num_qps, // 16 slots per connection
     };
 
     let mut client = RpcClient::new(&test_ctx.pd, client_config).ok()?;
 
-    // Create NUM_QPS connections
-    let mut conn_ids = Vec::with_capacity(NUM_QPS);
-    let mut client_infos = Vec::with_capacity(NUM_QPS);
+    // Create num_qps connections
+    let mut conn_ids = Vec::with_capacity(num_qps);
+    let mut client_infos = Vec::with_capacity(num_qps);
 
-    for _ in 0..NUM_QPS {
+    for _ in 0..num_qps {
         let conn_id = client.add_connection(&test_ctx.ctx, &test_ctx.pd, test_ctx.port).ok()?;
         let endpoint = client.local_endpoint(conn_id).ok()?;
         conn_ids.push(conn_id);
@@ -524,8 +573,9 @@ fn setup_multi_qp_benchmark() -> Option<MultiQpBenchmarkSetup> {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let server_stop = stop_flag.clone();
 
+    let server_config = config.clone();
     let handle = thread::spawn(move || {
-        multi_qp_server_thread_main(server_info_tx, client_info_rx, server_ready_clone, server_stop);
+        multi_qp_server_thread_main(&server_config, server_info_tx, client_info_rx, server_ready_clone, server_stop);
     });
 
     client_info_tx.send(client_infos).ok()?;
@@ -565,12 +615,13 @@ fn setup_multi_qp_benchmark() -> Option<MultiQpBenchmarkSetup> {
 }
 
 fn multi_qp_server_thread_main(
+    config: &BenchConfig,
     info_tx: Sender<Vec<ConnectionInfo>>,
     info_rx: Receiver<Vec<ConnectionInfo>>,
     ready_signal: Arc<AtomicU32>,
     stop_flag: Arc<AtomicBool>,
 ) {
-    set_cpu_affinity(SERVER_CORE);
+    set_cpu_affinity(config.server_core);
 
     let ctx = match open_mlx5_device() {
         Some(c) => c,
@@ -588,14 +639,17 @@ fn multi_qp_server_thread_main(
         Err(_) => return,
     };
 
+    let num_qps = config.num_qps;
+    let multi_qp_num_slots = config.multi_qp_num_slots();
+
     let server_config = ServerConfig {
         pool: PoolConfig {
-            num_slots: MULTI_QP_NUM_SLOTS,
+            num_slots: multi_qp_num_slots,
             slot_data_size: 4080,
         },
         num_recv_slots: 256,
         group: GroupConfig::default(),
-        max_connections: NUM_QPS, // 256 / 8 = 32 slots per connection
+        max_connections: num_qps, // 16 slots per connection
     };
 
     let mut server = match RpcServer::new(&pd, server_config) {
@@ -605,11 +659,11 @@ fn multi_qp_server_thread_main(
 
     server.set_handler(|_rpc_type, payload| (0, payload.to_vec()));
 
-    // Create NUM_QPS connections on server side
-    let mut server_infos = Vec::with_capacity(NUM_QPS);
-    let mut server_conn_ids = Vec::with_capacity(NUM_QPS);
+    // Create num_qps connections on server side
+    let mut server_infos = Vec::with_capacity(num_qps);
+    let mut server_conn_ids = Vec::with_capacity(num_qps);
 
-    for _ in 0..NUM_QPS {
+    for _ in 0..num_qps {
         let conn_id = match server.add_connection(&ctx, &pd, port) {
             Ok(c) => c,
             Err(_) => return,
@@ -722,7 +776,9 @@ fn run_multi_qp_throughput_bench(
 }
 
 fn bench_multi_qp_throughput(c: &mut Criterion) {
-    let setup = match setup_multi_qp_benchmark() {
+    let config = BenchConfig::load();
+
+    let setup = match setup_multi_qp_benchmark(&config) {
         Some(s) => s,
         None => {
             eprintln!("Skipping benchmark: no mlx5 device available");
@@ -740,22 +796,25 @@ fn bench_multi_qp_throughput(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(5));
     group.throughput(Throughput::Elements(1));
 
-    // 8 QPs, 1024 concurrent, 32B messages
+    let num_qps = config.num_qps;
+    let pipeline_depth = config.multi_qp_pipeline_depth;
+
+    // Multi-QP, 32B messages
     group.bench_function(
-        BenchmarkId::new("8qp_1024concurrent", "32B"),
+        BenchmarkId::new(format!("{}qp_depth{}", num_qps, pipeline_depth), "32B"),
         |b| {
             b.iter_custom(|iters| {
-                run_multi_qp_throughput_bench(&client, &conn_ids, SMALL_MSG_SIZE, iters, MULTI_QP_PIPELINE_DEPTH)
+                run_multi_qp_throughput_bench(&client, &conn_ids, SMALL_MSG_SIZE, iters, pipeline_depth)
             });
         },
     );
 
-    // 8 QPs, 1024 concurrent, 4KB messages
+    // Multi-QP, 4KB messages
     group.bench_function(
-        BenchmarkId::new("8qp_1024concurrent", "4KB"),
+        BenchmarkId::new(format!("{}qp_depth{}", num_qps, pipeline_depth), "4KB"),
         |b| {
             b.iter_custom(|iters| {
-                run_multi_qp_throughput_bench(&client, &conn_ids, LARGE_MSG_SIZE, iters, MULTI_QP_PIPELINE_DEPTH)
+                run_multi_qp_throughput_bench(&client, &conn_ids, LARGE_MSG_SIZE, iters, pipeline_depth)
             });
         },
     );
