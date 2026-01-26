@@ -3756,6 +3756,136 @@ macro_rules! emit_ud_wqe {
             }
         }
     }};
+
+    // SEND with SGE (unsignaled)
+    ($ctx:expr, send {
+        av: $av:expr,
+        flags: $flags:expr,
+        sge: { addr: $addr:expr, len: $len:expr, lkey: $lkey:expr $(,)? } $(,)?
+    }) => {{
+        const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE
+            + $crate::wqe::ADDRESS_VECTOR_SIZE
+            + $crate::wqe::DATA_SEG_SIZE;
+        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+
+        let ctx = $ctx;
+        let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
+        let av = $av;
+
+        if $crate::wqe::unlikely(available < WQEBB_CNT) {
+            Err($crate::wqe::SubmissionError::SqFull)
+        } else {
+            let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
+            if $crate::wqe::unlikely(WQEBB_CNT > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
+                $crate::wqe::emit::emit_ud_send_wrap(
+                    ctx, av, $flags,
+                    $crate::wqe::emit::SgeParams { addr: $addr, len: $len, lkey: $lkey },
+                    None, 0, $crate::wqe::WqeOpcode::Send,
+                    WQEBB_CNT, slots_to_end,
+                )
+            } else {
+                let wqe_idx = ctx.pi().get();
+                let wqe_ptr = unsafe { ctx.sq_buf().add(((wqe_idx & (ctx.wqe_cnt() - 1)) as usize) * 64) };
+
+                unsafe {
+                    $crate::wqe::write_ctrl_seg(wqe_ptr, &$crate::wqe::CtrlSegParams {
+                        opmod: 0,
+                        opcode: $crate::wqe::WqeOpcode::Send as u8,
+                        wqe_idx,
+                        qpn: ctx.sqn(),
+                        ds_cnt: (WQE_SIZE / 16) as u8,
+                        flags: $flags,
+                        imm: 0,
+                    });
+                    $crate::wqe::emit::write_ud_address_vector_ib(
+                        wqe_ptr.add($crate::wqe::CTRL_SEG_SIZE),
+                        &av,
+                    );
+                    $crate::wqe::write_data_seg(
+                        wqe_ptr.add($crate::wqe::CTRL_SEG_SIZE + $crate::wqe::ADDRESS_VECTOR_SIZE),
+                        $len,
+                        $lkey,
+                        $addr,
+                    );
+                }
+
+                ctx.pi().set(wqe_idx.wrapping_add(WQEBB_CNT));
+                ctx.last_wqe().set(Some((wqe_ptr, WQE_SIZE)));
+
+                Ok($crate::wqe::emit::EmitResult {
+                    wqe_ptr,
+                    wqe_idx,
+                    wqe_size: WQE_SIZE,
+                    wqebb_cnt: WQEBB_CNT,
+                })
+            }
+        }
+    }};
+
+    // SEND with inline (unsignaled)
+    ($ctx:expr, send {
+        av: $av:expr,
+        flags: $flags:expr,
+        inline: $data:expr $(,)?
+    }) => {{
+        let ctx = $ctx;
+        let data: &[u8] = $data;
+        let data_len = data.len();
+        let inline_size = 4 + ((data_len + 15) & !15); // header + aligned data
+        let wqe_size = $crate::wqe::CTRL_SEG_SIZE
+            + $crate::wqe::ADDRESS_VECTOR_SIZE
+            + inline_size;
+        let wqebb_cnt = ((wqe_size + 63) / 64) as u16;
+
+        let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
+        let av = $av;
+
+        if $crate::wqe::unlikely(available < wqebb_cnt) {
+            Err($crate::wqe::SubmissionError::SqFull)
+        } else {
+            let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
+            if $crate::wqe::unlikely(wqebb_cnt > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
+                $crate::wqe::emit::emit_ud_send_wrap(
+                    ctx, av, $flags,
+                    $crate::wqe::emit::SgeParams { addr: 0, len: 0, lkey: 0 },
+                    Some(data), 0, $crate::wqe::WqeOpcode::Send,
+                    wqebb_cnt, slots_to_end,
+                )
+            } else {
+                let wqe_idx = ctx.pi().get();
+                let wqe_ptr = unsafe { ctx.sq_buf().add(((wqe_idx & (ctx.wqe_cnt() - 1)) as usize) * 64) };
+
+                unsafe {
+                    $crate::wqe::write_ctrl_seg(wqe_ptr, &$crate::wqe::CtrlSegParams {
+                        opmod: 0,
+                        opcode: $crate::wqe::WqeOpcode::Send as u8,
+                        wqe_idx,
+                        qpn: ctx.sqn(),
+                        ds_cnt: (wqe_size / 16) as u8,
+                        flags: $flags,
+                        imm: 0,
+                    });
+                    $crate::wqe::emit::write_ud_address_vector_ib(
+                        wqe_ptr.add($crate::wqe::CTRL_SEG_SIZE),
+                        &av,
+                    );
+                    let inline_ptr = wqe_ptr.add($crate::wqe::CTRL_SEG_SIZE + $crate::wqe::ADDRESS_VECTOR_SIZE);
+                    $crate::wqe::write_inline_header(inline_ptr, data_len as u32);
+                    $crate::wqe::copy_inline_data(inline_ptr.add(4), data.as_ptr(), data_len);
+                }
+
+                ctx.pi().set(wqe_idx.wrapping_add(wqebb_cnt));
+                ctx.last_wqe().set(Some((wqe_ptr, wqe_size)));
+
+                Ok($crate::wqe::emit::EmitResult {
+                    wqe_ptr,
+                    wqe_idx,
+                    wqe_size,
+                    wqebb_cnt,
+                })
+            }
+        }
+    }};
 }
 
 pub use emit_ud_wqe;

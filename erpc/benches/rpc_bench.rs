@@ -53,7 +53,7 @@ const LARGE_MSG_SIZE: usize = 4000;
 
 // Multi-QP benchmark parameters
 const NUM_QPS: usize = 8;
-const PIPELINE_DEPTH_PER_QP: usize = 1024;
+const PIPELINE_DEPTH_PER_QP: usize = 256;
 
 // =============================================================================
 // Connection Info
@@ -399,13 +399,21 @@ fn multi_qp_server_thread(
     ready_signal.store(1, Ordering::Release);
 
     // Single event loop for all QPs - poll recv() and reply()
+    // Process limited requests per server per iteration to avoid buffer exhaustion
+    const MAX_BATCH: usize = 16;
     while !stop_flag.load(Ordering::Relaxed) {
         for server in &servers {
             server.run_event_loop_once();
-            // Process incoming requests and echo back
-            while let Some(req) = server.recv() {
-                if let Err(e) = server.reply(&req, &req.data) {
-                    eprintln!("Server failed to respond: {:?}", e);
+            // Process incoming requests and echo back (limited batch)
+            let mut processed = 0;
+            while processed < MAX_BATCH {
+                if let Some(req) = server.recv() {
+                    if let Err(e) = server.reply(&req, &req.data) {
+                        eprintln!("Server failed to respond: {:?}", e);
+                    }
+                    processed += 1;
+                } else {
+                    break;
                 }
             }
         }
@@ -479,12 +487,20 @@ fn server_thread_main_with_config(
     ready_signal.store(1, Ordering::Release);
 
     // Server loop - poll recv() and reply()
+    // Process limited requests per event loop iteration to avoid buffer exhaustion
+    const MAX_BATCH: usize = 16;
     while !stop_flag.load(Ordering::Relaxed) {
         server.run_event_loop_once();
-        // Process incoming requests and echo back
-        while let Some(req) = server.recv() {
-            if let Err(e) = server.reply(&req, &req.data) {
-                eprintln!("Server failed to respond: {:?}", e);
+        // Process incoming requests and echo back (limited batch)
+        let mut processed = 0;
+        while processed < MAX_BATCH {
+            if let Some(req) = server.recv() {
+                if let Err(e) = server.reply(&req, &req.data) {
+                    eprintln!("Server failed to respond: {:?}", e);
+                }
+                processed += 1;
+            } else {
+                break;
             }
         }
         std::hint::spin_loop();
@@ -703,20 +719,20 @@ fn bench_throughput(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(3));
     group.throughput(Throughput::Elements(1));
 
-    // Pipeline depth 16
-    let pipeline_depth = 16;
-
-    // 32B message throughput
-    group.bench_function(
-        BenchmarkId::new("pipelined", format!("32B_depth{}", pipeline_depth)),
-        |b| {
-            b.iter_custom(|iters| {
-                run_throughput_bench(&client, session, SMALL_MSG_SIZE, iters, pipeline_depth)
-            });
-        },
-    );
+    // 32B message throughput with varying depths
+    for &pipeline_depth in &[16, 64, 256] {
+        group.bench_function(
+            BenchmarkId::new("pipelined", format!("32B_depth{}", pipeline_depth)),
+            |b| {
+                b.iter_custom(|iters| {
+                    run_throughput_bench(&client, session, SMALL_MSG_SIZE, iters, pipeline_depth)
+                });
+            },
+        );
+    }
 
     // 4KB message throughput
+    let pipeline_depth = 16;
     group.bench_function(
         BenchmarkId::new("pipelined", format!("4KB_depth{}", pipeline_depth)),
         |b| {

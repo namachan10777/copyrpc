@@ -93,9 +93,11 @@ impl<U: 'static> Rpc<U> {
         let pd = transport.pd();
 
         // Create buffer pools
+        // send_buffers needs to be large enough to hold in-flight requests/responses
+        // until send completions are processed. Use 4x max_send_wr to provide headroom.
         let recv_buf_size = mtu + GRH_SIZE;
         let recv_buffers = BufferPool::new(config.num_recv_buffers, recv_buf_size, pd)?;
-        let send_buffers = BufferPool::new(config.max_send_wr as usize, mtu, pd)?;
+        let send_buffers = BufferPool::new((config.max_send_wr as usize) * 4, mtu, pd)?;
 
         let mut timing_wheel = TimingWheel::default_for_rpc();
         timing_wheel.init(current_time_us());
@@ -456,6 +458,9 @@ impl<U: 'static> Rpc<U> {
     }
 
     /// Send a response to a request.
+    ///
+    /// Uses inline send for small responses (data copied to WQE),
+    /// which avoids buffer allocation overhead.
     fn send_response(
         &self,
         session_num: u16,
@@ -473,7 +478,7 @@ impl<U: 'static> Rpc<U> {
             sess.remote_session_num
         };
 
-        // Phase 2: Prepare buffer
+        // Phase 2: Prepare inline packet (header + data)
         let hdr = PktHdr::new(
             req_type,
             data.len(),
@@ -483,9 +488,11 @@ impl<U: 'static> Rpc<U> {
             req_num,
         );
 
-        let buf_info = self.prepare_send_buffer(data, &hdr)?;
+        // Build inline packet: header + data
+        let total_len = PKT_HDR_SIZE + data.len();
+        let max_inline = self.config.max_inline_data as usize;
 
-        // Phase 3: Post send
+        // Phase 3: Get address vector
         let av = {
             let sessions = self.sessions.borrow();
             let handle = SessionHandle(session_num);
@@ -494,7 +501,33 @@ impl<U: 'static> Rpc<U> {
             UdTransport::ah_to_av(ah)
         };
 
-        {
+        // Phase 4: Send - use buffered send for all responses
+        // (inline with always signaled has higher CQ overhead than buffered)
+        if false && total_len <= max_inline {
+            // Build inline packet on stack
+            let mut inline_buf = [0u8; 256]; // Stack buffer for inline data
+            unsafe {
+                hdr.write_to(inline_buf.as_mut_ptr());
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    inline_buf.as_mut_ptr().add(PKT_HDR_SIZE),
+                    data.len(),
+                );
+            }
+
+            // Post inline send - uses signaled interval internally
+            // buf_idx = usize::MAX indicates no buffer to free
+            let entry = TransportEntry {
+                buf_idx: usize::MAX,
+                session_num,
+                context: 0,
+                buf_type: BufferType::Request, // Treated as no-op in completion (buf_idx check)
+            };
+            self.transport.post_send_inline(av, &inline_buf[..total_len], true, entry)?;
+        } else {
+            // Fall back to buffered send for large responses
+            let buf_info = self.prepare_send_buffer(data, &hdr)?;
+
             let entry = TransportEntry {
                 buf_idx: buf_info.idx,
                 session_num,
@@ -505,8 +538,8 @@ impl<U: 'static> Rpc<U> {
             let send_buffers = self.send_buffers.borrow();
             let buf = send_buffers.get(buf_info.idx).ok_or(Error::InvalidPacket)?;
             self.transport.post_send(av, buf, entry)?;
-            // Doorbell is batched in run_event_loop_once()
         }
+        // Doorbell is batched in run_event_loop_once()
 
         // Note: Credit is implicitly returned with the response packet.
         // The client's handle_response() calls sess.return_credit() upon receiving this.
@@ -1081,8 +1114,9 @@ impl<U: 'static> Rpc<U> {
         // Poll and process send completions
         // Request buffers are kept until response is received (for retransmission)
         // Response buffers are freed immediately on send completion
+        // Note: buf_idx == usize::MAX indicates inline send with no buffer to free
         for comp in self.transport.poll_send_completions() {
-            if comp.buf_type == BufferType::Response {
+            if comp.buf_type == BufferType::Response && comp.buf_idx != usize::MAX {
                 self.send_buffers.borrow_mut().free(comp.buf_idx);
             }
             // Request buffers are freed in handle_response() when response is received

@@ -116,7 +116,15 @@ type RecvCallback = Box<dyn Fn(Cqe, TransportEntry)>;
 struct CompletionBuffers {
     send_completions: Vec<SendCompletion>,
     recv_completions: Vec<RecvCompletion>,
+    /// Pending response buffer indices for unsignaled sends.
+    /// (send_counter, buf_idx) - counter is used to match with signaled completion.
+    pending_response_bufs: Vec<(u32, usize)>,
 }
+
+/// Signaled interval - every Nth send is signaled.
+/// Lower values = more CQ overhead but safer for SQ.
+/// Higher values = less CQ overhead but more pending buffers.
+const SIGNALED_INTERVAL: u32 = 4;
 
 /// UD transport wrapper.
 ///
@@ -144,6 +152,8 @@ pub struct UdTransport {
     pending_recvs: Cell<u32>,
     /// Completion buffers for direct polling pattern.
     completions: Rc<RefCell<CompletionBuffers>>,
+    /// Send counter for signaled interval.
+    send_counter: Cell<u32>,
 }
 
 impl UdTransport {
@@ -179,12 +189,43 @@ impl UdTransport {
         let completions = Rc::new(RefCell::new(CompletionBuffers {
             send_completions: Vec::with_capacity(config.max_send_wr as usize),
             recv_completions: Vec::with_capacity(config.max_recv_wr as usize),
+            pending_response_bufs: Vec::with_capacity(config.max_send_wr as usize),
         }));
 
         // Create callbacks that capture completion buffers
         let send_completions = completions.clone();
         let send_callback: SendCallback = Box::new(move |_cqe, entry| {
-            send_completions.borrow_mut().send_completions.push(SendCompletion {
+            let mut completions = send_completions.borrow_mut();
+            // The signaled WQE's send_counter is stored in entry.context
+            // Release only pending buffers with counter <= this counter
+            let signaled_counter = entry.context as u32;
+
+            // Partition pending buffers: release those with counter <= signaled_counter
+            let pending = std::mem::take(&mut completions.pending_response_bufs);
+            let mut to_release = Vec::new();
+            let mut remaining = Vec::new();
+            for (counter, buf_idx) in pending {
+                // Use wrapping comparison to handle counter overflow
+                let diff = signaled_counter.wrapping_sub(counter);
+                if diff < 0x8000_0000 {
+                    // counter <= signaled_counter (within half the range)
+                    to_release.push(buf_idx);
+                } else {
+                    // counter > signaled_counter - keep for later
+                    remaining.push((counter, buf_idx));
+                }
+            }
+            completions.pending_response_bufs = remaining;
+
+            // Add completions for released buffers
+            for buf_idx in to_release {
+                completions.send_completions.push(SendCompletion {
+                    buf_idx,
+                    buf_type: BufferType::Response,
+                });
+            }
+            // Add the signaled completion itself
+            completions.send_completions.push(SendCompletion {
                 buf_idx: entry.buf_idx,
                 buf_type: entry.buf_type,
             });
@@ -223,6 +264,7 @@ impl UdTransport {
             pending_sends: Cell::new(0),
             pending_recvs: Cell::new(0),
             completions,
+            send_counter: Cell::new(0),
         })
     }
 
@@ -259,7 +301,10 @@ impl UdTransport {
 
     /// Post a send operation using the emit_ud_wqe! macro approach.
     ///
-    /// Note: All sends are signaled in this implementation.
+    /// Uses signaled interval: only every Nth send is signaled to reduce
+    /// CQ overhead while still updating SQ ci.
+    /// For unsignaled Response sends, the buffer index is queued for deferred
+    /// deallocation when the next signaled completion arrives.
     /// The buffer must be registered.
     pub fn post_send(
         &self,
@@ -275,14 +320,111 @@ impl UdTransport {
             ))
         })?;
 
-        // Use the emit context to post the WQE
+        // Use signaled interval: every Nth send is signaled
+        // Unsignaled Response buffers are queued for deferred deallocation
+        let count = self.send_counter.get();
+        let should_signal = count % SIGNALED_INTERVAL == 0;
+        self.send_counter.set(count.wrapping_add(1));
+
+        let ctx = qp.emit_ctx()?;
+        if should_signal {
+            // Store send_counter in entry.context for completion ordering
+            let mut signaled_entry = entry;
+            signaled_entry.context = count as u64;
+            mlx5::emit_ud_wqe!(&ctx, send {
+                av: av,
+                flags: WqeFlags::empty(),
+                sge: { addr: buf.addr(), len: buf.len() as u32, lkey: lkey },
+                signaled: signaled_entry,
+            })?;
+        } else {
+            // Queue Response buffers for deferred deallocation with counter
+            if entry.buf_type == BufferType::Response && entry.buf_idx != usize::MAX {
+                self.completions.borrow_mut().pending_response_bufs.push((count, entry.buf_idx));
+            }
+            mlx5::emit_ud_wqe!(&ctx, send {
+                av: av,
+                flags: WqeFlags::empty(),
+                sge: { addr: buf.addr(), len: buf.len() as u32, lkey: lkey },
+            })?;
+        }
+
+        self.pending_sends.set(self.pending_sends.get() + 1);
+        Ok(())
+    }
+
+    /// Post an unsignaled send operation.
+    ///
+    /// This variant does not generate a completion, which reduces CQ overhead.
+    /// Use with caution: the buffer must remain valid until the send completes.
+    pub fn post_send_unsignaled(
+        &self,
+        av: UdAvIb,
+        buf: &MsgBuffer,
+    ) -> Result<()> {
+        let qp = self.qp.borrow();
+        let lkey = buf.lkey().ok_or_else(|| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Buffer not registered",
+            ))
+        })?;
+
+        // Use the emit context to post the WQE (unsignaled)
         let ctx = qp.emit_ctx()?;
         mlx5::emit_ud_wqe!(&ctx, send {
             av: av,
             flags: WqeFlags::empty(),
             sge: { addr: buf.addr(), len: buf.len() as u32, lkey: lkey },
-            signaled: entry,
         })?;
+
+        self.pending_sends.set(self.pending_sends.get() + 1);
+        Ok(())
+    }
+
+    /// Post an inline send operation.
+    ///
+    /// Data is copied directly into the WQE, so the source buffer can be
+    /// immediately freed after this call returns.
+    ///
+    /// Uses signaled interval: only every Nth send is signaled to reduce
+    /// CQ overhead while still updating SQ ci.
+    ///
+    /// # Arguments
+    /// * `av` - Address vector for the destination
+    /// * `data` - Data to send (copied into WQE)
+    /// * `signaled` - If true, forces signaled (for explicit control)
+    /// * `entry` - Entry to pass to completion callback (only used if signaled)
+    pub fn post_send_inline(
+        &self,
+        av: UdAvIb,
+        data: &[u8],
+        force_signaled: bool,
+        entry: TransportEntry,
+    ) -> Result<()> {
+        let qp = self.qp.borrow();
+        let ctx = qp.emit_ctx()?;
+
+        // Use signaled interval like post_send
+        // Inline sends don't need buffer deallocation, so interval is sufficient
+        let count = self.send_counter.get();
+        let should_signal = force_signaled || count % SIGNALED_INTERVAL == 0;
+        self.send_counter.set(count.wrapping_add(1));
+
+        if should_signal {
+            mlx5::emit_ud_wqe!(&ctx, send {
+                av: av,
+                flags: WqeFlags::empty(),
+                inline: data,
+                signaled: entry,
+            })?;
+        } else {
+            mlx5::emit_ud_wqe!(&ctx, send {
+                av: av,
+                flags: WqeFlags::empty(),
+                inline: data,
+            })?;
+        }
 
         self.pending_sends.set(self.pending_sends.get() + 1);
         Ok(())
