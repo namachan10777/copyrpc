@@ -43,7 +43,7 @@ pub use error::{Error, Result, SlotState};
 pub use mapping::VirtualMapping;
 pub use pool::{MessagePool, MessageSlot, SlotHandle};
 pub use protocol::{
-    ContextSwitchEvent, EndpointEntry, MessageTrailer, RequestHeader, ResponseHeader,
+    ContextSwitchEvent, MessageTrailer, RequestHeader, ResponseHeader,
     MESSAGE_BLOCK_SIZE, MESSAGE_MAX_DATA_SIZE, MESSAGE_TRAILER_SIZE,
 };
 pub use connection::{Connection, RemoteEndpoint, ConnectionId};

@@ -29,13 +29,14 @@ pub const MESSAGE_VALID: u32 = 1;
 /// Valid field value indicating no message (slot is empty).
 pub const MESSAGE_INVALID: u32 = 0;
 
-/// Message block size (4KB page aligned).
-pub const MESSAGE_BLOCK_SIZE: usize = 4096;
+/// Message block size (matches slot data size: 4KB - 16 byte slot header).
+/// Note: The slot header is implementation overhead, leaving 4080 bytes for message data.
+pub const MESSAGE_BLOCK_SIZE: usize = 4080;
 
 /// Size of the message trailer (msg_len + valid).
 pub const MESSAGE_TRAILER_SIZE: usize = 8;
 
-/// Maximum data size in a message block.
+/// Maximum data size in a message block (4080 - 8 trailer = 4072 bytes).
 pub const MESSAGE_MAX_DATA_SIZE: usize = MESSAGE_BLOCK_SIZE - MESSAGE_TRAILER_SIZE;
 
 /// Right-aligned message trailer.
@@ -289,53 +290,6 @@ pub mod status {
     pub const TIMEOUT: u32 = 4;
 }
 
-/// Endpoint entry for warmup mechanism (Section 3.4).
-///
-/// Each client in the warmup group registers an endpoint entry
-/// with the server. The server uses RDMA READ to fetch requests
-/// from these addresses.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct EndpointEntry {
-    /// Client's local request buffer address.
-    pub req_addr: u64,
-    /// Number of requests batched at this address.
-    pub batch_size: u32,
-    /// Client ID for this entry.
-    pub client_id: u32,
-    /// Remote key for RDMA READ access.
-    pub rkey: u32,
-    /// Padding for alignment.
-    _pad: u32,
-}
-
-impl EndpointEntry {
-    /// Size of endpoint entry in bytes.
-    pub const SIZE: usize = std::mem::size_of::<Self>();
-
-    /// Create a new endpoint entry.
-    pub fn new(client_id: u32, req_addr: u64, batch_size: u32, rkey: u32) -> Self {
-        Self {
-            req_addr,
-            batch_size,
-            client_id,
-            rkey,
-            _pad: 0,
-        }
-    }
-
-    /// Check if this entry is valid (has pending requests).
-    pub fn is_valid(&self) -> bool {
-        self.batch_size > 0
-    }
-
-    /// Clear this entry.
-    pub fn clear(&mut self) {
-        self.batch_size = 0;
-        self.req_addr = 0;
-    }
-}
-
 /// Context switch event notification.
 ///
 /// Sent from server to client when the client's group is being
@@ -462,10 +416,10 @@ mod tests {
     fn test_message_trailer_constants() {
         // Trailer is 8 bytes (4 + 4)
         assert_eq!(MESSAGE_TRAILER_SIZE, 8);
-        // Block is 4KB
-        assert_eq!(MESSAGE_BLOCK_SIZE, 4096);
+        // Block is 4080 bytes (4KB slot - 16 byte header)
+        assert_eq!(MESSAGE_BLOCK_SIZE, 4080);
         // Max data is block - trailer
-        assert_eq!(MESSAGE_MAX_DATA_SIZE, 4088);
+        assert_eq!(MESSAGE_MAX_DATA_SIZE, 4072);
     }
 
     #[test]
@@ -487,20 +441,6 @@ mod tests {
         let trailer_ptr = unsafe { buf.as_ptr().add(trailer_offset) as *const u32 };
         assert_eq!(unsafe { *trailer_ptr }, 100); // msg_len
         assert_eq!(unsafe { *trailer_ptr.add(1) }, MESSAGE_VALID); // valid
-    }
-
-    #[test]
-    fn test_endpoint_entry() {
-        let entry = EndpointEntry::new(42, 0x1234_5678, 10, 0xABCD);
-        assert!(entry.is_valid());
-        assert_eq!(entry.client_id, 42);
-        assert_eq!(entry.req_addr, 0x1234_5678);
-        assert_eq!(entry.batch_size, 10);
-        assert_eq!(entry.rkey, 0xABCD);
-
-        let mut entry2 = entry;
-        entry2.clear();
-        assert!(!entry2.is_valid());
     }
 
     #[test]

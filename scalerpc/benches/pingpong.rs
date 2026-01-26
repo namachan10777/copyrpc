@@ -246,7 +246,6 @@ fn server_thread_main(
         },
         num_recv_slots: 256,
         group: GroupConfig::default(),
-        enable_scheduler: false, // Disable for benchmark (simpler path)
     };
 
     let mut server = match RpcServer::new(&pd, server_config) {
@@ -593,7 +592,6 @@ fn multi_qp_server_thread_main(
         },
         num_recv_slots: 256,
         group: GroupConfig::default(),
-        enable_scheduler: false,
     };
 
     let mut server = match RpcServer::new(&pd, server_config) {

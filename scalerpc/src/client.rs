@@ -43,7 +43,7 @@ use crate::error::{Error, Result, SlotState};
 use crate::mapping::VirtualMapping;
 use crate::pool::MessagePool;
 use crate::protocol::{
-    ContextSwitchEvent, EndpointEntry, MessageTrailer, RequestHeader, ResponseHeader,
+    ContextSwitchEvent, MessageTrailer, RequestHeader, ResponseHeader,
     MESSAGE_BLOCK_SIZE,
 };
 
@@ -91,6 +91,9 @@ pub struct WarmupBuffer {
     write_offset: usize,
 }
 
+/// Alignment for RDMA memory allocations (4KB page).
+const RDMA_ALIGNMENT: usize = 4096;
+
 impl WarmupBuffer {
     /// Create a new warmup buffer.
     pub fn new(pd: &Pd, num_slots: usize) -> Result<Self> {
@@ -98,7 +101,7 @@ impl WarmupBuffer {
 
         let buffer = unsafe {
             let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            let ret = libc::posix_memalign(&mut ptr, MESSAGE_BLOCK_SIZE, size);
+            let ret = libc::posix_memalign(&mut ptr, RDMA_ALIGNMENT, size);
             if ret != 0 {
                 return Err(Error::Io(std::io::Error::from_raw_os_error(ret)));
             }
@@ -294,12 +297,6 @@ struct ConnectionState {
     warmup_buffer: RefCell<WarmupBuffer>,
     /// Event buffer for context switch notifications.
     event_buffer: EventBuffer,
-    /// Endpoint entry to register with server.
-    endpoint_entry: RefCell<EndpointEntry>,
-    /// Server's endpoint entry address (for registering warmup info).
-    server_endpoint_entry_addr: Cell<u64>,
-    /// Server's endpoint entry rkey.
-    server_endpoint_entry_rkey: Cell<u32>,
 }
 
 /// RPC Client.
@@ -401,9 +398,6 @@ impl RpcClient {
             state: Cell::new(ClientState::Connected),
             warmup_buffer: RefCell::new(warmup_buffer),
             event_buffer,
-            endpoint_entry: RefCell::new(EndpointEntry::default()),
-            server_endpoint_entry_addr: Cell::new(0),
-            server_endpoint_entry_rkey: Cell::new(0),
         };
 
         self.connections.push(Some(conn));
@@ -417,9 +411,6 @@ impl RpcClient {
     /// # Arguments
     /// * `conn_id` - Local connection ID
     /// * `remote` - Remote endpoint information
-    ///
-    /// When the remote provides endpoint_entry_addr/rkey (scheduler enabled),
-    /// they are automatically saved for warmup registration.
     pub fn connect(&mut self, conn_id: ConnectionId, remote: RemoteEndpoint) -> Result<()> {
         let conn = self
             .connections
@@ -431,14 +422,6 @@ impl RpcClient {
         self.mapping
             .set_remote_slot(conn_id, remote.slot_addr, remote.slot_rkey)?;
 
-        // Auto-save endpoint entry info if provided (for warmup registration)
-        if remote.endpoint_entry_addr != 0 {
-            if let Some(Some(state)) = self.connection_states.get(conn_id) {
-                state.server_endpoint_entry_addr.set(remote.endpoint_entry_addr);
-                state.server_endpoint_entry_rkey.set(remote.endpoint_entry_rkey);
-            }
-        }
-
         conn.connect(remote)?;
         Ok(())
     }
@@ -447,6 +430,7 @@ impl RpcClient {
     ///
     /// Note: slot_addr points to the pool's data region base for response write-back.
     /// event_buffer_addr/rkey are populated for context switch notification.
+    /// warmup_buffer_addr/rkey/slots are populated for server to RDMA READ warmup requests.
     pub fn local_endpoint(&self, conn_id: ConnectionId) -> Result<RemoteEndpoint> {
         let conn = self
             .connections
@@ -463,6 +447,14 @@ impl RpcClient {
         if let Some((addr, rkey)) = self.event_buffer_addr(conn_id) {
             endpoint.event_buffer_addr = addr;
             endpoint.event_buffer_rkey = rkey;
+        }
+
+        // Add warmup buffer info for server to RDMA READ requests
+        if let Some(Some(state)) = self.connection_states.get(conn_id) {
+            let warmup_buffer = state.warmup_buffer.borrow();
+            endpoint.warmup_buffer_addr = warmup_buffer.addr();
+            endpoint.warmup_buffer_rkey = warmup_buffer.rkey();
+            endpoint.warmup_buffer_slots = warmup_buffer.capacity() as u32;
         }
 
         Ok(endpoint)
@@ -496,10 +488,33 @@ impl RpcClient {
         rpc_type: u16,
         payload: &[u8],
     ) -> Result<RpcResponse> {
+        // Check if we're going through warmup before sending
+        let current_state = self.state(conn_id);
+        let uses_warmup = matches!(
+            current_state,
+            Some(ClientState::Warmup) | Some(ClientState::Idle)
+        );
+
         let pending = self.call_async(conn_id, rpc_type, payload)?;
         // Flush doorbell immediately for blocking call
         self.poll();
-        pending.wait()
+        let response = pending.wait()?;
+
+        // After receiving response via warmup, transition to Process
+        if uses_warmup {
+            if let Some(Some(state)) = self.connection_states.get(conn_id) {
+                state.state.set(ClientState::Process);
+            }
+        }
+
+        // Connected -> Process after first successful response
+        if current_state == Some(ClientState::Connected) {
+            if let Some(Some(state)) = self.connection_states.get(conn_id) {
+                state.state.set(ClientState::Process);
+            }
+        }
+
+        Ok(response)
     }
 
     /// Make a direct RPC call via RDMA WRITE.
@@ -530,8 +545,10 @@ impl RpcClient {
 
         // Calculate remote slot address based on client slot index
         // This ensures each request goes to a different server slot
+        // Note: Remote slots are 4096 bytes apart (full slot size including header)
+        const REMOTE_SLOT_STRIDE: usize = 4096;
         let remote_base_addr = mapping_entry.remote_slot_addr;
-        let remote_addr = remote_base_addr + (slot_index * MESSAGE_BLOCK_SIZE) as u64;
+        let remote_addr = remote_base_addr + (slot_index * REMOTE_SLOT_STRIDE) as u64;
         let remote_rkey = mapping_entry.remote_slot_rkey;
 
         // Generate request ID
@@ -563,13 +580,17 @@ impl RpcClient {
                     payload.len(),
                 );
             }
+
+            // Write message trailer (Valid field) for server to detect request
+            let msg_len = (RequestHeader::SIZE + payload.len()) as u32;
+            MessageTrailer::write_to(slot_data_ptr, msg_len);
         }
 
         // Update slot state
         slot.set_state(SlotState::RequestPending);
 
         // Send request via RDMA WRITE
-        let total_len = RequestHeader::SIZE + payload.len();
+        // Send the full block to include the Valid field at the end (MESSAGE_BLOCK_SIZE)
         {
             let qp_ref = conn.qp().borrow();
             let emit_ctx = qp_ref
@@ -582,7 +603,7 @@ impl RpcClient {
                 rkey: remote_rkey,
                 sge: {
                     addr: slot.data_addr(),
-                    len: total_len as u32,
+                    len: MESSAGE_BLOCK_SIZE as u32,
                     lkey: self.pool.lkey()
                 },
                 signaled: req_id,
@@ -657,86 +678,10 @@ impl RpcClient {
         }
     }
 
-    /// Send endpoint entry to the server via RDMA WRITE.
-    ///
-    /// This registers the client's warmup buffer with the server,
-    /// allowing the server to fetch requests via RDMA READ.
-    fn send_endpoint_entry(&self, conn_id: ConnectionId) -> Result<()> {
-        let conn = self
-            .connections
-            .get(conn_id)
-            .and_then(|c| c.as_ref())
-            .ok_or(Error::ConnectionNotFound(conn_id))?;
-
-        let conn_state = self
-            .connection_states
-            .get(conn_id)
-            .and_then(|s| s.as_ref())
-            .ok_or(Error::ConnectionNotFound(conn_id))?;
-
-        let server_addr = conn_state.server_endpoint_entry_addr.get();
-        let server_rkey = conn_state.server_endpoint_entry_rkey.get();
-
-        if server_addr == 0 {
-            // Server doesn't support warmup (scheduler disabled)
-            return Ok(());
-        }
-
-        // Allocate a temporary slot for the endpoint entry
-        let slot = self.pool.alloc()?;
-        let entry = conn_state.endpoint_entry.borrow();
-
-        // Write endpoint entry to slot
-        let slot_data_ptr = slot.slot().data_ptr();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                &*entry as *const EndpointEntry as *const u8,
-                slot_data_ptr,
-                EndpointEntry::SIZE,
-            );
-        }
-
-        // Send via RDMA WRITE
-        {
-            let qp_ref = conn.qp().borrow();
-            let emit_ctx = qp_ref
-                .emit_ctx()
-                .map_err(|e| Error::Protocol(format!("emit_ctx failed: {:?}", e)))?;
-
-            emit_wqe!(&emit_ctx, write {
-                flags: WqeFlags::COMPLETION,
-                remote_addr: server_addr,
-                rkey: server_rkey,
-                sge: {
-                    addr: slot.data_addr(),
-                    len: EndpointEntry::SIZE as u32,
-                    lkey: self.pool.lkey()
-                },
-                signaled: conn_id as u64,
-            })
-            .map_err(|e| Error::Protocol(format!("emit_wqe failed: {:?}", e)))?;
-        }
-        conn.ring_sq_doorbell();
-
-        // Poll for completion
-        let start = Instant::now();
-        let timeout = Duration::from_millis(self.config.timeout_ms);
-        loop {
-            if conn.poll_send_cq() > 0 {
-                break;
-            }
-            if start.elapsed() > timeout {
-                return Err(Error::Protocol("endpoint entry send timeout".to_string()));
-            }
-            std::hint::spin_loop();
-        }
-
-        Ok(())
-    }
-
     /// Send request via warmup mechanism.
     ///
-    /// Writes request to warmup buffer and sends endpoint entry to server.
+    /// Writes request to warmup buffer. The server will RDMA READ from this
+    /// buffer using the warmup buffer info exchanged during connection setup.
     fn send_warmup(
         &self,
         conn_id: ConnectionId,
@@ -749,8 +694,9 @@ impl RpcClient {
             .and_then(|s| s.as_ref())
             .ok_or(Error::ConnectionNotFound(conn_id))?;
 
-        // Auto-transition Idle -> Warmup
-        if conn_state.state.get() == ClientState::Idle {
+        // Auto-transition Idle/Connected -> Warmup
+        let current = conn_state.state.get();
+        if current == ClientState::Idle || current == ClientState::Connected {
             conn_state.warmup_buffer.borrow_mut().clear();
             conn_state.state.set(ClientState::Warmup);
         }
@@ -775,19 +721,6 @@ impl RpcClient {
             warmup_buffer.write_request(&header, payload)?;
         }
 
-        // Update endpoint entry
-        {
-            let warmup_buffer = conn_state.warmup_buffer.borrow();
-            let mut entry = conn_state.endpoint_entry.borrow_mut();
-            entry.req_addr = warmup_buffer.addr();
-            entry.batch_size = warmup_buffer.request_count() as u32;
-            entry.client_id = conn_id as u32;
-            entry.rkey = warmup_buffer.rkey();
-        }
-
-        // Send endpoint entry to server
-        self.send_endpoint_entry(conn_id)?;
-
         Ok(PendingRpc {
             pool: &self.pool,
             slot_index: response_slot.release(),
@@ -801,8 +734,15 @@ impl RpcClient {
     /// Returns immediately with a `PendingRpc` handle that can be polled
     /// for completion. The request behavior depends on the current state:
     ///
-    /// - **Process/Connected**: Sends directly via RDMA WRITE
-    /// - **Warmup/Idle**: Uses warmup mechanism with endpoint entry
+    /// - **Process/Connected**: Sends directly via RDMA WRITE to processing pool
+    /// - **Warmup/Idle**: Uses warmup mechanism (server RDMA READs)
+    ///
+    /// State machine (Figure 7):
+    /// CONNECT → WARMUP → PROCESS → IDLE → WARMUP → ...
+    ///
+    /// Note: Connected clients send directly because they may be in an active
+    /// group. After receiving a context switch event, they transition to Idle
+    /// and then use the warmup mechanism.
     ///
     /// # Arguments
     /// * `conn_id` - Connection to use
@@ -821,7 +761,7 @@ impl RpcClient {
 
         match current_state {
             ClientState::Process | ClientState::Connected => {
-                // Active: send directly via RDMA WRITE
+                // Active or newly connected (assumed active): send directly via RDMA WRITE
                 self.call_direct(conn_id, rpc_type, payload)
             }
             ClientState::Warmup | ClientState::Idle => {

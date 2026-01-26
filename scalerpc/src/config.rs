@@ -75,9 +75,6 @@ pub struct ServerConfig {
     pub num_recv_slots: usize,
     /// Group scheduling configuration.
     pub group: GroupConfig,
-    /// Enable ScaleRPC time-sharing scheduler.
-    /// When disabled, falls back to simple direct processing.
-    pub enable_scheduler: bool,
 }
 
 impl Default for ServerConfig {
@@ -86,7 +83,6 @@ impl Default for ServerConfig {
             pool: PoolConfig::default(),
             num_recv_slots: 256,
             group: GroupConfig::default(),
-            enable_scheduler: true,
         }
     }
 }

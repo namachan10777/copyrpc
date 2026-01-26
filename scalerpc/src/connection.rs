@@ -30,14 +30,16 @@ pub struct RemoteEndpoint {
     pub slot_addr: u64,
     /// Remote slot rkey.
     pub slot_rkey: u32,
-    /// Remote endpoint entry address for warmup registration.
-    pub endpoint_entry_addr: u64,
-    /// Remote endpoint entry rkey.
-    pub endpoint_entry_rkey: u32,
     /// Remote event buffer address for context switch notification.
     pub event_buffer_addr: u64,
     /// Remote event buffer rkey.
     pub event_buffer_rkey: u32,
+    /// Remote warmup buffer address for RDMA READ.
+    pub warmup_buffer_addr: u64,
+    /// Remote warmup buffer rkey.
+    pub warmup_buffer_rkey: u32,
+    /// Number of slots in warmup buffer.
+    pub warmup_buffer_slots: u32,
 }
 
 /// Callback type for SQ completions.
@@ -140,12 +142,13 @@ impl Connection {
             qpn: self.qpn(),
             psn: 0,
             lid: self.lid(),
-            slot_addr: 0,            // To be filled by caller
-            slot_rkey: 0,            // To be filled by caller
-            endpoint_entry_addr: 0,  // To be filled by caller (server only)
-            endpoint_entry_rkey: 0,  // To be filled by caller (server only)
-            event_buffer_addr: 0,    // To be filled by caller (client only)
-            event_buffer_rkey: 0,    // To be filled by caller (client only)
+            slot_addr: 0,              // To be filled by caller
+            slot_rkey: 0,              // To be filled by caller
+            event_buffer_addr: 0,      // To be filled by caller (client only)
+            event_buffer_rkey: 0,      // To be filled by caller (client only)
+            warmup_buffer_addr: 0,     // To be filled by caller (client only)
+            warmup_buffer_rkey: 0,     // To be filled by caller (client only)
+            warmup_buffer_slots: 0,    // To be filled by caller (client only)
         }
     }
 

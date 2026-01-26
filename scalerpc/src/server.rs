@@ -31,7 +31,7 @@ use std::time::Instant;
 use mlx5::cq::Cqe;
 use mlx5::device::Context;
 use mlx5::emit_wqe;
-use mlx5::pd::{AccessFlags, MemoryRegion, Pd};
+use mlx5::pd::Pd;
 use mlx5::wqe::WqeFlags;
 
 use crate::config::ServerConfig;
@@ -40,7 +40,7 @@ use crate::error::{Error, Result};
 use crate::mapping::VirtualMapping;
 use crate::pool::MessagePool;
 use crate::protocol::{
-    ContextSwitchEvent, EndpointEntry, MessageTrailer, RequestHeader, ResponseHeader,
+    ContextSwitchEvent, MessageTrailer, RequestHeader, ResponseHeader,
     MESSAGE_BLOCK_SIZE,
 };
 
@@ -52,6 +52,20 @@ pub type RequestHandler = Box<dyn Fn(u16, &[u8]) -> (u32, Vec<u8>)>;
 /// Group ID type.
 pub type GroupId = usize;
 
+/// Per-connection warmup buffer information.
+///
+/// Stores the remote warmup buffer address and rkey for each connection,
+/// allowing the server to RDMA READ requests directly from clients.
+#[derive(Debug, Clone, Copy, Default)]
+struct WarmupBufferInfo {
+    /// Remote warmup buffer address.
+    addr: u64,
+    /// Remote warmup buffer rkey.
+    rkey: u32,
+    /// Number of slots in the warmup buffer.
+    slots: u32,
+}
+
 /// Group scheduler state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedulerState {
@@ -59,122 +73,6 @@ pub enum SchedulerState {
     Processing,
     /// Transitioning between groups.
     ContextSwitching,
-}
-
-/// Endpoint entries buffer for warmup mechanism.
-///
-/// Holds endpoint entries from clients in the warmup group.
-/// The server scans these to know where to RDMA READ requests.
-pub struct EndpointEntryBuffer {
-    /// Buffer memory.
-    buffer: *mut u8,
-    /// Buffer size in bytes.
-    size: usize,
-    /// Memory region.
-    mr: MemoryRegion,
-    /// Maximum number of entries.
-    max_entries: usize,
-    /// Number of valid entries.
-    num_entries: Cell<usize>,
-}
-
-impl EndpointEntryBuffer {
-    /// Create a new endpoint entry buffer.
-    pub fn new(pd: &Pd, max_entries: usize) -> Result<Self> {
-        let size = max_entries * EndpointEntry::SIZE;
-
-        let buffer = unsafe {
-            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            let ret = libc::posix_memalign(&mut ptr, 64, size);
-            if ret != 0 {
-                return Err(Error::Io(std::io::Error::from_raw_os_error(ret)));
-            }
-            std::ptr::write_bytes(ptr as *mut u8, 0, size);
-            ptr as *mut u8
-        };
-
-        let access =
-            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ;
-        let mr = unsafe { pd.register(buffer, size, access)? };
-
-        Ok(Self {
-            buffer,
-            size,
-            mr,
-            max_entries,
-            num_entries: Cell::new(0),
-        })
-    }
-
-    /// Get the base address.
-    pub fn addr(&self) -> u64 {
-        self.buffer as u64
-    }
-
-    /// Get the rkey.
-    pub fn rkey(&self) -> u32 {
-        self.mr.rkey()
-    }
-
-    /// Get the lkey.
-    pub fn lkey(&self) -> u32 {
-        self.mr.lkey()
-    }
-
-    /// Get the address for a specific entry slot.
-    pub fn entry_addr(&self, index: usize) -> Option<u64> {
-        if index >= self.max_entries {
-            return None;
-        }
-        Some(self.buffer as u64 + (index * EndpointEntry::SIZE) as u64)
-    }
-
-    /// Read an entry at the given index.
-    pub fn read_entry(&self, index: usize) -> Option<EndpointEntry> {
-        if index >= self.max_entries {
-            return None;
-        }
-        let entry_ptr = unsafe { self.buffer.add(index * EndpointEntry::SIZE) };
-        let entry = unsafe { std::ptr::read_unaligned(entry_ptr as *const EndpointEntry) };
-        Some(entry)
-    }
-
-    /// Scan all valid entries.
-    ///
-    /// Returns entries that have batch_size > 0.
-    pub fn scan_valid_entries(&self) -> Vec<EndpointEntry> {
-        let mut entries = Vec::new();
-        for i in 0..self.max_entries {
-            if let Some(entry) = self.read_entry(i) {
-                if entry.is_valid() {
-                    entries.push(entry);
-                }
-            }
-        }
-        self.num_entries.set(entries.len());
-        entries
-    }
-
-    /// Clear all entries.
-    pub fn clear(&self) {
-        unsafe {
-            std::ptr::write_bytes(self.buffer, 0, self.size);
-        }
-        self.num_entries.set(0);
-    }
-
-    /// Get the maximum number of entries.
-    pub fn max_entries(&self) -> usize {
-        self.max_entries
-    }
-}
-
-impl Drop for EndpointEntryBuffer {
-    fn drop(&mut self) {
-        unsafe {
-            libc::free(self.buffer as *mut std::ffi::c_void);
-        }
-    }
 }
 
 /// Per-group context.
@@ -219,28 +117,24 @@ pub struct GroupScheduler {
     last_switch: Instant,
     /// Current scheduler state.
     state: SchedulerState,
-    /// Endpoint entries for warmup clients.
-    endpoint_entries: EndpointEntryBuffer,
     /// Context switch event sequence number.
     context_switch_seq: u64,
 }
 
 impl GroupScheduler {
     /// Create a new group scheduler.
-    pub fn new(pd: &Pd, num_groups: usize, time_slice_us: u64, max_entries: usize) -> Result<Self> {
+    pub fn new(num_groups: usize, time_slice_us: u64) -> Self {
         let groups = (0..num_groups).map(GroupContext::new).collect();
-        let endpoint_entries = EndpointEntryBuffer::new(pd, max_entries)?;
 
-        Ok(Self {
+        Self {
             groups,
             current_group: 0,
             next_group: if num_groups > 1 { 1 } else { 0 },
             time_slice_us,
             last_switch: Instant::now(),
             state: SchedulerState::Processing,
-            endpoint_entries,
             context_switch_seq: 0,
-        })
+        }
     }
 
     /// Get the currently active group ID.
@@ -251,11 +145,6 @@ impl GroupScheduler {
     /// Get the next (warmup) group ID.
     pub fn next_group_id(&self) -> GroupId {
         self.next_group
-    }
-
-    /// Get the endpoint entries buffer.
-    pub fn endpoint_entries(&self) -> &EndpointEntryBuffer {
-        &self.endpoint_entries
     }
 
     /// Check if a context switch is due.
@@ -299,20 +188,6 @@ impl GroupScheduler {
         &self.groups[self.next_group].connections
     }
 
-    /// Get endpoint entry address for a connection slot.
-    ///
-    /// Used by clients to know where to WRITE their endpoint entry.
-    pub fn endpoint_entry_addr_for(&self, slot: usize) -> Option<(u64, u32)> {
-        self.endpoint_entries
-            .entry_addr(slot)
-            .map(|addr| (addr, self.endpoint_entries.rkey()))
-    }
-
-    /// Scan endpoint entries for pending warmup requests.
-    pub fn scan_warmup_entries(&self) -> Vec<EndpointEntry> {
-        self.endpoint_entries.scan_valid_entries()
-    }
-
     /// Perform context switch.
     ///
     /// Returns the new context switch sequence number.
@@ -326,9 +201,6 @@ impl GroupScheduler {
         // Update sequence number
         self.context_switch_seq += 1;
         self.groups[self.current_group].context_switch_seq = self.context_switch_seq;
-
-        // Clear endpoint entries for new warmup group
-        self.endpoint_entries.clear();
 
         // Update timing
         self.last_switch = Instant::now();
@@ -387,12 +259,16 @@ pub struct RpcServer {
     handler: Option<RequestHandler>,
     /// Next slot to check for incoming requests (Cell for interior mutability).
     next_check_slot: Cell<usize>,
-    /// Group scheduler for time-sharing (None if disabled).
-    scheduler: Option<GroupScheduler>,
+    /// Group scheduler for time-sharing.
+    scheduler: GroupScheduler,
+    /// Slot count mask for fast modulo (num_slots - 1, requires power of 2).
+    slot_mask: usize,
     /// Per-connection event buffer addresses for context switch notification.
     event_buffer_addrs: Vec<Option<(u64, u32)>>,
     /// Connections that need doorbell flush (for batching).
     needs_flush: RefCell<Vec<ConnectionId>>,
+    /// Per-connection warmup buffer info for RDMA READ.
+    warmup_buffer_infos: Vec<Option<WarmupBufferInfo>>,
 }
 
 impl RpcServer {
@@ -406,16 +282,18 @@ impl RpcServer {
         let warmup_pool = MessagePool::new(pd, &config.pool)?;
         let mapping = VirtualMapping::new();
 
-        let scheduler = if config.enable_scheduler {
-            Some(GroupScheduler::new(
-                pd,
-                config.group.num_groups,
-                config.group.time_slice_us,
-                config.group.max_endpoint_entries,
-            )?)
-        } else {
-            None
-        };
+        let scheduler = GroupScheduler::new(
+            config.group.num_groups,
+            config.group.time_slice_us,
+        );
+
+        // Compute slot mask (requires num_slots to be power of 2)
+        let num_slots = processing_pool.num_slots();
+        assert!(
+            num_slots.is_power_of_two(),
+            "num_slots must be power of 2 for bitmask optimization"
+        );
+        let slot_mask = num_slots - 1;
 
         Ok(Self {
             processing_pool,
@@ -426,19 +304,21 @@ impl RpcServer {
             handler: None,
             next_check_slot: Cell::new(0),
             scheduler,
+            slot_mask,
             event_buffer_addrs: Vec::new(),
             needs_flush: RefCell::new(Vec::new()),
+            warmup_buffer_infos: Vec::new(),
         })
     }
 
-    /// Get the group scheduler (if enabled).
-    pub fn scheduler(&self) -> Option<&GroupScheduler> {
-        self.scheduler.as_ref()
+    /// Get the group scheduler.
+    pub fn scheduler(&self) -> &GroupScheduler {
+        &self.scheduler
     }
 
-    /// Get the group scheduler mutably (if enabled).
-    pub fn scheduler_mut(&mut self) -> Option<&mut GroupScheduler> {
-        self.scheduler.as_mut()
+    /// Get the group scheduler mutably.
+    pub fn scheduler_mut(&mut self) -> &mut GroupScheduler {
+        &mut self.scheduler
     }
 
     /// Register a client's event buffer address.
@@ -455,14 +335,12 @@ impl RpcServer {
     ///
     /// Returns the new sequence number if a switch occurred.
     pub fn check_and_switch(&mut self) -> Option<u64> {
-        let scheduler = self.scheduler.as_mut()?;
-
-        if !scheduler.should_switch() {
+        if !self.scheduler.should_switch() {
             return None;
         }
 
         // Perform context switch
-        let seq = scheduler.context_switch();
+        let seq = self.scheduler.context_switch();
 
         // Swap pools
         std::mem::swap(&mut self.processing_pool, &mut self.warmup_pool);
@@ -480,21 +358,16 @@ impl RpcServer {
     ///
     /// Returns (sequence_number, old_group_connections) if a switch occurred.
     pub fn perform_context_switch(&mut self) -> Result<Option<(u64, Vec<ConnectionId>)>> {
-        let scheduler = match self.scheduler.as_mut() {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-
-        if !scheduler.should_switch() {
+        if !self.scheduler.should_switch() {
             return Ok(None);
         }
 
         // Step 1: Get connections in the current (soon to be old) group
         let old_group_connections: Vec<ConnectionId> =
-            scheduler.current_group_connections().to_vec();
+            self.scheduler.current_group_connections().to_vec();
 
         // Step 2: Perform the actual context switch in scheduler
-        let seq = scheduler.context_switch();
+        let seq = self.scheduler.context_switch();
 
         // Step 3: Swap pools
         std::mem::swap(&mut self.processing_pool, &mut self.warmup_pool);
@@ -662,10 +535,8 @@ impl RpcServer {
         self.mapping.register_connection(conn_id);
         self.connections.push(Some(conn));
 
-        // Add to scheduler if enabled
-        if let Some(scheduler) = &mut self.scheduler {
-            scheduler.add_connection(conn_id);
-        }
+        // Add to scheduler
+        self.scheduler.add_connection(conn_id);
 
         Ok(conn_id)
     }
@@ -678,6 +549,8 @@ impl RpcServer {
     ///
     /// When the remote provides event_buffer_addr/rkey, they are automatically
     /// registered for context switch notification.
+    /// When the remote provides warmup_buffer_addr/rkey/slots, they are
+    /// stored for RDMA READ during warmup phase.
     pub fn connect(&mut self, conn_id: ConnectionId, remote: RemoteEndpoint) -> Result<()> {
         // Store client slot info in mapping
         self.mapping
@@ -686,6 +559,18 @@ impl RpcServer {
         // Auto-register event buffer if provided
         if remote.event_buffer_addr != 0 {
             self.register_event_buffer(conn_id, remote.event_buffer_addr, remote.event_buffer_rkey);
+        }
+
+        // Store warmup buffer info if provided
+        if remote.warmup_buffer_addr != 0 {
+            while self.warmup_buffer_infos.len() <= conn_id {
+                self.warmup_buffer_infos.push(None);
+            }
+            self.warmup_buffer_infos[conn_id] = Some(WarmupBufferInfo {
+                addr: remote.warmup_buffer_addr,
+                rkey: remote.warmup_buffer_rkey,
+                slots: remote.warmup_buffer_slots,
+            });
         }
 
         // Get connection and connect
@@ -702,8 +587,6 @@ impl RpcServer {
     /// Get local endpoint information for a connection.
     ///
     /// Note: slot_addr points to slot 0's data area (after slot header).
-    /// When scheduler is enabled, endpoint_entry_addr/rkey are populated
-    /// for client warmup registration.
     pub fn local_endpoint(&self, conn_id: ConnectionId) -> Result<RemoteEndpoint> {
         let conn = self
             .connections
@@ -715,14 +598,6 @@ impl RpcServer {
         // Point to slot 0's data area (not the slot header)
         endpoint.slot_addr = self.processing_pool.slot_data_addr(0).unwrap();
         endpoint.slot_rkey = self.processing_pool.rkey();
-
-        // If scheduler is enabled, provide endpoint entry address for warmup registration
-        if let Some(scheduler) = &self.scheduler {
-            if let Some((addr, rkey)) = scheduler.endpoint_entry_addr_for(conn_id) {
-                endpoint.endpoint_entry_addr = addr;
-                endpoint.endpoint_entry_rkey = rkey;
-            }
-        }
 
         Ok(endpoint)
     }
@@ -744,7 +619,7 @@ impl RpcServer {
 
     /// Poll for incoming requests.
     ///
-    /// Scans message pool slots for new requests.
+    /// Scans message pool slots for new requests using the Valid field.
     /// Returns the first request found, or None if no requests are pending.
     pub fn poll_request(&self) -> Option<IncomingRequest> {
         let num_slots = self.processing_pool.num_slots();
@@ -752,7 +627,8 @@ impl RpcServer {
         // Scan all slots to find any pending request
         for _ in 0..num_slots {
             let slot_index = self.next_check_slot.get();
-            self.next_check_slot.set((slot_index + 1) % num_slots);
+            // Use bitmask instead of modulo for faster operation
+            self.next_check_slot.set((slot_index + 1) & self.slot_mask);
 
             if let Some(request) = self.check_slot_for_request(slot_index) {
                 return Some(request);
@@ -762,41 +638,40 @@ impl RpcServer {
         None
     }
 
-    /// Check a specific slot for an incoming request.
+    /// Check a specific slot for an incoming request using the Valid field.
     fn check_slot_for_request(&self, slot_index: usize) -> Option<IncomingRequest> {
         let slot = self.processing_pool.get_slot(slot_index)?;
-        let data_ptr = slot.data_ptr();
+        let slot_ptr = slot.data_ptr();
 
-        // Use volatile read for magic to see RDMA writes from client
-        let magic = unsafe { std::ptr::read_volatile(data_ptr as *const u32) };
-        if magic != crate::protocol::REQUEST_MAGIC {
+        // Read trailer (Valid field at end of block) - this is the poll target
+        let (msg_len, valid) = unsafe { MessageTrailer::read_from(slot_ptr) };
+
+        if valid == 0 || msg_len == 0 {
             return None;
         }
 
-        // Memory fence to ensure we see the complete header
+        // Memory fence to ensure we see the complete message
         std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
 
         // Read the full request header
-        let header = unsafe { RequestHeader::read_from(data_ptr) };
-
-        if !header.is_valid() {
-            return None;
-        }
+        let header = unsafe { RequestHeader::read_from(slot_ptr) };
 
         // Valid request found - extract payload
         let payload_len = header.payload_len as usize;
         let payload = if payload_len > 0 {
             unsafe {
-                let payload_ptr = data_ptr.add(RequestHeader::SIZE);
+                let payload_ptr = slot_ptr.add(RequestHeader::SIZE);
                 std::slice::from_raw_parts(payload_ptr, payload_len).to_vec()
             }
         } else {
             Vec::new()
         };
 
-        // Clear the magic to mark as processed
+        // Clear the valid flag to mark as processed
         unsafe {
-            std::ptr::write_volatile(data_ptr as *mut u32, 0);
+            let trailer_offset = MESSAGE_BLOCK_SIZE - 4;
+            let valid_ptr = slot_ptr.add(trailer_offset) as *mut u32;
+            std::ptr::write_volatile(valid_ptr, 0);
         }
 
         // Use sender_conn_id from the request header for multi-QP routing
@@ -816,70 +691,9 @@ impl RpcServer {
     /// Poll for incoming requests using the new message trailer format.
     ///
     /// Checks the Valid field in the message trailer for new messages.
+    #[deprecated(note = "Use poll_request() instead, which now uses Valid field")]
     pub fn poll_request_trailer(&self) -> Option<IncomingRequest> {
-        let num_slots = self.processing_pool.num_slots();
-
-        for _ in 0..num_slots {
-            let slot_index = self.next_check_slot.get();
-            self.next_check_slot.set((slot_index + 1) % num_slots);
-
-            if let Some(request) = self.check_slot_trailer(slot_index) {
-                return Some(request);
-            }
-        }
-
-        None
-    }
-
-    /// Check a slot using the message trailer format.
-    fn check_slot_trailer(&self, slot_index: usize) -> Option<IncomingRequest> {
-        let slot = self.processing_pool.get_slot(slot_index)?;
-        let slot_ptr = slot.data_ptr();
-
-        // Read trailer (at end of block)
-        let (msg_len, valid) = unsafe { MessageTrailer::read_from(slot_ptr) };
-
-        if valid == 0 || msg_len == 0 {
-            return None;
-        }
-
-        // Valid message found - read the request header
-        let header = unsafe { RequestHeader::read_from(slot_ptr) };
-
-        if !header.is_valid() {
-            return None;
-        }
-
-        // Extract payload
-        let payload_len = header.payload_len as usize;
-        let payload = if payload_len > 0 {
-            unsafe {
-                let payload_ptr = slot_ptr.add(RequestHeader::SIZE);
-                std::slice::from_raw_parts(payload_ptr, payload_len).to_vec()
-            }
-        } else {
-            Vec::new()
-        };
-
-        // Clear the valid flag
-        unsafe {
-            let trailer_offset = MESSAGE_BLOCK_SIZE - 4;
-            let valid_ptr = slot_ptr.add(trailer_offset) as *mut u32;
-            std::ptr::write_volatile(valid_ptr, 0);
-        }
-
-        // Use sender_conn_id from the request header for multi-QP routing
-        let conn_id = { header.sender_conn_id } as usize;
-
-        Some(IncomingRequest {
-            req_id: header.req_id,
-            rpc_type: header.rpc_type,
-            payload,
-            client_slot_addr: header.client_slot_addr,
-            client_slot_rkey: header.client_slot_rkey,
-            conn_id,
-            slot_index,
-        })
+        self.poll_request()
     }
 
     /// Send a response for a request.
@@ -1062,7 +876,7 @@ impl RpcServer {
     /// This is the simplified API for running the server. It handles:
     /// - Flushing pending doorbells (batch doorbell)
     /// - Draining CQs
-    /// - Context switch when scheduler is enabled
+    /// - Context switch (time-sharing scheduler)
     /// - Fetching warmup requests
     /// - Processing incoming requests (if handler is set)
     ///
@@ -1075,18 +889,15 @@ impl RpcServer {
         // 2. Drain all CQs
         let cq_processed = self.poll_cqs();
 
-        // Handle scheduler tasks if enabled
-        if self.scheduler.is_some() {
-            // Check for context switch
-            if let Ok(Some((seq, old_conns))) = self.perform_context_switch() {
-                let _ = self.notify_context_switch(&old_conns, seq);
-            }
-
-            // Fetch warmup requests from next group
-            let _ = self.fetch_warmup_requests();
+        // 3. Check for context switch
+        if let Ok(Some((seq, old_conns))) = self.perform_context_switch() {
+            let _ = self.notify_context_switch(&old_conns, seq);
         }
 
-        // Process requests if handler is set
+        // 4. Fetch warmup requests from next group
+        let _ = self.fetch_warmup_requests();
+
+        // 5. Process requests if handler is set
         let mut requests_processed = 0;
         if self.handler.is_some() {
             while let Some(request) = self.recv() {
@@ -1108,38 +919,28 @@ impl RpcServer {
 
     /// Fetch warmup requests from clients via RDMA READ.
     ///
-    /// Scans the endpoint entries buffer and issues RDMA READs to fetch
-    /// requests from clients in the warmup group.
+    /// Scans each connection's warmup buffer directly using the valid flag
+    /// in the message trailer to detect pending requests.
     ///
     /// Returns the number of requests fetched.
     pub fn fetch_warmup_requests(&self) -> Result<usize> {
-        let scheduler = match &self.scheduler {
-            Some(s) => s,
-            None => return Ok(0),
-        };
-
-        let entries = scheduler.scan_warmup_entries();
-        if entries.is_empty() {
-            return Ok(0);
-        }
-
         let mut fetched = 0;
 
-        for entry in &entries {
-            if !entry.is_valid() {
-                continue;
-            }
+        // Iterate over all connections with warmup buffer info
+        for conn_id in 0..self.warmup_buffer_infos.len() {
+            let warmup_info = match self.warmup_buffer_infos.get(conn_id).and_then(|w| w.as_ref()) {
+                Some(info) => info,
+                None => continue,
+            };
 
-            // Find connection for this client
-            let conn_id = entry.client_id as usize;
             let conn = match self.connections.get(conn_id).and_then(|c| c.as_ref()) {
                 Some(c) => c,
                 None => continue,
             };
 
-            // Fetch each request in the batch
-            for batch_idx in 0..entry.batch_size {
-                let result = self.fetch_single_request(conn, &entry, batch_idx);
+            // Scan each slot in the client's warmup buffer
+            for slot_idx in 0..warmup_info.slots {
+                let result = self.fetch_warmup_slot(conn, conn_id, warmup_info, slot_idx);
                 if result.is_ok() {
                     fetched += 1;
                 }
@@ -1149,18 +950,19 @@ impl RpcServer {
         Ok(fetched)
     }
 
-    /// Fetch a single request from a client's warmup buffer via RDMA READ.
-    fn fetch_single_request(
+    /// Fetch a single request from a client's warmup buffer slot via RDMA READ.
+    fn fetch_warmup_slot(
         &self,
         conn: &Connection,
-        entry: &EndpointEntry,
-        batch_idx: u32,
+        conn_id: ConnectionId,
+        warmup_info: &WarmupBufferInfo,
+        slot_idx: u32,
     ) -> Result<()> {
         // Allocate a slot in the warmup pool
         let slot = self.warmup_pool.alloc()?;
 
-        // Calculate source address (client's warmup buffer + offset)
-        let src_addr = entry.req_addr + (batch_idx as u64 * MESSAGE_BLOCK_SIZE as u64);
+        // Calculate source address (client's warmup buffer + slot offset)
+        let src_addr = warmup_info.addr + (slot_idx as u64 * MESSAGE_BLOCK_SIZE as u64);
 
         // Issue RDMA READ
         {
@@ -1172,13 +974,13 @@ impl RpcServer {
             emit_wqe!(&emit_ctx, read {
                 flags: WqeFlags::COMPLETION,
                 remote_addr: src_addr,
-                rkey: entry.rkey,
+                rkey: warmup_info.rkey,
                 sge: {
                     addr: slot.data_addr(),
                     len: MESSAGE_BLOCK_SIZE as u32,
                     lkey: self.warmup_pool.lkey()
                 },
-                signaled: entry.client_id as u64,
+                signaled: conn_id as u64,
             })
             .map_err(|e| Error::Protocol(format!("emit_wqe failed: {:?}", e)))?;
         }
@@ -1192,9 +994,19 @@ impl RpcServer {
                 break;
             }
             if start.elapsed() > timeout {
+                // Timeout - free the slot and return error
                 return Err(Error::Protocol("RDMA READ timeout".to_string()));
             }
             std::hint::spin_loop();
+        }
+
+        // Check if the fetched slot has a valid message
+        let slot_ptr = slot.slot().data_ptr();
+        let (_, valid) = unsafe { MessageTrailer::read_from(slot_ptr) };
+
+        if valid == 0 {
+            // No valid message in this slot, release and indicate not fetched
+            return Err(Error::Protocol("No valid message in slot".to_string()));
         }
 
         // Release the slot handle but keep the data (it's now in the warmup pool)
@@ -1303,13 +1115,4 @@ impl RpcServer {
         })
     }
 
-    /// Get endpoint entry address for a connection slot.
-    ///
-    /// Returns (address, rkey) that clients should use to WRITE their
-    /// endpoint entry for warmup registration.
-    pub fn endpoint_entry_addr_for(&self, slot: usize) -> Option<(u64, u32)> {
-        self.scheduler
-            .as_ref()
-            .and_then(|s| s.endpoint_entry_addr_for(slot))
-    }
 }

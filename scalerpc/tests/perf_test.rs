@@ -75,7 +75,6 @@ fn test_latency() {
             },
             num_recv_slots: 64,
             group: GroupConfig::default(),
-            enable_scheduler: false, // Disable for simple latency test
         };
 
         let mut server = match RpcServer::new(&ctx.pd, server_config) {
@@ -229,7 +228,6 @@ fn test_throughput() {
             },
             num_recv_slots: 256,
             group: GroupConfig::default(),
-            enable_scheduler: false, // Disable for throughput test
         };
 
         let mut server = match RpcServer::new(&ctx.pd, server_config) {
@@ -435,7 +433,6 @@ fn test_throughput_4kb() {
             },
             num_recv_slots: 256,
             group: GroupConfig::default(),
-            enable_scheduler: false,
         };
 
         let mut server = match RpcServer::new(&ctx.pd, server_config) {
