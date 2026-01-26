@@ -51,9 +51,9 @@ const SMALL_MSG_SIZE: usize = 32;
 // Multi-packet messages are not yet supported in the benchmark
 const LARGE_MSG_SIZE: usize = 4000;
 
-// Multi-QP benchmark parameters
+// Multi-QP benchmark parameters (matching eRPC paper conditions)
 const NUM_QPS: usize = 8;
-const PIPELINE_DEPTH_PER_QP: usize = 256;
+const PIPELINE_DEPTH_PER_QP: usize = 32;
 
 // =============================================================================
 // Connection Info
@@ -408,7 +408,9 @@ fn multi_qp_server_thread(
             let mut processed = 0;
             while processed < MAX_BATCH {
                 if let Some(req) = server.recv() {
-                    if let Err(e) = server.reply(&req, &req.data) {
+                    // Zero-copy: get data reference from request
+                    let data = req.data(server).to_vec(); // Copy for echo response
+                    if let Err(e) = server.reply(&req, &data) {
                         eprintln!("Server failed to respond: {:?}", e);
                     }
                     processed += 1;
@@ -495,7 +497,9 @@ fn server_thread_main_with_config(
         let mut processed = 0;
         while processed < MAX_BATCH {
             if let Some(req) = server.recv() {
-                if let Err(e) = server.reply(&req, &req.data) {
+                // Zero-copy: get data reference from request
+                let data = req.data(&server).to_vec(); // Copy for echo response
+                if let Err(e) = server.reply(&req, &data) {
                     eprintln!("Server failed to respond: {:?}", e);
                 }
                 processed += 1;

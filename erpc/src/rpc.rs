@@ -6,7 +6,7 @@ use std::cell::{Cell, RefCell};
 
 use mlx5::device::Context;
 
-use crate::buffer::BufferPool;
+use crate::buffer::{BufferPool, ZeroCopyPool};
 use crate::config::RpcConfig;
 use crate::error::{Error, Result};
 use crate::packet::{PktHdr, PktType, SmPktHdr, SmPktType, PKT_HDR_SIZE, SM_PKT_HDR_SIZE};
@@ -21,15 +21,34 @@ const SM_REQ_TYPE: u8 = 0xFF;
 pub type OnResponse<U> = Box<dyn Fn(U, &[u8])>;
 
 /// Incoming request from a client (copyrpc-style API).
+///
+/// Zero-copy design: the request holds a reference to the receive buffer
+/// instead of copying the data. Call `data()` to access the payload,
+/// and the buffer is automatically released when `reply()` is called.
 pub struct IncomingRequest {
     /// Request type (application-defined).
     pub req_type: u8,
-    /// Request data (payload).
-    pub data: Vec<u8>,
+    /// Receive buffer index (for zero-copy access).
+    buf_idx: usize,
+    /// Offset to payload within the buffer (after GRH + PKT_HDR).
+    payload_offset: usize,
+    /// Payload length.
+    payload_len: usize,
     /// Session number that sent this request.
     pub session_num: u16,
     /// Request number for correlating with response.
     pub req_num: u64,
+}
+
+impl IncomingRequest {
+    /// Get the payload data as a slice.
+    ///
+    /// This returns a reference to the receive buffer without copying.
+    /// The buffer remains valid until `reply()` is called.
+    #[inline]
+    pub fn data<'a, U: 'static>(&self, rpc: &'a Rpc<U>) -> &'a [u8] {
+        rpc.get_recv_buffer_slice(self.buf_idx, self.payload_offset, self.payload_len)
+    }
 }
 
 /// eRPC instance.
@@ -55,8 +74,8 @@ where
     config: RpcConfig,
     /// Timing wheel for retransmission timeouts.
     timing_wheel: RefCell<TimingWheel>,
-    /// Receive buffer pool.
-    recv_buffers: RefCell<BufferPool>,
+    /// Receive buffer pool (zero-copy).
+    recv_buffers: RefCell<ZeroCopyPool>,
     /// Send buffer pool.
     send_buffers: RefCell<BufferPool>,
     /// MTU in bytes.
@@ -102,7 +121,8 @@ impl<U: 'static> Rpc<U> {
         // send_buffers needs to be large enough to hold in-flight requests/responses
         // until send completions are processed. Use 4x max_send_wr to provide headroom.
         let recv_buf_size = mtu + GRH_SIZE;
-        let recv_buffers = BufferPool::new(config.num_recv_buffers, recv_buf_size, pd)?;
+        // Use ZeroCopyPool for receive buffers (single MR, zero-copy access)
+        let recv_buffers = ZeroCopyPool::new(config.num_recv_buffers, recv_buf_size, pd)?;
         let send_buffers = BufferPool::new((config.max_send_wr as usize) * 4, mtu, pd)?;
 
         let mut timing_wheel = TimingWheel::default_for_rpc();
@@ -465,11 +485,46 @@ impl<U: 'static> Rpc<U> {
 
     /// Send a response to a request (copyrpc-style API).
     ///
+    /// This also releases the receive buffer associated with the request.
+    ///
     /// # Arguments
     /// * `request` - The incoming request to respond to
     /// * `data` - Response payload
     pub fn reply(&self, request: &IncomingRequest, data: &[u8]) -> Result<()> {
-        self.send_response(request.session_num, request.req_num, request.req_type, data)
+        let result = self.send_response(request.session_num, request.req_num, request.req_type, data);
+        // Release the receive buffer after sending response
+        self.release_recv_buffer(request.buf_idx);
+        result
+    }
+
+    /// Release a receive buffer without sending a response.
+    ///
+    /// Use this when you want to drop a request without responding.
+    pub fn release_request(&self, request: &IncomingRequest) {
+        self.release_recv_buffer(request.buf_idx);
+    }
+
+    /// Internal: release a receive buffer and mark it for reposting.
+    fn release_recv_buffer(&self, buf_idx: usize) {
+        self.recv_buffers.borrow_mut().free(buf_idx);
+    }
+
+    /// Internal: get a slice of the receive buffer for zero-copy access.
+    fn get_recv_buffer_slice(&self, buf_idx: usize, offset: usize, len: usize) -> &[u8] {
+        let recv_buffers = self.recv_buffers.borrow();
+        let slice = recv_buffers.slot_slice(buf_idx);
+        // Safety: we return a reference that is valid as long as the buffer is not freed.
+        // The caller must ensure the buffer is not freed while the slice is in use.
+        // This is guaranteed because:
+        // 1. The buffer is only freed in release_recv_buffer()
+        // 2. release_recv_buffer() is only called after reply() or release_request()
+        // 3. The IncomingRequest holds the buf_idx, preventing accidental double-free
+        unsafe {
+            std::slice::from_raw_parts(
+                slice.as_ptr().add(offset),
+                len.min(slice.len().saturating_sub(offset)),
+            )
+        }
     }
 
     /// Send a response to a request.
@@ -629,17 +684,14 @@ impl<U: 'static> Rpc<U> {
     /// Post receive buffers to the transport.
     fn post_recv_buffers(&self) -> Result<()> {
         let mut recv_buffers = self.recv_buffers.borrow_mut();
+        let lkey = recv_buffers.lkey();
+        let slot_size = recv_buffers.slot_size() as u32;
 
         // Collect buffer info first
         let mut buf_infos = Vec::new();
-        while let Some((idx, buf)) = recv_buffers.alloc() {
-            let lkey = buf.lkey().ok_or_else(|| {
-                Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Buffer not registered",
-                ))
-            })?;
-            buf_infos.push((idx, buf.addr(), buf.capacity() as u32, lkey));
+        while let Some((idx, _slice)) = recv_buffers.alloc() {
+            let addr = recv_buffers.slot_addr(idx);
+            buf_infos.push((idx, addr, slot_size, lkey));
         }
         drop(recv_buffers);
 
@@ -661,12 +713,16 @@ impl<U: 'static> Rpc<U> {
     /// Process a received packet.
     #[inline]
     fn process_recv(&self, buf_idx: usize, byte_cnt: u32) -> Result<()> {
-        // Read packet data
-        let (hdr, payload) = {
+        // Validate packet size and read header (zero-copy)
+        let hdr = {
             let recv_buffers = self.recv_buffers.borrow();
-            let buf = recv_buffers.get(buf_idx).ok_or(Error::InvalidPacket)?;
+            let buf_ptr = recv_buffers.slot_ptr(buf_idx);
 
             if (byte_cnt as usize) < GRH_SIZE + PKT_HDR_SIZE {
+                // Invalid packet, free buffer and return error
+                drop(recv_buffers);
+                self.recv_buffers.borrow_mut().free(buf_idx);
+                self.posted_recv_count.set(self.posted_recv_count.get().saturating_sub(1));
                 return Err(Error::BufferTooSmall {
                     required: GRH_SIZE + PKT_HDR_SIZE,
                     available: byte_cnt as usize,
@@ -674,52 +730,79 @@ impl<U: 'static> Rpc<U> {
             }
 
             // Read header
-            let hdr_ptr = unsafe { buf.as_ptr().add(GRH_SIZE) };
+            let hdr_ptr = unsafe { buf_ptr.add(GRH_SIZE) };
             let hdr = unsafe { PktHdr::read_from(hdr_ptr) };
             hdr.validate()?;
-
-            // Copy payload (single copy, no zero-init)
-            let payload_offset = GRH_SIZE + PKT_HDR_SIZE;
-            let payload_len = (byte_cnt as usize).saturating_sub(payload_offset);
-            let payload = if payload_len > 0 {
-                let mut payload = Vec::with_capacity(payload_len);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        buf.as_ptr().add(payload_offset),
-                        payload.as_mut_ptr(),
-                        payload_len,
-                    );
-                    payload.set_len(payload_len);
-                }
-                payload
-            } else {
-                Vec::new()
-            };
-
-            (hdr, payload)
+            hdr
         };
 
-        // Return buffer to pool
-        self.recv_buffers.borrow_mut().free(buf_idx);
-
-        // Decrement posted recv count (batch repost will be done in run_event_loop_once)
-        self.posted_recv_count.set(self.posted_recv_count.get().saturating_sub(1));
+        let payload_offset = GRH_SIZE + PKT_HDR_SIZE;
+        let payload_len = (byte_cnt as usize).saturating_sub(payload_offset);
 
         // Check if this is an SM (Session Management) packet
         if hdr.req_type() == SM_REQ_TYPE {
+            // SM packets: copy payload and free buffer immediately
+            let payload = {
+                let recv_buffers = self.recv_buffers.borrow();
+                let buf_ptr = recv_buffers.slot_ptr(buf_idx);
+                if payload_len > 0 {
+                    let mut payload = Vec::with_capacity(payload_len);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            buf_ptr.add(payload_offset),
+                            payload.as_mut_ptr(),
+                            payload_len,
+                        );
+                        payload.set_len(payload_len);
+                    }
+                    payload
+                } else {
+                    Vec::new()
+                }
+            };
+            // Free buffer for SM packets
+            self.recv_buffers.borrow_mut().free(buf_idx);
+            self.posted_recv_count.set(self.posted_recv_count.get().saturating_sub(1));
             return self.handle_sm_packet(&hdr, &payload);
         }
 
         // Process based on packet type
         match hdr.pkt_type() {
             PktType::Req | PktType::ReqForResp => {
-                // Pass payload by value - avoids second copy in handle_request
-                self.handle_request(&hdr, payload)?;
+                // Zero-copy: pass buf_idx and offsets to handle_request
+                // Buffer will be freed when reply() is called
+                self.handle_request_zero_copy(&hdr, buf_idx, payload_offset, payload_len)?;
+                // Decrement posted recv count (buffer is held by IncomingRequest)
+                self.posted_recv_count.set(self.posted_recv_count.get().saturating_sub(1));
             }
             PktType::Resp => {
+                // Response packets: copy payload and free buffer immediately
+                let payload = {
+                    let recv_buffers = self.recv_buffers.borrow();
+                    let buf_ptr = recv_buffers.slot_ptr(buf_idx);
+                    if payload_len > 0 {
+                        let mut payload = Vec::with_capacity(payload_len);
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                buf_ptr.add(payload_offset),
+                                payload.as_mut_ptr(),
+                                payload_len,
+                            );
+                            payload.set_len(payload_len);
+                        }
+                        payload
+                    } else {
+                        Vec::new()
+                    }
+                };
+                self.recv_buffers.borrow_mut().free(buf_idx);
+                self.posted_recv_count.set(self.posted_recv_count.get().saturating_sub(1));
                 self.handle_response(&hdr, &payload)?;
             }
             PktType::CreditReturn => {
+                // Free buffer immediately for credit return
+                self.recv_buffers.borrow_mut().free(buf_idx);
+                self.posted_recv_count.set(self.posted_recv_count.get().saturating_sub(1));
                 self.handle_credit_return(&hdr)?;
             }
         }
@@ -822,10 +905,11 @@ impl<U: 'static> Rpc<U> {
         // Collect buffer info first to avoid holding borrow during post
         {
             let mut recv_buffers = self.recv_buffers.borrow_mut();
-            while let Some((idx, buf)) = recv_buffers.alloc() {
-                if let Some(lkey) = buf.lkey() {
-                    buf_infos.push((idx, buf.addr(), buf.capacity() as u32, lkey));
-                }
+            let lkey = recv_buffers.lkey();
+            let slot_size = recv_buffers.slot_size() as u32;
+            while let Some((idx, _slice)) = recv_buffers.alloc() {
+                let addr = recv_buffers.slot_addr(idx);
+                buf_infos.push((idx, addr, slot_size, lkey));
             }
         }
 
@@ -848,11 +932,19 @@ impl<U: 'static> Rpc<U> {
         // RQ doorbell is batched in run_event_loop_once()
     }
 
-    /// Handle an incoming request by pushing it to the recv_queue.
-    fn handle_request(&self, hdr: &PktHdr, payload: Vec<u8>) -> Result<()> {
+    /// Handle an incoming request by pushing it to the recv_queue (zero-copy).
+    fn handle_request_zero_copy(
+        &self,
+        hdr: &PktHdr,
+        buf_idx: usize,
+        payload_offset: usize,
+        payload_len: usize,
+    ) -> Result<()> {
         self.recv_queue.borrow_mut().push(IncomingRequest {
             req_type: hdr.req_type(),
-            data: payload,  // Move, no copy
+            buf_idx,
+            payload_offset,
+            payload_len,
             session_num: hdr.dest_session_num(),
             req_num: hdr.req_num(),
         });

@@ -209,9 +209,12 @@ fn test_rpc_loopback() {
 
         // Server: poll for incoming requests and reply
         while let Some(req) = server.recv() {
-            println!("Server received request: type={}, len={}", req.req_type, req.data.len());
+            // Zero-copy: get data reference from request
+            let data = req.data(&server);
+            println!("Server received request: type={}, len={}", req.req_type, data.len());
             // Echo back the data
-            let _ = server.reply(&req, &req.data);
+            let data_copy = data.to_vec();
+            let _ = server.reply(&req, &data_copy);
         }
 
         if *response_received.borrow() {
