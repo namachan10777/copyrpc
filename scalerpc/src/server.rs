@@ -104,21 +104,22 @@ impl GroupContext {
 /// Group scheduler for time-sharing.
 ///
 /// Implements the ScaleRPC connection grouping and time-sharing mechanism.
+/// Uses Cell for interior mutability so context switches can happen during process().
 pub struct GroupScheduler {
     /// Group contexts.
     groups: Vec<GroupContext>,
     /// Currently active (processing) group index.
-    current_group: usize,
+    current_group: Cell<usize>,
     /// Next group (warmup) index.
-    next_group: usize,
+    next_group: Cell<usize>,
     /// Time slice duration in microseconds.
     time_slice_us: u64,
     /// Last context switch time.
-    last_switch: Instant,
+    last_switch: Cell<Instant>,
     /// Current scheduler state.
-    state: SchedulerState,
+    state: Cell<SchedulerState>,
     /// Context switch event sequence number.
-    context_switch_seq: u64,
+    context_switch_seq: Cell<u64>,
 }
 
 impl GroupScheduler {
@@ -128,33 +129,33 @@ impl GroupScheduler {
 
         Self {
             groups,
-            current_group: 0,
-            next_group: if num_groups > 1 { 1 } else { 0 },
+            current_group: Cell::new(0),
+            next_group: Cell::new(if num_groups > 1 { 1 } else { 0 }),
             time_slice_us,
-            last_switch: Instant::now(),
-            state: SchedulerState::Processing,
-            context_switch_seq: 0,
+            last_switch: Cell::new(Instant::now()),
+            state: Cell::new(SchedulerState::Processing),
+            context_switch_seq: Cell::new(0),
         }
     }
 
     /// Get the currently active group ID.
     pub fn current_group_id(&self) -> GroupId {
-        self.current_group
+        self.current_group.get()
     }
 
     /// Get the next (warmup) group ID.
     pub fn next_group_id(&self) -> GroupId {
-        self.next_group
+        self.next_group.get()
     }
 
     /// Check if a context switch is due.
     pub fn should_switch(&self) -> bool {
-        self.last_switch.elapsed().as_micros() as u64 >= self.time_slice_us
+        self.last_switch.get().elapsed().as_micros() as u64 >= self.time_slice_us
     }
 
     /// Get the current scheduler state.
     pub fn state(&self) -> SchedulerState {
-        self.state
+        self.state.get()
     }
 
     /// Add a connection to a group.
@@ -180,38 +181,87 @@ impl GroupScheduler {
 
     /// Get connections in the current (processing) group.
     pub fn current_group_connections(&self) -> &[ConnectionId] {
-        &self.groups[self.current_group].connections
+        &self.groups[self.current_group.get()].connections
     }
 
     /// Get connections in the next (warmup) group.
     pub fn next_group_connections(&self) -> &[ConnectionId] {
-        &self.groups[self.next_group].connections
+        &self.groups[self.next_group.get()].connections
     }
 
-    /// Perform context switch.
+    /// Perform context switch (interior mutability version for use in &self methods).
     ///
+    /// Skips empty groups to avoid processing gaps.
     /// Returns the new context switch sequence number.
-    pub fn context_switch(&mut self) -> u64 {
-        self.state = SchedulerState::ContextSwitching;
+    pub fn do_context_switch(&self) -> u64 {
+        self.state.set(SchedulerState::ContextSwitching);
 
-        // Advance to next group
-        self.current_group = self.next_group;
-        self.next_group = (self.next_group + 1) % self.groups.len();
+        // Find next non-empty group (or wrap around to current if all others empty)
+        let num_groups = self.groups.len();
+        let current = self.current_group.get();
+        let mut next = (current + 1) % num_groups;
+
+        // Skip empty groups
+        for _ in 0..num_groups {
+            if !self.groups[next].connections.is_empty() {
+                break;
+            }
+            next = (next + 1) % num_groups;
+        }
+
+        self.current_group.set(next);
+        self.next_group.set((next + 1) % num_groups);
 
         // Update sequence number
-        self.context_switch_seq += 1;
-        self.groups[self.current_group].context_switch_seq = self.context_switch_seq;
+        let new_seq = self.context_switch_seq.get() + 1;
+        self.context_switch_seq.set(new_seq);
+        // Note: can't update groups[].context_switch_seq here without RefCell
 
         // Update timing
-        self.last_switch = Instant::now();
-        self.state = SchedulerState::Processing;
+        self.last_switch.set(Instant::now());
+        self.state.set(SchedulerState::Processing);
 
-        self.context_switch_seq
+        new_seq
+    }
+
+    /// Perform context switch (mutable version).
+    ///
+    /// Skips empty groups to avoid processing gaps.
+    /// Returns the new context switch sequence number.
+    pub fn context_switch(&mut self) -> u64 {
+        self.state.set(SchedulerState::ContextSwitching);
+
+        // Find next non-empty group (or wrap around to current if all others empty)
+        let num_groups = self.groups.len();
+        let current = self.current_group.get();
+        let mut next = (current + 1) % num_groups;
+
+        // Skip empty groups
+        for _ in 0..num_groups {
+            if !self.groups[next].connections.is_empty() {
+                break;
+            }
+            next = (next + 1) % num_groups;
+        }
+
+        self.current_group.set(next);
+        self.next_group.set((next + 1) % num_groups);
+
+        // Update sequence number
+        let new_seq = self.context_switch_seq.get() + 1;
+        self.context_switch_seq.set(new_seq);
+        self.groups[next].context_switch_seq = new_seq;
+
+        // Update timing
+        self.last_switch.set(Instant::now());
+        self.state.set(SchedulerState::Processing);
+
+        new_seq
     }
 
     /// Get the current context switch sequence number.
     pub fn context_switch_seq(&self) -> u64 {
-        self.context_switch_seq
+        self.context_switch_seq.get()
     }
 
     /// Get the number of groups.
@@ -257,12 +307,8 @@ pub struct RpcServer {
     config: ServerConfig,
     /// Request handler.
     handler: Option<RequestHandler>,
-    /// Next slot to check for incoming requests (Cell for interior mutability).
-    next_check_slot: Cell<usize>,
     /// Group scheduler for time-sharing.
     scheduler: GroupScheduler,
-    /// Slot count mask for fast modulo (num_slots - 1, requires power of 2).
-    slot_mask: usize,
     /// Per-connection event buffer addresses for context switch notification.
     event_buffer_addrs: Vec<Option<(u64, u32)>>,
     /// Connections that need doorbell flush (for batching).
@@ -287,14 +333,6 @@ impl RpcServer {
             config.group.time_slice_us,
         );
 
-        // Compute slot mask (requires num_slots to be power of 2)
-        let num_slots = processing_pool.num_slots();
-        assert!(
-            num_slots.is_power_of_two(),
-            "num_slots must be power of 2 for bitmask optimization"
-        );
-        let slot_mask = num_slots - 1;
-
         Ok(Self {
             processing_pool,
             warmup_pool,
@@ -302,9 +340,7 @@ impl RpcServer {
             connections: Vec::new(),
             config,
             handler: None,
-            next_check_slot: Cell::new(0),
             scheduler,
-            slot_mask,
             event_buffer_addrs: Vec::new(),
             needs_flush: RefCell::new(Vec::new()),
             warmup_buffer_infos: Vec::new(),
@@ -527,12 +563,28 @@ impl RpcServer {
     pub fn add_connection(&mut self, ctx: &Context, pd: &Pd, port: u8) -> Result<ConnectionId> {
         let conn_id = self.connections.len();
 
+        // Check max_connections limit
+        if conn_id >= self.config.max_connections {
+            return Err(Error::Protocol(format!(
+                "max_connections limit ({}) reached",
+                self.config.max_connections
+            )));
+        }
+
         fn sq_callback(_cqe: Cqe, _entry: u64) {}
         fn rq_callback(_cqe: Cqe, _entry: u64) {}
 
         let conn = Connection::new(ctx, pd, conn_id, port, sq_callback, rq_callback)?;
 
         self.mapping.register_connection(conn_id);
+
+        // Virtualized Mapping: allocate fixed slot range for this connection
+        let slots_per_conn = self.config.pool.num_slots / self.config.max_connections;
+        let start_slot = conn_id * slots_per_conn;
+        for i in 0..slots_per_conn {
+            self.mapping.bind_slot(conn_id, start_slot + i)?;
+        }
+
         self.connections.push(Some(conn));
 
         // Add to scheduler
@@ -619,19 +671,26 @@ impl RpcServer {
 
     /// Poll for incoming requests.
     ///
-    /// Scans message pool slots for new requests using the Valid field.
-    /// Returns the first request found, or None if no requests are pending.
+    /// Scans only the slots owned by connections in the current active group.
+    /// This is a key optimization from the ScaleRPC paper - instead of scanning
+    /// all 1024 slots, we only scan slots belonging to active connections.
+    ///
+    /// For example, with 1024 slots and 64 max connections:
+    /// - Each connection owns 16 slots
+    /// - With 1 active connection, we scan 16 slots instead of 1024
+    /// - Expected improvement: ~60x reduction in memory accesses
     pub fn poll_request(&self) -> Option<IncomingRequest> {
-        let num_slots = self.processing_pool.num_slots();
+        // Get active group's connections
+        let active_conns = self.scheduler.current_group_connections();
 
-        // Scan all slots to find any pending request
-        for _ in 0..num_slots {
-            let slot_index = self.next_check_slot.get();
-            // Use bitmask instead of modulo for faster operation
-            self.next_check_slot.set((slot_index + 1) & self.slot_mask);
-
-            if let Some(request) = self.check_slot_for_request(slot_index) {
-                return Some(request);
+        // Scan only slots owned by active connections
+        for &conn_id in active_conns {
+            if let Some(entry) = self.mapping.get_connection(conn_id) {
+                for &slot_idx in &entry.slots {
+                    if let Some(request) = self.check_slot_for_request(slot_idx) {
+                        return Some(request);
+                    }
+                }
             }
         }
 
@@ -784,6 +843,7 @@ impl RpcServer {
     ///
     /// Polls for requests and processes them with the handler.
     /// Flushes doorbells and drains CQs after processing.
+    /// Automatically performs context switch when time slice expires.
     /// Returns the number of requests processed.
     pub fn process(&self) -> usize {
         let handler = match &self.handler {
@@ -809,6 +869,11 @@ impl RpcServer {
         self.flush_doorbells();
         self.needs_flush.borrow_mut().clear();
         self.poll_cqs();
+
+        // Check context switch after processing batch (amortize overhead)
+        if self.scheduler.should_switch() {
+            self.scheduler.do_context_switch();
+        }
 
         processed
     }

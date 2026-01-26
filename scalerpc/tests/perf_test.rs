@@ -42,6 +42,7 @@ fn test_latency() {
             slot_data_size: 4080,
         },
         timeout_ms: 5000,
+        max_connections: 4,
     };
 
     let mut client = RpcClient::new(&ctx.pd, client_config).expect("create client");
@@ -75,6 +76,7 @@ fn test_latency() {
             },
             num_recv_slots: 64,
             group: GroupConfig::default(),
+            max_connections: 4,
         };
 
         let mut server = match RpcServer::new(&ctx.pd, server_config) {
@@ -195,6 +197,7 @@ fn test_throughput() {
             slot_data_size: 4080,
         },
         timeout_ms: 5000,
+        max_connections: 8,
     };
 
     let mut client = RpcClient::new(&ctx.pd, client_config).expect("create client");
@@ -228,6 +231,7 @@ fn test_throughput() {
             },
             num_recv_slots: 256,
             group: GroupConfig::default(),
+            max_connections: 8,
         };
 
         let mut server = match RpcServer::new(&ctx.pd, server_config) {
@@ -400,6 +404,7 @@ fn test_throughput_4kb() {
             slot_data_size: 4080,
         },
         timeout_ms: 5000,
+        max_connections: 8,
     };
 
     let mut client = RpcClient::new(&ctx.pd, client_config).expect("create client");
@@ -433,6 +438,7 @@ fn test_throughput_4kb() {
             },
             num_recv_slots: 256,
             group: GroupConfig::default(),
+            max_connections: 8,
         };
 
         let mut server = match RpcServer::new(&ctx.pd, server_config) {

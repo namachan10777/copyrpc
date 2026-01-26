@@ -270,6 +270,47 @@ impl MessagePool {
         }
     }
 
+    /// Allocate a free slot from a specific range.
+    ///
+    /// This is used for virtualized mapping where each connection owns a
+    /// specific range of slots.
+    ///
+    /// # Arguments
+    /// * `slots` - The slot indices to search for a free slot (must be sorted/contiguous)
+    ///
+    /// # Returns
+    /// `Ok(SlotHandle)` if a slot was allocated, `Err(NoFreeSlots)` otherwise.
+    pub fn alloc_from_slots(&self, slots: &[usize]) -> Result<SlotHandle<'_>> {
+        if slots.is_empty() {
+            return Err(Error::NoFreeSlots);
+        }
+
+        // Optimization: slots are contiguous, so we can use range check
+        // instead of O(n) contains() lookup
+        let min_slot = slots[0];
+        let max_slot = slots[slots.len() - 1];
+
+        let mut free_list = self.free_list.lock().unwrap();
+
+        // Find a slot from the given range that is in the free list
+        for (pos, &free_idx) in free_list.iter().enumerate() {
+            // O(1) range check instead of O(n) contains()
+            if free_idx >= min_slot && free_idx <= max_slot {
+                let slot = self.get_slot(free_idx).unwrap();
+                // Transition from Free to Reserved
+                if slot.try_transition(SlotState::Free, SlotState::Reserved) {
+                    free_list.swap_remove(pos);
+                    return Ok(SlotHandle {
+                        pool: self,
+                        index: free_idx,
+                    });
+                }
+            }
+        }
+
+        Err(Error::NoFreeSlots)
+    }
+
     /// Return a slot to the free list.
     ///
     /// This is used internally by SlotHandle::drop().

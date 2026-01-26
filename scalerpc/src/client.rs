@@ -378,6 +378,14 @@ impl RpcClient {
     pub fn add_connection(&mut self, ctx: &Context, pd: &Pd, port: u8) -> Result<ConnectionId> {
         let conn_id = self.connections.len();
 
+        // Check max_connections limit
+        if conn_id >= self.config.max_connections {
+            return Err(Error::Protocol(format!(
+                "max_connections limit ({}) reached",
+                self.config.max_connections
+            )));
+        }
+
         fn sq_callback(_cqe: Cqe, _entry: u64) {
             // Entry contains request ID - we could track completions here
         }
@@ -389,6 +397,13 @@ impl RpcClient {
 
         // Register with mapping
         self.mapping.register_connection(conn_id);
+
+        // Virtualized Mapping: allocate fixed slot range for this connection
+        let slots_per_conn = self.config.pool.num_slots / self.config.max_connections;
+        let start_slot = conn_id * slots_per_conn;
+        for i in 0..slots_per_conn {
+            self.mapping.bind_slot(conn_id, start_slot + i)?;
+        }
 
         // Create per-connection state with warmup and event buffers
         let warmup_buffer = WarmupBuffer::new(pd, 16)?; // 16 slots for warmup batching
@@ -527,10 +542,6 @@ impl RpcClient {
         rpc_type: u16,
         payload: &[u8],
     ) -> Result<PendingRpc<'_>> {
-        // Allocate a slot for this request
-        let slot = self.pool.alloc()?;
-        let slot_index = slot.index();
-
         // Get connection and remote info
         let conn = self
             .connections
@@ -542,6 +553,10 @@ impl RpcClient {
             .mapping
             .get_connection(conn_id)
             .ok_or(Error::ConnectionNotFound(conn_id))?;
+
+        // Allocate a slot from this connection's assigned slot range
+        let slot = self.pool.alloc_from_slots(&mapping_entry.slots)?;
+        let slot_index = slot.index();
 
         // Calculate remote slot address based on client slot index
         // This ensures each request goes to a different server slot

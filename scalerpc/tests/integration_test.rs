@@ -78,6 +78,7 @@ fn test_client_creation() {
             num_slots: 32,
             slot_data_size: 4080,
         },
+        max_connections: 4, // 32 / 4 = 8 slots per connection
         ..Default::default()
     };
 
@@ -118,6 +119,7 @@ fn test_server_creation() {
             num_slots: 64,
             slot_data_size: 4080,
         },
+        max_connections: 4, // 64 / 4 = 16 slots per connection
         ..Default::default()
     };
 
@@ -166,7 +168,7 @@ fn test_loopback_rpc() {
             slot_data_size: 4080,
         },
         timeout_ms: 5000,
-        ..Default::default()
+        max_connections: 4, // 32 / 4 = 8 slots per connection
     };
     let mut client = RpcClient::new(&ctx.pd, client_config).expect("Failed to create client");
 
@@ -176,6 +178,7 @@ fn test_loopback_rpc() {
             num_slots: 64,
             slot_data_size: 4080,
         },
+        max_connections: 4, // 64 / 4 = 16 slots per connection
         ..Default::default()
     };
     let mut server = RpcServer::new(&ctx.pd, server_config).expect("Failed to create server");

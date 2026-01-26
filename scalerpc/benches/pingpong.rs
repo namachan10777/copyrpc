@@ -148,6 +148,7 @@ fn setup_benchmark() -> Option<BenchmarkSetup> {
             slot_data_size: 4080,
         },
         timeout_ms: 10000,
+        max_connections: 64, // 1024 / 64 = 16 slots per connection
     };
 
     let mut client = RpcClient::new(&test_ctx.pd, client_config).ok()?;
@@ -246,6 +247,7 @@ fn server_thread_main(
         },
         num_recv_slots: 256,
         group: GroupConfig::default(),
+        max_connections: 64, // 1024 / 64 = 16 slots per connection
     };
 
     let mut server = match RpcServer::new(&pd, server_config) {
@@ -465,12 +467,12 @@ fn bench_throughput(c: &mut Criterion) {
 }
 
 // =============================================================================
-// Multi-QP Benchmark (8 QPs, 1024 concurrent requests)
+// Multi-QP Benchmark
 // =============================================================================
 
-const NUM_QPS: usize = 8;
-const MULTI_QP_PIPELINE_DEPTH: usize = 64; // Balanced for performance
-const MULTI_QP_NUM_SLOTS: usize = 256; // Enough slots for 64 concurrent + headroom
+const NUM_QPS: usize = 64;
+const MULTI_QP_PIPELINE_DEPTH: usize = 64;
+const MULTI_QP_NUM_SLOTS: usize = 1024; // NUM_QPS * 16 slots/QP
 
 struct MultiQpBenchmarkSetup {
     client: RpcClient,
@@ -490,6 +492,7 @@ fn setup_multi_qp_benchmark() -> Option<MultiQpBenchmarkSetup> {
             slot_data_size: 4080,
         },
         timeout_ms: 10000,
+        max_connections: NUM_QPS, // 256 / 8 = 32 slots per connection
     };
 
     let mut client = RpcClient::new(&test_ctx.pd, client_config).ok()?;
@@ -592,6 +595,7 @@ fn multi_qp_server_thread_main(
         },
         num_recv_slots: 256,
         group: GroupConfig::default(),
+        max_connections: NUM_QPS, // 256 / 8 = 32 slots per connection
     };
 
     let mut server = match RpcServer::new(&pd, server_config) {
