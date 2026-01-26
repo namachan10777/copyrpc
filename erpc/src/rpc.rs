@@ -659,6 +659,7 @@ impl<U: 'static> Rpc<U> {
     }
 
     /// Process a received packet.
+    #[inline]
     fn process_recv(&self, buf_idx: usize, byte_cnt: u32) -> Result<()> {
         // Read packet data
         let (hdr, payload) = {
@@ -1128,6 +1129,7 @@ impl<U: 'static> Rpc<U> {
     /// Run one iteration of the event loop.
     ///
     /// Returns the number of events processed.
+    #[inline]
     pub fn run_event_loop_once(&self) -> usize {
         let mut events = 0;
 
@@ -1135,21 +1137,24 @@ impl<U: 'static> Rpc<U> {
         // Request buffers are kept until response is received (for retransmission)
         // Response buffers are freed immediately on send completion
         // Note: buf_idx == usize::MAX indicates inline send with no buffer to free
-        for comp in self.transport.poll_send_completions() {
-            if comp.buf_type == BufferType::Response && comp.buf_idx != usize::MAX {
-                self.send_buffers.borrow_mut().free(comp.buf_idx);
+        events += self.transport.poll_send_completions(|comps| {
+            for comp in comps {
+                if comp.buf_type == BufferType::Response && comp.buf_idx != usize::MAX {
+                    self.send_buffers.borrow_mut().free(comp.buf_idx);
+                }
             }
-            // Request buffers are freed in handle_response() when response is received
-            events += 1;
-        }
+            comps.len()
+        });
 
         // Poll and process receive completions
-        for comp in self.transport.poll_recv_completions() {
-            if let Err(e) = self.process_recv(comp.buf_idx, comp.byte_cnt) {
-                eprintln!("process_recv error: {:?}", e);
+        events += self.transport.poll_recv_completions(|comps| {
+            for comp in comps {
+                if let Err(e) = self.process_recv(comp.buf_idx, comp.byte_cnt) {
+                    eprintln!("process_recv error: {:?}", e);
+                }
             }
-            events += 1;
-        }
+            comps.len()
+        });
 
         // Batch repost receive buffers when below threshold
         if self.posted_recv_count.get() <= self.recv_repost_threshold {
