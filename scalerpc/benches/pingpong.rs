@@ -23,6 +23,8 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use fastant::Instant;
+
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use mlx5::device::{Context, DeviceList};
@@ -376,7 +378,7 @@ fn server_thread_main(
 fn run_latency_bench(client: &RpcClient, conn_id: usize, msg_size: usize, iters: u64) -> Duration {
     let request_data = vec![0xAAu8; msg_size];
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
 
     for _ in 0..iters {
         // call() is now blocking and returns RpcResponse directly
@@ -402,7 +404,7 @@ fn run_throughput_bench(
     let mut completed = 0u64;
     let mut sent = 0u64;
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
 
     // Initial fill (using call_async for pipelining)
     for _ in 0..pipeline_depth.min(iters as usize) {
@@ -751,7 +753,7 @@ fn run_multi_qp_throughput_bench(
     let mut sent = 0u64;
     let num_qps = conn_ids.len();
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
 
     // Initial fill - distribute across QPs round-robin
     for i in 0..pipeline_depth.min(iters as usize) {
