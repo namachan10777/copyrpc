@@ -55,7 +55,9 @@ struct BenchConfig {
     pipeline_depth: usize,
     // Multi QP
     num_qps: usize,
+    num_groups: usize,
     multi_qp_pipeline_depth: usize,
+    slots_per_conn: usize,
 }
 
 impl BenchConfig {
@@ -66,12 +68,20 @@ impl BenchConfig {
             num_slots: env_or("SCALERPC_NUM_SLOTS", 1024),
             pipeline_depth: env_or("SCALERPC_PIPELINE_DEPTH", 16),
             num_qps: env_or("SCALERPC_NUM_QPS", 64),
+            num_groups: env_or("SCALERPC_NUM_GROUPS", 4),
             multi_qp_pipeline_depth: env_or("SCALERPC_MULTI_QP_PIPELINE_DEPTH", 64),
+            slots_per_conn: env_or("SCALERPC_SLOTS_PER_CONN", 4),
         }
     }
 
+    /// Number of connections per group.
+    fn group_size(&self) -> usize {
+        self.num_qps / self.num_groups
+    }
+
+    /// Total slots needed - based on group size (only one group active at a time).
     fn multi_qp_num_slots(&self) -> usize {
-        self.num_qps * 16 // 16 slots per connection
+        self.group_size() * self.slots_per_conn
     }
 }
 
@@ -641,6 +651,7 @@ fn multi_qp_server_thread_main(
 
     let num_qps = config.num_qps;
     let multi_qp_num_slots = config.multi_qp_num_slots();
+    let group_size = config.group_size();
 
     let server_config = ServerConfig {
         pool: PoolConfig {
@@ -648,8 +659,13 @@ fn multi_qp_server_thread_main(
             slot_data_size: 4080,
         },
         num_recv_slots: 256,
-        group: GroupConfig::default(),
-        max_connections: num_qps, // 16 slots per connection
+        group: GroupConfig {
+            num_groups: config.num_groups,
+            max_active_per_group: group_size,
+            time_slice_us: 100,
+            max_endpoint_entries: 256,
+        },
+        max_connections: num_qps,
     };
 
     let mut server = match RpcServer::new(&pd, server_config) {
@@ -798,10 +814,13 @@ fn bench_multi_qp_throughput(c: &mut Criterion) {
 
     let num_qps = config.num_qps;
     let pipeline_depth = config.multi_qp_pipeline_depth;
+    let group_size = config.group_size();
+    let num_slots = config.multi_qp_num_slots();
 
     // Multi-QP, 32B messages
+    // Format: {qps}qp_{groups}g_{slots}s_d{depth}
     group.bench_function(
-        BenchmarkId::new(format!("{}qp_depth{}", num_qps, pipeline_depth), "32B"),
+        BenchmarkId::new(format!("{}qp_{}g_{}s_d{}", num_qps, config.num_groups, num_slots, pipeline_depth), "32B"),
         |b| {
             b.iter_custom(|iters| {
                 run_multi_qp_throughput_bench(&client, &conn_ids, SMALL_MSG_SIZE, iters, pipeline_depth)
@@ -811,7 +830,7 @@ fn bench_multi_qp_throughput(c: &mut Criterion) {
 
     // Multi-QP, 4KB messages
     group.bench_function(
-        BenchmarkId::new(format!("{}qp_depth{}", num_qps, pipeline_depth), "4KB"),
+        BenchmarkId::new(format!("{}qp_{}g_{}s_d{}", num_qps, config.num_groups, num_slots, pipeline_depth), "4KB"),
         |b| {
             b.iter_custom(|iters| {
                 run_multi_qp_throughput_bench(&client, &conn_ids, LARGE_MSG_SIZE, iters, pipeline_depth)
