@@ -339,6 +339,7 @@ impl<U: 'static> Rpc<U> {
     /// * `req_type` - Application-defined request type
     /// * `data` - Request payload
     /// * `user_data` - User data to be passed to on_response callback
+    #[inline]
     pub fn call(
         &self,
         session: SessionHandle,
@@ -346,8 +347,8 @@ impl<U: 'static> Rpc<U> {
         data: &[u8],
         user_data: U,
     ) -> Result<u64> {
-        // Phase 1: Session setup
-        let (req_num, sslot_idx, remote_session_num) = {
+        // Phase 1: Session setup and get AV (single borrow)
+        let (req_num, sslot_idx, remote_session_num, av) = {
             let mut sessions = self.sessions.borrow_mut();
             let sess = sessions
                 .get_mut(session)
@@ -367,7 +368,11 @@ impl<U: 'static> Rpc<U> {
             let req_num = sess.next_req_num();
             let remote_session_num = sess.remote_session_num;
 
-            (req_num, sslot_idx, remote_session_num)
+            // Get AV while we have the session borrowed
+            let ah = sess.ah.as_ref().ok_or(Error::SessionNotConnected(session.session_num()))?;
+            let av = UdTransport::ah_to_av(ah);
+
+            (req_num, sslot_idx, remote_session_num, av)
         };
 
         // Phase 2: Calculate packet count and prepare buffers
@@ -407,57 +412,44 @@ impl<U: 'static> Rpc<U> {
             buf_indices.push(buf_info.idx);
         }
 
-        // Phase 3: Update session state
+        // Phase 3: Post send for all packets (single borrow for send_buffers)
+        {
+            let send_buffers = self.send_buffers.borrow();
+            for &buf_idx in &buf_indices {
+                let entry = TransportEntry {
+                    buf_idx,
+                    session_num: session.session_num(),
+                    context: req_num,
+                    buf_type: BufferType::Request, // Keep until response received
+                };
+
+                let buf = send_buffers.get(buf_idx).ok_or(Error::InvalidPacket)?;
+                self.transport.post_send(av, buf, entry)?;
+            }
+        }
+        // Doorbell is batched in run_event_loop_once()
+
+        // Phase 4: Update session state (single borrow)
+        let now = current_time_us();
         {
             let mut sessions = self.sessions.borrow_mut();
             let sess = sessions.get_mut(session).unwrap();
 
+            let sslot = sess.sslot_mut(sslot_idx).unwrap();
+            // Store buf_indices in pending request (moved, not cloned)
             let pending = PendingRequest {
                 user_data: Some(user_data),
-                req_buf_indices: buf_indices.clone(),
+                req_buf_indices: buf_indices,
             };
-
-            let sslot = sess.sslot_mut(sslot_idx).unwrap();
             sslot.start_request(req_num, req_type, pending);
             sslot.req_msg_size = msg_size;
             sslot.req_num_pkts = num_pkts;
-            sslot.req_pkts_sent = 0;
-            sslot.req_buf_indices = buf_indices.clone();
-            sslot.tx_ts = current_time_us();
+            sslot.req_pkts_sent = num_pkts;
+            sslot.tx_ts = now;
             sslot.wait_response(1); // Will be updated when response arrives
 
             // Register req_num -> sslot_idx for O(1) lookup
             sess.register_req_num(req_num, sslot_idx);
-        }
-
-        // Phase 4: Post send for all packets
-        let av = {
-            let sessions = self.sessions.borrow();
-            let sess = sessions.get(session).ok_or(Error::SessionNotFound(session.session_num()))?;
-            let ah = sess.ah.as_ref().ok_or(Error::SessionNotConnected(session.session_num()))?;
-            UdTransport::ah_to_av(ah)
-        };
-
-        for buf_idx in &buf_indices {
-            let entry = TransportEntry {
-                buf_idx: *buf_idx,
-                session_num: session.session_num(),
-                context: req_num,
-                buf_type: BufferType::Request, // Keep until response received
-            };
-
-            let send_buffers = self.send_buffers.borrow();
-            let buf = send_buffers.get(*buf_idx).ok_or(Error::InvalidPacket)?;
-            self.transport.post_send(av, buf, entry)?;
-        }
-        // Doorbell is batched in run_event_loop_once()
-
-        // Update packets sent count and rate limiting
-        {
-            let mut sessions = self.sessions.borrow_mut();
-            let sess = sessions.get_mut(session).unwrap();
-            let sslot = sess.sslot_mut(sslot_idx).unwrap();
-            sslot.req_pkts_sent = num_pkts;
         }
 
         // Update next send time based on Timely rate
@@ -468,7 +460,7 @@ impl<U: 'static> Rpc<U> {
             session_num: session.session_num(),
             sslot_idx,
             req_num,
-            expires_at: current_time_us() + self.config.rto_us,
+            expires_at: now + self.config.rto_us,
         };
         self.timing_wheel.borrow_mut().insert(timer_entry);
 
@@ -1256,9 +1248,13 @@ impl<U: 'static> Rpc<U> {
         // Process timeouts
         self.process_timeouts();
 
-        // Batch doorbell: ring both SQ and RQ doorbells once per event loop iteration
-        self.transport.ring_sq_doorbell();
-        self.transport.ring_rq_doorbell();
+        // Batch doorbell: ring doorbells only if there are pending operations
+        if self.transport.pending_sends() > 0 {
+            self.transport.ring_sq_doorbell();
+        }
+        if self.transport.pending_recvs() > 0 {
+            self.transport.ring_rq_doorbell();
+        }
 
         events
     }
