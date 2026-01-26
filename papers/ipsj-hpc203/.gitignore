@@ -1,0 +1,24 @@
+# LaTeX auxiliary files
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.run.xml
+*.synctex.gz
+*.toc
+*.nav
+*.snm
+*.vrb
+*.dvi
+
+# Output
+*.pdf
+
+# IPSJ style files (downloaded via setup-ipsj.sh)
+*.cls
+*.sty
+*.bst
