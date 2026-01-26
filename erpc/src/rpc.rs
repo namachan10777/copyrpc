@@ -6,7 +6,7 @@ use std::cell::{Cell, RefCell};
 
 use mlx5::device::Context;
 
-use crate::buffer::{BufferPool, ZeroCopyPool};
+use crate::buffer::ZeroCopyPool;
 use crate::config::RpcConfig;
 use crate::error::{Error, Result};
 use crate::packet::{PktHdr, PktType, SmPktHdr, SmPktType, PKT_HDR_SIZE, SM_PKT_HDR_SIZE};
@@ -76,8 +76,8 @@ where
     timing_wheel: RefCell<TimingWheel>,
     /// Receive buffer pool (zero-copy).
     recv_buffers: RefCell<ZeroCopyPool>,
-    /// Send buffer pool.
-    send_buffers: RefCell<BufferPool>,
+    /// Send buffer pool (zero-copy).
+    send_buffers: RefCell<ZeroCopyPool>,
     /// MTU in bytes.
     mtu: usize,
     /// Number of currently posted receive buffers.
@@ -123,7 +123,8 @@ impl<U: 'static> Rpc<U> {
         let recv_buf_size = mtu + GRH_SIZE;
         // Use ZeroCopyPool for receive buffers (single MR, zero-copy access)
         let recv_buffers = ZeroCopyPool::new(config.num_recv_buffers, recv_buf_size, pd)?;
-        let send_buffers = BufferPool::new((config.max_send_wr as usize) * 4, mtu, pd)?;
+        // Use ZeroCopyPool for send buffers (single MR, zero-copy access)
+        let send_buffers = ZeroCopyPool::new((config.max_send_wr as usize) * 4, mtu, pd)?;
 
         let mut timing_wheel = TimingWheel::default_for_rpc();
         timing_wheel.init(current_time_us());
@@ -211,7 +212,7 @@ impl<U: 'static> Rpc<U> {
     /// Prepare and send an SM packet.
     fn send_sm_packet(&self, session: SessionHandle, sm_hdr: &SmPktHdr) -> Result<()> {
         // Prepare SM packet buffer
-        let buf_idx = {
+        let (buf_idx, addr, lkey) = {
             let mut send_buffers = self.send_buffers.borrow_mut();
             let (buf_idx, buf) = send_buffers.alloc().ok_or(Error::RequestQueueFull)?;
 
@@ -229,9 +230,10 @@ impl<U: 'static> Rpc<U> {
                 pkt_hdr.write_to(buf.as_mut_ptr());
                 sm_hdr.write_to(buf.as_mut_ptr().add(PKT_HDR_SIZE));
             }
-            buf.set_len(PKT_HDR_SIZE + SM_PKT_HDR_SIZE);
 
-            buf_idx
+            let addr = send_buffers.slot_addr(buf_idx);
+            let lkey = send_buffers.lkey();
+            (buf_idx, addr, lkey)
         };
 
         // Post send
@@ -249,11 +251,8 @@ impl<U: 'static> Rpc<U> {
             buf_type: BufferType::Response, // SM packets can be freed immediately
         };
 
-        {
-            let send_buffers = self.send_buffers.borrow();
-            let buf = send_buffers.get(buf_idx).ok_or(Error::InvalidPacket)?;
-            self.transport.post_send(av, buf, entry)?;
-        }
+        let len = (PKT_HDR_SIZE + SM_PKT_HDR_SIZE) as u32;
+        self.transport.post_send_raw(av, addr, len, lkey, entry)?;
         // Doorbell is batched in run_event_loop_once()
 
         Ok(())
@@ -273,15 +272,6 @@ impl<U: 'static> Rpc<U> {
                 data.len(),
             );
         }
-        buf.set_len(PKT_HDR_SIZE + data.len());
-
-        // Verify buffer is registered
-        let _ = buf.lkey().ok_or_else(|| {
-            Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Buffer not registered",
-            ))
-        })?;
 
         Ok(BufInfo { idx: buf_idx })
     }
@@ -415,6 +405,8 @@ impl<U: 'static> Rpc<U> {
         // Phase 3: Post send for all packets (single borrow for send_buffers)
         {
             let send_buffers = self.send_buffers.borrow();
+            let lkey = send_buffers.lkey();
+            let pkt_len = (PKT_HDR_SIZE + data_per_pkt.min(msg_size)) as u32;
             for &buf_idx in &buf_indices {
                 let entry = TransportEntry {
                     buf_idx,
@@ -423,8 +415,8 @@ impl<U: 'static> Rpc<U> {
                     buf_type: BufferType::Request, // Keep until response received
                 };
 
-                let buf = send_buffers.get(buf_idx).ok_or(Error::InvalidPacket)?;
-                self.transport.post_send(av, buf, entry)?;
+                let addr = send_buffers.slot_addr(buf_idx);
+                self.transport.post_send_raw(av, addr, pkt_len, lkey, entry)?;
             }
         }
         // Doorbell is batched in run_event_loop_once()
@@ -598,8 +590,9 @@ impl<U: 'static> Rpc<U> {
             };
 
             let send_buffers = self.send_buffers.borrow();
-            let buf = send_buffers.get(buf_info.idx).ok_or(Error::InvalidPacket)?;
-            self.transport.post_send(av, buf, entry)?;
+            let addr = send_buffers.slot_addr(buf_info.idx);
+            let lkey = send_buffers.lkey();
+            self.transport.post_send_raw(av, addr, total_len as u32, lkey, entry)?;
         }
         // Doorbell is batched in run_event_loop_once()
 
@@ -635,16 +628,17 @@ impl<U: 'static> Rpc<U> {
         );
 
         // Allocate and prepare buffer
-        let buf_idx = {
+        let (buf_idx, addr, lkey) = {
             let mut send_buffers = self.send_buffers.borrow_mut();
             let (buf_idx, buf) = send_buffers.alloc().ok_or(Error::RequestQueueFull)?;
 
             unsafe {
                 hdr.write_to(buf.as_mut_ptr());
             }
-            buf.set_len(PKT_HDR_SIZE);
 
-            buf_idx
+            let addr = send_buffers.slot_addr(buf_idx);
+            let lkey = send_buffers.lkey();
+            (buf_idx, addr, lkey)
         };
 
         // Post send
@@ -656,18 +650,14 @@ impl<U: 'static> Rpc<U> {
             UdTransport::ah_to_av(ah)
         };
 
-        {
-            let entry = TransportEntry {
-                buf_idx,
-                session_num,
-                context: 0,
-                buf_type: BufferType::Response, // Free on send completion
-            };
+        let entry = TransportEntry {
+            buf_idx,
+            session_num,
+            context: 0,
+            buf_type: BufferType::Response, // Free on send completion
+        };
 
-            let send_buffers = self.send_buffers.borrow();
-            let buf = send_buffers.get(buf_idx).ok_or(Error::InvalidPacket)?;
-            self.transport.post_send(av, buf, entry)?;
-        }
+        self.transport.post_send_raw(av, addr, PKT_HDR_SIZE as u32, lkey, entry)?;
         // Doorbell is batched in run_event_loop_once()
 
         Ok(())
@@ -1182,18 +1172,21 @@ impl<U: 'static> Rpc<U> {
         };
 
         // Retransmit all packets
-        for &req_buf_idx in req_buf_indices {
-            let entry = TransportEntry {
-                buf_idx: req_buf_idx,
-                session_num,
-                context: req_num,
-                buf_type: BufferType::Request, // Keep until response received
-            };
+        {
+            let send_buffers = self.send_buffers.borrow();
+            let lkey = send_buffers.lkey();
+            // Use MTU as packet size (receiver uses header's msg_size to interpret)
+            let pkt_len = self.mtu as u32;
+            for &req_buf_idx in req_buf_indices {
+                let entry = TransportEntry {
+                    buf_idx: req_buf_idx,
+                    session_num,
+                    context: req_num,
+                    buf_type: BufferType::Request, // Keep until response received
+                };
 
-            {
-                let send_buffers = self.send_buffers.borrow();
-                let buf = send_buffers.get(req_buf_idx).ok_or(Error::InvalidPacket)?;
-                self.transport.post_send(av, buf, entry)?;
+                let addr = send_buffers.slot_addr(req_buf_idx);
+                self.transport.post_send_raw(av, addr, pkt_len, lkey, entry)?;
             }
         }
         // Doorbell is batched in run_event_loop_once()

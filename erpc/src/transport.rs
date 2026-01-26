@@ -400,6 +400,55 @@ impl UdTransport {
         Ok(())
     }
 
+    /// Post a send operation with raw buffer parameters.
+    ///
+    /// Uses signaled interval: only every Nth send is signaled to reduce
+    /// CQ overhead while still updating SQ ci.
+    /// For unsignaled Response sends, the buffer index is queued for deferred
+    /// deallocation when the next signaled completion arrives.
+    pub fn post_send_raw(
+        &self,
+        av: UdAvIb,
+        addr: u64,
+        len: u32,
+        lkey: u32,
+        entry: TransportEntry,
+    ) -> Result<()> {
+        let qp = self.qp.borrow();
+
+        // Use signaled interval: every Nth send is signaled
+        // Unsignaled Response buffers are queued for deferred deallocation
+        let count = self.send_counter.get();
+        let should_signal = count % SIGNALED_INTERVAL == 0;
+        self.send_counter.set(count.wrapping_add(1));
+
+        let ctx = qp.emit_ctx()?;
+        if should_signal {
+            // Store send_counter in entry.context for completion ordering
+            let mut signaled_entry = entry;
+            signaled_entry.context = count as u64;
+            mlx5::emit_ud_wqe!(&ctx, send {
+                av: av,
+                flags: WqeFlags::empty(),
+                sge: { addr: addr, len: len, lkey: lkey },
+                signaled: signaled_entry,
+            })?;
+        } else {
+            // Queue Response buffers for deferred deallocation with counter
+            if entry.buf_type == BufferType::Response && entry.buf_idx != usize::MAX {
+                self.send_completions.borrow_mut().pending_response_bufs.push((count, entry.buf_idx));
+            }
+            mlx5::emit_ud_wqe!(&ctx, send {
+                av: av,
+                flags: WqeFlags::empty(),
+                sge: { addr: addr, len: len, lkey: lkey },
+            })?;
+        }
+
+        self.pending_sends.set(self.pending_sends.get() + 1);
+        Ok(())
+    }
+
     /// Post an unsignaled send operation.
     ///
     /// This variant does not generate a completion, which reduces CQ overhead.
