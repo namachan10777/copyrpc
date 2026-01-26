@@ -1131,3 +1131,166 @@ fn test_mono_cq_with_srq() {
 
     eprintln!("MonoCq with SRQ test passed!");
 }
+
+/// Test MonoCq with UD QP.
+///
+/// This test verifies that MonoCq works correctly with Unreliable Datagram QPs.
+/// UD is connectionless and each message is independently addressed.
+#[test]
+fn test_mono_cq_with_ud_qp() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    use mlx5::ud::{UdQpConfig, UdQpForMonoCq};
+    use mlx5::pd::RemoteUdQpInfo;
+    use mlx5::wqe::emit::UdAvIb;
+    use mlx5::emit_ud_wqe;
+    use mlx5::wqe::WqeFlags;
+    use std::cell::RefCell;
+
+    const GRH_SIZE: usize = 40;
+
+    // Track completions
+    let completions: Rc<RefCell<Vec<(Cqe, u64)>>> = Rc::new(RefCell::new(Vec::new()));
+    let completions_clone = completions.clone();
+
+    let callback = move |cqe: Cqe, entry: u64| {
+        eprintln!("UD callback: entry={}, opcode={:?}, syndrome={}", entry, cqe.opcode, cqe.syndrome);
+        completions_clone.borrow_mut().push((cqe, entry));
+    };
+
+    // Create MonoCq for UD QPs
+    let cq = Rc::new(ctx
+        .ctx
+        .create_mono_cq::<UdQpForMonoCq<u64>, _>(256, callback, &CqConfig::default())
+        .expect("Failed to create MonoCq"));
+
+    let qkey: u32 = 0x1BCDEF00;
+    let config = UdQpConfig {
+        qkey,
+        ..Default::default()
+    };
+
+    // Create sender UD QP with MonoCq
+    let sender = ctx
+        .ctx
+        .ud_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_mono_cq(&cq)
+        .rq_mono_cq(&cq)
+        .build()
+        .expect("Failed to create sender QP");
+
+    // Create receiver UD QP with MonoCq
+    let receiver = ctx
+        .ctx
+        .ud_qp_builder::<u64, u64>(&ctx.pd, &config)
+        .sq_mono_cq(&cq)
+        .rq_mono_cq(&cq)
+        .build()
+        .expect("Failed to create receiver QP");
+
+    // Register QPs with MonoCq
+    cq.register(&sender);
+    cq.register(&receiver);
+
+    // Activate QPs
+    sender.borrow_mut().activate(ctx.port, 0).expect("activate sender");
+    receiver.borrow_mut().activate(ctx.port, 0).expect("activate receiver");
+
+    eprintln!("Sender QPN: 0x{:x}", sender.borrow().qpn());
+    eprintln!("Receiver QPN: 0x{:x}", receiver.borrow().qpn());
+
+    // Allocate buffers
+    let mut send_buf = AlignedBuffer::new(4096);
+    let recv_buf = AlignedBuffer::new(4096);
+
+    let send_mr = unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }
+        .expect("register send MR");
+    let recv_mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
+        .expect("register recv MR");
+
+    // Prepare test data
+    let test_data = b"UD MonoCq test data!";
+    send_buf.fill_bytes(test_data);
+
+    // Post receive (must include space for GRH)
+    let recv_len = 256 + GRH_SIZE as u32;
+    receiver
+        .borrow()
+        .post_recv(1000u64, recv_buf.addr(), recv_len, recv_mr.lkey())
+        .expect("post_recv failed");
+    receiver.borrow().ring_rq_doorbell();
+
+    // Create Address Handle for receiver
+    let remote_info = RemoteUdQpInfo {
+        qpn: receiver.borrow().qpn(),
+        qkey,
+        lid: ctx.port_attr.lid,
+    };
+    let ah = ctx.pd.create_ah(ctx.port, &remote_info).expect("create AH");
+
+    // Post UD SEND
+    {
+        let sender_ref = sender.borrow();
+        let emit_ctx = sender_ref.emit_ctx().expect("emit_ctx");
+        emit_ud_wqe!(&emit_ctx, send {
+            av: UdAvIb::new(ah.qpn(), ah.qkey(), ah.dlid()),
+            flags: WqeFlags::empty(),
+            sge: { addr: send_buf.addr(), len: test_data.len() as u32, lkey: send_mr.lkey() },
+            signaled: 42u64,
+        }).expect("emit_ud_wqe");
+        sender_ref.ring_sq_doorbell();
+    }
+
+    // Poll for completions (expecting 2: send and recv)
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(5);
+
+    while completions.borrow().len() < 2 {
+        let count = cq.poll();
+        if count > 0 {
+            eprintln!("poll returned {}", count);
+            cq.flush();
+        }
+
+        if start.elapsed() > timeout {
+            panic!(
+                "Timeout: got {} completions, expected 2",
+                completions.borrow().len()
+            );
+        }
+        std::hint::spin_loop();
+    }
+
+    // Verify completions
+    let comps = completions.borrow();
+    assert_eq!(comps.len(), 2, "Should have 2 completions (send + recv)");
+
+    // Find send and recv completions
+    let mut found_send = false;
+    let mut found_recv = false;
+    for (cqe, entry) in comps.iter() {
+        if cqe.opcode.is_responder() {
+            // Recv completion
+            assert_eq!(*entry, 1000, "Recv entry should be 1000");
+            found_recv = true;
+        } else {
+            // Send completion
+            assert_eq!(*entry, 42, "Send entry should be 42");
+            found_send = true;
+        }
+        assert_eq!(cqe.syndrome, 0, "CQE should have no error");
+    }
+    assert!(found_send && found_recv, "Should have both send and recv completions");
+
+    // Verify received data
+    let received = recv_buf.read_bytes(GRH_SIZE + test_data.len());
+    assert_eq!(&received[GRH_SIZE..], test_data, "UD data mismatch");
+
+    eprintln!("MonoCq with UD QP test passed!");
+}

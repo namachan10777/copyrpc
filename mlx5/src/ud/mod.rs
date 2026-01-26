@@ -617,6 +617,13 @@ pub type UdQpForMonoCq<Entry> =
 pub type UdQpForMonoCqRoCE<Entry> =
     UdQp<Entry, Entry, RoCE, OrderedWqeTable<Entry>, UdOwnedRq<Entry>, (), ()>;
 
+/// Type alias for UD QP with SQ callback and RQ MonoCq (hybrid mode, InfiniBand).
+///
+/// This allows using a normal CQ with callback for SQ completions while using
+/// MonoCq for RQ completions (for direct dispatch).
+pub type UdQpForMonoCqWithSqCb<Entry, OnSq> =
+    UdQp<Entry, Entry, InfiniBand, OrderedWqeTable<Entry>, UdOwnedRq<Entry>, OnSq, ()>;
+
 /// UD (Unreliable Datagram) Queue Pair.
 ///
 /// Provides connectionless datagram service. Each send operation requires
@@ -1686,6 +1693,75 @@ where
 }
 
 // =============================================================================
+// Build Methods - InfiniBand + OwnedRq + Hybrid (SQ: Cq+callback, RQ: MonoCq)
+// =============================================================================
+
+impl<'a, Entry, OnSq>
+    UdQpBuilder<'a, Entry, Entry, InfiniBand, UdOwnedRq<Entry>, CqSet, CqSet, OnSq, ()>
+where
+    Entry: 'static,
+    OnSq: Fn(Cqe, Entry) + 'static,
+{
+    /// Build the UD QP in hybrid mode (SQ: normal CQ with callback, RQ: MonoCq).
+    ///
+    /// This variant is for when SQ uses normal CQ with callback and RQ uses MonoCq.
+    /// SQ completions will trigger the SQ callback.
+    /// RQ completions will be dispatched via MonoCq callback.
+    pub fn build(self) -> BuildResult<UdQpForMonoCqWithSqCb<Entry, OnSq>> {
+        unsafe {
+            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
+            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_UD;
+            qp_attr.send_cq = self.send_cq_ptr;
+            qp_attr.recv_cq = self.recv_cq_ptr;
+            qp_attr.cap.max_send_wr = self.config.max_send_wr;
+            qp_attr.cap.max_recv_wr = self.config.max_recv_wr;
+            qp_attr.cap.max_send_sge = self.config.max_send_sge;
+            qp_attr.cap.max_recv_sge = self.config.max_recv_sge;
+            qp_attr.cap.max_inline_data = self.config.max_inline_data;
+            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
+            qp_attr.pd = self.pd.as_ptr();
+
+            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
+
+            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
+            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
+
+            // Clone weak references before moving into UdQp
+            let send_cq_for_register = self.send_cq_weak.clone();
+
+            let mut result = UdQp {
+                qp,
+                state: Cell::new(UdQpState::Reset),
+                qkey: self.config.qkey,
+                sq: None,
+                rq: UdOwnedRq::new(None),
+                sq_callback: self.sq_callback,
+                rq_callback: (), // MonoCq callback is on CQ side
+                send_cq: self.send_cq_weak.unwrap_or_default(),
+                recv_cq: Weak::new(), // MonoCq doesn't need CQ registration
+                _pd: self.pd.clone(),
+                _marker: std::marker::PhantomData,
+            };
+
+            UdQpForMonoCqWithSqCb::<Entry, OnSq>::init_direct_access_internal(&mut result)?;
+
+            let qp_rc = Rc::new(RefCell::new(result));
+            let qpn = qp_rc.borrow().qpn();
+
+            // Register with send CQ only (recv CQ is MonoCq)
+            if let Some(send_cq) = &send_cq_for_register {
+                if let Some(cq) = send_cq.upgrade() {
+                    let weak: Weak<RefCell<dyn CompletionTarget>> = Rc::downgrade(&(qp_rc.clone() as Rc<RefCell<dyn CompletionTarget>>));
+                    cq.register_queue(qpn, weak);
+                }
+            }
+
+            Ok(qp_rc)
+        }
+    }
+}
+
+// =============================================================================
 // Build Methods - InfiniBand + SharedRq (SRQ)
 // =============================================================================
 
@@ -1996,5 +2072,66 @@ where
 
             Ok(Rc::new(RefCell::new(result)))
         }
+    }
+}
+
+// =============================================================================
+// CompletionSource Implementation for UdQpForMonoCq
+// =============================================================================
+
+use crate::mono_cq::CompletionSource;
+
+/// CompletionSource for UdQpForMonoCqWithSqCb (covers both pure MonoCq and hybrid mode).
+///
+/// This implementation is used for:
+/// - `UdQpForMonoCq<Entry>` (when OnSq = ()): Both SQ and RQ use MonoCq
+/// - `UdQpForMonoCqWithSqCb<Entry, OnSq>` (when OnSq is a callback): SQ uses normal CQ, RQ uses MonoCq
+///
+/// In both cases, MonoCq handles RQ completions. For hybrid mode, SQ completions
+/// are handled by the normal CQ via CompletionTarget::dispatch_cqe.
+///
+/// This implementation handles both SQ and RQ completions for MonoCq:
+/// - In pure MonoCq mode (both SQ and RQ use MonoCq): processes both
+/// - In hybrid mode (SQ uses normal Cq): only RQ completions arrive at MonoCq,
+///   so the SQ branch won't be called (send completions go to normal Cq)
+impl<Entry, OnSq> CompletionSource for UdQpForMonoCqWithSqCb<Entry, OnSq> {
+    type Entry = Entry;
+
+    fn qpn(&self) -> u32 {
+        UdQp::qpn(self)
+    }
+
+    fn process_cqe(&self, cqe: Cqe) -> Option<Entry> {
+        if cqe.opcode.is_responder() {
+            // RQ completion
+            self.rq.as_ref()?.process_completion(cqe.wqe_counter)
+        } else {
+            // SQ completion
+            self.sq.as_ref()?.process_completion(cqe.wqe_counter)
+        }
+    }
+}
+
+/// CompletionTarget for UdQpForMonoCqWithSqCb (hybrid mode: SQ callback, RQ MonoCq).
+///
+/// This implementation is for the normal CQ send side. It only handles SQ completions.
+impl<Entry, OnSq> CompletionTarget for UdQpForMonoCqWithSqCb<Entry, OnSq>
+where
+    OnSq: Fn(Cqe, Entry),
+{
+    fn qpn(&self) -> u32 {
+        UdQp::qpn(self)
+    }
+
+    fn dispatch_cqe(&self, cqe: Cqe) {
+        if !cqe.opcode.is_responder() {
+            // SQ completion - process and call callback
+            if let Some(sq) = self.sq.as_ref()
+                && let Some(entry) = sq.process_completion(cqe.wqe_counter)
+            {
+                (self.sq_callback)(cqe, entry);
+            }
+        }
+        // RQ completions are handled by MonoCq via CompletionSource, not here
     }
 }

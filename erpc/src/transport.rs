@@ -1,14 +1,21 @@
 //! Transport layer for eRPC.
 //!
 //! Provides a wrapper around mlx5::ud for UD-based transport.
+//!
+//! # Direct Dispatch with MonoCq
+//!
+//! The transport uses MonoCq for receive completions, enabling direct callback
+//! dispatch without intermediate Vec operations. The recv callback is passed
+//! at construction time and is invoked directly from the poll loop.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use mlx5::cq::{Cq, CqConfig, Cqe};
 use mlx5::device::Context;
+use mlx5::mono_cq::MonoCq;
 use mlx5::pd::{AddressHandle, Pd, RemoteUdQpInfo};
-use mlx5::ud::{UdQpConfig, UdQpIb};
+use mlx5::ud::{UdQpConfig, UdQpForMonoCqWithSqCb};
 pub use mlx5::wqe::emit::UdAvIb;
 use mlx5::wqe::WqeFlags;
 
@@ -106,12 +113,6 @@ pub struct LocalInfo {
     pub lid: u16,
 }
 
-/// Completion callback type for send operations.
-type SendCallback = Box<dyn Fn(Cqe, TransportEntry)>;
-
-/// Completion callback type for receive operations.
-type RecvCallback = Box<dyn Fn(Cqe, TransportEntry)>;
-
 /// Completion buffers shared with callbacks.
 struct CompletionBuffers {
     send_completions: Vec<SendCompletion>,
@@ -121,21 +122,71 @@ struct CompletionBuffers {
     pending_response_bufs: Vec<(u32, usize)>,
 }
 
+/// Process send completion and update completion buffers.
+///
+/// This function handles signaled interval logic for send completions.
+fn process_send_completion(completions: &Rc<RefCell<CompletionBuffers>>, _cqe: Cqe, entry: TransportEntry) {
+    let mut comps = completions.borrow_mut();
+    // The signaled WQE's send_counter is stored in entry.context
+    // Release only pending buffers with counter <= this counter
+    let signaled_counter = entry.context as u32;
+
+    // Partition pending buffers: release those with counter <= signaled_counter
+    let pending = std::mem::take(&mut comps.pending_response_bufs);
+    let mut to_release = Vec::new();
+    let mut remaining = Vec::new();
+    for (counter, buf_idx) in pending {
+        // Use wrapping comparison to handle counter overflow
+        let diff = signaled_counter.wrapping_sub(counter);
+        if diff < 0x8000_0000 {
+            // counter <= signaled_counter (within half the range)
+            to_release.push(buf_idx);
+        } else {
+            // counter > signaled_counter - keep for later
+            remaining.push((counter, buf_idx));
+        }
+    }
+    comps.pending_response_bufs = remaining;
+
+    // Add completions for released buffers
+    for buf_idx in to_release {
+        comps.send_completions.push(SendCompletion {
+            buf_idx,
+            buf_type: BufferType::Response,
+        });
+    }
+    // Add the signaled completion itself
+    comps.send_completions.push(SendCompletion {
+        buf_idx: entry.buf_idx,
+        buf_type: entry.buf_type,
+    });
+}
+
 /// Signaled interval - every Nth send is signaled.
 /// Lower values = more CQ overhead but safer for SQ.
 /// Higher values = less CQ overhead but more pending buffers.
 const SIGNALED_INTERVAL: u32 = 4;
 
-/// UD transport wrapper.
+/// Send completion callback type.
+type SendCallback = Box<dyn Fn(Cqe, TransportEntry)>;
+
+/// Recv completion callback type (used internally to collect completions).
+type RecvCallback = Box<dyn Fn(Cqe, TransportEntry)>;
+
+/// QP type for hybrid mode (SQ: normal CQ, RQ: MonoCq).
+type HybridQp = UdQpForMonoCqWithSqCb<TransportEntry, SendCallback>;
+
+/// UD transport wrapper with direct dispatch for receive completions.
 ///
 /// Provides a higher-level interface over mlx5::ud::UdQp for eRPC.
+/// Uses MonoCq for receive completions to enable inlined callback dispatch.
 pub struct UdTransport {
-    /// The underlying UD QP.
-    qp: Rc<RefCell<UdQpIb<TransportEntry, TransportEntry, SendCallback, RecvCallback>>>,
-    /// Send completion queue.
+    /// The underlying UD QP (hybrid: SQ uses normal CQ, RQ uses MonoCq).
+    qp: Rc<RefCell<HybridQp>>,
+    /// Send completion queue (normal Cq with callback).
     send_cq: Rc<Cq>,
-    /// Receive completion queue.
-    recv_cq: Rc<Cq>,
+    /// Receive completion queue (MonoCq for direct dispatch).
+    recv_cq: Rc<MonoCq<HybridQp, RecvCallback>>,
     /// Protection domain.
     pd: Pd,
     /// Port number.
@@ -150,7 +201,7 @@ pub struct UdTransport {
     pending_sends: Cell<u32>,
     /// Number of pending receive operations.
     pending_recvs: Cell<u32>,
-    /// Completion buffers for direct polling pattern.
+    /// Completion buffers for send completions.
     completions: Rc<RefCell<CompletionBuffers>>,
     /// Send counter for signaled interval.
     send_counter: Cell<u32>,
@@ -158,6 +209,15 @@ pub struct UdTransport {
 
 impl UdTransport {
     /// Create a new UD transport.
+    ///
+    /// Uses MonoCq for receive completions (inlined dispatch) while collecting
+    /// completions into a Vec for polling via poll_recv_completions().
+    ///
+    /// # Arguments
+    ///
+    /// * `ctx` - RDMA device context
+    /// * `port` - Port number
+    /// * `config` - RPC configuration
     pub fn new(ctx: &Context, port: u8, config: &RpcConfig) -> Result<Self> {
         // Query port attributes for LID and MTU
         let port_attr = ctx.query_port(port)?;
@@ -167,13 +227,43 @@ impl UdTransport {
         // Allocate PD
         let pd = ctx.alloc_pd()?;
 
-        // Create CQs
+        // Create CQ config
         let cq_config = CqConfig::default();
-        let send_cq = ctx.create_cq(config.max_send_wr as i32, &cq_config)?;
-        let recv_cq = ctx.create_cq(config.max_recv_wr as i32, &cq_config)?;
 
+        // Create send CQ (normal Cq with callback for signaled interval handling)
+        let send_cq = ctx.create_cq(config.max_send_wr as i32, &cq_config)?;
         let send_cq = Rc::new(send_cq);
-        let recv_cq = Rc::new(recv_cq);
+
+        // Create completion buffers shared with send/recv callbacks
+        let completions = Rc::new(RefCell::new(CompletionBuffers {
+            send_completions: Vec::with_capacity(config.max_send_wr as usize),
+            recv_completions: Vec::with_capacity(config.max_recv_wr as usize),
+            pending_response_bufs: Vec::with_capacity(config.max_send_wr as usize),
+        }));
+
+        // Create send callback that handles signaled interval
+        let send_completions = completions.clone();
+        let send_callback: SendCallback = Box::new(move |cqe, entry| {
+            process_send_completion(&send_completions, cqe, entry);
+        });
+
+        // Create recv callback that collects completions
+        let recv_completions = completions.clone();
+        let recv_callback: RecvCallback = Box::new(move |cqe, entry| {
+            recv_completions.borrow_mut().recv_completions.push(RecvCompletion {
+                buf_idx: entry.buf_idx,
+                byte_cnt: cqe.byte_cnt,
+            });
+        });
+
+        // Create recv CQ (MonoCq for direct dispatch)
+        let recv_cq = Rc::new(
+            ctx.create_mono_cq::<HybridQp, _>(
+                config.max_recv_wr as i32,
+                recv_callback,
+                &cq_config,
+            )?,
+        );
 
         // Create UD QP configuration
         let qp_config = UdQpConfig {
@@ -185,66 +275,15 @@ impl UdTransport {
             qkey: config.qkey,
         };
 
-        // Create completion buffers shared with callbacks
-        let completions = Rc::new(RefCell::new(CompletionBuffers {
-            send_completions: Vec::with_capacity(config.max_send_wr as usize),
-            recv_completions: Vec::with_capacity(config.max_recv_wr as usize),
-            pending_response_bufs: Vec::with_capacity(config.max_send_wr as usize),
-        }));
-
-        // Create callbacks that capture completion buffers
-        let send_completions = completions.clone();
-        let send_callback: SendCallback = Box::new(move |_cqe, entry| {
-            let mut completions = send_completions.borrow_mut();
-            // The signaled WQE's send_counter is stored in entry.context
-            // Release only pending buffers with counter <= this counter
-            let signaled_counter = entry.context as u32;
-
-            // Partition pending buffers: release those with counter <= signaled_counter
-            let pending = std::mem::take(&mut completions.pending_response_bufs);
-            let mut to_release = Vec::new();
-            let mut remaining = Vec::new();
-            for (counter, buf_idx) in pending {
-                // Use wrapping comparison to handle counter overflow
-                let diff = signaled_counter.wrapping_sub(counter);
-                if diff < 0x8000_0000 {
-                    // counter <= signaled_counter (within half the range)
-                    to_release.push(buf_idx);
-                } else {
-                    // counter > signaled_counter - keep for later
-                    remaining.push((counter, buf_idx));
-                }
-            }
-            completions.pending_response_bufs = remaining;
-
-            // Add completions for released buffers
-            for buf_idx in to_release {
-                completions.send_completions.push(SendCompletion {
-                    buf_idx,
-                    buf_type: BufferType::Response,
-                });
-            }
-            // Add the signaled completion itself
-            completions.send_completions.push(SendCompletion {
-                buf_idx: entry.buf_idx,
-                buf_type: entry.buf_type,
-            });
-        });
-
-        let recv_completions = completions.clone();
-        let recv_callback: RecvCallback = Box::new(move |cqe, entry| {
-            recv_completions.borrow_mut().recv_completions.push(RecvCompletion {
-                buf_idx: entry.buf_idx,
-                byte_cnt: cqe.byte_cnt,
-            });
-        });
-
-        // Build the UD QP
+        // Build the UD QP with normal CQ for send, MonoCq for recv
         let qp = ctx
             .ud_qp_builder::<TransportEntry, TransportEntry>(&pd, &qp_config)
             .sq_cq(send_cq.clone(), send_callback)
-            .rq_cq(recv_cq.clone(), recv_callback)
+            .rq_mono_cq(&recv_cq)
             .build()?;
+
+        // Register QP with recv MonoCq
+        recv_cq.register(&qp);
 
         // Transition QP to RTR/RTS
         {
@@ -488,7 +527,7 @@ impl UdTransport {
 
     /// Poll for receive completions.
     ///
-    /// Returns a Vec of receive completions with buffer indices and byte counts.
+    /// Polls the MonoCq and returns all collected recv completions.
     pub fn poll_recv_completions(&self) -> Vec<RecvCompletion> {
         let count = self.recv_cq.poll();
         self.recv_cq.flush();
@@ -502,29 +541,36 @@ impl UdTransport {
         std::mem::take(&mut completions.recv_completions)
     }
 
-    /// Poll the send CQ and dispatch completions (legacy).
+    /// Poll the receive CQ and dispatch completions via MonoCq callback.
+    ///
+    /// This method polls the recv CQ and invokes the recv_callback (passed at
+    /// construction) for each completion. The callback is called inline from
+    /// the poll loop for maximum performance.
     ///
     /// Returns the number of completions processed.
-    #[deprecated(note = "Use poll_send_completions() instead")]
+    pub fn poll_recv_cq(&self) -> usize {
+        let count = self.recv_cq.poll();
+        self.recv_cq.flush();
+        if count > 0 {
+            let pending = self.pending_recvs.get();
+            self.pending_recvs.set(pending.saturating_sub(count as u32));
+        }
+        count as usize
+    }
+
+    /// Poll the send CQ and dispatch completions.
+    ///
+    /// Returns the number of completions processed.
     pub fn poll_send_cq(&self) -> usize {
         self.poll_send_completions().len()
     }
 
-    /// Poll the receive CQ and dispatch completions (legacy).
+    /// Poll both CQs.
     ///
-    /// Returns the number of completions processed.
-    #[deprecated(note = "Use poll_recv_completions() instead")]
-    pub fn poll_recv_cq(&self) -> usize {
-        self.poll_recv_completions().len()
-    }
-
-    /// Poll both CQs (legacy).
-    ///
-    /// Returns (send_completions, recv_completions).
-    #[deprecated(note = "Use poll_send_completions() and poll_recv_completions() instead")]
+    /// Returns (send_completions_count, recv_completions_count).
     pub fn poll(&self) -> (usize, usize) {
         let send_count = self.poll_send_completions().len();
-        let recv_count = self.poll_recv_completions().len();
+        let recv_count = self.poll_recv_cq();
         (send_count, recv_count)
     }
 
