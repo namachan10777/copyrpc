@@ -5,6 +5,7 @@ RUN apt-get update && apt-get install -y \
     make \
     wget \
     unzip \
+    fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 # Download and install IPSJ style files (UTF8 version)
@@ -17,6 +18,9 @@ RUN mkdir -p /usr/local/texlive/texmf-local/tex/latex/ipsj && \
     cp ipsj_v4-1/UTF8/*.bst /usr/local/texlive/texmf-local/tex/latex/ipsj/ && \
     rm -rf /tmp/* && \
     mktexlsr
+
+# Configure Japanese fonts
+RUN kanji-config-updmap-sys noto
 
 WORKDIR /workdir
 

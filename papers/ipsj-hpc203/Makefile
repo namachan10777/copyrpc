@@ -9,13 +9,13 @@ all: build
 docker-build:
 	docker build -t $(DOCKER_IMAGE) .
 
-# Build PDF using Docker
+# Build PDF using Docker (pLaTeX + dvipdfmx)
 build: docker-build
-	$(DOCKER_RUN) latexmk -pdf main.tex
+	$(DOCKER_RUN) latexmk main.tex
 
 # Watch for changes and rebuild
 watch: docker-build
-	$(DOCKER_RUN) latexmk -pdf -pvc main.tex
+	$(DOCKER_RUN) latexmk -pvc main.tex
 
 # Clean auxiliary files
 clean:
