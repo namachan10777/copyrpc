@@ -1,0 +1,30 @@
+[build]
+executable = "docker"
+args = [
+  "compose",
+  "-f",
+  "papers/ipsj-hpc203/docker-compose.yml",
+  "run",
+  "--rm",
+  "latex",
+  "latexmk",
+  "-cd",
+  "/workspace/papers/ipsj-hpc203/%f"
+]
+onSave = true
+forwardSearchAfter = false
+
+[forwardSearch]
+executable = ""
+args = []
+
+[chktex]
+onOpenAndSave = false
+onEdit = false
+
+[diagnostics]
+allowedPatterns = []
+ignoredPatterns = ["Expecting a curly bracket: \"}\""]
+
+[formatting]
+lineLength = 80
