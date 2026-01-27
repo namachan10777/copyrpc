@@ -28,7 +28,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use fastant::Instant;
+use minstant::Instant;
 
 use mlx5::cq::{Cq, Cqe};
 use mlx5::device::Context;
