@@ -67,7 +67,7 @@ impl BenchConfig {
         Self {
             client_core: env_or("SCALERPC_CLIENT_CORE", 0),
             server_core: env_or("SCALERPC_SERVER_CORE", 1),
-            num_slots: env_or("SCALERPC_NUM_SLOTS", 1024),
+            num_slots: env_or("SCALERPC_NUM_SLOTS", 256),
             pipeline_depth: env_or("SCALERPC_PIPELINE_DEPTH", 16),
             num_qps: env_or("SCALERPC_NUM_QPS", 64),
             num_groups: env_or("SCALERPC_NUM_GROUPS", 4),
