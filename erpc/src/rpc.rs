@@ -86,14 +86,40 @@ where
     recv_repost_threshold: usize,
     /// Reusable buffer for batch recv posting to avoid allocation.
     recv_post_buf: RefCell<Vec<(usize, u64, u32, u32)>>,
+    /// Reusable buffer for expired timers to avoid allocation in event loop.
+    expired_timers: RefCell<Vec<TimerEntry>>,
 }
 
 /// Pending request state.
 struct PendingRequest<U> {
     /// User data to pass to on_response callback.
     user_data: Option<U>,
-    /// Request buffer indices for all packets (for retransmission).
-    req_buf_indices: Vec<usize>,
+    /// Single packet buffer index (avoids Vec allocation for 99% of requests).
+    single_buf_idx: Option<usize>,
+    /// Multi-packet buffer indices (only allocated for large requests).
+    multi_buf_indices: Option<Vec<usize>>,
+}
+
+impl<U> PendingRequest<U> {
+    /// Create a new pending request for a single-packet request.
+    #[inline]
+    fn new_single(user_data: U, buf_idx: usize) -> Self {
+        Self {
+            user_data: Some(user_data),
+            single_buf_idx: Some(buf_idx),
+            multi_buf_indices: None,
+        }
+    }
+
+    /// Create a new pending request for a multi-packet request.
+    #[inline]
+    fn new_multi(user_data: U, buf_indices: Vec<usize>) -> Self {
+        Self {
+            user_data: Some(user_data),
+            single_buf_idx: None,
+            multi_buf_indices: Some(buf_indices),
+        }
+    }
 }
 
 /// Buffer index for tracking allocated send buffers.
@@ -146,6 +172,7 @@ impl<U: 'static> Rpc<U> {
             posted_recv_count: Cell::new(0),
             recv_repost_threshold,
             recv_post_buf: RefCell::new(Vec::with_capacity(num_recv_buffers)),
+            expired_timers: RefCell::new(Vec::new()),
         };
 
         // Post initial receive buffers
@@ -370,30 +397,82 @@ impl<U: 'static> Rpc<U> {
         let data_per_pkt = self.mtu - PKT_HDR_SIZE;
         let num_pkts = PktHdr::calc_num_pkts(msg_size, self.mtu);
 
-        // Allocate and prepare buffers for all packets
+        // Get timestamp once for this call
+        let now = current_time_us();
+
+        // Single-packet fast path (99% of requests)
+        if num_pkts == 1 {
+            let hdr = PktHdr::new(
+                req_type,
+                msg_size,
+                remote_session_num,
+                PktType::ReqForResp,
+                0,
+                req_num,
+            );
+
+            let buf_idx = self.prepare_send_buffer(data, &hdr)?.idx;
+
+            // Post send
+            {
+                let send_buffers = self.send_buffers.borrow();
+                let lkey = send_buffers.lkey();
+                let pkt_len = (PKT_HDR_SIZE + msg_size) as u32;
+                let entry = TransportEntry {
+                    buf_idx,
+                    session_num: session.session_num(),
+                    context: req_num,
+                    buf_type: BufferType::Request,
+                };
+                let addr = send_buffers.slot_addr(buf_idx);
+                self.transport.post_send_raw(av, addr, pkt_len, lkey, entry)?;
+            }
+
+            // Update session state and start timer
+            {
+                let timer_entry = TimerEntry {
+                    session_num: session.session_num(),
+                    sslot_idx,
+                    req_num,
+                    expires_at: now + self.config.rto_us,
+                };
+                let wheel_slot = self.timing_wheel.borrow_mut().insert(timer_entry);
+
+                let mut sessions = self.sessions.borrow_mut();
+                let sess = sessions.get_mut(session).unwrap();
+                let sslot = sess.sslot_mut(sslot_idx).unwrap();
+
+                // Use single-packet pending request (no Vec allocation)
+                let pending = PendingRequest::new_single(user_data, buf_idx);
+                sslot.start_request(req_num, req_type, pending);
+                sslot.req_msg_size = msg_size;
+                sslot.req_num_pkts = 1;
+                sslot.req_pkts_sent = 1;
+                sslot.tx_ts = now;
+                sslot.timer_wheel_slot = wheel_slot;
+                sslot.wait_response(1);
+            }
+
+            self.update_next_send_time(session, msg_size + PKT_HDR_SIZE, now);
+            return Ok(req_num);
+        }
+
+        // Multi-packet path (rare, large requests)
         let mut buf_indices = Vec::with_capacity(num_pkts as usize);
         for pkt_num in 0..num_pkts {
             let offset = (pkt_num as usize) * data_per_pkt;
             let pkt_data_len = if pkt_num == num_pkts - 1 {
-                // Last packet
                 msg_size.saturating_sub(offset)
             } else {
                 data_per_pkt
             };
             let pkt_data = &data[offset..offset + pkt_data_len];
 
-            // Determine packet type
-            let pkt_type = if num_pkts == 1 {
-                PktType::ReqForResp
-            } else {
-                PktType::Req
-            };
-
             let hdr = PktHdr::new(
                 req_type,
                 msg_size,
                 remote_session_num,
-                pkt_type,
+                PktType::Req,
                 pkt_num,
                 req_num,
             );
@@ -402,7 +481,7 @@ impl<U: 'static> Rpc<U> {
             buf_indices.push(buf_info.idx);
         }
 
-        // Phase 3: Post send for all packets (single borrow for send_buffers)
+        // Post send for all packets
         {
             let send_buffers = self.send_buffers.borrow();
             let lkey = send_buffers.lkey();
@@ -412,19 +491,15 @@ impl<U: 'static> Rpc<U> {
                     buf_idx,
                     session_num: session.session_num(),
                     context: req_num,
-                    buf_type: BufferType::Request, // Keep until response received
+                    buf_type: BufferType::Request,
                 };
-
                 let addr = send_buffers.slot_addr(buf_idx);
                 self.transport.post_send_raw(av, addr, pkt_len, lkey, entry)?;
             }
         }
-        // Doorbell is batched in run_event_loop_once()
 
-        // Phase 4: Update session state and start timer (single borrow)
-        let now = current_time_us();
+        // Update session state and start timer
         {
-            // Start timer first to get wheel_slot
             let timer_entry = TimerEntry {
                 session_num: session.session_num(),
                 sslot_idx,
@@ -435,23 +510,19 @@ impl<U: 'static> Rpc<U> {
 
             let mut sessions = self.sessions.borrow_mut();
             let sess = sessions.get_mut(session).unwrap();
-
             let sslot = sess.sslot_mut(sslot_idx).unwrap();
-            // Store buf_indices in pending request (moved, not cloned)
-            let pending = PendingRequest {
-                user_data: Some(user_data),
-                req_buf_indices: buf_indices,
-            };
+
+            // Use multi-packet pending request
+            let pending = PendingRequest::new_multi(user_data, buf_indices);
             sslot.start_request(req_num, req_type, pending);
             sslot.req_msg_size = msg_size;
             sslot.req_num_pkts = num_pkts;
             sslot.req_pkts_sent = num_pkts;
             sslot.tx_ts = now;
             sslot.timer_wheel_slot = wheel_slot;
-            sslot.wait_response(1); // Will be updated when response arrives
+            sslot.wait_response(1);
         }
 
-        // Update next send time based on Timely rate
         self.update_next_send_time(session, msg_size + PKT_HDR_SIZE * (num_pkts as usize), now);
 
         Ok(req_num)
@@ -756,7 +827,8 @@ impl<U: 'static> Rpc<U> {
                 self.posted_recv_count.set(self.posted_recv_count.get().saturating_sub(1));
             }
             PktType::Resp => {
-                // Response packets: copy payload and free buffer immediately
+                // Response packets: copy payload and free buffer, then process
+                // Copy is required to avoid holding recv_buffers borrow during callback
                 let payload = {
                     let recv_buffers = self.recv_buffers.borrow();
                     let buf_ptr = recv_buffers.slot_ptr(buf_idx);
@@ -777,7 +849,18 @@ impl<U: 'static> Rpc<U> {
                 };
                 self.recv_buffers.borrow_mut().free(buf_idx);
                 self.posted_recv_count.set(self.posted_recv_count.get().saturating_sub(1));
-                self.handle_response(&hdr, &payload, batch_ts)?;
+
+                // Check if single-packet response (most common case)
+                let msg_size = hdr.msg_size();
+                let num_pkts = PktHdr::calc_num_pkts(msg_size, self.mtu);
+
+                if num_pkts == 1 {
+                    // Single-packet response: optimized path
+                    self.handle_response_single_packet(&hdr, &payload, batch_ts)?;
+                } else {
+                    // Multi-packet response: reassembly path
+                    self.handle_response_multi_packet(&hdr, &payload, batch_ts)?;
+                }
             }
             PktType::CreditReturn => {
                 // Free buffer immediately for credit return
@@ -931,100 +1014,126 @@ impl<U: 'static> Rpc<U> {
         Ok(())
     }
 
-    /// Handle an incoming response.
-    fn handle_response(&self, hdr: &PktHdr, payload: &[u8], batch_ts: u64) -> Result<()> {
+    /// Handle a single-packet response.
+    #[inline]
+    fn handle_response_single_packet(
+        &self,
+        hdr: &PktHdr,
+        payload: &[u8],
+        batch_ts: u64,
+    ) -> Result<()> {
         let dest_session = hdr.dest_session_num();
-        let pkt_num = hdr.pkt_num();
-        let msg_size = hdr.msg_size();
-        let num_pkts = PktHdr::calc_num_pkts(msg_size, self.mtu);
 
-        let (is_complete, user_data, data, req_buf_indices) = {
+        let pending = {
             let mut sessions = self.sessions.borrow_mut();
             let handle = SessionHandle(dest_session);
             let sess = sessions.get_mut(handle).ok_or(Error::SessionNotFound(dest_session))?;
 
             // Find the matching slot
-            // Note: Slot may not be found if this is a duplicate response after
-            // the original response was already processed. This is normal behavior.
             let sslot_idx = match sess.find_sslot_by_req_num(hdr.req_num()) {
                 Some(idx) => idx,
                 None => return Ok(()), // Silently drop duplicate/stale response
             };
 
-            // For multi-packet responses
-            if num_pkts > 1 {
-                // Get the slot and process
-                {
-                    let sslot = sess.sslot_mut(sslot_idx).unwrap();
+            // Return credit
+            sess.return_credit();
 
-                    // Initialize response buffer on first packet
-                    if sslot.resp_buf.is_none() {
-                        sslot.init_resp_buf(msg_size, num_pkts);
-                    }
+            // Get the slot and extract user_data
+            let sslot = sess.sslot_mut(sslot_idx).unwrap();
 
-                    // Copy payload to reassembly buffer
-                    let data_per_pkt = self.mtu - PKT_HDR_SIZE;
-                    let offset = (pkt_num as usize) * data_per_pkt;
+            // Cancel the retransmission timer (fast path with known wheel_slot)
+            if let Some(wheel_slot) = sslot.timer_wheel_slot {
+                self.timing_wheel.borrow_mut().cancel_fast(wheel_slot, hdr.req_num());
+            }
 
-                    if let Some(buf) = sslot.resp_buf_mut() {
-                        let copy_len = payload.len().min(buf.len().saturating_sub(offset));
-                        if copy_len > 0 && offset < buf.len() {
-                            buf[offset..offset + copy_len].copy_from_slice(&payload[..copy_len]);
-                        }
-                    }
+            let tx_ts = sslot.tx_ts;
+            let pending = sslot.user_data.take();
 
-                    // Record received packet
-                    if !sslot.record_recv_pkt(pkt_num) {
-                        // Duplicate packet, ignore
-                        return Ok(());
+            // Mark slot as free
+            sslot.reset();
+
+            // Update Timely congestion control with RTT measurement
+            if tx_ts > 0 {
+                let rtt = batch_ts.saturating_sub(tx_ts);
+                if let Some(ref cc_state) = sess.cc_state {
+                    cc_state.update(rtt);
+                }
+            }
+
+            pending
+        };
+
+        // Free request buffers now that response is received
+        if let Some(ref p) = pending {
+            let mut send_buffers = self.send_buffers.borrow_mut();
+            if let Some(idx) = p.single_buf_idx {
+                send_buffers.free(idx);
+            }
+        }
+
+        // Call callback
+        if let Some(p) = pending {
+            if let Some(ud) = p.user_data {
+                (self.on_response)(ud, payload);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle a multi-packet response.
+    fn handle_response_multi_packet(&self, hdr: &PktHdr, payload: &[u8], batch_ts: u64) -> Result<()> {
+        let dest_session = hdr.dest_session_num();
+        let pkt_num = hdr.pkt_num();
+        let msg_size = hdr.msg_size();
+        let num_pkts = PktHdr::calc_num_pkts(msg_size, self.mtu);
+
+        let (is_complete, pending, data) = {
+            let mut sessions = self.sessions.borrow_mut();
+            let handle = SessionHandle(dest_session);
+            let sess = sessions.get_mut(handle).ok_or(Error::SessionNotFound(dest_session))?;
+
+            // Find the matching slot
+            let sslot_idx = match sess.find_sslot_by_req_num(hdr.req_num()) {
+                Some(idx) => idx,
+                None => return Ok(()), // Silently drop duplicate/stale response
+            };
+
+            // Get the slot and process
+            {
+                let sslot = sess.sslot_mut(sslot_idx).unwrap();
+
+                // Initialize response buffer on first packet
+                if sslot.resp_buf.is_none() {
+                    sslot.init_resp_buf(msg_size, num_pkts);
+                }
+
+                // Copy payload to reassembly buffer
+                let data_per_pkt = self.mtu - PKT_HDR_SIZE;
+                let offset = (pkt_num as usize) * data_per_pkt;
+
+                if let Some(buf) = sslot.resp_buf_mut() {
+                    let copy_len = payload.len().min(buf.len().saturating_sub(offset));
+                    if copy_len > 0 && offset < buf.len() {
+                        buf[offset..offset + copy_len].copy_from_slice(&payload[..copy_len]);
                     }
                 }
 
-                // Check completion after releasing sslot borrow
-                let is_complete = sess.sslot(sslot_idx).unwrap().is_response_complete();
-
-                if is_complete {
-                    // Return credit
-                    sess.return_credit();
-
-                    // Get the slot again and extract data
-                    let sslot = sess.sslot_mut(sslot_idx).unwrap();
-
-                    // Cancel the retransmission timer (fast path with known wheel_slot)
-                    if let Some(wheel_slot) = sslot.timer_wheel_slot {
-                        self.timing_wheel.borrow_mut().cancel_fast(wheel_slot, hdr.req_num());
-                    }
-
-                    let tx_ts = sslot.tx_ts;
-                    let pending = sslot.user_data.take();
-                    let resp_data = sslot.take_resp_buf();
-
-                    // Extract request buffer indices and user_data from pending
-                    let (ud, req_bufs) = pending
-                        .map(|p| (p.user_data, p.req_buf_indices))
-                        .unwrap_or((None, Vec::new()));
-
-                    // Mark slot as free
-                    sslot.reset();
-
-                    // Update Timely congestion control with RTT measurement
-                    if tx_ts > 0 {
-                        let rtt = batch_ts.saturating_sub(tx_ts);
-                        if let Some(ref cc_state) = sess.cc_state {
-                            cc_state.update(rtt);
-                        }
-                    }
-
-                    (true, ud, resp_data, req_bufs)
-                } else {
-                    (false, None, None, Vec::new())
+                // Record received packet
+                if !sslot.record_recv_pkt(pkt_num) {
+                    // Duplicate packet, ignore
+                    return Ok(());
                 }
-            } else {
-                // Single-packet response
+            }
+
+            // Check completion after releasing sslot borrow
+            let is_complete = sess.sslot(sslot_idx).unwrap().is_response_complete();
+
+            if is_complete {
                 // Return credit
                 sess.return_credit();
 
-                // Get the slot and extract user_data
+                // Get the slot again and extract data
                 let sslot = sess.sslot_mut(sslot_idx).unwrap();
 
                 // Cancel the retransmission timer (fast path with known wheel_slot)
@@ -1034,11 +1143,7 @@ impl<U: 'static> Rpc<U> {
 
                 let tx_ts = sslot.tx_ts;
                 let pending = sslot.user_data.take();
-
-                // Extract request buffer indices and user_data from pending
-                let (ud, req_bufs) = pending
-                    .map(|p| (p.user_data, p.req_buf_indices))
-                    .unwrap_or((None, Vec::new()));
+                let resp_data = sslot.take_resp_buf();
 
                 // Mark slot as free
                 sslot.reset();
@@ -1051,27 +1156,34 @@ impl<U: 'static> Rpc<U> {
                     }
                 }
 
-                (true, ud, None, req_bufs)
+                (true, pending, resp_data)
+            } else {
+                (false, None, None)
             }
         };
 
         // Free all request buffers now that response is received
-        {
+        if let Some(ref p) = pending {
             let mut send_buffers = self.send_buffers.borrow_mut();
-            for buf_idx in req_buf_indices {
-                send_buffers.free(buf_idx);
+            // Free single buffer (common case, no iteration overhead)
+            if let Some(idx) = p.single_buf_idx {
+                send_buffers.free(idx);
+            }
+            // Free multi-packet buffers
+            if let Some(ref indices) = p.multi_buf_indices {
+                for &idx in indices {
+                    send_buffers.free(idx);
+                }
             }
         }
 
         // Call on_response callback outside of borrow
         if is_complete {
-            if let Some(ud) = user_data {
-                if let Some(resp_data) = data {
-                    // Multi-packet response
-                    (self.on_response)(ud, &resp_data);
-                } else {
-                    // Single-packet response
-                    (self.on_response)(ud, payload);
+            if let Some(p) = pending {
+                if let Some(ud) = p.user_data {
+                    if let Some(resp_data) = data {
+                        (self.on_response)(ud, &resp_data);
+                    }
                 }
             }
         }
@@ -1091,16 +1203,20 @@ impl<U: 'static> Rpc<U> {
 
     /// Process retransmission timeouts.
     fn process_timeouts(&self, batch_ts: u64) {
-        let expired = self.timing_wheel.borrow_mut().advance(batch_ts);
+        // Use pre-allocated buffer to avoid allocation in hot path
+        let mut expired = self.expired_timers.borrow_mut();
+        expired.clear();
+        self.timing_wheel.borrow_mut().advance_into(batch_ts, &mut expired);
 
-        for entry in expired {
+        for entry in expired.drain(..) {
             self.handle_timeout(entry, batch_ts);
         }
     }
 
     /// Handle a single timeout.
     fn handle_timeout(&self, entry: TimerEntry, now: u64) {
-        let should_retransmit: Option<Vec<usize>> = {
+        // For retransmit: (single_buf_idx, multi_buf_indices)
+        let should_retransmit: Option<(Option<usize>, Option<Vec<usize>>)> = {
             let mut sessions = self.sessions.borrow_mut();
             let handle = SessionHandle(entry.session_num);
 
@@ -1118,14 +1234,21 @@ impl<U: 'static> Rpc<U> {
 
                             if let Some(p) = pending {
                                 let mut send_buffers = self.send_buffers.borrow_mut();
-                                for buf_idx in p.req_buf_indices {
-                                    send_buffers.free(buf_idx);
+                                if let Some(idx) = p.single_buf_idx {
+                                    send_buffers.free(idx);
+                                }
+                                if let Some(indices) = p.multi_buf_indices {
+                                    for idx in indices {
+                                        send_buffers.free(idx);
+                                    }
                                 }
                             }
                             None
                         } else {
                             // Need to retransmit all request packets
-                            sslot.user_data.as_ref().map(|p| p.req_buf_indices.clone())
+                            sslot.user_data.as_ref().map(|p| {
+                                (p.single_buf_idx, p.multi_buf_indices.clone())
+                            })
                         }
                     } else {
                         None
@@ -1139,9 +1262,63 @@ impl<U: 'static> Rpc<U> {
         };
 
         // Retransmit if needed
-        if let Some(req_buf_indices) = should_retransmit {
-            let _ = self.retransmit(entry.session_num, &req_buf_indices, entry.sslot_idx, entry.req_num, now);
+        if let Some((single_idx, multi_indices)) = should_retransmit {
+            // Single-packet fast path
+            if let Some(idx) = single_idx {
+                let _ = self.retransmit_single(entry.session_num, idx, entry.sslot_idx, entry.req_num, now);
+            }
+            // Multi-packet path
+            if let Some(ref indices) = multi_indices {
+                let _ = self.retransmit(entry.session_num, indices, entry.sslot_idx, entry.req_num, now);
+            }
         }
+    }
+
+    /// Retransmit a single-packet request.
+    fn retransmit_single(&self, session_num: u16, buf_idx: usize, sslot_idx: usize, req_num: u64, now: u64) -> Result<()> {
+        let av = {
+            let sessions = self.sessions.borrow();
+            let handle = SessionHandle(session_num);
+            let sess = sessions.get(handle).ok_or(Error::SessionNotFound(session_num))?;
+            let ah = sess.ah.as_ref().ok_or(Error::SessionNotConnected(session_num))?;
+            UdTransport::ah_to_av(ah)
+        };
+
+        {
+            let send_buffers = self.send_buffers.borrow();
+            let lkey = send_buffers.lkey();
+            let pkt_len = self.mtu as u32;
+            let entry = TransportEntry {
+                buf_idx,
+                session_num,
+                context: req_num,
+                buf_type: BufferType::Request,
+            };
+            let addr = send_buffers.slot_addr(buf_idx);
+            self.transport.post_send_raw(av, addr, pkt_len, lkey, entry)?;
+        }
+
+        // Re-arm timer
+        let timer_entry = TimerEntry {
+            session_num,
+            sslot_idx,
+            req_num,
+            expires_at: now + self.config.rto_us,
+        };
+        let wheel_slot = self.timing_wheel.borrow_mut().insert(timer_entry);
+
+        // Update timer_wheel_slot in sslot
+        {
+            let mut sessions = self.sessions.borrow_mut();
+            let handle = SessionHandle(session_num);
+            if let Some(sess) = sessions.get_mut(handle) {
+                if let Some(sslot) = sess.sslot_mut(sslot_idx) {
+                    sslot.timer_wheel_slot = wheel_slot;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Retransmit all packets of a request.

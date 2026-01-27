@@ -94,12 +94,22 @@ impl TimingWheel {
 
     /// Advance the wheel to the given timestamp.
     ///
-    /// Returns an iterator over expired entries.
+    /// Returns a Vec of expired entries (allocates on each call).
+    /// For hot paths, prefer `advance_into` which reuses a pre-allocated buffer.
     pub fn advance(&mut self, ts: u64) -> Vec<TimerEntry> {
         let mut expired = Vec::new();
+        self.advance_into(ts, &mut expired);
+        expired
+    }
 
+    /// Advance the wheel to the given timestamp, pushing expired entries into `out`.
+    ///
+    /// This avoids allocation by reusing the caller's buffer.
+    /// The buffer is NOT cleared; caller should clear it before calling if needed.
+    #[inline]
+    pub fn advance_into(&mut self, ts: u64, out: &mut Vec<TimerEntry>) {
         if ts <= self.current_ts {
-            return expired;
+            return;
         }
 
         // Calculate how many slots to advance
@@ -110,7 +120,7 @@ impl TimingWheel {
             // Drain current slot
             while let Some(entry) = self.slots[self.current_slot].pop_front() {
                 if entry.expires_at <= ts {
-                    expired.push(entry);
+                    out.push(entry);
                 } else {
                     // Re-insert entries that haven't expired yet
                     // (can happen if slot_duration is large)
@@ -126,7 +136,6 @@ impl TimingWheel {
         }
 
         self.current_ts = ts;
-        expired
     }
 
     /// Cancel a timer entry (slow path, O(n) - searches all slots).
