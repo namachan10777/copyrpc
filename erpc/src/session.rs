@@ -4,7 +4,6 @@
 //! SSlots (session slots) track individual request/response transactions.
 
 use std::cell::Cell;
-use std::collections::HashMap;
 
 use mlx5::pd::AddressHandle;
 
@@ -86,6 +85,8 @@ pub struct SSlot<U> {
     pub req_pkts_sent: u16,
     /// Request buffer indices for all packets (for retransmission).
     pub req_buf_indices: Vec<usize>,
+    /// Timing wheel slot for O(1) timer cancellation.
+    pub timer_wheel_slot: Option<usize>,
 }
 
 impl<U> SSlot<U> {
@@ -111,6 +112,7 @@ impl<U> SSlot<U> {
             req_num_pkts: 0,
             req_pkts_sent: 0,
             req_buf_indices: Vec::new(),
+            timer_wheel_slot: None,
         }
     }
 
@@ -139,6 +141,7 @@ impl<U> SSlot<U> {
         self.req_num_pkts = 0;
         self.req_pkts_sent = 0;
         self.req_buf_indices.clear();
+        self.timer_wheel_slot = None;
     }
 
     /// Start a new request.
@@ -256,8 +259,6 @@ pub struct Session<U> {
     pub ah: Option<AddressHandle>,
     /// Session slots for concurrent requests.
     pub sslots: Vec<SSlot<U>>,
-    /// Fast lookup: req_num -> sslot index (O(1) instead of linear search).
-    req_num_to_sslot: HashMap<u64, usize>,
     /// Available credits for sending.
     pub credits: Cell<usize>,
     /// Next request number.
@@ -293,7 +294,6 @@ impl<U> Session<U> {
             remote,
             ah: None,
             sslots,
-            req_num_to_sslot: HashMap::with_capacity(req_window),
             credits: Cell::new(config.session_credits),
             next_req_num: Cell::new(0),
             cc_state,
@@ -325,16 +325,18 @@ impl<U> Session<U> {
         self.state = SessionState::Connected;
     }
 
-    /// Allocate a free SSlot.
+    /// Allocate an SSlot for a given request number.
     ///
-    /// Returns the slot index if a free slot is available.
-    pub fn alloc_sslot(&mut self) -> Option<usize> {
-        for (i, slot) in self.sslots.iter().enumerate() {
-            if slot.is_free() {
-                return Some(i);
-            }
+    /// Uses eRPC's fixed slot assignment: sslot_idx = req_num % req_window.
+    /// Returns the slot index if the slot is free, None if occupied.
+    #[inline]
+    pub fn alloc_sslot(&mut self, req_num: u64) -> Option<usize> {
+        let idx = (req_num % self.req_window as u64) as usize;
+        if self.sslots[idx].is_free() {
+            Some(idx)
+        } else {
+            None
         }
-        None
     }
 
     /// Get a reference to an SSlot.
@@ -349,44 +351,17 @@ impl<U> Session<U> {
         self.sslots.get_mut(idx)
     }
 
-    /// Threshold for using HashMap vs linear search.
-    /// For small req_window, linear search is faster due to better cache locality.
-    /// Set to 8 to enable HashMap for req_window > 8 (most concurrent workloads).
-    const HASHMAP_THRESHOLD: usize = 8;
-
     /// Find an SSlot by request number.
-    /// Uses linear search for small req_window, HashMap for larger.
+    ///
+    /// Uses eRPC's fixed slot assignment: sslot_idx = req_num % req_window.
+    /// O(1) lookup without HashMap.
     #[inline]
     pub fn find_sslot_by_req_num(&self, req_num: u64) -> Option<usize> {
-        if self.req_window <= Self::HASHMAP_THRESHOLD {
-            // Linear search for small req_window (better cache locality)
-            for (i, slot) in self.sslots.iter().enumerate() {
-                if !slot.is_free() && slot.req_num == req_num {
-                    return Some(i);
-                }
-            }
-            None
+        let idx = (req_num % self.req_window as u64) as usize;
+        if !self.sslots[idx].is_free() && self.sslots[idx].req_num == req_num {
+            Some(idx)
         } else {
-            // HashMap lookup for large req_window (O(1))
-            self.req_num_to_sslot.get(&req_num).copied()
-        }
-    }
-
-    /// Register a request number to sslot mapping.
-    /// Only used when req_window > HASHMAP_THRESHOLD.
-    #[inline]
-    pub fn register_req_num(&mut self, req_num: u64, sslot_idx: usize) {
-        if self.req_window > Self::HASHMAP_THRESHOLD {
-            self.req_num_to_sslot.insert(req_num, sslot_idx);
-        }
-    }
-
-    /// Unregister a request number mapping (call when slot is freed).
-    /// Only used when req_window > HASHMAP_THRESHOLD.
-    #[inline]
-    pub fn unregister_req_num(&mut self, req_num: u64) {
-        if self.req_window > Self::HASHMAP_THRESHOLD {
-            self.req_num_to_sslot.remove(&req_num);
+            None
         }
     }
 

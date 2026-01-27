@@ -348,14 +348,15 @@ impl<U: 'static> Rpc<U> {
                 return Err(Error::SessionNotConnected(session.session_num()));
             }
 
-            // Find a free slot
-            let sslot_idx = sess.alloc_sslot().ok_or(Error::NoAvailableSlots)?;
+            // Get request number first (eRPC pattern: sslot_idx = req_num % req_window)
+            let req_num = sess.next_req_num();
+
+            // Allocate slot using fixed assignment
+            let sslot_idx = sess.alloc_sslot(req_num).ok_or(Error::NoAvailableSlots)?;
 
             // Check credits
             sess.consume_credit()?;
 
-            // Get request number
-            let req_num = sess.next_req_num();
             let remote_session_num = sess.remote_session_num;
 
             // Get AV while we have the session borrowed
@@ -421,9 +422,18 @@ impl<U: 'static> Rpc<U> {
         }
         // Doorbell is batched in run_event_loop_once()
 
-        // Phase 4: Update session state (single borrow)
+        // Phase 4: Update session state and start timer (single borrow)
         let now = current_time_us();
         {
+            // Start timer first to get wheel_slot
+            let timer_entry = TimerEntry {
+                session_num: session.session_num(),
+                sslot_idx,
+                req_num,
+                expires_at: now + self.config.rto_us,
+            };
+            let wheel_slot = self.timing_wheel.borrow_mut().insert(timer_entry);
+
             let mut sessions = self.sessions.borrow_mut();
             let sess = sessions.get_mut(session).unwrap();
 
@@ -438,23 +448,12 @@ impl<U: 'static> Rpc<U> {
             sslot.req_num_pkts = num_pkts;
             sslot.req_pkts_sent = num_pkts;
             sslot.tx_ts = now;
+            sslot.timer_wheel_slot = wheel_slot;
             sslot.wait_response(1); // Will be updated when response arrives
-
-            // Register req_num -> sslot_idx for O(1) lookup
-            sess.register_req_num(req_num, sslot_idx);
         }
 
         // Update next send time based on Timely rate
         self.update_next_send_time(session, msg_size + PKT_HDR_SIZE * (num_pkts as usize));
-
-        // Phase 5: Start timer
-        let timer_entry = TimerEntry {
-            session_num: session.session_num(),
-            sslot_idx,
-            req_num,
-            expires_at: now + self.config.rto_us,
-        };
-        self.timing_wheel.borrow_mut().insert(timer_entry);
 
         Ok(req_num)
     }
@@ -694,7 +693,7 @@ impl<U: 'static> Rpc<U> {
 
     /// Process a received packet.
     #[inline]
-    fn process_recv(&self, buf_idx: usize, byte_cnt: u32) -> Result<()> {
+    fn process_recv(&self, buf_idx: usize, byte_cnt: u32, batch_ts: u64) -> Result<()> {
         // Validate packet size and read header (zero-copy)
         let hdr = {
             let recv_buffers = self.recv_buffers.borrow();
@@ -779,7 +778,7 @@ impl<U: 'static> Rpc<U> {
                 };
                 self.recv_buffers.borrow_mut().free(buf_idx);
                 self.posted_recv_count.set(self.posted_recv_count.get().saturating_sub(1));
-                self.handle_response(&hdr, &payload)?;
+                self.handle_response(&hdr, &payload, batch_ts)?;
             }
             PktType::CreditReturn => {
                 // Free buffer immediately for credit return
@@ -934,7 +933,7 @@ impl<U: 'static> Rpc<U> {
     }
 
     /// Handle an incoming response.
-    fn handle_response(&self, hdr: &PktHdr, payload: &[u8]) -> Result<()> {
+    fn handle_response(&self, hdr: &PktHdr, payload: &[u8], batch_ts: u64) -> Result<()> {
         let dest_session = hdr.dest_session_num();
         let pkt_num = hdr.pkt_num();
         let msg_size = hdr.msg_size();
@@ -986,20 +985,18 @@ impl<U: 'static> Rpc<U> {
                 let is_complete = sess.sslot(sslot_idx).unwrap().is_response_complete();
 
                 if is_complete {
-                    // Cancel the retransmission timer
-                    self.timing_wheel.borrow_mut().cancel(
-                        dest_session,
-                        sslot_idx,
-                        hdr.req_num(),
-                    );
-
                     // Return credit
                     sess.return_credit();
 
                     // Get the slot again and extract data
                     let sslot = sess.sslot_mut(sslot_idx).unwrap();
+
+                    // Cancel the retransmission timer (fast path with known wheel_slot)
+                    if let Some(wheel_slot) = sslot.timer_wheel_slot {
+                        self.timing_wheel.borrow_mut().cancel_fast(wheel_slot, hdr.req_num());
+                    }
+
                     let tx_ts = sslot.tx_ts;
-                    let req_num_for_unregister = sslot.req_num;
                     let pending = sslot.user_data.take();
                     let resp_data = sslot.take_resp_buf();
 
@@ -1011,12 +1008,9 @@ impl<U: 'static> Rpc<U> {
                     // Mark slot as free
                     sslot.reset();
 
-                    // Unregister req_num from HashMap
-                    sess.unregister_req_num(req_num_for_unregister);
-
                     // Update Timely congestion control with RTT measurement
                     if tx_ts > 0 {
-                        let rtt = current_time_us().saturating_sub(tx_ts);
+                        let rtt = batch_ts.saturating_sub(tx_ts);
                         if let Some(ref cc_state) = sess.cc_state {
                             cc_state.update(rtt);
                         }
@@ -1028,20 +1022,18 @@ impl<U: 'static> Rpc<U> {
                 }
             } else {
                 // Single-packet response
-                // Cancel the retransmission timer
-                self.timing_wheel.borrow_mut().cancel(
-                    dest_session,
-                    sslot_idx,
-                    hdr.req_num(),
-                );
-
                 // Return credit
                 sess.return_credit();
 
                 // Get the slot and extract user_data
                 let sslot = sess.sslot_mut(sslot_idx).unwrap();
+
+                // Cancel the retransmission timer (fast path with known wheel_slot)
+                if let Some(wheel_slot) = sslot.timer_wheel_slot {
+                    self.timing_wheel.borrow_mut().cancel_fast(wheel_slot, hdr.req_num());
+                }
+
                 let tx_ts = sslot.tx_ts;
-                let req_num_for_unregister = sslot.req_num;
                 let pending = sslot.user_data.take();
 
                 // Extract request buffer indices and user_data from pending
@@ -1052,12 +1044,9 @@ impl<U: 'static> Rpc<U> {
                 // Mark slot as free
                 sslot.reset();
 
-                // Unregister req_num from HashMap
-                sess.unregister_req_num(req_num_for_unregister);
-
                 // Update Timely congestion control with RTT measurement
                 if tx_ts > 0 {
-                    let rtt = current_time_us().saturating_sub(tx_ts);
+                    let rtt = batch_ts.saturating_sub(tx_ts);
                     if let Some(ref cc_state) = sess.cc_state {
                         cc_state.update(rtt);
                     }
@@ -1102,12 +1091,11 @@ impl<U: 'static> Rpc<U> {
     }
 
     /// Process retransmission timeouts.
-    fn process_timeouts(&self) {
-        let now = current_time_us();
-        let expired = self.timing_wheel.borrow_mut().advance(now);
+    fn process_timeouts(&self, batch_ts: u64) {
+        let expired = self.timing_wheel.borrow_mut().advance(batch_ts);
 
         for entry in expired {
-            self.handle_timeout(entry, now);
+            self.handle_timeout(entry, batch_ts);
         }
     }
 
@@ -1128,9 +1116,6 @@ impl<U: 'static> Rpc<U> {
                             // (timeout failure case)
                             let pending = sslot.user_data.take();
                             sslot.reset();
-
-                            // Unregister req_num from HashMap
-                            sess.unregister_req_num(entry.req_num);
 
                             if let Some(p) = pending {
                                 let mut send_buffers = self.send_buffers.borrow_mut();
@@ -1191,14 +1176,25 @@ impl<U: 'static> Rpc<U> {
         }
         // Doorbell is batched in run_event_loop_once()
 
-        // Re-arm timer
+        // Re-arm timer and update wheel_slot in sslot
         let timer_entry = TimerEntry {
             session_num,
             sslot_idx,
             req_num,
             expires_at: now + self.config.rto_us,
         };
-        self.timing_wheel.borrow_mut().insert(timer_entry);
+        let wheel_slot = self.timing_wheel.borrow_mut().insert(timer_entry);
+
+        // Update timer_wheel_slot in sslot for next cancel_fast
+        {
+            let mut sessions = self.sessions.borrow_mut();
+            let handle = SessionHandle(session_num);
+            if let Some(sess) = sessions.get_mut(handle) {
+                if let Some(sslot) = sess.sslot_mut(sslot_idx) {
+                    sslot.timer_wheel_slot = wheel_slot;
+                }
+            }
+        }
 
         Ok(())
     }
@@ -1209,6 +1205,9 @@ impl<U: 'static> Rpc<U> {
     #[inline]
     pub fn run_event_loop_once(&self) -> usize {
         let mut events = 0;
+
+        // Get batch timestamp once for all operations in this iteration
+        let batch_ts = current_time_us();
 
         // Poll and process send completions
         // Request buffers are kept until response is received (for retransmission)
@@ -1226,7 +1225,7 @@ impl<U: 'static> Rpc<U> {
         // Poll and process receive completions
         events += self.transport.poll_recv_completions(|comps| {
             for comp in comps {
-                if let Err(e) = self.process_recv(comp.buf_idx, comp.byte_cnt) {
+                if let Err(e) = self.process_recv(comp.buf_idx, comp.byte_cnt, batch_ts) {
                     eprintln!("process_recv error: {:?}", e);
                 }
             }
@@ -1239,7 +1238,7 @@ impl<U: 'static> Rpc<U> {
         }
 
         // Process timeouts
-        self.process_timeouts();
+        self.process_timeouts(batch_ts);
 
         // Batch doorbell: ring doorbells only if there are pending operations
         if self.transport.pending_sends() > 0 {

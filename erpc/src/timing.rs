@@ -129,9 +129,10 @@ impl TimingWheel {
         expired
     }
 
-    /// Cancel a timer entry.
+    /// Cancel a timer entry (slow path, O(n) - searches all slots).
     ///
     /// Returns true if the entry was found and removed.
+    /// Prefer `cancel_fast()` when the wheel_slot is known.
     pub fn cancel(&mut self, session_num: u16, sslot_idx: usize, req_num: u64) -> bool {
         for slot in &mut self.slots {
             if let Some(pos) = slot.iter().position(|e| {
@@ -140,6 +141,21 @@ impl TimingWheel {
                 slot.remove(pos);
                 return true;
             }
+        }
+        false
+    }
+
+    /// Cancel a timer entry with known wheel slot (fast path, O(k) where k = entries in slot).
+    ///
+    /// Returns true if the entry was found and removed.
+    #[inline]
+    pub fn cancel_fast(&mut self, wheel_slot: usize, req_num: u64) -> bool {
+        if wheel_slot >= self.num_slots {
+            return false;
+        }
+        if let Some(pos) = self.slots[wheel_slot].iter().position(|e| e.req_num == req_num) {
+            self.slots[wheel_slot].remove(pos);
+            return true;
         }
         false
     }
@@ -194,6 +210,7 @@ pub fn rdtsc() -> u64 {
 }
 
 /// Get current timestamp in microseconds.
+#[inline]
 pub fn current_time_us() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
