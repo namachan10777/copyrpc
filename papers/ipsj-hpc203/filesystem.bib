@@ -1,0 +1,1846 @@
+@article{agrawalFiveyearStudyFilesystem2007,
+  title = {A Five-Year Study of File-System Metadata},
+  author = {Agrawal, Nitin and Bolosky, William J. and Douceur, John R. and Lorch, Jacob R.},
+  date = {2007-10},
+  journaltitle = {ACM Transactions on Storage},
+  shortjournal = {ACM Trans. Storage},
+  volume = {3},
+  number = {3},
+  pages = {9},
+  issn = {1553-3077, 1553-3093},
+  doi = {10.1145/1288783.1288788},
+  url = {https://dl.acm.org/doi/10.1145/1288783.1288788},
+  urldate = {2024-06-25},
+  abstract = {For five years, we collected annual snapshots of filesystem metadata from over 60,000 Windows PC file systems in a large corporation. In this paper, we use these snapshots to study temporal changes in file size, file age, file-type frequency, directory size, namespace structure, file-system population, storage capacity and consumption, and degree of file modification. We present a generative model that explains the namespace structure and the distribution of directory sizes. We find significant temporal trends relating to the popularity of certain file types, the origin of file content, the way the namespace is used, and the degree of variation among file systems, as well as more pedestrian changes in sizes and capacities. We give examples of consequent lessons for designers of file systems and related software.},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/UGD7UEA5/Agrawal et al. - 2007 - A five-year study of file-system metadata.pdf}
+}
+
+@article{aliSurveyWebCaching2011,
+  title = {A {{Survey}} of {{Web Caching}} and {{Prefetching A Survey}} of {{Web Caching}} and {{Prefetching}}},
+  author = {Ali, Waleed and Shamsuddin, Siti Mariyam and Ismail, Abdul Samad},
+  date = {2011-03-01},
+  journaltitle = {International Journal of Advances in Soft Computing and its Applications},
+  shortjournal = {International Journal of Advances in Soft Computing and its Applications},
+  volume = {3},
+  abstract = {Web caching and prefetching are the most popular techniques that play a key role in improving the Web performance by keeping web objects that are likely to be visited in the near future closer to the client. Web caching can work independently or integrated with the web prefetching. The Web caching and prefetching can complement each other since the web caching exploits the temporal locality for predicting revisiting requested objects, while the web prefetching utilizes the spatial locality for predicting next related web objects of the requested Web objects. This paper reviews principles and some existing web caching and prefetching approaches. The conventional and intelligent web caching techniques are investigated and discussed. Moreover, Web prefetching techniques are summarized and classified with comparison limitations of these approaches. This paper also presents and discusses some studies that take into consideration impact of integrating both web caching and web prefetching together.},
+  file = {/Users/mnakano/Zotero/storage/DDQGK5IH/Ali et al. - 2011 - A Survey of Web Caching and Prefetching A Survey o.pdf}
+}
+
+@book{associationforcomputingmachineryProceedings2013ACM2013,
+  title = {Proceedings of the 2013 {{ACM SIGPLAN Conference}} on {{Programming Language Design}} and {{Implementation}}, {{June}} 16 - 19, 2013, {{Seattle}}, {{Washington}}, {{USA}}},
+  editor = {{Association for Computing Machinery}},
+  date = {2013},
+  publisher = {ACM},
+  location = {New York, NY},
+  isbn = {978-1-4503-2014-6},
+  langid = {english},
+  pagetotal = {532},
+  file = {/Users/mnakano/Zotero/storage/T98H7UTL/Association for Computing Machinery - 2013 - Proceedings of the 2013 ACM SIGPLAN Conference on .pdf}
+}
+
+@inproceedings{bakerMeasurementsDistributedFile1991a,
+  title = {Measurements of a Distributed File System},
+  booktitle = {Proceedings of the Thirteenth {{ACM}} Symposium on {{Operating}} Systems Principles},
+  author = {Baker, Mary G. and Hartman, John H. and Kupfer, Michael D. and Shirriff, Ken W. and Ousterhout, John K.},
+  date = {1991-09-01},
+  series = {{{SOSP}} '91},
+  pages = {198--212},
+  publisher = {Association for Computing Machinery},
+  location = {New York, NY, USA},
+  doi = {10.1145/121132.121164},
+  url = {https://dl.acm.org/doi/10.1145/121132.121164},
+  urldate = {2025-01-31},
+  abstract = {We analyzed the user-level file access patterns and caching behavior of the Sprite distributed file system. The first part of our analysis repeated a study done in 1985 of the: BSD UNIX file system. We found that file throughput has increased by a factor of 20 to an average of 8 Kbytes per second per active user over 10-minute intervals, and that the use of process migration for load sharing increased burst rates by another factor of six. Also, many more very large (multi-megabyte) files are in use today than in 1985. The second part of our analysis measured the behavior of Sprite's main-memory file caches. Client-level caches average about 7 Mbytes in size (about one-quarter to one-third of main memory) and filter out about 50\% of the traffic between clients and servers. 35\% of the remaining server traffic is caused by paging, even on workstations with large memories. We found that client cache consistency is needed to prevent stale data errors, but that it is not invoked often enough to degrade overall system performance.},
+  isbn = {978-0-89791-447-5},
+  file = {/Users/mnakano/Zotero/storage/GGPLX6VY/Baker et al. - 1991 - Measurements of a distributed file system.pdf}
+}
+
+@article{beaverFindingNeedleHaystack,
+  title = {Finding a Needle in {{Haystack}}: {{Facebook}}’s Photo Storage},
+  author = {Beaver, Doug and Kumar, Sanjeev and Li, Harry C and Sobel, Jason and Vajgel, Peter},
+  abstract = {This paper describes Haystack, an object storage system optimized for Facebook’s Photos application. Facebook currently stores over 260 billion images, which translates to over 20 petabytes of data. Users upload one billion new photos (∼60 terabytes) each week and Facebook serves over one million images per second at peak. Haystack provides a less expensive and higher performing solution than our previous approach, which leveraged network attached storage appliances over NFS. Our key observation is that this traditional design incurs an excessive number of disk operations because of metadata lookups. We carefully reduce this per photo metadata so that Haystack storage machines can perform all metadata lookups in main memory. This choice conserves disk operations for reading actual data and thus increases overall throughput.},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/EBBV3IFR/Beaver et al. - Finding a needle in Haystack Facebook’s photo sto.pdf}
+}
+
+@inproceedings{bentPLFSCheckpointFilesystem2009,
+  title = {{{PLFS}}: A Checkpoint Filesystem for Parallel Applications},
+  shorttitle = {{{PLFS}}},
+  booktitle = {Proceedings of the {{Conference}} on {{High Performance Computing Networking}}, {{Storage}} and {{Analysis}}},
+  author = {Bent, John and Gibson, Garth and Grider, Gary and McClelland, Ben and Nowoczynski, Paul and Nunez, James and Polte, Milo and Wingate, Meghan},
+  date = {2009-01-01},
+  pages = {1--12},
+  issn = {2167-4337},
+  doi = {10.1145/1654059.1654081},
+  url = {https://ieeexplore.ieee.org/document/6375580},
+  urldate = {2024-05-31},
+  abstract = {Parallel applications running across thousands of processors must protect themselves from inevitable system failures. Many applications insulate themselves from failures by checkpointing. For many applications, checkpointing into a shared single file is most convenient. With such an approach, the size of writes are often small and not aligned with file system boundaries. Unfortunately for these applications, this preferred data layout results in pathologically poor performance from the underlying file system which is optimized for large, aligned writes to non-shared files. To address this fundamental mismatch, we have developed a virtual parallel log structured file system, PLFS. PLFS remaps an application's preferred data layout into one which is optimized for the underlying file system. Through testing on PanFS, Lustre, and GPFS, we have seen that this layer of indirection and reorganization can reduce checkpoint time by an order of magnitude for several important benchmarks and real applications without any application modification.},
+  eventtitle = {Proceedings of the {{Conference}} on {{High Performance Computing Networking}}, {{Storage}} and {{Analysis}}},
+  keywords = {check-pointing,high performance computing,parallel computing,parallel file systems and IO},
+  file = {/Users/mnakano/Zotero/storage/FZTXM3DB/Bent et al. - 2009 - PLFS a checkpoint filesystem for parallel applica.pdf;/Users/mnakano/Zotero/storage/LEHJINTY/6375580.html}
+}
+
+@article{bezAccessPatternsHPC2023,
+  title = {I/{{O Access Patterns}} in {{HPC Applications}}: {{A}} 360-{{Degree Survey}}},
+  shorttitle = {I/{{O Access Patterns}} in {{HPC Applications}}},
+  author = {Bez, Jean Luca and Byna, Suren and Ibrahim, Shadi},
+  date = {2023-09-15},
+  journaltitle = {ACM Comput. Surv.},
+  volume = {56},
+  number = {2},
+  pages = {46:1--46:41},
+  issn = {0360-0300},
+  doi = {10.1145/3611007},
+  url = {https://dl.acm.org/doi/10.1145/3611007},
+  urldate = {2025-07-01},
+  abstract = {The high-performance computing I/O stack has been complex due to multiple software layers, the inter-dependencies among these layers, and the different performance tuning options for each layer. In this complex stack, the definition of an “I/O access pattern” has been reappropriated to describe what an application is doing to write or read data from the perspective of different layers of the stack, often comprising a different set of features. It has become common to have to redefine what is meant when discussing a pattern in every new study, as no assumption can be made. This survey aims to propose a baseline taxonomy, harnessing the I/O community’s knowledge over the past 20 years. This definition can serve as a common ground for high-performance computing I/O researchers and developers to apply known I/O tuning strategies and design new strategies for improving I/O performance. We seek to summarize and bring a consensus to the multiple ways to describe a pattern based on common features already used by the community over the years.},
+  file = {/Users/mnakano/Zotero/storage/W6AK84BZ/Bez et al. - 2023 - IO Access Patterns in HPC Applications A 360-Degree Survey.pdf}
+}
+
+@online{bornholtUsingLightweightFormal2021,
+  title = {Using Lightweight Formal Methods to Validate a Key-Value Storage Node in {{Amazon S3}}},
+  author = {Bornholt, James and Joshi, Rajeev and Astrauskas, Vytautas and Cully, Brendan and Kragl, Bernhard and Markle, Seth and Sauri, Kyle and Schleit, Drew and Slatton, Grant and Tasiran, Serdar and Geffen, Jacob Van and Warfield, Andrew},
+  date = {2021},
+  url = {https://www.amazon.science/publications/using-lightweight-formal-methods-to-validate-a-key-value-storage-node-in-amazon-s3},
+  urldate = {2025-02-07},
+  abstract = {This paper reports our experience applying lightweight formal methods to validate the correctness of ShardStore, a new key-value storage node implementation for the Amazon S3 cloud object storage service. By “lightweight formal methods" we mean a pragmatic approach to verifying the correctness of a…},
+  langid = {english},
+  organization = {Amazon Science},
+  file = {/Users/mnakano/Zotero/storage/3KSNRH94/Bornholt et al. - 2021 - Using lightweight formal methods to validate a key.pdf}
+}
+
+@inproceedings{brimUnifyFSUserlevelShared2023,
+  title = {{{UnifyFS}}: {{A User-level Shared File System}} for {{Unified Access}} to {{Distributed Local Storage}}},
+  shorttitle = {{{UnifyFS}}},
+  booktitle = {2023 {{IEEE International Parallel}} and {{Distributed Processing Symposium}} ({{IPDPS}})},
+  author = {Brim, Michael J. and Moody, Adam T. and Lim, Seung-Hwan and Miller, Ross and Boehm, Swen and Stanavige, Cameron and Mohror, Kathryn M. and Oral, Sarp},
+  date = {2023-05},
+  pages = {290--300},
+  issn = {1530-2075},
+  doi = {10.1109/IPDPS54959.2023.00037},
+  url = {https://ieeexplore.ieee.org/document/10177390},
+  urldate = {2024-05-31},
+  abstract = {We introduce UnifyFS, a user-level file system that aggregates node-local storage tiers available on high performance computing (HPC) systems and makes them available to HPC applications under a unified namespace. UnifyFS employs transparent I/O interception, so it does not require changes to application code and is compatible with commonly used HPC I/O libraries. The design of UnifyFS supports the predominant HPC I/O workloads and is optimized for bulk-synchronous I/O patterns. Furthermore, UnifyFS provides customizable file system semantics to flexibly adapt its behavior for diverse I/O workloads and storage devices. In this paper, we discuss the unique design goals and architecture of UnifyFS and evaluate its performance on a leadership-class HPC system. In our experimental results, we demonstrate that UnifyFS exhibits excellent scaling performance for write operations and can improve the performance of application checkpoint operations by as much as 3× versus a tuned configuration.},
+  eventtitle = {2023 {{IEEE International Parallel}} and {{Distributed Processing Symposium}} ({{IPDPS}})},
+  keywords = {Aggregates,Codes,Distributed file systems,Distributed processing,File systems,High performance computing,Parallel I/O,Parallel systems,Performance evaluation,Semantics,Storage devices,Storage hierarchies},
+  file = {/Users/mnakano/Zotero/storage/NQSJIB6M/Brim et al. - 2023 - UnifyFS A User-level Shared File System for Unifi.pdf;/Users/mnakano/Zotero/storage/TJV4BRXK/10177390.html}
+}
+
+@article{brinkmannAdHocFile2020,
+  title = {Ad {{Hoc File Systems}} for {{High-Performance Computing}}},
+  author = {Brinkmann, André and Mohror, Kathryn and Yu, Weikuan and Carns, Philip and Cortes, Toni and Klasky, Scott A. and Miranda, Alberto and Pfreundt, Franz-Josef and Ross, Robert B. and Vef, Marc-André},
+  date = {2020-01},
+  journaltitle = {Journal of Computer Science and Technology},
+  shortjournal = {J. Comput. Sci. Technol.},
+  volume = {35},
+  number = {1},
+  pages = {4--26},
+  issn = {1000-9000, 1860-4749},
+  doi = {10.1007/s11390-020-9801-1},
+  url = {http://link.springer.com/10.1007/s11390-020-9801-1},
+  urldate = {2024-06-13},
+  abstract = {Storage backends of parallel compute clusters are still based mostly on magnetic disks, while newer and faster storage technologies such as flash-based SSDs or non-volatile random access memory (NVRAM) are deployed within compute nodes. Including these new storage technologies into scientific workflows is unfortunately today a mostly manual task, and most scientists therefore do not take advantage of the faster storage media. One approach to systematically include nodelocal SSDs or NVRAMs into scientific workflows is to deploy ad hoc file systems over a set of compute nodes, which serve as temporary storage systems for single applications or longer-running campaigns. This paper presents results from the Dagstuhl Seminar 17202 “Challenges and Opportunities of User-Level File Systems for HPC” and discusses application scenarios as well as design strategies for ad hoc file systems using node-local storage media. The discussion includes open research questions, such as how to couple ad hoc file systems with the batch scheduling environment and how to schedule stage-in and stage-out processes of data between the storage backend and the ad hoc file systems. Also presented are strategies to build ad hoc file systems by using reusable components for networking and how to improve storage device compatibility. Various interfaces and semantics are presented, for example those used by the three ad hoc file systems BeeOND, GekkoFS, and BurstFS. Their presentation covers a range from file systems running in production to cutting-edge research focusing on reaching the performance limits of the underlying devices.},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/6JAJLX6T/Brinkmann et al. - 2020 - Ad Hoc File Systems for High-Performance Computing.pdf}
+}
+
+@inproceedings{brookerOndemandContainerLoading2023,
+  title = {On-Demand {{Container Loading}} in {{AWS Lambda}}},
+  author = {Brooker, Marc and Danilov, Mike and Greenwood, Chris and Piwonka, Phil},
+  date = {2023},
+  pages = {315--328},
+  url = {https://www.usenix.org/conference/atc23/presentation/brooker},
+  urldate = {2024-05-31},
+  eventtitle = {2023 {{USENIX Annual Technical Conference}} ({{USENIX ATC}} 23)},
+  isbn = {978-1-939133-35-9},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/HGV7NA6S/Brooker et al. - 2023 - On-demand Container Loading in AWS Lambda.pdf}
+}
+
+@article{caoPolarFSUltralowLatency2018,
+  title = {{{PolarFS}}: An Ultra-Low Latency and Failure Resilient Distributed File System for Shared Storage Cloud Database},
+  shorttitle = {{{PolarFS}}},
+  author = {Cao, Wei and Liu, Zhenjun and Wang, Peng and Chen, Sen and Zhu, Caifeng and Zheng, Song and Wang, Yuhui and Ma, Guoqing},
+  date = {2018-08-01},
+  journaltitle = {Proc. VLDB Endow.},
+  volume = {11},
+  number = {12},
+  pages = {1849--1862},
+  issn = {2150-8097},
+  doi = {10.14778/3229863.3229872},
+  url = {https://dl.acm.org/doi/10.14778/3229863.3229872},
+  urldate = {2025-02-01},
+  abstract = {PolarFS is a distributed file system with ultra-low latency and high availability, designed for the POLARDB database service, which is now available on the Alibaba Cloud. PolarFS utilizes a lightweight network stack and I/O stack in user-space, taking full advantage of the emerging techniques like RDMA, NVMe, and SPDK. In this way, the end-to-end latency of PolarFS has been reduced drastically and our experiments show that the write latency of PolarFS is quite close to that of local file system on SSD. To keep replica consistency while maximizing I/O throughput for PolarFS, we develop ParallelRaft, a consensus protocol derived from Raft, which breaks Raft's strict serialization by exploiting the out-of-order I/O completion tolerance capability of databases. ParallelRaft inherits the understand-ability and easy implementation of Raft while providing much better I/O scalability for PolarFS. We also describe the shared storage architecture of PolarFS, which gives a strong support for POLARDB.},
+  file = {/Users/mnakano/Zotero/storage/Q4MK7SXJ/Cao et al. - 2018 - PolarFS an ultra-low latency and failure resilien.pdf}
+}
+
+@inproceedings{carnsPVFSParallelFile2000,
+  title = {{{PVFS}}: {{A Parallel File System}} for {{Linux Clusters}}},
+  shorttitle = {\{{{PVFS}}\}},
+  author = {Carns, Philip H. and Iii, Walter B. Ligon and Ross, Robert B. and Thakur, Rajeev},
+  date = {2000},
+  url = {https://www.usenix.org/conference/als-2000/pvfs-parallel-file-system-linux-clusters},
+  urldate = {2024-06-24},
+  eventtitle = {4th {{Annual Linux Showcase}} \& {{Conference}} ({{ALS}} 2000)},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/RLZ4VYNP/Carns et al. - 2000 - PVFS A Parallel File System for Linux Clusters.pdf}
+}
+
+@article{cheng3DCrosspointPhasechange2019,
+  title = {{{3D}} Cross-Point Phase-Change Memory for Storage-Class Memory},
+  author = {Cheng, Huai-Yu and Carta, Fabio and Chien, Wei-Chih and Lung, Hsiang-Lan and BrightSky, Matthew J},
+  date = {2019-09},
+  journaltitle = {Journal of Physics D: Applied Physics},
+  shortjournal = {J. Phys. D: Appl. Phys.},
+  volume = {52},
+  number = {47},
+  pages = {473002},
+  publisher = {IOP Publishing},
+  issn = {0022-3727},
+  doi = {10.1088/1361-6463/ab39a0},
+  url = {https://dx.doi.org/10.1088/1361-6463/ab39a0},
+  urldate = {2025-01-26},
+  abstract = {We survey progress in the 3D cross-point phase-change memory (PCM) field over recent years, starting from the choice of 3D-capable access devices to candidate Ovonic threshold switching (OTS) materials, particularly with high cycling endurance and good thermal stability. First, we discuss 3D integration challenges faced when combining OTS and PCM. Then, we review the operation scheme of the OTS+PCM cross-point devices as well as the criteria that an OTS access device needs to meet (e.g. Vth and IOFF) to successfully operate true cross-point array. We also review arsenic (As) and non-As-based OTS materials and discuss their properties as well as those of phase-change materials, focusing in particular on fast switching speed and long endurance compounds, which are among those proposed for storage-class memory (SCM). Finally, we briefly survey recent work on OTS integrated with PCM in stackable devices for SCM application.},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/96UYCR57/Cheng et al. - 2019 - 3D cross-point phase-change memory for storage-cla.pdf}
+}
+
+@article{chenPeakFSUltraHighPerformance2024,
+  title = {{{PeakFS}}: {{An Ultra-High Performance Parallel File System}} via {{Computing-Network-Storage Co-Optimization}} for {{HPC Applications}}},
+  shorttitle = {{{PeakFS}}},
+  author = {Chen, Yixiao and Yang, Haomai and Lu, Kai and Huang, Wenlve and Wang, Jibin and Wan, Jiguang and Zhou, Jian and Wu, Fei and Xie, Changsheng},
+  date = {2024-02},
+  journaltitle = {IEEE Transactions on Parallel and Distributed Systems},
+  volume = {35},
+  number = {12},
+  pages = {2578--2595},
+  issn = {1558-2183},
+  doi = {10.1109/TPDS.2024.3485754},
+  url = {https://ieeexplore.ieee.org/document/10735121/metrics#metrics},
+  urldate = {2025-01-26},
+  abstract = {Emerging high-performance computing (HPC) applications with diverse workload characteristics impose greater demands on parallel file systems (PFSs). PFSs also require more efficient software designs to fully utilize the performance of modern hardware, such as multi-core CPUs, Remote Direct Memory Access (RDMA), and NVMe SSDs. However, existing PFSs expose great limitations under these requirements due to limited multi-core scalability, unaware of HPC workloads, and disjointed network-storage optimizations. In this article, we present PeakFS, an ultra-high performance parallel file system via computing-network-storage co-optimization for HPC applications. PeakFS designs a shared-nothing scheduling system based on link-reduced task dispatching with lock-free queues to reduce concurrency overhead. Besides, PeakFS improves I/O performance with flexible distribution strategies, memory-efficient indexing, and metadata caching according to HPC I/O characteristics. Finally, PeakFS shortens the critical path of request processing through network-storage co-optimizations. Experimental results show that the metadata and data performance of PeakFS reaches more than 90\% of the hardware limits. For metadata throughput, PeakFS achieves a 3.5–19× improvement over GekkoFS and outperforms BeeGFS by three orders of magnitude.},
+  eventtitle = {{{IEEE Transactions}} on {{Parallel}} and {{Distributed Systems}}},
+  keywords = {File systems,Hardware,high-performance computing,Message systems,Metadata,Optimization,Parallel file system,performance optimization,Program processors,Protocols,remote direct memory access,Scalability,Semantics,Servers},
+  file = {/Users/mnakano/Zotero/storage/VHTMTWMX/Chen et al. - 2024 - PeakFS An Ultra-High Performance Parallel File Sy.pdf;/Users/mnakano/Zotero/storage/7QCS65RY/metrics.html}
+}
+
+@inproceedings{chenScalableRDMARPC2019,
+  title = {Scalable {{RDMA RPC}} on {{Reliable Connection}} with {{Efficient Resource Sharing}}},
+  booktitle = {Proceedings of the {{Fourteenth EuroSys Conference}} 2019},
+  author = {Chen, Youmin and Lu, Youyou and Shu, Jiwu},
+  date = {2019-03-25},
+  series = {{{EuroSys}} '19},
+  pages = {1--14},
+  publisher = {Association for Computing Machinery},
+  location = {New York, NY, USA},
+  doi = {10.1145/3302424.3303968},
+  url = {https://dl.acm.org/doi/10.1145/3302424.3303968},
+  urldate = {2025-06-27},
+  abstract = {RDMA provides extremely low latency and high bandwidth to distributed systems. Unfortunately, it fails to scale and suffers from performance degradation when transferring data to an increasing number of targets on Reliable Connection (RC). We observe that the above scalability issue has its root in the resource contention in the NIC cache, the CPU cache and the memory of each server. In this paper, we propose ScaleRPC, an efficient RPC primitive using one-sided RDMA verbs on reliable connection to provide scalable performance. To effectively alleviate the resource contention, ScaleRPC introduces 1) connection grouping to organize the network connections into groups, so as to balance the saturation and thrashing of the NIC cache; 2) virtualized mapping to enable a single message pool to be shared by different groups of connections, which reduces CPU cache misses and improve memory utilization. Such scalable connection management provides substantial performance benefits: By deploying ScaleRPC both in a distributed file system and a distributed transactional system, we observe that it achieves high scalability and respectively improves performance by up to 90\% and 160\% for metadata accessing and SmallBank transaction processing.},
+  isbn = {978-1-4503-6281-8},
+  file = {/Users/mnakano/Zotero/storage/8IGB3JDW/Chen et al. - 2019 - Scalable RDMA RPC on Reliable Connection with Efficient Resource Sharing.pdf;/Users/mnakano/Zotero/storage/J33UE6IT/ja-33024243303968.pdf}
+}
+
+@article{choRFUSEModernizingUserspace,
+  title = {{{RFUSE}}: {{Modernizing Userspace Filesystem Framework}} through {{Scalable Kernel-Userspace Communication}}},
+  author = {Cho, Kyu-Jin and Choi, Jaewon and Kwon, Hyungjoon and Kim, Jin-Soo},
+  abstract = {With the advancement of storage devices and the increasing scale of data, filesystem design has transformed in response to this progress. However, implementing new features within an in-kernel filesystem is a challenging task due to development complexity and code security concerns. As an alternative, userspace filesystems are gaining attention, owing to their ease of development and reliability. FUSE is a renowned framework that allows users to develop custom filesystems in userspace. However, the complex internal stack of FUSE leads to notable performance overhead, which becomes even more prominent in modern hardware environments with highperformance storage devices and a large number of cores. In this paper, we present RFUSE, a novel userspace filesystem framework that utilizes scalable message communication between the kernel and userspace. RFUSE employs a per-core ring buffer structure as a communication channel and effectively minimizes transmission overhead caused by context switches and request copying. Furthermore, RFUSE enables users to utilize existing FUSE-based filesystems without making any modifications. Our evaluation results indicate that RFUSE demonstrates comparable throughput to in-kernel filesystems on high-performance devices while exhibiting high scalability in both data and metadata operations.},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/XN3HWSY7/Cho et al. - RFUSE Modernizing Userspace Filesystem Framework .pdf}
+}
+
+@inproceedings{cuiDecentralizedEpochbasedF2FS2025,
+  title = {Decentralized, {{Epoch-based}} \{{{F2FS}}\} {{Journaling}} with {{Fine-grained Crash Recovery}}},
+  author = {Cui, Yaotian and Wang, Zhiqi and Chen, Renhai and Shao, Zili},
+  date = {2025},
+  pages = {879--895},
+  url = {https://www.usenix.org/conference/osdi25/presentation/cui},
+  urldate = {2025-07-18},
+  eventtitle = {19th {{USENIX Symposium}} on {{Operating Systems Design}} and {{Implementation}} ({{OSDI}} 25)},
+  isbn = {978-1-939133-47-2},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/9DDDMNLF/Cui et al. - 2025 - Decentralized, Epoch-based F2FS Journaling with Fine-grained Crash Recovery.pdf}
+}
+
+@inproceedings{denmanAcreMethodSupporting,
+  title = {Acre: A {{Method}} for {{Supporting Strong Consistency}} and {{Adaptivity}} in {{Replicated Data Storage}}},
+  shorttitle = {Acre},
+  author = {Denman, S. and Kang, K.},
+  url = {https://www.semanticscholar.org/paper/Acre%3A-a-Method-for-Supporting-Strong-Consistency-in-Denman-Kang/9858026b6d41f4d9e865c6e0f8e23d171cdbbdb1},
+  urldate = {2025-03-05},
+  abstract = {As most key-value stores partition and replicate data to support high availability with no strong consistency guarantee among replicas, users may suffer from data inconsistency. Although previous research has been done to support strong consistency among replicated data, most existing approaches suffer from potential hotspots and load imbalance. Neither do they consider dynamic data access patterns that may largely vary over time. In this paper, we propose a new approach, called ACRE (Adaptive Chain REplication), to support strong consistency among data replicas, hotspot avoidance and load balancing, and adaptivity to dynamic data access patterns.},
+  file = {/Users/mnakano/Zotero/storage/VKWUM8H8/Denman and Kang - Acre a Method for Supporting Strong Consistency a.pdf}
+}
+
+@inproceedings{dragojevicFaRMFastRemote2014,
+  title = {{{FaRM}}: Fast Remote Memory},
+  shorttitle = {{{FaRM}}},
+  booktitle = {Proceedings of the 11th {{USENIX Conference}} on {{Networked Systems Design}} and {{Implementation}}},
+  author = {Dragojević, Aleksandar and Narayanan, Dushyanth and Hodson, Orion and Castro, Miguel},
+  date = {2014-04-02},
+  series = {{{NSDI}}'14},
+  pages = {401--414},
+  publisher = {USENIX Association},
+  location = {USA},
+  abstract = {We describe the design and implementation of FaRM, a new main memory distributed computing platform that exploits RDMA to improve both latency and throughput by an order of magnitude relative to state of the art main memory systems that use TCP/IP. FaRM exposes the memory of machines in the cluster as a shared address space. Applications can use transactions to allocate, read, write, and free objects in the address space with location transparency. We expect this simple programming model to be sufficient for most application code. FaRM provides two mechanisms to improve performance where required: lock-free reads over RDMA, and support for collocating objects and function shipping to enable the use of efficient single machine transactions. FaRM uses RDMA both to directly access data in the shared address space and for fast messaging and is carefully tuned for the best RDMA performance. We used FaRM to build a key-value store and a graph store similar to Facebook's. They both perform well, for example, a 20-machine cluster can perform 167 million key-value lookups per second with a latency of 31µs.},
+  isbn = {978-1-931971-09-6},
+  file = {/Users/mnakano/Zotero/storage/VGKMWW33/Dragojević et al. - 2014 - FaRM Fast Remote Memory.pdf}
+}
+
+@article{faginExtendibleHashingFast1979,
+  title = {Extendible Hashing—a Fast Access Method for Dynamic Files},
+  author = {Fagin, Ronald and Nievergelt, Jurg and Pippenger, Nicholas and Strong, H. Raymond},
+  date = {1979-09},
+  journaltitle = {ACM Transactions on Database Systems},
+  shortjournal = {ACM Trans. Database Syst.},
+  volume = {4},
+  number = {3},
+  pages = {315--344},
+  issn = {0362-5915, 1557-4644},
+  doi = {10.1145/320083.320092},
+  url = {https://dl.acm.org/doi/10.1145/320083.320092},
+  urldate = {2025-01-31},
+  abstract = {Extendible hashing is a new access technique, in which the user is guaranteed no more than two page faults to locate the data associated with a given unique identifier, or key. Unlike conventional hashing, extendible hashing has a dynamic structure that grows and shrinks gracefully as the database grows and shrinks. This approach simultaneously solves the problem of making hash tables that are extendible and of making radix search trees that are balanced. We study, by analysis and simulation, the performance of extendible hashing. The results indicate that extendible hashing provides an attractive alternative to other access methods, such as balanced trees.},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/RBWQF5AB/Fagin et al. - 1979 - Extendible hashing—a fast access method for dynami.pdf}
+}
+
+@inproceedings{gaoShiftLockMitigateOnesided2025,
+  title = {{{ShiftLock}}: {{Mitigate One-sided RDMA Lock Contention}} via {{Handover}}},
+  shorttitle = {\{{{ShiftLock}}\}},
+  author = {Gao, Jian and Wang, Qing and Shu, Jiwu},
+  date = {2025},
+  pages = {355--372},
+  url = {https://www.usenix.org/conference/fast25/presentation/gao},
+  urldate = {2025-03-07},
+  eventtitle = {23rd {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 25)},
+  isbn = {978-1-939133-45-8},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/AKSDCZZS/Gao et al. - 2025 - ShiftLock Mitigate One-sided RDMA Lock Conten.pdf}
+}
+
+@inproceedings{gaoStripelessDataPlacement2025,
+  title = {Stripeless {{Data Placement}} for \{{{Erasure-Coded}}\} \{{{In-Memory}}\} {{Storage}}},
+  author = {Gao, Jian and Shu, Jiwu and Yan, Bin and Zhang, Yuhao and Huang, Keji},
+  date = {2025},
+  pages = {821--838},
+  url = {https://www.usenix.org/conference/osdi25/presentation/gao},
+  urldate = {2025-07-18},
+  eventtitle = {19th {{USENIX Symposium}} on {{Operating Systems Design}} and {{Implementation}} ({{OSDI}} 25)},
+  isbn = {978-1-939133-47-2},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/NQKE998D/Gao et al. - 2025 - Stripeless Data Placement for Erasure-Coded In-Memory Storage.pdf}
+}
+
+@article{gibsonCostEffectiveHighBandwidthStorage,
+  title = {A {{Cost-Effective}}, {{High-Bandwidth Storage Architecture}}},
+  author = {Gibson, Garth A and Nagle, David F and Amiri, Khalil and Butler, Jeff and Chang, Fay W and Gobioff, Howard and Hardin, Charles and Riedel, Erik and Rochberg, David and Zelenka, Jim},
+  abstract = {This paper describes the Network-Attached Secure Disk (NASD) storage architecture, prototype implementations of NASD drives, array management for our architecture, and three filesystems built on our prototype. NASD provides scalable storage bandwidth without the cost of servers used primarily for transferring data from peripheral networks (e.g. SCSI) to client networks (e.g. ethernet). Increasing dataset sizes, new attachment technologies, the convergence of peripheral and interprocessor switched networks, and the increased availability of on-drive transistors motivate and enable this new architecture. NASD is based on four main principles: direct transfer to clients, secure interfaces via cryptographic support, asynchronous non-critical-path oversight, and variably-sized data objects. Measurements of our prototype system show that these services can be costeffectively integrated into a next generation disk drive ASIC. End-to-end measurements of our prototype drive and filesystems suggest that NASD can support conventional distributed filesystems without performance degradation. More importantly, we show scalable bandwidth for NASD-specialized filesystems. Using a parallel data mining application, NASD drives deliver a linear scaling of 6.2 MB/s per clientdrive pair, tested with up to eight pairs in our lab.},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/9549GC55/Gibson et al. - A Cost-Effective, High-Bandwidth Storage Architect.pdf}
+}
+
+@inproceedings{giffordWeightedVotingReplicated1979,
+  title = {Weighted Voting for Replicated Data},
+  booktitle = {Proceedings of the Seventh {{ACM}} Symposium on {{Operating}} Systems Principles},
+  author = {Gifford, David K.},
+  date = {1979-12-10},
+  series = {{{SOSP}} '79},
+  pages = {150--162},
+  publisher = {Association for Computing Machinery},
+  location = {New York, NY, USA},
+  doi = {10.1145/800215.806583},
+  url = {https://dl.acm.org/doi/10.1145/800215.806583},
+  urldate = {2025-03-05},
+  abstract = {In a new algorithm for maintaining replicated data, every copy of a replicated file is assigned some number of votes. Every transaction collects a read quorum of rvotes to read a file, and a write quorum of wvotes to write a file, such that r+w is greater than the total number of votes assigned to the file. This ensures that there is a non-null intersection between every read quorum and every write quorum. Version numbers make it possible to determine which copies are current. The reliability and performance characteristics of a replicated file can be controlled by appropriately choosing r, w, and the file's voting configuration. The algorithm guarantees serial consistency, admits temporary copies in a natural way by the introduction of copies with no votes, and has been implemented in the context of an application system called Violet.},
+  isbn = {978-0-89791-009-5},
+  file = {/Users/mnakano/Zotero/storage/HMDM95HF/Gifford - 1979 - Weighted voting for replicated data.pdf}
+}
+
+@inproceedings{griffioenReducingFileSystem1994,
+  title = {Reducing File System Latency Using a Predictive Approach},
+  booktitle = {Proceedings of the {{USENIX Summer}} 1994 {{Technical Conference}} on {{USENIX Summer}} 1994 {{Technical Conference}} - {{Volume}} 1},
+  author = {Griffioen, James and Appleton, Randy},
+  date = {1994-06-06},
+  series = {{{USTC}}'94},
+  pages = {13},
+  publisher = {USENIX Association},
+  location = {USA},
+  abstract = {Despite impressive advances in file system through put resulting from technologies such as high-bandwidth networks and disk arrays, file system latency has not improved and in many cases has become worse. Consequently, file system I/O remains one of the major bottlenecks to operating system performance [10]. This paper investigates an automated predictive approach towards reducing file latency. Automatic Prefetching uses past file accesses to predict future file systemrequests. The objective is to provide data in advance of the request for the data, effectively masking access latencies. We have designed and implement a system to measure the performance benefits of automatic prefetching. Our current results, obtained from a trace-driven simulation, show that prefetching results in as much as a 280\% improvement over LRU especially for smaller caches. Alternatively, prefetching can reduce cache size by up to 50\%.}
+}
+
+@inproceedings{guoSingularFSBillionScaleDistributed2023,
+  title = {{{SingularFS}}: {{A Billion-Scale Distributed File System Using}} a {{Single Metadata Server}}},
+  shorttitle = {\{{{SingularFS}}\}},
+  author = {Guo, Hao and Lu, Youyou and Lv, Wenhao and Liao, Xiaojian and Zeng, Shaoxun and Shu, Jiwu},
+  date = {2023},
+  pages = {915--928},
+  url = {https://www.usenix.org/conference/atc23/presentation/guo},
+  urldate = {2024-06-30},
+  eventtitle = {2023 {{USENIX Annual Technical Conference}} ({{USENIX ATC}} 23)},
+  isbn = {978-1-939133-35-9},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/G42AJI7Q/Guo et al. - 2023 - SingularFS A Billion-Scale Distributed File S.pdf}
+}
+
+@inproceedings{hayashibaraSplPhiAccrual2004a,
+  title = {The /Spl Phi/ Accrual Failure Detector},
+  booktitle = {Proceedings of the 23rd {{IEEE International Symposium}} on {{Reliable Distributed Systems}}, 2004.},
+  author = {Hayashibara, N. and Defago, X. and Yared, R. and Katayama, T.},
+  date = {2004-10},
+  pages = {66--78},
+  issn = {1060-9857},
+  doi = {10.1109/RELDIS.2004.1353004},
+  url = {https://ieeexplore.ieee.org/document/1353004},
+  urldate = {2025-01-31},
+  abstract = {The detection of failures is a fundamental issue for fault-tolerance in distributed systems. Recently, many people have come to realize that failure detection ought to be provided as some form of generic service, similar to IP address lookup or time synchronization. However, this has not been successful so far; one of the reasons being the fact that classical failure detectors were not designed to satisfy several application requirements simultaneously. We present a novel abstraction, called accrual failure detectors, that emphasizes flexibility and expressiveness and can serve as a basic building block to implementing failure detectors in distributed systems. Instead of providing information of a binary nature (trust vs. suspect), accrual failure detectors output a suspicion level on a continuous scale. The principal merit of this approach is that it favors a nearly complete decoupling between application requirements and the monitoring of the environment. In this paper, we describe an implementation of such an accrual failure detector, that we call the /spl phi/ failure detector. The particularity of the /spl phi/ failure detector is that it dynamically adjusts to current network conditions the scale on which the suspicion level is expressed. We analyzed the behavior of our /spl phi/ failure detector over an intercontinental communication link over a week. Our experimental results show that if performs equally well as other known adaptive failure detection mechanisms, with an improved flexibility.},
+  eventtitle = {Proceedings of the 23rd {{IEEE International Symposium}} on {{Reliable Distributed Systems}}, 2004.},
+  keywords = {Computer crashes,Condition monitoring,Detectors,Event detection,Failure analysis,Fault detection,Fault tolerant systems,H infinity control,Information science,Quality of service},
+  file = {/Users/mnakano/Zotero/storage/BYH5G5HA/Hayashibara et al. - 2004 - The spl phi accrual failure detector.pdf;/Users/mnakano/Zotero/storage/R3WAE89F/1353004.html}
+}
+
+@inproceedings{heHadaFSFileSystem2023,
+  title = {{{HadaFS}}: {{A File System Bridging}} the {{Local}} and {{Shared Burst Buffer}} for {{Exascale Supercomputers}}},
+  shorttitle = {\{{{HadaFS}}\}},
+  author = {He, Xiaobin and Yang, Bin and Gao, Jie and Xiao, Wei and Chen, Qi and Shi, Shupeng and Chen, Dexun and Liu, Weiguo and Xue, Wei and Chen, Zuo-ning},
+  date = {2023},
+  pages = {215--230},
+  url = {https://www.usenix.org/conference/fast23/presentation/he},
+  urldate = {2025-02-01},
+  eventtitle = {21st {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 23)},
+  isbn = {978-1-939133-32-8},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/JRPIRXVG/He et al. - 2023 - HadaFS A File System Bridging the Local and Sha.pdf}
+}
+
+@inproceedings{henneckeUnderstandingDAOSStorage2023,
+  title = {Understanding {{DAOS Storage Performance Scalability}}},
+  booktitle = {Proceedings of the {{HPC Asia}} 2023 {{Workshops}}},
+  author = {Hennecke, Michael},
+  date = {2023-02-27},
+  series = {{{HPCAsia}} '23 {{Workshops}}},
+  pages = {1--14},
+  publisher = {Association for Computing Machinery},
+  location = {New York, NY, USA},
+  doi = {10.1145/3581576.3581577},
+  url = {https://dl.acm.org/doi/10.1145/3581576.3581577},
+  urldate = {2025-06-29},
+  abstract = {High performance scale-out storage systems are a critical component of modern HPC and AI clusters. However, characterizing their performance remains challenging: Different client I/O patterns have very different performance scaling behavior, and bottlenecks in the HPC storage software may also limit performance scaling. The Distributed Asynchronous Object Storage (DAOS) is an open source scale-out storage system that is designed from the ground up to support Storage Class Memory (SCM) and NVMe storage in user space. DAOS has demonstrated leadership performance on IO500. But while IO500 has defined an extensive “standard” set of I/O patterns, a single IO500 run does not provide much insight into how a storage solution scales. This paper investigates the performance scaling behavior of the DAOS storage stack for typical IOR and mdtest workloads, as a function of the storage server hardware and the client-side parallelism. It also analyses the impact of the HPC networking stack (libfabric/verbs and UCX) on the achievable performance.},
+  isbn = {978-1-4503-9989-0},
+  file = {/Users/mnakano/Zotero/storage/FY2KC44G/Hennecke - 2023 - Understanding DAOS Storage Performance Scalability.pdf}
+}
+
+@inproceedings{hiragaPEANUTSPersistentMemoryBased2024,
+  title = {{{PEANUTS}}: {{A Persistent Memory-Based Network Unilateral Transfer System}} for~{{Enhanced MPI-IO Data Transfer}}},
+  shorttitle = {{{PEANUTS}}},
+  booktitle = {Euro-{{Par}} 2024: {{Parallel Processing}}: 30th {{European Conference}} on {{Parallel}} and {{Distributed Processing}}, {{Madrid}}, {{Spain}}, {{August}} 26–30, 2024, {{Proceedings}}, {{Part II}}},
+  author = {Hiraga, Kohei and Tatebe, Osamu},
+  date = {2024-08-26},
+  pages = {439--453},
+  publisher = {Springer-Verlag},
+  location = {Berlin, Heidelberg},
+  doi = {10.1007/978-3-031-69766-1_30},
+  url = {https://doi.org/10.1007/978-3-031-69766-1_30},
+  urldate = {2025-01-20},
+  abstract = {This paper introduces PEANUTS, a system designed to improve I/O performance\&nbsp;for Single Shared File (SSF) in high-performance computing scenarios. I/O performance evaluation of SSF on 100 nodes demonstrated write speeds of 2.47\&nbsp;TB/s, remote read speeds of 2.39\&nbsp;TB/s, and local read speeds of 7.75 TB/s. These outcomes are close to the hardware’s performance limits\&nbsp;and represent significant improvements of approximately 2.2\&nbsp;times, 2.3\&nbsp;times, and 7.5\&nbsp;times, respectively, compared to existing state-of-the-art systems. A major feature of PEANUTS is the integration of persistent memory with RDMA one-sided communication, supporting high-speed and low-latency data transfers without the need for separate storage servers on the compute nodes. This configuration allows all compute node CPU cores to be fully available for application processing. Seamless integration with the MPI runtime enables rapid data sharing through the MPI-IO interface. The advancements by PEANUTS suggest that utilizing large-scale SSF could solidify as the standard I/O framework in HPC, demonstrating a viable solution to overcome traditional performance limitations.},
+  isbn = {978-3-031-69765-4},
+  file = {/Users/mnakano/Zotero/storage/XYD778XC/Hiraga and Tatebe - 2024 - PEANUTS A Persistent Memory-Based Network Unilate.pdf}
+}
+
+@inproceedings{jannenBetrFSRightOptimizedWriteOptimized2015,
+  title = {{{BetrFS}}: {{A Right-Optimized Write-Optimized File System}}},
+  shorttitle = {\{{{BetrFS}}\}},
+  author = {Jannen, William and Yuan, Jun and Zhan, Yang and Akshintala, Amogh and Esmet, John and Jiao, Yizheng and Mittal, Ankur and Pandey, Prashant and Reddy, Phaneendra and Walsh, Leif and Bender, Michael and Farach-Colton, Martin and Johnson, Rob and Kuszmaul, Bradley C. and Porter, Donald E.},
+  date = {2015},
+  pages = {301--315},
+  url = {https://www.usenix.org/conference/fast15/technical-sessions/presentation/jannen},
+  urldate = {2025-01-31},
+  eventtitle = {13th {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 15)},
+  isbn = {978-1-931971-20-1},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/G299VWJN/Jannen et al. - 2015 - BetrFS A Right-Optimized Write-Optimized Fi.pdf}
+}
+
+@article{JianBuCHFSadohotukuBingLieFenSanhuairusisutemunoakusesuXingNengnoPingJia2022,
+  title = {CHFSアドホック並列分散ファイルシステムのアクセス性能の評価},
+  author = {建部, 修見},
+  date = {2022-07-20},
+  journaltitle = {研究報告ハイパフォーマンスコンピューティング（HPC）},
+  volume = {2022-HPC-185},
+  number = {31},
+  pages = {1--6},
+  issn = {2188-8841},
+  url = {https://ipsj.ixsq.nii.ac.jp/ej/index.php?active_action=repository_view_main_item_detail&page_id=13&block_id=8&item_id=218969&item_no=1},
+  urldate = {2025-01-26},
+  abstract = {情報学広場 情報処理学会電子図書館},
+  langid = {japanese},
+  file = {/Users/mnakano/Zotero/storage/DPDHASMD/修見 - 2022 - CHFSアドホック並列分散ファイルシステムのアクセス性能の評価.pdf}
+}
+
+@article{JianBuXiuJianJiSuannodonoBuHuiFaXingmemoriwoYongitakiyatusiyuhuairusisutemunoSheJi2022,
+  title = {計算ノードの不揮発性メモリを用いたキャッシュファイルシステムの設計},
+  author = {建部修見},
+  date = {2022},
+  journaltitle = {情報処理学会研究報告(Web)},
+  volume = {2022},
+  pages = {2022--183},
+  url = {https://jglobal.jst.go.jp/detail?JGLOBAL_ID=202202241102461942},
+  urldate = {2025-06-30},
+  abstract = {文献「計算ノードの不揮発性メモリを用いたキャッシュファイルシステムの設計」の詳細情報です。J-GLOBAL 科学技術総合リンクセンターは、国立研究開発法人科学技術振興機構（JST）が運営する、無料で研究者、文献、特許などの科学技術・医学薬学等の二次情報を閲覧できる検索サービスです。検索結果からJST内外の良質な一次情報等へ案内します。},
+  issue = {HPC-183},
+  langid = {japanese}
+}
+
+@inproceedings{jiangHighPerformanceMPI22004,
+  title = {High Performance {{MPI-2}} One-Sided Communication over {{InfiniBand}}},
+  booktitle = {{{IEEE International Symposium}} on {{Cluster Computing}} and the {{Grid}}, 2004. {{CCGrid}} 2004.},
+  author = {Jiang, Weihang and Liu, Jiuxing and Jin, Hyun-Wook and Panda, D.K. and Gropp, W. and Thakur, R.},
+  date = {2004-04},
+  pages = {531--538},
+  doi = {10.1109/CCGrid.2004.1336648},
+  url = {https://ieeexplore.ieee.org/document/1336648},
+  urldate = {2025-07-01},
+  abstract = {Many existing MPI-2 one-sided communication implementations are built on top of MPI send/receive operations. Although this approach can achieve good portability, it suffers front high communication overhead and dependency on remote process for communication progress. To address these problems, we propose a high performance MPI-2 one-sided communication design over the InfiniBand Architecture. In our design, MPI-2 one-sided communication operations such as MPI-Put, MPI-Get and MPI-Accumulate are directly mapped to InfiniBand Remote Direct Memory Access (RDMA) operations. Our design has been implemented based on MPICH2 over InfiniBand. We present detailed design issues for this approach and perform a set of microbenchmarks to characterize different aspects of its performance. Our performance evaluation shows that compared with the design based on MPI send/receive, our design can improve throughput up to 77\%, and reduce latency and synchronization overhead up to 19\% and 13\%, respectively. Under certain process skew, the bad impact can be significantly reduced by new design, from 41\% to nearly 0\%. It also can achieve better overlap of communication and computation.},
+  eventtitle = {{{IEEE International Symposium}} on {{Cluster Computing}} and the {{Grid}}, 2004. {{CCGrid}} 2004.},
+  keywords = {Communication standards,Computer science,Concurrent computing,Contracts,High performance computing,Information science,Protocols,Scientific computing,Throughput,Writing}
+}
+
+@inproceedings{joshiPassthruUpstreamingFlexible2024a,
+  title = {I/{{O Passthru}}: {{Upstreaming}} a Flexible and Efficient {{I}}/{{O Path}} in {{Linux}}},
+  shorttitle = {\{{{I}}/{{O}}\} {{Passthru}}},
+  author = {Joshi, Kanchan and Gupta, Anuj and González, Javier and Kumar, Ankit and Reddy, Krishna Kanth and George, Arun and Lund, Simon and Axboe, Jens},
+  date = {2024},
+  pages = {107--121},
+  url = {https://www.usenix.org/conference/fast24/presentation/joshi},
+  urldate = {2024-05-31},
+  eventtitle = {22nd {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 24)},
+  isbn = {978-1-939133-38-0},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/KIUV6YRH/Joshi et al. - 2024 - IO Passthru Upstreaming a flexible and efficie.pdf}
+}
+
+@article{jSerializableIsolationSnapshot2009,
+  title = {Serializable Isolation for Snapshot Databases},
+  author = {J, CahillMichael and RöhmUwe and D, FeketeAlan},
+  date = {2009-12-14},
+  journaltitle = {ACM Transactions on Database Systems (TODS)},
+  publisher = {ACMPUB27New York, NY, USA},
+  doi = {10.1145/1620585.1620587},
+  url = {https://dl.acm.org/doi/10.1145/1620585.1620587},
+  urldate = {2024-06-03},
+  abstract = {Many popular database management systems implement a multiversion concurrency control algorithm called snapshot isolation rather than providing full serializability based on locking. There are well-known anomalies permitted by snapshot isolation that ...},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/WNIBIALL/1620585.html}
+}
+
+@inproceedings{junWeAintAfraid2024,
+  title = {We {{Ain}}'t {{Afraid}} of {{No File Fragmentation}}: {{Causes}} and {{Prevention}} of {{Its Performance Impact}} on {{Modern Flash}} \{{{SSDs}}\}},
+  shorttitle = {We {{Ain}}'t {{Afraid}} of {{No File Fragmentation}}},
+  author = {Jun, Yuhun and Park, Shinhyun and Kang, Jeong-Uk and Kim, Sang-Hoon and Seo, Euiseong},
+  date = {2024},
+  pages = {193--208},
+  url = {https://www.usenix.org/conference/fast24/presentation/jun},
+  urldate = {2024-05-31},
+  eventtitle = {22nd {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 24)},
+  isbn = {978-1-939133-38-0},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/F6GDAB9A/Jun et al. - 2024 - We Ain't Afraid of No File Fragmentation Causes a.pdf}
+}
+
+@inproceedings{kaliaDatacenterRPCsCan2019,
+  title = {Datacenter {{RPCs}} Can Be {{General}} and {{Fast}}},
+  author = {Kalia, Anuj and Kaminsky, Michael and Andersen, David},
+  date = {2019},
+  pages = {1--16},
+  url = {https://www.usenix.org/conference/nsdi19/presentation/kalia},
+  urldate = {2025-06-29},
+  eventtitle = {16th {{USENIX Symposium}} on {{Networked Systems Design}} and {{Implementation}} ({{NSDI}} 19)},
+  isbn = {978-1-931971-49-2},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/RIXU9HSU/Kalia et al. - 2019 - Datacenter RPCs can be General and Fast.pdf}
+}
+
+@inproceedings{kaliaFaSSTFastScalable2016,
+  title = {{{FaSST}}: {{Fast}}, {{Scalable}} and {{Simple Distributed Transactions}} with {{Two-Sided}} ({{RDMA}}) {{Datagram RPCs}}},
+  shorttitle = {\{{{FaSST}}\}},
+  author = {Kalia, Anuj and Kaminsky, Michael and Andersen, David G.},
+  date = {2016},
+  pages = {185--201},
+  url = {https://www.usenix.org/conference/osdi16/technical-sessions/presentation/kalia},
+  urldate = {2025-06-29},
+  eventtitle = {12th {{USENIX Symposium}} on {{Operating Systems Design}} and {{Implementation}} ({{OSDI}} 16)},
+  isbn = {978-1-931971-33-1},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/T7VUSL92/Kalia et al. - 2016 - FaSST Fast, Scalable and Simple Distributed Transactions with Two-Sided ( RDMA ) Datagr.pdf}
+}
+
+@inproceedings{kaliaUsingRDMAEfficiently2014,
+  title = {Using {{RDMA}} Efficiently for Key-Value Services},
+  booktitle = {Proceedings of the 2014 {{ACM}} Conference on {{SIGCOMM}}},
+  author = {Kalia, Anuj and Kaminsky, Michael and Andersen, David G.},
+  date = {2014-08-17},
+  series = {{{SIGCOMM}} '14},
+  pages = {295--306},
+  publisher = {Association for Computing Machinery},
+  location = {New York, NY, USA},
+  doi = {10.1145/2619239.2626299},
+  url = {https://dl.acm.org/doi/10.1145/2619239.2626299},
+  urldate = {2025-06-30},
+  abstract = {This paper describes the design and implementation of HERD, a key-value system designed to make the best use of an RDMA network. Unlike prior RDMA-based key-value systems, HERD focuses its design on reducing network round trips while using efficient RDMA primitives; the result is substantially lower latency, and throughput that saturates modern, commodity RDMA hardware.HERD has two unconventional decisions: First, it does not use RDMA reads, despite the allure of operations that bypass the remote CPU entirely. Second, it uses a mix of RDMA and messaging verbs, despite the conventional wisdom that the messaging primitives are slow. A HERD client writes its request into the server's memory; the server computes the reply. This design uses a single round trip for all requests and supports up to 26 million key-value operations per second with 5μs average latency. Notably, for small key-value items, our full system throughput is similar to native RDMA read throughput and is over 2X higher than recent RDMA-based key-value systems. We believe that HERD further serves as an effective template for the construction of RDMA-based datacenter services.},
+  isbn = {978-1-4503-2836-4},
+  file = {/Users/mnakano/Zotero/storage/9RXTTRSF/Kalia et al. - 2014 - Using RDMA efficiently for key-value services.pdf}
+}
+
+@inproceedings{kaliaUsingRDMAEfficiently2014a,
+  title = {Using {{RDMA}} Efficiently for Key-Value Services},
+  booktitle = {Proceedings of the 2014 {{ACM}} Conference on {{SIGCOMM}}},
+  author = {Kalia, Anuj and Kaminsky, Michael and Andersen, David G.},
+  date = {2014-08-17},
+  series = {{{SIGCOMM}} '14},
+  pages = {295--306},
+  publisher = {Association for Computing Machinery},
+  location = {New York, NY, USA},
+  doi = {10.1145/2619239.2626299},
+  url = {https://dl.acm.org/doi/10.1145/2619239.2626299},
+  urldate = {2025-06-29},
+  abstract = {This paper describes the design and implementation of HERD, a key-value system designed to make the best use of an RDMA network. Unlike prior RDMA-based key-value systems, HERD focuses its design on reducing network round trips while using efficient RDMA primitives; the result is substantially lower latency, and throughput that saturates modern, commodity RDMA hardware.HERD has two unconventional decisions: First, it does not use RDMA reads, despite the allure of operations that bypass the remote CPU entirely. Second, it uses a mix of RDMA and messaging verbs, despite the conventional wisdom that the messaging primitives are slow. A HERD client writes its request into the server's memory; the server computes the reply. This design uses a single round trip for all requests and supports up to 26 million key-value operations per second with 5μs average latency. Notably, for small key-value items, our full system throughput is similar to native RDMA read throughput and is over 2X higher than recent RDMA-based key-value systems. We believe that HERD further serves as an effective template for the construction of RDMA-based datacenter services.},
+  isbn = {978-1-4503-2836-4},
+  file = {/Users/mnakano/Zotero/storage/NHG2TVE5/Kalia et al. - 2014 - Using RDMA efficiently for key-value services.pdf}
+}
+
+@article{kargerConsistentHashingRandom,
+  title = {Consistent {{Hashing}} and {{Random Trees}}: {{Distributed Caching Protocols}} for {{Relieving Hot Spots}} on the {{World Wide Web}}},
+  author = {Karger, David and Lehman, Eric and Leighton, Tom and Panigrahy, Rina and Levine, Matthew and Lewin, Daniel},
+  abstract = {We describe a family of caching protocols for distrib-uted networks that can be used to decrease or eliminate the occurrence of hot spots in the network. Our protocols are particularly designed for use with very large networks such as the Internet, where delays caused by hot spots can be severe, and where it is not feasible for every server to have complete information about the current state of the entire network. The protocols are easy to implement using existing network protocols such as TCP/IP, and require very little overhead. The protocols work with local control, make efficient use of existing resources, and scale gracefully as the network grows.},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/4G3LG76I/Karger et al. - Consistent Hashing and Random Trees Distributed C.pdf}
+}
+
+@inproceedings{katsarakisHermesFastFaultTolerant2020,
+  title = {Hermes: {{A Fast}}, {{Fault-Tolerant}} and {{Linearizable Replication Protocol}}},
+  shorttitle = {Hermes},
+  booktitle = {Proceedings of the {{Twenty-Fifth International Conference}} on {{Architectural Support}} for {{Programming Languages}} and {{Operating Systems}}},
+  author = {Katsarakis, Antonios and Gavrielatos, Vasilis and Katebzadeh, M.R. Siavash and Joshi, Arpit and Dragojevic, Aleksandar and Grot, Boris and Nagarajan, Vijay},
+  date = {2020-03-13},
+  series = {{{ASPLOS}} '20},
+  pages = {201--217},
+  publisher = {Association for Computing Machinery},
+  location = {New York, NY, USA},
+  doi = {10.1145/3373376.3378496},
+  url = {https://dl.acm.org/doi/10.1145/3373376.3378496},
+  urldate = {2025-03-05},
+  abstract = {Today's datacenter applications are underpinned by datastores that are responsible for providing availability, consistency, and performance. For high availability in the presence of failures, these datastores replicate data across several nodes. This is accomplished with the help of a reliable replication protocol that is responsible for maintaining the replicas strongly-consistent even when faults occur. Strong consistency is preferred to weaker consistency models that cannot guarantee an intuitive behavior for the clients. Furthermore, to accommodate high demand at real-time latencies, datastores must deliver high throughput and low latency.This work introduces Hermes, a broadcast-based reliable replication protocol for in-memory datastores that provides both high throughput and low latency by enabling local reads and fully-concurrent fast writes at all replicas. Hermes couples logical timestamps with cache-coherence-inspired invalidations to guarantee linearizability, avoid write serialization at a centralized ordering point, resolve write conflicts locally at each replica (hence ensuring that writes never abort) and provide fault-tolerance via replayable writes. Our implementation of Hermes over an RDMA-enabled reliable datastore with five replicas shows that Hermes consistently achieves higher throughput than state-of-the-art RDMA-based reliable protocols (ZAB and CRAQ) across all write ratios while also significantly reducing tail latency. At 5\% writes, the tail latency of Hermes is 3.6X lower than that of CRAQ and ZAB.},
+  isbn = {978-1-4503-7102-5},
+  file = {/Users/mnakano/Zotero/storage/BQ6M3B9M/Katsarakis et al. - 2020 - Hermes A Fast, Fault-Tolerant and Linearizable Re.pdf}
+}
+
+@article{keshavsHowReadPaper2007,
+  title = {How to Read a Paper},
+  author = {KeshavS},
+  date = {2007-07-20},
+  journaltitle = {ACM SIGCOMM Computer Communication Review},
+  publisher = {ACMPUB27New York, NY, USA},
+  doi = {10.1145/1273445.1273458},
+  url = {https://dl.acm.org/doi/10.1145/1273445.1273458},
+  urldate = {2024-05-31},
+  abstract = {Researchers spend a great deal of time reading research papers. However, this skill is rarely taught, leading to much wasted effort. This article outlines a practical and efficient three-pass method for reading research papers. I also describe how to ...},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/8Q6L7PS3/1273445.html}
+}
+
+@article{kimInnetworkLeaderlessReplication2022,
+  title = {In-Network Leaderless Replication for Distributed Data Stores},
+  author = {Kim, Gyuyeong and Lee, Wonjun},
+  date = {2022-03-01},
+  journaltitle = {Proc. VLDB Endow.},
+  volume = {15},
+  number = {7},
+  pages = {1337--1349},
+  issn = {2150-8097},
+  doi = {10.14778/3523210.3523213},
+  url = {https://dl.acm.org/doi/10.14778/3523210.3523213},
+  urldate = {2025-03-05},
+  abstract = {Leaderless replication allows any replica to handle any type of request to achieve read scalability and high availability for distributed data stores. However, this entails burdensome coordination overhead of replication protocols, degrading write throughput. In addition, the data store still requires coordination for membership changes, making it hard to resolve server failures quickly. To this end, we present NetLR, a replicated data store architecture that supports high performance, fault tolerance, and linearizability simultaneously. The key idea of NetLR is moving the entire replication functions into the network by leveraging the switch as an on-path in-network replication orchestrator. Specifically, NetLR performs consistency-aware read scheduling, high-performance write coordination, and active fault adaptation in the network switch. Our in-network replication eliminates inter-replica coordination for writes and membership changes, providing high write performance and fast failure handling. NetLR can be implemented using programmable switches at a line rate with only 5.68\% of additional memory usage. We implement a prototype of NetLR on an Intel Tofino switch and conduct extensive testbed experiments. Our evaluation results show that NetLR is the only solution that achieves high throughput and low latency and is robust to server failures.},
+  file = {/Users/mnakano/Zotero/storage/5RBNRJZG/Kim and Lee - 2022 - In-network leaderless replication for distributed .pdf}
+}
+
+@inproceedings{koyamaFINCHFSDesignAdHoc2024,
+  title = {{{FINCHFS}}: {{Design}} of {{Ad-Hoc File System}} for {{I}}/{{O Heavy HPC Workloads}}},
+  shorttitle = {{{FINCHFS}}},
+  booktitle = {2024 {{IEEE International Conference}} on {{Cluster Computing}} ({{CLUSTER}})},
+  author = {Koyama, Sohei and Hiraga, Kohei and Tatebe, Osamu},
+  date = {2024-09},
+  pages = {440--450},
+  issn = {2168-9253},
+  doi = {10.1109/CLUSTER59578.2024.00045},
+  url = {https://ieeexplore.ieee.org/document/10740840},
+  urldate = {2025-07-01},
+  abstract = {Although the performance improvements in parallel file systems have been significant, the rise of data science and deep learning using Python has introduced new I/O requirements. We redefine ad-hoc file systems as a complement to parallel file systems by specializing in requirements that cannot be met by improvements to parallel file systems. Ad-hoc file systems require extremely high metadata performance and the scalability to create and read large numbers of files in parallel in a single directory. Therefore, it is necessary to process a large number of small RPCs with low latency and high throughput, which cannot be achieved with existing ad-hoc file systems. In this research, we propose a new ad-hoc file system, FINCHFS, and realize the truly desired ad-hoc file system using intra-node shared-nothing architecture and number-aware hashing. The contribution of the intra-node shared-nothing architecture is the ability to run multiple iterative server processes on each node to achieve high IOPS using many-core. The contribution of number-aware hashing is to alleviate tail latency degradation due to the uneven distribution of requests to servers. In the evaluation using 64 nodes on the Pegasus supercomputer, we achieved 32.5 MIOPS in mdtest-hard-write.},
+  eventtitle = {2024 {{IEEE International Conference}} on {{Cluster Computing}} ({{CLUSTER}})},
+  keywords = {ad-hoc filesystem,Computer architecture,distributed filesystem,File systems,High-performance computing,Iterative methods,Low latency communication,Metadata,parallel filesystem,persistent memory,Scalability,Servers,Supercomputers,Tail,Throughput},
+  file = {/Users/mnakano/Zotero/storage/SWIM983E/10740840.html}
+}
+
+@inproceedings{lathamInitialExperiencesDAOS2025,
+  title = {Initial {{Experiences}} with {{DAOS Object Storage}} on {{Aurora}}},
+  booktitle = {Proceedings of the {{SC}} '24 {{Workshops}} of the {{International Conference}} on {{High Performance Computing}}, {{Network}}, {{Storage}}, and {{Analysis}}},
+  author = {Latham, Rob and Ross, Robert B. and Carns, Philip and Snyder, Shane and Harms, Kevin and Velusamy, Kaushik and Coffman, Paul and McPheeters, Gordon},
+  date = {2025-02-11},
+  series = {{{SC-W}} '24},
+  pages = {1304--1310},
+  publisher = {IEEE Press},
+  location = {Atlanta, GA, USA},
+  doi = {10.1109/SCW63240.2024.00171},
+  url = {https://dl.acm.org/doi/10.1109/SCW63240.2024.00171},
+  urldate = {2025-06-30},
+  abstract = {The storage subsystem of the Aurora platform at Argonne National Laboratory offers the potential for unprecedented application I/O performance. Its hardware stack combines NVMe drives, persistent memory devices, a large collection of storage servers, and a unified RDMA-capable network fabric. Its software stack is based on the DAOS object storage system, thereby putting into practice decades of I/O research into minimizing overhead, maximizing access concurrency, and streamlining application interfaces. Taken together, these elements combine to present up to 230 PiB of projected storage capacity and up to 31 TiB/s of projected I/O throughput to applications executing on Aurora.This storage platform is unique, however, and presents a new set of challenges to practitioners. To unlock the full potential of this system, we must revisit fundamental issues such as hardware topology, network concurrency, and I/O APIs to understand their impact on real-world I/O performance. In this paper we present our initial experiences with the DAOS storage system on Aurora and characterize its sensitivity to these parameters at small scale. We discuss our initial impressions and offer recommendations for how to extract maximum effective performance from this class of storage system.},
+  isbn = {979-8-3503-5554-3}
+}
+
+@online{leblancSquirrelFSUsingRust2024,
+  title = {{{SquirrelFS}}: Using the {{Rust}} Compiler to Check File-System Crash Consistency},
+  shorttitle = {{{SquirrelFS}}},
+  author = {LeBlanc, Hayley and Taylor, Nathan and Bornholt, James and Chidambaram, Vijay},
+  date = {2024-06-13},
+  eprint = {2406.09649},
+  eprinttype = {arXiv},
+  eprintclass = {cs},
+  doi = {10.48550/arXiv.2406.09649},
+  url = {http://arxiv.org/abs/2406.09649},
+  urldate = {2024-07-19},
+  abstract = {This work introduces a new approach to building crash-safe file systems for persistent memory. We exploit the fact that Rust's typestate pattern allows compile-time enforcement of a specific order of operations. We introduce a novel crash-consistency mechanism, Synchronous Soft Updates, that boils down crash safety to enforcing ordering among updates to file-system metadata. We employ this approach to build SquirrelFS, a new file system with crash-consistency guarantees that are checked at compile time. SquirrelFS avoids the need for separate proofs, instead incorporating correctness guarantees into the typestate itself. Compiling SquirrelFS only takes tens of seconds; successful compilation indicates crash consistency, while an error provides a starting point for fixing the bug. We evaluate SquirrelFS against state of the art file systems such as NOVA and WineFS, and find that SquirrelFS achieves similar or better performance on a wide range of benchmarks and applications.},
+  pubstate = {prepublished},
+  keywords = {Computer Science - Operating Systems},
+  file = {/Users/mnakano/Zotero/storage/586PBDQR/LeBlanc et al. - 2024 - SquirrelFS using the Rust compiler to check file-.pdf;/Users/mnakano/Zotero/storage/5GCSQLV6/2406.html}
+}
+
+@article{leisVirtualMemoryAssistedBuffer2023,
+  title = {Virtual-{{Memory Assisted Buffer Management}}},
+  author = {Leis, Viktor and Alhomssi, Adnan and Ziegler, Tobias and Loeck, Yannick and Dietrich, Christian},
+  date = {2023-05-26},
+  journaltitle = {Proceedings of the ACM on Management of Data},
+  shortjournal = {Proc. ACM Manag. Data},
+  volume = {1},
+  number = {1},
+  pages = {1--25},
+  issn = {2836-6573},
+  doi = {10.1145/3588687},
+  url = {https://dl.acm.org/doi/10.1145/3588687},
+  urldate = {2024-06-28},
+  abstract = {Most database management systems cache pages from storage in a main memory buffer pool. To do this, they either rely on a hash table that translates page identifiers into pointers, or on pointer swizzling which avoids this translation. In this work, we propose vmcache, a buffer manager design that instead uses hardware-supported virtual memory to translate page identifiers to virtual memory addresses. In contrast to existing mmap-based approaches, the DBMS retains control over page faulting and eviction. Our design is portable across modern operating systems, supports arbitrary graph data, enables variable-sized pages, and is easy to implement. One downside of relying on virtual memory is that with fast storage devices the existing operating system primitives for manipulating the page table can become a performance bottleneck. As a second contribution, we therefore propose exmap, which implements scalable page table manipulation on Linux. Together, vmcache and exmap provide flexible, efficient, and scalable buffer management on multi-core CPUs and fast storage devices.},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/ZLQQL2QB/Leis et al. - 2023 - Virtual-Memory Assisted Buffer Management.pdf}
+}
+
+@article{lewisMachineLearningApplications2025,
+  title = {I/{{O}} in {{Machine Learning Applications}} on {{HPC Systems}}: {{A}} 360-Degree {{Survey}}},
+  shorttitle = {I/{{O}} in {{Machine Learning Applications}} on {{HPC Systems}}},
+  author = {Lewis, Noah and Bez, Jean Luca and Byna, Surendra},
+  date = {2025-03-07},
+  journaltitle = {ACM Comput. Surv.},
+  issn = {0360-0300},
+  doi = {10.1145/3722215},
+  url = {https://dl.acm.org/doi/10.1145/3722215},
+  urldate = {2025-03-09},
+  abstract = {Growing interest in Artificial Intelligence (AI) has resulted in a surge in demand for faster methods of Machine Learning (ML) model training and inference. This demand for speed has prompted the use of high performance computing (HPC) systems that excel in managing distributed workloads. Because data is the main fuel for AI applications, the performance of the storage and I/O subsystem of HPC systems is critical. In the past, HPC applications accessed large portions of data written by simulations or experiments or ingested data for visualizations or analysis tasks. ML workloads perform small reads spread across a large number of random files. This shift of I/O access patterns poses several challenges to modern parallel storage systems. In this paper, we survey I/O in ML applications on HPC systems, and target literature within a 6-year time window from 2019 to 2024. We define the scope of the survey, provide an overview of the common phases of ML, review available profilers and benchmarks, examine the I/O patterns encountered during offline data preparation, training, and inference, and explore I/O optimizations utilized in modern ML frameworks and proposed in recent literature. Lastly, we seek to expose research gaps that could spawn further R\&amp;D.},
+  annotation = {Just Accepted},
+  file = {/Users/mnakano/Zotero/storage/C5I369FN/Lewis et al. - 2025 - IO in Machine Learning Applications on HPC System.pdf}
+}
+
+@inproceedings{liangDAOSScaleOutHigh2020,
+  title = {{{DAOS}}: {{A Scale-Out High Performance Storage Stack}} for {{Storage Class Memory}}},
+  shorttitle = {{{DAOS}}},
+  booktitle = {Supercomputing {{Frontiers}}: 6th {{Asian Conference}}, {{SCFA}} 2020, {{Singapore}}, {{February}} 24–27, 2020, {{Proceedings}}},
+  author = {Liang, Zhen and Lombardi, Johann and Chaarawi, Mohamad and Hennecke, Michael},
+  date = {2020-02-24},
+  pages = {40--54},
+  publisher = {Springer-Verlag},
+  location = {Berlin, Heidelberg},
+  doi = {10.1007/978-3-030-48842-0_3},
+  url = {https://doi.org/10.1007/978-3-030-48842-0_3},
+  urldate = {2025-06-23},
+  abstract = {The Distributed Asynchronous Object Storage (DAOS) is an open source scale-out storage system that is designed from the ground up to support Storage Class Memory (SCM) and NVMe storage in user space. Its advanced storage API enables the native support of structured, semi-structured and unstructured data models, overcoming the limitations of traditional POSIX based parallel filesystem. For HPC workloads, DAOS provides direct MPI-IO and HDF5 support as well as POSIX access for legacy applications. In this paper we present the architecture of the DAOS storage engine and its high-level application interfaces. We also describe initial performance results of DAOS for IO500 benchmarks.},
+  isbn = {978-3-030-48841-3},
+  file = {/Users/mnakano/Zotero/storage/TN3Y2G55/Liang et al. - 2020 - DAOS A Scale-Out High Performance Storage Stack for Storage Class Memory.pdf}
+}
+
+@inproceedings{liCtFSReplacingFile2022,
+  title = {{{ctFS}}: {{Replacing File Indexing}} with {{Hardware Memory Translation}} through {{Contiguous File Allocation}} for {{Persistent Memory}}},
+  shorttitle = {\{{{ctFS}}\}},
+  author = {Li, Ruibin and Ren, Xiang and Zhao, Xu and He, Siwei and Stumm, Michael and Yuan, Ding},
+  date = {2022},
+  pages = {35--50},
+  url = {https://www.usenix.org/conference/fast22/presentation/li},
+  urldate = {2025-01-17},
+  eventtitle = {20th {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 22)},
+  isbn = {978-1-939133-26-7},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/KXESSQYP/Li et al. - 2022 - ctFS Replacing File Indexing with Hardware Memo.pdf}
+}
+
+@inproceedings{liuFlacIOFlatCollective2025,
+  title = {{{FlacIO}}: {{Flat}} and {{Collective I}}/{{O}} for {{Container Image Service}}},
+  shorttitle = {\{{{FlacIO}}\}},
+  author = {Liu, Yubo and Li, Hongbo and Liu, Mingrui and Jing, Rui and Guo, Jian and Zhang, Bo and Guo, Hanjun and Ren, Yuxin and Jia, Ning},
+  date = {2025},
+  pages = {87--101},
+  url = {https://www.usenix.org/conference/fast25/presentation/liu-yubo},
+  urldate = {2025-03-07},
+  eventtitle = {23rd {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 25)},
+  isbn = {978-1-939133-45-8},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/FBQA7KZQ/Liu et al. - 2025 - FlacIO Flat and Collective IO for Container .pdf}
+}
+
+@inproceedings{liuOptimizingFileSystems2024,
+  title = {Optimizing {{File Systems}} on {{Heterogeneous Memory}} by {{Integrating DRAM Cache}} with {{Virtual Memory Management}}},
+  author = {Liu, Yubo and Ren, Yuxin and Liu, Mingrui and Li, Hongbo and Guo, Hanjun and Miao, Xie and Hu, Xinwei and Chen, Haibo},
+  date = {2024},
+  pages = {71--87},
+  url = {https://www.usenix.org/conference/fast24/presentation/liu-yubo},
+  urldate = {2024-05-31},
+  eventtitle = {22nd {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 24)},
+  isbn = {978-1-939133-38-0},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/G5K92TTH/Liu et al. - 2024 - Optimizing File Systems on Heterogeneous Memory by.pdf}
+}
+
+@article{liuOutbackFastCommunicationEfficient2024b,
+  title = {Outback: {{Fast}} and {{Communication-Efficient Index}} for {{Key-Value Store}} on {{Disaggregated Memory}}},
+  shorttitle = {Outback},
+  author = {Liu, Yi and Xie, Minghao and Shi, Shouqian and Xu, Yuanchao and Litz, Heiner and Qian, Chen},
+  date = {2024-10},
+  journaltitle = {Proceedings of the VLDB Endowment},
+  shortjournal = {Proc. VLDB Endow.},
+  volume = {18},
+  number = {2},
+  pages = {335--348},
+  issn = {2150-8097},
+  doi = {10.14778/3705829.3705849},
+  url = {https://dl.acm.org/doi/10.14778/3705829.3705849},
+  urldate = {2025-12-05},
+  abstract = {Disaggregated memory systems achieve resource utilization efficiency and system scalability by distributing computation and memory resources into distinct pools of nodes. RDMA is an attractive solution to support high-throughput communication between different disaggregated resource pools. However, existing RDMA solutions face a dilemma: one-sided RDMA completely bypasses computation at memory nodes, but its communication takes multiple round trips; two-sided RDMA achieves one-round-trip communication but requires non-trivial computation for index lookups at memory nodes, which violates the principle of disaggregated memory. This work presents Outback, a novel indexing solution for key-value stores with a one-round-trip RDMA-based network that does not incur computation-heavy tasks at memory nodes. Outback is the first to utilize dynamic minimal perfect hashing and separates its index into two components: one memory-efficient and computeheavy component at compute nodes and the other memory-heavy and compute-efficient component at memory nodes. We implement a prototype of Outback and evaluate its performance in a public cloud. The experimental results show that Outback achieves higher throughput than both the state-of-the-art one-sided RDMA and two-sided RDMA-based in-memory KVS by 1.06-5.03×, due to the unique strength of applying a separated perfect hashing index.},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/7RWZ43LK/Liu et al. - 2024 - Outback Fast and Communication-Efficient Index for Key-Value Store on Disaggregated Memory.pdf}
+}
+
+@article{lloydStrongerConsistencySemantics2013,
+  title = {Stronger {{Consistency}} and {{Semantics}} for {{Low-Latency Geo-Replicated Storage}}},
+  author = {Lloyd, Wyatt},
+  date = {2013},
+  publisher = {Princeton, NJ : Princeton University},
+  url = {https://dataspace.princeton.edu/handle/88435/dsp01vx021f18v},
+  urldate = {2025-03-05},
+  abstract = {Geo-replicated, distributed data stores that support complex online applications, such as social networks, strive to provide an always-on experience where operations always successfully complete with low latency. Today's systems sacrifice strong consistency and expressive semantics to achieve these goals, exposing inconsistencies to their clients and necessitating complex application logic. In this work, we identify and define a consistency model--causal consistency with convergent conflict handling, or causal+--that is the strongest achieved under these constraints. 								 We explore the ramifications of and implementation techniques for causal+ consistency through the design and implementation of two storage systems, COPS and Eiger. COPS is a key-value store that provides causal+ consistency. A key contribution of COPS is its scalability, which can enforce causal dependencies between keys stored across an entire cluster, rather than a single server like previous systems. Eiger is a system that provides causal+ consistency for the rich column-family data model. The central approach in COPS and Eiger is tracking and explicitly checking that causal dependencies between keys are satisfied in the local cluster before exposing writes. 								 Our work also provides stronger semantics, in the form of read- and write-only transac- tions, that allow programmers to consistently interact with data spread across many servers. COPS includes the first scalable read-only transactions that can optimistically complete in one round of local reads and take at most two non-blocking rounds of local reads. Eiger includes read-only transactions with the same properties that are more general--they are applicable to non-causal systems--and more fault-tolerant. Eiger also includes scalable write-only transactions that take three rounds of local non-blocking communication and do not block concurrent read-only transactions. 								 We implemented COPS and Eiger and demonstrate their performance experimentally. The later of these systems, Eiger, achieves low latency, has throughput competitive with an eventually-consistent and non-transactional production system, and scales to large clusters almost linearly.},
+  langid = {english},
+  annotation = {Accepted: 2013-05-21T13:34:06Z},
+  file = {/Users/mnakano/Zotero/storage/Y6T62YLE/Lloyd - 2013 - Stronger Consistency and Semantics for Low-Latency.pdf}
+}
+
+@inproceedings{lofsteadDAOSFriendsProposal2016,
+  title = {{{DAOS}} and Friends: A Proposal for an Exascale Storage System},
+  shorttitle = {{{DAOS}} and Friends},
+  booktitle = {Proceedings of the {{International Conference}} for {{High Performance Computing}}, {{Networking}}, {{Storage}} and {{Analysis}}},
+  author = {Lofstead, Jay and Jimenez, Ivo and Maltzahn, Carlos and Koziol, Quincey and Bent, John and Barton, Eric},
+  date = {2016-11-13},
+  series = {{{SC}} '16},
+  pages = {1--12},
+  publisher = {IEEE Press},
+  location = {Salt Lake City, Utah},
+  abstract = {The DOE Extreme-Scale Technology Acceleration Fast Forward Storage and IO Stack project is going to have significant impact on storage systems design within and beyond the HPC community. With phase two of the project starting, it is an excellent opportunity to explore the complete design and how it will address the needs of extreme scale platforms. This paper examines each layer of the proposed stack in some detail along with cross-cutting topics, such as transactions and metadata management.This paper not only provides a timely summary of important aspects of the design specifications but also captures the underlying reasoning that is not available elsewhere. We encourage the broader community to understand the design, intent, and future directions to foster discussion guiding phase two and the ultimate production storage stack based on this work. An initial performance evaluation of the early prototype implementation is also provided to validate the presented design.},
+  isbn = {978-1-4673-8815-3},
+  file = {/Users/mnakano/Zotero/storage/FFW65ZJS/Lofstead et al. - 2016 - DAOS and friends a proposal for an exascale stora.pdf}
+}
+
+@article{luoLSMbasedStorageTechniques2020,
+  title = {{{LSM-based Storage Techniques}}: {{A Survey}}},
+  shorttitle = {{{LSM-based Storage Techniques}}},
+  author = {Luo, Chen and Carey, Michael J.},
+  date = {2020-01},
+  journaltitle = {The VLDB Journal},
+  shortjournal = {The VLDB Journal},
+  volume = {29},
+  number = {1},
+  eprint = {1812.07527},
+  eprinttype = {arXiv},
+  eprintclass = {cs},
+  pages = {393--418},
+  issn = {1066-8888, 0949-877X},
+  doi = {10.1007/s00778-019-00555-y},
+  url = {http://arxiv.org/abs/1812.07527},
+  urldate = {2024-05-31},
+  abstract = {Recently, the Log-Structured Merge-tree (LSM-tree) has been widely adopted for use in the storage layer of modern NoSQL systems. Because of this, there have been a large number of research efforts, from both the database community and the operating systems community, that try to improve various aspects of LSM-trees. In this paper, we provide a survey of recent research efforts on LSM-trees so that readers can learn the state-of-the-art in LSM-based storage techniques. We provide a general taxonomy to classify the literature of LSM-trees, survey the efforts in detail, and discuss their strengths and trade-offs. We further survey several representative LSM-based open-source NoSQL systems and discuss some potential future research directions resulting from the survey.},
+  keywords = {Computer Science - Databases},
+  file = {/Users/mnakano/Zotero/storage/G2FDAALP/Luo and Carey - 2020 - LSM-based Storage Techniques A Survey.pdf;/Users/mnakano/Zotero/storage/FRDRF7B9/1812.html}
+}
+
+@online{Lustre,
+  title = {Lustre},
+  url = {https://www.lustre.org/},
+  urldate = {2025-01-25},
+  file = {/Users/mnakano/Zotero/storage/TESN2P4B/www.lustre.org.html}
+}
+
+@inproceedings{lvInfiniFSEfficientMetadata2022,
+  title = {{{InfiniFS}}: {{An Efficient Metadata Service}} for {{Large-Scale Distributed Filesystems}}},
+  shorttitle = {\{{{InfiniFS}}\}},
+  author = {Lv, Wenhao and Lu, Youyou and Zhang, Yiming and Duan, Peile and Shu, Jiwu},
+  date = {2022},
+  pages = {313--328},
+  url = {https://www.usenix.org/conference/fast22/presentation/lv},
+  urldate = {2025-02-01},
+  eventtitle = {20th {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 22)},
+  isbn = {978-1-939133-26-7},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/QCYAAGUF/Lv et al. - 2022 - InfiniFS An Efficient Metadata Service for Lar.pdf}
+}
+
+@inproceedings{maDRustLanguageGuidedDistributed2024,
+  title = {{{DRust}}: {{Language-Guided Distributed Shared Memory}} with {{Fine Granularity}}, {{Full Transparency}}, and {{Ultra Efficiency}}},
+  shorttitle = {\{{{DRust}}\}},
+  author = {Ma, Haoran and Qiao, Yifan and Liu, Shi and Yu, Shan and Ni, Yuanjiang and Lu, Qingda and Wu, Jiesheng and Zhang, Yiying and Kim, Miryung and Xu, Harry},
+  date = {2024},
+  pages = {97--115},
+  url = {https://www.usenix.org/conference/osdi24/presentation/ma-haoran},
+  urldate = {2024-07-19},
+  eventtitle = {18th {{USENIX Symposium}} on {{Operating Systems Design}} and {{Implementation}} ({{OSDI}} 24)},
+  isbn = {978-1-939133-40-3},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/M3U6G2RE/Ma et al. - 2024 - DRust Language-Guided Distributed Shared Memo.pdf}
+}
+
+@article{maorEffectInfiniBandInNetwork,
+  title = {The {{Effect}} of {{InfiniBand}} and {{In-Network Computing}} on {{LS-DYNA}}® {{Simulations}}},
+  author = {Maor, Ophir and Shainer, Gilad and Cho, David and Cisneros-Stoianowski, Gerardo and Qin, Yong},
+  abstract = {High-performance computing (HPC) technologies are used in the automotive design and manufacturing industry. One of the applications is computer-aided engineering (CAE), from component-level design to full analyses for a variety of use cases, including: crash simulations, structure integrity, thermal management, climate control, modeling, acoustics, and more. HPC helps drive faster time-to-market, significantly reducing the cost of laboratory testing and enabling tremendous flexibility. HPC’s strength and efficiency depend on the ability to achieve sustained top performance by driving the CPU performance toward its limits. The motivation for high-performance computing has long been associated with its tremendous cost savings and product improvements; the cost of a high-performance compute cluster can be just a fraction of the price of a single crash test, for example, and the same cluster can serve as the platform for every test simulation going forward.},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/J86A7J3F/Maor et al. - The Effect of InfiniBand and In-Network Computing on LS-DYNA® Simulations.pdf}
+}
+
+@article{maSurveyAddressTranslation2014,
+  title = {A Survey of Address Translation Technologies for Flash Memories},
+  author = {Ma, Dongzhe and Feng, Jianhua and Li, Guoliang},
+  date = {2014-01-01},
+  journaltitle = {ACM Comput. Surv.},
+  volume = {46},
+  number = {3},
+  pages = {36:1--36:39},
+  issn = {0360-0300},
+  doi = {10.1145/2512961},
+  url = {https://doi.org/10.1145/2512961},
+  urldate = {2024-06-28},
+  abstract = {Flash is a type of Electronically Erasable Programmable Read-Only Memory (EEPROM). Different from traditional magnetic disks, flash memories have no moving parts and are purely electronic devices, giving them unique advantages, such as lower access latency, lower power consumption, higher density, shock resistance, and lack of noise. However, existing applications cannot run directly on flash memories due to their special characteristics. Flash Translation Layer (FTL) is a software layer built on raw flash memories that emulates a normal block device like magnetic disks. Primary functionalities of the FTL include address translation, garbage collection, and wear leveling. This survey focuses on address translation technologies and provides a broad overview of existing schemes described in patents, journals, and conference proceedings.},
+  file = {/Users/mnakano/Zotero/storage/BTEM5XCR/Ma et al. - 2014 - A survey of address translation technologies for f.pdf}
+}
+
+@inproceedings{maXRDMAEffectiveRDMA2019,
+  title = {X-{{RDMA}}: {{Effective RDMA Middleware}} in {{Large-scale Production Environments}}},
+  shorttitle = {X-{{RDMA}}},
+  author = {Ma, Teng and Ma, Tao and Song, Zhuo and Li, Jingxuan and Chang, Huaixin and Chen, Kang and Jiang, Hai and Wu, Yongwei},
+  date = {2019-09},
+  pages = {1--12},
+  publisher = {IEEE},
+  location = {Albuquerque, NM, USA},
+  doi = {10.1109/CLUSTER.2019.8891004},
+  url = {https://ieeexplore.ieee.org/document/8891004/},
+  urldate = {2025-06-28},
+  eventtitle = {2019 {{IEEE International Conference}} on {{Cluster Computing}} ({{CLUSTER}})},
+  isbn = {978-1-7281-4734-5}
+}
+
+@inproceedings{mcsherryScalabilityWhatCost2015,
+  title = {Scalability! But at What Cost?},
+  booktitle = {Proceedings of the 15th {{USENIX}} Conference on {{Hot Topics}} in {{Operating Systems}}},
+  author = {McSherry, Frank and Isard, Michael and Murray, Derek G.},
+  date = {2015-05-18},
+  series = {{{HOTOS}}'15},
+  pages = {14},
+  publisher = {USENIX Association},
+  location = {USA},
+  abstract = {We offer a new metric for big data platforms, COST, or the Configuration that Outperforms a Single Thread. The COST of a given platform for a given problem is the hardware configuration required before the platform outperforms a competent single-threaded implementation. COST weighs a system's scalability against the overheads introduced by the system, and indicates the actual performance gains of the system, without rewarding systems that bring substantial but parallelizable overheads.We survey measurements of data-parallel systems recently reported in SOSP and OSDI, and find that many systems have either a surprisingly large COST, often hundreds of cores, or simply underperform one thread for all of their reported configurations.},
+  file = {/Users/mnakano/Zotero/storage/E4IFW6MV/hotos15-paper-mcsherry.pdf}
+}
+
+@online{MicrokernelGoesGeneral,
+  title = {Microkernel {{Goes General}}: {{Performance}} and {{Compatibility}} in the {{HongMeng Production Microkernel}} | {{USENIX}}},
+  url = {https://www.usenix.org/conference/osdi24/presentation/chen-haibo},
+  urldate = {2024-07-19},
+  file = {/Users/mnakano/Zotero/storage/TE5AF3Q7/chen-haibo.html}
+}
+
+@inproceedings{ongaroSearchUnderstandableConsensus2014,
+  title = {In {{Search}} of an {{Understandable Consensus Algorithm}}},
+  author = {Ongaro, Diego and Ousterhout, John},
+  date = {2014},
+  pages = {305--319},
+  url = {https://www.usenix.org/conference/atc14/technical-sessions/presentation/ongaro},
+  urldate = {2024-07-01},
+  eventtitle = {2014 {{USENIX Annual Technical Conference}} ({{USENIX ATC}} 14)},
+  isbn = {978-1-931971-10-2},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/ZGHW78RR/Ongaro and Ousterhout - 2014 - In Search of an Understandable Consensus Algorithm.pdf}
+}
+
+@inproceedings{panFacebooksTectonicFilesystem2021,
+  title = {Facebook's {{Tectonic Filesystem}}: {{Efficiency}} from {{Exascale}}},
+  shorttitle = {Facebook's {{Tectonic Filesystem}}},
+  author = {Pan, Satadru and Stavrinos, Theano and Zhang, Yunqiao and Sikaria, Atul and Zakharov, Pavel and Sharma, Abhinav and P, Shiva Shankar and Shuey, Mike and Wareing, Richard and Gangapuram, Monika and Cao, Guanglei and Preseau, Christian and Singh, Pratap and Patiejunas, Kestutis and Tipton, J. R. and Katz-Bassett, Ethan and Lloyd, Wyatt},
+  date = {2021},
+  pages = {217--231},
+  url = {https://www.usenix.org/conference/fast21/presentation/pan},
+  urldate = {2025-07-09},
+  eventtitle = {19th {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 21)},
+  isbn = {978-1-939133-20-5},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/35XJ6PY6/Pan et al. - 2021 - Facebook's Tectonic Filesystem Efficiency from Exascale.pdf}
+}
+
+@inproceedings{panFastSynchronousCrash2025,
+  title = {Fast and {{Synchronous Crash Consistency}} with {{Metadata}} \{{{Write-Once}}\} {{File System}}},
+  author = {Pan, Yanqi and Xia, Wen and Zhang, Yifeng and Zou, Xiangyu and Huang, Hao and Li, Zhenhua and Wu, Chentao},
+  date = {2025},
+  pages = {859--878},
+  url = {https://www.usenix.org/conference/osdi25/presentation/pan},
+  urldate = {2025-07-18},
+  eventtitle = {19th {{USENIX Symposium}} on {{Operating Systems Design}} and {{Implementation}} ({{OSDI}} 25)},
+  isbn = {978-1-939133-47-2},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/7ARB2TWP/Pan et al. - 2025 - Fast and Synchronous Crash Consistency with Metadata Write-Once File System.pdf}
+}
+
+@article{parkLookaheadReadCache2017,
+  title = {A {{Lookahead Read Cache}}: {{Improving Read Performance}} for {{Deduplication Backup Storage}}},
+  shorttitle = {A {{Lookahead Read Cache}}},
+  author = {Park, Dongchul and Fan, Ziqi and Nam, Young Jin and Du, David H. C.},
+  date = {2017-01-01},
+  journaltitle = {Journal of Computer Science and Technology},
+  shortjournal = {J. Comput. Sci. Technol.},
+  volume = {32},
+  number = {1},
+  pages = {26--40},
+  issn = {1860-4749},
+  doi = {10.1007/s11390-017-1680-8},
+  url = {https://doi.org/10.1007/s11390-017-1680-8},
+  urldate = {2024-06-14},
+  abstract = {Data deduplication (dedupe for short) is a special data compression technique. It has been widely adopted to save backup time as well as storage space, particularly in backup storage systems. Therefore, most dedupe research has primarily focused on improving dedupe write performance. However, backup storage dedupe read performance is also a crucial problem for storage recovery. This paper designs a new dedupe storage read cache for backup applications that improves read performance by exploiting a special characteristic: the read sequence is the same as the write sequence. Consequently, for better cache utilization, by looking ahead for future references within a moving window, it evicts victims from the cache having the smallest future access. Moreover, to further improve read cache performance, it maintains a small log buffer to judiciously cache future access data chunks. Extensive experiments with real-world backup workloads demonstrate that the proposed read cache scheme improves read performance by up to 64.3\%},
+  langid = {english},
+  keywords = {backup,dedupe,deduplication,read cache},
+  file = {/Users/mnakano/Zotero/storage/ZMBYH7NQ/Park et al. - 2017 - A Lookahead Read Cache Improving Read Performance.pdf}
+}
+
+@inproceedings{patilScaleConcurrencyGIGA2011,
+  title = {Scale and {{Concurrency}} of {{GIGA}}+: {{File System Directories}} with {{Millions}} of {{Files}}},
+  shorttitle = {Scale and {{Concurrency}} of \{{{GIGA}}+\}},
+  author = {Patil, Swapnil and Gibson, Garth},
+  date = {2011},
+  url = {https://www.usenix.org/conference/fast11/scale-and-concurrency-giga-file-system-directories-millions-files},
+  urldate = {2024-05-31},
+  eventtitle = {9th {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 11)},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/TTGZAD83/Patil and Gibson - 2011 - Scale and Concurrency of GIGA+ File System Dire.pdf}
+}
+
+@article{pattersonInformedPrefetchingCaching1995,
+  title = {Informed Prefetching and Caching},
+  author = {Patterson, R. H. and Gibson, G. A. and Ginting, E. and Stodolsky, D. and Zelenka, J.},
+  date = {1995-12-03},
+  journaltitle = {ACM SIGOPS Operating Systems Review},
+  shortjournal = {SIGOPS Oper. Syst. Rev.},
+  volume = {29},
+  number = {5},
+  pages = {79--95},
+  issn = {0163-5980},
+  doi = {10.1145/224057.224064},
+  url = {https://dl.acm.org/doi/10.1145/224057.224064},
+  urldate = {2024-06-20},
+  file = {/Users/mnakano/Zotero/storage/PG8MDKRF/Patterson et al. - 1995 - Informed prefetching and caching.pdf}
+}
+
+@online{peterj.braamLustreNetworkingWhitepaper2007,
+  title = {Lustre {{Networking Whitepaper}} v4 {{Load Balancing}} ({{Computing}}) {{Computer Network}}},
+  author = {Peter J. Braam},
+  date = {2007-07},
+  url = {https://www.scribd.com/document/68270100/Lustre-Networking-Whitepaper-v4},
+  urldate = {2025-07-01},
+  abstract = {This paper provides information about Lustre(r) networking (LNET) that can be used to plan cluster file system deployments for optimal performance and scalability. We will review Lustre message passing, Lustre Network Drivers (LNDs), and routing in Lustre Networks. The final section of this paper describes some new LNET features that are currently under consideration or planned release.},
+  langid = {english},
+  organization = {Scribd},
+  file = {/Users/mnakano/Zotero/storage/Y8DR3M2U/Lustre-Networking-Whitepaper-v4.html}
+}
+
+@inproceedings{pismennyDisentanglingDualRole2025,
+  title = {Disentangling the {{Dual Role}} of \{{{NIC}}\} {{Receive Rings}}},
+  author = {Pismenny, Boris and Morrison, Adam and Tsafrir, Dan},
+  date = {2025},
+  pages = {651--669},
+  url = {https://www.usenix.org/conference/osdi25/presentation/pismenny},
+  urldate = {2025-07-18},
+  eventtitle = {19th {{USENIX Symposium}} on {{Operating Systems Design}} and {{Implementation}} ({{OSDI}} 25)},
+  isbn = {978-1-939133-47-2},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/2XJ38EY6/Pismenny et al. - 2025 - Disentangling the Dual Role of NIC Receive Rings.pdf}
+}
+
+@inproceedings{qianCombiningBufferedDirect2024a,
+  title = {Combining {{Buffered I}}/{{O}} and {{Direct I}}/{{O}} in {{Distributed File Systems}}},
+  author = {Qian, Yingjin and Vef, Marc-André and Farrell, Patrick and Dilger, Andreas and Li, Xi and Ihara, Shuichi and Fu, Yinjin and Xue, Wei and Brinkmann, André},
+  date = {2024},
+  pages = {17--33},
+  url = {https://www.usenix.org/conference/fast24/presentation/qian},
+  urldate = {2024-05-31},
+  eventtitle = {22nd {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 24)},
+  isbn = {978-1-939133-38-0},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/68NBDGUI/Qian et al. - 2024 - Combining Buffered IO and Direct IO in Distr.pdf}
+}
+
+@inproceedings{qianXfastExtremeFile2023,
+  title = {Xfast: {{Extreme File Attribute Stat Acceleration}} for {{Lustre}}},
+  shorttitle = {Xfast},
+  booktitle = {Proceedings of the {{International Conference}} for {{High Performance Computing}}, {{Networking}}, {{Storage}} and {{Analysis}}},
+  author = {Qian, Yingjin and Cheng, Wen and Zeng, Lingfang and Li, Xi and Vef, Marc-André and Dilger, Andreas and Lai, Siyao and Ihara, Shuichi and Fan, Yong and Brinkmann, André},
+  date = {2023-11-11},
+  series = {{{SC}} '23},
+  pages = {1--12},
+  publisher = {Association for Computing Machinery},
+  location = {New York, NY, USA},
+  doi = {10.1145/3581784.3607080},
+  url = {https://dl.acm.org/doi/10.1145/3581784.3607080},
+  urldate = {2025-02-04},
+  abstract = {Directory tree walks on parallel file systems are costly operations frequently required by many storage management tasks. Even listing the contents of a single directory can take minutes to hours for huge directories, as the tree walk performance of parallel file systems in Linux is severely throttled by sequentially accessing distributed metadata for each file through the syscall interface.We present eXtreme file attribute stat (Xfast), which scales the performance of directory tree walks by combining techniques that have been developed over a time frame of 10 years for the Lustre file system. Scalable statahead predicts file access patterns and prefetches required attributes, while the Size on MDT (SOM) mechanism reduces the number of RPC calls to collect file attributes. Xfast improves the performance of common directory operations, e.g. reduces the time to list one million files from 11 minutes to less than one minute for a single process.},
+  isbn = {979-8-4007-0109-2},
+  file = {/Users/mnakano/Zotero/storage/RXM3GQCB/Qian et al. - 2023 - Xfast Extreme File Attribute Stat Acceleration fo.pdf}
+}
+
+@inproceedings{renIndexFSScalingFile2014,
+  title = {{{IndexFS}}: {{Scaling File System Metadata Performance}} with {{Stateless Caching}} and {{Bulk Insertion}}},
+  shorttitle = {{{IndexFS}}},
+  booktitle = {{{SC}} '14: {{Proceedings}} of the {{International Conference}} for {{High Performance Computing}}, {{Networking}}, {{Storage}} and {{Analysis}}},
+  author = {Ren, Kai and Zheng, Qing and Patil, Swapnil and Gibson, Garth},
+  date = {2014-01-01},
+  pages = {237--248},
+  issn = {2167-4337},
+  doi = {10.1109/SC.2014.25},
+  url = {https://ieeexplore.ieee.org/document/7013007},
+  urldate = {2024-05-31},
+  abstract = {The growing size of modern storage systems is expected to exceed billions of objects, making metadata scalability critical to overall performance. Many existing distributed file systems only focus on providing highly parallel fast access to file data, and lack a scalable metadata service. In this paper, we introduce a middleware design called Index FS that adds support to existing file systems such as PVFS, Lustre, and HDFS for scalable high-performance operations on metadata and small files. Index FS uses a table-based architecture that incrementally partitions the namespace on a per-directory basis, preserving server and disk locality for small directories. An optimized log-structured layout is used to store metadata and small files efficiently. We also propose two client-based storm free caching techniques: bulk namespace insertion for creation intensive workloads such as N-N check pointing, and stateless consistent metadata caching for hot spot mitigation. By combining these techniques, we have demonstrated Index FS scaled to 128 metadata servers. Experiments show our out-of-core metadata throughput out-performing existing solutions such as PVFS, Lustre, and HDFS by 50\% to two orders of magnitude.},
+  eventtitle = {{{SC}} '14: {{Proceedings}} of the {{International Conference}} for {{High Performance Computing}}, {{Networking}}, {{Storage}} and {{Analysis}}},
+  keywords = {bulk insertion,Compaction,Distributed file systems,file system metadata,Indexes,log-structured merge tree,Middleware,Receivers,Scalability,Servers,stateless caching,Throughput},
+  file = {/Users/mnakano/Zotero/storage/GC5TI7WJ/Ren et al. - 2014 - IndexFS Scaling File System Metadata Performance .pdf;/Users/mnakano/Zotero/storage/6VAJECFV/7013007.html}
+}
+
+@inproceedings{renTABLEFSEnhancingMetadata2013,
+  title = {{{TABLEFS}}: {{Enhancing Metadata Efﬁciency}} in the {{Local File System}}},
+  shorttitle = {\{{{TABLEFS}}\}},
+  author = {Ren, Kai and Gibson, Garth},
+  date = {2013},
+  pages = {145--156},
+  url = {https://www.usenix.org/conference/atc13/technical-sessions/presentation/ren},
+  urldate = {2024-05-31},
+  eventtitle = {2013 {{USENIX Annual Technical Conference}} ({{USENIX ATC}} 13)},
+  isbn = {978-1-931971-01-0},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/XKJLS69E/Ren and Gibson - 2013 - TABLEFS Enhancing Metadata Efﬁciency in the L.pdf}
+}
+
+@online{romainCRDTsTrulyConcurrent,
+  title = {{{CRDTs}} for Truly Concurrent File Systems | {{Proceedings}} of the 13th {{ACM Workshop}} on {{Hot Topics}} in {{Storage}} and {{File Systems}}},
+  author = {Romain, Vaillant},
+  doi = {10.1145/3465332.3470872},
+  url = {https://dl.acm.org/doi/10.1145/3465332.3470872},
+  urldate = {2024-06-03},
+  langid = {english},
+  organization = {ACM Conferences},
+  file = {/Users/mnakano/Zotero/storage/Q69YE3VS/CRDTs for truly concurrent file systems  Proceedi.pdf;/Users/mnakano/Zotero/storage/D6WFF6AF/3465332.html}
+}
+
+@article{rompfGoMetaCase2015,
+  title = {Go {{Meta}}! {{A Case}} for {{Generative Programming}} and {{DSLs}} in {{Performance Critical Systems}}},
+  author = {Rompf, Tiark and Brown, Kevin J. and Lee, HyoukJoong and Sujeeth, Arvind K. and Jonnalagedda, Manohar and Amin, Nada and Ofenbeck, Georg and Stojanov, Alen and Klonatos, Yannis and Dashti, Mohammad and Koch, Christoph and Püschel, Markus and Olukotun, Kunle},
+  namea = {Ball, Thomas and Bodik, Rastislav and Krishnamurthi, Shriram and Lerner, Benjamin S. and Morrisett, Greg},
+  nameatype = {collaborator},
+  date = {2015},
+  journaltitle = {LIPIcs, Volume 32, SNAPL 2015},
+  volume = {32},
+  pages = {238--261},
+  publisher = {Schloss Dagstuhl – Leibniz-Zentrum für Informatik},
+  issn = {1868-8969},
+  doi = {10.4230/LIPICS.SNAPL.2015.238},
+  url = {https://drops.dagstuhl.de/entities/document/10.4230/LIPIcs.SNAPL.2015.238},
+  urldate = {2024-07-07},
+  abstract = {Most performance critical software is developed using very low-level techniques. We argue that this needs to change, and that generative programming is an effective avenue to enable the use of high-level languages and programming techniques in many such circumstances.},
+  isbn = {9783939897804},
+  langid = {english},
+  keywords = {DSLs,Generative Programming,Performance,Staging},
+  file = {/Users/mnakano/Zotero/storage/SQBDUI99/Rompf et al. - 2015 - Go Meta! A Case for Generative Programming and DSL.pdf}
+}
+
+@inproceedings{satijaCloudscapeStudyStorage2025,
+  title = {Cloudscape: {{A Study}} of {{Storage Services}} in {{Modern Cloud Architectures}}},
+  shorttitle = {Cloudscape},
+  author = {Satija, Sambhav and Ye, Chenhao and Kosgi, Ranjitha and Jain, Aditya and Kankaria, Romit and Chen, Yiwei and Arpaci-Dusseau, Andrea C. and Arpaci-Dusseau, Remzi H. and Srinivasan, Kiran},
+  date = {2025},
+  pages = {103--121},
+  url = {https://www.usenix.org/conference/fast25/presentation/satija},
+  urldate = {2025-03-07},
+  eventtitle = {23rd {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 25)},
+  isbn = {978-1-939133-45-8},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/83Z5GQ2H/Satija et al. - 2025 - Cloudscape A Study of Storage Services in Modern .pdf}
+}
+
+@inproceedings{schuermannBuildingBridgesSafe2025,
+  title = {Building {{Bridges}}: {{Safe Interactions}} with {{Foreign Languages}} through {{Omniglot}}},
+  shorttitle = {Building {{Bridges}}},
+  author = {Schuermann, Leon and Toubes, Jack and Potyondy, Tyler and Pannuto, Pat and Milano, Mae and Levy, Amit},
+  date = {2025},
+  pages = {595--613},
+  url = {https://www.usenix.org/conference/osdi25/presentation/schuermann},
+  urldate = {2025-07-18},
+  eventtitle = {19th {{USENIX Symposium}} on {{Operating Systems Design}} and {{Implementation}} ({{OSDI}} 25)},
+  isbn = {978-1-939133-47-2},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/UV3JPUKC/Schuermann et al. - 2025 - Building Bridges Safe Interactions with Foreign Languages through Omniglot.pdf}
+}
+
+@inproceedings{SFSRandomWrite2012,
+  title = {{{SFS}}: {{Random Write Considered Harmful}} in {{Solid State Drives}}},
+  shorttitle = {\{{{SFS}}\}},
+  date = {2012},
+  url = {https://www.usenix.org/conference/fast12/sfs-random-write-considered-harmful-solid-state-drives},
+  urldate = {2024-05-31},
+  eventtitle = {10th {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 12)},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/VVZEXNVF/2012 - SFS Random Write Considered Harmful in Solid St.pdf}
+}
+
+@inproceedings{shakibaKosmoEfficientOnline2024,
+  title = {Kosmo: {{Efficient Online Miss Ratio Curve Generation}} for {{Eviction Policy Evaluation}}},
+  shorttitle = {Kosmo},
+  author = {Shakiba, Kia and Sultan, Sari and Stumm, Michael},
+  date = {2024},
+  pages = {89--105},
+  url = {https://www.usenix.org/conference/fast24/presentation/shakiba},
+  urldate = {2024-05-31},
+  eventtitle = {22nd {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 24)},
+  isbn = {978-1-939133-38-0},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/D456E5EC/Shakiba et al. - 2024 - Kosmo Efficient Online Miss Ratio Curve Generatio.pdf}
+}
+
+@inproceedings{shenFUSEEFullyMemoryDisaggregated2023,
+  title = {{{FUSEE}}: {{A Fully Memory-Disaggregated Key-Value Store}}},
+  shorttitle = {\{{{FUSEE}}\}},
+  author = {Shen, Jiacheng and Zuo, Pengfei and Luo, Xuchuan and Yang, Tianyi and Su, Yuxin and Zhou, Yangfan and Lyu, Michael R.},
+  date = {2023},
+  pages = {81--98},
+  url = {https://www.usenix.org/conference/fast23/presentation/shen},
+  urldate = {2025-02-04},
+  eventtitle = {21st {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 23)},
+  isbn = {978-1-939133-32-8},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/P7MMR35E/Shen et al. - 2023 - FUSEE A Fully Memory-Disaggregated Key-Value.pdf}
+}
+
+@inproceedings{shenXSchedPreemptiveScheduling2025,
+  title = {\{{{XSched}}\}: {{Preemptive Scheduling}} for {{Diverse}} \{{{XPUs}}\}},
+  shorttitle = {\{{{XSched}}\}},
+  author = {Shen, Weihang and Han, Mingcong and Liu, Jialong and Chen, Rong and Chen, Haibo},
+  date = {2025},
+  pages = {671--692},
+  url = {https://www.usenix.org/conference/osdi25/presentation/shen-weihang},
+  urldate = {2025-07-18},
+  eventtitle = {19th {{USENIX Symposium}} on {{Operating Systems Design}} and {{Implementation}} ({{OSDI}} 25)},
+  isbn = {978-1-939133-47-2},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/GGXM3QHZ/Shen et al. - 2025 - XSched Preemptive Scheduling for Diverse XPUs .pdf}
+}
+
+@inproceedings{shvachkoHadoopDistributedFile2010,
+  title = {The {{Hadoop Distributed File System}}},
+  booktitle = {2010 {{IEEE}} 26th {{Symposium}} on {{Mass Storage Systems}} and {{Technologies}} ({{MSST}})},
+  author = {Shvachko, Konstantin and Kuang, Hairong and Radia, Sanjay and Chansler, Robert},
+  date = {2010-05},
+  pages = {1--10},
+  issn = {2160-1968},
+  doi = {10.1109/MSST.2010.5496972},
+  url = {https://ieeexplore.ieee.org/document/5496972},
+  urldate = {2024-06-25},
+  abstract = {The Hadoop Distributed File System (HDFS) is designed to store very large data sets reliably, and to stream those data sets at high bandwidth to user applications. In a large cluster, thousands of servers both host directly attached storage and execute user application tasks. By distributing storage and computation across many servers, the resource can grow with demand while remaining economical at every size. We describe the architecture of HDFS and report on experience using HDFS to manage 25 petabytes of enterprise data at Yahoo!.},
+  eventtitle = {2010 {{IEEE}} 26th {{Symposium}} on {{Mass Storage Systems}} and {{Technologies}} ({{MSST}})},
+  keywords = {Bandwidth,Clustering algorithms,Computer architecture,Concurrent computing,Distributed computing,distributed file system,Facebook,File servers,File systems,Hadoop,HDFS,Protection,Protocols},
+  file = {/Users/mnakano/Zotero/storage/G99PJ6EW/Shvachko et al. - 2010 - The Hadoop Distributed File System.pdf;/Users/mnakano/Zotero/storage/5MJZ7NXG/5496972.html}
+}
+
+@article{singhScalableMetadataManagement2018,
+  title = {Scalable {{Metadata Management Techniques}} for {{Ultra-Large Distributed Storage Systems}} -- {{A Systematic Review}}},
+  author = {Singh, Harcharan Jit and Bawa, Seema},
+  date = {2018-07-31},
+  journaltitle = {ACM Comput. Surv.},
+  volume = {51},
+  number = {4},
+  pages = {82:1--82:37},
+  issn = {0360-0300},
+  doi = {10.1145/3212686},
+  url = {https://dl.acm.org/doi/10.1145/3212686},
+  urldate = {2025-02-04},
+  abstract = {The provisioning of an efficient ultra-large scalable distributed storage system for expanding cloud applications has been a challenging job for researchers in academia and industry. In such an ultra-large-scale storage system, data are distributed on multiple storage nodes for performance, scalability, and availability. The access to this distributed data is through its metadata, maintained by multiple metadata servers. The metadata carries information about the physical address of data and access privileges. The efficiency of a storage system highly depends on effective metadata management. This research presents an extensive systematic literature analysis of metadata management techniques in storage systems. This research work will help researchers to find the significance of metadata management and important parameters of metadata management techniques for storage systems. Methodical examination of metadata management techniques developed by various industry and research groups is described. The different metadata distribution techniques lead to various taxonomies. Furthermore, the article investigates techniques based on distribution structures and key parameters of metadata management. It also presents strengths and weaknesses of individual existing techniques that will help researchers to select the most appropriate technique for specific applications. Finally, it discusses existing challenges and significant research directions in metadata management for researchers.},
+  file = {/Users/mnakano/Zotero/storage/LYW6B39E/Singh and Bawa - 2018 - Scalable Metadata Management Techniques for Ultra-.pdf}
+}
+
+@unpublished{SongGangCongCiShiDaiJiSuanJiPanFuYueNEXTnoTuiJinnituite2024,
+  title = {次世代計算基盤（富岳NEXT）の推進について},
+  author = {松岡聡},
+  date = {2024-08},
+  url = {https://www.mext.go.jp/content/20240823-mxt-jyohoka01-000037488\_04.pdf},
+  langid = {japanese},
+  file = {/Users/mnakano/Zotero/storage/4R9IGV5Y/計算科学研究センター - 次世代計算基盤（富岳NEXT）の推進について.pdf}
+}
+
+@inproceedings{sugiharaDesignDirectRead2020,
+  title = {Design of {{Direct Read}} from {{Sparse Segments}} in {{MPI-IO}}},
+  booktitle = {2020 {{IEEE}} 22nd {{International Conference}} on {{High Performance Computing}} and {{Communications}}; {{IEEE}} 18th {{International Conference}} on {{Smart City}}; {{IEEE}} 6th {{International Conference}} on {{Data Science}} and {{Systems}} ({{HPCC}}/{{SmartCity}}/{{DSS}})},
+  author = {Sugihara, Kohei and Tatebe, Osamu},
+  date = {2020-12},
+  pages = {1308--1315},
+  doi = {10.1109/HPCC-SmartCity-DSS50907.2020.00168},
+  url = {https://ieeexplore.ieee.org/document/9407823/references},
+  urldate = {2025-06-29},
+  abstract = {As computational power of a supercomputer in-creases, there is an increase in the gap between the computational performance and storage performance. This is because of the slow improvement rate of storage performance. A promising remedy to bridge this gap is the node-local storages seen in recent supercomputers.We had previously proposed sparse segments for scalable write performance. This enabled the awareness of locality and avoided lock contention and performance degradation for single shared file access by converting single shared file (SSF) access to file per process (FPP) access internally within the MPI-IO library. It exhibited linear I/O performance by increasing the number of compute nodes. However, the purpose of this method is to improve write performance. To read a file in a sparse segment format, it is necessary to flush all segments back to a parallel filesystem, which may cause performance degradation.A direct read method for sparse segments is proposed to overcome this setback. We introduce an offset table and provide a scalable lookup functionality against multiple sparse segments. We implement our method in the MPI-IO layer to apply existing MPI-IO applications without any code modification. The experimental results of using IOR on Cygnus supercomputer exhibit a scalable performance for both read and write functions.},
+  eventtitle = {2020 {{IEEE}} 22nd {{International Conference}} on {{High Performance Computing}} and {{Communications}}; {{IEEE}} 18th {{International Conference}} on {{Smart City}}; {{IEEE}} 6th {{International Conference}} on {{Data Science}} and {{Systems}} ({{HPCC}}/{{SmartCity}}/{{DSS}})},
+  keywords = {Bandwidth,Bridges,Conferences,Degradation,Distributed file systems,High performance computing,Optimization methods,Parallel I/O,Scalability,Single shared file},
+  file = {/Users/mnakano/Zotero/storage/B3PHV4S2/references.html}
+}
+
+@inproceedings{sugiharaDesignLocalityawareMPIIO2020,
+  title = {Design of {{Locality-aware MPI-IO}} for {{Scalable Shared File Write Performance}}},
+  booktitle = {2020 {{IEEE International Parallel}} and {{Distributed Processing Symposium Workshops}} ({{IPDPSW}})},
+  author = {Sugihara, Kohei and Tatebe, Osamu},
+  date = {2020-05},
+  pages = {1080--1089},
+  doi = {10.1109/IPDPSW50202.2020.00179},
+  url = {https://ieeexplore.ieee.org/document/9150399},
+  urldate = {2025-06-29},
+  abstract = {Difficult and challenging I/O access pattern among applications is N-1 access pattern such that multiple N processes share and access a single file. This I/O pattern is commonly and widely used because it can reduce the number of output files, while there is a problem of I/O performance degradation due to lock conflicts in a parallel file system among processes. In this study, we propose a locality-aware MPI-IO to improve N-1 write performance by using node-local storage. Our method achieved a significantly scalable performance with N-1 noncollective write performance reaching 1062.36 GiB/s for read and 268.08 GiB/s for write using 256 nodes. The parallel efficiency of N-1 noncollective write was 58\% using 256 nodes and that of N-1 collective write was 63\% using 72 nodes. The scalability of the proposed method outperforms the Lustre and BeeOND. It also achieves a scalable performance for real application benchmarks such as S3D-IO, LES-IO and VPIC-IO, which shows that it is promising for Exascale systems.},
+  eventtitle = {2020 {{IEEE International Parallel}} and {{Distributed Processing Symposium Workshops}} ({{IPDPSW}})},
+  keywords = {Benchmark testing,Degradation,Libraries,Optimization methods,Standards,Supercomputers},
+  file = {/Users/mnakano/Zotero/storage/DTX9X3JE/9150399.html}
+}
+
+@article{sunLearnedIndexComprehensive2023,
+  title = {Learned {{Index}}: {{A Comprehensive Experimental Evaluation}}},
+  shorttitle = {Learned {{Index}}},
+  author = {Sun, Zhaoyan and Zhou, Xuanhe and Li, Guoliang},
+  date = {2023-04-01},
+  journaltitle = {Proc. VLDB Endow.},
+  volume = {16},
+  number = {8},
+  pages = {1992--2004},
+  issn = {2150-8097},
+  doi = {10.14778/3594512.3594528},
+  url = {https://dl.acm.org/doi/10.14778/3594512.3594528},
+  urldate = {2025-03-07},
+  abstract = {Indexes can improve query-processing performance by avoiding full table scans. Although traditional indexes (e.g., B+-tree) have been widely used, learned indexes are proposed to adopt machine learning models to reduce the query latency and index size. However, existing learned indexes are (1) not thoroughly evaluated under the same experimental framework and are (2) not comprehensively compared with different settings (e.g., key lookup, key insert, concurrent operations, bulk loading). Moreover, it is hard to select appropriate learned indexes for practitioners in different settings. To address those problems, this paper detailedly reviews existing learned indexes and discusses the design choices of key components in learned indexes, including key lookup (position inference which predicts the position of a key, and position refinement which re-searches the position if the predicted position is incorrect), key insert, concurrency, and bulk loading. Moreover, we provide a testbed to facilitate the design and test of new learned indexes for researchers. We compare state-of-the-art learned indexes in the same experimental framework, and provide findings to select suitable learned indexes under various practical scenarios.},
+  file = {/Users/mnakano/Zotero/storage/9HT9IJIR/Sun et al. - 2023 - Learned Index A Comprehensive Experimental Evalua.pdf}
+}
+
+@inproceedings{tatebeCHFSParallelConsistent2022,
+  title = {{{CHFS}}: {{Parallel Consistent Hashing File System}} for {{Node-local Persistent Memory}}},
+  shorttitle = {{{CHFS}}},
+  booktitle = {International {{Conference}} on {{High Performance Computing}} in {{Asia-Pacific Region}}},
+  author = {Tatebe, Osamu and Obata, Kazuki and Hiraga, Kohei and Ohtsuji, Hiroki},
+  date = {2022-01-07},
+  series = {{{HPCAsia}} '22},
+  pages = {115--124},
+  publisher = {Association for Computing Machinery},
+  location = {New York, NY, USA},
+  doi = {10.1145/3492805.3492807},
+  url = {https://doi.org/10.1145/3492805.3492807},
+  urldate = {2024-06-24},
+  abstract = {This paper proposes a design for CHFS, an ad hoc parallel file system that utilizes the persistent memory of compute nodes. The design is based entirely on a highly scalable distributed key-value store with consistent hashing. CHFS improves the scalability of parallel data-access performance and metadata performance in terms of the number of compute nodes by eliminating dedicated metadata servers, sequential execution, and centralized data management. The implementation efficiently utilizes multicore and manycore CPUs, high-performance networks, and remote direct memory access by the Mochi-Margo library. With a 4-node persistent memory cluster, CHFS performs 9.9 times better than the state-of-the-art DAOS distributed object storage and 6.0 times better than GekkoFS on the IOR hard write benchmark. Regarding scalability, CHFS displays better scalability and performance for both bandwidth and metadata compared with BeeOND and GekkoFS. CHFS is a promising building block for HPC storage layers.},
+  isbn = {978-1-4503-8498-8},
+  file = {/Users/mnakano/Zotero/storage/VYUPRDWJ/Tatebe et al. - 2022 - CHFS Parallel Consistent Hashing File System for .pdf}
+}
+
+@article{tatebeGfarmBBGfarm2020,
+  title = {Gfarm/{{BB}} — {{Gfarm File System}} for {{Node-Local Burst Buffer}}},
+  author = {Tatebe, Osamu and Moriwake, Shukuko and Oyama, Yoshihiro},
+  date = {2020-01-01},
+  journaltitle = {Journal of Computer Science and Technology},
+  shortjournal = {J. Comput. Sci. Technol.},
+  volume = {35},
+  number = {1},
+  pages = {61--71},
+  issn = {1860-4749},
+  doi = {10.1007/s11390-020-9803-z},
+  url = {https://doi.org/10.1007/s11390-020-9803-z},
+  urldate = {2025-01-26},
+  abstract = {Burst buffer has become a major component to meet the I/O performance requirement of HPC bursty traffic. This paper proposes Gfarm/BB that is a file system for a burst buffer efficiently exploiting node-local storage systems. Although node-local storages improve storage performance, they are only available during the job allocation. Gfarm/BB should have better access and metadata performance while it should be constructed on-demand before the job execution. To improve the read and write performance, it exploits the file descriptor passing and remote direct memory access (RDMA). It improves the metadata performance by omitting the persistency and the redundancy since it is a temporal file system. Using RDMA, writes and reads bandwidth are improved by 1.7x and 2.2x compared with IP over InfiniBand (IPoIB), respectively. It achieves 14 700 operations per second in the directory creation performance, which is 13.4x faster than the fully persistent and redundant case. The construction of Gfarm/BB takes 0.31 seconds using 2 nodes. IOR benchmark and ARGOT-IO application I/O benchmark show the scalable performance improvement by exploiting the locality of node-local storages. Compared with BeeOND, Gfarm/BB shows 2.6x and 2.4x better performance in IOR write and read benchmarks, respectively, and it shows 2.5x better performance in ARGOT-IO.},
+  langid = {english},
+  keywords = {Artificial Intelligence,burst buffer,node-local storage,on-demand file system,remote direct memory access},
+  file = {/Users/mnakano/Zotero/storage/6YJL7GXD/Tatebe et al. - 2020 - GfarmBB — Gfarm File System for Node-Local Burst .pdf}
+}
+
+@article{terraceObjectStorageCRAQ,
+  title = {Object {{Storage}} on {{CRAQ}}},
+  author = {Terrace, Jeff and Freedman, Michael J},
+  abstract = {Massive storage systems typically replicate and partition data over many potentially-faulty components to provide both reliability and scalability. Yet many commerciallydeployed systems, especially those designed for interactive use by customers, sacrifice stronger consistency properties in the desire for greater availability and higher throughput.},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/WPIQSYW3/Terrace and Freedman - Object Storage on CRAQ.pdf}
+}
+
+@online{UsingLightweightFormal,
+  title = {Using {{Lightweight Formal Methods}} to {{Validate}} a {{Key-Value Storage Node}} in {{Amazon S3}} | {{Proceedings}} of the {{ACM SIGOPS}} 28th {{Symposium}} on {{Operating Systems Principles}}},
+  doi = {10.1145/3477132.3483540},
+  url = {https://dl.acm.org/doi/10.1145/3477132.3483540},
+  urldate = {2024-05-31},
+  langid = {english},
+  organization = {ACM Conferences},
+  file = {/Users/mnakano/Zotero/storage/CGFDWDS6/Using Lightweight Formal Methods to Validate a Key.pdf;/Users/mnakano/Zotero/storage/QAF8NNGJ/3477132.html}
+}
+
+@article{usmanDataLocalityHigh2023,
+  title = {Data {{Locality}} in {{High Performance Computing}}, {{Big Data}}, and {{Converged Systems}}: {{An Analysis}} of the {{Cutting Edge}} and a {{Future System Architecture}}},
+  shorttitle = {Data {{Locality}} in {{High Performance Computing}}, {{Big Data}}, and {{Converged Systems}}},
+  author = {Usman, Sardar and Mehmood, Rashid and Katib, Iyad and Albeshri, Aiiad},
+  date = {2023-01},
+  journaltitle = {Electronics},
+  volume = {12},
+  number = {1},
+  pages = {53},
+  publisher = {Multidisciplinary Digital Publishing Institute},
+  issn = {2079-9292},
+  doi = {10.3390/electronics12010053},
+  url = {https://www.mdpi.com/2079-9292/12/1/53},
+  urldate = {2025-02-04},
+  abstract = {Big data has revolutionized science and technology leading to the transformation of our societies. High-performance computing (HPC) provides the necessary computational power for big data analysis using artificial intelligence and methods. Traditionally, HPC and big data had focused on different problem domains and had grown into two different ecosystems. Efforts have been underway for the last few years on bringing the best of both paradigms into HPC and big converged architectures. Designing HPC and big data converged systems is a hard task requiring careful placement of data, analytics, and other computational tasks such that the desired performance is achieved with the least amount of resources. Energy efficiency has become the biggest hurdle in the realization of HPC, big data, and converged systems capable of delivering exascale and beyond performance. Data locality is a key parameter of HPDA system design as moving even a byte costs heavily both in time and energy with an increase in the size of the system. Performance in terms of time and energy are the most important factors for users, particularly energy, due to it being the major hurdle in high-performance system design and the increasing focus on green energy systems due to environmental sustainability. Data locality is a broad term that encapsulates different aspects including bringing computations to data, minimizing data movement by efficient exploitation of cache hierarchies, reducing intra- and inter-node communications, locality-aware process and thread mapping, and in situ and transit data analysis. This paper provides an extensive review of cutting-edge research on data locality in HPC, big data, and converged systems. We review the literature on data locality in HPC, big data, and converged environments and discuss challenges, opportunities, and future directions. Subsequently, using the knowledge gained from this extensive review, we propose a system architecture for future HPC and big data converged systems. To the best of our knowledge, there is no such review on data locality in converged HPC and big data systems.},
+  issue = {1},
+  langid = {english},
+  keywords = {big data,convergence,data locality,design patterns,Hadoop,High-performance computing (HPC),High-Performance Data Analytics (HPDS),in situ data analysis,process mapping,Spark},
+  file = {/Users/mnakano/Zotero/storage/G969DC7R/Usman et al. - 2023 - Data Locality in High Performance Computing, Big D.pdf}
+}
+
+@inproceedings{vangoorFUSENotFUSE2017,
+  title = {To \{{{FUSE}}\} or {{Not}} to \{{{FUSE}}\}: {{Performance}} of \{{{User-Space}}\} {{File Systems}}},
+  shorttitle = {To \{{{FUSE}}\} or {{Not}} to \{{{FUSE}}\}},
+  author = {Vangoor, Bharath Kumar Reddy and Tarasov, Vasily and Zadok, Erez},
+  date = {2017},
+  pages = {59--72},
+  url = {https://www.usenix.org/conference/fast17/technical-sessions/presentation/vangoor},
+  urldate = {2024-06-28},
+  eventtitle = {15th {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 17)},
+  isbn = {978-1-931971-36-2},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/AU5UT48P/Vangoor et al. - 2017 - To FUSE or Not to FUSE Performance of User-S.pdf}
+}
+
+@inproceedings{vefGekkoFSTemporaryDistributed2018,
+  title = {{{GekkoFS}} - {{A Temporary Distributed File System}} for {{HPC Applications}}},
+  booktitle = {2018 {{IEEE International Conference}} on {{Cluster Computing}} ({{CLUSTER}})},
+  author = {Vef, Marc-André and Moti, Nafiseh and Süß, Tim and Tocci, Tommaso and Nou, Ramon and Miranda, Alberto and Cortes, Toni and Brinkmann, André},
+  date = {2018-09},
+  pages = {319--324},
+  issn = {2168-9253},
+  doi = {10.1109/CLUSTER.2018.00049},
+  url = {https://ieeexplore.ieee.org/document/8514892},
+  urldate = {2024-05-31},
+  abstract = {We present GekkoFS, a temporary, highly-scalable burst buffer file system which has been specifically optimized for new access patterns of data-intensive High-Performance Computing (HPC) applications. The file system provides relaxed POSIX semantics, only offering features which are actually required by most (not all) applications. It is able to provide scalable I/O performance and reaches millions of metadata operations already for a small number of nodes, significantly outperforming the capabilities of general-purpose parallel file systems.},
+  eventtitle = {2018 {{IEEE International Conference}} on {{Cluster Computing}} ({{CLUSTER}})},
+  keywords = {Burst Buffers,Data structures,Distributed File Systems,HPC,Libraries,Metadata,Semantics,Servers,Systems operation,Throughput},
+  file = {/Users/mnakano/Zotero/storage/LUSEKJTY/Vef et al. - 2018 - GekkoFS - A Temporary Distributed File System for .pdf;/Users/mnakano/Zotero/storage/5Y47YSZT/8514892.html}
+}
+
+@inproceedings{waldspurgerEfficientMRCConstruction2015,
+  title = {Efficient {{MRC Construction}} with {{SHARDS}}},
+  author = {Waldspurger, Carl A. and Park, Nohhyun and Garthwaite, Alexander and Ahmad, Irfan},
+  date = {2015},
+  pages = {95--110},
+  url = {https://www.usenix.org/conference/fast15/technical-sessions/presentation/waldspurger},
+  urldate = {2025-03-07},
+  eventtitle = {13th {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 15)},
+  isbn = {978-1-931971-20-1},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/MMPHUGSG/Waldspurger et al. - 2015 - Efficient MRC Construction with SHARDS .pdf}
+}
+
+@inproceedings{wangBurstFSDistributedBurst2016,
+  title = {{{BurstFS}}: {{A Distributed Burst Buffer File System}} for {{Scientiﬁc Applications}}},
+  author = {Wang, Teng and Mohror, Kathryn and Moody, Adam and Yu, Weikuan and Sato, Kento},
+  date = {2016-01-28},
+  eventtitle = {International {{Conference}} on {{Supercomputing}} 2016},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/VAENGRS5/Wang et al. - BurstFS A Distributed Burst Buffer File System for Scientiﬁc Applications.pdf}
+}
+
+@inproceedings{wangCFSScalingMetadata2023,
+  title = {{{CFS}}: {{Scaling Metadata Service}} for {{Distributed File System}} via {{Pruned Scope}} of {{Critical Sections}}},
+  shorttitle = {{{CFS}}},
+  booktitle = {Proceedings of the {{Eighteenth European Conference}} on {{Computer Systems}}},
+  author = {Wang, Yiduo and Wu, Yufei and Li, Cheng and Zheng, Pengfei and Cao, Biao and Sun, Yan and Zhou, Fei and Xu, Yinlong and Wang, Yao and Xie, Guangjun},
+  date = {2023-05-08},
+  series = {{{EuroSys}} '23},
+  pages = {331--346},
+  publisher = {Association for Computing Machinery},
+  location = {New York, NY, USA},
+  doi = {10.1145/3552326.3587443},
+  url = {https://dl.acm.org/doi/10.1145/3552326.3587443},
+  urldate = {2025-02-03},
+  abstract = {There is a fundamental tension between metadata scalability and POSIX semantics within distributed file systems. The bottleneck lies in the coordination, mainly locking, used for ensuring strong metadata consistency, namely, atomicity and isolation. CFS is a scalable, fully POSIX-compliant distributed file system that eliminates the metadata management bottleneck via pruning the scope of critical sections for reduced locking overhead. First, CFS adopts a tiered metadata organization to scale file attributes and the remaining namespace hierarchies independently with appropriate partitioning and indexing methods, eliminating cross-shard distributed coordination. Second, it further scales up the single metadata shard performance by single-shard atomic primitives, shortening the metadata requests' lifespan and removing spurious conflicts. Third, CFS drops the metadata proxy layer but employs the light-weight, scalable client-side metadata resolving. CFS has been running in the production environment of Baidu AI Cloud for three years. Our evaluation with a 50-node cluster and microbenchmarks shows that CFS simultaneously improves the throughput of baselines like HopsFS and InfiniFS by 1.76--75.82× and 1.22--4.10×, and reduces their average latency by up to 91.71\% and 54.54\%, respectively. Under cases with higher contention and larger directories, CFS' throughput benefits expand by one order of magnitude. For three real-world workloads with data accesses, CFS introduces 1.62--2.55× end-to-end throughput speedups and 35.06--62.47\% tail latency reductions over InfiniFS.},
+  isbn = {978-1-4503-9487-1},
+  file = {/Users/mnakano/Zotero/storage/M7G4ENCE/Wang et al. - 2023 - CFS Scaling Metadata Service for Distributed File.pdf}
+}
+
+@inproceedings{wangEphemeralBurstBufferFile2016,
+  title = {An {{Ephemeral Burst-Buffer File System}} for {{Scientific Applications}}},
+  booktitle = {{{SC}} '16: {{Proceedings}} of the {{International Conference}} for {{High Performance Computing}}, {{Networking}}, {{Storage}} and {{Analysis}}},
+  author = {Wang, Teng and Mohror, Kathryn and Moody, Adam and Sato, Kento and Yu, Weikuan},
+  date = {2016-01-01},
+  pages = {807--818},
+  issn = {2167-4337},
+  doi = {10.1109/SC.2016.68},
+  url = {https://ieeexplore.ieee.org/document/7877147},
+  urldate = {2024-05-31},
+  abstract = {Burst buffers are becoming an indispensable hardware resource on large-scale supercomputers to buffer the bursty I/O from scientific applications. However, there is a lack of software support for burst buffers to be efficiently shared by applications within a batch-submitted job and recycled across different batch jobs. In addition, burst buffers need to cope with a variety of challenging I/O patterns from data-intensive scientific applications. In this study, we have designed an ephemeral Burst Buffer File System (BurstFS) that supports scalable and efficient aggregation of I/O bandwidth from burst buffers while having the same life cycle as a batch-submitted job. BurstFS features several techniques including scalable metadata indexing, co-located I/O delegation, and server-side read clustering and pipelining. Through extensive tuning and analysis, we have validated that BurstFS has accomplished our design objectives, with linear scalability in terms of aggregated I/O bandwidth for parallel writes and reads.},
+  eventtitle = {{{SC}} '16: {{Proceedings}} of the {{International Conference}} for {{High Performance Computing}}, {{Networking}}, {{Storage}} and {{Analysis}}},
+  keywords = {Bandwidth,Buffer storage,Distributed databases,File systems,Indexing,Metadata,Pipeline processing},
+  file = {/Users/mnakano/Zotero/storage/66CWKYL6/Wang et al. - 2016 - An Ephemeral Burst-Buffer File System for Scientif.pdf;/Users/mnakano/Zotero/storage/TXPAAI4N/7877147.html}
+}
+
+@inproceedings{wangEphemeralBurstBufferFile2016a,
+  title = {An {{Ephemeral Burst-Buffer File System}} for {{Scientific Applications}}},
+  booktitle = {{{SC}} '16: {{Proceedings}} of the {{International Conference}} for {{High Performance Computing}}, {{Networking}}, {{Storage}} and {{Analysis}}},
+  author = {Wang, Teng and Mohror, Kathryn and Moody, Adam and Sato, Kento and Yu, Weikuan},
+  date = {2016-11},
+  pages = {807--818},
+  issn = {2167-4337},
+  doi = {10.1109/SC.2016.68},
+  url = {https://ieeexplore.ieee.org/document/7877147},
+  urldate = {2025-07-01},
+  abstract = {Burst buffers are becoming an indispensable hardware resource on large-scale supercomputers to buffer the bursty I/O from scientific applications. However, there is a lack of software support for burst buffers to be efficiently shared by applications within a batch-submitted job and recycled across different batch jobs. In addition, burst buffers need to cope with a variety of challenging I/O patterns from data-intensive scientific applications. In this study, we have designed an ephemeral Burst Buffer File System (BurstFS) that supports scalable and efficient aggregation of I/O bandwidth from burst buffers while having the same life cycle as a batch-submitted job. BurstFS features several techniques including scalable metadata indexing, co-located I/O delegation, and server-side read clustering and pipelining. Through extensive tuning and analysis, we have validated that BurstFS has accomplished our design objectives, with linear scalability in terms of aggregated I/O bandwidth for parallel writes and reads.},
+  eventtitle = {{{SC}} '16: The {{International Conference}} for {{High Performance Computing}}, {{Networking}}, {{Storage}} and {{Analysis}}},
+  keywords = {Bandwidth,Buffer storage,Distributed databases,File systems,Indexing,Metadata,Pipeline processing},
+  file = {/Users/mnakano/Zotero/storage/DR6K9Q5D/7877147.html}
+}
+
+@inproceedings{wangSelectivePreprocessingOffloading2024,
+  title = {A {{Selective Preprocessing Offloading Framework}} for {{Reducing Data Traffic}} in {{DL Training}}},
+  booktitle = {Proceedings of the 16th {{ACM Workshop}} on {{Hot Topics}} in {{Storage}} and {{File Systems}}},
+  author = {Wang, Meng and Waldspurger, Gus and Sundararaman, Swaminathan},
+  date = {2024-07-08},
+  series = {{{HotStorage}} '24},
+  pages = {63--70},
+  publisher = {Association for Computing Machinery},
+  location = {New York, NY, USA},
+  doi = {10.1145/3655038.3665947},
+  url = {https://doi.org/10.1145/3655038.3665947},
+  urldate = {2024-07-19},
+  abstract = {Deep learning (DL) training is data-intensive and often bottlenecked by fetching data from remote storage. Recognizing that many samples' sizes diminish during data preprocessing, we explore selectively offloading preprocessing to remote storage to mitigate data traffic. We conduct a case study to uncover the potential benefits and challenges of this approach. We then propose SOPHON, a framework that selectively offloads preprocessing tasks at a fine granularity in order to reduce data traffic, utilizing online profiling and adaptive algorithms to optimize for every sample in every training scenario. Our results show that SOPHON can reduce data traffic and training time by 1.2-2.2x over existing solutions.},
+  isbn = {979-8-4007-0630-1},
+  file = {/Users/mnakano/Zotero/storage/PQVPT49M/Wang et al. - 2024 - A Selective Preprocessing Offloading Framework for.pdf}
+}
+
+@inproceedings{weihangjiangHighPerformanceMPI22004,
+  title = {High Performance {{MPI-2}} One-Sided Communication over {{InfiniBand}}},
+  booktitle = {{{IEEE International Symposium}} on {{Cluster Computing}} and the {{Grid}}, 2004. {{CCGrid}} 2004.},
+  author = {{Weihang Jiang} and {Jiuxing Liu} and {Hyun-Wook Jin} and Panda, D.K. and Gropp, W. and Thakur, R.},
+  date = {2004},
+  pages = {531--538},
+  publisher = {IEEE},
+  location = {Chicago, IL, USA},
+  doi = {10.1109/CCGrid.2004.1336648},
+  url = {https://ieeexplore.ieee.org/document/1336648/},
+  urldate = {2025-07-01},
+  abstract = {Many existing MPI-2 one-sided communication implementations are built on top of MPI send/receive operations. Although this approach can achieve good portability, it suffers from high communication overhead and dependency on remote process for communication progress. To address these problems, we propose a high performance MPI-2 onesided communication design over the InfiniBand Architecture. In our design, MPI-2 one-sided communication operations such as MPI Put, MPI Get and MPI Accumulate are directly mapped to InfiniBand Remote Direct Memory Access (RDMA) operations.},
+  eventtitle = {2004 {{IEEE International Symposium}} on {{Cluster Computing}} and the {{Grid}}},
+  isbn = {978-0-7803-8430-9},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/RG6U2LA6/Weihang Jiang et al. - 2004 - High performance MPI-2 one-sided communication over InfiniBand.pdf}
+}
+
+@inproceedings{weihangjiangHighPerformanceMPI22004a,
+  title = {High Performance {{MPI-2}} One-Sided Communication over {{InfiniBand}}},
+  booktitle = {{{IEEE International Symposium}} on {{Cluster Computing}} and the {{Grid}}, 2004. {{CCGrid}} 2004.},
+  author = {{Weihang Jiang} and {Jiuxing Liu} and {Hyun-Wook Jin} and Panda, D.K. and Gropp, W. and Thakur, R.},
+  date = {2004},
+  pages = {531--538},
+  publisher = {IEEE},
+  location = {Chicago, IL, USA},
+  doi = {10.1109/CCGrid.2004.1336648},
+  url = {https://ieeexplore.ieee.org/document/1336648/},
+  urldate = {2025-07-01},
+  abstract = {Many existing MPI-2 one-sided communication implementations are built on top of MPI send/receive operations. Although this approach can achieve good portability, it suffers from high communication overhead and dependency on remote process for communication progress. To address these problems, we propose a high performance MPI-2 onesided communication design over the InfiniBand Architecture. In our design, MPI-2 one-sided communication operations such as MPI Put, MPI Get and MPI Accumulate are directly mapped to InfiniBand Remote Direct Memory Access (RDMA) operations.},
+  eventtitle = {2004 {{IEEE International Symposium}} on {{Cluster Computing}} and the {{Grid}}},
+  isbn = {978-0-7803-8430-9},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/76WM2H4J/Weihang Jiang et al. - 2004 - High performance MPI-2 one-sided communication over InfiniBand.pdf}
+}
+
+@inproceedings{welchScalablePerformancePanasas2008,
+  title = {Scalable {{Performance}} of the {{Panasas Parallel File System}}},
+  author = {Welch, Brent and Unangst, Marc and Abbasi, Zainul and Gibson, Garth and Mueller, Brian and Small, Jason and Zelenka, Jim and Zhou, Bin},
+  date = {2008},
+  url = {https://www.usenix.org/conference/fast-08/scalable-performance-panasas-parallel-file-system},
+  urldate = {2025-02-04},
+  eventtitle = {6th {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 08)},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/YQ87QWPI/Welch et al. - 2008 - Scalable Performance of the Panasas Parallel File .pdf}
+}
+
+@article{whittakerScalingReplicatedState2021,
+  title = {Scaling Replicated State Machines with Compartmentalization},
+  author = {Whittaker, Michael and Ailijiang, Ailidani and Charapko, Aleksey and Demirbas, Murat and Giridharan, Neil and Hellerstein, Joseph M. and Howard, Heidi and Stoica, Ion and Szekeres, Adriana},
+  date = {2021-07},
+  journaltitle = {Proceedings of the VLDB Endowment},
+  shortjournal = {Proc. VLDB Endow.},
+  volume = {14},
+  number = {11},
+  pages = {2203--2215},
+  issn = {2150-8097},
+  doi = {10.14778/3476249.3476273},
+  url = {https://dl.acm.org/doi/10.14778/3476249.3476273},
+  urldate = {2025-03-05},
+  abstract = {State machine replication protocols, like MultiPaxos and Raft, are a critical component of many distributed systems and databases. However, these protocols offer relatively low throughput due to several bottlenecked components. Numerous existing protocols fix different bottlenecks in isolation but fall short of a complete solution. When you fix one bottleneck, another arises. In this paper, we introduce compartmentalization, the first comprehensive technique to eliminate state machine replication bottlenecks. Compartmentalization involves decoupling individual bottlenecks into distinct components and scaling these components independently. Compartmentalization has two key strengths. First, compartmentalization leads to strong performance. In this paper, we demonstrate how to compartmentalize MultiPaxos to increase its throughput by 6× on a write-only workload and 16× on a mixed read-write workload. Unlike other approaches, we achieve this performance without the need for specialized hardware. Second, compartmentalization is a technique, not a protocol. Industry practitioners can apply compartmentalization to their protocols incrementally without having to adopt a completely new protocol.},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/XERVLL3I/Whittaker et al. - 2021 - Scaling replicated state machines with compartment.pdf}
+}
+
+@article{wuRFRPCRemoteFetching2019,
+  title = {{{RF-RPC}}: {{Remote Fetching RPC Paradigm}} for {{RDMA-Enabled Network}}},
+  shorttitle = {{{RF-RPC}}},
+  author = {Wu, Yongwei and Ma, Teng and Su, Maomeng and Zhang, Mingxing and Chen, Kang and Guo, Zhenyu},
+  date = {2019-07-01},
+  journaltitle = {IEEE Transactions on Parallel and Distributed Systems},
+  shortjournal = {IEEE Trans. Parallel Distrib. Syst.},
+  volume = {30},
+  number = {7},
+  pages = {1657--1671},
+  issn = {1045-9219, 1558-2183, 2161-9883},
+  doi = {10.1109/TPDS.2018.2889718},
+  url = {https://ieeexplore.ieee.org/document/8588372/},
+  urldate = {2025-06-28}
+}
+
+@online{xuAsyncFSMetadataUpdates2024,
+  title = {{{AsyncFS}}: {{Metadata Updates Made Asynchronous}} for {{Distributed Filesystems}} with {{In-Network Coordination}}},
+  shorttitle = {{{AsyncFS}}},
+  author = {Xu, Jingwei and Dong, Mingkai and Tian, Qiulin and Tian, Ziyi and Xin, Tong and Chen, Haibo},
+  date = {2024-10-11},
+  eprint = {2410.08618},
+  eprinttype = {arXiv},
+  eprintclass = {cs},
+  doi = {10.48550/arXiv.2410.08618},
+  url = {http://arxiv.org/abs/2410.08618},
+  urldate = {2025-02-04},
+  abstract = {Distributed filesystems typically employ synchronous metadata updates, facing inherent challenges for access efficiency, load balancing, and directory contention, especially under dynamic and skewed workloads. This paper argues that synchronous updates are overly conservative for distributed filesystems. We propose AsyncFS with asynchronous metadata updates, allowing operations to return early and defer directory updates until respective read to enable latency hiding and conflict resolution. The key challenge is efficiently maintaining the synchronous semantics of metadata updates. To address this, AsyncFS is co-designed with a programmable switch, leveraging the constrained on-switch resources to holistically track directory states in the network with negligible cost. This allows AsyncFS to timely aggregate and efficiently apply delayed updates using batching and consolidation before directory reads. Evaluation shows that AsyncFS achieves up to 13.34\$\textbackslash times\$ and 3.85\$\textbackslash times\$ higher throughput, and 61.6\% and 57.3\% lower latency than two state-of-the-art distributed filesystems, InfiniFS and CFS-KV, respectively, on skewed workloads. For real-world workloads, AsyncFS improves end-to-end throughput by 21.1\$\textbackslash times\$, 1.1\$\textbackslash times\$ and 30.1\% over Ceph, IndexFS and CFS-KV, respectively.},
+  pubstate = {prepublished},
+  keywords = {Computer Science - Distributed Parallel and Cluster Computing,Computer Science - Operating Systems,Computer Science - Performance},
+  file = {/Users/mnakano/Zotero/storage/IDHNLRBS/Xu et al. - 2024 - AsyncFS Metadata Updates Made Asynchronous for Di.pdf;/Users/mnakano/Zotero/storage/IX5CJYM7/2410.html}
+}
+
+@inproceedings{xuIONIAHighPerformanceReplication2024,
+  title = {{{IONIA}}: {{High-Performance Replication}} for {{Modern Disk-based KV Stores}}},
+  shorttitle = {\{{{IONIA}}\}},
+  author = {Xu, Yi and Zhu, Henry and Pandey, Prashant and Conway, Alex and Johnson, Rob and Ganesan, Aishwarya and Alagappan, Ramnatthan},
+  date = {2024},
+  pages = {225--241},
+  url = {https://www.usenix.org/conference/fast24/presentation/xu},
+  urldate = {2024-05-31},
+  eventtitle = {22nd {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 24)},
+  isbn = {978-1-939133-38-0},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/2XHAWBBA/Xu et al. - 2024 - IONIA High-Performance Replication for Modern.pdf}
+}
+
+@inproceedings{yasukataZpolineSystemCall2023,
+  title = {Zpoline: A System Call Hook Mechanism Based on Binary Rewriting},
+  shorttitle = {Zpoline},
+  author = {Yasukata, Kenichi and Tazaki, Hajime and Aublin, Pierre-Louis and Ishiguro, Kenta},
+  date = {2023},
+  pages = {293--300},
+  url = {https://www.usenix.org/conference/atc23/presentation/yasukata},
+  urldate = {2024-07-19},
+  eventtitle = {2023 {{USENIX Annual Technical Conference}} ({{USENIX ATC}} 23)},
+  isbn = {978-1-939133-35-9},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/RATQ6XFF/Yasukata et al. - 2023 - zpoline a system call hook mechanism based on bin.pdf}
+}
+
+@inproceedings{zhanFullPathFullPath2018,
+  title = {The {{Full Path}} to {{Full-Path Indexing}}},
+  author = {Zhan, Yang and Conway, Alex and Jiao, Yizheng and Knorr, Eric and Bender, Michael A. and Farach-Colton, Martin and Jannen, William and Johnson, Rob and Porter, Donald E. and Yuan, Jun},
+  date = {2018},
+  pages = {123--138},
+  url = {https://www.usenix.org/conference/fast18/presentation/zhan},
+  urldate = {2025-02-07},
+  eventtitle = {16th {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 18)},
+  isbn = {978-1-931971-42-3},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/DVPFR5ID/Zhan et al. - 2018 - The Full Path to Full-Path Indexing.pdf}
+}
+
+@inproceedings{zhangContextawarePrefetchingNearStorage2024,
+  title = {Context-Aware {{Prefetching}} for {{Near-Storage Accelerators}}},
+  booktitle = {Proceedings of the 16th {{ACM Workshop}} on {{Hot Topics}} in {{Storage}} and {{File Systems}}},
+  author = {Zhang, Jian and Nguyen, Marie and Kashyap, Sanidhya and Kannan, Sudarsun},
+  date = {2024-07-08},
+  series = {{{HotStorage}} '24},
+  pages = {131--136},
+  publisher = {Association for Computing Machinery},
+  location = {New York, NY, USA},
+  doi = {10.1145/3655038.3665956},
+  url = {https://dl.acm.org/doi/10.1145/3655038.3665956},
+  urldate = {2025-01-31},
+  abstract = {We present ContextPrefetcher, a host-guided high-performant prefetching framework for near-storage accelerators that prefetches data blocks from storage (e.g., NAND) to device-level RAM. Efficiently prefetching data blocks to device-level RAM reduces storage access costs and improves I/O performance. We introduce a novel abstraction, Cross-layered Context (CLC), a virtual entity that spans across the host and the device and is used for identifying, managing, and tracking active and inactive data such as files, objects (within object stores), or a range of blocks. To support efficient prefetching of actively used CLCs to device memory without incurring near-device resource (memory and compute) bottlenecks, ContextPrefetcher delegates prefetching management to the host, guiding near-device compute to prefetch blocks of active CLC. Finally, ContextPrefetcher facilitates the swift reclamation of blocks associated with inactive CLC. Preliminary evaluation against state-of-the-art near-storage accelerator designs demonstrates performance gains of up to 1.34X.},
+  isbn = {979-8-4007-0630-1},
+  file = {/Users/mnakano/Zotero/storage/K2QYWR6F/Zhang et al. - 2024 - Context-aware Prefetching for Near-Storage Acceler.pdf}
+}
+
+@article{zhangDEPARTReplicaDecoupling,
+  title = {{{DEPART}}: {{Replica Decoupling}} for {{Distributed Key-Value Storage}}},
+  author = {Zhang, Qiang and Li, Yongkun and Lee, Patrick P C and Xu, Yinlong and Wu, Si},
+  abstract = {Modern distributed key-value (KV) stores adopt replication for fault tolerance by distributing replicas of KV pairs across nodes. However, existing distributed KV stores often manage all replicas in the same index structure, thereby leading to significant I/O costs beyond the replication redundancy. We propose a notion called replica decoupling, which decouples the storage management of the primary and redundant copies of replicas, so as to not only mitigate the I/O costs in indexing, but also provide tunable performance. In particular, we design a novel two-layer log that enables tunable ordering for the redundant copies to achieve balanced read/write performance. We implement a distributed KV store prototype, DEPART, atop Cassandra. Experiments show that DEPART outperforms Cassandra in all performance aspects under various consistency levels and parameter settings. Specifically, under the eventual consistency setting, DEPART achieves up to 1.43×, 2.43×, 2.68×, and 1.44× throughput for writes, reads, scans, and updates, respectively.},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/7FSM2KUP/Zhang et al. - DEPART Replica Decoupling for Distributed Key-Val.pdf}
+}
+
+@inproceedings{zhangRevisitingUnderlyingCauses2024,
+  title = {Revisiting the {{Underlying Causes}} of {{RDMA Scalability Issues}}},
+  author = {Zhang, Junye and Yuan, Hui and Wang, Zhe and Yu, Peng and Song, Hexiang and Qu, Di and Yan, Siyu and Zheng, Xiaolong},
+  date = {2024-10-01},
+  pages = {227--235},
+  publisher = {IEEE Computer Society},
+  doi = {10.1109/ISPA63168.2024.00037},
+  url = {https://www.computer.org/csdl/proceedings-article/ispa/2024/097100a227/24uqf3fPO24},
+  urldate = {2025-06-27},
+  abstract = {Remote direct memory access (RDMA) networks are widely deployed in clouds and data centers for low latency and high throughput. Emerging applications like artificial intelligence training and serverless computing demand RDMA networks with high connection scalability. However, increasing connections can reduce throughput, as many academic research states. Conversely, some industry reports indicate the scalability issues are situation-specific. Despite this, existing work lacks a comprehensive analysis of RDMA scalability issue triggers and causes. In this paper, we revisit triggering conditions and underlying causes of RDMA scalability issues. First, we comprehensively analyze RDMA data flows and potential resource contentions, particularly with direct cache access. Second, we conduct extensive tests across varied measurement settings and RDMA NICs (RNICs). We identify triggering conditions including frequent switching of queue pair connections, rapid request posting, intensive memory access demands and inappropriate program configurations. We also systematically uncover causes of scalability issues, mainly due to RNIC cache misses, RNIC processing unit backpressure, host last-level cache misses, and software inefficiency. Finally, we provide guidelines to mitigate the RDMA scalability issues.},
+  eventtitle = {2024 {{IEEE International Symposium}} on {{Parallel}} and {{Distributed Processing}} with {{Applications}} ({{ISPA}})},
+  isbn = {979-8-3315-0971-2},
+  langid = {english}
+}
+
+@inproceedings{zhengBatchFSScalingFile2014,
+  title = {{{BatchFS}}: {{Scaling}} the {{File System Control Plane}} with {{Client-Funded Metadata Servers}}},
+  shorttitle = {{{BatchFS}}},
+  author = {Zheng, Qing and Ren, Kai and Gibson, Garth},
+  date = {2014-11},
+  pages = {1--6},
+  publisher = {IEEE},
+  location = {New Orleans, LA, USA},
+  doi = {10.1109/PDSW.2014.7},
+  url = {http://ieeexplore.ieee.org/document/7016275/},
+  urldate = {2025-01-30},
+  eventtitle = {2014 9th {{Parallel Data Storage Workshop}} ({{PDSW}})},
+  isbn = {978-1-4799-7025-4},
+  file = {/Users/mnakano/Zotero/storage/6LAGRDP2/Zheng et al. - 2014 - BatchFS Scaling the File System Control Plane wit.pdf}
+}
+
+@inproceedings{zhengDeltaFSExascaleFile2015,
+  title = {{{DeltaFS}}: Exascale File Systems Scale Better without Dedicated Servers},
+  shorttitle = {{{DeltaFS}}},
+  booktitle = {Proceedings of the 10th {{Parallel Data Storage Workshop}}},
+  author = {Zheng, Qing and Ren, Kai and Gibson, Garth and Settlemyer, Bradley W. and Grider, Gary},
+  date = {2015-11-15},
+  pages = {1--6},
+  publisher = {ACM},
+  location = {Austin Texas},
+  doi = {10.1145/2834976.2834984},
+  url = {https://dl.acm.org/doi/10.1145/2834976.2834984},
+  urldate = {2025-01-24},
+  abstract = {High performance computing fault tolerance depends on scalable parallel file system performance. For more than a decade scalable bandwidth has been available from the object storage systems that underlie modern parallel file systems, and recently we have seen demonstrations of scalable parallel metadata using dynamic partitioning of the namespace over multiple metadata servers. But even these scalable parallel file systems require significant numbers of dedicated servers, and some workloads still experience bottlenecks. We envision exascale parallel file systems that do not have any dedicated server machines. Instead a parallel job instantiates a file system namespace service in client middleware that operates on only scalable object storage and communicates with other jobs by sharing or publishing namespace snapshots. Experiments shows that our serverless file system design, DeltaFS, performs metadata operations orders of magnitude faster than traditional file system architectures.},
+  eventtitle = {{{SC15}}: {{The International Conference}} for {{High Performance Computing}}, {{Networking}}, {{Storage}} and {{Analysis}}},
+  isbn = {978-1-4503-4008-3},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/MYLQDG63/Zheng et al. - 2015 - DeltaFS exascale file systems scale better withou.pdf}
+}
+
+@inproceedings{zhengDeltaFSScalableNogroundtruth2021,
+  title = {{{DeltaFS}}: A Scalable No-Ground-Truth Filesystem for Massively-Parallel Computing},
+  shorttitle = {{{DeltaFS}}},
+  booktitle = {Proceedings of the {{International Conference}} for {{High Performance Computing}}, {{Networking}}, {{Storage}} and {{Analysis}}},
+  author = {Zheng, Qing and Cranor, Charles D. and Ganger, Gregory R. and Gibson, Garth A. and Amvrosiadis, George and Settlemyer, Bradley W. and Grider, Gary A.},
+  date = {2021-11-13},
+  series = {{{SC}} '21},
+  pages = {1--15},
+  publisher = {Association for Computing Machinery},
+  location = {New York, NY, USA},
+  doi = {10.1145/3458817.3476148},
+  url = {https://dl.acm.org/doi/10.1145/3458817.3476148},
+  urldate = {2025-01-20},
+  abstract = {High-Performance Computing (HPC) is known for its use of massive concurrency. But it can be challenging for a parallel filesystem's control plane to utilize cores when every client process must globally synchronize and serialize its metadata mutations with those of other clients. We present DeltaFS, a new paradigm for distributed filesystem metadata.DeltaFS allows jobs to self-commit their namespace changes to logs, avoiding the cost of global synchronization. Followup jobs selectively merge logs produced by previous jobs as needed, a principle we term No Ground Truth which allows for efficient data sharing. By avoiding unnecessary synchronization of metadata operations, DeltaFS improves metadata operation throughput up to 98X leveraging parallelism on the nodes where job processes run. This speedup grows as job size increases. DeltaFS enables efficient inter-job communication, reducing overall workflow runtime by significantly improving client metadata operation latency up to 49X and resource usage up to 52X.},
+  isbn = {978-1-4503-8442-1},
+  file = {/Users/mnakano/Zotero/storage/LHRLK83Z/Zheng et al. - 2021 - DeltaFS a scalable no-ground-truth filesystem for.pdf}
+}
+
+@inproceedings{zhengScalingEmbeddedInSitu2018,
+  title = {Scaling {{Embedded In-Situ Indexing}} with {{DeltaFS}}},
+  booktitle = {{{SC18}}: {{International Conference}} for {{High Performance Computing}}, {{Networking}}, {{Storage}} and {{Analysis}}},
+  author = {Zheng, Qing and Cranor, Charles D. and Guo, Danhao and Ganger, Gregory R. and Amvrosiadis, George and Gibson, Garth A. and Settlemyer, Bradley W. and Grider, Gary and Guo, Fan},
+  date = {2018-11},
+  pages = {30--44},
+  publisher = {IEEE},
+  location = {Dallas, TX, USA},
+  doi = {10.1109/SC.2018.00006},
+  url = {https://ieeexplore.ieee.org/document/8665820/},
+  urldate = {2025-01-24},
+  abstract = {Analysis of large-scale simulation output is a core element of scientific inquiry, but analysis queries may experience significant I/O overhead when the data is not structured for efficient retrieval. While in-situ processing allows for improved time-to-insight for many applications, scaling in-situ frameworks to hundreds of thousands of cores can be difficult in practice. The DeltaFS in-situ indexing is a new approach for in-situ processing of massive amounts of data to achieve efficient point and small-range queries. This paper describes the challenges and lessons learned when scaling this in-situ processing function to hundreds of thousands of cores. We propose techniques for scalable all-to-all communication that is memory and bandwidth efficient, concurrent indexing, and specialized LSM-Tree formats. Combining these techniques allows DeltaFS to control the cost of in-situ processing while maintaining 3 orders of magnitude query speedup when scaling alongside the popular VPIC particle-in-cell code to 131,072 cores.},
+  eventtitle = {{{SC18}}: {{International Conference}} for {{High Performance Computing}}, {{Networking}}, {{Storage}} and {{Analysis}}},
+  isbn = {978-1-5386-8384-2},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/LS6J4A35/Zheng et al. - 2018 - Scaling Embedded In-Situ Indexing with DeltaFS.pdf}
+}
+
+@inproceedings{zhengSoftwaredefinedStorageFast2017,
+  title = {Software-Defined Storage for Fast Trajectory Queries Using a {{deltaFS}} Indexed Massive Directory},
+  booktitle = {Proceedings of the 2nd {{Joint International Workshop}} on {{Parallel Data Storage}} \& {{Data Intensive Scalable Computing Systems}}},
+  author = {Zheng, Qing and Amvrosiadis, George and Kadekodi, Saurabh and Gibson, Garth A. and Cranor, Charles D. and Settlemyer, Bradley W. and Grider, Gary and Guo, Fan},
+  date = {2017-11-12},
+  pages = {7--12},
+  publisher = {ACM},
+  location = {Denver Colorado},
+  doi = {10.1145/3149393.3149398},
+  url = {https://dl.acm.org/doi/10.1145/3149393.3149398},
+  urldate = {2025-01-24},
+  abstract = {In this paper we introduce the Indexed Massive Directory, a new technique for indexing data within DeltaFS. With its design as a scalable, server-less file system for HPC platforms, DeltaFS scales file system metadata performance with application scale. The Indexed Massive Directory is a novel extension to the DeltaFS data plane, enabling in-situ indexing of massive amounts of data written to a single directory simultaneously, and in an arbitrarily large number of files. We achieve this through a memory-efficient indexing mechanism for reordering and indexing data, and a log-structured storage layout to pack small writes into large log objects, all while ensuring compute node resources are used frugally. We demonstrate the efficiency of this indexing mechanism through VPIC, a widely-used simulation code that scales to trillions of particles. With DeltaFS, we modify VPIC to create a file for each particle to receive writes of that particle’s output data. Dynamically indexing the directory’s underlying storage allows us to achieve a 5000x speedup in single particle trajectory queries, which require reading all data for a single particle. This speedup increases with application scale while the overhead is fixed at 3\% of available memory.},
+  eventtitle = {{{SC}} '17: {{The International Conference}} for {{High Performance Computing}}, {{Networking}}, {{Storage}} and {{Analysis}}},
+  isbn = {978-1-4503-5134-8},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/JQ9EC635/Zheng et al. - 2017 - Software-defined storage for fast trajectory queri.pdf}
+}
+
+@inproceedings{zhou3LCacheLowOverhead2025,
+  title = {{{3L-Cache}}: {{Low Overhead}} and {{Precise Learning-based Eviction Policy}} for {{Caches}}},
+  shorttitle = {\{{{3L-Cache}}\}},
+  author = {Zhou, Wenbin and Niu, Zhixiong and Xiong, Yongqiang and Fang, Juan and Wang, Qian},
+  date = {2025},
+  pages = {237--254},
+  url = {https://www.usenix.org/conference/fast25/presentation/zhou-wenbin},
+  urldate = {2025-03-07},
+  eventtitle = {23rd {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 25)},
+  isbn = {978-1-939133-45-8},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/9H87MHPT/Zhou et al. - 2025 - 3L-Cache Low Overhead and Precise Learning-base.pdf}
+}
+
+@inproceedings{zhouVeriSMoVerifiedSecurity2024,
+  title = {{{VeriSMo}}: {{A Verified Security Module}} for {{Confidential VMs}}},
+  shorttitle = {\{{{VeriSMo}}\}},
+  author = {Zhou, Ziqiao and Anjali and Chen, Weiteng and Gong, Sishuai and Hawblitzel, Chris and Cui, Weidong},
+  date = {2024},
+  pages = {599--614},
+  url = {https://www.usenix.org/conference/osdi24/presentation/zhou},
+  urldate = {2024-07-19},
+  eventtitle = {18th {{USENIX Symposium}} on {{Operating Systems Design}} and {{Implementation}} ({{OSDI}} 24)},
+  isbn = {978-1-939133-40-3},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/XQNF6H54/Zhou et al. - 2024 - VeriSMo A Verified Security Module for Confiden.pdf}
+}
+
+@online{ZonedStorageZoned,
+  title = {Zoned {{Storage}} | {{Zoned Storage}}},
+  url = {https://zonedstorage.io/},
+  urldate = {2024-07-19},
+  abstract = {Zoned Storage Documentation and Resources},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/MLE6QWGE/zonedstorage.io.html}
+}
