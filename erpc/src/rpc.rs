@@ -294,7 +294,7 @@ impl<U: 'static> Rpc<U> {
     }
 
     /// Update the next allowed send time based on Timely rate and bytes sent.
-    fn update_next_send_time(&self, session: SessionHandle, bytes_sent: usize) {
+    fn update_next_send_time(&self, session: SessionHandle, bytes_sent: usize, now: u64) {
         if !self.config.enable_cc {
             return;
         }
@@ -309,7 +309,6 @@ impl<U: 'static> Rpc<U> {
                     let bytes_per_us = rate * (self.mtu as f64);
                     if bytes_per_us > 0.0 {
                         let interval_us = (bytes_sent as f64 / bytes_per_us) as u64;
-                        let now = current_time_us();
                         sess.next_send_time_us.set(now + interval_us);
                     }
                 }
@@ -453,7 +452,7 @@ impl<U: 'static> Rpc<U> {
         }
 
         // Update next send time based on Timely rate
-        self.update_next_send_time(session, msg_size + PKT_HDR_SIZE * (num_pkts as usize));
+        self.update_next_send_time(session, msg_size + PKT_HDR_SIZE * (num_pkts as usize), now);
 
         Ok(req_num)
     }
