@@ -491,15 +491,19 @@ fn server_thread_main_with_config(
     // Server loop - poll recv() and reply()
     // Process limited requests per event loop iteration to avoid buffer exhaustion
     const MAX_BATCH: usize = 16;
+    // Pre-allocated response buffer to avoid allocation in hot path
+    let mut response_buf = vec![0u8; 4096];
     while !stop_flag.load(Ordering::Relaxed) {
         server.run_event_loop_once();
         // Process incoming requests and echo back (limited batch)
         let mut processed = 0;
         while processed < MAX_BATCH {
             if let Some(req) = server.recv() {
-                // Zero-copy: get data reference from request
-                let data = req.data(&server).to_vec(); // Copy for echo response
-                if let Err(e) = server.reply(&req, &data) {
+                // Zero-copy echo: copy request data to pre-allocated buffer
+                let data = req.data(&server);
+                let len = data.len().min(response_buf.len());
+                response_buf[..len].copy_from_slice(&data[..len]);
+                if let Err(e) = server.reply(&req, &response_buf[..len]) {
                     eprintln!("Server failed to respond: {:?}", e);
                 }
                 processed += 1;
@@ -507,7 +511,6 @@ fn server_thread_main_with_config(
                 break;
             }
         }
-        std::hint::spin_loop();
     }
 }
 
@@ -724,7 +727,8 @@ fn bench_throughput(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     // 32B message throughput with varying depths
-    for &pipeline_depth in &[16, 64, 256] {
+    // eRPC paper uses B=8 as default session credits
+    for &pipeline_depth in &[8, 16, 64, 256] {
         group.bench_function(
             BenchmarkId::new("pipelined", format!("32B_depth{}", pipeline_depth)),
             |b| {
@@ -790,5 +794,297 @@ fn bench_multi_qp_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_latency, bench_throughput, bench_multi_qp_throughput);
+// =============================================================================
+// eRPC Paper Condition Benchmark (1 Rpc, multiple sessions)
+// =============================================================================
+
+struct MultiSessionBenchmarkSetup {
+    client: Rpc<usize>,
+    sessions: Vec<erpc::SessionHandle>,
+    _server_handle: ServerHandle,
+}
+
+// Completion counter for multi-session benchmark
+thread_local! {
+    static MULTI_SESSION_COMPLETED: RefCell<u64> = RefCell::new(0);
+}
+
+fn setup_multi_session_benchmark(num_sessions: usize) -> Option<MultiSessionBenchmarkSetup> {
+    set_cpu_affinity(CLIENT_CORE);
+
+    let (ctx, port, _port_attr) = open_mlx5_device()?;
+
+    // eRPC paper: B=8 session credits, large req_window for pipelining
+    let pipeline_depth = 64;
+    let config = RpcConfig::default()
+        .with_req_window(pipeline_depth * num_sessions)
+        .with_session_credits(8) // eRPC default
+        .with_num_recv_buffers(pipeline_depth * num_sessions * 2)
+        .with_max_send_wr((pipeline_depth * num_sessions * 2) as u32)
+        .with_max_recv_wr((pipeline_depth * num_sessions * 2) as u32);
+
+    // Create single client Rpc with callback
+    let client: Rpc<usize> = Rpc::new(&ctx, port, config.clone(), |_session_idx, _payload| {
+        MULTI_SESSION_COMPLETED.with(|c| *c.borrow_mut() += 1);
+    }).ok()?;
+    let client_info = client.local_info();
+
+    // Setup communication channels
+    let (server_infos_tx, server_infos_rx): (Sender<Vec<ConnectionInfo>>, Receiver<Vec<ConnectionInfo>>) =
+        mpsc::channel();
+    let (client_info_tx, client_info_rx): (Sender<ConnectionInfo>, Receiver<ConnectionInfo>) =
+        mpsc::channel();
+    let (num_sessions_tx, num_sessions_rx): (Sender<usize>, Receiver<usize>) = mpsc::channel();
+
+    let server_ready = Arc::new(AtomicU32::new(0));
+    let server_ready_clone = server_ready.clone();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let server_stop = stop_flag.clone();
+
+    let server_config = config.clone();
+    let handle = thread::spawn(move || {
+        multi_session_server_thread(
+            server_infos_tx,
+            client_info_rx,
+            num_sessions_rx,
+            server_ready_clone,
+            server_stop,
+            server_config,
+        );
+    });
+
+    // Send client info and num_sessions
+    client_info_tx.send(ConnectionInfo {
+        qpn: client_info.qpn,
+        qkey: client_info.qkey,
+        lid: client_info.lid,
+    }).ok()?;
+    num_sessions_tx.send(num_sessions).ok()?;
+
+    let server_infos = server_infos_rx.recv().ok()?;
+
+    // Wait for server to be ready
+    while server_ready.load(Ordering::Acquire) == 0 {
+        std::hint::spin_loop();
+    }
+
+    // Create sessions to server
+    let mut sessions = Vec::with_capacity(num_sessions);
+    for i in 0..num_sessions {
+        let server_remote = RemoteInfo {
+            qpn: server_infos[i].qpn,
+            qkey: server_infos[i].qkey,
+            lid: server_infos[i].lid,
+        };
+        let session = client.create_session(&server_remote).ok()?;
+        sessions.push(session);
+    }
+
+    // Wait for all session handshakes
+    let handshake_start = std::time::Instant::now();
+    let handshake_timeout = Duration::from_secs(5);
+    loop {
+        if handshake_start.elapsed() >= handshake_timeout {
+            eprintln!("Session handshake timeout");
+            return None;
+        }
+        client.run_event_loop_once();
+        let all_connected = sessions.iter().all(|&s| client.is_session_connected(s));
+        if all_connected {
+            break;
+        }
+        std::hint::spin_loop();
+    }
+
+    let server_handle = ServerHandle {
+        stop_flag,
+        handle: Some(handle),
+    };
+
+    Some(MultiSessionBenchmarkSetup {
+        client,
+        sessions,
+        _server_handle: server_handle,
+    })
+}
+
+/// Server thread for multi-session benchmark (single Rpc handling multiple sessions)
+fn multi_session_server_thread(
+    infos_tx: Sender<Vec<ConnectionInfo>>,
+    _client_info_rx: Receiver<ConnectionInfo>,
+    num_sessions_rx: Receiver<usize>,
+    ready_signal: Arc<AtomicU32>,
+    stop_flag: Arc<AtomicBool>,
+    config: RpcConfig,
+) {
+    set_cpu_affinity(SERVER_CORE);
+
+    let (ctx, port, _port_attr) = match open_mlx5_device() {
+        Some(c) => c,
+        None => return,
+    };
+
+    // Receive client info (unused but kept for protocol)
+    let _ = _client_info_rx.recv();
+    let num_sessions = match num_sessions_rx.recv() {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+
+    // Create single server Rpc
+    // Sessions will be created on-demand when client sends ConnectRequest
+    let server: Rpc<()> = match Rpc::new(&ctx, port, config, |_, _| {}) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    // Send server info (same for all sessions since it's the same Rpc/QP)
+    let info = server.local_info();
+    let server_infos: Vec<ConnectionInfo> = (0..num_sessions)
+        .map(|_| ConnectionInfo {
+            qpn: info.qpn,
+            qkey: info.qkey,
+            lid: info.lid,
+        })
+        .collect();
+
+    if infos_tx.send(server_infos).is_err() {
+        return;
+    }
+
+    ready_signal.store(1, Ordering::Release);
+
+    // Server loop - sessions are auto-accepted via handle_connect_request
+    let mut response_buf = vec![0u8; 4096];
+    const MAX_BATCH: usize = 32;
+    while !stop_flag.load(Ordering::Relaxed) {
+        server.run_event_loop_once();
+        let mut processed = 0;
+        while processed < MAX_BATCH {
+            if let Some(req) = server.recv() {
+                let data = req.data(&server);
+                let len = data.len().min(response_buf.len());
+                response_buf[..len].copy_from_slice(&data[..len]);
+                let _ = server.reply(&req, &response_buf[..len]);
+                processed += 1;
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+/// Run multi-session throughput benchmark (eRPC paper conditions)
+fn run_multi_session_throughput_bench(
+    client: &Rpc<usize>,
+    sessions: &[erpc::SessionHandle],
+    msg_size: usize,
+    iters: u64,
+    pipeline_depth_per_session: usize,
+) -> Duration {
+    #[allow(unused)]
+    static RUN_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    #[allow(unused)]
+    let run_num = RUN_COUNT.fetch_add(1, Ordering::SeqCst);
+    let debug = false; // Disable debug output for production
+
+    let request_data = vec![0xAAu8; msg_size];
+    let num_sessions = sessions.len();
+    let iters_per_session = iters / num_sessions as u64;
+
+    // Drain any pending completions from previous iterations
+    for _ in 0..100 {
+        client.run_event_loop_once();
+    }
+
+    // Record baseline completion count (instead of resetting, track delta)
+    let baseline_completed = MULTI_SESSION_COMPLETED.with(|c| *c.borrow());
+
+    let mut sent: u64 = 0;
+
+    let start = std::time::Instant::now();
+
+    // Initial fill for all sessions
+    for &session in sessions.iter() {
+        for _ in 0..pipeline_depth_per_session.min(iters_per_session as usize) {
+            if client.call(session, 1, &request_data, 0).is_ok() {
+                sent += 1;
+            }
+        }
+    }
+
+    let _ = debug; // suppress unused warning
+
+    // Main loop
+    let total_target = iters_per_session * num_sessions as u64;
+    let mut session_idx = 0;
+    loop {
+        client.run_event_loop_once();
+
+        let raw_completed = MULTI_SESSION_COMPLETED.with(|c| *c.borrow());
+        let completed = raw_completed.saturating_sub(baseline_completed);
+        if completed >= total_target {
+            break;
+        }
+
+        // Send more requests if we have capacity (round-robin across sessions)
+        let inflight = sent.saturating_sub(completed);
+        let max_inflight = (pipeline_depth_per_session * num_sessions) as u64;
+        while sent < total_target && inflight < max_inflight {
+            let session = sessions[session_idx];
+            if client.call(session, 1, &request_data, 0).is_ok() {
+                sent += 1;
+            } else {
+                break;
+            }
+            session_idx = (session_idx + 1) % num_sessions;
+        }
+    }
+
+    start.elapsed()
+}
+
+fn bench_erpc_paper_conditions(c: &mut Criterion) {
+    // eRPC paper: 1 Rpc, multiple sessions, B=8 credits
+    const NUM_SESSIONS: usize = 8;
+    const PIPELINE_DEPTH: usize = 8; // B=8 per session
+
+    let setup = match setup_multi_session_benchmark(NUM_SESSIONS) {
+        Some(s) => s,
+        None => {
+            eprintln!("Skipping eRPC paper benchmark: setup failed");
+            return;
+        }
+    };
+
+    let client = setup.client;
+    let sessions = setup.sessions;
+    let _server = setup._server_handle;
+
+    let mut group = c.benchmark_group("erpc_paper");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(5));
+    group.warm_up_time(Duration::from_secs(3));
+    group.throughput(Throughput::Elements(1));
+
+    // 32B message, 8 sessions, B=8 pipeline depth each (eRPC paper condition)
+    group.bench_function(
+        BenchmarkId::new("32B", format!("{}sessions_B{}", NUM_SESSIONS, PIPELINE_DEPTH)),
+        |b| {
+            b.iter_custom(|iters| {
+                run_multi_session_throughput_bench(
+                    &client,
+                    &sessions,
+                    SMALL_MSG_SIZE,
+                    iters,
+                    PIPELINE_DEPTH,
+                )
+            });
+        },
+    );
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_latency, bench_throughput, bench_multi_qp_throughput, bench_erpc_paper_conditions);
 criterion_main!(benches);
