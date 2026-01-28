@@ -171,18 +171,22 @@ fn test_latency() {
 
     client.connect(conn_id, server_info.into()).expect("connect");
 
-    // Warmup (using blocking call)
+    // Warmup
     let payload = vec![0xAAu8; 32];
     for _ in 0..10 {
-        let _ = client.call(conn_id, 1, &payload);
+        let pending = client.call_async(conn_id, 1, &payload).expect("call_async");
+        client.poll();
+        let _ = pending.wait();
     }
 
-    // Measure latency (using blocking call)
+    // Measure latency
     let iterations = 1000;
     let start = Instant::now();
 
     for _ in 0..iterations {
-        let _response = client.call(conn_id, 1, &payload).expect("call");
+        let pending = client.call_async(conn_id, 1, &payload).expect("call_async");
+        client.poll();
+        let _response = pending.wait().expect("wait");
     }
 
     let elapsed = start.elapsed();
