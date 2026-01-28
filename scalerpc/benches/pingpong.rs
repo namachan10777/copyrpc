@@ -409,9 +409,11 @@ fn run_latency_bench(client: &RpcClient, conn_id: usize, msg_size: usize, iters:
     let start = Instant::now();
 
     for _ in 0..iters {
-        // call() is now blocking and returns RpcResponse directly
-        match client.call(conn_id, 1, &request_data) {
-            Ok(_response) => {}
+        match client.call_async(conn_id, 1, &request_data) {
+            Ok(pending) => {
+                client.poll();
+                let _ = pending.wait();
+            }
             Err(_) => continue,
         };
     }
