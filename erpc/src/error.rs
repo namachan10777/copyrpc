@@ -27,6 +27,8 @@ pub enum Error {
     MessageTooLarge { size: usize, max: usize },
     /// Credits exhausted.
     NoCredits,
+    /// Request queued due to credit exhaustion (will be sent when credits return).
+    RequestQueued,
     /// Maximum retries exceeded.
     MaxRetriesExceeded,
     /// Buffer too small.
@@ -53,6 +55,7 @@ impl fmt::Display for Error {
                 write!(f, "Message too large: {} bytes, max {} bytes", size, max)
             }
             Error::NoCredits => write!(f, "Credits exhausted"),
+            Error::RequestQueued => write!(f, "Request queued due to credit exhaustion"),
             Error::MaxRetriesExceeded => write!(f, "Maximum retries exceeded"),
             Error::BufferTooSmall { required, available } => {
                 write!(

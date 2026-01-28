@@ -3,6 +3,7 @@
 //! The Rpc struct provides the primary API for eRPC operations.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 
 use mlx5::device::Context;
 
@@ -11,7 +12,7 @@ use crate::config::RpcConfig;
 use crate::error::{Error, Result};
 use crate::packet::{PktHdr, PktType, SmPktHdr, SmPktType, PKT_HDR_SIZE, SM_PKT_HDR_SIZE};
 use crate::session::{SessionHandle, SessionState, SessionTable};
-use crate::timing::{TimerEntry, TimingWheel, current_time_us};
+use crate::timing::{RdtscClock, TimerEntry, TimingWheel, current_time_us, likely};
 use crate::transport::{BufferType, GRH_SIZE, RemoteInfo, TransportEntry, UdTransport};
 
 /// Reserved request type for Session Management packets.
@@ -88,6 +89,10 @@ where
     recv_post_buf: RefCell<Vec<(usize, u64, u32, u32)>>,
     /// Reusable buffer for expired timers to avoid allocation in event loop.
     expired_timers: RefCell<Vec<TimerEntry>>,
+    /// RDTSC-based clock for low-overhead timestamping.
+    rdtsc_clock: RdtscClock,
+    /// Credit stall queue for requests waiting on credits.
+    credit_stall_queue: RefCell<VecDeque<StalledRequest<U>>>,
 }
 
 /// Pending request state.
@@ -98,6 +103,21 @@ struct PendingRequest<U> {
     single_buf_idx: Option<usize>,
     /// Multi-packet buffer indices (only allocated for large requests).
     multi_buf_indices: Option<Vec<usize>>,
+}
+
+/// Stalled request waiting for credit.
+///
+/// When a call() cannot proceed due to credit exhaustion,
+/// the request is queued here for later processing.
+struct StalledRequest<U> {
+    /// Session to send the request to.
+    session: SessionHandle,
+    /// Application-defined request type.
+    req_type: u8,
+    /// Request payload (copied to avoid lifetime issues).
+    data: Vec<u8>,
+    /// User data to pass to on_response callback.
+    user_data: U,
 }
 
 impl<U> PendingRequest<U> {
@@ -125,6 +145,16 @@ impl<U> PendingRequest<U> {
 /// Buffer index for tracking allocated send buffers.
 struct BufInfo {
     idx: usize,
+}
+
+/// Log process_recv error (cold path).
+///
+/// Separating error logging into a cold function keeps the hot path
+/// instruction cache clean.
+#[cold]
+#[inline(never)]
+fn log_process_recv_error(e: &Error) {
+    eprintln!("process_recv error: {:?}", e);
 }
 
 impl<U: 'static> Rpc<U> {
@@ -159,6 +189,10 @@ impl<U: 'static> Rpc<U> {
         // Repost threshold: when posted count drops to 1/4, batch repost all free buffers
         // Balance between batch efficiency and avoiding RQ starvation
         let recv_repost_threshold = num_recv_buffers / 4;
+
+        // Initialize RDTSC clock (calibration takes ~10ms)
+        let rdtsc_clock = RdtscClock::new();
+
         let rpc = Self {
             transport,
             sessions: RefCell::new(SessionTable::new(config.max_sessions)),
@@ -173,6 +207,8 @@ impl<U: 'static> Rpc<U> {
             recv_repost_threshold,
             recv_post_buf: RefCell::new(Vec::with_capacity(num_recv_buffers)),
             expired_timers: RefCell::new(Vec::new()),
+            rdtsc_clock,
+            credit_stall_queue: RefCell::new(VecDeque::new()),
         };
 
         // Post initial receive buffers
@@ -374,14 +410,22 @@ impl<U: 'static> Rpc<U> {
                 return Err(Error::SessionNotConnected(session.session_num()));
             }
 
+            // Check credits first (before allocating resources)
+            if !sess.has_credits() {
+                // Credit exhausted: queue the request for later processing
+                drop(sessions); // Release borrow before queueing
+                self.enqueue_stalled_request(session, req_type, data, user_data);
+                return Err(Error::RequestQueued);
+            }
+
             // Get request number first (eRPC pattern: sslot_idx = req_num % req_window)
             let req_num = sess.next_req_num();
 
             // Allocate slot using fixed assignment
             let sslot_idx = sess.alloc_sslot(req_num).ok_or(Error::NoAvailableSlots)?;
 
-            // Check credits
-            sess.consume_credit()?;
+            // Consume credit (we already checked availability)
+            sess.consume_credit().expect("credit should be available");
 
             let remote_session_num = sess.remote_session_num;
 
@@ -397,11 +441,11 @@ impl<U: 'static> Rpc<U> {
         let data_per_pkt = self.mtu - PKT_HDR_SIZE;
         let num_pkts = PktHdr::calc_num_pkts(msg_size, self.mtu);
 
-        // Get timestamp once for this call
-        let now = current_time_us();
+        // Get timestamp once for this call (RDTSC, no syscall)
+        let now = self.rdtsc_clock.now_us();
 
         // Single-packet fast path (99% of requests)
-        if num_pkts == 1 {
+        if likely(num_pkts == 1) {
             let hdr = PktHdr::new(
                 req_type,
                 msg_size,
@@ -874,6 +918,10 @@ impl<U: 'static> Rpc<U> {
     }
 
     /// Handle an SM (Session Management) packet.
+    ///
+    /// SM packets are rare (only during session setup), so keep this
+    /// out of the hot path instruction cache.
+    #[inline(never)]
     fn handle_sm_packet(&self, _pkt_hdr: &PktHdr, payload: &[u8]) -> Result<()> {
         if payload.len() < SM_PKT_HDR_SIZE {
             return Err(Error::BufferTooSmall {
@@ -1192,6 +1240,10 @@ impl<U: 'static> Rpc<U> {
     }
 
     /// Handle a credit return packet.
+    ///
+    /// Credit returns are rare in request-response patterns, so keep this
+    /// out of the hot path instruction cache.
+    #[inline(never)]
     fn handle_credit_return(&self, hdr: &PktHdr) -> Result<()> {
         let mut sessions = self.sessions.borrow_mut();
         let handle = SessionHandle(hdr.dest_session_num());
@@ -1383,7 +1435,8 @@ impl<U: 'static> Rpc<U> {
         let mut events = 0;
 
         // Get batch timestamp once for all operations in this iteration
-        let batch_ts = current_time_us();
+        // Uses RDTSC for low-overhead timestamping (no syscall)
+        let batch_ts = self.rdtsc_clock.now_us();
 
         // Poll and process send completions
         // Request buffers are kept until response is received (for retransmission)
@@ -1402,7 +1455,7 @@ impl<U: 'static> Rpc<U> {
         events += self.transport.poll_recv_completions(|comps| {
             for comp in comps {
                 if let Err(e) = self.process_recv(comp.buf_idx, comp.byte_cnt, batch_ts) {
-                    eprintln!("process_recv error: {:?}", e);
+                    log_process_recv_error(&e);
                 }
             }
             comps.len()
@@ -1412,6 +1465,9 @@ impl<U: 'static> Rpc<U> {
         if self.posted_recv_count.get() <= self.recv_repost_threshold {
             self.batch_repost_recv_buffers();
         }
+
+        // Process stalled requests now that credits may have been returned
+        self.process_credit_stall_queue();
 
         // Process timeouts
         self.process_timeouts(batch_ts);
@@ -1440,5 +1496,75 @@ impl<U: 'static> Rpc<U> {
     /// Get the number of active sessions.
     pub fn active_sessions(&self) -> usize {
         self.sessions.borrow().active_count()
+    }
+
+    /// Enqueue a request that couldn't be sent due to credit exhaustion.
+    fn enqueue_stalled_request(
+        &self,
+        session: SessionHandle,
+        req_type: u8,
+        data: &[u8],
+        user_data: U,
+    ) {
+        let stalled = StalledRequest {
+            session,
+            req_type,
+            data: data.to_vec(),
+            user_data,
+        };
+        self.credit_stall_queue.borrow_mut().push_back(stalled);
+    }
+
+    /// Process stalled requests when credits become available.
+    ///
+    /// Called from run_event_loop_once() after processing responses
+    /// (which return credits to sessions).
+    fn process_credit_stall_queue(&self) {
+        // Process up to 8 stalled requests per iteration
+        // to avoid starving the main event loop
+        const MAX_PROCESS_PER_ITER: usize = 8;
+
+        let mut processed = 0;
+
+        while processed < MAX_PROCESS_PER_ITER {
+            // Check if there's a request to process
+            let stalled = {
+                let mut queue = self.credit_stall_queue.borrow_mut();
+                if queue.is_empty() {
+                    break;
+                }
+
+                // Check if the front request's session has credits
+                let front = queue.front().unwrap();
+                let has_credit = {
+                    let sessions = self.sessions.borrow();
+                    sessions
+                        .get(front.session)
+                        .map(|s| s.has_credits())
+                        .unwrap_or(false)
+                };
+
+                if !has_credit {
+                    // No credit for front request, stop processing
+                    // (we process in FIFO order to maintain fairness)
+                    break;
+                }
+
+                // Pop the request
+                queue.pop_front().unwrap()
+            };
+
+            // Retry the call with the stalled request
+            // Note: This may fail again if slots are exhausted or session disconnected,
+            // but we don't re-queue in that case to avoid infinite loops
+            let _ = self.call(stalled.session, stalled.req_type, &stalled.data, stalled.user_data);
+
+            processed += 1;
+        }
+    }
+
+    /// Get the number of stalled requests in the queue.
+    pub fn stalled_request_count(&self) -> usize {
+        self.credit_stall_queue.borrow().len()
     }
 }

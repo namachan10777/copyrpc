@@ -5,6 +5,26 @@
 
 use std::collections::VecDeque;
 
+/// Branch prediction hint: condition is likely to be true.
+///
+/// On stable Rust, this is a no-op passthrough.
+/// When `cold_path` is stabilized, this can be enhanced with
+/// compiler hints.
+#[inline(always)]
+pub fn likely(b: bool) -> bool {
+    b
+}
+
+/// Branch prediction hint: condition is unlikely to be true.
+///
+/// On stable Rust, this is a no-op passthrough.
+/// When `cold_path` is stabilized, this can be enhanced with
+/// compiler hints.
+#[inline(always)]
+pub fn unlikely(b: bool) -> bool {
+    b
+}
+
 /// Entry in the timing wheel.
 #[derive(Debug, Clone, Copy)]
 pub struct TimerEntry {
@@ -199,10 +219,10 @@ impl TimingWheel {
     }
 }
 
-/// Get current timestamp in microseconds using RDTSC.
+/// Get raw RDTSC counter value.
 ///
-/// Note: This assumes a roughly constant CPU frequency. For more accurate
-/// timing, use clock_gettime(CLOCK_MONOTONIC).
+/// Note: This returns raw CPU cycles, not microseconds.
+/// Use RdtscClock for calibrated time.
 #[inline]
 pub fn rdtsc() -> u64 {
     #[cfg(target_arch = "x86_64")]
@@ -218,14 +238,91 @@ pub fn rdtsc() -> u64 {
     }
 }
 
-/// Get current timestamp in microseconds.
+/// Get current timestamp in microseconds via syscall.
+///
+/// Used for calibration and fallback.
 #[inline]
-pub fn current_time_us() -> u64 {
+pub fn current_time_us_syscall() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_micros() as u64
+}
+
+/// Get current timestamp in microseconds.
+///
+/// This is a legacy function for compatibility.
+/// Prefer using RdtscClock::now_us() for hot paths.
+#[inline]
+pub fn current_time_us() -> u64 {
+    current_time_us_syscall()
+}
+
+/// RDTSC-based clock for low-overhead timestamping.
+///
+/// Calibrates RDTSC cycles against system clock during initialization,
+/// then provides sub-microsecond timestamps without syscall overhead.
+pub struct RdtscClock {
+    /// Cycles per microsecond (calibrated).
+    cycles_per_us: f64,
+    /// Base RDTSC value at calibration time.
+    base_tsc: u64,
+    /// Base timestamp in microseconds at calibration time.
+    base_us: u64,
+}
+
+impl RdtscClock {
+    /// Create and calibrate a new RDTSC clock.
+    ///
+    /// Calibration takes approximately 10ms.
+    pub fn new() -> Self {
+        let (cycles_per_us, base_tsc, base_us) = Self::calibrate();
+        Self {
+            cycles_per_us,
+            base_tsc,
+            base_us,
+        }
+    }
+
+    /// Calibrate RDTSC against system clock.
+    ///
+    /// Measures RDTSC cycles over a 10ms interval to calculate cycles/μs.
+    fn calibrate() -> (f64, u64, u64) {
+        use std::time::Duration;
+
+        let start_us = current_time_us_syscall();
+        let start_tsc = rdtsc();
+
+        // Sleep for 10ms to get a good calibration sample
+        std::thread::sleep(Duration::from_millis(10));
+
+        let end_us = current_time_us_syscall();
+        let end_tsc = rdtsc();
+
+        let cycles = end_tsc.wrapping_sub(start_tsc);
+        let us = end_us.saturating_sub(start_us).max(1); // Avoid division by zero
+
+        let cycles_per_us = cycles as f64 / us as f64;
+
+        (cycles_per_us, end_tsc, end_us)
+    }
+
+    /// Get current timestamp in microseconds.
+    ///
+    /// This is a low-overhead operation using RDTSC.
+    #[inline]
+    pub fn now_us(&self) -> u64 {
+        let tsc = rdtsc();
+        let delta_cycles = tsc.wrapping_sub(self.base_tsc);
+        self.base_us + (delta_cycles as f64 / self.cycles_per_us) as u64
+    }
+}
+
+impl Default for RdtscClock {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
