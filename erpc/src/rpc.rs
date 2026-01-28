@@ -871,40 +871,49 @@ impl<U: 'static> Rpc<U> {
                 self.posted_recv_count.set(self.posted_recv_count.get().saturating_sub(1));
             }
             PktType::Resp => {
-                // Response packets: copy payload and free buffer, then process
-                // Copy is required to avoid holding recv_buffers borrow during callback
-                let payload = {
-                    let recv_buffers = self.recv_buffers.borrow();
-                    let buf_ptr = recv_buffers.slot_ptr(buf_idx);
-                    if payload_len > 0 {
-                        let mut payload = Vec::with_capacity(payload_len);
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                buf_ptr.add(payload_offset),
-                                payload.as_mut_ptr(),
-                                payload_len,
-                            );
-                            payload.set_len(payload_len);
-                        }
-                        payload
-                    } else {
-                        Vec::new()
-                    }
-                };
-                self.recv_buffers.borrow_mut().free(buf_idx);
-                self.posted_recv_count.set(self.posted_recv_count.get().saturating_sub(1));
-
-                // Check if single-packet response (most common case)
+                // Response packets: zero-copy path
+                // Get payload slice directly from recv buffer, process, then free
                 let msg_size = hdr.msg_size();
                 let num_pkts = PktHdr::calc_num_pkts(msg_size, self.mtu);
 
                 if num_pkts == 1 {
-                    // Single-packet response: optimized path
-                    self.handle_response_single_packet(&hdr, &payload, batch_ts)?;
+                    // Single-packet response: zero-copy fast path
+                    // Borrow recv_buffers only to get the slice, then release before callback
+                    let payload_ptr = {
+                        let recv_buffers = self.recv_buffers.borrow();
+                        recv_buffers.slot_ptr(buf_idx)
+                    };
+                    // SAFETY: Buffer is valid until we call free(buf_idx)
+                    let payload = unsafe {
+                        std::slice::from_raw_parts(payload_ptr.add(payload_offset), payload_len)
+                    };
+                    self.handle_response_single_packet(&hdr, payload, batch_ts)?;
                 } else {
-                    // Multi-packet response: reassembly path
+                    // Multi-packet response: need to copy for reassembly
+                    let payload = {
+                        let recv_buffers = self.recv_buffers.borrow();
+                        let buf_ptr = recv_buffers.slot_ptr(buf_idx);
+                        if payload_len > 0 {
+                            let mut payload = Vec::with_capacity(payload_len);
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    buf_ptr.add(payload_offset),
+                                    payload.as_mut_ptr(),
+                                    payload_len,
+                                );
+                                payload.set_len(payload_len);
+                            }
+                            payload
+                        } else {
+                            Vec::new()
+                        }
+                    };
                     self.handle_response_multi_packet(&hdr, &payload, batch_ts)?;
                 }
+
+                // Free buffer after processing
+                self.recv_buffers.borrow_mut().free(buf_idx);
+                self.posted_recv_count.set(self.posted_recv_count.get().saturating_sub(1));
             }
             PktType::CreditReturn => {
                 // Free buffer immediately for credit return
