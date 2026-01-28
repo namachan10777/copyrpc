@@ -44,7 +44,7 @@ use crate::error::{Error, Result, SlotState};
 use crate::mapping::VirtualMapping;
 use crate::pool::MessagePool;
 use crate::protocol::{
-    ContextSwitchEvent, MessageTrailer, RequestHeader, ResponseHeader,
+    ContextSwitchEvent, EndpointEntry, MessageTrailer, RequestHeader, ResponseHeader,
     MESSAGE_BLOCK_SIZE,
 };
 
@@ -261,13 +261,13 @@ impl EventBuffer {
 
     /// Check for new context switch event.
     ///
-    /// Returns the new sequence number if an event occurred.
-    pub fn poll(&self) -> Option<u64> {
+    /// Returns (scheduler sequence, fetched endpoint entry seq) if an event occurred.
+    pub fn poll(&self) -> Option<(u64, u32)> {
         let event = unsafe { ContextSwitchEvent::read_from(self.buffer) };
 
         if event.is_valid() && event.sequence > self.last_sequence.get() {
             self.last_sequence.set(event.sequence);
-            Some(event.sequence)
+            Some((event.sequence, event.fetched_seq))
         } else {
             None
         }
@@ -298,6 +298,17 @@ struct ConnectionState {
     warmup_buffer: RefCell<WarmupBuffer>,
     /// Event buffer for context switch notifications.
     event_buffer: EventBuffer,
+    /// Server's endpoint entry address (client writes to this).
+    endpoint_entry_addr: Cell<u64>,
+    /// Server's endpoint entry rkey.
+    endpoint_entry_rkey: Cell<u32>,
+    /// Current sequence number for endpoint entry.
+    endpoint_entry_seq: Cell<u32>,
+    /// Number of requests in warmup buffer when last notified.
+    last_notified_count: Cell<usize>,
+    /// True if a notification has been sent and we're waiting for server to fetch.
+    /// This prevents overwriting the endpoint entry before the server reads it.
+    pending_notification: Cell<bool>,
 }
 
 /// RPC Client.
@@ -431,6 +442,11 @@ impl RpcClient {
             state: Cell::new(ClientState::Connected),
             warmup_buffer: RefCell::new(warmup_buffer),
             event_buffer,
+            endpoint_entry_addr: Cell::new(0),
+            endpoint_entry_rkey: Cell::new(0),
+            endpoint_entry_seq: Cell::new(0),
+            last_notified_count: Cell::new(0),
+            pending_notification: Cell::new(false),
         };
 
         self.connections.push(Some(conn));
@@ -454,6 +470,12 @@ impl RpcClient {
         // Store remote slot info in mapping
         self.mapping
             .set_remote_slot(conn_id, remote.slot_addr, remote.slot_rkey)?;
+
+        // Store endpoint entry info for warmup notification
+        if let Some(Some(state)) = self.connection_states.get(conn_id) {
+            state.endpoint_entry_addr.set(remote.endpoint_entry_addr);
+            state.endpoint_entry_rkey.set(remote.endpoint_entry_rkey);
+        }
 
         conn.connect(remote)?;
         Ok(())
@@ -521,31 +543,14 @@ impl RpcClient {
         rpc_type: u16,
         payload: &[u8],
     ) -> Result<RpcResponse> {
-        // Check if we're going through warmup before sending
-        let current_state = self.state(conn_id);
-        let uses_warmup = matches!(
-            current_state,
-            Some(ClientState::Warmup) | Some(ClientState::Idle)
-        );
-
         let pending = self.call_async(conn_id, rpc_type, payload)?;
         // Flush doorbell immediately for blocking call
         self.poll();
         let response = pending.wait()?;
 
-        // After receiving response via warmup, transition to Process
-        if uses_warmup {
-            if let Some(Some(state)) = self.connection_states.get(conn_id) {
-                state.state.set(ClientState::Process);
-            }
-        }
-
-        // Connected -> Process after first successful response
-        if current_state == Some(ClientState::Connected) {
-            if let Some(Some(state)) = self.connection_states.get(conn_id) {
-                state.state.set(ClientState::Process);
-            }
-        }
+        // Check for context switch events after receiving response
+        // This processes the event and clears the warmup buffer for the next call
+        self.check_events(conn_id);
 
         Ok(response)
     }
@@ -686,12 +691,38 @@ impl RpcClient {
     ///
     /// This is the main polling method that should be called periodically.
     /// It:
-    /// 1. Issues doorbells for all connections with pending WQEs
-    /// 2. Drains all connection CQs
+    /// 1. Notifies server of new warmup requests (batched)
+    /// 2. Issues doorbells for all connections with pending WQEs
+    /// 3. Drains all connection CQs
     ///
     /// Returns the total number of CQ entries processed.
     pub fn poll(&self) -> usize {
-        // 1. Flush all pending doorbells
+        // 1. Check for context switch events first (to clear pending_notification)
+        for conn_id in 0..self.connection_states.len() {
+            self.check_events(conn_id);
+        }
+
+        // 2. Notify server of new warmup requests (batched notification)
+        // Skip if there's already a pending notification to avoid overwriting
+        // the endpoint entry before the server reads it.
+        for conn_id in 0..self.connection_states.len() {
+            if let Some(Some(state)) = self.connection_states.get(conn_id) {
+                // Don't send new notification if previous one hasn't been processed
+                if state.pending_notification.get() {
+                    continue;
+                }
+                let warmup_count = state.warmup_buffer.borrow().request_count();
+                let last_notified = state.last_notified_count.get();
+                if warmup_count > last_notified {
+                    // New requests since last notification
+                    let _ = self.notify_warmup_ready(conn_id);
+                    state.last_notified_count.set(warmup_count);
+                    state.pending_notification.set(true);
+                }
+            }
+        }
+
+        // 2. Flush all pending doorbells
         {
             let needs_flush = self.needs_flush.borrow();
             for &conn_id in needs_flush.iter() {
@@ -702,20 +733,109 @@ impl RpcClient {
         }
         self.needs_flush.borrow_mut().clear();
 
-        // 2. Drain all CQs
+        // 3. Drain all CQs
         self.poll_cqs()
     }
 
     /// Check for context switch events on a specific connection.
     ///
     /// Called automatically by `call()` to handle state transitions.
+    /// Context switch events indicate that warmup requests were fetched by server.
+    /// Since call_direct is disabled, we just clear the buffer and stay in Warmup.
     fn check_events(&self, conn_id: ConnectionId) {
         if let Some(Some(state)) = self.connection_states.get(conn_id) {
-            if state.event_buffer.poll().is_some() {
-                // Context switch event received - transition to Idle
-                state.state.set(ClientState::Idle);
+            if let Some((_sched_seq, fetched_seq)) = state.event_buffer.poll() {
+                // Context switch event received - server fetched warmup requests
+                // Only clear buffer if the fetched_seq matches our last notified seq
+                // This prevents clearing the buffer for events that correspond to older batches
+                let notified_seq = state.endpoint_entry_seq.get();
+                if fetched_seq == notified_seq && state.pending_notification.get() {
+                    state.pending_notification.set(false);
+                    // Clear the warmup buffer so we can send new requests
+                    if state.state.get() == ClientState::Warmup && state.last_notified_count.get() > 0 {
+                        state.warmup_buffer.borrow_mut().clear();
+                        state.last_notified_count.set(0);
+                    }
+                }
             }
         }
+    }
+
+    /// Notify server that warmup requests are ready via RDMA WRITE to endpoint entry.
+    ///
+    /// This is the key optimization from the paper: instead of the server blindly
+    /// reading all warmup slots, the client notifies exactly how many requests
+    /// are ready and their location.
+    fn notify_warmup_ready(&self, conn_id: ConnectionId) -> Result<()> {
+        let conn = self
+            .connections
+            .get(conn_id)
+            .and_then(|c| c.as_ref())
+            .ok_or(Error::ConnectionNotFound(conn_id))?;
+
+        let conn_state = self
+            .connection_states
+            .get(conn_id)
+            .and_then(|s| s.as_ref())
+            .ok_or(Error::ConnectionNotFound(conn_id))?;
+
+        let warmup_buffer = conn_state.warmup_buffer.borrow();
+        let batch_size = warmup_buffer.request_count() as u32;
+
+        if batch_size == 0 {
+            return Ok(()); // Nothing to notify
+        }
+
+        let endpoint_entry_addr = conn_state.endpoint_entry_addr.get();
+        let endpoint_entry_rkey = conn_state.endpoint_entry_rkey.get();
+
+        // Skip if no endpoint entry configured (backward compatibility)
+        if endpoint_entry_addr == 0 {
+            return Ok(());
+        }
+
+        // Increment sequence
+        let new_seq = conn_state.endpoint_entry_seq.get() + 1;
+        conn_state.endpoint_entry_seq.set(new_seq);
+
+        // Build endpoint entry
+        let entry = EndpointEntry::new(warmup_buffer.addr(), batch_size, new_seq);
+
+        // Allocate a small buffer for RDMA WRITE
+        let slot = self.pool.alloc()?;
+        unsafe {
+            entry.write_to(slot.slot().data_ptr());
+        }
+
+        // RDMA WRITE to server's endpoint entry
+        {
+            let qp_ref = conn.qp().borrow();
+            let emit_ctx = qp_ref
+                .emit_ctx()
+                .map_err(|e| Error::Protocol(format!("emit_ctx failed: {:?}", e)))?;
+
+            emit_wqe!(&emit_ctx, write {
+                flags: WqeFlags::COMPLETION,
+                remote_addr: endpoint_entry_addr,
+                rkey: endpoint_entry_rkey,
+                sge: {
+                    addr: slot.data_addr(),
+                    len: EndpointEntry::SIZE as u32,
+                    lkey: self.pool.lkey()
+                },
+                signaled: new_seq as u64,
+            })
+            .map_err(|e| Error::Protocol(format!("emit_wqe failed: {:?}", e)))?;
+        }
+
+        // Mark connection as needing doorbell flush
+        self.mark_needs_flush(conn_id);
+
+        // Release the slot - the data has been queued for RDMA WRITE
+        // The doorbell will be flushed in the next poll() call
+        drop(slot);
+
+        Ok(())
     }
 
     /// Send request via warmup mechanism.
@@ -738,7 +858,26 @@ impl RpcClient {
         let current = conn_state.state.get();
         if current == ClientState::Idle || current == ClientState::Connected {
             conn_state.warmup_buffer.borrow_mut().clear();
+            conn_state.last_notified_count.set(0); // Reset notification tracking
             conn_state.state.set(ClientState::Warmup);
+        }
+
+        // Check if a notification is pending (server hasn't fetched yet)
+        // We can't add more requests because the batch size has already been sent
+        // Adding more would result in those requests being lost when warmup_buffer is cleared
+        if conn_state.pending_notification.get() {
+            return Err(Error::NoFreeSlots);
+        }
+
+        // Check if warmup buffer is full - return error instead of clearing
+        // Clearing while server is still reading would cause a race condition
+        // and lose requests. The caller should wait for responses (which will
+        // trigger context_switch_event and state transition to Idle->Warmup).
+        {
+            let warmup_buffer = conn_state.warmup_buffer.borrow();
+            if warmup_buffer.request_count() >= warmup_buffer.capacity() {
+                return Err(Error::NoFreeSlots);
+            }
         }
 
         // Allocate a response slot
@@ -761,6 +900,9 @@ impl RpcClient {
             warmup_buffer.write_request(&header, payload)?;
         }
 
+        // Note: We don't notify immediately. Notification is batched in poll()
+        // to avoid RDMA WRITE ordering issues when multiple requests are queued.
+
         Ok(PendingRpc {
             pool: &self.pool,
             slot_index: response_slot.release(),
@@ -772,17 +914,15 @@ impl RpcClient {
     /// Make an asynchronous RPC call.
     ///
     /// Returns immediately with a `PendingRpc` handle that can be polled
-    /// for completion. The request behavior depends on the current state:
+    /// for completion. Always uses the warmup mechanism where the server
+    /// fetches requests via RDMA READ.
     ///
-    /// - **Process/Connected**: Sends directly via RDMA WRITE to processing pool
-    /// - **Warmup/Idle**: Uses warmup mechanism (server RDMA READs)
+    /// Note: The direct RDMA WRITE optimization (call_direct) is currently
+    /// disabled because pool swapping during context switch causes requests
+    /// to end up in the wrong pool.
     ///
     /// State machine (Figure 7):
-    /// CONNECT → WARMUP → PROCESS → IDLE → WARMUP → ...
-    ///
-    /// Note: Connected clients send directly because they may be in an active
-    /// group. After receiving a context switch event, they transition to Idle
-    /// and then use the warmup mechanism.
+    /// CONNECT → WARMUP → (server fetches, context switch) → PROCESS → IDLE → WARMUP → ...
     ///
     /// # Arguments
     /// * `conn_id` - Connection to use
@@ -797,18 +937,9 @@ impl RpcClient {
         // Check for context switch events
         self.check_events(conn_id);
 
-        let current_state = self.state(conn_id).ok_or(Error::ConnectionNotFound(conn_id))?;
-
-        match current_state {
-            ClientState::Process | ClientState::Connected => {
-                // Active or newly connected (assumed active): send directly via RDMA WRITE
-                self.call_direct(conn_id, rpc_type, payload)
-            }
-            ClientState::Warmup | ClientState::Idle => {
-                // Inactive: use warmup mechanism
-                self.send_warmup(conn_id, rpc_type, payload)
-            }
-        }
+        // Always use warmup mechanism for now
+        // TODO: Re-enable call_direct when pool addressing is fixed
+        self.send_warmup(conn_id, rpc_type, payload)
     }
 
     /// Poll for any completed responses.

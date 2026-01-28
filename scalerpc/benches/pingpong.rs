@@ -120,6 +120,13 @@ struct ConnectionInfo {
     lid: u16,
     slot_addr: u64,
     slot_rkey: u32,
+    event_buffer_addr: u64,
+    event_buffer_rkey: u32,
+    warmup_buffer_addr: u64,
+    warmup_buffer_rkey: u32,
+    warmup_buffer_slots: u32,
+    endpoint_entry_addr: u64,
+    endpoint_entry_rkey: u32,
 }
 
 // =============================================================================
@@ -217,6 +224,13 @@ fn setup_benchmark(config: &BenchConfig) -> Option<BenchmarkSetup> {
         lid: client_endpoint.lid,
         slot_addr: client_endpoint.slot_addr,
         slot_rkey: client_endpoint.slot_rkey,
+        event_buffer_addr: client_endpoint.event_buffer_addr,
+        event_buffer_rkey: client_endpoint.event_buffer_rkey,
+        warmup_buffer_addr: client_endpoint.warmup_buffer_addr,
+        warmup_buffer_rkey: client_endpoint.warmup_buffer_rkey,
+        warmup_buffer_slots: client_endpoint.warmup_buffer_slots,
+        endpoint_entry_addr: client_endpoint.endpoint_entry_addr,
+        endpoint_entry_rkey: client_endpoint.endpoint_entry_rkey,
     };
 
     // Setup communication channels
@@ -249,6 +263,8 @@ fn setup_benchmark(config: &BenchConfig) -> Option<BenchmarkSetup> {
         lid: server_info.lid,
         slot_addr: server_info.slot_addr,
         slot_rkey: server_info.slot_rkey,
+        endpoint_entry_addr: server_info.endpoint_entry_addr,
+        endpoint_entry_rkey: server_info.endpoint_entry_rkey,
         ..Default::default()
     };
 
@@ -337,6 +353,13 @@ fn server_thread_main(
         lid: server_endpoint.lid,
         slot_addr: server_endpoint.slot_addr,
         slot_rkey: server_endpoint.slot_rkey,
+        event_buffer_addr: 0,  // Server doesn't have event buffer
+        event_buffer_rkey: 0,
+        warmup_buffer_addr: 0, // Server doesn't have warmup buffer
+        warmup_buffer_rkey: 0,
+        warmup_buffer_slots: 0,
+        endpoint_entry_addr: server_endpoint.endpoint_entry_addr,
+        endpoint_entry_rkey: server_endpoint.endpoint_entry_rkey,
     };
 
     if info_tx.send(server_info).is_err() {
@@ -354,6 +377,11 @@ fn server_thread_main(
         lid: client_info.lid,
         slot_addr: client_info.slot_addr,
         slot_rkey: client_info.slot_rkey,
+        event_buffer_addr: client_info.event_buffer_addr,
+        event_buffer_rkey: client_info.event_buffer_rkey,
+        warmup_buffer_addr: client_info.warmup_buffer_addr,
+        warmup_buffer_rkey: client_info.warmup_buffer_rkey,
+        warmup_buffer_slots: client_info.warmup_buffer_slots,
         ..Default::default()
     };
 
@@ -573,6 +601,13 @@ fn setup_multi_qp_benchmark(config: &BenchConfig) -> Option<MultiQpBenchmarkSetu
             lid: endpoint.lid,
             slot_addr: endpoint.slot_addr,
             slot_rkey: endpoint.slot_rkey,
+            event_buffer_addr: endpoint.event_buffer_addr,
+            event_buffer_rkey: endpoint.event_buffer_rkey,
+            warmup_buffer_addr: endpoint.warmup_buffer_addr,
+            warmup_buffer_rkey: endpoint.warmup_buffer_rkey,
+            warmup_buffer_slots: endpoint.warmup_buffer_slots,
+            endpoint_entry_addr: endpoint.endpoint_entry_addr,
+            endpoint_entry_rkey: endpoint.endpoint_entry_rkey,
         });
     }
 
@@ -608,6 +643,8 @@ fn setup_multi_qp_benchmark(config: &BenchConfig) -> Option<MultiQpBenchmarkSetu
             lid: server_info.lid,
             slot_addr: server_info.slot_addr,
             slot_rkey: server_info.slot_rkey,
+            endpoint_entry_addr: server_info.endpoint_entry_addr,
+            endpoint_entry_rkey: server_info.endpoint_entry_rkey,
             ..Default::default()
         };
         client.connect(*conn_id, server_endpoint).ok()?;
@@ -703,6 +740,13 @@ fn multi_qp_server_thread_main(
             lid: endpoint.lid,
             slot_addr: endpoint.slot_addr,
             slot_rkey: endpoint.slot_rkey,
+            event_buffer_addr: 0,  // Server doesn't have event buffer
+            event_buffer_rkey: 0,
+            warmup_buffer_addr: 0, // Server doesn't have warmup buffer
+            warmup_buffer_rkey: 0,
+            warmup_buffer_slots: 0,
+            endpoint_entry_addr: endpoint.endpoint_entry_addr,
+            endpoint_entry_rkey: endpoint.endpoint_entry_rkey,
         });
     }
 
@@ -724,6 +768,11 @@ fn multi_qp_server_thread_main(
             lid: client_info.lid,
             slot_addr: client_info.slot_addr,
             slot_rkey: client_info.slot_rkey,
+            event_buffer_addr: client_info.event_buffer_addr,
+            event_buffer_rkey: client_info.event_buffer_rkey,
+            warmup_buffer_addr: client_info.warmup_buffer_addr,
+            warmup_buffer_rkey: client_info.warmup_buffer_rkey,
+            warmup_buffer_slots: client_info.warmup_buffer_slots,
             ..Default::default()
         };
         if server.connect(*conn_id, client_endpoint).is_err() {
@@ -734,7 +783,7 @@ fn multi_qp_server_thread_main(
     ready_signal.store(1, Ordering::Release);
 
     while !stop_flag.load(Ordering::Relaxed) {
-        server.process();
+        server.poll();
         std::hint::spin_loop();
     }
 }

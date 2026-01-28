@@ -33,7 +33,7 @@ use minstant::Instant;
 use mlx5::cq::{Cq, Cqe};
 use mlx5::device::Context;
 use mlx5::emit_wqe;
-use mlx5::pd::Pd;
+use mlx5::pd::{AccessFlags, MemoryRegion, Pd};
 use mlx5::wqe::WqeFlags;
 
 use crate::config::ServerConfig;
@@ -42,7 +42,7 @@ use crate::error::{Error, Result};
 use crate::mapping::VirtualMapping;
 use crate::pool::MessagePool;
 use crate::protocol::{
-    ContextSwitchEvent, MessageTrailer, RequestHeader, ResponseHeader,
+    ContextSwitchEvent, EndpointEntry, MessageTrailer, RequestHeader, ResponseHeader,
     MESSAGE_BLOCK_SIZE,
 };
 
@@ -68,6 +68,108 @@ struct WarmupBufferInfo {
     rkey: u32,
     /// Number of slots in the warmup buffer.
     slots: u32,
+}
+
+/// Alignment for RDMA memory allocations (4KB page).
+const RDMA_ALIGNMENT: usize = 4096;
+
+/// Pool of endpoint entries for client warmup notification.
+///
+/// Each connection has an endpoint entry that the client writes to
+/// via RDMA WRITE to notify the server that warmup requests are ready.
+/// This allows the server to read only the required number of requests
+/// instead of scanning all warmup slots.
+struct EndpointEntryPool {
+    /// Buffer memory.
+    buffer: *mut u8,
+    /// Memory region for RDMA access.
+    mr: MemoryRegion,
+    /// Number of entries in the pool.
+    num_entries: usize,
+    /// Last seen sequence number per connection.
+    last_seqs: Vec<u32>,
+}
+
+impl EndpointEntryPool {
+    /// Create a new endpoint entry pool.
+    fn new(pd: &Pd, max_connections: usize) -> Result<Self> {
+        let size = max_connections * EndpointEntry::SIZE;
+
+        let buffer = unsafe {
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let ret = libc::posix_memalign(&mut ptr, RDMA_ALIGNMENT, size);
+            if ret != 0 {
+                return Err(Error::Io(std::io::Error::from_raw_os_error(ret)));
+            }
+            std::ptr::write_bytes(ptr as *mut u8, 0, size);
+            ptr as *mut u8
+        };
+
+        let access =
+            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ;
+        let mr = unsafe { pd.register(buffer, size, access)? };
+
+        Ok(Self {
+            buffer,
+            mr,
+            num_entries: max_connections,
+            last_seqs: vec![0; max_connections],
+        })
+    }
+
+    /// Get the address for a specific connection's endpoint entry.
+    fn addr(&self, conn_id: ConnectionId) -> u64 {
+        self.buffer as u64 + (conn_id * EndpointEntry::SIZE) as u64
+    }
+
+    /// Get the rkey for RDMA WRITE.
+    fn rkey(&self) -> u32 {
+        self.mr.rkey()
+    }
+
+    /// Read the endpoint entry for a connection.
+    fn read_entry(&self, conn_id: ConnectionId) -> EndpointEntry {
+        if conn_id >= self.num_entries {
+            return EndpointEntry::default();
+        }
+        let entry_ptr = unsafe { self.buffer.add(conn_id * EndpointEntry::SIZE) };
+        unsafe { EndpointEntry::read_from(entry_ptr) }
+    }
+
+    /// Check if the entry has a new batch (sequence changed).
+    fn has_new_batch(&mut self, conn_id: ConnectionId) -> Option<EndpointEntry> {
+        if conn_id >= self.num_entries {
+            return None;
+        }
+        let entry = self.read_entry(conn_id);
+        if entry.seq > self.last_seqs[conn_id] && entry.batch_size > 0 {
+            self.last_seqs[conn_id] = entry.seq;
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    /// Clear the endpoint entry for a connection.
+    fn clear_entry(&self, conn_id: ConnectionId) {
+        if conn_id >= self.num_entries {
+            return;
+        }
+        let entry_ptr = unsafe { self.buffer.add(conn_id * EndpointEntry::SIZE) };
+        unsafe {
+            // Clear batch_size to indicate processed
+            let batch_size_ptr = entry_ptr.add(8) as *mut u32;
+            std::ptr::write_volatile(batch_size_ptr, 0);
+        }
+    }
+}
+
+impl Drop for EndpointEntryPool {
+    fn drop(&mut self) {
+        unsafe {
+            libc::free(self.buffer as *mut std::ffi::c_void);
+        }
+    }
 }
 
 /// Group scheduler state.
@@ -323,6 +425,8 @@ pub struct RpcServer {
     shared_send_cq: Option<Rc<Cq>>,
     /// Shared receive completion queue (all QPs share this).
     shared_recv_cq: Option<Rc<Cq>>,
+    /// Endpoint entries for each connection (client writes here to notify warmup ready).
+    endpoint_entries: Option<EndpointEntryPool>,
 }
 
 impl RpcServer {
@@ -341,6 +445,9 @@ impl RpcServer {
             config.group.time_slice_us,
         );
 
+        // Create endpoint entry pool for warmup notification
+        let endpoint_entries = EndpointEntryPool::new(pd, config.max_connections)?;
+
         Ok(Self {
             processing_pool,
             warmup_pool,
@@ -354,6 +461,7 @@ impl RpcServer {
             warmup_buffer_infos: Vec::new(),
             shared_send_cq: None,
             shared_recv_cq: None,
+            endpoint_entries: Some(endpoint_entries),
         })
     }
 
@@ -508,8 +616,8 @@ impl RpcServer {
 
         // Check if we need to context switch
         if let Some((seq, old_connections)) = self.perform_context_switch()? {
-            // Notify old group's clients
-            if let Err(e) = self.notify_context_switch(&old_connections, seq) {
+            // Notify old group's clients (fetched_seq=0 for time-based switches)
+            if let Err(e) = self.notify_context_switch(&old_connections, seq, 0) {
                 eprintln!("Failed to notify context switch: {}", e);
             }
         }
@@ -526,8 +634,8 @@ impl RpcServer {
     /// Notify clients of context switch.
     ///
     /// Sends context switch events to all clients in the old active group.
-    pub fn notify_context_switch(&self, conn_ids: &[ConnectionId], sequence: u64) -> Result<()> {
-        let event = ContextSwitchEvent::new(sequence);
+    pub fn notify_context_switch(&self, conn_ids: &[ConnectionId], sequence: u64, fetched_seq: u32) -> Result<()> {
+        let event = ContextSwitchEvent::new(sequence, fetched_seq);
 
         for &conn_id in conn_ids {
             if let Some(Some((addr, rkey))) = self.event_buffer_addrs.get(conn_id) {
@@ -677,6 +785,7 @@ impl RpcServer {
     /// Get local endpoint information for a connection.
     ///
     /// Note: slot_addr points to slot 0's data area (after slot header).
+    /// endpoint_entry_addr/rkey are populated for client to RDMA WRITE warmup notification.
     pub fn local_endpoint(&self, conn_id: ConnectionId) -> Result<RemoteEndpoint> {
         let conn = self
             .connections
@@ -688,6 +797,12 @@ impl RpcServer {
         // Point to slot 0's data area (not the slot header)
         endpoint.slot_addr = self.processing_pool.slot_data_addr(0).unwrap();
         endpoint.slot_rkey = self.processing_pool.rkey();
+
+        // Add endpoint entry info for client to RDMA WRITE warmup notification
+        if let Some(ref entries) = self.endpoint_entries {
+            endpoint.endpoint_entry_addr = entries.addr(conn_id);
+            endpoint.endpoint_entry_rkey = entries.rkey();
+        }
 
         Ok(endpoint)
     }
@@ -1080,9 +1195,13 @@ impl RpcServer {
     /// This is the simplified API for running the server. It handles:
     /// - Flushing pending doorbells (batch doorbell)
     /// - Draining CQs
+    /// - Fetching warmup requests (BEFORE context switch)
     /// - Context switch (time-sharing scheduler)
-    /// - Fetching warmup requests
     /// - Processing incoming requests (if handler is set)
+    ///
+    /// The order is important: fetch warmup requests FIRST, then context switch.
+    /// This way, fetched requests are in warmup_pool, and after context switch,
+    /// warmup_pool becomes processing_pool where recv() can find them.
     ///
     /// Returns the number of CQ entries processed (or requests if handler is set).
     pub fn poll(&mut self) -> usize {
@@ -1093,15 +1212,30 @@ impl RpcServer {
         // 2. Drain all CQs
         let cq_processed = self.poll_cqs();
 
-        // 3. Check for context switch
-        if let Ok(Some((seq, old_conns))) = self.perform_context_switch() {
-            let _ = self.notify_context_switch(&old_conns, seq);
-        }
+        // 3. Fetch warmup requests from next group (BEFORE context switch)
+        //    This puts requests into warmup_pool
+        let (fetched, fetched_seq) = self.fetch_warmup_requests().unwrap_or((0, 0));
 
-        // 4. Fetch warmup requests from next group
-        let _ = self.fetch_warmup_requests();
+        // 4. Check for context switch (swaps warmup_pool <-> processing_pool)
+        //    After this, the warmup_pool (with fetched requests) becomes processing_pool
+        //    If we fetched requests, force a context switch to move them to processing_pool
+        let _did_switch = if fetched > 0 {
+            // Force context switch to make fetched requests available for processing
+            let seq = self.scheduler.do_context_switch();
+            let old_conns: Vec<ConnectionId> = self.scheduler.current_group_connections().to_vec();
+            std::mem::swap(&mut self.processing_pool, &mut self.warmup_pool);
+            self.clear_pool_valid_flags(&self.warmup_pool);
+            let _ = self.notify_context_switch(&old_conns, seq, fetched_seq);
+            true
+        } else if let Ok(Some((seq, old_conns))) = self.perform_context_switch() {
+            let _ = self.notify_context_switch(&old_conns, seq, 0);
+            true
+        } else {
+            false
+        };
 
         // 5. Process requests if handler is set
+        //    recv() scans processing_pool (which was warmup_pool before context switch)
         let mut requests_processed = 0;
         if self.handler.is_some() {
             while let Some(request) = self.recv() {
@@ -1128,6 +1262,22 @@ impl RpcServer {
             }
         }
 
+        // 6. Flush doorbells for responses
+        self.flush_doorbells();
+        self.needs_flush.borrow_mut().clear();
+
+        // 7. Drain CQs to ensure response WRITEs complete before next poll iteration
+        // This prevents WRITE completions from being counted as READ completions in fetch_warmup_batch
+        if requests_processed > 0 {
+            // Only drain if we sent responses (have outstanding WRITEs)
+            loop {
+                let n = self.poll_cqs();
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+
         if requests_processed > 0 {
             requests_processed
         } else {
@@ -1137,17 +1287,29 @@ impl RpcServer {
 
     /// Fetch warmup requests from clients via RDMA READ.
     ///
-    /// Scans each connection's warmup buffer directly using the valid flag
-    /// in the message trailer to detect pending requests.
+    /// Uses the endpoint entry mechanism: client writes <addr, batch_size, seq>
+    /// to notify the server, and the server reads only batch_size requests.
+    /// This avoids wasted bandwidth from reading empty slots.
     ///
-    /// Returns the number of requests fetched.
-    pub fn fetch_warmup_requests(&self) -> Result<usize> {
+    /// Returns (number of requests fetched, last fetched endpoint entry seq).
+    pub fn fetch_warmup_requests(&mut self) -> Result<(usize, u32)> {
         let mut fetched = 0;
+        let mut last_seq = 0u32;
 
-        // Iterate over all connections with warmup buffer info
-        for conn_id in 0..self.warmup_buffer_infos.len() {
+        // Get connections in the next (warmup) group
+        let warmup_conn_ids: Vec<ConnectionId> =
+            self.scheduler.next_group_connections().to_vec();
+
+        for conn_id in warmup_conn_ids {
+            // Check if this connection has a new batch via endpoint entry
+            let entry_opt = self.endpoint_entries.as_mut().and_then(|e| e.has_new_batch(conn_id));
+            let entry = match entry_opt {
+                Some(e) => e,
+                None => continue,
+            };
+
             let warmup_info = match self.warmup_buffer_infos.get(conn_id).and_then(|w| w.as_ref()) {
-                Some(info) => info,
+                Some(info) => *info,
                 None => continue,
             };
 
@@ -1156,33 +1318,105 @@ impl RpcServer {
                 None => continue,
             };
 
-            // Scan each slot in the client's warmup buffer
-            for slot_idx in 0..warmup_info.slots {
-                let result = self.fetch_warmup_slot(conn, conn_id, warmup_info, slot_idx);
-                if result.is_ok() {
-                    fetched += 1;
-                }
+            // Fetch all batch_size slots at once (issue all RDMA READs, then wait)
+            let batch_size = entry.batch_size.min(warmup_info.slots);
+            let batch_fetched = self.fetch_warmup_batch(conn, conn_id, &warmup_info, batch_size)?;
+            fetched += batch_fetched;
+            last_seq = entry.seq;
+
+            // Clear the endpoint entry to indicate processed
+            if let Some(ref entries) = self.endpoint_entries {
+                entries.clear_entry(conn_id);
             }
         }
 
-        Ok(fetched)
+        Ok((fetched, last_seq))
     }
 
-    /// Fetch a single request from a client's warmup buffer slot via RDMA READ.
-    fn fetch_warmup_slot(
+    /// Fetch a batch of warmup requests at once.
+    ///
+    /// Issues all RDMA READs first, then waits for all completions.
+    /// This is more efficient than waiting for each READ individually.
+    fn fetch_warmup_batch(
+        &self,
+        conn: &Connection,
+        conn_id: ConnectionId,
+        warmup_info: &WarmupBufferInfo,
+        batch_size: u32,
+    ) -> Result<usize> {
+        if batch_size == 0 {
+            return Ok(0);
+        }
+
+        // Drain any stale completions from previous operations before issuing new READs
+        // This prevents counting old WRITE completions as READ completions
+        loop {
+            let n = self.poll_cqs();
+            if n == 0 {
+                break;
+            }
+        }
+
+        // Issue all RDMA READs
+        for slot_idx in 0..batch_size {
+            self.issue_warmup_read(conn, conn_id, warmup_info, slot_idx)?;
+        }
+
+        // Ring doorbell once for all WQEs
+        conn.ring_sq_doorbell();
+
+        // Wait for all completions - now we know all completions are from our READs
+        let start = Instant::now();
+        let timeout = std::time::Duration::from_millis(100);
+        let mut completions = 0u32;
+
+        while completions < batch_size {
+            let n = self.poll_cqs();
+            if n > 0 {
+                completions += n as u32;
+            }
+            if start.elapsed() > timeout {
+                return Err(Error::Protocol(format!(
+                    "RDMA READ batch timeout: expected {}, got {}",
+                    batch_size, completions
+                )));
+            }
+            std::hint::spin_loop();
+        }
+
+        Ok(batch_size as usize)
+    }
+
+    /// Issue a single RDMA READ for a warmup slot (without waiting).
+    fn issue_warmup_read(
         &self,
         conn: &Connection,
         conn_id: ConnectionId,
         warmup_info: &WarmupBufferInfo,
         slot_idx: u32,
     ) -> Result<()> {
-        // Allocate a slot in the warmup pool
-        let slot = self.warmup_pool.alloc()?;
+        // Get the server slot index from the mapping
+        let server_slot_idx = self
+            .mapping
+            .get_connection(conn_id)
+            .and_then(|entry| entry.slots.get(slot_idx as usize).copied())
+            .ok_or(Error::Protocol(format!(
+                "No mapping slot for conn_id={}, slot_idx={}",
+                conn_id, slot_idx
+            )))?;
+
+        let slot_data_addr = self
+            .warmup_pool
+            .slot_data_addr(server_slot_idx)
+            .ok_or(Error::Protocol(format!(
+                "Warmup pool slot {} addr not found",
+                server_slot_idx
+            )))?;
 
         // Calculate source address (client's warmup buffer + slot offset)
         let src_addr = warmup_info.addr + (slot_idx as u64 * MESSAGE_BLOCK_SIZE as u64);
 
-        // Issue RDMA READ
+        // Issue RDMA READ (don't ring doorbell yet)
         {
             let qp_ref = conn.qp().borrow();
             let emit_ctx = qp_ref
@@ -1194,41 +1428,14 @@ impl RpcServer {
                 remote_addr: src_addr,
                 rkey: warmup_info.rkey,
                 sge: {
-                    addr: slot.data_addr(),
+                    addr: slot_data_addr,
                     len: MESSAGE_BLOCK_SIZE as u32,
                     lkey: self.warmup_pool.lkey()
                 },
-                signaled: conn_id as u64,
+                signaled: (conn_id as u64) << 32 | slot_idx as u64,
             })
             .map_err(|e| Error::Protocol(format!("emit_wqe failed: {:?}", e)))?;
         }
-        conn.ring_sq_doorbell();
-
-        // Wait for read completion
-        let start = Instant::now();
-        let timeout = std::time::Duration::from_millis(10);
-        loop {
-            if self.poll_cqs() > 0 {
-                break;
-            }
-            if start.elapsed() > timeout {
-                // Timeout - free the slot and return error
-                return Err(Error::Protocol("RDMA READ timeout".to_string()));
-            }
-            std::hint::spin_loop();
-        }
-
-        // Check if the fetched slot has a valid message
-        let slot_ptr = slot.slot().data_ptr();
-        let (_, valid) = unsafe { MessageTrailer::read_from(slot_ptr) };
-
-        if valid == 0 {
-            // No valid message in this slot, release and indicate not fetched
-            return Err(Error::Protocol("No valid message in slot".to_string()));
-        }
-
-        // Release the slot handle but keep the data (it's now in the warmup pool)
-        let _ = slot.release();
 
         Ok(())
     }

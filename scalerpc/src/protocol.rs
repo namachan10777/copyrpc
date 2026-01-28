@@ -290,6 +290,53 @@ pub mod status {
     pub const TIMEOUT: u32 = 4;
 }
 
+/// Endpoint entry for warmup notification.
+///
+/// Client writes this to the server's endpoint entry buffer via RDMA WRITE
+/// to notify that warmup requests are ready. This allows the server to
+/// know exactly how many requests to RDMA READ, avoiding wasted bandwidth
+/// on empty slots.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EndpointEntry {
+    /// Client's warmup buffer address.
+    pub req_addr: u64,
+    /// Number of pending requests (batch_size).
+    pub batch_size: u32,
+    /// Sequence number for change detection.
+    pub seq: u32,
+}
+
+impl EndpointEntry {
+    /// Size of the endpoint entry in bytes.
+    pub const SIZE: usize = 16; // 8 + 4 + 4
+
+    /// Create a new endpoint entry.
+    pub fn new(req_addr: u64, batch_size: u32, seq: u32) -> Self {
+        Self {
+            req_addr,
+            batch_size,
+            seq,
+        }
+    }
+
+    /// Read from a buffer.
+    ///
+    /// # Safety
+    /// `src` must point to at least `SIZE` bytes.
+    pub unsafe fn read_from(src: *const u8) -> Self {
+        std::ptr::read_unaligned(src as *const Self)
+    }
+
+    /// Write to a buffer.
+    ///
+    /// # Safety
+    /// `dst` must point to at least `SIZE` bytes.
+    pub unsafe fn write_to(&self, dst: *mut u8) {
+        std::ptr::copy_nonoverlapping(self as *const Self as *const u8, dst, Self::SIZE);
+    }
+}
+
 /// Context switch event notification.
 ///
 /// Sent from server to client when the client's group is being
@@ -299,8 +346,8 @@ pub mod status {
 pub struct ContextSwitchEvent {
     /// Magic number for validation.
     pub magic: u32,
-    /// Event type (reserved for future use).
-    pub event_type: u32,
+    /// Endpoint entry sequence that was fetched.
+    pub fetched_seq: u32,
     /// Sequence number for ordering.
     pub sequence: u64,
 }
@@ -313,10 +360,10 @@ impl ContextSwitchEvent {
     pub const SIZE: usize = std::mem::size_of::<Self>();
 
     /// Create a new context switch event.
-    pub fn new(sequence: u64) -> Self {
+    pub fn new(sequence: u64, fetched_seq: u32) -> Self {
         Self {
             magic: Self::MAGIC,
-            event_type: 0,
+            fetched_seq,
             sequence,
         }
     }
@@ -445,9 +492,10 @@ mod tests {
 
     #[test]
     fn test_context_switch_event() {
-        let event = ContextSwitchEvent::new(12345);
+        let event = ContextSwitchEvent::new(12345, 42);
         assert!(event.is_valid());
         assert_eq!(event.sequence, 12345);
+        assert_eq!(event.fetched_seq, 42);
 
         let mut buf = [0u8; ContextSwitchEvent::SIZE];
         unsafe {
@@ -456,5 +504,37 @@ mod tests {
             assert!(read_back.is_valid());
             assert_eq!(read_back.sequence, 12345);
         }
+    }
+
+    #[test]
+    fn test_endpoint_entry_size() {
+        // Expected size: 8 + 4 + 4 = 16 bytes
+        assert_eq!(EndpointEntry::SIZE, 16);
+        assert_eq!(std::mem::size_of::<EndpointEntry>(), 16);
+    }
+
+    #[test]
+    fn test_endpoint_entry_serialization() {
+        let entry = EndpointEntry::new(0x1234_5678_9ABC_DEF0, 42, 123);
+        assert_eq!(entry.req_addr, 0x1234_5678_9ABC_DEF0);
+        assert_eq!(entry.batch_size, 42);
+        assert_eq!(entry.seq, 123);
+
+        let mut buf = [0u8; EndpointEntry::SIZE];
+        unsafe {
+            entry.write_to(buf.as_mut_ptr());
+            let read_back = EndpointEntry::read_from(buf.as_ptr());
+            assert_eq!(read_back.req_addr, 0x1234_5678_9ABC_DEF0);
+            assert_eq!(read_back.batch_size, 42);
+            assert_eq!(read_back.seq, 123);
+        }
+    }
+
+    #[test]
+    fn test_endpoint_entry_default() {
+        let entry = EndpointEntry::default();
+        assert_eq!(entry.req_addr, 0);
+        assert_eq!(entry.batch_size, 0);
+        assert_eq!(entry.seq, 0);
     }
 }

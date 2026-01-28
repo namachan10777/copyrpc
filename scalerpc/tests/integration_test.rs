@@ -175,12 +175,18 @@ fn test_loopback_rpc() {
     let mut client = RpcClient::new(&ctx.pd, client_config).expect("Failed to create client");
 
     // Create server
+    // Use num_groups=1 so that current_group == next_group (warmup works for single connection)
     let server_config = ServerConfig {
         pool: PoolConfig {
             num_slots: 64,
             slot_data_size: 4080,
         },
         max_connections: 4, // 64 / 4 = 16 slots per connection
+        group: scalerpc::config::GroupConfig {
+            num_groups: 1,
+            time_slice_us: 100,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let mut server = RpcServer::new(&ctx.pd, server_config).expect("Failed to create server");
@@ -231,49 +237,58 @@ fn test_loopback_rpc() {
     // Flush doorbell to send the request
     client.poll();
 
-    // Server processes request
-    // In a real scenario, this would be in a separate thread/process
-    // For loopback test, we manually drive both sides
+    // Server processes request using poll() which handles:
+    // - Fetching warmup requests via RDMA READ
+    // - Context switch (swapping warmup/processing pools)
+    // - Processing requests and sending responses
+    server.set_handler(|_rpc_type, payload, response_buf| {
+        let response = b"ECHO: ";
+        let len = response.len() + payload.len();
+        response_buf[..response.len()].copy_from_slice(response);
+        response_buf[response.len()..len].copy_from_slice(payload);
+        (0, len)
+    });
+
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(5);
 
     loop {
-        // Check for incoming request on server
-        if let Some(request) = server.recv() {
-            println!("Server received request: type={}, payload={:?}",
-                     request.rpc_type,
-                     std::str::from_utf8(&request.payload));
-
-            // Process and send response
-            let (status, response_payload) = {
-                let handler = |_rpc_type: u16, payload: &[u8]| {
-                    let mut response = b"ECHO: ".to_vec();
-                    response.extend_from_slice(payload);
-                    (0u32, response)
-                };
-                handler(request.rpc_type, &request.payload)
-            };
-
-            server
-                .reply(&request, status, &response_payload)
-                .expect("send response");
-
-            // Flush doorbell to send the response
-            server.flush_doorbells();
-            server.clear_needs_flush();
-
-            println!("Server sent response");
+        // poll() handles warmup fetch, context switch, and request processing
+        let processed = server.poll();
+        if processed > 0 {
+            println!("Server processed {} requests", processed);
+            // Keep polling a few more times to ensure response is sent
+            for _ in 0..10 {
+                server.poll();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             break;
         }
 
         if start.elapsed() > timeout {
-            panic!("Timeout waiting for server to receive request");
+            panic!("Timeout waiting for server to process request");
         }
         std::hint::spin_loop();
     }
 
-    // Client waits for response
-    let response = pending.wait().expect("wait for response");
+    // Client waits for response - poll manually for debugging
+    println!("Waiting for response, slot_index={}", pending.slot_index());
+    let start2 = std::time::Instant::now();
+    let response = loop {
+        if let Some(r) = pending.poll() {
+            break r;
+        }
+        if start2.elapsed() > std::time::Duration::from_secs(5) {
+            // Dump slot content for debugging
+            if let Some(slot) = client.pool().get_slot(pending.slot_index()) {
+                let data_ptr = slot.data_ptr();
+                let magic = unsafe { std::ptr::read_volatile(data_ptr as *const u32) };
+                println!("Slot magic: 0x{:08x} (expected 0x52455350)", magic);
+            }
+            panic!("wait for response: Protocol(\"response timeout\")");
+        }
+        std::hint::spin_loop();
+    };
 
     assert!(response.is_success(), "RPC failed with status {}", response.status());
 

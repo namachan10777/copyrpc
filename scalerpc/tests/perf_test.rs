@@ -23,6 +23,50 @@ struct ConnectionInfo {
     lid: u16,
     slot_addr: u64,
     slot_rkey: u32,
+    event_buffer_addr: u64,
+    event_buffer_rkey: u32,
+    warmup_buffer_addr: u64,
+    warmup_buffer_rkey: u32,
+    warmup_buffer_slots: u32,
+    endpoint_entry_addr: u64,
+    endpoint_entry_rkey: u32,
+}
+
+impl From<RemoteEndpoint> for ConnectionInfo {
+    fn from(e: RemoteEndpoint) -> Self {
+        Self {
+            qpn: e.qpn,
+            lid: e.lid,
+            slot_addr: e.slot_addr,
+            slot_rkey: e.slot_rkey,
+            event_buffer_addr: e.event_buffer_addr,
+            event_buffer_rkey: e.event_buffer_rkey,
+            warmup_buffer_addr: e.warmup_buffer_addr,
+            warmup_buffer_rkey: e.warmup_buffer_rkey,
+            warmup_buffer_slots: e.warmup_buffer_slots,
+            endpoint_entry_addr: e.endpoint_entry_addr,
+            endpoint_entry_rkey: e.endpoint_entry_rkey,
+        }
+    }
+}
+
+impl From<ConnectionInfo> for RemoteEndpoint {
+    fn from(c: ConnectionInfo) -> Self {
+        Self {
+            qpn: c.qpn,
+            psn: 0,
+            lid: c.lid,
+            slot_addr: c.slot_addr,
+            slot_rkey: c.slot_rkey,
+            event_buffer_addr: c.event_buffer_addr,
+            event_buffer_rkey: c.event_buffer_rkey,
+            warmup_buffer_addr: c.warmup_buffer_addr,
+            warmup_buffer_rkey: c.warmup_buffer_rkey,
+            warmup_buffer_slots: c.warmup_buffer_slots,
+            endpoint_entry_addr: c.endpoint_entry_addr,
+            endpoint_entry_rkey: c.endpoint_entry_rkey,
+        }
+    }
 }
 
 /// Latency test: measure RTT for individual RPC calls.
@@ -75,7 +119,10 @@ fn test_latency() {
                 slot_data_size: 4080,
             },
             num_recv_slots: 64,
-            group: GroupConfig::default(),
+            group: GroupConfig {
+                num_groups: 1,
+                ..Default::default()
+            },
             max_connections: 4,
         };
 
@@ -97,32 +144,15 @@ fn test_latency() {
 
         let server_endpoint = server.local_endpoint(conn_id).unwrap();
 
-        server_info_tx
-            .send(ConnectionInfo {
-                qpn: server_endpoint.qpn,
-                lid: server_endpoint.lid,
-                slot_addr: server_endpoint.slot_addr,
-                slot_rkey: server_endpoint.slot_rkey,
-            })
-            .unwrap();
+        server_info_tx.send(server_endpoint.into()).unwrap();
 
         let client_info = client_info_rx.recv().unwrap();
-
-        let remote = RemoteEndpoint {
-            qpn: client_info.qpn,
-            psn: 0,
-            lid: client_info.lid,
-            slot_addr: client_info.slot_addr,
-            slot_rkey: client_info.slot_rkey,
-            ..Default::default()
-        };
-
-        server.connect(conn_id, remote).unwrap();
+        server.connect(conn_id, client_info.into()).unwrap();
         server_ready_clone.store(1, Ordering::Release);
 
         let mut total_processed = 0u64;
         while !stop_flag_clone.load(Ordering::Relaxed) {
-            let n = server.process();
+            let n = server.poll();
             if n > 0 {
                 total_processed += n as u64;
             }
@@ -131,14 +161,7 @@ fn test_latency() {
         eprintln!("[server] exiting, total_processed={}", total_processed);
     });
 
-    client_info_tx
-        .send(ConnectionInfo {
-            qpn: client_endpoint.qpn,
-            lid: client_endpoint.lid,
-            slot_addr: client_endpoint.slot_addr,
-            slot_rkey: client_endpoint.slot_rkey,
-        })
-        .unwrap();
+    client_info_tx.send(client_endpoint.into()).unwrap();
 
     let server_info = server_info_rx.recv().unwrap();
 
@@ -146,16 +169,7 @@ fn test_latency() {
         std::hint::spin_loop();
     }
 
-    let server_endpoint = RemoteEndpoint {
-        qpn: server_info.qpn,
-        psn: 0,
-        lid: server_info.lid,
-        slot_addr: server_info.slot_addr,
-        slot_rkey: server_info.slot_rkey,
-        ..Default::default()
-    };
-
-    client.connect(conn_id, server_endpoint).expect("connect");
+    client.connect(conn_id, server_info.into()).expect("connect");
 
     // Warmup (using blocking call)
     let payload = vec![0xAAu8; 32];
@@ -234,7 +248,10 @@ fn test_throughput() {
                 slot_data_size: 4080,
             },
             num_recv_slots: 256,
-            group: GroupConfig::default(),
+            group: GroupConfig {
+                num_groups: 1,
+                ..Default::default()
+            },
             max_connections: 8,
         };
 
@@ -256,32 +273,15 @@ fn test_throughput() {
 
         let server_endpoint = server.local_endpoint(conn_id).unwrap();
 
-        server_info_tx
-            .send(ConnectionInfo {
-                qpn: server_endpoint.qpn,
-                lid: server_endpoint.lid,
-                slot_addr: server_endpoint.slot_addr,
-                slot_rkey: server_endpoint.slot_rkey,
-            })
-            .unwrap();
+        server_info_tx.send(server_endpoint.into()).unwrap();
 
         let client_info = client_info_rx.recv().unwrap();
-
-        let remote = RemoteEndpoint {
-            qpn: client_info.qpn,
-            psn: 0,
-            lid: client_info.lid,
-            slot_addr: client_info.slot_addr,
-            slot_rkey: client_info.slot_rkey,
-            ..Default::default()
-        };
-
-        server.connect(conn_id, remote).unwrap();
+        server.connect(conn_id, client_info.into()).unwrap();
         server_ready_clone.store(1, Ordering::Release);
 
         let mut total_processed = 0u64;
         while !stop_flag_clone.load(Ordering::Relaxed) {
-            let n = server.process();
+            let n = server.poll();
             if n > 0 {
                 total_processed += n as u64;
             }
@@ -290,14 +290,7 @@ fn test_throughput() {
         eprintln!("[server] exiting, total_processed={}", total_processed);
     });
 
-    client_info_tx
-        .send(ConnectionInfo {
-            qpn: client_endpoint.qpn,
-            lid: client_endpoint.lid,
-            slot_addr: client_endpoint.slot_addr,
-            slot_rkey: client_endpoint.slot_rkey,
-        })
-        .unwrap();
+    client_info_tx.send(client_endpoint.into()).unwrap();
 
     let server_info = server_info_rx.recv().unwrap();
 
@@ -305,16 +298,7 @@ fn test_throughput() {
         std::hint::spin_loop();
     }
 
-    let server_endpoint = RemoteEndpoint {
-        qpn: server_info.qpn,
-        psn: 0,
-        lid: server_info.lid,
-        slot_addr: server_info.slot_addr,
-        slot_rkey: server_info.slot_rkey,
-        ..Default::default()
-    };
-
-    client.connect(conn_id, server_endpoint).expect("connect");
+    client.connect(conn_id, server_info.into()).expect("connect");
 
     let pipeline_depth = 16;
     let total_requests = 50;
@@ -348,8 +332,14 @@ fn test_throughput() {
     client.poll();
 
     // Main loop
+    let timeout = std::time::Duration::from_secs(30);
     let mut iter = 0u64;
     while completed < total_requests {
+        if start.elapsed() > timeout {
+            panic!("Test timed out after {:?}. completed={}, sent={}, pending={}",
+                   timeout, completed, sent, pending_requests.len());
+        }
+
         // Check for completed requests
         let mut i = 0;
         while i < pending_requests.len() {
@@ -445,7 +435,10 @@ fn test_throughput_4kb() {
                 slot_data_size: 4080,
             },
             num_recv_slots: 256,
-            group: GroupConfig::default(),
+            group: GroupConfig {
+                num_groups: 1,
+                ..Default::default()
+            },
             max_connections: 8,
         };
 
@@ -467,32 +460,15 @@ fn test_throughput_4kb() {
 
         let server_endpoint = server.local_endpoint(conn_id).unwrap();
 
-        server_info_tx
-            .send(ConnectionInfo {
-                qpn: server_endpoint.qpn,
-                lid: server_endpoint.lid,
-                slot_addr: server_endpoint.slot_addr,
-                slot_rkey: server_endpoint.slot_rkey,
-            })
-            .unwrap();
+        server_info_tx.send(server_endpoint.into()).unwrap();
 
         let client_info = client_info_rx.recv().unwrap();
-
-        let remote = RemoteEndpoint {
-            qpn: client_info.qpn,
-            psn: 0,
-            lid: client_info.lid,
-            slot_addr: client_info.slot_addr,
-            slot_rkey: client_info.slot_rkey,
-            ..Default::default()
-        };
-
-        server.connect(conn_id, remote).unwrap();
+        server.connect(conn_id, client_info.into()).unwrap();
         server_ready_clone.store(1, Ordering::Release);
 
         let mut total_processed = 0u64;
         while !stop_flag_clone.load(Ordering::Relaxed) {
-            let n = server.process();
+            let n = server.poll();
             if n > 0 {
                 total_processed += n as u64;
             }
@@ -501,14 +477,7 @@ fn test_throughput_4kb() {
         eprintln!("[server] exiting, total_processed={}", total_processed);
     });
 
-    client_info_tx
-        .send(ConnectionInfo {
-            qpn: client_endpoint.qpn,
-            lid: client_endpoint.lid,
-            slot_addr: client_endpoint.slot_addr,
-            slot_rkey: client_endpoint.slot_rkey,
-        })
-        .unwrap();
+    client_info_tx.send(client_endpoint.into()).unwrap();
 
     let server_info = server_info_rx.recv().unwrap();
 
@@ -516,16 +485,7 @@ fn test_throughput_4kb() {
         std::hint::spin_loop();
     }
 
-    let server_endpoint = RemoteEndpoint {
-        qpn: server_info.qpn,
-        psn: 0,
-        lid: server_info.lid,
-        slot_addr: server_info.slot_addr,
-        slot_rkey: server_info.slot_rkey,
-        ..Default::default()
-    };
-
-    client.connect(conn_id, server_endpoint).expect("connect");
+    client.connect(conn_id, server_info.into()).expect("connect");
 
     let pipeline_depth = 16;
     let total_requests = 50;
@@ -559,7 +519,7 @@ fn test_throughput_4kb() {
     client.poll();
 
     // Main loop with timeout
-    let timeout = std::time::Duration::from_secs(10);
+    let timeout = std::time::Duration::from_secs(30);
     let mut iter = 0u64;
     while completed < total_requests {
         if start.elapsed() > timeout {

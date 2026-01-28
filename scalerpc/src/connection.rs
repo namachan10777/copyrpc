@@ -40,6 +40,10 @@ pub struct RemoteEndpoint {
     pub warmup_buffer_rkey: u32,
     /// Number of slots in warmup buffer.
     pub warmup_buffer_slots: u32,
+    /// Server's endpoint entry address (client writes to this).
+    pub endpoint_entry_addr: u64,
+    /// Server's endpoint entry rkey.
+    pub endpoint_entry_rkey: u32,
 }
 
 /// Callback type for SQ completions.
@@ -152,6 +156,8 @@ impl Connection {
             warmup_buffer_addr: 0,     // To be filled by caller (client only)
             warmup_buffer_rkey: 0,     // To be filled by caller (client only)
             warmup_buffer_slots: 0,    // To be filled by caller (client only)
+            endpoint_entry_addr: 0,    // To be filled by caller (server only)
+            endpoint_entry_rkey: 0,    // To be filled by caller (server only)
         }
     }
 
