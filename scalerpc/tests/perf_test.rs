@@ -248,15 +248,15 @@ fn test_throughput() {
 
         let server_config = ServerConfig {
             pool: PoolConfig {
-                num_slots: 256,
+                num_slots: 512,
                 slot_data_size: 4080,
             },
-            num_recv_slots: 256,
+            num_recv_slots: 512,
             group: GroupConfig {
                 num_groups: 1,
                 ..Default::default()
             },
-            max_connections: 8,
+            max_connections: 8, // 512/8 = 64 slots per connection
         };
 
         let mut server = match RpcServer::new(&ctx.pd, server_config) {
@@ -304,8 +304,14 @@ fn test_throughput() {
 
     client.connect(conn_id, server_info.into()).expect("connect");
 
-    let pipeline_depth = 16;
-    let total_requests = 50;
+    let pipeline_depth = std::env::var("SCALERPC_PIPELINE_DEPTH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+    let total_requests = std::env::var("SCALERPC_TOTAL_REQUESTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10000);
     let payload = vec![0xAAu8; 32];
 
     println!("\n=== ScaleRPC Throughput Test ===");
@@ -322,15 +328,12 @@ fn test_throughput() {
     // Initial fill (using call_async for pipelining)
     while sent < pipeline_depth && sent < total_requests {
         if let Ok(p) = client.call_async(conn_id, 1, &payload) {
-            eprintln!("[fill] sent={}, slot={}, req_id={}", sent, p.slot_index(), p.req_id());
             pending_requests.push(p);
             sent += 1;
         } else {
-            eprintln!("[fill] call_async failed at sent={}", sent);
             break;
         }
     }
-    eprintln!("[fill] done, sent={}", sent);
 
     // Batch doorbell for initial fill
     client.poll();
@@ -348,18 +351,12 @@ fn test_throughput() {
         let mut i = 0;
         while i < pending_requests.len() {
             if pending_requests[i].poll().is_some() {
-                if completed < 20 || completed % 100 == 0 {
-                    eprintln!("[main] completed={}, req_id={}", completed, pending_requests[i].req_id());
-                }
                 pending_requests.swap_remove(i);
                 completed += 1;
 
                 // Send new request
                 if sent < total_requests {
                     if let Ok(p) = client.call_async(conn_id, 1, &payload) {
-                        if sent < 20 || sent % 100 == 0 {
-                            eprintln!("[main] sent={}, slot={}", sent, p.slot_index());
-                        }
                         pending_requests.push(p);
                         sent += 1;
                     }
@@ -369,10 +366,6 @@ fn test_throughput() {
             }
         }
         iter += 1;
-        if iter % 5_000_000 == 0 {
-            let pending_info: Vec<_> = pending_requests.iter().map(|p| (p.slot_index(), p.req_id())).collect();
-            eprintln!("[main] iter={}, completed={}, pending={:?}", iter, completed, pending_info);
-        }
 
         // Batch doorbell + CQ drain
         client.poll();
@@ -435,15 +428,15 @@ fn test_throughput_4kb() {
 
         let server_config = ServerConfig {
             pool: PoolConfig {
-                num_slots: 256,
+                num_slots: 512,
                 slot_data_size: 4080,
             },
-            num_recv_slots: 256,
+            num_recv_slots: 512,
             group: GroupConfig {
                 num_groups: 1,
                 ..Default::default()
             },
-            max_connections: 8,
+            max_connections: 8, // 512/8 = 64 slots per connection
         };
 
         let mut server = match RpcServer::new(&ctx.pd, server_config) {
@@ -492,7 +485,10 @@ fn test_throughput_4kb() {
     client.connect(conn_id, server_info.into()).expect("connect");
 
     let pipeline_depth = 16;
-    let total_requests = 50;
+    let total_requests = std::env::var("SCALERPC_TOTAL_REQUESTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000);
     let payload = vec![0xAAu8; 4000]; // ~4KB payload (max is 4056)
 
     println!("\n=== ScaleRPC Throughput Test (4KB) ===");
@@ -509,15 +505,12 @@ fn test_throughput_4kb() {
     // Initial fill
     while sent < pipeline_depth && sent < total_requests {
         if let Ok(p) = client.call_async(conn_id, 1, &payload) {
-            eprintln!("[fill] sent={}, slot={}, req_id={}", sent, p.slot_index(), p.req_id());
             pending_requests.push(p);
             sent += 1;
         } else {
-            eprintln!("[fill] call_async failed at sent={}", sent);
             break;
         }
     }
-    eprintln!("[fill] done, sent={}", sent);
 
     // Batch doorbell for initial fill
     client.poll();
@@ -534,17 +527,11 @@ fn test_throughput_4kb() {
         let mut i = 0;
         while i < pending_requests.len() {
             if pending_requests[i].poll().is_some() {
-                if completed < 20 || completed % 100 == 0 {
-                    eprintln!("[main] completed={}, req_id={}", completed, pending_requests[i].req_id());
-                }
                 pending_requests.swap_remove(i);
                 completed += 1;
 
                 if sent < total_requests {
                     if let Ok(p) = client.call_async(conn_id, 1, &payload) {
-                        if sent < 20 || sent % 100 == 0 {
-                            eprintln!("[main] sent={}, slot={}", sent, p.slot_index());
-                        }
                         pending_requests.push(p);
                         sent += 1;
                     }
@@ -554,10 +541,6 @@ fn test_throughput_4kb() {
             }
         }
         iter += 1;
-        if iter % 5_000_000 == 0 {
-            let pending_info: Vec<_> = pending_requests.iter().map(|p| (p.slot_index(), p.req_id())).collect();
-            eprintln!("[main] iter={}, completed={}, pending={:?}", iter, completed, pending_info);
-        }
 
         // Batch doorbell + CQ drain
         client.poll();
