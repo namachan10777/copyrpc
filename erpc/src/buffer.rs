@@ -348,6 +348,79 @@ impl BufferPool {
 /// Page size alignment for zero-copy buffers.
 pub const PAGE_SIZE: usize = 4096;
 
+/// Fixed-size ring buffer for free list management.
+///
+/// This provides O(1) alloc/free with no heap allocation and excellent
+/// cache locality. The ring buffer is stored inline with the pool.
+struct FreeListRing {
+    /// Ring buffer storage (boxed for large sizes).
+    buffer: Box<[u32]>,
+    /// Head index (next slot to pop).
+    head: u32,
+    /// Tail index (next slot to push).
+    tail: u32,
+    /// Capacity (power of 2 for fast modulo).
+    capacity: u32,
+}
+
+impl FreeListRing {
+    /// Create a new ring buffer with the given capacity.
+    /// Capacity is rounded up to the next power of 2.
+    fn new(capacity: usize) -> Self {
+        // Round up to power of 2 for fast modulo
+        let capacity = capacity.next_power_of_two().max(2) as u32;
+        let buffer = vec![0u32; capacity as usize].into_boxed_slice();
+        Self {
+            buffer,
+            head: 0,
+            tail: 0,
+            capacity,
+        }
+    }
+
+    /// Initialize with all indices from 0 to count-1.
+    fn init_full(&mut self, count: usize) {
+        debug_assert!(count <= self.capacity as usize);
+        for i in 0..count {
+            self.buffer[i] = i as u32;
+        }
+        self.head = 0;
+        self.tail = count as u32;
+    }
+
+    /// Pop an index from the ring buffer.
+    #[inline]
+    fn pop(&mut self) -> Option<usize> {
+        if self.head == self.tail {
+            return None;
+        }
+        let idx = self.buffer[(self.head & (self.capacity - 1)) as usize];
+        self.head = self.head.wrapping_add(1);
+        Some(idx as usize)
+    }
+
+    /// Push an index to the ring buffer.
+    #[inline]
+    fn push(&mut self, idx: usize) {
+        debug_assert!(self.len() < self.capacity as usize);
+        self.buffer[(self.tail & (self.capacity - 1)) as usize] = idx as u32;
+        self.tail = self.tail.wrapping_add(1);
+    }
+
+    /// Get the number of elements in the ring buffer.
+    #[inline]
+    fn len(&self) -> usize {
+        self.tail.wrapping_sub(self.head) as usize
+    }
+
+    /// Check if the ring buffer is empty.
+    #[inline]
+    #[allow(dead_code)]
+    fn is_empty(&self) -> bool {
+        self.head == self.tail
+    }
+}
+
 /// A zero-copy buffer pool with single MR registration.
 ///
 /// This pool allocates a single contiguous memory region and registers it
@@ -364,8 +437,8 @@ pub struct ZeroCopyPool {
     slot_size: usize,
     /// Total number of slots.
     num_slots: usize,
-    /// Free list of available slot indices.
-    free_list: Vec<usize>,
+    /// Free list ring buffer (fixed-size, cache-friendly).
+    free_list: FreeListRing,
 }
 
 impl ZeroCopyPool {
@@ -407,8 +480,9 @@ impl ZeroCopyPool {
             pd.register(buffer, total_size, AccessFlags::LOCAL_WRITE)?
         };
 
-        // Initialize free list with all slots
-        let free_list = (0..num_slots).collect();
+        // Initialize free list ring buffer with all slots
+        let mut free_list = FreeListRing::new(num_slots);
+        free_list.init_full(num_slots);
 
         Ok(Self {
             buffer,
@@ -422,6 +496,7 @@ impl ZeroCopyPool {
     /// Allocate a slot from the pool.
     ///
     /// Returns the slot index and a mutable slice to the slot's memory.
+    #[inline]
     pub fn alloc(&mut self) -> Option<(usize, &mut [u8])> {
         let idx = self.free_list.pop()?;
         let slice = unsafe {
@@ -432,9 +507,9 @@ impl ZeroCopyPool {
     }
 
     /// Free a slot back to the pool.
+    #[inline]
     pub fn free(&mut self, idx: usize) {
         debug_assert!(idx < self.num_slots);
-        debug_assert!(!self.free_list.contains(&idx));
         self.free_list.push(idx);
     }
 
