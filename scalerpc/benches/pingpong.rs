@@ -129,6 +129,43 @@ struct ConnectionInfo {
     endpoint_entry_rkey: u32,
 }
 
+impl From<RemoteEndpoint> for ConnectionInfo {
+    fn from(e: RemoteEndpoint) -> Self {
+        Self {
+            qpn: e.qpn,
+            lid: e.lid,
+            slot_addr: e.slot_addr,
+            slot_rkey: e.slot_rkey,
+            event_buffer_addr: e.event_buffer_addr,
+            event_buffer_rkey: e.event_buffer_rkey,
+            warmup_buffer_addr: e.warmup_buffer_addr,
+            warmup_buffer_rkey: e.warmup_buffer_rkey,
+            warmup_buffer_slots: e.warmup_buffer_slots,
+            endpoint_entry_addr: e.endpoint_entry_addr,
+            endpoint_entry_rkey: e.endpoint_entry_rkey,
+        }
+    }
+}
+
+impl From<ConnectionInfo> for RemoteEndpoint {
+    fn from(c: ConnectionInfo) -> Self {
+        Self {
+            qpn: c.qpn,
+            psn: 0,
+            lid: c.lid,
+            slot_addr: c.slot_addr,
+            slot_rkey: c.slot_rkey,
+            event_buffer_addr: c.event_buffer_addr,
+            event_buffer_rkey: c.event_buffer_rkey,
+            warmup_buffer_addr: c.warmup_buffer_addr,
+            warmup_buffer_rkey: c.warmup_buffer_rkey,
+            warmup_buffer_slots: c.warmup_buffer_slots,
+            endpoint_entry_addr: c.endpoint_entry_addr,
+            endpoint_entry_rkey: c.endpoint_entry_rkey,
+        }
+    }
+}
+
 // =============================================================================
 // Server Handle
 // =============================================================================
@@ -257,18 +294,7 @@ fn setup_benchmark(config: &BenchConfig) -> Option<BenchmarkSetup> {
     }
 
     // Connect to server
-    let server_endpoint = RemoteEndpoint {
-        qpn: server_info.qpn,
-        psn: 0,
-        lid: server_info.lid,
-        slot_addr: server_info.slot_addr,
-        slot_rkey: server_info.slot_rkey,
-        endpoint_entry_addr: server_info.endpoint_entry_addr,
-        endpoint_entry_rkey: server_info.endpoint_entry_rkey,
-        ..Default::default()
-    };
-
-    client.connect(conn_id, server_endpoint).ok()?;
+    client.connect(conn_id, server_info.into()).ok()?;
 
     let server_handle = ServerHandle {
         stop_flag,
@@ -321,8 +347,11 @@ fn server_thread_main(
             slot_data_size: 4080,
         },
         num_recv_slots: 256,
-        group: GroupConfig::default(),
-        max_connections: 64, // 16 slots per connection
+        group: GroupConfig {
+            num_groups: 1,  // Single QP test uses 1 group
+            ..GroupConfig::default()
+        },
+        max_connections: 1, // Single QP test uses 1 connection
     };
 
     let mut server = match RpcServer::new(&pd, server_config) {
@@ -371,31 +400,22 @@ fn server_thread_main(
         Err(_) => return,
     };
 
-    let client_endpoint = RemoteEndpoint {
-        qpn: client_info.qpn,
-        psn: 0,
-        lid: client_info.lid,
-        slot_addr: client_info.slot_addr,
-        slot_rkey: client_info.slot_rkey,
-        event_buffer_addr: client_info.event_buffer_addr,
-        event_buffer_rkey: client_info.event_buffer_rkey,
-        warmup_buffer_addr: client_info.warmup_buffer_addr,
-        warmup_buffer_rkey: client_info.warmup_buffer_rkey,
-        warmup_buffer_slots: client_info.warmup_buffer_slots,
-        ..Default::default()
-    };
-
-    if server.connect(conn_id, client_endpoint).is_err() {
+    if server.connect(conn_id, client_info.into()).is_err() {
         return;
     }
 
     ready_signal.store(1, Ordering::Release);
 
     // Server loop
+    let mut total_processed = 0u64;
     while !stop_flag.load(Ordering::Relaxed) {
-        server.process();
+        let n = server.poll();
+        if n > 0 {
+            total_processed += n as u64;
+        }
         std::hint::spin_loop();
     }
+    eprintln!("[server] exiting, total_processed={}", total_processed);
 }
 
 // =============================================================================
@@ -450,8 +470,14 @@ fn run_throughput_bench(
     // Batch doorbell for initial fill
     client.poll();
 
-    // Main loop
+    // Main loop with timeout
+    let timeout = Duration::from_secs(10);
     while completed < iters {
+        if start.elapsed() > timeout {
+            eprintln!("[bench] TIMEOUT: completed={}/{}, sent={}, pending={}",
+                     completed, iters, sent, pending_requests.len());
+            break;
+        }
         // Check for completed requests
         let mut i = 0;
         while i < pending_requests.len() {
@@ -638,18 +664,8 @@ fn setup_multi_qp_benchmark(config: &BenchConfig) -> Option<MultiQpBenchmarkSetu
 
     // Connect all QPs
     for (i, conn_id) in conn_ids.iter().enumerate() {
-        let server_info = &server_infos[i];
-        let server_endpoint = RemoteEndpoint {
-            qpn: server_info.qpn,
-            psn: 0,
-            lid: server_info.lid,
-            slot_addr: server_info.slot_addr,
-            slot_rkey: server_info.slot_rkey,
-            endpoint_entry_addr: server_info.endpoint_entry_addr,
-            endpoint_entry_rkey: server_info.endpoint_entry_rkey,
-            ..Default::default()
-        };
-        client.connect(*conn_id, server_endpoint).ok()?;
+        let server_info = server_infos[i].clone();
+        client.connect(*conn_id, server_info.into()).ok()?;
     }
 
     let server_handle = ServerHandle {
@@ -763,21 +779,8 @@ fn multi_qp_server_thread_main(
 
     // Connect all server QPs to client QPs
     for (i, conn_id) in server_conn_ids.iter().enumerate() {
-        let client_info = &client_infos[i];
-        let client_endpoint = RemoteEndpoint {
-            qpn: client_info.qpn,
-            psn: 0,
-            lid: client_info.lid,
-            slot_addr: client_info.slot_addr,
-            slot_rkey: client_info.slot_rkey,
-            event_buffer_addr: client_info.event_buffer_addr,
-            event_buffer_rkey: client_info.event_buffer_rkey,
-            warmup_buffer_addr: client_info.warmup_buffer_addr,
-            warmup_buffer_rkey: client_info.warmup_buffer_rkey,
-            warmup_buffer_slots: client_info.warmup_buffer_slots,
-            ..Default::default()
-        };
-        if server.connect(*conn_id, client_endpoint).is_err() {
+        let client_info = client_infos[i].clone();
+        if server.connect(*conn_id, client_info.into()).is_err() {
             return;
         }
     }

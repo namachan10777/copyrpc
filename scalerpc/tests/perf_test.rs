@@ -256,7 +256,7 @@ fn test_throughput() {
                 num_groups: 1,
                 ..Default::default()
             },
-            max_connections: 8, // 512/8 = 64 slots per connection
+            max_connections: 1, // Single connection test
         };
 
         let mut server = match RpcServer::new(&ctx.pd, server_config) {
@@ -436,7 +436,7 @@ fn test_throughput_4kb() {
                 num_groups: 1,
                 ..Default::default()
             },
-            max_connections: 8, // 512/8 = 64 slots per connection
+            max_connections: 1, // Single connection test
         };
 
         let mut server = match RpcServer::new(&ctx.pd, server_config) {

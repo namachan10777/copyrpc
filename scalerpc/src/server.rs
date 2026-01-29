@@ -255,7 +255,12 @@ impl GroupScheduler {
     }
 
     /// Check if a context switch is due.
+    ///
+    /// Returns false if there's only one group (no need to switch).
     pub fn should_switch(&self) -> bool {
+        if self.groups.len() <= 1 {
+            return false;
+        }
         self.last_switch.get().elapsed().as_micros() as u64 >= self.time_slice_us
     }
 
