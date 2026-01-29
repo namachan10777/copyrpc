@@ -93,6 +93,8 @@ where
     rdtsc_clock: RdtscClock,
     /// Credit stall queue for requests waiting on credits.
     credit_stall_queue: RefCell<VecDeque<StalledRequest<U>>>,
+    /// Counter for stalled requests (debug/profiling).
+    stall_count: Cell<u64>,
 }
 
 /// Pending request state.
@@ -209,6 +211,7 @@ impl<U: 'static> Rpc<U> {
             expired_timers: RefCell::new(Vec::new()),
             rdtsc_clock,
             credit_stall_queue: RefCell::new(VecDeque::new()),
+            stall_count: Cell::new(0),
         };
 
         // Post initial receive buffers
@@ -270,6 +273,12 @@ impl<U: 'static> Rpc<U> {
     pub fn is_session_connected(&self, handle: SessionHandle) -> bool {
         let sessions = self.sessions.borrow();
         sessions.get(handle).map_or(false, |s| s.is_connected())
+    }
+
+    /// Get the number of requests that were stalled due to credit exhaustion.
+    /// Useful for debugging/profiling credit flow.
+    pub fn stall_count(&self) -> u64 {
+        self.stall_count.get()
     }
 
     /// Prepare and send an SM packet.
@@ -570,6 +579,110 @@ impl<U: 'static> Rpc<U> {
         self.update_next_send_time(session, msg_size + PKT_HDR_SIZE * (num_pkts as usize), now);
 
         Ok(req_num)
+    }
+
+    /// Send an RPC request without queueing on credit exhaustion.
+    ///
+    /// Unlike `call()`, this method returns `Error::NoCredits` immediately
+    /// if the session has no available credits, instead of queueing the request.
+    /// This is useful for benchmarks and scenarios where the caller wants to
+    /// control credit flow explicitly.
+    #[inline]
+    pub fn try_call(
+        &self,
+        session: SessionHandle,
+        req_type: u8,
+        data: &[u8],
+        user_data: U,
+    ) -> Result<u64> {
+        // Phase 1: Session setup and get AV (single borrow)
+        let (req_num, sslot_idx, remote_session_num, av) = {
+            let mut sessions = self.sessions.borrow_mut();
+            let sess = sessions
+                .get_mut(session)
+                .ok_or(Error::SessionNotFound(session.session_num()))?;
+
+            if !sess.is_connected() {
+                return Err(Error::SessionNotConnected(session.session_num()));
+            }
+
+            // Check credits - return error immediately without queueing
+            if !sess.has_credits() {
+                return Err(Error::NoCredits);
+            }
+
+            let req_num = sess.next_req_num();
+            let sslot_idx = sess.alloc_sslot(req_num).ok_or(Error::NoAvailableSlots)?;
+            sess.consume_credit().expect("credit should be available");
+
+            let remote_session_num = sess.remote_session_num;
+            let ah = sess.ah.as_ref().ok_or(Error::SessionNotConnected(session.session_num()))?;
+            let av = UdTransport::ah_to_av(ah);
+
+            (req_num, sslot_idx, remote_session_num, av)
+        };
+
+        // Phase 2: Prepare and send (same as call())
+        let msg_size = data.len();
+        let num_pkts = PktHdr::calc_num_pkts(msg_size, self.mtu);
+        let now = self.rdtsc_clock.now_us();
+
+        // Single-packet fast path
+        if likely(num_pkts == 1) {
+            let hdr = PktHdr::new(
+                req_type,
+                msg_size,
+                remote_session_num,
+                PktType::ReqForResp,
+                0,
+                req_num,
+            );
+
+            let buf_idx = self.prepare_send_buffer(data, &hdr)?.idx;
+
+            {
+                let send_buffers = self.send_buffers.borrow();
+                let lkey = send_buffers.lkey();
+                let pkt_len = (PKT_HDR_SIZE + msg_size) as u32;
+                let entry = TransportEntry {
+                    buf_idx,
+                    session_num: session.session_num(),
+                    context: req_num,
+                    buf_type: BufferType::Request,
+                };
+                let addr = send_buffers.slot_addr(buf_idx);
+                self.transport.post_send_raw(av, addr, pkt_len, lkey, entry)?;
+            }
+
+            {
+                let timer_entry = TimerEntry {
+                    session_num: session.session_num(),
+                    sslot_idx,
+                    req_num,
+                    expires_at: now + self.config.rto_us,
+                };
+                let wheel_slot = self.timing_wheel.borrow_mut().insert(timer_entry);
+
+                let mut sessions = self.sessions.borrow_mut();
+                let sess = sessions.get_mut(session).unwrap();
+                let sslot = sess.sslot_mut(sslot_idx).unwrap();
+
+                let pending = PendingRequest::new_single(user_data, buf_idx);
+                sslot.start_request(req_num, req_type, pending);
+                sslot.req_msg_size = msg_size;
+                sslot.req_num_pkts = 1;
+                sslot.req_pkts_sent = 1;
+                sslot.tx_ts = now;
+                sslot.timer_wheel_slot = wheel_slot;
+                sslot.wait_response(1);
+            }
+
+            self.update_next_send_time(session, msg_size + PKT_HDR_SIZE, now);
+            return Ok(req_num);
+        }
+
+        // Multi-packet path not supported in try_call (use call() for large messages)
+        Err(Error::MessageTooLarge { size: msg_size, max: self.mtu - PKT_HDR_SIZE })
     }
 
     /// Poll for an incoming request (non-blocking, copyrpc-style API).
@@ -1522,6 +1635,7 @@ impl<U: 'static> Rpc<U> {
             user_data,
         };
         self.credit_stall_queue.borrow_mut().push_back(stalled);
+        self.stall_count.set(self.stall_count.get() + 1);
     }
 
     /// Process stalled requests when credits become available.

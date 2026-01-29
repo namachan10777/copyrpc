@@ -982,12 +982,6 @@ fn run_multi_session_throughput_bench(
     iters: u64,
     pipeline_depth_per_session: usize,
 ) -> Duration {
-    #[allow(unused)]
-    static RUN_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    #[allow(unused)]
-    let run_num = RUN_COUNT.fetch_add(1, Ordering::SeqCst);
-    let debug = false; // Disable debug output for production
-
     let request_data = vec![0xAAu8; msg_size];
     let num_sessions = sessions.len();
     let iters_per_session = iters / num_sessions as u64;
@@ -997,93 +991,119 @@ fn run_multi_session_throughput_bench(
         client.run_event_loop_once();
     }
 
-    // Record baseline completion count (instead of resetting, track delta)
+    // Record baseline completion count and stall count
     let baseline_completed = MULTI_SESSION_COMPLETED.with(|c| *c.borrow());
+    let baseline_stall = client.stall_count();
 
-    let mut sent: u64 = 0;
+    // Per-session tracking: sent count per session
+    // This ensures we don't exceed per-session credit limits
+    let mut sent_per_session = vec![0u64; num_sessions];
+    let mut _total_sent: u64 = 0;
 
     let start = std::time::Instant::now();
 
-    // Initial fill for all sessions
-    for &session in sessions.iter() {
-        for _ in 0..pipeline_depth_per_session.min(iters_per_session as usize) {
-            if client.call(session, 1, &request_data, 0).is_ok() {
-                sent += 1;
+    // Initial fill for all sessions (up to pipeline_depth_per_session each)
+    // Use try_call() to avoid stall queue allocation
+    for (i, &session) in sessions.iter().enumerate() {
+        let to_send = pipeline_depth_per_session.min(iters_per_session as usize);
+        for _ in 0..to_send {
+            if client.try_call(session, 1, &request_data, 0).is_ok() {
+                sent_per_session[i] += 1;
+                _total_sent += 1;
+            } else {
+                // Credit exhausted for this session, move to next
+                break;
             }
         }
     }
 
-    let _ = debug; // suppress unused warning
-
-    // Main loop
+    // Main loop: simple round-robin with credit-aware retry
+    // Use try_call() to avoid stall queue allocation on credit exhaustion
     let total_target = iters_per_session * num_sessions as u64;
     let mut session_idx = 0;
     loop {
         client.run_event_loop_once();
 
         let raw_completed = MULTI_SESSION_COMPLETED.with(|c| *c.borrow());
-        let completed = raw_completed.saturating_sub(baseline_completed);
-        if completed >= total_target {
+        let total_completed = raw_completed.saturating_sub(baseline_completed);
+        if total_completed >= total_target {
             break;
         }
 
-        // Send more requests if we have capacity (round-robin across sessions)
-        let inflight = sent.saturating_sub(completed);
-        let max_inflight = (pipeline_depth_per_session * num_sessions) as u64;
-        while sent < total_target && inflight < max_inflight {
-            let session = sessions[session_idx];
-            if client.call(session, 1, &request_data, 0).is_ok() {
-                sent += 1;
-            } else {
-                break;
-            }
+        // Try each session once per event loop iteration
+        // try_call() returns Error::NoCredits without allocating if credits exhausted
+        for _ in 0..num_sessions {
+            let i = session_idx;
             session_idx = (session_idx + 1) % num_sessions;
+
+            // Skip if this session has sent enough
+            if sent_per_session[i] >= iters_per_session {
+                continue;
+            }
+
+            // Try to send - try_call() returns error without allocating
+            let session = sessions[i];
+            if client.try_call(session, 1, &request_data, 0).is_ok() {
+                sent_per_session[i] += 1;
+                _total_sent += 1;
+            }
+            // Don't break on failure - try other sessions in this round
         }
+    }
+
+    // Print stall count periodically for debugging
+    static ITER_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let iter_num = ITER_COUNT.fetch_add(1, Ordering::Relaxed);
+    let stalls_this_run = client.stall_count() - baseline_stall;
+    if iter_num % 10 == 0 {
+        eprintln!("DEBUG: stalls_this_run={}", stalls_this_run);
     }
 
     start.elapsed()
 }
 
 fn bench_erpc_paper_conditions(c: &mut Criterion) {
-    // eRPC paper: 1 Rpc, multiple sessions, B=8 credits
-    const NUM_SESSIONS: usize = 8;
-    const PIPELINE_DEPTH: usize = 8; // B=8 per session
+    // Test different session counts to find optimal configuration
+    // eRPC paper achieves peak throughput with many sessions
+    for num_sessions in [2, 8] {
+        const PIPELINE_DEPTH: usize = 8; // B=8 per session
 
-    let setup = match setup_multi_session_benchmark(NUM_SESSIONS) {
-        Some(s) => s,
-        None => {
-            eprintln!("Skipping eRPC paper benchmark: setup failed");
-            return;
-        }
-    };
+        let setup = match setup_multi_session_benchmark(num_sessions) {
+            Some(s) => s,
+            None => {
+                eprintln!("Skipping eRPC paper benchmark ({}sessions): setup failed", num_sessions);
+                continue;
+            }
+        };
 
-    let client = setup.client;
-    let sessions = setup.sessions;
-    let _server = setup._server_handle;
+        let client = setup.client;
+        let sessions = setup.sessions;
+        let _server = setup._server_handle;
 
-    let mut group = c.benchmark_group("erpc_paper");
-    group.sample_size(10);
-    group.measurement_time(Duration::from_secs(5));
-    group.warm_up_time(Duration::from_secs(3));
-    group.throughput(Throughput::Elements(1));
+        let mut group = c.benchmark_group("erpc_paper");
+        group.sample_size(10);
+        group.measurement_time(Duration::from_secs(5));
+        group.warm_up_time(Duration::from_secs(3));
+        group.throughput(Throughput::Elements(1));
 
-    // 32B message, 8 sessions, B=8 pipeline depth each (eRPC paper condition)
-    group.bench_function(
-        BenchmarkId::new("32B", format!("{}sessions_B{}", NUM_SESSIONS, PIPELINE_DEPTH)),
-        |b| {
-            b.iter_custom(|iters| {
-                run_multi_session_throughput_bench(
-                    &client,
-                    &sessions,
-                    SMALL_MSG_SIZE,
-                    iters,
-                    PIPELINE_DEPTH,
-                )
-            });
-        },
-    );
+        // 32B message with varying session count
+        group.bench_function(
+            BenchmarkId::new("32B", format!("{}sessions_B{}", num_sessions, PIPELINE_DEPTH)),
+            |b| {
+                b.iter_custom(|iters| {
+                    run_multi_session_throughput_bench(
+                        &client,
+                        &sessions,
+                        SMALL_MSG_SIZE,
+                        iters,
+                        PIPELINE_DEPTH,
+                    )
+                });
+            },
+        );
 
-    group.finish();
+        group.finish();
+    }
 }
 
 criterion_group!(benches, bench_latency, bench_throughput, bench_multi_qp_throughput, bench_erpc_paper_conditions);
