@@ -998,9 +998,9 @@ impl RpcServer {
             )))?;
 
         // Check for pending context switch event to piggyback
-        let response_header = if let Some((seq, _fetched_seq)) = self.take_pending_context_switch(request.conn_id) {
+        let response_header = if let Some((seq, fetched_seq)) = self.take_pending_context_switch(request.conn_id) {
             // Piggyback context switch event on the response
-            ResponseHeader::with_context_switch(request.req_id, status, payload.len() as u32, seq)
+            ResponseHeader::with_context_switch(request.req_id, status, payload.len() as u32, seq, fetched_seq)
         } else {
             ResponseHeader::new(request.req_id, status, payload.len() as u32)
         };
@@ -1088,9 +1088,9 @@ impl RpcServer {
             )))?;
 
         // Check for pending context switch event to piggyback
-        let response_header = if let Some((seq, _fetched_seq)) = self.take_pending_context_switch(request.conn_id) {
+        let response_header = if let Some((seq, fetched_seq)) = self.take_pending_context_switch(request.conn_id) {
             // Piggyback context switch event on the response
-            ResponseHeader::with_context_switch(request.req_id, status, payload_len as u32, seq)
+            ResponseHeader::with_context_switch(request.req_id, status, payload_len as u32, seq, fetched_seq)
         } else {
             ResponseHeader::new(request.req_id, status, payload_len as u32)
         };

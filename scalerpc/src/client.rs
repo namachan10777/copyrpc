@@ -1083,15 +1083,21 @@ impl RpcClient {
     /// * `conn_id` - Connection ID
     /// * `response` - The response containing the context switch event
     pub fn process_response_context_switch(&self, conn_id: ConnectionId, response: &RpcResponse) {
-        if let Some(_seq) = response.context_switch_seq() {
+        if let (Some(_seq), Some(fetched_seq)) = (response.context_switch_seq(), response.fetched_seq()) {
             if let Some(Some(state)) = self.connection_states.get(conn_id) {
                 // Context switch event received via response piggyback
                 // Transition from Process → Idle
                 if state.state.get() == ClientState::Process {
                     state.state.set(ClientState::Idle);
                 }
-                // Also clear the warmup buffer for new batch
-                if state.state.get() == ClientState::Warmup {
+
+                // Only clear warmup buffer if fetched_seq matches our notified seq
+                // This ensures we don't clear a buffer that has new requests for the next batch
+                let notified_seq = state.endpoint_entry_seq.get();
+                if state.state.get() == ClientState::Warmup
+                    && fetched_seq > 0
+                    && fetched_seq == notified_seq
+                {
                     state.pending_notification.set(false);
                     state.warmup_buffer.borrow_mut().clear();
                     state.last_notified_count.set(0);
@@ -1180,8 +1186,9 @@ impl<'a> PendingRpc<'a> {
 
         if header.req_id == self.req_id {
             // Check for piggybacked context switch event
+            // Store the raw context_switch_seq value which encodes both scheduler seq and fetched_seq
             let context_switch_seq = if header.has_context_switch() {
-                Some(header.get_context_switch_seq())
+                Some(header.context_switch_seq) // Use raw field value, not get_context_switch_seq()
             } else {
                 None
             };
@@ -1207,6 +1214,13 @@ impl<'a> PendingRpc<'a> {
 
 impl Drop for PendingRpc<'_> {
     fn drop(&mut self) {
+        // Clear the response magic number to avoid confusion on slot reuse
+        if let Some(slot) = self.pool.get_slot(self.slot_index) {
+            unsafe {
+                // Clear magic number at start of slot
+                std::ptr::write_volatile(slot.data_ptr() as *mut u32, 0);
+            }
+        }
         // Return the slot to the free list when PendingRpc is dropped
         self.pool.free_slot_by_index(self.slot_index);
     }
@@ -1256,7 +1270,18 @@ impl RpcResponse {
     }
 
     /// Get the context switch sequence number (if piggybacked).
+    ///
+    /// This returns the scheduler's context switch sequence (lower 32 bits).
     pub fn context_switch_seq(&self) -> Option<u64> {
-        self.context_switch_seq
+        self.context_switch_seq.map(|seq| (seq & 0xFFFFFFFF) as u64)
+    }
+
+    /// Get the fetched endpoint entry sequence (if context switch piggybacked).
+    ///
+    /// This returns the fetched_seq (upper 32 bits of context_switch_seq).
+    /// The client should compare this with its endpoint_entry_seq to verify
+    /// the context switch is for the expected batch.
+    pub fn fetched_seq(&self) -> Option<u32> {
+        self.context_switch_seq.map(|seq| (seq >> 32) as u32)
     }
 }

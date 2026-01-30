@@ -251,7 +251,15 @@ impl ResponseHeader {
     }
 
     /// Create a new response header with context switch event piggybacked.
-    pub fn with_context_switch(req_id: u64, status: u32, payload_len: u32, context_switch_seq: u64) -> Self {
+    ///
+    /// The context_switch_seq field encodes both the scheduler sequence and the fetched
+    /// endpoint entry sequence:
+    /// - Lower 32 bits: scheduler sequence (truncated)
+    /// - Upper 32 bits: fetched endpoint entry sequence (fetched_seq)
+    pub fn with_context_switch(req_id: u64, status: u32, payload_len: u32, scheduler_seq: u64, fetched_seq: u32) -> Self {
+        // Encode both seq and fetched_seq in context_switch_seq
+        // Lower 32 bits: scheduler_seq (truncated), Upper 32 bits: fetched_seq
+        let context_switch_seq = ((fetched_seq as u64) << 32) | (scheduler_seq as u32 as u64);
         Self {
             magic: RESPONSE_MAGIC,
             req_id,
@@ -287,9 +295,19 @@ impl ResponseHeader {
         self.flags & response_flags::FLAG_CONTEXT_SWITCH != 0
     }
 
-    /// Get the context switch sequence number (valid when has_context_switch() is true).
+    /// Get the scheduler's context switch sequence (valid when has_context_switch() is true).
+    ///
+    /// This is the lower 32 bits of context_switch_seq.
     pub fn get_context_switch_seq(&self) -> u64 {
-        self.context_switch_seq
+        (self.context_switch_seq & 0xFFFFFFFF) as u64
+    }
+
+    /// Get the fetched endpoint entry sequence (valid when has_context_switch() is true).
+    ///
+    /// This is the upper 32 bits of context_switch_seq. The client should compare this
+    /// with its endpoint_entry_seq to verify the context switch is for the expected batch.
+    pub fn get_fetched_seq(&self) -> u32 {
+        (self.context_switch_seq >> 32) as u32
     }
 
     /// Write the header to a byte slice.
@@ -503,20 +521,25 @@ mod tests {
 
     #[test]
     fn test_response_header_with_context_switch() {
-        let header = ResponseHeader::with_context_switch(789, 0, 100, 42);
+        // scheduler_seq = 42, fetched_seq = 5
+        let header = ResponseHeader::with_context_switch(789, 0, 100, 42, 5);
         assert!(header.is_valid());
         assert!(header.is_success());
         assert!(header.has_context_switch());
+        // get_context_switch_seq returns lower 32 bits (scheduler_seq)
         assert_eq!(header.get_context_switch_seq(), 42);
+        // get_fetched_seq returns upper 32 bits
+        assert_eq!(header.get_fetched_seq(), 5);
 
         let mut buf = [0u8; ResponseHeader::SIZE];
         unsafe {
             header.write_to(buf.as_mut_ptr());
             let read_back = ResponseHeader::read_from(buf.as_ptr());
             let flags = { read_back.flags };
-            let context_switch_seq = { read_back.context_switch_seq };
             assert_eq!(flags, response_flags::FLAG_CONTEXT_SWITCH);
-            assert_eq!(context_switch_seq, 42);
+            // context_switch_seq encodes both: (fetched_seq << 32) | scheduler_seq
+            assert_eq!(read_back.get_context_switch_seq(), 42);
+            assert_eq!(read_back.get_fetched_seq(), 5);
         }
     }
 
