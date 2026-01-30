@@ -30,6 +30,7 @@ struct ConnectionInfo {
     warmup_buffer_slots: u32,
     endpoint_entry_addr: u64,
     endpoint_entry_rkey: u32,
+    server_conn_id: u32,
 }
 
 impl From<RemoteEndpoint> for ConnectionInfo {
@@ -46,6 +47,7 @@ impl From<RemoteEndpoint> for ConnectionInfo {
             warmup_buffer_slots: e.warmup_buffer_slots,
             endpoint_entry_addr: e.endpoint_entry_addr,
             endpoint_entry_rkey: e.endpoint_entry_rkey,
+            server_conn_id: e.server_conn_id,
         }
     }
 }
@@ -65,6 +67,7 @@ impl From<ConnectionInfo> for RemoteEndpoint {
             warmup_buffer_slots: c.warmup_buffer_slots,
             endpoint_entry_addr: c.endpoint_entry_addr,
             endpoint_entry_rkey: c.endpoint_entry_rkey,
+            server_conn_id: c.server_conn_id,
         }
     }
 }
@@ -85,7 +88,6 @@ fn test_latency() {
             num_slots: 64,
             slot_data_size: 4080,
         },
-        timeout_ms: 5000,
         max_connections: 4,
     };
 
@@ -176,7 +178,13 @@ fn test_latency() {
     for _ in 0..10 {
         let pending = client.call_async(conn_id, 1, &payload).expect("call_async");
         client.poll();
-        let _ = pending.wait();
+        loop {
+            client.poll();
+            if pending.poll().is_some() {
+                break;
+            }
+            std::hint::spin_loop();
+        }
     }
 
     // Measure latency
@@ -186,7 +194,13 @@ fn test_latency() {
     for _ in 0..iterations {
         let pending = client.call_async(conn_id, 1, &payload).expect("call_async");
         client.poll();
-        let _response = pending.wait().expect("wait");
+        loop {
+            client.poll();
+            if pending.poll().is_some() {
+                break;
+            }
+            std::hint::spin_loop();
+        }
     }
 
     let elapsed = start.elapsed();
@@ -218,7 +232,6 @@ fn test_throughput() {
             num_slots: 256,
             slot_data_size: 4080,
         },
-        timeout_ms: 5000,
         max_connections: 8,
     };
 
@@ -398,7 +411,6 @@ fn test_throughput_4kb() {
             num_slots: 256,
             slot_data_size: 4080,
         },
-        timeout_ms: 5000,
         max_connections: 8,
     };
 

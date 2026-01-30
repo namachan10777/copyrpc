@@ -791,6 +791,7 @@ impl RpcServer {
     ///
     /// Note: slot_addr points to slot 0's data area (after slot header).
     /// endpoint_entry_addr/rkey are populated for client to RDMA WRITE warmup notification.
+    /// server_conn_id is set so clients can use it as sender_conn_id in requests.
     pub fn local_endpoint(&self, conn_id: ConnectionId) -> Result<RemoteEndpoint> {
         let conn = self
             .connections
@@ -808,6 +809,9 @@ impl RpcServer {
             endpoint.endpoint_entry_addr = entries.addr(conn_id);
             endpoint.endpoint_entry_rkey = entries.rkey();
         }
+
+        // Set server_conn_id so client can use it as sender_conn_id
+        endpoint.server_conn_id = conn_id as u32;
 
         Ok(endpoint)
     }

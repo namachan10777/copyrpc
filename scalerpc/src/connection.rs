@@ -44,6 +44,9 @@ pub struct RemoteEndpoint {
     pub endpoint_entry_addr: u64,
     /// Server's endpoint entry rkey.
     pub endpoint_entry_rkey: u32,
+    /// Server-assigned connection ID (used as sender_conn_id in requests).
+    /// This allows the server to route responses back through the correct QP.
+    pub server_conn_id: u32,
 }
 
 /// Callback type for SQ completions.
@@ -158,6 +161,7 @@ impl Connection {
             warmup_buffer_slots: 0,    // To be filled by caller (client only)
             endpoint_entry_addr: 0,    // To be filled by caller (server only)
             endpoint_entry_rkey: 0,    // To be filled by caller (server only)
+            server_conn_id: self.conn_id as u32, // Filled by connection
         }
     }
 

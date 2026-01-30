@@ -30,7 +30,6 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use mlx5::cq::{Cq, Cqe};
 use mlx5::device::Context;
@@ -309,6 +308,8 @@ struct ConnectionState {
     /// True if a notification has been sent and we're waiting for server to fetch.
     /// This prevents overwriting the endpoint entry before the server reads it.
     pending_notification: Cell<bool>,
+    /// Server-assigned connection ID (used as sender_conn_id in requests).
+    server_conn_id: Cell<u32>,
 }
 
 /// RPC Client.
@@ -447,6 +448,7 @@ impl RpcClient {
             endpoint_entry_seq: Cell::new(0),
             last_notified_count: Cell::new(0),
             pending_notification: Cell::new(false),
+            server_conn_id: Cell::new(0),
         };
 
         self.connections.push(Some(conn));
@@ -471,10 +473,11 @@ impl RpcClient {
         self.mapping
             .set_remote_slot(conn_id, remote.slot_addr, remote.slot_rkey)?;
 
-        // Store endpoint entry info for warmup notification
+        // Store endpoint entry info for warmup notification and server_conn_id
         if let Some(Some(state)) = self.connection_states.get(conn_id) {
             state.endpoint_entry_addr.set(remote.endpoint_entry_addr);
             state.endpoint_entry_rkey.set(remote.endpoint_entry_rkey);
+            state.server_conn_id.set(remote.server_conn_id);
         }
 
         conn.connect(remote)?;
@@ -744,6 +747,9 @@ impl RpcClient {
         let response_slot = self.pool.alloc()?;
         let req_id = next_req_id();
 
+        // Use server_conn_id so server can route response through correct QP
+        let sender_conn_id = conn_state.server_conn_id.get();
+
         // Build request header
         let header = RequestHeader::new(
             req_id,
@@ -751,7 +757,7 @@ impl RpcClient {
             payload.len() as u16,
             response_slot.data_addr(),
             self.pool.rkey(),
-            conn_id as u32,
+            sender_conn_id,
         );
 
         // Write to warmup buffer
@@ -767,7 +773,6 @@ impl RpcClient {
             pool: &self.pool,
             slot_index: response_slot.release(),
             req_id,
-            timeout_ms: self.config.timeout_ms,
         })
     }
 
@@ -819,11 +824,14 @@ impl RpcClient {
 }
 
 /// A pending RPC request waiting for response.
+///
+/// The caller should poll for completion using `poll()`. When the response
+/// is received, it is returned. Flow control is handled by slot allocation:
+/// if all slots are occupied waiting for responses, new requests cannot be sent.
 pub struct PendingRpc<'a> {
     pool: &'a MessagePool,
     slot_index: usize,
     req_id: u64,
-    timeout_ms: u64,
 }
 
 impl<'a> PendingRpc<'a> {
@@ -841,6 +849,9 @@ impl<'a> PendingRpc<'a> {
     ///
     /// Returns `Some(RpcResponse)` if the response is ready,
     /// `None` if still pending.
+    ///
+    /// Flow control: The slot remains allocated until a response is received.
+    /// This naturally limits outstanding requests to the number of available slots.
     pub fn poll(&self) -> Option<RpcResponse> {
         let slot = self.pool.get_slot(self.slot_index)?;
 
@@ -866,22 +877,6 @@ impl<'a> PendingRpc<'a> {
             })
         } else {
             None
-        }
-    }
-
-    /// Wait for response with timeout.
-    pub fn wait(&self) -> Result<RpcResponse> {
-        let start = Instant::now();
-        let timeout = Duration::from_millis(self.timeout_ms);
-
-        loop {
-            if let Some(response) = self.poll() {
-                return Ok(response);
-            }
-            if start.elapsed() > timeout {
-                return Err(Error::Protocol("response timeout".to_string()));
-            }
-            std::hint::spin_loop();
         }
     }
 

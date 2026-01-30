@@ -53,8 +53,6 @@ impl Default for GroupConfig {
 pub struct ClientConfig {
     /// Message pool configuration.
     pub pool: PoolConfig,
-    /// Timeout for RPC calls in milliseconds.
-    pub timeout_ms: u64,
     /// Maximum number of connections.
     /// Used to calculate slots_per_connection = pool.num_slots / max_connections.
     pub max_connections: usize,
@@ -64,7 +62,6 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             pool: PoolConfig::default(),
-            timeout_ms: 5000,
             max_connections: 64, // Default 64 connections
         }
     }
