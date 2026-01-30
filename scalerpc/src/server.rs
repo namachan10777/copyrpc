@@ -432,6 +432,9 @@ pub struct RpcServer {
     shared_recv_cq: Option<Rc<Cq>>,
     /// Endpoint entries for each connection (client writes here to notify warmup ready).
     endpoint_entries: Option<EndpointEntryPool>,
+    /// Pending context switch events per connection (fetched_seq to piggyback on responses).
+    /// When set, the next response to this connection will carry the context switch event.
+    pending_context_switch: RefCell<Vec<Option<(u64, u32)>>>, // (seq, fetched_seq)
 }
 
 impl RpcServer {
@@ -467,6 +470,7 @@ impl RpcServer {
             shared_send_cq: None,
             shared_recv_cq: None,
             endpoint_entries: Some(endpoint_entries),
+            pending_context_switch: RefCell::new(Vec::new()),
         })
     }
 
@@ -636,10 +640,44 @@ impl RpcServer {
         Ok(total_processed)
     }
 
+    /// Queue context switch events for piggybacking on responses.
+    ///
+    /// Instead of sending separate RDMA WRITEs, the context switch event will be
+    /// piggybacked on the next response to each client. This reduces network overhead.
+    pub fn queue_context_switch_for_piggyback(&self, conn_ids: &[ConnectionId], sequence: u64, fetched_seq: u32) {
+        let mut pending = self.pending_context_switch.borrow_mut();
+        for &conn_id in conn_ids {
+            while pending.len() <= conn_id {
+                pending.push(None);
+            }
+            pending[conn_id] = Some((sequence, fetched_seq));
+        }
+    }
+
+    /// Take pending context switch event for a connection (if any).
+    ///
+    /// Returns (sequence, fetched_seq) and clears the pending event.
+    fn take_pending_context_switch(&self, conn_id: ConnectionId) -> Option<(u64, u32)> {
+        let mut pending = self.pending_context_switch.borrow_mut();
+        if conn_id < pending.len() {
+            pending[conn_id].take()
+        } else {
+            None
+        }
+    }
+
     /// Notify clients of context switch.
     ///
     /// Sends context switch events to all clients in the old active group.
+    /// This method sends separate RDMA WRITEs for backward compatibility.
+    /// For better efficiency, use queue_context_switch_for_piggyback() to piggyback
+    /// events on responses.
     pub fn notify_context_switch(&self, conn_ids: &[ConnectionId], sequence: u64, fetched_seq: u32) -> Result<()> {
+        // Queue for piggybacking on responses (primary method)
+        self.queue_context_switch_for_piggyback(conn_ids, sequence, fetched_seq);
+
+        // Also send via event buffer for backward compatibility and to handle
+        // cases where there are no pending responses.
         let event = ContextSwitchEvent::new(sequence, fetched_seq);
 
         for &conn_id in conn_ids {
@@ -927,6 +965,9 @@ impl RpcServer {
     /// Per the ScaleRPC paper (Section 3.3), the message pool is "stateless" and
     /// slots become obsolete immediately after a request is processed. Therefore,
     /// we reuse the same slot where the request was received for sending the response.
+    ///
+    /// If a context switch event is pending for this connection, it will be
+    /// piggybacked on the response (ScaleRPC optimization).
     pub fn send_response(
         &self,
         request: &IncomingRequest,
@@ -956,9 +997,13 @@ impl RpcServer {
                 request.slot_index
             )))?;
 
-        // Build response header
-        let response_header =
-            ResponseHeader::new(request.req_id, status, payload.len() as u32);
+        // Check for pending context switch event to piggyback
+        let response_header = if let Some((seq, _fetched_seq)) = self.take_pending_context_switch(request.conn_id) {
+            // Piggyback context switch event on the response
+            ResponseHeader::with_context_switch(request.req_id, status, payload.len() as u32, seq)
+        } else {
+            ResponseHeader::new(request.req_id, status, payload.len() as u32)
+        };
 
         // Write response to slot
         let slot_data_ptr = slot.data_ptr();
@@ -1006,6 +1051,9 @@ impl RpcServer {
     /// The response payload is assumed to already be written in the slot
     /// (after ResponseHeader::SIZE offset). Only the header is written here.
     ///
+    /// If a context switch event is pending for this connection, it will be
+    /// piggybacked on the response (ScaleRPC optimization).
+    ///
     /// # Arguments
     /// * `request` - The original request
     /// * `status` - Response status code
@@ -1039,9 +1087,14 @@ impl RpcServer {
                 request.slot_index
             )))?;
 
-        // Build and write response header only (payload already in place)
-        let response_header =
-            ResponseHeader::new(request.req_id, status, payload_len as u32);
+        // Check for pending context switch event to piggyback
+        let response_header = if let Some((seq, _fetched_seq)) = self.take_pending_context_switch(request.conn_id) {
+            // Piggyback context switch event on the response
+            ResponseHeader::with_context_switch(request.req_id, status, payload_len as u32, seq)
+        } else {
+            ResponseHeader::new(request.req_id, status, payload_len as u32)
+        };
+
         unsafe {
             response_header.write_to(slot.data_ptr());
         }

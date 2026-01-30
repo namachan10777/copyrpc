@@ -205,9 +205,18 @@ impl RequestHeader {
     }
 }
 
+/// Response header flags.
+pub mod response_flags {
+    /// Context switch event flag.
+    /// When set, indicates that the client's group has been switched out.
+    /// The client should transition to Idle state.
+    pub const FLAG_CONTEXT_SWITCH: u32 = 0x1;
+}
+
 /// Response header sent from server to client.
 ///
 /// The header is placed at the beginning of the response data.
+/// Includes flags for piggybacking context switch events (ScaleRPC optimization).
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct ResponseHeader {
@@ -219,6 +228,10 @@ pub struct ResponseHeader {
     pub status: u32,
     /// Length of payload data following the header.
     pub payload_len: u32,
+    /// Flags for context switch events and other metadata.
+    pub flags: u32,
+    /// Context switch sequence number (valid when FLAG_CONTEXT_SWITCH is set).
+    pub context_switch_seq: u64,
 }
 
 impl ResponseHeader {
@@ -232,6 +245,20 @@ impl ResponseHeader {
             req_id,
             status,
             payload_len,
+            flags: 0,
+            context_switch_seq: 0,
+        }
+    }
+
+    /// Create a new response header with context switch event piggybacked.
+    pub fn with_context_switch(req_id: u64, status: u32, payload_len: u32, context_switch_seq: u64) -> Self {
+        Self {
+            magic: RESPONSE_MAGIC,
+            req_id,
+            status,
+            payload_len,
+            flags: response_flags::FLAG_CONTEXT_SWITCH,
+            context_switch_seq,
         }
     }
 
@@ -253,6 +280,16 @@ impl ResponseHeader {
     /// Check if the response indicates success.
     pub fn is_success(&self) -> bool {
         self.status == 0
+    }
+
+    /// Check if the response has a context switch event piggybacked.
+    pub fn has_context_switch(&self) -> bool {
+        self.flags & response_flags::FLAG_CONTEXT_SWITCH != 0
+    }
+
+    /// Get the context switch sequence number (valid when has_context_switch() is true).
+    pub fn get_context_switch_seq(&self) -> u64 {
+        self.context_switch_seq
     }
 
     /// Write the header to a byte slice.
@@ -406,8 +443,8 @@ mod tests {
 
     #[test]
     fn test_response_header_size() {
-        // Expected size: 4 + 8 + 4 + 4 = 20 bytes
-        assert_eq!(ResponseHeader::SIZE, 20);
+        // Expected size: 4 + 8 + 4 + 4 + 4 + 8 = 32 bytes
+        assert_eq!(ResponseHeader::SIZE, 32);
     }
 
     #[test]
@@ -442,6 +479,7 @@ mod tests {
         let header = ResponseHeader::success(456, 50);
         assert!(header.is_valid());
         assert!(header.is_success());
+        assert!(!header.has_context_switch());
 
         let mut buf = [0u8; ResponseHeader::SIZE];
         unsafe {
@@ -452,10 +490,33 @@ mod tests {
             let req_id = { read_back.req_id };
             let status = { read_back.status };
             let payload_len = { read_back.payload_len };
+            let flags = { read_back.flags };
+            let context_switch_seq = { read_back.context_switch_seq };
             assert_eq!(magic, RESPONSE_MAGIC);
             assert_eq!(req_id, 456);
             assert_eq!(status, 0);
             assert_eq!(payload_len, 50);
+            assert_eq!(flags, 0);
+            assert_eq!(context_switch_seq, 0);
+        }
+    }
+
+    #[test]
+    fn test_response_header_with_context_switch() {
+        let header = ResponseHeader::with_context_switch(789, 0, 100, 42);
+        assert!(header.is_valid());
+        assert!(header.is_success());
+        assert!(header.has_context_switch());
+        assert_eq!(header.get_context_switch_seq(), 42);
+
+        let mut buf = [0u8; ResponseHeader::SIZE];
+        unsafe {
+            header.write_to(buf.as_mut_ptr());
+            let read_back = ResponseHeader::read_from(buf.as_ptr());
+            let flags = { read_back.flags };
+            let context_switch_seq = { read_back.context_switch_seq };
+            assert_eq!(flags, response_flags::FLAG_CONTEXT_SWITCH);
+            assert_eq!(context_switch_seq, 42);
         }
     }
 

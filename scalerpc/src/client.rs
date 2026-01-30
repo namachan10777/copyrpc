@@ -310,6 +310,11 @@ struct ConnectionState {
     pending_notification: Cell<bool>,
     /// Server-assigned connection ID (used as sender_conn_id in requests).
     server_conn_id: Cell<u32>,
+    /// Next slot index to use for direct RDMA WRITE in Processing state.
+    /// Cycles through the connection's slot range.
+    direct_slot_index: Cell<usize>,
+    /// Context switch sequence received from server (for state transition tracking).
+    last_context_switch_seq: Cell<u64>,
 }
 
 /// RPC Client.
@@ -449,6 +454,8 @@ impl RpcClient {
             last_notified_count: Cell::new(0),
             pending_notification: Cell::new(false),
             server_conn_id: Cell::new(0),
+            direct_slot_index: Cell::new(0),
+            last_context_switch_seq: Cell::new(0),
         };
 
         self.connections.push(Some(conn));
@@ -554,35 +561,51 @@ impl RpcClient {
     ///
     /// This is the main polling method that should be called periodically.
     /// It:
-    /// 1. Notifies server of new warmup requests (batched)
-    /// 2. Issues doorbells for all connections with pending WQEs
-    /// 3. Drains all connection CQs
+    /// 1. Checks for context switch events
+    /// 2. Auto-flushes warmup requests (for backward compatibility)
+    /// 3. Issues doorbells for all connections with pending WQEs
+    /// 4. Drains all connection CQs
+    ///
+    /// For optimal performance in high-throughput scenarios, consider using
+    /// `flush_warmup()` explicitly to batch multiple requests before notification,
+    /// and use `poll_minimal()` which skips auto-flush.
     ///
     /// Returns the total number of CQ entries processed.
     pub fn poll(&self) -> usize {
-        // 1. Check for context switch events first (to clear pending_notification)
+        // 1. Check for context switch events first
         for conn_id in 0..self.connection_states.len() {
             self.check_events(conn_id);
         }
 
-        // 2. Notify server of new warmup requests (batched notification)
-        // Skip if there's already a pending notification to avoid overwriting
-        // the endpoint entry before the server reads it.
-        for conn_id in 0..self.connection_states.len() {
-            if let Some(Some(state)) = self.connection_states.get(conn_id) {
-                // Don't send new notification if previous one hasn't been processed
-                if state.pending_notification.get() {
-                    continue;
-                }
-                let warmup_count = state.warmup_buffer.borrow().request_count();
-                let last_notified = state.last_notified_count.get();
-                if warmup_count > last_notified {
-                    // New requests since last notification
-                    let _ = self.notify_warmup_ready(conn_id);
-                    state.last_notified_count.set(warmup_count);
-                    state.pending_notification.set(true);
+        // 2. Auto-flush warmup requests (for backward compatibility)
+        self.flush_all_warmup();
+
+        // 3. Flush all pending doorbells
+        {
+            let needs_flush = self.needs_flush.borrow();
+            for &conn_id in needs_flush.iter() {
+                if let Some(Some(conn)) = self.connections.get(conn_id) {
+                    conn.ring_sq_doorbell();
                 }
             }
+        }
+        self.needs_flush.borrow_mut().clear();
+
+        // 4. Drain all CQs
+        self.poll_cqs()
+    }
+
+    /// Minimal poll without auto-flush.
+    ///
+    /// This is an optimized version of `poll()` that does not auto-flush warmup
+    /// requests. Use this when you want explicit control over batching via
+    /// `flush_warmup()`.
+    ///
+    /// Returns the total number of CQ entries processed.
+    pub fn poll_minimal(&self) -> usize {
+        // 1. Check for context switch events first
+        for conn_id in 0..self.connection_states.len() {
+            self.check_events(conn_id);
         }
 
         // 2. Flush all pending doorbells
@@ -600,24 +623,116 @@ impl RpcClient {
         self.poll_cqs()
     }
 
+    /// Flush warmup requests by sending endpoint entry notification.
+    ///
+    /// Call this method after preparing a batch of requests via `call_async()`
+    /// (in Warmup state) to notify the server that the batch is ready.
+    ///
+    /// This follows the ScaleRPC paper's design (Section 3.2):
+    /// - Client prepares multiple requests in the warmup buffer
+    /// - Client sends a single endpoint entry notification when the batch is ready
+    /// - Server RDMA READs the entire batch at once
+    ///
+    /// # Arguments
+    /// * `conn_id` - Connection to flush
+    ///
+    /// # Returns
+    /// The number of requests in the batch that was flushed.
+    pub fn flush_warmup(&self, conn_id: ConnectionId) -> Result<usize> {
+        let conn_state = self
+            .connection_states
+            .get(conn_id)
+            .and_then(|s| s.as_ref())
+            .ok_or(Error::ConnectionNotFound(conn_id))?;
+
+        // Don't send new notification if previous one hasn't been processed
+        if conn_state.pending_notification.get() {
+            return Ok(0);
+        }
+
+        let warmup_count = conn_state.warmup_buffer.borrow().request_count();
+        let last_notified = conn_state.last_notified_count.get();
+
+        if warmup_count > last_notified {
+            // New requests since last notification
+            self.notify_warmup_ready(conn_id)?;
+            conn_state.last_notified_count.set(warmup_count);
+            conn_state.pending_notification.set(true);
+            Ok(warmup_count)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Auto-flush warmup requests for all connections.
+    ///
+    /// This is a convenience method that flushes all connections with pending
+    /// warmup requests. Use this when you want automatic batching behavior
+    /// similar to the previous implementation.
+    ///
+    /// For optimal performance, prefer using `flush_warmup()` explicitly
+    /// after preparing each batch.
+    pub fn flush_all_warmup(&self) -> usize {
+        let mut total_flushed = 0;
+
+        for conn_id in 0..self.connection_states.len() {
+            if let Ok(flushed) = self.flush_warmup(conn_id) {
+                total_flushed += flushed;
+            }
+        }
+
+        total_flushed
+    }
+
     /// Check for context switch events on a specific connection.
     ///
-    /// Called automatically by `call()` to handle state transitions.
-    /// Context switch events indicate that warmup requests were fetched by server.
-    /// Since call_direct is disabled, we just clear the buffer and stay in Warmup.
+    /// Called automatically by `call_async()` to handle state transitions.
+    /// Implements the ScaleRPC state machine (Figure 7):
+    ///
+    /// - **Warmup → Process**: When server fetches warmup requests (fetched_seq > 0)
+    ///   NOTE: Currently disabled due to pool swap issue (server's processing pool
+    ///   address changes on context switch). Processing state is prepared but not active.
+    /// - **Process → Idle**: When server performs time-based context switch (fetched_seq = 0)
+    ///
+    /// Context switch events can arrive via:
+    /// 1. Event buffer (RDMA WRITE from server)
+    /// 2. Response piggyback (FLAG_CONTEXT_SWITCH in response header)
     fn check_events(&self, conn_id: ConnectionId) {
         if let Some(Some(state)) = self.connection_states.get(conn_id) {
-            if let Some((_sched_seq, fetched_seq)) = state.event_buffer.poll() {
-                // Context switch event received - server fetched warmup requests
-                // Only clear buffer if the fetched_seq matches our last notified seq
-                // This prevents clearing the buffer for events that correspond to older batches
+            if let Some((sched_seq, fetched_seq)) = state.event_buffer.poll() {
+                // Only process new events
+                if sched_seq <= state.last_context_switch_seq.get() {
+                    return;
+                }
+                state.last_context_switch_seq.set(sched_seq);
+
+                let current_state = state.state.get();
                 let notified_seq = state.endpoint_entry_seq.get();
-                if fetched_seq == notified_seq && state.pending_notification.get() {
+
+                if fetched_seq > 0 && fetched_seq == notified_seq {
+                    // Server fetched our warmup requests
                     state.pending_notification.set(false);
-                    // Clear the warmup buffer so we can send new requests
-                    if state.state.get() == ClientState::Warmup && state.last_notified_count.get() > 0 {
-                        state.warmup_buffer.borrow_mut().clear();
-                        state.last_notified_count.set(0);
+                    state.warmup_buffer.borrow_mut().clear();
+                    state.last_notified_count.set(0);
+                    state.direct_slot_index.set(0); // Reset direct slot counter
+
+                    // NOTE: Processing state transition is currently disabled.
+                    // The pool swap issue means the server's processing pool address
+                    // changes on context switch, invalidating the address we'd use
+                    // for direct RDMA WRITE. For now, stay in Warmup state and use
+                    // the warmup mechanism for all requests.
+                    //
+                    // TODO: Enable Processing state when server provides dynamic
+                    // pool address updates or uses a fixed addressing scheme.
+                    if current_state == ClientState::Warmup {
+                        // state.state.set(ClientState::Process);  // Disabled
+                        let _ = current_state; // Suppress unused warning
+                    }
+                } else if fetched_seq == 0 {
+                    // Time-based context switch (no fetch)
+                    // Process → Idle transition
+                    if current_state == ClientState::Process {
+                        state.state.set(ClientState::Idle);
                     }
                 }
             }
@@ -701,6 +816,133 @@ impl RpcClient {
         Ok(())
     }
 
+    /// Send request directly to server's processing pool via RDMA WRITE.
+    ///
+    /// This is used in Processing state (Figure 7). The client directly writes
+    /// to the server's processing pool, which is more efficient than the warmup
+    /// mechanism because it eliminates the RDMA READ from server.
+    ///
+    /// # Arguments
+    /// * `conn_id` - Connection to use
+    /// * `rpc_type` - RPC method identifier
+    /// * `payload` - Request payload data
+    fn call_direct(
+        &self,
+        conn_id: ConnectionId,
+        rpc_type: u16,
+        payload: &[u8],
+    ) -> Result<PendingRpc<'_>> {
+        let conn = self
+            .connections
+            .get(conn_id)
+            .and_then(|c| c.as_ref())
+            .ok_or(Error::ConnectionNotFound(conn_id))?;
+
+        let conn_state = self
+            .connection_states
+            .get(conn_id)
+            .and_then(|s| s.as_ref())
+            .ok_or(Error::ConnectionNotFound(conn_id))?;
+
+        // Get remote slot info from mapping
+        let mapping_entry = self
+            .mapping
+            .get_connection(conn_id)
+            .ok_or(Error::ConnectionNotFound(conn_id))?;
+
+        let remote_base_addr = mapping_entry.remote_slot_addr;
+        let remote_rkey = mapping_entry.remote_slot_rkey;
+
+        if remote_base_addr == 0 {
+            return Err(Error::Protocol("Remote slot address not configured".into()));
+        }
+
+        // Get the slot index to use (cycles through connection's slot range)
+        let num_slots = mapping_entry.slots.len();
+        if num_slots == 0 {
+            return Err(Error::NoFreeSlots);
+        }
+
+        let slot_idx = conn_state.direct_slot_index.get() % num_slots;
+        conn_state.direct_slot_index.set(slot_idx + 1);
+
+        // Get the server slot index from the mapping
+        let server_slot_idx = mapping_entry.slots[slot_idx];
+
+        // Allocate a response slot
+        let response_slot = self.pool.alloc()?;
+        let req_id = next_req_id();
+
+        // Use server_conn_id so server can route response through correct QP
+        let sender_conn_id = conn_state.server_conn_id.get();
+
+        // Build request header
+        let header = RequestHeader::new(
+            req_id,
+            rpc_type,
+            payload.len() as u16,
+            response_slot.data_addr(),
+            self.pool.rkey(),
+            sender_conn_id,
+        );
+
+        // Use our local slot to prepare the request for RDMA WRITE
+        let local_slot = self.pool.alloc()?;
+        let local_slot_ptr = local_slot.slot().data_ptr();
+        let local_slot_addr = local_slot.data_addr();
+
+        // Write request to local buffer
+        unsafe {
+            header.write_to(local_slot_ptr);
+            if !payload.is_empty() {
+                std::ptr::copy_nonoverlapping(
+                    payload.as_ptr(),
+                    local_slot_ptr.add(RequestHeader::SIZE),
+                    payload.len(),
+                );
+            }
+
+            // Write message trailer (right-aligned)
+            let msg_len = (RequestHeader::SIZE + payload.len()) as u32;
+            MessageTrailer::write_to(local_slot_ptr, msg_len);
+        }
+
+        // Calculate remote address for this slot
+        // The server slot address is: base_addr + slot_idx * MESSAGE_BLOCK_SIZE
+        let remote_slot_addr = remote_base_addr + (server_slot_idx * MESSAGE_BLOCK_SIZE) as u64;
+
+        // RDMA WRITE to server's processing pool
+        {
+            let qp_ref = conn.qp().borrow();
+            let emit_ctx = qp_ref
+                .emit_ctx()
+                .map_err(|e| Error::Protocol(format!("emit_ctx failed: {:?}", e)))?;
+
+            emit_wqe!(&emit_ctx, write {
+                flags: WqeFlags::COMPLETION,
+                remote_addr: remote_slot_addr,
+                rkey: remote_rkey,
+                sge: {
+                    addr: local_slot_addr,
+                    len: MESSAGE_BLOCK_SIZE as u32,
+                    lkey: self.pool.lkey()
+                },
+                signaled: req_id,
+            })
+            .map_err(|e| Error::Protocol(format!("emit_wqe failed: {:?}", e)))?;
+        }
+
+        // Mark connection as needing doorbell flush
+        self.mark_needs_flush(conn_id);
+
+        Ok(PendingRpc {
+            pool: &self.pool,
+            slot_index: response_slot.release(),
+            req_id,
+            conn_id,
+        })
+    }
+
     /// Send request via warmup mechanism.
     ///
     /// Writes request to warmup buffer. The server will RDMA READ from this
@@ -773,21 +1015,20 @@ impl RpcClient {
             pool: &self.pool,
             slot_index: response_slot.release(),
             req_id,
+            conn_id,
         })
     }
 
     /// Make an asynchronous RPC call.
     ///
     /// Returns immediately with a `PendingRpc` handle that can be polled
-    /// for completion. Always uses the warmup mechanism where the server
-    /// fetches requests via RDMA READ.
+    /// for completion. The method used depends on the client state:
     ///
-    /// Note: The direct RDMA WRITE optimization (call_direct) is currently
-    /// disabled because pool swapping during context switch causes requests
-    /// to end up in the wrong pool.
+    /// - **Warmup/Connected/Idle**: Uses warmup mechanism (server RDMA READs)
+    /// - **Process**: Uses direct RDMA WRITE to server's processing pool
     ///
     /// State machine (Figure 7):
-    /// CONNECT → WARMUP → (server fetches, context switch) → PROCESS → IDLE → WARMUP → ...
+    /// CONNECT → WARMUP → (server fetches) → PROCESS → (context switch) → IDLE → WARMUP → ...
     ///
     /// # Arguments
     /// * `conn_id` - Connection to use
@@ -802,9 +1043,19 @@ impl RpcClient {
         // Check for context switch events
         self.check_events(conn_id);
 
-        // Always use warmup mechanism for now
-        // TODO: Re-enable call_direct when pool addressing is fixed
-        self.send_warmup(conn_id, rpc_type, payload)
+        // Get current state
+        let current_state = self.state(conn_id).unwrap_or(ClientState::Connected);
+
+        match current_state {
+            ClientState::Process => {
+                // In Processing state: use direct RDMA WRITE
+                self.call_direct(conn_id, rpc_type, payload)
+            }
+            ClientState::Connected | ClientState::Warmup | ClientState::Idle => {
+                // In Warmup/Connected/Idle state: use warmup mechanism
+                self.send_warmup(conn_id, rpc_type, payload)
+            }
+        }
     }
 
     /// Poll for any completed responses.
@@ -821,6 +1072,53 @@ impl RpcClient {
         // TODO: Implement pending request tracking for async recv
         None
     }
+
+    /// Process context switch event from a response.
+    ///
+    /// When a response has FLAG_CONTEXT_SWITCH set, call this method to
+    /// transition the client state appropriately. This implements the
+    /// ScaleRPC state machine: Process → Idle (on context switch event).
+    ///
+    /// # Arguments
+    /// * `conn_id` - Connection ID
+    /// * `response` - The response containing the context switch event
+    pub fn process_response_context_switch(&self, conn_id: ConnectionId, response: &RpcResponse) {
+        if let Some(_seq) = response.context_switch_seq() {
+            if let Some(Some(state)) = self.connection_states.get(conn_id) {
+                // Context switch event received via response piggyback
+                // Transition from Process → Idle
+                if state.state.get() == ClientState::Process {
+                    state.state.set(ClientState::Idle);
+                }
+                // Also clear the warmup buffer for new batch
+                if state.state.get() == ClientState::Warmup {
+                    state.pending_notification.set(false);
+                    state.warmup_buffer.borrow_mut().clear();
+                    state.last_notified_count.set(0);
+                }
+            }
+        }
+    }
+
+    /// Poll a pending RPC and handle context switch events.
+    ///
+    /// This is a convenience method that polls the pending RPC and automatically
+    /// processes any piggybacked context switch events.
+    ///
+    /// # Arguments
+    /// * `pending` - The pending RPC to poll
+    ///
+    /// # Returns
+    /// `Some(RpcResponse)` if the response is ready, `None` if still pending.
+    pub fn poll_pending(&self, pending: &PendingRpc<'_>) -> Option<RpcResponse> {
+        if let Some(response) = pending.poll() {
+            // Process any piggybacked context switch event
+            self.process_response_context_switch(pending.conn_id(), &response);
+            Some(response)
+        } else {
+            None
+        }
+    }
 }
 
 /// A pending RPC request waiting for response.
@@ -832,6 +1130,8 @@ pub struct PendingRpc<'a> {
     pool: &'a MessagePool,
     slot_index: usize,
     req_id: u64,
+    /// Connection ID for state transition tracking.
+    conn_id: ConnectionId,
 }
 
 impl<'a> PendingRpc<'a> {
@@ -845,10 +1145,18 @@ impl<'a> PendingRpc<'a> {
         self.slot_index
     }
 
+    /// Get the connection ID.
+    pub fn conn_id(&self) -> ConnectionId {
+        self.conn_id
+    }
+
     /// Poll for response completion.
     ///
     /// Returns `Some(RpcResponse)` if the response is ready,
     /// `None` if still pending.
+    ///
+    /// If the response has a context switch event piggybacked (FLAG_CONTEXT_SWITCH),
+    /// the RpcResponse will contain the context switch sequence number.
     ///
     /// Flow control: The slot remains allocated until a response is received.
     /// This naturally limits outstanding requests to the number of available slots.
@@ -871,9 +1179,17 @@ impl<'a> PendingRpc<'a> {
         let header = unsafe { ResponseHeader::read_from(data_ptr) };
 
         if header.req_id == self.req_id {
+            // Check for piggybacked context switch event
+            let context_switch_seq = if header.has_context_switch() {
+                Some(header.get_context_switch_seq())
+            } else {
+                None
+            };
+
             Some(RpcResponse {
                 header,
                 payload_ptr: unsafe { data_ptr.add(ResponseHeader::SIZE) },
+                context_switch_seq,
             })
         } else {
             None
@@ -900,6 +1216,8 @@ impl Drop for PendingRpc<'_> {
 pub struct RpcResponse {
     header: ResponseHeader,
     payload_ptr: *const u8,
+    /// Context switch sequence (valid when has_context_switch() is true).
+    context_switch_seq: Option<u64>,
 }
 
 impl RpcResponse {
@@ -930,5 +1248,15 @@ impl RpcResponse {
         let len = buf.len().min(self.payload_len());
         buf[..len].copy_from_slice(&self.payload()[..len]);
         len
+    }
+
+    /// Check if this response has a context switch event piggybacked.
+    pub fn has_context_switch(&self) -> bool {
+        self.context_switch_seq.is_some()
+    }
+
+    /// Get the context switch sequence number (if piggybacked).
+    pub fn context_switch_seq(&self) -> Option<u64> {
+        self.context_switch_seq
     }
 }
