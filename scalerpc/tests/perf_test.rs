@@ -317,13 +317,12 @@ fn test_throughput() {
 
     client.connect(conn_id, server_info.into()).expect("connect");
 
-    // Default to pipeline depth 2 for test stability.
-    // Higher depths (>4) can cause flaky test failures due to slot reuse timing.
-    // Use SCALERPC_PIPELINE_DEPTH env var to test higher depths.
+    // Default to pipeline depth 8 for good throughput.
+    // Use SCALERPC_PIPELINE_DEPTH env var to customize.
     let pipeline_depth = std::env::var("SCALERPC_PIPELINE_DEPTH")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(2);
+        .unwrap_or(8);
     let total_requests = std::env::var("SCALERPC_TOTAL_REQUESTS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -497,11 +496,11 @@ fn test_throughput_4kb() {
 
     client.connect(conn_id, server_info.into()).expect("connect");
 
-    // Default to pipeline depth 2 for test stability.
+    // Default to pipeline depth 8 for good throughput.
     let pipeline_depth = std::env::var("SCALERPC_PIPELINE_DEPTH")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(2);
+        .unwrap_or(8);
     let total_requests = std::env::var("SCALERPC_TOTAL_REQUESTS")
         .ok()
         .and_then(|s| s.parse().ok())

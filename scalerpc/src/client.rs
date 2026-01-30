@@ -315,6 +315,9 @@ struct ConnectionState {
     direct_slot_index: Cell<usize>,
     /// Context switch sequence received from server (for state transition tracking).
     last_context_switch_seq: Cell<u64>,
+    /// Last acknowledged endpoint entry sequence from server.
+    /// Used to handle out-of-order context switch event delivery.
+    last_acknowledged_seq: Cell<u32>,
 }
 
 /// RPC Client.
@@ -372,6 +375,21 @@ impl RpcClient {
             .get(conn_id)
             .and_then(|s| s.as_ref())
             .map(|s| s.state.get())
+    }
+
+    /// Get debug info for a connection.
+    /// Returns (pending_notification, endpoint_entry_seq, last_acknowledged_seq, warmup_count, last_notified_count)
+    pub fn debug_state(&self, conn_id: ConnectionId) -> Option<(bool, u32, u32, usize, usize)> {
+        self.connection_states
+            .get(conn_id)
+            .and_then(|s| s.as_ref())
+            .map(|s| (
+                s.pending_notification.get(),
+                s.endpoint_entry_seq.get(),
+                s.last_acknowledged_seq.get(),
+                s.warmup_buffer.borrow().request_count(),
+                s.last_notified_count.get(),
+            ))
     }
 
     /// Transition connection to a new state.
@@ -456,6 +474,7 @@ impl RpcClient {
             server_conn_id: Cell::new(0),
             direct_slot_index: Cell::new(0),
             last_context_switch_seq: Cell::new(0),
+            last_acknowledged_seq: Cell::new(0),
         };
 
         self.connections.push(Some(conn));
@@ -700,37 +719,42 @@ impl RpcClient {
     fn check_events(&self, conn_id: ConnectionId) {
         if let Some(Some(state)) = self.connection_states.get(conn_id) {
             if let Some((sched_seq, fetched_seq)) = state.event_buffer.poll() {
-                // Only process new events
-                if sched_seq <= state.last_context_switch_seq.get() {
-                    return;
-                }
-                state.last_context_switch_seq.set(sched_seq);
+                // Event buffer events can arrive out of order with piggybacked responses.
+                // We use fetched_seq (not sched_seq) to track what the server has acknowledged.
+                // This allows both event buffer and piggybacked responses to process independently.
 
-                let current_state = state.state.get();
-                let notified_seq = state.endpoint_entry_seq.get();
-
-                if fetched_seq > 0 && fetched_seq == notified_seq {
-                    // Server fetched our warmup requests
-                    state.pending_notification.set(false);
-                    state.warmup_buffer.borrow_mut().clear();
-                    state.last_notified_count.set(0);
-                    state.direct_slot_index.set(0); // Reset direct slot counter
-
-                    // NOTE: Processing state transition is currently disabled.
-                    // The pool swap issue means the server's processing pool address
-                    // changes on context switch, invalidating the address we'd use
-                    // for direct RDMA WRITE. For now, stay in Warmup state and use
-                    // the warmup mechanism for all requests.
-                    //
-                    // TODO: Enable Processing state when server provides dynamic
-                    // pool address updates or uses a fixed addressing scheme.
-                    if current_state == ClientState::Warmup {
-                        // state.state.set(ClientState::Process);  // Disabled
-                        let _ = current_state; // Suppress unused warning
+                if fetched_seq > 0 {
+                    let last_ack = state.last_acknowledged_seq.get();
+                    // Only process if this is a newer acknowledgment
+                    if fetched_seq <= last_ack {
+                        return;
                     }
-                } else if fetched_seq == 0 {
+                    state.last_acknowledged_seq.set(fetched_seq);
+
+                    // Update last_context_switch_seq for compatibility
+                    if sched_seq > state.last_context_switch_seq.get() {
+                        state.last_context_switch_seq.set(sched_seq);
+                    }
+
+                    // Clear pending_notification if the server has acknowledged the current batch
+                    let notified_seq = state.endpoint_entry_seq.get();
+                    if fetched_seq == notified_seq {
+                        state.pending_notification.set(false);
+                        state.warmup_buffer.borrow_mut().clear();
+                        state.last_notified_count.set(0);
+                        state.direct_slot_index.set(0);
+                    }
+                } else {
                     // Time-based context switch (no fetch)
+                    // Only process if we haven't seen this sched_seq
+                    let last_seq = state.last_context_switch_seq.get();
+                    if sched_seq <= last_seq {
+                        return;
+                    }
+                    state.last_context_switch_seq.set(sched_seq);
+
                     // Process → Idle transition
+                    let current_state = state.state.get();
                     if current_state == ClientState::Process {
                         state.state.set(ClientState::Idle);
                     }
@@ -1083,24 +1107,44 @@ impl RpcClient {
     /// * `conn_id` - Connection ID
     /// * `response` - The response containing the context switch event
     pub fn process_response_context_switch(&self, conn_id: ConnectionId, response: &RpcResponse) {
-        if let (Some(_seq), Some(fetched_seq)) = (response.context_switch_seq(), response.fetched_seq()) {
+        if let (Some(sched_seq), Some(fetched_seq)) = (response.context_switch_seq(), response.fetched_seq()) {
             if let Some(Some(state)) = self.connection_states.get(conn_id) {
-                // Context switch event received via response piggyback
-                // Transition from Process → Idle
-                if state.state.get() == ClientState::Process {
-                    state.state.set(ClientState::Idle);
-                }
+                // We use fetched_seq (not sched_seq) to track what the server has acknowledged.
+                // This allows both event buffer and piggybacked responses to process independently.
 
-                // Only clear warmup buffer if fetched_seq matches our notified seq
-                // This ensures we don't clear a buffer that has new requests for the next batch
-                let notified_seq = state.endpoint_entry_seq.get();
-                if state.state.get() == ClientState::Warmup
-                    && fetched_seq > 0
-                    && fetched_seq == notified_seq
-                {
-                    state.pending_notification.set(false);
-                    state.warmup_buffer.borrow_mut().clear();
-                    state.last_notified_count.set(0);
+                if fetched_seq > 0 {
+                    let last_ack = state.last_acknowledged_seq.get();
+                    // Only process if this is a newer acknowledgment
+                    if fetched_seq <= last_ack {
+                        return;
+                    }
+                    state.last_acknowledged_seq.set(fetched_seq);
+
+                    // Update last_context_switch_seq for compatibility
+                    if sched_seq > state.last_context_switch_seq.get() {
+                        state.last_context_switch_seq.set(sched_seq);
+                    }
+
+                    // Clear pending_notification if the server has acknowledged the current batch
+                    let notified_seq = state.endpoint_entry_seq.get();
+                    if fetched_seq == notified_seq {
+                        state.pending_notification.set(false);
+                        state.warmup_buffer.borrow_mut().clear();
+                        state.last_notified_count.set(0);
+                    }
+                } else {
+                    // Time-based context switch (fetched_seq == 0)
+                    // Use sched_seq tracking for these events
+                    let last_seq = state.last_context_switch_seq.get();
+                    if sched_seq <= last_seq {
+                        return;
+                    }
+                    state.last_context_switch_seq.set(sched_seq);
+
+                    // Process → Idle transition
+                    if state.state.get() == ClientState::Process {
+                        state.state.set(ClientState::Idle);
+                    }
                 }
             }
         }
