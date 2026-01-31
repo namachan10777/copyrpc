@@ -261,10 +261,10 @@ fn test_throughput() {
 
         let server_config = ServerConfig {
             pool: PoolConfig {
-                num_slots: 512,
+                num_slots: 64,  // Balanced for slot scanning
                 slot_data_size: 4080,
             },
-            num_recv_slots: 512,
+            num_recv_slots: 64,
             group: GroupConfig {
                 num_groups: 1,
                 ..Default::default()
@@ -440,10 +440,10 @@ fn test_throughput_4kb() {
 
         let server_config = ServerConfig {
             pool: PoolConfig {
-                num_slots: 512,
+                num_slots: 64,  // Balanced for slot scanning
                 slot_data_size: 4080,
             },
-            num_recv_slots: 512,
+            num_recv_slots: 64,
             group: GroupConfig {
                 num_groups: 1,
                 ..Default::default()
