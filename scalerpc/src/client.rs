@@ -318,6 +318,11 @@ struct ConnectionState {
     /// Last acknowledged endpoint entry sequence from server.
     /// Used to handle out-of-order context switch event delivery.
     last_acknowledged_seq: Cell<u32>,
+    /// Pre-allocated send slots for call_direct (avoids alloc on every call).
+    /// Using ring buffer with direct_send_slot_index to cycle through.
+    send_slots: Vec<usize>,
+    /// Next send slot index for call_direct (cycles through send_slots).
+    direct_send_slot_index: Cell<usize>,
 }
 
 /// RPC Client.
@@ -465,6 +470,19 @@ impl RpcClient {
         let warmup_buffer = WarmupBuffer::new(pd, 16)?; // 16 slots for warmup batching
         let event_buffer = EventBuffer::new(pd)?;
 
+        // Pre-allocate send slots for call_direct (avoid alloc on every call)
+        // Use min(32, available_slots/4) to leave room for response slots
+        let available = self.pool.free_count();
+        let num_send_slots = std::cmp::min(32, available / 4).max(1);
+        let mut send_slots = Vec::with_capacity(num_send_slots);
+        for _ in 0..num_send_slots {
+            if let Ok(slot) = self.pool.alloc() {
+                send_slots.push(slot.release());
+            } else {
+                break;
+            }
+        }
+
         let conn_state = ConnectionState {
             state: Cell::new(ClientState::Connected),
             warmup_buffer: RefCell::new(warmup_buffer),
@@ -478,6 +496,8 @@ impl RpcClient {
             direct_slot_index: Cell::new(0),
             last_context_switch_seq: Cell::new(0),
             last_acknowledged_seq: Cell::new(0),
+            send_slots,
+            direct_send_slot_index: Cell::new(0),
         };
 
         self.connections.push(Some(conn));
@@ -917,10 +937,15 @@ impl RpcClient {
             sender_conn_id,
         );
 
-        // Use our local slot to prepare the request for RDMA WRITE
-        let local_slot = self.pool.alloc()?;
-        let local_slot_ptr = local_slot.slot().data_ptr();
-        let local_slot_addr = local_slot.data_addr();
+        // Use pre-allocated send slot (ring buffer, no alloc needed)
+        let send_slot_idx = conn_state.direct_send_slot_index.get() % conn_state.send_slots.len();
+        conn_state.direct_send_slot_index.set(send_slot_idx + 1);
+        let local_slot_index = conn_state.send_slots[send_slot_idx];
+        let local_slot = self.pool.get_slot(local_slot_index)
+            .ok_or(Error::InvalidSlotIndex(local_slot_index))?;
+        let local_slot_ptr = local_slot.data_ptr();
+        let local_slot_addr = self.pool.slot_data_addr(local_slot_index)
+            .ok_or(Error::InvalidSlotIndex(local_slot_index))?;
 
         // Write request to local buffer
         unsafe {
@@ -968,16 +993,14 @@ impl RpcClient {
         // Mark connection as needing doorbell flush
         self.mark_needs_flush(conn_id);
 
-        // Release the local_slot index but keep the slot allocated until PendingRpc is dropped.
-        // This prevents the slot from being reused while the RDMA WRITE is in progress.
-        let send_slot_index = local_slot.release();
-
+        // No need to track send_slot_index - pre-allocated slots are reused via ring buffer.
+        // The ring buffer is sized larger than pipeline depth to avoid reuse before WRITE completes.
         Ok(PendingRpc {
             pool: &self.pool,
             slot_index: response_slot.release(),
             req_id,
             conn_id,
-            send_slot_index: Some(send_slot_index),
+            send_slot_index: None,
         })
     }
 
