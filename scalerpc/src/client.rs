@@ -327,8 +327,8 @@ struct ConnectionState {
 pub struct RpcClient {
     /// Message pool for request/response data.
     pool: MessagePool,
-    /// Virtual mapping table.
-    mapping: VirtualMapping,
+    /// Virtual mapping table (RefCell for interior mutability during Process mode transitions).
+    mapping: RefCell<VirtualMapping>,
     /// Connections indexed by ID.
     connections: Vec<Option<Connection>>,
     /// Per-connection state.
@@ -354,7 +354,7 @@ impl RpcClient {
     /// * `config` - Client configuration
     pub fn new(pd: &Pd, config: ClientConfig) -> Result<Self> {
         let pool = MessagePool::new(pd, &config.pool)?;
-        let mapping = VirtualMapping::new();
+        let mapping = RefCell::new(VirtualMapping::new());
 
         Ok(Self {
             pool,
@@ -449,13 +449,16 @@ impl RpcClient {
         let conn = Connection::new(ctx, pd, conn_id, port, send_cq, recv_cq, sq_callback, rq_callback)?;
 
         // Register with mapping
-        self.mapping.register_connection(conn_id);
+        {
+            let mut mapping = self.mapping.borrow_mut();
+            mapping.register_connection(conn_id);
 
-        // Virtualized Mapping: allocate fixed slot range for this connection
-        let slots_per_conn = self.config.pool.num_slots / self.config.max_connections;
-        let start_slot = conn_id * slots_per_conn;
-        for i in 0..slots_per_conn {
-            self.mapping.bind_slot(conn_id, start_slot + i)?;
+            // Virtualized Mapping: allocate fixed slot range for this connection
+            let slots_per_conn = self.config.pool.num_slots / self.config.max_connections;
+            let start_slot = conn_id * slots_per_conn;
+            for i in 0..slots_per_conn {
+                mapping.bind_slot(conn_id, start_slot + i)?;
+            }
         }
 
         // Create per-connection state with warmup and event buffers
@@ -496,7 +499,7 @@ impl RpcClient {
             .ok_or(Error::ConnectionNotFound(conn_id))?;
 
         // Store remote slot info in mapping
-        self.mapping
+        self.mapping.borrow_mut()
             .set_remote_slot(conn_id, remote.slot_addr, remote.slot_rkey)?;
 
         // Store endpoint entry info for warmup notification and server_conn_id
@@ -868,30 +871,34 @@ impl RpcClient {
             .and_then(|s| s.as_ref())
             .ok_or(Error::ConnectionNotFound(conn_id))?;
 
-        // Get remote slot info from mapping
-        let mapping_entry = self
-            .mapping
-            .get_connection(conn_id)
-            .ok_or(Error::ConnectionNotFound(conn_id))?;
+        // Get remote slot info from mapping (copy values to release borrow early)
+        let (remote_base_addr, remote_rkey, server_slot_idx) = {
+            let mapping = self.mapping.borrow();
+            let mapping_entry = mapping
+                .get_connection(conn_id)
+                .ok_or(Error::ConnectionNotFound(conn_id))?;
 
-        let remote_base_addr = mapping_entry.remote_slot_addr;
-        let remote_rkey = mapping_entry.remote_slot_rkey;
+            let remote_base_addr = mapping_entry.remote_slot_addr;
+            let remote_rkey = mapping_entry.remote_slot_rkey;
 
-        if remote_base_addr == 0 {
-            return Err(Error::Protocol("Remote slot address not configured".into()));
-        }
+            if remote_base_addr == 0 {
+                return Err(Error::Protocol("Remote slot address not configured".into()));
+            }
 
-        // Get the slot index to use (cycles through connection's slot range)
-        let num_slots = mapping_entry.slots.len();
-        if num_slots == 0 {
-            return Err(Error::NoFreeSlots);
-        }
+            // Get the slot index to use (cycles through connection's slot range)
+            let num_slots = mapping_entry.slots.len();
+            if num_slots == 0 {
+                return Err(Error::NoFreeSlots);
+            }
 
-        let slot_idx = conn_state.direct_slot_index.get() % num_slots;
-        conn_state.direct_slot_index.set(slot_idx + 1);
+            let slot_idx = conn_state.direct_slot_index.get() % num_slots;
+            conn_state.direct_slot_index.set(slot_idx + 1);
 
-        // Get the server slot index from the mapping
-        let server_slot_idx = mapping_entry.slots[slot_idx];
+            // Get the server slot index from the mapping
+            let server_slot_idx = mapping_entry.slots[slot_idx];
+
+            (remote_base_addr, remote_rkey, server_slot_idx)
+        };
 
         // Allocate a response slot
         let response_slot = self.pool.alloc()?;
@@ -932,8 +939,10 @@ impl RpcClient {
         }
 
         // Calculate remote address for this slot
-        // The server slot address is: base_addr + slot_idx * MESSAGE_BLOCK_SIZE
-        let remote_slot_addr = remote_base_addr + (server_slot_idx * MESSAGE_BLOCK_SIZE) as u64;
+        // The server slot address is: base_addr + slot_idx * slot_size
+        // Note: slot_size is 4096 (16 byte header + 4080 byte data), not MESSAGE_BLOCK_SIZE (4080)
+        const SLOT_SIZE: usize = 4096;  // Must match pool::DEFAULT_SLOT_SIZE
+        let remote_slot_addr = remote_base_addr + (server_slot_idx * SLOT_SIZE) as u64;
 
         // RDMA WRITE to server's processing pool
         {
@@ -959,11 +968,16 @@ impl RpcClient {
         // Mark connection as needing doorbell flush
         self.mark_needs_flush(conn_id);
 
+        // Release the local_slot index but keep the slot allocated until PendingRpc is dropped.
+        // This prevents the slot from being reused while the RDMA WRITE is in progress.
+        let send_slot_index = local_slot.release();
+
         Ok(PendingRpc {
             pool: &self.pool,
             slot_index: response_slot.release(),
             req_id,
             conn_id,
+            send_slot_index: Some(send_slot_index),
         })
     }
 
@@ -1040,6 +1054,7 @@ impl RpcClient {
             slot_index: response_slot.release(),
             req_id,
             conn_id,
+            send_slot_index: None, // Warmup uses separate buffer, not pool slots
         })
     }
 
@@ -1101,12 +1116,31 @@ impl RpcClient {
     ///
     /// When a response has FLAG_CONTEXT_SWITCH set, call this method to
     /// transition the client state appropriately. This implements the
-    /// ScaleRPC state machine: Process → Idle (on context switch event).
+    /// ScaleRPC state machine:
+    /// - Warmup/Idle → Process (when fetched_seq > 0 with processing pool info)
+    /// - Process → Idle (on time-based context switch, fetched_seq = 0)
     ///
     /// # Arguments
     /// * `conn_id` - Connection ID
     /// * `response` - The response containing the context switch event
     pub fn process_response_context_switch(&self, conn_id: ConnectionId, response: &RpcResponse) {
+        // First, handle processing pool info (independent of context switch seq tracking)
+        // This is the only way to get pool info (event buffer doesn't have it),
+        // so we must process it even if check_events() already handled the context switch.
+        if let (Some(pool_addr), Some(pool_rkey)) = (
+            response.get_processing_pool_addr(),
+            response.get_processing_pool_rkey(),
+        ) {
+            if let Some(Some(state)) = self.connection_states.get(conn_id) {
+                // Update mapping with new processing pool address
+                if let Ok(()) = self.mapping.borrow_mut().set_remote_slot(conn_id, pool_addr, pool_rkey) {
+                    // Transition to Process state
+                    state.state.set(ClientState::Process);
+                }
+            }
+        }
+
+        // Then handle context switch sequence tracking (for state cleanup and Idle transitions)
         if let (Some(sched_seq), Some(fetched_seq)) = (response.context_switch_seq(), response.fetched_seq()) {
             if let Some(Some(state)) = self.connection_states.get(conn_id) {
                 // We use fetched_seq (not sched_seq) to track what the server has acknowledged.
@@ -1114,7 +1148,7 @@ impl RpcClient {
 
                 if fetched_seq > 0 {
                     let last_ack = state.last_acknowledged_seq.get();
-                    // Only process if this is a newer acknowledgment
+                    // Only process cleanup if this is a newer acknowledgment
                     if fetched_seq <= last_ack {
                         return;
                     }
@@ -1131,6 +1165,7 @@ impl RpcClient {
                         state.pending_notification.set(false);
                         state.warmup_buffer.borrow_mut().clear();
                         state.last_notified_count.set(0);
+                        state.direct_slot_index.set(0);
                     }
                 } else {
                     // Time-based context switch (fetched_seq == 0)
@@ -1182,6 +1217,9 @@ pub struct PendingRpc<'a> {
     req_id: u64,
     /// Connection ID for state transition tracking.
     conn_id: ConnectionId,
+    /// Send slot index (used by call_direct to hold the slot until RDMA WRITE completes).
+    /// This prevents the slot from being reused while the RDMA WRITE is still in progress.
+    send_slot_index: Option<usize>,
 }
 
 impl<'a> PendingRpc<'a> {
@@ -1237,10 +1275,18 @@ impl<'a> PendingRpc<'a> {
                 None
             };
 
+            // Check for processing pool info
+            let processing_pool_info = if header.has_processing_pool_info() {
+                Some((header.processing_pool_addr, header.processing_pool_rkey))
+            } else {
+                None
+            };
+
             Some(RpcResponse {
                 header,
                 payload_ptr: unsafe { data_ptr.add(ResponseHeader::SIZE) },
                 context_switch_seq,
+                processing_pool_info,
             })
         } else {
             None
@@ -1265,8 +1311,13 @@ impl Drop for PendingRpc<'_> {
                 std::ptr::write_volatile(slot.data_ptr() as *mut u32, 0);
             }
         }
-        // Return the slot to the free list when PendingRpc is dropped
+        // Return the response slot to the free list
         self.pool.free_slot_by_index(self.slot_index);
+
+        // Return the send slot (used by call_direct) if it exists
+        if let Some(send_slot_index) = self.send_slot_index {
+            self.pool.free_slot_by_index(send_slot_index);
+        }
     }
 }
 
@@ -1276,6 +1327,8 @@ pub struct RpcResponse {
     payload_ptr: *const u8,
     /// Context switch sequence (valid when has_context_switch() is true).
     context_switch_seq: Option<u64>,
+    /// Processing pool info (addr, rkey) from server for Process mode transition.
+    processing_pool_info: Option<(u64, u32)>,
 }
 
 impl RpcResponse {
@@ -1327,5 +1380,20 @@ impl RpcResponse {
     /// the context switch is for the expected batch.
     pub fn fetched_seq(&self) -> Option<u32> {
         self.context_switch_seq.map(|seq| (seq >> 32) as u32)
+    }
+
+    /// Check if this response has processing pool info.
+    pub fn has_processing_pool_info(&self) -> bool {
+        self.processing_pool_info.is_some()
+    }
+
+    /// Get the processing pool address (if present).
+    pub fn get_processing_pool_addr(&self) -> Option<u64> {
+        self.processing_pool_info.map(|(addr, _)| addr)
+    }
+
+    /// Get the processing pool rkey (if present).
+    pub fn get_processing_pool_rkey(&self) -> Option<u32> {
+        self.processing_pool_info.map(|(_, rkey)| rkey)
     }
 }

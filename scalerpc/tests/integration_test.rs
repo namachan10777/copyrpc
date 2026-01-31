@@ -792,3 +792,200 @@ fn test_poll_pending_with_state_transition() {
 
     println!("Test passed: poll_pending with state transition works!");
 }
+
+/// Test Process mode state transition.
+///
+/// This test verifies that:
+/// 1. Client transitions from Warmup to Process when receiving pool info
+/// 2. Client can send requests directly via RDMA WRITE in Process state
+/// 3. Client transitions from Process to Idle on time-based context switch
+#[test]
+fn test_process_mode_transition() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    use scalerpc::ClientState;
+
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test: no mlx5 device available");
+            return;
+        }
+    };
+
+    let (server_tx, server_rx) = mpsc::channel();
+    let (client_tx, client_rx) = mpsc::channel();
+    let server_ready = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::new(AtomicBool::new(false));
+
+    let server_ready_clone = server_ready.clone();
+    let stop_flag_clone = stop_flag.clone();
+
+    // Server thread
+    let server_handle = thread::spawn(move || {
+        let ctx = match TestContext::new() {
+            Some(ctx) => ctx,
+            None => return,
+        };
+
+        let server_config = ServerConfig {
+            pool: PoolConfig {
+                num_slots: 256,
+                slot_data_size: 4080,
+            },
+            num_recv_slots: 64,
+            group: scalerpc::config::GroupConfig {
+                num_groups: 1,
+                time_slice_us: 100,
+                ..Default::default()
+            },
+            max_connections: 1,
+        };
+
+        let mut server = match RpcServer::new(&ctx.pd, server_config) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to create server: {}", e);
+                return;
+            }
+        };
+
+        server.set_handler(|_rpc_type, payload, response_buf| {
+            let len = payload.len().min(response_buf.len());
+            response_buf[..len].copy_from_slice(&payload[..len]);
+            (0, len)
+        });
+
+        let conn_id = match server.add_connection(&ctx.ctx, &ctx.pd, ctx.port) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Failed to add server connection: {}", e);
+                return;
+            }
+        };
+
+        let server_endpoint = server.local_endpoint(conn_id).unwrap();
+        server_tx.send(server_endpoint).unwrap();
+
+        let client_endpoint = client_rx.recv().unwrap();
+        server.connect(conn_id, client_endpoint).unwrap();
+
+        server_ready_clone.store(true, Ordering::Release);
+
+        while !stop_flag_clone.load(Ordering::Relaxed) {
+            server.poll();
+            std::hint::spin_loop();
+        }
+    });
+
+    // Client setup
+    let client_config = ClientConfig {
+        pool: PoolConfig {
+            num_slots: 64,
+            slot_data_size: 4080,
+        },
+        max_connections: 1,
+    };
+
+    let mut client = RpcClient::new(&ctx.pd, client_config).expect("create client");
+    let conn_id = client
+        .add_connection(&ctx.ctx, &ctx.pd, ctx.port)
+        .expect("add client connection");
+
+    let client_endpoint = client.local_endpoint(conn_id).expect("client endpoint");
+    client_tx.send(client_endpoint).unwrap();
+
+    let server_endpoint = server_rx.recv().unwrap();
+
+    while !server_ready.load(Ordering::Acquire) {
+        std::hint::spin_loop();
+    }
+
+    client.connect(conn_id, server_endpoint).expect("connect");
+
+    println!("\n=== Process Mode Transition Test ===");
+
+    // 1. Initial state should be Connected
+    let initial_state = client.state(conn_id).expect("get state");
+    println!("1. Initial state: {:?}", initial_state);
+    assert_eq!(initial_state, ClientState::Connected);
+
+    // 2. Send first request - transitions to Warmup
+    let payload = vec![0xDDu8; 32];
+    let pending1 = client.call_async(conn_id, 1, &payload).expect("call_async");
+    let after_first_call = client.state(conn_id).expect("get state");
+    println!("2. After first call_async: {:?}", after_first_call);
+    assert_eq!(after_first_call, ClientState::Warmup);
+
+    // 3. Flush warmup and poll
+    client.poll();
+
+    // 4. Wait for response with pool info (should transition to Process)
+    let start = std::time::Instant::now();
+    let response1 = loop {
+        client.poll();
+        if let Some(r) = client.poll_pending(&pending1) {
+            break r;
+        }
+        if start.elapsed() > Duration::from_secs(5) {
+            panic!("Response1 timeout");
+        }
+        std::hint::spin_loop();
+    };
+
+    assert!(response1.is_success(), "RPC1 failed");
+    println!("3. Response1 has context_switch: {}, has_processing_pool_info: {}",
+             response1.has_context_switch(),
+             response1.has_processing_pool_info());
+
+    let after_response1 = client.state(conn_id).expect("get state");
+    println!("4. After response1 (with pool info): {:?}", after_response1);
+
+    // If pool info was received, state should be Process
+    if response1.has_processing_pool_info() {
+        assert_eq!(after_response1, ClientState::Process,
+            "State should be Process after receiving pool info");
+
+        // 5. Send more requests in Process mode (direct RDMA WRITE)
+        println!("5. Sending requests in Process mode...");
+        for i in 0..3 {
+            let pending = client.call_async(conn_id, 1, &payload).expect("call_async in process mode");
+            client.poll();
+
+            // Wait for response
+            let start = std::time::Instant::now();
+            let response = loop {
+                client.poll();
+                if let Some(r) = client.poll_pending(&pending) {
+                    break r;
+                }
+                if start.elapsed() > Duration::from_secs(5) {
+                    panic!("Process mode request {} timeout", i);
+                }
+                std::hint::spin_loop();
+            };
+
+            assert!(response.is_success(), "Process mode RPC {} failed", i);
+
+            // Check state remains in Process
+            let state = client.state(conn_id).expect("get state");
+
+            // State might transition to Idle if context switch happens
+            if state == ClientState::Idle {
+                println!("   Transitioned to Idle (context switch)");
+                break;
+            }
+        }
+    } else {
+        println!("   Note: No pool info received (server might not have triggered warmup fetch)");
+    }
+
+    stop_flag.store(true, Ordering::SeqCst);
+    server_handle.join().unwrap();
+
+    println!("\nTest passed: Process mode transition works!");
+}

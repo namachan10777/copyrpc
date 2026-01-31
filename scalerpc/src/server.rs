@@ -999,8 +999,21 @@ impl RpcServer {
 
         // Check for pending context switch event to piggyback
         let response_header = if let Some((seq, fetched_seq)) = self.take_pending_context_switch(request.conn_id) {
-            // Piggyback context switch event on the response
-            ResponseHeader::with_context_switch(request.req_id, status, payload.len() as u32, seq, fetched_seq)
+            if fetched_seq > 0 {
+                // Warmup fetch complete → include processing pool info for Process mode transition
+                ResponseHeader::with_processing_pool_info(
+                    request.req_id,
+                    status,
+                    payload.len() as u32,
+                    seq,
+                    fetched_seq,
+                    self.processing_pool.slot_data_addr(0).unwrap_or(0),
+                    self.processing_pool.rkey(),
+                )
+            } else {
+                // Time-based context switch (Idle transition)
+                ResponseHeader::with_context_switch(request.req_id, status, payload.len() as u32, seq, fetched_seq)
+            }
         } else {
             ResponseHeader::new(request.req_id, status, payload.len() as u32)
         };
@@ -1089,8 +1102,21 @@ impl RpcServer {
 
         // Check for pending context switch event to piggyback
         let response_header = if let Some((seq, fetched_seq)) = self.take_pending_context_switch(request.conn_id) {
-            // Piggyback context switch event on the response
-            ResponseHeader::with_context_switch(request.req_id, status, payload_len as u32, seq, fetched_seq)
+            if fetched_seq > 0 {
+                // Warmup fetch complete → include processing pool info for Process mode transition
+                ResponseHeader::with_processing_pool_info(
+                    request.req_id,
+                    status,
+                    payload_len as u32,
+                    seq,
+                    fetched_seq,
+                    self.processing_pool.slot_data_addr(0).unwrap_or(0),
+                    self.processing_pool.rkey(),
+                )
+            } else {
+                // Time-based context switch (Idle transition)
+                ResponseHeader::with_context_switch(request.req_id, status, payload_len as u32, seq, fetched_seq)
+            }
         } else {
             ResponseHeader::new(request.req_id, status, payload_len as u32)
         };

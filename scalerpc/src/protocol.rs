@@ -211,6 +211,11 @@ pub mod response_flags {
     /// When set, indicates that the client's group has been switched out.
     /// The client should transition to Idle state.
     pub const FLAG_CONTEXT_SWITCH: u32 = 0x1;
+
+    /// Processing pool info flag.
+    /// When set, the response contains the server's processing pool address and rkey.
+    /// The client should update its mapping and transition to Process state.
+    pub const FLAG_PROCESSING_POOL_INFO: u32 = 0x2;
 }
 
 /// Response header sent from server to client.
@@ -232,6 +237,12 @@ pub struct ResponseHeader {
     pub flags: u32,
     /// Context switch sequence number (valid when FLAG_CONTEXT_SWITCH is set).
     pub context_switch_seq: u64,
+    /// Server's processing pool address (valid when FLAG_PROCESSING_POOL_INFO is set).
+    pub processing_pool_addr: u64,
+    /// Server's processing pool rkey (valid when FLAG_PROCESSING_POOL_INFO is set).
+    pub processing_pool_rkey: u32,
+    /// Padding for alignment.
+    pub _padding: u32,
 }
 
 impl ResponseHeader {
@@ -247,6 +258,9 @@ impl ResponseHeader {
             payload_len,
             flags: 0,
             context_switch_seq: 0,
+            processing_pool_addr: 0,
+            processing_pool_rkey: 0,
+            _padding: 0,
         }
     }
 
@@ -267,6 +281,36 @@ impl ResponseHeader {
             payload_len,
             flags: response_flags::FLAG_CONTEXT_SWITCH,
             context_switch_seq,
+            processing_pool_addr: 0,
+            processing_pool_rkey: 0,
+            _padding: 0,
+        }
+    }
+
+    /// Create a new response header with context switch event AND processing pool info.
+    ///
+    /// This is used when the server has fetched warmup requests and wants to notify
+    /// the client to transition to Process state with the processing pool address.
+    pub fn with_processing_pool_info(
+        req_id: u64,
+        status: u32,
+        payload_len: u32,
+        scheduler_seq: u64,
+        fetched_seq: u32,
+        pool_addr: u64,
+        pool_rkey: u32,
+    ) -> Self {
+        let context_switch_seq = ((fetched_seq as u64) << 32) | (scheduler_seq as u32 as u64);
+        Self {
+            magic: RESPONSE_MAGIC,
+            req_id,
+            status,
+            payload_len,
+            flags: response_flags::FLAG_CONTEXT_SWITCH | response_flags::FLAG_PROCESSING_POOL_INFO,
+            context_switch_seq,
+            processing_pool_addr: pool_addr,
+            processing_pool_rkey: pool_rkey,
+            _padding: 0,
         }
     }
 
@@ -295,6 +339,11 @@ impl ResponseHeader {
         self.flags & response_flags::FLAG_CONTEXT_SWITCH != 0
     }
 
+    /// Check if the response has processing pool info.
+    pub fn has_processing_pool_info(&self) -> bool {
+        self.flags & response_flags::FLAG_PROCESSING_POOL_INFO != 0
+    }
+
     /// Get the scheduler's context switch sequence (valid when has_context_switch() is true).
     ///
     /// This is the lower 32 bits of context_switch_seq.
@@ -308,6 +357,24 @@ impl ResponseHeader {
     /// with its endpoint_entry_seq to verify the context switch is for the expected batch.
     pub fn get_fetched_seq(&self) -> u32 {
         (self.context_switch_seq >> 32) as u32
+    }
+
+    /// Get the processing pool address (valid when has_processing_pool_info() is true).
+    pub fn get_processing_pool_addr(&self) -> Option<u64> {
+        if self.has_processing_pool_info() {
+            Some(self.processing_pool_addr)
+        } else {
+            None
+        }
+    }
+
+    /// Get the processing pool rkey (valid when has_processing_pool_info() is true).
+    pub fn get_processing_pool_rkey(&self) -> Option<u32> {
+        if self.has_processing_pool_info() {
+            Some(self.processing_pool_rkey)
+        } else {
+            None
+        }
     }
 
     /// Write the header to a byte slice.
@@ -461,8 +528,8 @@ mod tests {
 
     #[test]
     fn test_response_header_size() {
-        // Expected size: 4 + 8 + 4 + 4 + 4 + 8 = 32 bytes
-        assert_eq!(ResponseHeader::SIZE, 32);
+        // Expected size: 4 + 8 + 4 + 4 + 4 + 8 + 8 + 4 + 4 = 48 bytes
+        assert_eq!(ResponseHeader::SIZE, 48);
     }
 
     #[test]
@@ -526,6 +593,7 @@ mod tests {
         assert!(header.is_valid());
         assert!(header.is_success());
         assert!(header.has_context_switch());
+        assert!(!header.has_processing_pool_info());
         // get_context_switch_seq returns lower 32 bits (scheduler_seq)
         assert_eq!(header.get_context_switch_seq(), 42);
         // get_fetched_seq returns upper 32 bits
@@ -540,6 +608,35 @@ mod tests {
             // context_switch_seq encodes both: (fetched_seq << 32) | scheduler_seq
             assert_eq!(read_back.get_context_switch_seq(), 42);
             assert_eq!(read_back.get_fetched_seq(), 5);
+        }
+    }
+
+    #[test]
+    fn test_response_header_with_processing_pool_info() {
+        // scheduler_seq = 42, fetched_seq = 5, pool_addr = 0x1234_5678_9ABC_DEF0, pool_rkey = 0xABCD
+        let header = ResponseHeader::with_processing_pool_info(
+            789, 0, 100, 42, 5,
+            0x1234_5678_9ABC_DEF0, 0xABCD
+        );
+        assert!(header.is_valid());
+        assert!(header.is_success());
+        assert!(header.has_context_switch());
+        assert!(header.has_processing_pool_info());
+        assert_eq!(header.get_context_switch_seq(), 42);
+        assert_eq!(header.get_fetched_seq(), 5);
+        assert_eq!(header.get_processing_pool_addr(), Some(0x1234_5678_9ABC_DEF0));
+        assert_eq!(header.get_processing_pool_rkey(), Some(0xABCD));
+
+        let mut buf = [0u8; ResponseHeader::SIZE];
+        unsafe {
+            header.write_to(buf.as_mut_ptr());
+            let read_back = ResponseHeader::read_from(buf.as_ptr());
+            let flags = { read_back.flags };
+            assert_eq!(flags, response_flags::FLAG_CONTEXT_SWITCH | response_flags::FLAG_PROCESSING_POOL_INFO);
+            assert_eq!(read_back.get_context_switch_seq(), 42);
+            assert_eq!(read_back.get_fetched_seq(), 5);
+            assert_eq!(read_back.get_processing_pool_addr(), Some(0x1234_5678_9ABC_DEF0));
+            assert_eq!(read_back.get_processing_pool_rkey(), Some(0xABCD));
         }
     }
 
