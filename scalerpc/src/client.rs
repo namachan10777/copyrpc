@@ -310,8 +310,11 @@ struct ConnectionState {
     pending_notification: Cell<bool>,
     /// Server-assigned connection ID (used as sender_conn_id in requests).
     server_conn_id: Cell<u32>,
+    /// Number of slots in server's processing pool.
+    /// Used by call_direct to cycle through server slots correctly.
+    server_pool_num_slots: Cell<usize>,
     /// Next slot index to use for direct RDMA WRITE in Processing state.
-    /// Cycles through the connection's slot range.
+    /// Cycles through server's pool slots (0 to server_pool_num_slots-1).
     direct_slot_index: Cell<usize>,
     /// Context switch sequence received from server (for state transition tracking).
     last_context_switch_seq: Cell<u64>,
@@ -476,9 +479,9 @@ impl RpcClient {
         let event_buffer = EventBuffer::new(pd)?;
 
         // Pre-allocate send slots for call_direct (avoid alloc on every call)
-        // Use min(32, available_slots/4) to leave room for response slots
+        // Use min(128, available_slots/4) to leave room for response slots
         let available = self.pool.free_count();
-        let num_send_slots = std::cmp::min(32, available / 4).max(1);
+        let num_send_slots = std::cmp::min(128, available / 4).max(1);
         let mut send_slots = Vec::with_capacity(num_send_slots);
         for _ in 0..num_send_slots {
             if let Ok(slot) = self.pool.alloc() {
@@ -511,6 +514,7 @@ impl RpcClient {
             last_notified_count: Cell::new(0),
             pending_notification: Cell::new(false),
             server_conn_id: Cell::new(0),
+            server_pool_num_slots: Cell::new(64), // Default, updated in connect()
             direct_slot_index: Cell::new(0),
             last_context_switch_seq: Cell::new(0),
             last_acknowledged_seq: Cell::new(0),
@@ -542,11 +546,15 @@ impl RpcClient {
         self.mapping.borrow_mut()
             .set_remote_slot(conn_id, remote.slot_addr, remote.slot_rkey)?;
 
-        // Store endpoint entry info for warmup notification and server_conn_id
+        // Store endpoint entry info for warmup notification and server info
         if let Some(Some(state)) = self.connection_states.get(conn_id) {
             state.endpoint_entry_addr.set(remote.endpoint_entry_addr);
             state.endpoint_entry_rkey.set(remote.endpoint_entry_rkey);
             state.server_conn_id.set(remote.server_conn_id);
+            // Store server's pool size for call_direct slot cycling
+            if remote.pool_num_slots > 0 {
+                state.server_pool_num_slots.set(remote.pool_num_slots as usize);
+            }
         }
 
         conn.connect(remote)?;
@@ -933,17 +941,15 @@ impl RpcClient {
                 return Err(Error::Protocol("Remote slot address not configured".into()));
             }
 
-            // Get the slot index to use (cycles through server's pool slots)
-            // For Process mode, we write directly to server's processing pool
-            // which has sequential slots starting from 0
-            let num_slots = mapping_entry.slots.len();
-            if num_slots == 0 {
-                return Err(Error::NoFreeSlots);
+            // Use server's pool size for slot cycling (not client's mapping size)
+            let server_pool_size = conn_state.server_pool_num_slots.get();
+            if server_pool_size == 0 {
+                return Err(Error::Protocol("Server pool size not configured".into()));
             }
 
             // Use sequential server slot indices (0, 1, 2, ...)
             // direct_slot_index tracks which server slot to write to next
-            let server_slot_idx = conn_state.direct_slot_index.get() % num_slots;
+            let server_slot_idx = conn_state.direct_slot_index.get() % server_pool_size;
             conn_state.direct_slot_index.set(conn_state.direct_slot_index.get() + 1);
 
             (remote_base_addr, remote_rkey, server_slot_idx)

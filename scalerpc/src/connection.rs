@@ -47,6 +47,9 @@ pub struct RemoteEndpoint {
     /// Server-assigned connection ID (used as sender_conn_id in requests).
     /// This allows the server to route responses back through the correct QP.
     pub server_conn_id: u32,
+    /// Number of slots in server's processing pool.
+    /// Used by call_direct to cycle through server slots correctly.
+    pub pool_num_slots: u32,
 }
 
 /// Callback type for SQ completions.
@@ -162,6 +165,7 @@ impl Connection {
             endpoint_entry_addr: 0,    // To be filled by caller (server only)
             endpoint_entry_rkey: 0,    // To be filled by caller (server only)
             server_conn_id: self.conn_id as u32, // Filled by connection
+            pool_num_slots: 0,         // To be filled by caller (server only)
         }
     }
 

@@ -127,6 +127,8 @@ struct ConnectionInfo {
     warmup_buffer_slots: u32,
     endpoint_entry_addr: u64,
     endpoint_entry_rkey: u32,
+    server_conn_id: u32,
+    pool_num_slots: u32,
 }
 
 impl From<RemoteEndpoint> for ConnectionInfo {
@@ -143,6 +145,8 @@ impl From<RemoteEndpoint> for ConnectionInfo {
             warmup_buffer_slots: e.warmup_buffer_slots,
             endpoint_entry_addr: e.endpoint_entry_addr,
             endpoint_entry_rkey: e.endpoint_entry_rkey,
+            server_conn_id: e.server_conn_id,
+            pool_num_slots: e.pool_num_slots,
         }
     }
 }
@@ -162,6 +166,8 @@ impl From<ConnectionInfo> for RemoteEndpoint {
             warmup_buffer_slots: c.warmup_buffer_slots,
             endpoint_entry_addr: c.endpoint_entry_addr,
             endpoint_entry_rkey: c.endpoint_entry_rkey,
+            server_conn_id: c.server_conn_id,
+            pool_num_slots: c.pool_num_slots,
         }
     }
 }
@@ -248,7 +254,6 @@ fn setup_benchmark(config: &BenchConfig) -> Option<BenchmarkSetup> {
             num_slots: config.num_slots,
             slot_data_size: 4080,
         },
-        timeout_ms: 10000,
         max_connections: 64, // 16 slots per connection
     };
 
@@ -256,19 +261,7 @@ fn setup_benchmark(config: &BenchConfig) -> Option<BenchmarkSetup> {
     let conn_id = client.add_connection(&test_ctx.ctx, &test_ctx.pd, test_ctx.port).ok()?;
 
     let client_endpoint = client.local_endpoint(conn_id).ok()?;
-    let client_info = ConnectionInfo {
-        qpn: client_endpoint.qpn,
-        lid: client_endpoint.lid,
-        slot_addr: client_endpoint.slot_addr,
-        slot_rkey: client_endpoint.slot_rkey,
-        event_buffer_addr: client_endpoint.event_buffer_addr,
-        event_buffer_rkey: client_endpoint.event_buffer_rkey,
-        warmup_buffer_addr: client_endpoint.warmup_buffer_addr,
-        warmup_buffer_rkey: client_endpoint.warmup_buffer_rkey,
-        warmup_buffer_slots: client_endpoint.warmup_buffer_slots,
-        endpoint_entry_addr: client_endpoint.endpoint_entry_addr,
-        endpoint_entry_rkey: client_endpoint.endpoint_entry_rkey,
-    };
+    let client_info: ConnectionInfo = client_endpoint.into();
 
     // Setup communication channels
     let (server_info_tx, server_info_rx): (Sender<ConnectionInfo>, Receiver<ConnectionInfo>) =
@@ -377,19 +370,7 @@ fn server_thread_main(
         Err(_) => return,
     };
 
-    let server_info = ConnectionInfo {
-        qpn: server_endpoint.qpn,
-        lid: server_endpoint.lid,
-        slot_addr: server_endpoint.slot_addr,
-        slot_rkey: server_endpoint.slot_rkey,
-        event_buffer_addr: 0,  // Server doesn't have event buffer
-        event_buffer_rkey: 0,
-        warmup_buffer_addr: 0, // Server doesn't have warmup buffer
-        warmup_buffer_rkey: 0,
-        warmup_buffer_slots: 0,
-        endpoint_entry_addr: server_endpoint.endpoint_entry_addr,
-        endpoint_entry_rkey: server_endpoint.endpoint_entry_rkey,
-    };
+    let server_info: ConnectionInfo = server_endpoint.into();
 
     if info_tx.send(server_info).is_err() {
         return;
@@ -431,8 +412,14 @@ fn run_latency_bench(client: &RpcClient, conn_id: usize, msg_size: usize, iters:
     for _ in 0..iters {
         match client.call_async(conn_id, 1, &request_data) {
             Ok(pending) => {
-                client.poll();
-                let _ = pending.wait();
+                // Poll until response is received
+                loop {
+                    client.poll();
+                    if pending.poll().is_some() {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
             }
             Err(_) => continue,
         };
@@ -610,7 +597,6 @@ fn setup_multi_qp_benchmark(config: &BenchConfig) -> Option<MultiQpBenchmarkSetu
             num_slots: multi_qp_num_slots,
             slot_data_size: 4080,
         },
-        timeout_ms: 10000,
         max_connections: num_qps, // 16 slots per connection
     };
 
@@ -624,19 +610,7 @@ fn setup_multi_qp_benchmark(config: &BenchConfig) -> Option<MultiQpBenchmarkSetu
         let conn_id = client.add_connection(&test_ctx.ctx, &test_ctx.pd, test_ctx.port).ok()?;
         let endpoint = client.local_endpoint(conn_id).ok()?;
         conn_ids.push(conn_id);
-        client_infos.push(ConnectionInfo {
-            qpn: endpoint.qpn,
-            lid: endpoint.lid,
-            slot_addr: endpoint.slot_addr,
-            slot_rkey: endpoint.slot_rkey,
-            event_buffer_addr: endpoint.event_buffer_addr,
-            event_buffer_rkey: endpoint.event_buffer_rkey,
-            warmup_buffer_addr: endpoint.warmup_buffer_addr,
-            warmup_buffer_rkey: endpoint.warmup_buffer_rkey,
-            warmup_buffer_slots: endpoint.warmup_buffer_slots,
-            endpoint_entry_addr: endpoint.endpoint_entry_addr,
-            endpoint_entry_rkey: endpoint.endpoint_entry_rkey,
-        });
+        client_infos.push(endpoint.into());
     }
 
     // Setup communication channels for multi-QP
@@ -753,19 +727,7 @@ fn multi_qp_server_thread_main(
             Err(_) => return,
         };
         server_conn_ids.push(conn_id);
-        server_infos.push(ConnectionInfo {
-            qpn: endpoint.qpn,
-            lid: endpoint.lid,
-            slot_addr: endpoint.slot_addr,
-            slot_rkey: endpoint.slot_rkey,
-            event_buffer_addr: 0,  // Server doesn't have event buffer
-            event_buffer_rkey: 0,
-            warmup_buffer_addr: 0, // Server doesn't have warmup buffer
-            warmup_buffer_rkey: 0,
-            warmup_buffer_slots: 0,
-            endpoint_entry_addr: endpoint.endpoint_entry_addr,
-            endpoint_entry_rkey: endpoint.endpoint_entry_rkey,
-        });
+        server_infos.push(endpoint.into());
     }
 
     if info_tx.send(server_infos).is_err() {

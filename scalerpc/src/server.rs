@@ -934,6 +934,9 @@ impl RpcServer {
         // Set server_conn_id so client can use it as sender_conn_id
         endpoint.server_conn_id = conn_id as u32;
 
+        // Set pool_num_slots so client knows how many server slots to cycle through
+        endpoint.pool_num_slots = self.processing_pool.num_slots() as u32;
+
         Ok(endpoint)
     }
 

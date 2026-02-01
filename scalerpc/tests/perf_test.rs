@@ -31,6 +31,7 @@ struct ConnectionInfo {
     endpoint_entry_addr: u64,
     endpoint_entry_rkey: u32,
     server_conn_id: u32,
+    pool_num_slots: u32,
 }
 
 impl From<RemoteEndpoint> for ConnectionInfo {
@@ -48,6 +49,7 @@ impl From<RemoteEndpoint> for ConnectionInfo {
             endpoint_entry_addr: e.endpoint_entry_addr,
             endpoint_entry_rkey: e.endpoint_entry_rkey,
             server_conn_id: e.server_conn_id,
+            pool_num_slots: e.pool_num_slots,
         }
     }
 }
@@ -68,6 +70,7 @@ impl From<ConnectionInfo> for RemoteEndpoint {
             endpoint_entry_addr: c.endpoint_entry_addr,
             endpoint_entry_rkey: c.endpoint_entry_rkey,
             server_conn_id: c.server_conn_id,
+            pool_num_slots: c.pool_num_slots,
         }
     }
 }
@@ -584,12 +587,14 @@ fn test_throughput_process_mode() {
         }
     };
 
-    // Client pool size must match server pool size for call_direct
-    // because call_direct uses client's mapping slot count to cycle
-    // through server slots
+    // Client needs enough slots for:
+    // - send_slots: pre-allocated for call_direct WRITEs
+    // - response_slots: pre-allocated for responses (must be >= pipeline_depth)
+    // - mapping slots: must match server's pool size for slot indexing
+    // The mapping slots count determines server slot cycling in call_direct.
     let client_config = ClientConfig {
         pool: PoolConfig {
-            num_slots: 64,  // Must match server's pool size
+            num_slots: 512,  // Large enough for pipeline depth + send slots
             slot_data_size: 4080,
         },
         max_connections: 1,
@@ -618,9 +623,13 @@ fn test_throughput_process_mode() {
             None => return,
         };
 
+        let server_pool_size = std::env::var("SCALERPC_SERVER_POOL_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(256);
         let server_config = ServerConfig {
             pool: PoolConfig {
-                num_slots: 64,
+                num_slots: server_pool_size,
                 slot_data_size: 4080,
             },
             num_recv_slots: 64,

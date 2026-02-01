@@ -35,6 +35,7 @@ struct ConnectionInfo {
     endpoint_entry_addr: u64,
     endpoint_entry_rkey: u32,
     server_conn_id: u32,
+    pool_num_slots: u32,
 }
 
 impl From<RemoteEndpoint> for ConnectionInfo {
@@ -52,6 +53,7 @@ impl From<RemoteEndpoint> for ConnectionInfo {
             endpoint_entry_addr: e.endpoint_entry_addr,
             endpoint_entry_rkey: e.endpoint_entry_rkey,
             server_conn_id: e.server_conn_id,
+            pool_num_slots: e.pool_num_slots,
         }
     }
 }
@@ -72,6 +74,7 @@ impl From<ConnectionInfo> for RemoteEndpoint {
             endpoint_entry_addr: c.endpoint_entry_addr,
             endpoint_entry_rkey: c.endpoint_entry_rkey,
             server_conn_id: c.server_conn_id,
+            pool_num_slots: c.pool_num_slots,
         }
     }
 }
