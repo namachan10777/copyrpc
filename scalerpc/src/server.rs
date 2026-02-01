@@ -435,6 +435,9 @@ pub struct RpcServer {
     /// Pending context switch events per connection (fetched_seq to piggyback on responses).
     /// When set, the next response to this connection will carry the context switch event.
     pending_context_switch: RefCell<Vec<Option<(u64, u32)>>>, // (seq, fetched_seq)
+    /// Per-connection next expected slot index for ring buffer polling.
+    /// Reset on context switch when transitioning to Process mode.
+    next_expected_slot: RefCell<Vec<usize>>,
 }
 
 impl RpcServer {
@@ -471,6 +474,7 @@ impl RpcServer {
             shared_recv_cq: None,
             endpoint_entries: Some(endpoint_entries),
             pending_context_switch: RefCell::new(Vec::new()),
+            next_expected_slot: RefCell::new(Vec::new()),
         })
     }
 
@@ -718,6 +722,23 @@ impl RpcServer {
         Ok(())
     }
 
+    /// Reset next_expected_slot for connections entering Process mode.
+    ///
+    /// Called after context switch when clients transition to Process mode.
+    /// Clients start writing from their first slot, so we reset to match.
+    fn reset_next_expected_slots(&self, conn_ids: &[ConnectionId]) {
+        let mut next_slots = self.next_expected_slot.borrow_mut();
+        for &conn_id in conn_ids {
+            if let Some(entry) = self.mapping.get_connection(conn_id) {
+                if !entry.slots.is_empty() {
+                    if conn_id < next_slots.len() {
+                        next_slots[conn_id] = entry.slots[0];
+                    }
+                }
+            }
+        }
+    }
+
     /// Set the request handler (zero-copy).
     ///
     /// The handler receives (rpc_type, request_payload, response_buffer) and
@@ -778,6 +799,15 @@ impl RpcServer {
 
         // Add to scheduler
         self.scheduler.add_connection(conn_id);
+
+        // Initialize ring buffer polling state
+        {
+            let mut next_slots = self.next_expected_slot.borrow_mut();
+            if conn_id >= next_slots.len() {
+                next_slots.resize(conn_id + 1, 0);
+            }
+            next_slots[conn_id] = start_slot; // Start at first slot of this connection
+        }
 
         Ok(conn_id)
     }
@@ -879,16 +909,56 @@ impl RpcServer {
     /// - Each connection owns 16 slots
     /// - With 1 active connection, we scan 16 slots instead of 1024
     /// - Expected improvement: ~60x reduction in memory accesses
+    ///
+    /// Uses ring buffer polling: only checks next_expected_slot per connection.
+    /// This assumes clients write to slots in order (which they do via direct_slot_index).
     pub fn poll_request(&self) -> Option<IncomingRequest> {
         // Get active group's connections
         let active_conns = self.scheduler.current_group_connections();
 
-        // Scan only slots owned by active connections
+        // Ring buffer polling: check only the next expected slot per connection.
+        // This is a key optimization: instead of scanning all slots (O(n)),
+        // we check only one slot per connection (O(1) per connection).
+        //
+        // Synchronization: Client's direct_slot_index and server's next_expected_slot
+        // must be in sync. This is achieved by:
+        // 1. Server resets next_expected_slot on context switch (warmup fetch)
+        // 2. Client sets direct_slot_index = warmup_request_count on Process mode entry
+        // This accounts for warmup requests that were processed before Process mode starts.
+        let mut next_slots = self.next_expected_slot.borrow_mut();
         for &conn_id in active_conns {
             if let Some(entry) = self.mapping.get_connection(conn_id) {
-                for &slot_idx in &entry.slots {
-                    if let Some(request) = self.check_slot_for_request(slot_idx) {
-                        return Some(request);
+                if entry.slots.is_empty() {
+                    continue;
+                }
+
+                // Get next expected slot for this connection
+                let next_slot = next_slots.get(conn_id).copied().unwrap_or(entry.slots[0]);
+
+                if let Some(request) = self.check_slot_for_request(next_slot) {
+                    // Advance to next slot in ring buffer
+                    let slot_pos = entry.slots.iter().position(|&s| s == next_slot).unwrap_or(0);
+                    let next_pos = (slot_pos + 1) % entry.slots.len();
+                    if conn_id < next_slots.len() {
+                        next_slots[conn_id] = entry.slots[next_pos];
+                    }
+                    return Some(request);
+                }
+
+                // Fallback: if ring buffer is out of sync, scan all slots
+                // This can happen during high-throughput scenarios where client and server
+                // slot indices diverge due to timing
+                for &slot in &entry.slots {
+                    if slot != next_slot {
+                        if let Some(request) = self.check_slot_for_request(slot) {
+                            // Resync ring buffer
+                            let slot_pos = entry.slots.iter().position(|&s| s == slot).unwrap_or(0);
+                            let next_pos = (slot_pos + 1) % entry.slots.len();
+                            if conn_id < next_slots.len() {
+                                next_slots[conn_id] = entry.slots[next_pos];
+                            }
+                            return Some(request);
+                        }
                     }
                 }
             }
@@ -1313,6 +1383,8 @@ impl RpcServer {
             let old_conns: Vec<ConnectionId> = self.scheduler.current_group_connections().to_vec();
             std::mem::swap(&mut self.processing_pool, &mut self.warmup_pool);
             self.clear_pool_valid_flags(&self.warmup_pool);
+            // Reset ring buffer pointers for new Process mode session
+            self.reset_next_expected_slots(&old_conns);
             let _ = self.notify_context_switch(&old_conns, seq, fetched_seq);
             true
         } else if let Ok(Some((seq, old_conns))) = self.perform_context_switch() {

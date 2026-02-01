@@ -762,10 +762,14 @@ impl RpcClient {
                     // Clear pending_notification if the server has acknowledged the current batch
                     let notified_seq = state.endpoint_entry_seq.get();
                     if fetched_seq == notified_seq {
+                        // Set direct_slot_index to warmup count BEFORE clearing
+                        // This syncs with server's next_expected_slot (which advanced by warmup_count)
+                        let warmup_count = state.last_notified_count.get() as usize;
+                        state.direct_slot_index.set(warmup_count);
+
                         state.pending_notification.set(false);
                         state.warmup_buffer.borrow_mut().clear();
                         state.last_notified_count.set(0);
-                        state.direct_slot_index.set(0);
                     }
                 } else {
                     // Time-based context switch (no fetch)
@@ -912,7 +916,7 @@ impl RpcClient {
             }
 
             let slot_idx = conn_state.direct_slot_index.get() % num_slots;
-            conn_state.direct_slot_index.set(slot_idx + 1);
+            conn_state.direct_slot_index.set(conn_state.direct_slot_index.get() + 1);
 
             // Get the server slot index from the mapping
             let server_slot_idx = mapping_entry.slots[slot_idx];
@@ -1159,6 +1163,9 @@ impl RpcClient {
                 if let Ok(()) = self.mapping.borrow_mut().set_remote_slot(conn_id, pool_addr, pool_rkey) {
                     // Transition to Process state
                     state.state.set(ClientState::Process);
+                    // Note: direct_slot_index is set in check_events() when it processes
+                    // the context switch event. It's set to warmup_count to sync with
+                    // server's next_expected_slot.
                 }
             }
         }
