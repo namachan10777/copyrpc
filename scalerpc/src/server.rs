@@ -381,15 +381,19 @@ impl GroupScheduler {
     }
 }
 
-/// Incoming RPC request.
-#[derive(Debug)]
+/// Incoming RPC request (zero-copy).
+///
+/// The payload is accessed directly from the processing pool slot via pointer.
+/// Response is written to a separate response_pool, so there's no overlap.
 pub struct IncomingRequest {
     /// Request ID.
     pub req_id: u64,
     /// RPC type.
     pub rpc_type: u16,
-    /// Request payload.
-    pub payload: Vec<u8>,
+    /// Pointer to request payload in processing pool (zero-copy).
+    payload_ptr: *const u8,
+    /// Length of request payload.
+    payload_len: usize,
     /// Client's slot address for response.
     pub client_slot_addr: u64,
     /// Client's slot rkey.
@@ -400,15 +404,52 @@ pub struct IncomingRequest {
     pub slot_index: usize,
 }
 
+impl IncomingRequest {
+    /// Get the request payload as a slice (zero-copy).
+    #[inline]
+    pub fn payload(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.payload_ptr, self.payload_len) }
+    }
+
+    /// Get the payload length.
+    #[inline]
+    pub fn payload_len(&self) -> usize {
+        self.payload_len
+    }
+}
+
+// SAFETY: The payload pointer points to registered RDMA memory that lives
+// as long as the RpcServer. The slot is marked as processed before the
+// IncomingRequest is returned, ensuring the memory is valid.
+unsafe impl Send for IncomingRequest {}
+unsafe impl Sync for IncomingRequest {}
+
+impl std::fmt::Debug for IncomingRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IncomingRequest")
+            .field("req_id", &self.req_id)
+            .field("rpc_type", &self.rpc_type)
+            .field("payload_len", &self.payload_len)
+            .field("client_slot_addr", &self.client_slot_addr)
+            .field("client_slot_rkey", &self.client_slot_rkey)
+            .field("conn_id", &self.conn_id)
+            .field("slot_index", &self.slot_index)
+            .finish()
+    }
+}
+
 /// RPC Server.
 ///
 /// Manages connections and processes incoming RPC requests.
 /// Implements the ScaleRPC time-sharing scheduler when enabled.
 pub struct RpcServer {
-    /// Processing pool for active group's requests.
+    /// Processing pool for active group's requests (inbound).
     processing_pool: MessagePool,
     /// Warmup pool for next group's requests (fetched via RDMA READ).
     warmup_pool: MessagePool,
+    /// Response pool for building responses before RDMA WRITE to client.
+    /// Separate from processing_pool to enable zero-copy request handling.
+    response_pool: MessagePool,
     /// Virtual mapping table.
     mapping: VirtualMapping,
     /// Connections indexed by ID.
@@ -438,6 +479,9 @@ pub struct RpcServer {
     /// Per-connection next expected slot index for ring buffer polling.
     /// Reset on context switch when transitioning to Process mode.
     next_expected_slot: RefCell<Vec<usize>>,
+    /// Reusable buffer for connection IDs during context switch.
+    /// Avoids per-call Vec allocation in hot paths.
+    conn_buf: RefCell<Vec<ConnectionId>>,
 }
 
 impl RpcServer {
@@ -447,8 +491,10 @@ impl RpcServer {
     /// * `pd` - Protection domain for memory registration
     /// * `config` - Server configuration
     pub fn new(pd: &Pd, config: ServerConfig) -> Result<Self> {
+        let max_connections = config.max_connections;
         let processing_pool = MessagePool::new(pd, &config.pool)?;
         let warmup_pool = MessagePool::new(pd, &config.pool)?;
+        let response_pool = MessagePool::new(pd, &config.pool)?;
         let mapping = VirtualMapping::new();
 
         let scheduler = GroupScheduler::new(
@@ -457,11 +503,12 @@ impl RpcServer {
         );
 
         // Create endpoint entry pool for warmup notification
-        let endpoint_entries = EndpointEntryPool::new(pd, config.max_connections)?;
+        let endpoint_entries = EndpointEntryPool::new(pd, max_connections)?;
 
         Ok(Self {
             processing_pool,
             warmup_pool,
+            response_pool,
             mapping,
             connections: Vec::new(),
             config,
@@ -475,6 +522,7 @@ impl RpcServer {
             endpoint_entries: Some(endpoint_entries),
             pending_context_switch: RefCell::new(Vec::new()),
             next_expected_slot: RefCell::new(Vec::new()),
+            conn_buf: RefCell::new(Vec::with_capacity(max_connections)),
         })
     }
 
@@ -523,15 +571,19 @@ impl RpcServer {
     /// 3. Swap processing and warmup pools
     /// 4. Reset state for new active group
     ///
-    /// Returns (sequence_number, old_group_connections) if a switch occurred.
-    pub fn perform_context_switch(&mut self) -> Result<Option<(u64, Vec<ConnectionId>)>> {
+    /// Returns sequence_number if a switch occurred. The old group connections
+    /// are stored in self.conn_buf for use by the caller.
+    pub fn perform_context_switch(&mut self) -> Result<Option<u64>> {
         if !self.scheduler.should_switch() {
             return Ok(None);
         }
 
-        // Step 1: Get connections in the current (soon to be old) group
-        let old_group_connections: Vec<ConnectionId> =
-            self.scheduler.current_group_connections().to_vec();
+        // Step 1: Copy connections to reusable buffer (no allocation)
+        {
+            let mut conn_buf = self.conn_buf.borrow_mut();
+            conn_buf.clear();
+            conn_buf.extend_from_slice(self.scheduler.current_group_connections());
+        }
 
         // Step 2: Perform the actual context switch in scheduler
         let seq = self.scheduler.context_switch();
@@ -542,7 +594,7 @@ impl RpcServer {
         // Step 4: Clear the new warmup pool for incoming requests
         self.clear_pool_valid_flags(&self.warmup_pool);
 
-        Ok(Some((seq, old_group_connections)))
+        Ok(Some(seq))
     }
 
     /// Clear valid flags in all slots of a pool.
@@ -589,13 +641,13 @@ impl RpcServer {
         let mut processed = 0;
 
         for request in requests {
-            // Get the slot for zero-copy response
-            let slot = match self.processing_pool.get_slot(request.slot_index) {
+            // Get the response_pool slot for zero-copy response building
+            let slot = match self.response_pool.get_slot(request.slot_index) {
                 Some(s) => s,
                 None => continue,
             };
 
-            // Get response buffer
+            // Get response buffer in response_pool
             let slot_ptr = slot.data_ptr();
             let response_buf = unsafe {
                 let buf_ptr = slot_ptr.add(ResponseHeader::SIZE);
@@ -603,7 +655,7 @@ impl RpcServer {
                 std::slice::from_raw_parts_mut(buf_ptr, buf_len)
             };
 
-            let (status, response_len) = handler(request.rpc_type, &request.payload, response_buf);
+            let (status, response_len) = handler(request.rpc_type, request.payload(), response_buf);
 
             if let Err(e) = self.send_response_zero_copy(&request, status, response_len) {
                 eprintln!("Failed to send response: {}", e);
@@ -628,9 +680,10 @@ impl RpcServer {
         let mut total_processed = 0;
 
         // Check if we need to context switch
-        if let Some((seq, old_connections)) = self.perform_context_switch()? {
+        if let Some(seq) = self.perform_context_switch()? {
             // Notify old group's clients (fetched_seq=0 for time-based switches)
-            if let Err(e) = self.notify_context_switch(&old_connections, seq, 0) {
+            // conn_buf contains old connections from perform_context_switch
+            if let Err(e) = self.notify_context_switch(&self.conn_buf.borrow(), seq, 0) {
                 eprintln!("Failed to notify context switch: {}", e);
             }
         }
@@ -985,16 +1038,10 @@ impl RpcServer {
         // Read the full request header
         let header = unsafe { RequestHeader::read_from(slot_ptr) };
 
-        // Valid request found - extract payload
+        // Zero-copy: get pointer to payload in processing pool
+        // Response will be built in separate response_pool, so no overlap
         let payload_len = header.payload_len as usize;
-        let payload = if payload_len > 0 {
-            unsafe {
-                let payload_ptr = slot_ptr.add(RequestHeader::SIZE);
-                std::slice::from_raw_parts(payload_ptr, payload_len).to_vec()
-            }
-        } else {
-            Vec::new()
-        };
+        let payload_ptr = unsafe { slot_ptr.add(RequestHeader::SIZE) };
 
         // Clear the valid flag to mark as processed
         unsafe {
@@ -1009,7 +1056,8 @@ impl RpcServer {
         Some(IncomingRequest {
             req_id: header.req_id,
             rpc_type: header.rpc_type,
-            payload,
+            payload_ptr,
+            payload_len,
             client_slot_addr: header.client_slot_addr,
             client_slot_rkey: header.client_slot_rkey,
             conn_id,
@@ -1032,9 +1080,9 @@ impl RpcServer {
     /// * `status` - Response status code
     /// * `payload` - Response payload data
     ///
-    /// Per the ScaleRPC paper (Section 3.3), the message pool is "stateless" and
-    /// slots become obsolete immediately after a request is processed. Therefore,
-    /// we reuse the same slot where the request was received for sending the response.
+    /// Per the ScaleRPC paper, response is built in the response_pool (separate from
+    /// processing_pool) and then RDMA WRITEd to the client. This enables zero-copy
+    /// request handling since request payload remains valid in processing_pool.
     ///
     /// If a context switch event is pending for this connection, it will be
     /// piggybacked on the response (ScaleRPC optimization).
@@ -1051,19 +1099,19 @@ impl RpcServer {
             .and_then(|c| c.as_ref())
             .ok_or(Error::ConnectionNotFound(request.conn_id))?;
 
-        // Reuse the request slot for the response (per ScaleRPC paper Section 3.3)
+        // Use response_pool (separate from processing_pool) for building response
         let slot = self
-            .processing_pool
+            .response_pool
             .get_slot(request.slot_index)
             .ok_or(Error::Protocol(format!(
-                "slot {} not found",
+                "response slot {} not found",
                 request.slot_index
             )))?;
         let slot_data_addr = self
-            .processing_pool
+            .response_pool
             .slot_data_addr(request.slot_index)
             .ok_or(Error::Protocol(format!(
-                "slot {} addr not found",
+                "response slot {} addr not found",
                 request.slot_index
             )))?;
 
@@ -1088,7 +1136,7 @@ impl RpcServer {
             ResponseHeader::new(request.req_id, status, payload.len() as u32)
         };
 
-        // Write response to slot
+        // Write response to response_pool slot
         let slot_data_ptr = slot.data_ptr();
         unsafe {
             response_header.write_to(slot_data_ptr);
@@ -1101,7 +1149,7 @@ impl RpcServer {
             }
         }
 
-        // Send response via RDMA WRITE
+        // Send response via RDMA WRITE to client
         let total_len = ResponseHeader::SIZE + payload.len();
         {
             let qp_ref = conn.qp().borrow();
@@ -1116,7 +1164,7 @@ impl RpcServer {
                 sge: {
                     addr: slot_data_addr,
                     len: total_len as u32,
-                    lkey: self.processing_pool.lkey()
+                    lkey: self.response_pool.lkey()
                 },
                 signaled: request.req_id,
             })
@@ -1154,19 +1202,19 @@ impl RpcServer {
             .and_then(|c| c.as_ref())
             .ok_or(Error::ConnectionNotFound(request.conn_id))?;
 
-        // Reuse the request slot for the response
+        // Use response_pool slot (payload already written by caller)
         let slot = self
-            .processing_pool
+            .response_pool
             .get_slot(request.slot_index)
             .ok_or(Error::Protocol(format!(
-                "slot {} not found",
+                "response slot {} not found",
                 request.slot_index
             )))?;
         let slot_data_addr = self
-            .processing_pool
+            .response_pool
             .slot_data_addr(request.slot_index)
             .ok_or(Error::Protocol(format!(
-                "slot {} addr not found",
+                "response slot {} addr not found",
                 request.slot_index
             )))?;
 
@@ -1195,7 +1243,7 @@ impl RpcServer {
             response_header.write_to(slot.data_ptr());
         }
 
-        // Send response via RDMA WRITE
+        // Send response via RDMA WRITE to client
         let total_len = ResponseHeader::SIZE + payload_len;
         {
             let qp_ref = conn.qp().borrow();
@@ -1210,7 +1258,7 @@ impl RpcServer {
                 sge: {
                     addr: slot_data_addr,
                     len: total_len as u32,
-                    lkey: self.processing_pool.lkey()
+                    lkey: self.response_pool.lkey()
                 },
                 signaled: request.req_id,
             })
@@ -1238,13 +1286,13 @@ impl RpcServer {
         let mut processed = 0;
 
         while let Some(request) = self.poll_request() {
-            // Get the slot for zero-copy response
-            let slot = match self.processing_pool.get_slot(request.slot_index) {
+            // Get the response_pool slot for zero-copy response building
+            let slot = match self.response_pool.get_slot(request.slot_index) {
                 Some(s) => s,
                 None => continue,
             };
 
-            // Get response buffer (after ResponseHeader)
+            // Get response buffer in response_pool (after ResponseHeader)
             let slot_ptr = slot.data_ptr();
             let response_buf = unsafe {
                 let buf_ptr = slot_ptr.add(ResponseHeader::SIZE);
@@ -1252,10 +1300,10 @@ impl RpcServer {
                 std::slice::from_raw_parts_mut(buf_ptr, buf_len)
             };
 
-            // Call handler with zero-copy buffer
-            let (status, response_len) = handler(request.rpc_type, &request.payload, response_buf);
+            // Call handler with request payload (zero-copy from processing_pool)
+            let (status, response_len) = handler(request.rpc_type, request.payload(), response_buf);
 
-            // Send response (header only, payload already in slot)
+            // Send response (header only, payload already in response_pool slot)
             if let Err(e) = self.send_response_zero_copy(&request, status, response_len) {
                 eprintln!("Failed to send response: {}", e);
             }
@@ -1380,15 +1428,19 @@ impl RpcServer {
         let _did_switch = if fetched > 0 {
             // Force context switch to make fetched requests available for processing
             let seq = self.scheduler.do_context_switch();
-            let old_conns: Vec<ConnectionId> = self.scheduler.current_group_connections().to_vec();
+            {
+                let mut conn_buf = self.conn_buf.borrow_mut();
+                conn_buf.clear();
+                conn_buf.extend_from_slice(self.scheduler.current_group_connections());
+            }
             std::mem::swap(&mut self.processing_pool, &mut self.warmup_pool);
             self.clear_pool_valid_flags(&self.warmup_pool);
             // Reset ring buffer pointers for new Process mode session
-            self.reset_next_expected_slots(&old_conns);
-            let _ = self.notify_context_switch(&old_conns, seq, fetched_seq);
+            self.reset_next_expected_slots(&self.conn_buf.borrow());
+            let _ = self.notify_context_switch(&self.conn_buf.borrow(), seq, fetched_seq);
             true
-        } else if let Ok(Some((seq, old_conns))) = self.perform_context_switch() {
-            let _ = self.notify_context_switch(&old_conns, seq, 0);
+        } else if let Ok(Some(seq)) = self.perform_context_switch() {
+            let _ = self.notify_context_switch(&self.conn_buf.borrow(), seq, 0);
             true
         } else {
             false
@@ -1399,13 +1451,13 @@ impl RpcServer {
         let mut requests_processed = 0;
         if self.handler.is_some() {
             while let Some(request) = self.recv() {
-                // Get the slot for zero-copy response
-                let slot = match self.processing_pool.get_slot(request.slot_index) {
+                // Get the response_pool slot for zero-copy response building
+                let slot = match self.response_pool.get_slot(request.slot_index) {
                     Some(s) => s,
                     None => continue,
                 };
 
-                // Get response buffer
+                // Get response buffer in response_pool
                 let slot_ptr = slot.data_ptr();
                 let response_buf = unsafe {
                     let buf_ptr = slot_ptr.add(ResponseHeader::SIZE);
@@ -1414,7 +1466,7 @@ impl RpcServer {
                 };
 
                 if let Some(handler) = &self.handler {
-                    let (status, response_len) = handler(request.rpc_type, &request.payload, response_buf);
+                    let (status, response_len) = handler(request.rpc_type, request.payload(), response_buf);
                     if self.reply_zero_copy(&request, status, response_len).is_ok() {
                         requests_processed += 1;
                     }
@@ -1456,11 +1508,17 @@ impl RpcServer {
         let mut fetched = 0;
         let mut last_seq = 0u32;
 
-        // Get connections in the next (warmup) group
-        let warmup_conn_ids: Vec<ConnectionId> =
-            self.scheduler.next_group_connections().to_vec();
+        // Copy connections to reusable buffer (no allocation)
+        {
+            let mut conn_buf = self.conn_buf.borrow_mut();
+            conn_buf.clear();
+            conn_buf.extend_from_slice(self.scheduler.next_group_connections());
+        }
 
-        for conn_id in warmup_conn_ids {
+        // Iterate by index to avoid borrow conflicts
+        let num_conns = self.conn_buf.borrow().len();
+        for i in 0..num_conns {
+            let conn_id = self.conn_buf.borrow()[i];
             // Check if this connection has a new batch via endpoint entry
             let entry_opt = self.endpoint_entries.as_mut().and_then(|e| e.has_new_batch(conn_id));
             let entry = match entry_opt {
@@ -1617,7 +1675,7 @@ impl RpcServer {
         requests
     }
 
-    /// Check a warmup pool slot for a request.
+    /// Check a warmup pool slot for a request (zero-copy).
     fn check_warmup_slot(&self, slot_index: usize) -> Option<IncomingRequest> {
         let slot = self.warmup_pool.get_slot(slot_index)?;
         let data_ptr = slot.data_ptr();
@@ -1632,15 +1690,9 @@ impl RpcServer {
                 return None;
             }
 
+            // Zero-copy: get pointer to payload
             let payload_len = header.payload_len as usize;
-            let payload = if payload_len > 0 {
-                unsafe {
-                    let payload_ptr = data_ptr.add(RequestHeader::SIZE);
-                    std::slice::from_raw_parts(payload_ptr, payload_len).to_vec()
-                }
-            } else {
-                Vec::new()
-            };
+            let payload_ptr = unsafe { data_ptr.add(RequestHeader::SIZE) };
 
             // Clear magic
             unsafe {
@@ -1653,7 +1705,8 @@ impl RpcServer {
             return Some(IncomingRequest {
                 req_id: header.req_id,
                 rpc_type: header.rpc_type,
-                payload,
+                payload_ptr,
+                payload_len,
                 client_slot_addr: header.client_slot_addr,
                 client_slot_rkey: header.client_slot_rkey,
                 conn_id,
@@ -1668,15 +1721,9 @@ impl RpcServer {
             return None;
         }
 
+        // Zero-copy: get pointer to payload
         let payload_len = header.payload_len as usize;
-        let payload = if payload_len > 0 {
-            unsafe {
-                let payload_ptr = data_ptr.add(RequestHeader::SIZE);
-                std::slice::from_raw_parts(payload_ptr, payload_len).to_vec()
-            }
-        } else {
-            Vec::new()
-        };
+        let payload_ptr = unsafe { data_ptr.add(RequestHeader::SIZE) };
 
         // Clear both magic and valid
         unsafe {
@@ -1692,7 +1739,8 @@ impl RpcServer {
         Some(IncomingRequest {
             req_id: header.req_id,
             rpc_type: header.rpc_type,
-            payload,
+            payload_ptr,
+            payload_len,
             client_slot_addr: header.client_slot_addr,
             client_slot_rkey: header.client_slot_rkey,
             conn_id,
