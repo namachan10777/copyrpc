@@ -323,6 +323,11 @@ struct ConnectionState {
     send_slots: Vec<usize>,
     /// Next send slot index for call_direct (cycles through send_slots).
     direct_send_slot_index: Cell<usize>,
+    /// Pre-allocated response slots for call_direct (avoids Mutex lock on every call).
+    /// Using ring buffer with response_slot_index to cycle through.
+    response_slots: Vec<usize>,
+    /// Next response slot index for call_direct (cycles through response_slots).
+    response_slot_index: Cell<usize>,
 }
 
 /// RPC Client.
@@ -483,6 +488,19 @@ impl RpcClient {
             }
         }
 
+        // Pre-allocate response slots for call_direct (avoid Mutex lock on every call)
+        // Need enough slots for pipeline depth (typically 64-128)
+        let available = self.pool.free_count();
+        let num_response_slots = std::cmp::min(128, available / 2).max(8);
+        let mut response_slots = Vec::with_capacity(num_response_slots);
+        for _ in 0..num_response_slots {
+            if let Ok(slot) = self.pool.alloc() {
+                response_slots.push(slot.release());
+            } else {
+                break;
+            }
+        }
+
         let conn_state = ConnectionState {
             state: Cell::new(ClientState::Connected),
             warmup_buffer: RefCell::new(warmup_buffer),
@@ -498,6 +516,8 @@ impl RpcClient {
             last_acknowledged_seq: Cell::new(0),
             send_slots,
             direct_send_slot_index: Cell::new(0),
+            response_slots,
+            response_slot_index: Cell::new(0),
         };
 
         self.connections.push(Some(conn));
@@ -924,8 +944,14 @@ impl RpcClient {
             (remote_base_addr, remote_rkey, server_slot_idx)
         };
 
-        // Allocate a response slot
-        let response_slot = self.pool.alloc()?;
+        // Use pre-allocated response slot (ring buffer, no Mutex lock needed)
+        // The ring buffer is sized larger than pipeline depth to avoid reuse before response arrives
+        let response_slot_idx = conn_state.response_slot_index.get() % conn_state.response_slots.len();
+        conn_state.response_slot_index.set(conn_state.response_slot_index.get() + 1);
+        let response_slot_index = conn_state.response_slots[response_slot_idx];
+        let response_slot_addr = self.pool.slot_data_addr(response_slot_index)
+            .ok_or(Error::InvalidSlotIndex(response_slot_index))?;
+
         let req_id = next_req_id();
 
         // Use server_conn_id so server can route response through correct QP
@@ -936,7 +962,7 @@ impl RpcClient {
             req_id,
             rpc_type,
             payload.len() as u16,
-            response_slot.data_addr(),
+            response_slot_addr,
             self.pool.rkey(),
             sender_conn_id,
         );
@@ -1001,7 +1027,7 @@ impl RpcClient {
         // The ring buffer is sized larger than pipeline depth to avoid reuse before WRITE completes.
         Ok(PendingRpc {
             pool: &self.pool,
-            slot_index: response_slot.release(),
+            slot_index: response_slot_index,
             req_id,
             conn_id,
             send_slot_index: None,
