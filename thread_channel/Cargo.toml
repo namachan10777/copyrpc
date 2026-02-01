@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+clap = { version = "4", features = ["derive"], optional = true }
+parquet = { version = "54", optional = true }
+arrow = { version = "54", optional = true }
+
+[features]
+bench-bin = ["clap", "parquet", "arrow"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -11,3 +17,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "comparison"
 harness = false
+
+[[bin]]
+name = "flux_bench"
+required-features = ["bench-bin"]
