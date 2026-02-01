@@ -6,13 +6,34 @@
 
 pub mod flux;
 pub mod mesh;
+pub mod spsc;
 
 pub(crate) mod mpsc;
-pub(crate) mod spsc;
 
 pub use flux::{create_flux, Flux};
 pub use mesh::{create_mesh, Mesh};
 pub use spsc::Serial;
+
+/// A received message, distinguishing between notifications, requests, and responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceivedMessage<T> {
+    /// A one-way notification (no reply expected).
+    Notify(T),
+    /// A request that expects a reply.
+    Request {
+        /// The request number to use when replying.
+        req_num: u64,
+        /// The request data.
+        data: T,
+    },
+    /// A response to a previous call.
+    Response {
+        /// The request number this responds to.
+        req_num: u64,
+        /// The response data.
+        data: T,
+    },
+}
 
 /// Error returned when sending fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

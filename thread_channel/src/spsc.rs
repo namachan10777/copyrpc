@@ -94,7 +94,8 @@ struct RxBlock {
 struct Inner<T> {
     tx: TxBlock,
     rx: RxBlock,
-    cap: usize,
+    /// Bitmask for fast modulo: capacity - 1 (capacity is always power of 2)
+    mask: usize,
     slots: Box<[UnsafeCell<ManuallyDrop<MaybeUninit<T>>>]>,
 }
 
@@ -112,6 +113,8 @@ pub struct Sender<T> {
     inner: Arc<Inner<T>>,
     /// Cached value of head to reduce atomic reads.
     head_cache: usize,
+    /// Local tail position (not yet visible to receiver until flush()).
+    pending_tail: usize,
 }
 
 unsafe impl<T: Send> Send for Sender<T> {}
@@ -119,20 +122,28 @@ unsafe impl<T: Send> Send for Sender<T> {}
 /// The receiving half of a SPSC channel.
 pub struct Receiver<T> {
     inner: Arc<Inner<T>>,
-    /// Cached value of tail to reduce atomic reads.
-    tail_cache: usize,
+    /// Local tail position (updated by sync()).
+    local_tail: usize,
+    /// Local head position (not yet visible to sender until sync()).
+    local_head: usize,
 }
 
 unsafe impl<T: Send> Send for Receiver<T> {}
 
 /// Creates a new SPSC channel with the given capacity.
 ///
+/// The actual capacity will be rounded up to the next power of 2 for performance.
+///
 /// # Panics
 /// Panics if `capacity` is 0.
 pub fn channel<T: Serial>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     assert!(capacity > 0, "channel capacity must be greater than 0");
 
-    let slots: Box<[_]> = (0..capacity)
+    // Round up to next power of 2
+    let cap = capacity.next_power_of_two();
+    let mask = cap - 1;
+
+    let slots: Box<[_]> = (0..cap)
         .map(|_| UnsafeCell::new(ManuallyDrop::new(MaybeUninit::uninit())))
         .collect();
 
@@ -145,37 +156,39 @@ pub fn channel<T: Serial>(capacity: usize) -> (Sender<T>, Receiver<T>) {
             head: AtomicUsize::new(0),
             tx_dead: AtomicBool::new(false),
         },
-        cap: capacity,
+        mask,
         slots,
     });
 
     let sender = Sender {
         inner: Arc::clone(&inner),
         head_cache: 0,
+        pending_tail: 0,
     };
 
     let receiver = Receiver {
         inner,
-        tail_cache: 0,
+        local_tail: 0,
+        local_head: 0,
     };
 
     (sender, receiver)
 }
 
 impl<T: Serial> Sender<T> {
-    /// Attempts to send a value on this channel.
+    /// Writes a value to the channel without making it visible to the receiver.
     ///
-    /// Returns `Err` if the receiver has disconnected.
-    /// Returns `Ok(None)` if the value was sent successfully.
-    /// Returns `Ok(Some(value))` if the channel is full.
-    pub fn try_send(&mut self, value: T) -> Result<Option<T>, SendError<T>> {
+    /// The value is written to the slot but `pending_tail` is only updated locally.
+    /// Call `flush()` to make all written values visible to the receiver.
+    ///
+    /// Returns `Err` if the receiver has disconnected or the channel is full.
+    pub fn write(&mut self, value: T) -> Result<(), SendError<T>> {
         // Check if receiver is dead
         if self.inner.tx.rx_dead.load(Ordering::Relaxed) {
             return Err(SendError(value));
         }
 
-        let tail = self.inner.tx.tail.load(Ordering::Relaxed);
-        let next_tail = (tail + 1) % self.inner.cap;
+        let next_tail = (self.pending_tail + 1) & self.inner.mask;
 
         // Check if we have room using cached head
         if next_tail == self.head_cache {
@@ -183,20 +196,52 @@ impl<T: Serial> Sender<T> {
             self.head_cache = self.inner.rx.head.load(Ordering::Acquire);
             if next_tail == self.head_cache {
                 // Channel is full
-                return Ok(Some(value));
+                return Err(SendError(value));
             }
         }
 
         // Write the value
         unsafe {
-            let slot = &*self.inner.slots[tail].get();
+            let slot = &*self.inner.slots[self.pending_tail].get();
             std::ptr::write(slot.as_ptr() as *mut T, value);
         }
 
-        // Update tail with Release ordering to ensure the write is visible
-        self.inner.tx.tail.store(next_tail, Ordering::Release);
+        // Update local pending_tail (not visible to receiver yet)
+        self.pending_tail = next_tail;
 
-        Ok(None)
+        Ok(())
+    }
+
+    /// Makes all written values visible to the receiver.
+    ///
+    /// This performs an atomic store with Release ordering.
+    #[inline]
+    pub fn flush(&mut self) {
+        self.inner.tx.tail.store(self.pending_tail, Ordering::Release);
+    }
+
+    /// Attempts to send a value on this channel.
+    ///
+    /// This is equivalent to `write()` followed by `flush()`.
+    ///
+    /// Returns `Err` if the receiver has disconnected.
+    /// Returns `Ok(None)` if the value was sent successfully.
+    /// Returns `Ok(Some(value))` if the channel is full.
+    pub fn try_send(&mut self, value: T) -> Result<Option<T>, SendError<T>> {
+        match self.write(value) {
+            Ok(()) => {
+                self.flush();
+                Ok(None)
+            }
+            Err(SendError(v)) => {
+                // Check if it was a disconnect or just full
+                if self.inner.tx.rx_dead.load(Ordering::Relaxed) {
+                    Err(SendError(v))
+                } else {
+                    Ok(Some(v))
+                }
+            }
+        }
     }
 
     /// Sends a value, blocking until space is available.
@@ -229,38 +274,70 @@ impl<T> Drop for Sender<T> {
 }
 
 impl<T: Serial> Receiver<T> {
+    /// Polls for a value without performing any atomic operations.
+    ///
+    /// Returns `Some(value)` if data is available in the local view.
+    /// Returns `None` if no data is available (call `sync()` to update).
+    #[inline]
+    pub fn poll(&mut self) -> Option<T> {
+        if self.local_head == self.local_tail {
+            return None;
+        }
+
+        // Read the value
+        let value = unsafe {
+            let slot = &*self.inner.slots[self.local_head].get();
+            std::ptr::read(slot.as_ptr() as *const T)
+        };
+
+        // Update local head (not visible to sender yet)
+        self.local_head = (self.local_head + 1) & self.inner.mask;
+
+        Some(value)
+    }
+
+    /// Synchronizes with the sender.
+    ///
+    /// This loads the sender's tail (Acquire) and stores our head (Release).
+    #[inline]
+    pub fn sync(&mut self) {
+        // Load sender's tail to see new data
+        self.local_tail = self.inner.tx.tail.load(Ordering::Acquire);
+        // Store our head to notify sender of consumed slots
+        self.inner.rx.head.store(self.local_head, Ordering::Release);
+    }
+
     /// Attempts to receive a value from this channel.
+    ///
+    /// This is equivalent to `sync()` + `poll()` when needed.
     ///
     /// Returns `Err(TryRecvError::Empty)` if the channel is empty.
     /// Returns `Err(TryRecvError::Disconnected)` if the sender has disconnected
     /// and the channel is empty.
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
-        let head = self.inner.rx.head.load(Ordering::Relaxed);
-
-        // Check if we have data using cached tail
-        if head == self.tail_cache {
-            // Cache miss - reload tail
-            self.tail_cache = self.inner.tx.tail.load(Ordering::Acquire);
-            if head == self.tail_cache {
-                // Check if sender is dead
-                if self.inner.rx.tx_dead.load(Ordering::Acquire) {
-                    return Err(TryRecvError::Disconnected);
-                }
-                return Err(TryRecvError::Empty);
-            }
+        // First try without sync
+        if let Some(value) = self.poll() {
+            // Store head to notify sender
+            self.inner.rx.head.store(self.local_head, Ordering::Release);
+            return Ok(value);
         }
 
-        // Read the value
-        let value = unsafe {
-            let slot = &*self.inner.slots[head].get();
-            std::ptr::read(slot.as_ptr() as *const T)
-        };
+        // Need to sync to see if there's new data
+        // Only load tail, don't store head yet (nothing consumed)
+        self.local_tail = self.inner.tx.tail.load(Ordering::Acquire);
 
-        // Update head with Release ordering
-        let next_head = (head + 1) % self.inner.cap;
-        self.inner.rx.head.store(next_head, Ordering::Release);
+        if let Some(value) = self.poll() {
+            // Store head to notify sender
+            self.inner.rx.head.store(self.local_head, Ordering::Release);
+            return Ok(value);
+        }
 
-        Ok(value)
+        // Check if sender is dead
+        if self.inner.rx.tx_dead.load(Ordering::Acquire) {
+            return Err(TryRecvError::Disconnected);
+        }
+
+        Err(TryRecvError::Empty)
     }
 
     /// Receives a value, blocking until one is available.
@@ -355,6 +432,127 @@ mod tests {
         let receiver = std::thread::spawn(move || {
             for i in 0..10000 {
                 assert_eq!(rx.recv().unwrap(), i);
+            }
+        });
+
+        sender.join().unwrap();
+        receiver.join().unwrap();
+    }
+
+    #[test]
+    fn test_write_flush() {
+        let (mut tx, mut rx) = channel::<u32>(8);
+
+        // Write multiple values without flush
+        tx.write(1).unwrap();
+        tx.write(2).unwrap();
+        tx.write(3).unwrap();
+
+        // Receiver should not see any data yet
+        assert!(rx.poll().is_none());
+        rx.sync();
+        assert!(rx.poll().is_none());
+
+        // Flush to make visible
+        tx.flush();
+
+        // Now receiver can see all values
+        rx.sync();
+        assert_eq!(rx.poll(), Some(1));
+        assert_eq!(rx.poll(), Some(2));
+        assert_eq!(rx.poll(), Some(3));
+        assert!(rx.poll().is_none());
+    }
+
+    #[test]
+    fn test_poll_sync() {
+        let (mut tx, mut rx) = channel::<u32>(8);
+
+        // Send some values
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap();
+
+        // poll without sync returns None
+        assert!(rx.poll().is_none());
+
+        // sync then poll
+        rx.sync();
+        assert_eq!(rx.poll(), Some(1));
+        assert_eq!(rx.poll(), Some(2));
+        assert!(rx.poll().is_none());
+
+        // Another sync to notify sender of consumed slots
+        rx.sync();
+    }
+
+    #[test]
+    fn test_batch_send_recv() {
+        let (mut tx, mut rx) = channel::<u64>(64);
+
+        // Batch write
+        for i in 0..32 {
+            tx.write(i).unwrap();
+        }
+        tx.flush();
+
+        // Batch receive
+        rx.sync();
+        let mut received = Vec::new();
+        while let Some(v) = rx.poll() {
+            received.push(v);
+        }
+        rx.sync(); // Notify sender
+
+        assert_eq!(received.len(), 32);
+        for (i, v) in received.iter().enumerate() {
+            assert_eq!(*v, i as u64);
+        }
+    }
+
+    #[test]
+    fn test_write_full() {
+        let (mut tx, mut _rx) = channel::<u32>(2);
+
+        // Fill the channel (capacity - 1 = 1)
+        tx.write(1).unwrap();
+        // Next write should fail with SendError
+        assert!(matches!(tx.write(2), Err(SendError(2))));
+    }
+
+    #[test]
+    fn test_threaded_batch() {
+        let (mut tx, mut rx) = channel::<u64>(1024);
+        const BATCH_SIZE: u64 = 100;
+        const NUM_BATCHES: u64 = 100;
+
+        let sender = std::thread::spawn(move || {
+            for batch in 0..NUM_BATCHES {
+                for i in 0..BATCH_SIZE {
+                    let val = batch * BATCH_SIZE + i;
+                    // Spin until we can write
+                    loop {
+                        match tx.write(val) {
+                            Ok(()) => break,
+                            Err(_) => {
+                                tx.flush(); // Flush pending writes first
+                                std::hint::spin_loop();
+                            }
+                        }
+                    }
+                }
+                tx.flush();
+            }
+        });
+
+        let receiver = std::thread::spawn(move || {
+            let mut expected = 0u64;
+            let total = BATCH_SIZE * NUM_BATCHES;
+            while expected < total {
+                rx.sync();
+                while let Some(v) = rx.poll() {
+                    assert_eq!(v, expected);
+                    expected += 1;
+                }
             }
         });
 
