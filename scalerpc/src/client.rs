@@ -893,11 +893,15 @@ impl RpcClient {
     /// to the server's processing pool, which is more efficient than the warmup
     /// mechanism because it eliminates the RDMA READ from server.
     ///
+    /// Can be called directly for benchmarking pure Process mode performance,
+    /// bypassing the state machine. Ensure the mapping is configured with the
+    /// correct server pool address before calling.
+    ///
     /// # Arguments
     /// * `conn_id` - Connection to use
     /// * `rpc_type` - RPC method identifier
     /// * `payload` - Request payload data
-    fn call_direct(
+    pub fn call_direct(
         &self,
         conn_id: ConnectionId,
         rpc_type: u16,
@@ -929,17 +933,18 @@ impl RpcClient {
                 return Err(Error::Protocol("Remote slot address not configured".into()));
             }
 
-            // Get the slot index to use (cycles through connection's slot range)
+            // Get the slot index to use (cycles through server's pool slots)
+            // For Process mode, we write directly to server's processing pool
+            // which has sequential slots starting from 0
             let num_slots = mapping_entry.slots.len();
             if num_slots == 0 {
                 return Err(Error::NoFreeSlots);
             }
 
-            let slot_idx = conn_state.direct_slot_index.get() % num_slots;
+            // Use sequential server slot indices (0, 1, 2, ...)
+            // direct_slot_index tracks which server slot to write to next
+            let server_slot_idx = conn_state.direct_slot_index.get() % num_slots;
             conn_state.direct_slot_index.set(conn_state.direct_slot_index.get() + 1);
-
-            // Get the server slot index from the mapping
-            let server_slot_idx = mapping_entry.slots[slot_idx];
 
             (remote_base_addr, remote_rkey, server_slot_idx)
         };

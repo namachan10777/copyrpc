@@ -569,3 +569,181 @@ fn test_throughput_4kb() {
     stop_flag.store(true, Ordering::SeqCst);
     server_handle.join().unwrap();
 }
+
+/// Pure Process mode throughput test.
+///
+/// Uses call_direct() to bypass the warmup state machine and measure
+/// raw RDMA WRITE performance without context switch overhead.
+#[test]
+fn test_throughput_process_mode() {
+    let ctx = match TestContext::new() {
+        Some(ctx) => ctx,
+        None => {
+            eprintln!("Skipping test - no RDMA device");
+            return;
+        }
+    };
+
+    // Client pool size must match server pool size for call_direct
+    // because call_direct uses client's mapping slot count to cycle
+    // through server slots
+    let client_config = ClientConfig {
+        pool: PoolConfig {
+            num_slots: 64,  // Must match server's pool size
+            slot_data_size: 4080,
+        },
+        max_connections: 1,
+    };
+
+    let mut client = RpcClient::new(&ctx.pd, client_config).expect("client");
+    let conn_id = client
+        .add_connection(&ctx.ctx, &ctx.pd, ctx.port)
+        .expect("add_connection");
+    let client_endpoint = client.local_endpoint(conn_id).expect("local_endpoint");
+
+    let (server_info_tx, server_info_rx): (Sender<ConnectionInfo>, Receiver<ConnectionInfo>) =
+        mpsc::channel();
+    let (client_info_tx, client_info_rx): (Sender<ConnectionInfo>, Receiver<ConnectionInfo>) =
+        mpsc::channel();
+
+    let server_ready = Arc::new(AtomicU32::new(0));
+    let stop_flag = Arc::new(AtomicBool::new(false));
+
+    let server_ready_clone = server_ready.clone();
+    let stop_flag_clone = stop_flag.clone();
+
+    let server_handle = thread::spawn(move || {
+        let ctx = match TestContext::new() {
+            Some(ctx) => ctx,
+            None => return,
+        };
+
+        let server_config = ServerConfig {
+            pool: PoolConfig {
+                num_slots: 64,
+                slot_data_size: 4080,
+            },
+            num_recv_slots: 64,
+            group: GroupConfig {
+                num_groups: 1,
+                ..Default::default()
+            },
+            max_connections: 1,
+        };
+
+        let mut server = match RpcServer::new(&ctx.pd, server_config) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        server.set_handler(|_rpc_type, payload, response_buf| {
+            let len = payload.len().min(response_buf.len());
+            response_buf[..len].copy_from_slice(&payload[..len]);
+            (0, len)
+        });
+
+        let conn_id = match server.add_connection(&ctx.ctx, &ctx.pd, ctx.port) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        let server_endpoint = server.local_endpoint(conn_id).unwrap();
+        server_info_tx.send(server_endpoint.into()).unwrap();
+
+        let client_info = client_info_rx.recv().unwrap();
+        server.connect(conn_id, client_info.into()).unwrap();
+        server_ready_clone.store(1, Ordering::Release);
+
+        let mut total_processed = 0u64;
+        while !stop_flag_clone.load(Ordering::Relaxed) {
+            let n = server.poll();
+            if n > 0 {
+                total_processed += n as u64;
+            }
+            std::hint::spin_loop();
+        }
+        eprintln!("[server] exiting, total_processed={}", total_processed);
+    });
+
+    client_info_tx.send(client_endpoint.into()).unwrap();
+    let server_info = server_info_rx.recv().unwrap();
+
+    while server_ready.load(Ordering::Acquire) == 0 {
+        std::hint::spin_loop();
+    }
+
+    client.connect(conn_id, server_info.into()).expect("connect");
+
+    let pipeline_depth = std::env::var("SCALERPC_PIPELINE_DEPTH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let total_requests = std::env::var("SCALERPC_TOTAL_REQUESTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10000);
+    let payload = vec![0xAAu8; 32];
+
+    println!("\n=== ScaleRPC Process Mode Throughput Test ===");
+    println!("Pipeline depth: {}", pipeline_depth);
+    println!("Total requests: {}", total_requests);
+
+    let mut pending_requests: Vec<scalerpc::PendingRpc<'_>> =
+        Vec::with_capacity(pipeline_depth);
+    let mut completed = 0usize;
+    let mut sent = 0usize;
+
+    let start = Instant::now();
+
+    // Initial fill using call_direct (bypasses state machine)
+    while sent < pipeline_depth && sent < total_requests {
+        if let Ok(p) = client.call_direct(conn_id, 1, &payload) {
+            pending_requests.push(p);
+            sent += 1;
+        } else {
+            break;
+        }
+    }
+
+    // Batch doorbell for initial fill
+    client.poll();
+
+    // Main loop
+    let timeout = std::time::Duration::from_secs(30);
+    while completed < total_requests {
+        if start.elapsed() > timeout {
+            panic!("Test timed out after {:?}. completed={}, sent={}, pending={}",
+                   timeout, completed, sent, pending_requests.len());
+        }
+
+        let mut i = 0;
+        while i < pending_requests.len() {
+            if client.poll_pending(&pending_requests[i]).is_some() {
+                pending_requests.swap_remove(i);
+                completed += 1;
+
+                // Send new request using call_direct
+                if sent < total_requests {
+                    if let Ok(p) = client.call_direct(conn_id, 1, &payload) {
+                        pending_requests.push(p);
+                        sent += 1;
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+
+        client.poll();
+    }
+
+    let elapsed = start.elapsed();
+    let throughput = completed as f64 / elapsed.as_secs_f64();
+
+    println!("Total time: {:.2?}", elapsed);
+    println!("Throughput: {:.2} KRPS", throughput / 1000.0);
+    println!("Average latency: {:.2} µs", 1_000_000.0 / throughput);
+
+    stop_flag.store(true, Ordering::SeqCst);
+    server_handle.join().unwrap();
+}
