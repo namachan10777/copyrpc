@@ -786,14 +786,13 @@ impl RpcServer {
     ///
     /// Called after context switch when clients transition to Process mode.
     /// Clients start writing from their first slot, so we reset to match.
+    /// Note: next_expected_slot stores position index (0..n-1), not slot value.
     fn reset_next_expected_slots(&self, conn_ids: &[ConnectionId]) {
         let mut next_slots = self.next_expected_slot.borrow_mut();
         for &conn_id in conn_ids {
-            if let Some(entry) = self.mapping.get_connection(conn_id) {
-                if !entry.slots.is_empty() {
-                    if conn_id < next_slots.len() {
-                        next_slots[conn_id] = entry.slots[0];
-                    }
+            if self.mapping.get_connection(conn_id).is_some() {
+                if conn_id < next_slots.len() {
+                    next_slots[conn_id] = 0; // Reset to first position
                 }
             }
         }
@@ -860,13 +859,13 @@ impl RpcServer {
         // Add to scheduler
         self.scheduler.add_connection(conn_id);
 
-        // Initialize ring buffer polling state
+        // Initialize ring buffer polling state (stores position index, not slot value)
         {
             let mut next_slots = self.next_expected_slot.borrow_mut();
             if conn_id >= next_slots.len() {
                 next_slots.resize(conn_id + 1, 0);
             }
-            next_slots[conn_id] = start_slot; // Start at first slot of this connection
+            next_slots[conn_id] = 0; // Start at first position (index 0 in entry.slots)
         }
 
         Ok(conn_id)
@@ -995,15 +994,15 @@ impl RpcServer {
                     continue;
                 }
 
-                // Get next expected slot for this connection
-                let next_slot = next_slots.get(conn_id).copied().unwrap_or(entry.slots[0]);
+                // Get next expected slot position (index into entry.slots array)
+                let slot_pos = next_slots.get(conn_id).copied().unwrap_or(0) % entry.slots.len();
+                let next_slot = entry.slots[slot_pos];
 
                 if let Some(request) = self.check_slot_for_request(next_slot) {
-                    // Advance to next slot in ring buffer
-                    let slot_pos = entry.slots.iter().position(|&s| s == next_slot).unwrap_or(0);
+                    // Advance to next position in ring buffer - O(1)
                     let next_pos = (slot_pos + 1) % entry.slots.len();
                     if conn_id < next_slots.len() {
-                        next_slots[conn_id] = entry.slots[next_pos];
+                        next_slots[conn_id] = next_pos;
                     }
                     return Some(request);
                 }
@@ -1011,14 +1010,13 @@ impl RpcServer {
                 // Fallback: if ring buffer is out of sync, scan all slots
                 // This can happen during high-throughput scenarios where client and server
                 // slot indices diverge due to timing
-                for &slot in &entry.slots {
-                    if slot != next_slot {
+                for (idx, &slot) in entry.slots.iter().enumerate() {
+                    if idx != slot_pos {
                         if let Some(request) = self.check_slot_for_request(slot) {
-                            // Resync ring buffer
-                            let slot_pos = entry.slots.iter().position(|&s| s == slot).unwrap_or(0);
-                            let next_pos = (slot_pos + 1) % entry.slots.len();
+                            // Resync ring buffer - advance to next position
+                            let next_pos = (idx + 1) % entry.slots.len();
                             if conn_id < next_slots.len() {
-                                next_slots[conn_id] = entry.slots[next_pos];
+                                next_slots[conn_id] = next_pos;
                             }
                             return Some(request);
                         }
