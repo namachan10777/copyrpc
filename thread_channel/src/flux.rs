@@ -2,15 +2,20 @@
 //!
 //! Each node pair has a dedicated SPSC channel, providing zero-contention
 //! communication at the cost of O(N^2) memory usage.
+//!
+//! This module uses a batch-oriented API:
+//! - `call()` / `reply()` write to the buffer without flushing
+//! - `flush()` makes all written messages visible to peers
+//! - `poll()` receives messages (auto-syncs when empty)
+//! - `sync()` explicitly synchronizes with all peers
 
-use crate::spsc::{self, Serial, TryRecvError};
-use crate::{ReceivedMessage, RecvError, SendError};
+use crate::spsc::{self, Serial};
+use crate::{ReceivedMessage, SendError};
 
 /// Message kind for internal protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 enum MessageKind {
-    Notify = 0,
     Request = 1,
     Response = 2,
 }
@@ -35,34 +40,22 @@ struct FluxChannel<T: Serial> {
     rx: spsc::Receiver<Message<T>>,
 }
 
-impl<T: Serial> FluxChannel<T> {
-    fn try_send(&mut self, value: Message<T>) -> Result<(), SendError<Message<T>>> {
-        match self.tx.try_send(value) {
-            Ok(None) => Ok(()),
-            Ok(Some(v)) => Err(SendError::Full(v)),
-            Err(spsc::SendError(v)) => Err(SendError::Disconnected(v)),
-        }
-    }
-
-    fn send(&mut self, value: Message<T>) -> Result<(), SendError<Message<T>>> {
-        self.tx
-            .send(value)
-            .map_err(|spsc::SendError(v)| SendError::Disconnected(v))
-    }
-
-    fn try_recv(&mut self) -> Result<Message<T>, TryRecvError> {
-        self.rx.try_recv()
-    }
-}
-
 /// A node in a Flux network.
 ///
 /// Each node can send to and receive from any other node through dedicated
 /// SPSC channels.
+///
+/// ## API Overview
+///
+/// - `call(to, value)` - Write a request to peer (returns request number)
+/// - `reply(to, req_num, value)` - Write a reply to peer
+/// - `flush()` - Make all written messages visible to peers
+/// - `poll()` - Receive a message (auto-syncs when empty)
+/// - `sync()` - Explicitly synchronize with all peers
 pub struct Flux<T: Serial> {
     id: usize,
     channels: Vec<FluxChannel<T>>,
-    /// Round-robin index for try_recv
+    /// Round-robin index for poll
     recv_index: usize,
     /// Next request number for call()
     next_req_num: u64,
@@ -79,189 +72,13 @@ impl<T: Serial + Send> Flux<T> {
         self.channels.len()
     }
 
-    /// Attempts to send a one-way notification to a specific peer.
-    pub fn try_notify(&mut self, to: usize, value: T) -> Result<(), SendError<T>> {
-        let msg = Message {
-            kind: MessageKind::Notify,
-            req_num: 0,
-            data: value,
-        };
-        match self.channels.iter_mut().find(|c| c.peer_id == to) {
-            Some(ch) => ch.try_send(msg).map_err(|e| match e {
-                SendError::Full(m) => SendError::Full(m.data),
-                SendError::Disconnected(m) => SendError::Disconnected(m.data),
-                SendError::InvalidPeer(m) => SendError::InvalidPeer(m.data),
-            }),
-            None => Err(SendError::InvalidPeer(value)),
-        }
-    }
-
-    /// Sends a one-way notification to a specific peer, blocking until space is available.
-    pub fn notify(&mut self, to: usize, value: T) -> Result<(), SendError<T>> {
-        let msg = Message {
-            kind: MessageKind::Notify,
-            req_num: 0,
-            data: value,
-        };
-        match self.channels.iter_mut().find(|c| c.peer_id == to) {
-            Some(ch) => ch.send(msg).map_err(|e| match e {
-                SendError::Full(m) => SendError::Full(m.data),
-                SendError::Disconnected(m) => SendError::Disconnected(m.data),
-                SendError::InvalidPeer(m) => SendError::InvalidPeer(m.data),
-            }),
-            None => Err(SendError::InvalidPeer(value)),
-        }
-    }
-
-    /// Attempts to send a request to a specific peer.
-    ///
-    /// Returns the request number on success, which can be used to match the response.
-    pub fn try_call(&mut self, to: usize, value: T) -> Result<u64, SendError<T>> {
-        let req_num = self.next_req_num;
-        let msg = Message {
-            kind: MessageKind::Request,
-            req_num,
-            data: value,
-        };
-        match self.channels.iter_mut().find(|c| c.peer_id == to) {
-            Some(ch) => match ch.try_send(msg) {
-                Ok(()) => {
-                    self.next_req_num = self.next_req_num.wrapping_add(1);
-                    Ok(req_num)
-                }
-                Err(e) => Err(match e {
-                    SendError::Full(m) => SendError::Full(m.data),
-                    SendError::Disconnected(m) => SendError::Disconnected(m.data),
-                    SendError::InvalidPeer(m) => SendError::InvalidPeer(m.data),
-                }),
-            },
-            None => Err(SendError::InvalidPeer(value)),
-        }
-    }
-
-    /// Sends a request to a specific peer, blocking until space is available.
-    ///
-    /// Returns the request number on success, which can be used to match the response.
-    pub fn call(&mut self, to: usize, value: T) -> Result<u64, SendError<T>> {
-        let req_num = self.next_req_num;
-        let msg = Message {
-            kind: MessageKind::Request,
-            req_num,
-            data: value,
-        };
-        match self.channels.iter_mut().find(|c| c.peer_id == to) {
-            Some(ch) => match ch.send(msg) {
-                Ok(()) => {
-                    self.next_req_num = self.next_req_num.wrapping_add(1);
-                    Ok(req_num)
-                }
-                Err(e) => Err(match e {
-                    SendError::Full(m) => SendError::Full(m.data),
-                    SendError::Disconnected(m) => SendError::Disconnected(m.data),
-                    SendError::InvalidPeer(m) => SendError::InvalidPeer(m.data),
-                }),
-            },
-            None => Err(SendError::InvalidPeer(value)),
-        }
-    }
-
-    /// Attempts to send a reply to a previous request.
-    pub fn try_reply(&mut self, to: usize, req_num: u64, value: T) -> Result<(), SendError<T>> {
-        let msg = Message {
-            kind: MessageKind::Response,
-            req_num,
-            data: value,
-        };
-        match self.channels.iter_mut().find(|c| c.peer_id == to) {
-            Some(ch) => ch.try_send(msg).map_err(|e| match e {
-                SendError::Full(m) => SendError::Full(m.data),
-                SendError::Disconnected(m) => SendError::Disconnected(m.data),
-                SendError::InvalidPeer(m) => SendError::InvalidPeer(m.data),
-            }),
-            None => Err(SendError::InvalidPeer(value)),
-        }
-    }
-
-    /// Sends a reply to a previous request, blocking until space is available.
-    pub fn reply(&mut self, to: usize, req_num: u64, value: T) -> Result<(), SendError<T>> {
-        let msg = Message {
-            kind: MessageKind::Response,
-            req_num,
-            data: value,
-        };
-        match self.channels.iter_mut().find(|c| c.peer_id == to) {
-            Some(ch) => ch.send(msg).map_err(|e| match e {
-                SendError::Full(m) => SendError::Full(m.data),
-                SendError::Disconnected(m) => SendError::Disconnected(m.data),
-                SendError::InvalidPeer(m) => SendError::InvalidPeer(m.data),
-            }),
-            None => Err(SendError::InvalidPeer(value)),
-        }
-    }
-
-    /// Attempts to receive a message from any peer (round-robin).
-    ///
-    /// Returns the peer ID and the received message if successful.
-    pub fn try_recv(&mut self) -> Result<(usize, ReceivedMessage<T>), RecvError> {
-        let n = self.channels.len();
-        if n == 0 {
-            return Err(RecvError::Empty);
-        }
-
-        for _ in 0..n {
-            let idx = self.recv_index;
-            // Avoid expensive div instruction by using conditional branch
-            self.recv_index += 1;
-            if self.recv_index >= n {
-                self.recv_index = 0;
-            }
-
-            match self.channels[idx].try_recv() {
-                Ok(msg) => {
-                    let peer_id = self.channels[idx].peer_id;
-                    let received = match msg.kind {
-                        MessageKind::Notify => ReceivedMessage::Notify(msg.data),
-                        MessageKind::Request => ReceivedMessage::Request {
-                            req_num: msg.req_num,
-                            data: msg.data,
-                        },
-                        MessageKind::Response => ReceivedMessage::Response {
-                            req_num: msg.req_num,
-                            data: msg.data,
-                        },
-                    };
-                    return Ok((peer_id, received));
-                }
-                Err(TryRecvError::Empty) => continue,
-                Err(TryRecvError::Disconnected) => continue,
-            }
-        }
-
-        Err(RecvError::Empty)
-    }
-
-    /// Receives a message from any peer (round-robin), blocking until one is available.
-    ///
-    /// Returns the peer ID and the received message if successful.
-    pub fn recv(&mut self) -> Result<(usize, ReceivedMessage<T>), RecvError> {
-        loop {
-            match self.try_recv() {
-                Ok(v) => return Ok(v),
-                Err(RecvError::Empty) => std::hint::spin_loop(),
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    // === Batch API ===
-
     /// Writes a call to the specified peer without making it visible yet.
     ///
     /// The message is written to the slot but not flushed. Call `flush()` to make
     /// all written messages visible to peers.
     ///
     /// Returns the request number on success.
-    pub fn write_call(&mut self, to: usize, value: T) -> Result<u64, SendError<T>> {
+    pub fn call(&mut self, to: usize, value: T) -> Result<u64, SendError<T>> {
         let req_num = self.next_req_num;
         let msg = Message {
             kind: MessageKind::Request,
@@ -283,7 +100,7 @@ impl<T: Serial + Send> Flux<T> {
     /// Writes a reply to the specified peer without making it visible yet.
     ///
     /// Call `flush()` to make all written messages visible to peers.
-    pub fn write_reply(&mut self, to: usize, req_num: u64, value: T) -> Result<(), SendError<T>> {
+    pub fn reply(&mut self, to: usize, req_num: u64, value: T) -> Result<(), SendError<T>> {
         let msg = Message {
             kind: MessageKind::Response,
             req_num,
@@ -314,15 +131,44 @@ impl<T: Serial + Send> Flux<T> {
         }
     }
 
-    /// Polls for a message from any peer without atomic operations (round-robin).
+    /// Polls for a message from any peer (round-robin).
     ///
-    /// Must call `sync()` first to update the local view of available data.
+    /// Automatically syncs when all channels appear empty, so you don't need
+    /// to call `sync()` before `poll()`.
+    ///
     /// Returns the peer ID and the received message if data is available.
     pub fn poll(&mut self) -> Option<(usize, ReceivedMessage<T>)> {
         let n = self.channels.len();
         if n == 0 {
             return None;
         }
+
+        // First pass: check local views
+        for _ in 0..n {
+            let idx = self.recv_index;
+            self.recv_index += 1;
+            if self.recv_index >= n {
+                self.recv_index = 0;
+            }
+
+            if let Some(msg) = self.channels[idx].rx.poll() {
+                let peer_id = self.channels[idx].peer_id;
+                let received = match msg.kind {
+                    MessageKind::Request => ReceivedMessage::Request {
+                        req_num: msg.req_num,
+                        data: msg.data,
+                    },
+                    MessageKind::Response => ReceivedMessage::Response {
+                        req_num: msg.req_num,
+                        data: msg.data,
+                    },
+                };
+                return Some((peer_id, received));
+            }
+        }
+
+        // All channels empty in local view, sync and try again
+        self.sync();
 
         for _ in 0..n {
             let idx = self.recv_index;
@@ -334,7 +180,6 @@ impl<T: Serial + Send> Flux<T> {
             if let Some(msg) = self.channels[idx].rx.poll() {
                 let peer_id = self.channels[idx].peer_id;
                 let received = match msg.kind {
-                    MessageKind::Notify => ReceivedMessage::Notify(msg.data),
                     MessageKind::Request => ReceivedMessage::Request {
                         req_num: msg.req_num,
                         data: msg.data,
@@ -427,39 +272,26 @@ mod tests {
     }
 
     #[test]
-    fn test_notify_recv() {
-        let mut nodes: Vec<Flux<u32>> = create_flux(2, 16);
-
-        nodes[0].notify(1, 42).unwrap();
-        let (from, msg) = nodes[1].recv().unwrap();
-        assert_eq!(from, 0);
-        assert_eq!(msg, ReceivedMessage::Notify(42));
-
-        nodes[1].notify(0, 123).unwrap();
-        let (from, msg) = nodes[0].recv().unwrap();
-        assert_eq!(from, 1);
-        assert_eq!(msg, ReceivedMessage::Notify(123));
-    }
-
-    #[test]
     fn test_call_reply() {
         let mut nodes: Vec<Flux<u32>> = create_flux(2, 16);
 
         let req_num = nodes[0].call(1, 42).unwrap();
+        nodes[0].flush();
         assert_eq!(req_num, 0);
 
-        let (from, msg) = nodes[1].recv().unwrap();
+        let (from, msg) = nodes[1].poll().unwrap();
         assert_eq!(from, 0);
         match msg {
             ReceivedMessage::Request { req_num: r, data } => {
                 assert_eq!(r, 0);
                 assert_eq!(data, 42);
                 nodes[1].reply(0, r, data + 1).unwrap();
+                nodes[1].flush();
             }
             _ => panic!("expected Request"),
         }
 
-        let (from, msg) = nodes[0].recv().unwrap();
+        let (from, msg) = nodes[0].poll().unwrap();
         assert_eq!(from, 1);
         match msg {
             ReceivedMessage::Response { req_num: r, data } => {
@@ -471,16 +303,21 @@ mod tests {
     }
 
     #[test]
-    fn test_try_recv_round_robin() {
+    fn test_poll_round_robin() {
         let mut nodes: Vec<Flux<u32>> = create_flux(3, 16);
 
         // Node 1 and 2 both send to node 0
-        nodes[1].notify(0, 100).unwrap();
-        nodes[2].notify(0, 200).unwrap();
+        nodes[1].call(0, 100).unwrap();
+        nodes[1].flush();
+        nodes[2].call(0, 200).unwrap();
+        nodes[2].flush();
 
         let mut received = Vec::new();
-        while let Ok((from, ReceivedMessage::Notify(val))) = nodes[0].try_recv() {
-            received.push((from, val));
+        while let Some((from, ReceivedMessage::Request { data, .. })) = nodes[0].poll() {
+            received.push((from, data));
+            if received.len() >= 2 {
+                break;
+            }
         }
 
         assert_eq!(received.len(), 2);
@@ -493,7 +330,7 @@ mod tests {
         let mut nodes: Vec<Flux<u32>> = create_flux(2, 16);
 
         assert!(matches!(
-            nodes[0].try_notify(5, 42),
+            nodes[0].call(5, 42),
             Err(SendError::InvalidPeer(42))
         ));
     }
@@ -514,19 +351,27 @@ mod tests {
                 for peer in 0..n {
                     if peer != id {
                         for i in 0..100 {
-                            node.notify(peer, (id * 1000 + i) as u64).unwrap();
+                            loop {
+                                match node.call(peer, (id * 1000 + i) as u64) {
+                                    Ok(_) => break,
+                                    Err(SendError::Full(_)) => {
+                                        node.flush();
+                                        std::hint::spin_loop();
+                                    }
+                                    Err(e) => panic!("send error: {:?}", e),
+                                }
+                            }
                         }
                     }
                 }
+                node.flush();
 
                 // Receive from all peers
                 let mut count = 0;
                 let expected = (n - 1) * 100;
                 while count < expected {
-                    match node.try_recv() {
-                        Ok(_) => count += 1,
-                        Err(RecvError::Empty) => std::hint::spin_loop(),
-                        Err(RecvError::Disconnected) => panic!("disconnected"),
+                    if node.poll().is_some() {
+                        count += 1;
                     }
                 }
 
@@ -576,7 +421,7 @@ mod tests {
                             // Try to flush pending replies first
                             let old_pending = pending_replies.len();
                             pending_replies.retain(|&(to, req_num, data)| {
-                                node.try_reply(to, req_num, data).is_err()
+                                node.reply(to, req_num, data).is_err()
                             });
                             sent_replies += (old_pending - pending_replies.len()) as u64;
 
@@ -585,31 +430,32 @@ mod tests {
                                 if sent_per_peer[peer] < iterations {
                                     let in_flight = sent_per_peer[peer] - completed_per_peer[peer];
                                     if in_flight < max_in_flight {
-                                        if node.try_call(peer, sent_per_peer[peer]).is_ok() {
+                                        if node.call(peer, sent_per_peer[peer]).is_ok() {
                                             sent_per_peer[peer] += 1;
                                         }
                                     }
                                 }
                             }
+                            node.flush();
 
                             // Process received messages
-                            loop {
-                                match node.try_recv() {
-                                    Ok((from, ReceivedMessage::Request { req_num, data })) => {
-                                        if node.try_reply(from, req_num, data).is_ok() {
+                            while let Some((from, msg)) = node.poll() {
+                                match msg {
+                                    ReceivedMessage::Request { req_num, data } => {
+                                        if node.reply(from, req_num, data).is_ok() {
                                             sent_replies += 1;
                                         } else {
                                             pending_replies.push((from, req_num, data));
                                         }
                                     }
-                                    Ok((from, ReceivedMessage::Response { .. })) => {
+                                    ReceivedMessage::Response { .. } => {
                                         completed_per_peer[from] += 1;
                                         completed += 1;
                                     }
-                                    Ok((_, ReceivedMessage::Notify(_))) => {}
-                                    Err(_) => break,
+                                    ReceivedMessage::Notify(_) => {}
                                 }
                             }
+                            node.flush();
                         }
 
                         // Wait for all threads to complete before dropping node

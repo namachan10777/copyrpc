@@ -10,7 +10,7 @@
 # ]
 # ///
 """
-Visualize Flux benchmark results.
+Visualize Flux vs Mesh benchmark results.
 
 Usage:
     ./visualize.py [--output-dir DIR]
@@ -38,115 +38,133 @@ def load_results(bench_dir: Path) -> pl.DataFrame:
 
 def create_throughput_chart(df: pl.DataFrame) -> alt.Chart:
     """Create throughput vs threads chart."""
-    # Create label for each configuration
-    df_labeled = df.with_columns(
-        pl.when(pl.col("api") == "legacy")
-        .then(pl.lit("Legacy API"))
-        .otherwise(pl.concat_str([pl.lit("Batch (size="), pl.col("batch_size").cast(pl.Utf8), pl.lit(")")]))
-        .alias("config")
-    )
-
     chart = (
-        alt.Chart(df_labeled.to_pandas())
+        alt.Chart(df.to_pandas())
         .mark_line(point=True)
         .encode(
-            x=alt.X("threads:Q", title="Number of Threads", scale=alt.Scale(domain=[2, 24])),
+            x=alt.X("threads:Q", title="Number of Threads", scale=alt.Scale(domain=[2, 26])),
             y=alt.Y("throughput_mops_mean:Q", title="Throughput (Mops/s)"),
-            color=alt.Color("config:N", title="Configuration"),
-            strokeDash=alt.StrokeDash("config:N"),
+            color=alt.Color("implementation:N", title="Implementation",
+                          scale=alt.Scale(domain=["flux", "mesh"],
+                                         range=["#1f77b4", "#ff7f0e"])),
+            strokeDash=alt.StrokeDash("implementation:N"),
         )
-        .properties(title="Flux All-to-All Throughput", width=600, height=400)
+        .properties(title="All-to-All Throughput: Flux vs Mesh", width=600, height=400)
     )
     return chart
 
 
 def create_latency_chart(df: pl.DataFrame) -> alt.Chart:
     """Create latency vs threads chart."""
-    df_labeled = df.with_columns(
-        pl.when(pl.col("api") == "legacy")
-        .then(pl.lit("Legacy API"))
-        .otherwise(pl.concat_str([pl.lit("Batch (size="), pl.col("batch_size").cast(pl.Utf8), pl.lit(")")]))
-        .alias("config")
-    )
-
     chart = (
-        alt.Chart(df_labeled.to_pandas())
+        alt.Chart(df.to_pandas())
         .mark_line(point=True)
         .encode(
-            x=alt.X("threads:Q", title="Number of Threads", scale=alt.Scale(domain=[2, 24])),
+            x=alt.X("threads:Q", title="Number of Threads", scale=alt.Scale(domain=[2, 26])),
             y=alt.Y("latency_ns_mean:Q", title="Latency (ns/call)"),
-            color=alt.Color("config:N", title="Configuration"),
-            strokeDash=alt.StrokeDash("config:N"),
+            color=alt.Color("implementation:N", title="Implementation",
+                          scale=alt.Scale(domain=["flux", "mesh"],
+                                         range=["#1f77b4", "#ff7f0e"])),
+            strokeDash=alt.StrokeDash("implementation:N"),
         )
-        .properties(title="Flux All-to-All Latency", width=600, height=400)
+        .properties(title="All-to-All Latency: Flux vs Mesh", width=600, height=400)
     )
     return chart
 
 
 def create_duration_chart(df: pl.DataFrame) -> alt.Chart:
     """Create duration vs threads chart with error bars."""
-    df_labeled = df.with_columns(
+    df_with_ms = df.with_columns(
         [
-            pl.when(pl.col("api") == "legacy")
-            .then(pl.lit("Legacy API"))
-            .otherwise(pl.concat_str([pl.lit("Batch (size="), pl.col("batch_size").cast(pl.Utf8), pl.lit(")")]))
-            .alias("config"),
             (pl.col("duration_ns_mean") / 1_000_000).alias("duration_ms_mean"),
             (pl.col("duration_ns_min") / 1_000_000).alias("duration_ms_min"),
             (pl.col("duration_ns_max") / 1_000_000).alias("duration_ms_max"),
         ]
     )
 
-    base = alt.Chart(df_labeled.to_pandas())
+    base = alt.Chart(df_with_ms.to_pandas())
 
     line = base.mark_line(point=True).encode(
-        x=alt.X("threads:Q", title="Number of Threads", scale=alt.Scale(domain=[2, 24])),
+        x=alt.X("threads:Q", title="Number of Threads", scale=alt.Scale(domain=[2, 18])),
         y=alt.Y("duration_ms_mean:Q", title="Duration (ms)"),
-        color=alt.Color("config:N", title="Configuration"),
+        color=alt.Color("implementation:N", title="Implementation",
+                       scale=alt.Scale(domain=["flux", "mesh"],
+                                      range=["#1f77b4", "#ff7f0e"])),
     )
 
     error_bars = base.mark_errorbar().encode(
         x=alt.X("threads:Q"),
         y=alt.Y("duration_ms_min:Q", title="Duration (ms)"),
         y2=alt.Y2("duration_ms_max:Q"),
-        color=alt.Color("config:N"),
+        color=alt.Color("implementation:N"),
     )
 
-    chart = (line + error_bars).properties(title="Flux All-to-All Duration", width=600, height=400)
+    chart = (line + error_bars).properties(title="All-to-All Duration: Flux vs Mesh", width=600, height=400)
     return chart
 
 
 def create_scaling_chart(df: pl.DataFrame) -> alt.Chart:
     """Create scaling efficiency chart (throughput / total_calls)."""
-    df_labeled = df.with_columns(
-        [
-            pl.when(pl.col("api") == "legacy")
-            .then(pl.lit("Legacy API"))
-            .otherwise(pl.concat_str([pl.lit("Batch (size="), pl.col("batch_size").cast(pl.Utf8), pl.lit(")")]))
-            .alias("config"),
-            # Normalize throughput by number of thread pairs: n*(n-1)
-            (pl.col("throughput_mops_mean") / (pl.col("threads") * (pl.col("threads") - 1))).alias(
-                "throughput_per_pair"
-            ),
-        ]
+    df_with_scaling = df.with_columns(
+        # Normalize throughput by number of thread pairs: n*(n-1)
+        (pl.col("throughput_mops_mean") / (pl.col("threads") * (pl.col("threads") - 1))).alias(
+            "throughput_per_pair"
+        ),
     )
 
     chart = (
-        alt.Chart(df_labeled.to_pandas())
+        alt.Chart(df_with_scaling.to_pandas())
         .mark_line(point=True)
         .encode(
-            x=alt.X("threads:Q", title="Number of Threads", scale=alt.Scale(domain=[2, 24])),
+            x=alt.X("threads:Q", title="Number of Threads", scale=alt.Scale(domain=[2, 26])),
             y=alt.Y("throughput_per_pair:Q", title="Throughput per Thread Pair (Mops/s)"),
-            color=alt.Color("config:N", title="Configuration"),
-            strokeDash=alt.StrokeDash("config:N"),
+            color=alt.Color("implementation:N", title="Implementation",
+                          scale=alt.Scale(domain=["flux", "mesh"],
+                                         range=["#1f77b4", "#ff7f0e"])),
+            strokeDash=alt.StrokeDash("implementation:N"),
         )
-        .properties(title="Flux Scaling Efficiency", width=600, height=400)
+        .properties(title="Scaling Efficiency: Flux vs Mesh", width=600, height=400)
     )
     return chart
 
 
+def create_speedup_chart(df: pl.DataFrame) -> alt.Chart:
+    """Create Flux speedup over Mesh chart."""
+    # Pivot to get flux and mesh throughput side by side
+    flux_df = df.filter(pl.col("implementation") == "flux").select(
+        ["threads", pl.col("throughput_mops_mean").alias("flux_throughput")]
+    )
+    mesh_df = df.filter(pl.col("implementation") == "mesh").select(
+        ["threads", pl.col("throughput_mops_mean").alias("mesh_throughput")]
+    )
+
+    speedup_df = flux_df.join(mesh_df, on="threads").with_columns(
+        (pl.col("flux_throughput") / pl.col("mesh_throughput")).alias("speedup")
+    )
+
+    chart = (
+        alt.Chart(speedup_df.to_pandas())
+        .mark_bar()
+        .encode(
+            x=alt.X("threads:O", title="Number of Threads"),
+            y=alt.Y("speedup:Q", title="Speedup (Flux / Mesh)"),
+            color=alt.condition(
+                alt.datum.speedup >= 1,
+                alt.value("#2ca02c"),  # green if flux is faster
+                alt.value("#d62728"),  # red if mesh is faster
+            ),
+        )
+        .properties(title="Flux Speedup over Mesh", width=600, height=400)
+    )
+
+    # Add reference line at y=1
+    rule = alt.Chart(pl.DataFrame({"y": [1.0]}).to_pandas()).mark_rule(strokeDash=[4, 4], color="gray").encode(y="y:Q")
+
+    return chart + rule
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Visualize Flux benchmark results")
+    parser = argparse.ArgumentParser(description="Visualize Flux vs Mesh benchmark results")
     parser.add_argument(
         "--bench-dir",
         type=Path,
@@ -176,6 +194,7 @@ def main():
         ("latency", create_latency_chart(df)),
         ("duration", create_duration_chart(df)),
         ("scaling", create_scaling_chart(df)),
+        ("speedup", create_speedup_chart(df)),
     ]
 
     for name, chart in charts:
@@ -189,7 +208,7 @@ def main():
     throughput_chart = create_throughput_chart(df)
     latency_chart = create_latency_chart(df)
     combined = alt.vconcat(throughput_chart, latency_chart).properties(
-        title="Flux All-to-All Benchmark Results"
+        title="Flux vs Mesh Benchmark Results"
     )
     combined_path = output_dir / "combined.svg"
     combined_png_path = output_dir / "combined.png"

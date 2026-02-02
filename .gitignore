@@ -24,3 +24,11 @@ target
 # Linux perf data
 *.data
 *.data.old
+
+# Image files
+*.png
+*.svg
+*.pdf
+
+# Benchmark results
+thread_channel/bench_results/

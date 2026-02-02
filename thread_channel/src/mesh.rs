@@ -5,11 +5,23 @@
 //! nodes send to the same target.
 
 use crate::mpsc::{self, MpscReceiver, MpscSender};
-use crate::{RecvError, SendError};
+use crate::spsc::Serial;
+use crate::{ReceivedMessage, RecvError, SendError};
+
+/// Message kind for internal protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum MessageKind {
+    Notify = 0,
+    Request = 1,
+    Response = 2,
+}
 
 /// A message tagged with the sender's ID (internal).
 struct TaggedMessage<T> {
     from: usize,
+    kind: MessageKind,
+    req_num: u64,
     data: T,
 }
 
@@ -21,9 +33,10 @@ pub struct Mesh<T> {
     num_nodes: usize,
     rx: MpscReceiver<TaggedMessage<T>>,
     txs: Vec<Option<MpscSender<TaggedMessage<T>>>>,
+    next_req_num: u64,
 }
 
-impl<T: Send> Mesh<T> {
+impl<T: Serial + Send> Mesh<T> {
     /// Returns this node's ID.
     pub fn id(&self) -> usize {
         self.id
@@ -34,8 +47,8 @@ impl<T: Send> Mesh<T> {
         self.num_nodes - 1
     }
 
-    /// Sends a value to a specific peer.
-    pub fn send(&self, to: usize, value: T) -> Result<(), SendError<T>> {
+    /// Sends a one-way notification to a specific peer.
+    pub fn notify(&self, to: usize, value: T) -> Result<(), SendError<T>> {
         if to >= self.num_nodes || to == self.id {
             return Err(SendError::InvalidPeer(value));
         }
@@ -44,6 +57,8 @@ impl<T: Send> Mesh<T> {
             Some(tx) => tx
                 .send(TaggedMessage {
                     from: self.id,
+                    kind: MessageKind::Notify,
+                    req_num: 0,
                     data: value,
                 })
                 .map_err(|mpsc::SendError(msg)| SendError::Disconnected(msg.data)),
@@ -51,21 +66,92 @@ impl<T: Send> Mesh<T> {
         }
     }
 
-    /// Attempts to receive a value from any peer.
+    /// Sends a request to a specific peer.
     ///
-    /// Returns the sender's ID and the value if successful.
-    pub fn try_recv(&mut self) -> Result<(usize, T), RecvError> {
+    /// Returns the request number on success, which can be used to match the response.
+    pub fn call(&mut self, to: usize, value: T) -> Result<u64, SendError<T>> {
+        if to >= self.num_nodes || to == self.id {
+            return Err(SendError::InvalidPeer(value));
+        }
+
+        let req_num = self.next_req_num;
+        match &self.txs[to] {
+            Some(tx) => match tx.send(TaggedMessage {
+                from: self.id,
+                kind: MessageKind::Request,
+                req_num,
+                data: value,
+            }) {
+                Ok(()) => {
+                    self.next_req_num = self.next_req_num.wrapping_add(1);
+                    Ok(req_num)
+                }
+                Err(mpsc::SendError(msg)) => Err(SendError::Disconnected(msg.data)),
+            },
+            None => Err(SendError::InvalidPeer(value)),
+        }
+    }
+
+    /// Sends a reply to a previous request.
+    pub fn reply(&self, to: usize, req_num: u64, value: T) -> Result<(), SendError<T>> {
+        if to >= self.num_nodes || to == self.id {
+            return Err(SendError::InvalidPeer(value));
+        }
+
+        match &self.txs[to] {
+            Some(tx) => tx
+                .send(TaggedMessage {
+                    from: self.id,
+                    kind: MessageKind::Response,
+                    req_num,
+                    data: value,
+                })
+                .map_err(|mpsc::SendError(msg)| SendError::Disconnected(msg.data)),
+            None => Err(SendError::InvalidPeer(value)),
+        }
+    }
+
+    /// Attempts to receive a message from any peer.
+    ///
+    /// Returns the sender's ID and the received message if successful.
+    pub fn try_recv(&mut self) -> Result<(usize, ReceivedMessage<T>), RecvError> {
         match self.rx.try_recv() {
-            Ok(msg) => Ok((msg.from, msg.data)),
+            Ok(msg) => {
+                let received = match msg.kind {
+                    MessageKind::Notify => ReceivedMessage::Notify(msg.data),
+                    MessageKind::Request => ReceivedMessage::Request {
+                        req_num: msg.req_num,
+                        data: msg.data,
+                    },
+                    MessageKind::Response => ReceivedMessage::Response {
+                        req_num: msg.req_num,
+                        data: msg.data,
+                    },
+                };
+                Ok((msg.from, received))
+            }
             Err(mpsc::TryRecvError::Empty) => Err(RecvError::Empty),
             Err(mpsc::TryRecvError::Disconnected) => Err(RecvError::Disconnected),
         }
     }
 
-    /// Receives a value from any peer, blocking until one is available.
-    pub fn recv(&mut self) -> Result<(usize, T), RecvError> {
+    /// Receives a message from any peer, blocking until one is available.
+    pub fn recv(&mut self) -> Result<(usize, ReceivedMessage<T>), RecvError> {
         match self.rx.recv() {
-            Ok(msg) => Ok((msg.from, msg.data)),
+            Ok(msg) => {
+                let received = match msg.kind {
+                    MessageKind::Notify => ReceivedMessage::Notify(msg.data),
+                    MessageKind::Request => ReceivedMessage::Request {
+                        req_num: msg.req_num,
+                        data: msg.data,
+                    },
+                    MessageKind::Response => ReceivedMessage::Response {
+                        req_num: msg.req_num,
+                        data: msg.data,
+                    },
+                };
+                Ok((msg.from, received))
+            }
             Err(mpsc::TryRecvError::Empty) => Err(RecvError::Empty),
             Err(mpsc::TryRecvError::Disconnected) => Err(RecvError::Disconnected),
         }
@@ -79,7 +165,7 @@ impl<T: Send> Mesh<T> {
 ///
 /// # Panics
 /// Panics if `n` is 0.
-pub fn create_mesh<T: Send>(n: usize) -> Vec<Mesh<T>> {
+pub fn create_mesh<T: Serial + Send>(n: usize) -> Vec<Mesh<T>> {
     assert!(n > 0, "must have at least one node");
 
     // Create receivers and collect senders
@@ -109,6 +195,7 @@ pub fn create_mesh<T: Send>(n: usize) -> Vec<Mesh<T>> {
             num_nodes: n,
             rx,
             txs,
+            next_req_num: 0,
         })
         .collect()
 }
@@ -127,14 +214,43 @@ mod tests {
     }
 
     #[test]
-    fn test_send_recv() {
+    fn test_notify_recv() {
         let mut nodes: Vec<Mesh<u32>> = create_mesh(2);
 
-        nodes[0].send(1, 42).unwrap();
-        assert_eq!(nodes[1].try_recv().unwrap(), (0, 42));
+        nodes[0].notify(1, 42).unwrap();
+        assert_eq!(nodes[1].try_recv().unwrap(), (0, ReceivedMessage::Notify(42)));
 
-        nodes[1].send(0, 123).unwrap();
-        assert_eq!(nodes[0].try_recv().unwrap(), (1, 123));
+        nodes[1].notify(0, 123).unwrap();
+        assert_eq!(nodes[0].try_recv().unwrap(), (1, ReceivedMessage::Notify(123)));
+    }
+
+    #[test]
+    fn test_call_reply() {
+        let mut nodes: Vec<Mesh<u32>> = create_mesh(2);
+
+        let req_num = nodes[0].call(1, 42).unwrap();
+        assert_eq!(req_num, 0);
+
+        let (from, msg) = nodes[1].recv().unwrap();
+        assert_eq!(from, 0);
+        match msg {
+            ReceivedMessage::Request { req_num: r, data } => {
+                assert_eq!(r, 0);
+                assert_eq!(data, 42);
+                nodes[1].reply(0, r, data + 1).unwrap();
+            }
+            _ => panic!("expected Request"),
+        }
+
+        let (from, msg) = nodes[0].recv().unwrap();
+        assert_eq!(from, 1);
+        match msg {
+            ReceivedMessage::Response { req_num: r, data } => {
+                assert_eq!(r, 0);
+                assert_eq!(data, 43);
+            }
+            _ => panic!("expected Response"),
+        }
     }
 
     #[test]
@@ -142,14 +258,14 @@ mod tests {
         let mut nodes: Vec<Mesh<u32>> = create_mesh(3);
 
         // Nodes 1 and 2 both send to node 0
-        nodes[1].send(0, 100).unwrap();
-        nodes[2].send(0, 200).unwrap();
+        nodes[1].notify(0, 100).unwrap();
+        nodes[2].notify(0, 200).unwrap();
 
         let mut received = Vec::new();
         for _ in 0..2 {
             match nodes[0].try_recv() {
-                Ok((from, val)) => received.push((from, val)),
-                Err(_) => break,
+                Ok((from, ReceivedMessage::Notify(val))) => received.push((from, val)),
+                _ => break,
             }
         }
 
@@ -163,11 +279,11 @@ mod tests {
         let nodes: Vec<Mesh<u32>> = create_mesh(2);
 
         assert!(matches!(
-            nodes[0].send(5, 42),
+            nodes[0].notify(5, 42),
             Err(SendError::InvalidPeer(42))
         ));
         assert!(matches!(
-            nodes[0].send(0, 42),
+            nodes[0].notify(0, 42),
             Err(SendError::InvalidPeer(42))
         )); // Can't send to self
     }
@@ -188,7 +304,7 @@ mod tests {
                 for peer in 0..n {
                     if peer != id {
                         for i in 0..100 {
-                            node.send(peer, (id * 1000 + i) as u64).unwrap();
+                            node.notify(peer, (id * 1000 + i) as u64).unwrap();
                         }
                     }
                 }

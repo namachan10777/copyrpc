@@ -1,28 +1,90 @@
 //! Integration tests for Flux (SPSC-based n-to-n).
 
 use std::thread;
-use thread_channel::{create_flux, Flux, RecvError, SendError};
+use thread_channel::{create_flux, Flux, ReceivedMessage, SendError};
 
 #[test]
 fn test_two_node_communication() {
     let mut nodes: Vec<Flux<u32>> = create_flux(2, 64);
 
     // Node 0 -> Node 1
-    nodes[0].send(1, 100).unwrap();
-    nodes[0].send(1, 200).unwrap();
+    nodes[0].call(1, 100).unwrap();
+    nodes[0].call(1, 200).unwrap();
+    nodes[0].flush();
 
-    let (from, val) = nodes[1].recv().unwrap();
+    let (from, msg) = nodes[1].poll().unwrap();
     assert_eq!(from, 0);
-    assert_eq!(val, 100);
-    let (from, val) = nodes[1].recv().unwrap();
+    assert!(matches!(msg, ReceivedMessage::Request { data: 100, .. }));
+    let (from, msg) = nodes[1].poll().unwrap();
     assert_eq!(from, 0);
-    assert_eq!(val, 200);
+    assert!(matches!(msg, ReceivedMessage::Request { data: 200, .. }));
 
     // Node 1 -> Node 0
-    nodes[1].send(0, 300).unwrap();
-    let (from, val) = nodes[0].recv().unwrap();
+    nodes[1].call(0, 300).unwrap();
+    nodes[1].flush();
+    let (from, msg) = nodes[0].poll().unwrap();
     assert_eq!(from, 1);
-    assert_eq!(val, 300);
+    assert!(matches!(msg, ReceivedMessage::Request { data: 300, .. }));
+}
+
+#[test]
+fn test_call_reply() {
+    let mut nodes: Vec<Flux<u32>> = create_flux(2, 64);
+
+    // Node 0 calls Node 1
+    let req_num = nodes[0].call(1, 42).unwrap();
+    nodes[0].flush();
+    assert_eq!(req_num, 0);
+
+    // Second call should have different req_num
+    let req_num2 = nodes[0].call(1, 43).unwrap();
+    nodes[0].flush();
+    assert_eq!(req_num2, 1);
+
+    // Node 1 receives requests and replies
+    let (from, msg) = nodes[1].poll().unwrap();
+    assert_eq!(from, 0);
+    match msg {
+        ReceivedMessage::Request { req_num: r, data } => {
+            assert_eq!(r, 0);
+            assert_eq!(data, 42);
+            nodes[1].reply(0, r, data * 2).unwrap();
+        }
+        _ => panic!("expected Request"),
+    }
+
+    let (from, msg) = nodes[1].poll().unwrap();
+    assert_eq!(from, 0);
+    match msg {
+        ReceivedMessage::Request { req_num: r, data } => {
+            assert_eq!(r, 1);
+            assert_eq!(data, 43);
+            nodes[1].reply(0, r, data * 2).unwrap();
+        }
+        _ => panic!("expected Request"),
+    }
+    nodes[1].flush();
+
+    // Node 0 receives responses
+    let (from, msg) = nodes[0].poll().unwrap();
+    assert_eq!(from, 1);
+    match msg {
+        ReceivedMessage::Response { req_num: r, data } => {
+            assert_eq!(r, 0);
+            assert_eq!(data, 84);
+        }
+        _ => panic!("expected Response"),
+    }
+
+    let (from, msg) = nodes[0].poll().unwrap();
+    assert_eq!(from, 1);
+    match msg {
+        ReceivedMessage::Response { req_num: r, data } => {
+            assert_eq!(r, 1);
+            assert_eq!(data, 86);
+        }
+        _ => panic!("expected Response"),
+    }
 }
 
 #[test]
@@ -34,19 +96,25 @@ fn test_all_to_all() {
     for i in 0..n {
         for j in 0..n {
             if i != j {
-                nodes[i].send(j, (i, j)).unwrap();
+                nodes[i].call(j, (i, j)).unwrap();
             }
         }
+        nodes[i].flush();
     }
 
     // Each node receives from all other nodes
     for i in 0..n {
         let mut received = Vec::new();
         for _ in 0..(n - 1) {
-            let (from, val) = nodes[i].recv().unwrap();
-            assert_eq!(from, val.0);
-            assert_eq!(i, val.1);
-            received.push(from);
+            let (from, msg) = nodes[i].poll().unwrap();
+            match msg {
+                ReceivedMessage::Request { data: (sender, receiver), .. } => {
+                    assert_eq!(from, sender);
+                    assert_eq!(i, receiver);
+                    received.push(from);
+                }
+                _ => panic!("expected Request"),
+            }
         }
         received.sort();
         let expected: Vec<usize> = (0..n).filter(|&j| j != i).collect();
@@ -55,18 +123,24 @@ fn test_all_to_all() {
 }
 
 #[test]
-fn test_round_robin_recv() {
+fn test_round_robin_poll() {
     let mut nodes: Vec<Flux<usize>> = create_flux(4, 64);
 
     // Nodes 1, 2, 3 all send to node 0
-    nodes[1].send(0, 1).unwrap();
-    nodes[2].send(0, 2).unwrap();
-    nodes[3].send(0, 3).unwrap();
+    nodes[1].call(0, 1).unwrap();
+    nodes[1].flush();
+    nodes[2].call(0, 2).unwrap();
+    nodes[2].flush();
+    nodes[3].call(0, 3).unwrap();
+    nodes[3].flush();
 
     let mut received = Vec::new();
     for _ in 0..3 {
-        let (from, val) = nodes[0].try_recv().unwrap();
-        received.push((from, val));
+        let (from, msg) = nodes[0].poll().unwrap();
+        match msg {
+            ReceivedMessage::Request { data: val, .. } => received.push((from, val)),
+            _ => panic!("expected Request"),
+        }
     }
 
     // Should have received from all three
@@ -75,7 +149,7 @@ fn test_round_robin_recv() {
     assert!(received.contains(&(3, 3)));
 
     // Channel should be empty now
-    assert!(matches!(nodes[0].try_recv(), Err(RecvError::Empty)));
+    assert!(nodes[0].poll().is_none());
 }
 
 #[test]
@@ -83,10 +157,10 @@ fn test_channel_full() {
     let mut nodes: Vec<Flux<u32>> = create_flux(2, 2); // Very small capacity
 
     // Fill the channel (capacity 2 = 1 slot usable)
-    assert!(nodes[0].try_send(1, 1).is_ok());
+    assert!(nodes[0].call(1, 1).is_ok());
 
     // Second send should fail with Full
-    match nodes[0].try_send(1, 2) {
+    match nodes[0].call(1, 2) {
         Err(SendError::Full(2)) => {}
         other => panic!("expected Full error, got {:?}", other),
     }
@@ -98,13 +172,13 @@ fn test_invalid_peer() {
 
     // Send to non-existent peer
     assert!(matches!(
-        nodes[0].try_send(10, 42),
+        nodes[0].call(10, 42),
         Err(SendError::InvalidPeer(42))
     ));
 
     // Cannot send to self
     assert!(matches!(
-        nodes[0].try_send(0, 42),
+        nodes[0].call(0, 42),
         Err(SendError::InvalidPeer(42))
     ));
 }
@@ -126,9 +200,10 @@ fn test_threaded_all_to_all() {
                     if peer != id {
                         for i in 0..msgs_per_pair {
                             loop {
-                                match node.try_send(peer, id as u64 * 1_000_000 + i as u64) {
-                                    Ok(()) => break,
+                                match node.call(peer, id as u64 * 1_000_000 + i as u64) {
+                                    Ok(_) => break,
                                     Err(SendError::Full(_)) => {
+                                        node.flush();
                                         std::hint::spin_loop();
                                     }
                                     Err(e) => panic!("send error: {:?}", e),
@@ -137,18 +212,15 @@ fn test_threaded_all_to_all() {
                         }
                     }
                 }
+                node.flush();
 
                 // Receive from all peers
                 let expected = (n - 1) * msgs_per_pair;
                 let mut count = 0;
                 while count < expected {
-                    match node.try_recv() {
-                        Ok((from, val)) => {
-                            assert_eq!(val / 1_000_000, from as u64);
-                            count += 1;
-                        }
-                        Err(RecvError::Empty) => std::hint::spin_loop(),
-                        Err(e) => panic!("recv error: {:?}", e),
+                    if let Some((from, ReceivedMessage::Request { data: val, .. })) = node.poll() {
+                        assert_eq!(val / 1_000_000, from as u64);
+                        count += 1;
                     }
                 }
 
@@ -181,33 +253,28 @@ fn test_ping_pong_pairs() {
                 if id < partner {
                     // Initiator
                     for i in 0..iterations {
-                        node.send(partner, i).unwrap();
+                        let req_num = node.call(partner, i).unwrap();
+                        node.flush();
                         loop {
-                            match node.try_recv() {
-                                Ok((from, v)) => {
-                                    assert_eq!(from, partner);
-                                    assert_eq!(v, i);
-                                    break;
-                                }
-                                Err(RecvError::Empty) => std::hint::spin_loop(),
-                                Err(e) => panic!("recv error: {:?}", e),
+                            if let Some((from, ReceivedMessage::Response { req_num: r, data })) = node.poll() {
+                                assert_eq!(from, partner);
+                                assert_eq!(r, req_num);
+                                assert_eq!(data, i);
+                                break;
                             }
                         }
                     }
                 } else {
                     // Responder
                     for _ in 0..iterations {
-                        let v = loop {
-                            match node.try_recv() {
-                                Ok((from, v)) => {
-                                    assert_eq!(from, partner);
-                                    break v;
-                                }
-                                Err(RecvError::Empty) => std::hint::spin_loop(),
-                                Err(e) => panic!("recv error: {:?}", e),
+                        let (from, req_num, v) = loop {
+                            if let Some((from, ReceivedMessage::Request { req_num, data })) = node.poll() {
+                                assert_eq!(from, partner);
+                                break (from, req_num, data);
                             }
                         };
-                        node.send(partner, v).unwrap();
+                        node.reply(from, req_num, v).unwrap();
+                        node.flush();
                     }
                 }
             })

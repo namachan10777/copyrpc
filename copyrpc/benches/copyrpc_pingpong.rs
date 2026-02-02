@@ -44,7 +44,7 @@ const SERVER_CORE: usize = 1;
 // =============================================================================
 
 const NUM_ENDPOINTS: usize = 8;
-const REQUESTS_PER_EP: usize = 1024;
+const REQUESTS_PER_EP: usize = 256;
 const MESSAGE_SIZE: usize = 32;
 const RING_SIZE: usize = 1 << 20; // 1 MB
 

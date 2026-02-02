@@ -222,46 +222,6 @@ impl<T: Serial> Sender<T> {
         self.inner.tx.tail.store(self.pending_tail, Ordering::Release);
     }
 
-    /// Attempts to send a value on this channel.
-    ///
-    /// This is equivalent to `write()` followed by `flush()`.
-    ///
-    /// Returns `Err` if the receiver has disconnected.
-    /// Returns `Ok(None)` if the value was sent successfully.
-    /// Returns `Ok(Some(value))` if the channel is full.
-    pub fn try_send(&mut self, value: T) -> Result<Option<T>, SendError<T>> {
-        match self.write(value) {
-            Ok(()) => {
-                self.flush();
-                Ok(None)
-            }
-            Err(SendError(v)) => {
-                // Check if it was a disconnect or just full
-                if self.inner.tx.rx_dead.load(Ordering::Relaxed) {
-                    Err(SendError(v))
-                } else {
-                    Ok(Some(v))
-                }
-            }
-        }
-    }
-
-    /// Sends a value, blocking until space is available.
-    ///
-    /// Returns `Err` if the receiver has disconnected.
-    pub fn send(&mut self, mut value: T) -> Result<(), SendError<T>> {
-        loop {
-            match self.try_send(value) {
-                Ok(None) => return Ok(()),
-                Ok(Some(v)) => {
-                    value = v;
-                    std::hint::spin_loop();
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
     /// Returns true if the receiver has disconnected.
     #[allow(dead_code)]
     pub fn is_disconnected(&self) -> bool {
@@ -276,14 +236,18 @@ impl<T> Drop for Sender<T> {
 }
 
 impl<T: Serial> Receiver<T> {
-    /// Polls for a value without performing any atomic operations.
+    /// Polls for a value, syncing automatically if the local view is empty.
     ///
-    /// Returns `Some(value)` if data is available in the local view.
-    /// Returns `None` if no data is available (call `sync()` to update).
+    /// Returns `Some(value)` if data is available.
+    /// Returns `None` if no data is available even after sync.
     #[inline]
     pub fn poll(&mut self) -> Option<T> {
         if self.local_head == self.local_tail {
-            return None;
+            // Empty local view, sync to get latest data
+            self.sync();
+            if self.local_head == self.local_tail {
+                return None;
+            }
         }
 
         // Read the value
@@ -342,20 +306,6 @@ impl<T: Serial> Receiver<T> {
         Err(TryRecvError::Empty)
     }
 
-    /// Receives a value, blocking until one is available.
-    ///
-    /// Returns `Err` if the sender has disconnected and the channel is empty.
-    #[allow(dead_code)]
-    pub fn recv(&mut self) -> Result<T, TryRecvError> {
-        loop {
-            match self.try_recv() {
-                Ok(v) => return Ok(v),
-                Err(TryRecvError::Empty) => std::hint::spin_loop(),
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
     /// Returns true if the sender has disconnected.
     #[allow(dead_code)]
     pub fn is_disconnected(&self) -> bool {
@@ -377,8 +327,9 @@ mod tests {
     fn test_send_recv() {
         let (mut tx, mut rx) = channel::<u32>(4);
 
-        assert!(tx.try_send(1).unwrap().is_none());
-        assert!(tx.try_send(2).unwrap().is_none());
+        tx.write(1).unwrap();
+        tx.write(2).unwrap();
+        tx.flush();
 
         assert_eq!(rx.try_recv().unwrap(), 1);
         assert_eq!(rx.try_recv().unwrap(), 2);
@@ -390,15 +341,17 @@ mod tests {
         let (mut tx, mut rx) = channel::<u32>(2);
 
         // Can send one item (capacity - 1 due to ring buffer)
-        assert!(tx.try_send(1).unwrap().is_none());
-        // Second send should indicate full
-        assert!(tx.try_send(2).unwrap().is_some());
+        tx.write(1).unwrap();
+        tx.flush();
+        // Second write should fail (full)
+        assert!(tx.write(2).is_err());
 
         // Receive to make room
         assert_eq!(rx.try_recv().unwrap(), 1);
 
-        // Now can send again
-        assert!(tx.try_send(2).unwrap().is_none());
+        // Now can write again
+        tx.write(2).unwrap();
+        tx.flush();
     }
 
     #[test]
@@ -417,7 +370,7 @@ mod tests {
 
         drop(rx);
 
-        assert!(matches!(tx.try_send(1), Err(SendError(1))));
+        assert!(matches!(tx.write(1), Err(SendError(1))));
         assert!(tx.is_disconnected());
     }
 
@@ -427,13 +380,30 @@ mod tests {
 
         let sender = std::thread::spawn(move || {
             for i in 0..10000 {
-                tx.send(i).unwrap();
+                loop {
+                    match tx.write(i) {
+                        Ok(()) => {
+                            tx.flush();
+                            break;
+                        }
+                        Err(_) => std::hint::spin_loop(),
+                    }
+                }
             }
         });
 
         let receiver = std::thread::spawn(move || {
             for i in 0..10000 {
-                assert_eq!(rx.recv().unwrap(), i);
+                loop {
+                    match rx.try_recv() {
+                        Ok(v) => {
+                            assert_eq!(v, i);
+                            break;
+                        }
+                        Err(TryRecvError::Empty) => std::hint::spin_loop(),
+                        Err(e) => panic!("recv error: {:?}", e),
+                    }
+                }
             }
         });
 
@@ -450,16 +420,13 @@ mod tests {
         tx.write(2).unwrap();
         tx.write(3).unwrap();
 
-        // Receiver should not see any data yet
-        assert!(rx.poll().is_none());
-        rx.sync();
+        // Receiver should not see any data yet (poll auto-syncs but data not flushed)
         assert!(rx.poll().is_none());
 
         // Flush to make visible
         tx.flush();
 
-        // Now receiver can see all values
-        rx.sync();
+        // Now receiver can see all values (poll auto-syncs)
         assert_eq!(rx.poll(), Some(1));
         assert_eq!(rx.poll(), Some(2));
         assert_eq!(rx.poll(), Some(3));
@@ -467,18 +434,15 @@ mod tests {
     }
 
     #[test]
-    fn test_poll_sync() {
+    fn test_poll_auto_sync() {
         let (mut tx, mut rx) = channel::<u32>(8);
 
-        // Send some values
-        tx.try_send(1).unwrap();
-        tx.try_send(2).unwrap();
+        // Write and flush some values
+        tx.write(1).unwrap();
+        tx.write(2).unwrap();
+        tx.flush();
 
-        // poll without sync returns None
-        assert!(rx.poll().is_none());
-
-        // sync then poll
-        rx.sync();
+        // poll auto-syncs and returns values
         assert_eq!(rx.poll(), Some(1));
         assert_eq!(rx.poll(), Some(2));
         assert!(rx.poll().is_none());
@@ -497,13 +461,12 @@ mod tests {
         }
         tx.flush();
 
-        // Batch receive
-        rx.sync();
+        // Batch receive (poll auto-syncs)
         let mut received = Vec::new();
         while let Some(v) = rx.poll() {
             received.push(v);
         }
-        rx.sync(); // Notify sender
+        rx.sync(); // Notify sender of consumed slots
 
         assert_eq!(received.len(), 32);
         for (i, v) in received.iter().enumerate() {
@@ -550,7 +513,7 @@ mod tests {
             let mut expected = 0u64;
             let total = BATCH_SIZE * NUM_BATCHES;
             while expected < total {
-                rx.sync();
+                // poll auto-syncs when empty
                 while let Some(v) = rx.poll() {
                     assert_eq!(v, expected);
                     expected += 1;
