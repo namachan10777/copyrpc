@@ -592,9 +592,14 @@ fn test_throughput_process_mode() {
     // - response_slots: pre-allocated for responses (must be >= pipeline_depth)
     // - mapping slots: must match server's pool size for slot indexing
     // The mapping slots count determines server slot cycling in call_direct.
+    // For deep pipelines (256-1024), use 2048+ slots.
+    let client_pool_size = std::env::var("SCALERPC_CLIENT_POOL_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2048);
     let client_config = ClientConfig {
         pool: PoolConfig {
-            num_slots: 512,  // Large enough for pipeline depth + send slots
+            num_slots: client_pool_size,
             slot_data_size: 4080,
         },
         max_connections: 1,
@@ -696,6 +701,7 @@ fn test_throughput_process_mode() {
     println!("\n=== ScaleRPC Process Mode Throughput Test ===");
     println!("Pipeline depth: {}", pipeline_depth);
     println!("Total requests: {}", total_requests);
+    println!("Client pool slots: {}", client_pool_size);
 
     let mut pending_requests: Vec<scalerpc::PendingRpc<'_>> =
         Vec::with_capacity(pipeline_depth);

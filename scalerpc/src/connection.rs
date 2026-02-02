@@ -110,8 +110,9 @@ impl Connection {
         let port_attr = ctx.query_port(port)?;
 
         // Create QP with shared CQs
+        // Use 2048 WRs to support deep pipelines (up to 1024 depth)
         let qp_config = RcQpConfig {
-            max_send_wr: 256,
+            max_send_wr: 2048,
             max_recv_wr: 256,
             max_send_sge: 4,
             max_recv_sge: 4,
