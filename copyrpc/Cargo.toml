@@ -8,6 +8,14 @@ fastmap = { version = "0.1.0", path = "../fastmap" }
 mlx5 = { version = "0.1.0", path = "../mlx5" }
 mlx5_sys = { version = "0.1.0", path = "../mlx5_sys" }
 slab = "0.4"
+mpi = { version = "0.8", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+parquet = { version = "54", optional = true }
+arrow = { version = "54", optional = true }
+libc = { version = "0.2", optional = true }
+
+[features]
+bench-bin = ["mpi", "clap", "parquet", "arrow", "libc"]
 
 [dev-dependencies]
 criterion = "0.5"
@@ -16,6 +24,10 @@ libc = "0.2"
 [[bench]]
 name = "copyrpc_pingpong"
 harness = false
+
+[[bin]]
+name = "copyrpc_bench"
+required-features = ["bench-bin"]
 
 [lints.clippy]
 manual_div_ceil = "allow"
