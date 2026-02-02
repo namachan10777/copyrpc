@@ -153,6 +153,9 @@ pub struct RequestHeader {
     pub client_slot_rkey: u32,
     /// Sender's connection ID (for multi-QP routing).
     pub sender_conn_id: u32,
+    /// Slot sequence number for credit-based flow control.
+    /// Incremented by client for each request sent via call_direct().
+    pub slot_seq: u64,
 }
 
 impl RequestHeader {
@@ -176,6 +179,29 @@ impl RequestHeader {
             client_slot_addr,
             client_slot_rkey,
             sender_conn_id,
+            slot_seq: 0,
+        }
+    }
+
+    /// Create a new request header with slot sequence for flow control.
+    pub fn new_with_seq(
+        req_id: u64,
+        rpc_type: u16,
+        payload_len: u16,
+        client_slot_addr: u64,
+        client_slot_rkey: u32,
+        sender_conn_id: u32,
+        slot_seq: u64,
+    ) -> Self {
+        Self {
+            magic: REQUEST_MAGIC,
+            req_id,
+            rpc_type,
+            payload_len,
+            client_slot_addr,
+            client_slot_rkey,
+            sender_conn_id,
+            slot_seq,
         }
     }
 
@@ -216,6 +242,11 @@ pub mod response_flags {
     /// When set, the response contains the server's processing pool address and rkey.
     /// The client should update its mapping and transition to Process state.
     pub const FLAG_PROCESSING_POOL_INFO: u32 = 0x2;
+
+    /// Credit acknowledgment flag.
+    /// When set, the response contains acked_slot_seq indicating how many
+    /// slot sequences the server has processed.
+    pub const FLAG_CREDIT_ACK: u32 = 0x4;
 }
 
 /// Response header sent from server to client.
@@ -243,6 +274,10 @@ pub struct ResponseHeader {
     pub processing_pool_rkey: u32,
     /// Padding for alignment.
     pub _padding: u32,
+    /// Acknowledged slot sequence for credit-based flow control.
+    /// Valid when FLAG_CREDIT_ACK is set. Indicates the highest slot_seq
+    /// that the server has processed for this connection.
+    pub acked_slot_seq: u64,
 }
 
 impl ResponseHeader {
@@ -261,6 +296,23 @@ impl ResponseHeader {
             processing_pool_addr: 0,
             processing_pool_rkey: 0,
             _padding: 0,
+            acked_slot_seq: 0,
+        }
+    }
+
+    /// Create a new response header with credit acknowledgment.
+    pub fn with_credit_ack(req_id: u64, status: u32, payload_len: u32, acked_seq: u64) -> Self {
+        Self {
+            magic: RESPONSE_MAGIC,
+            req_id,
+            status,
+            payload_len,
+            flags: response_flags::FLAG_CREDIT_ACK,
+            context_switch_seq: 0,
+            processing_pool_addr: 0,
+            processing_pool_rkey: 0,
+            _padding: 0,
+            acked_slot_seq: acked_seq,
         }
     }
 
@@ -284,6 +336,7 @@ impl ResponseHeader {
             processing_pool_addr: 0,
             processing_pool_rkey: 0,
             _padding: 0,
+            acked_slot_seq: 0,
         }
     }
 
@@ -311,6 +364,57 @@ impl ResponseHeader {
             processing_pool_addr: pool_addr,
             processing_pool_rkey: pool_rkey,
             _padding: 0,
+            acked_slot_seq: 0,
+        }
+    }
+
+    /// Create a new response header with context switch event AND credit acknowledgment.
+    pub fn with_context_switch_and_credit_ack(
+        req_id: u64,
+        status: u32,
+        payload_len: u32,
+        scheduler_seq: u64,
+        fetched_seq: u32,
+        acked_seq: u64,
+    ) -> Self {
+        let context_switch_seq = ((fetched_seq as u64) << 32) | (scheduler_seq as u32 as u64);
+        Self {
+            magic: RESPONSE_MAGIC,
+            req_id,
+            status,
+            payload_len,
+            flags: response_flags::FLAG_CONTEXT_SWITCH | response_flags::FLAG_CREDIT_ACK,
+            context_switch_seq,
+            processing_pool_addr: 0,
+            processing_pool_rkey: 0,
+            _padding: 0,
+            acked_slot_seq: acked_seq,
+        }
+    }
+
+    /// Create a new response header with processing pool info AND credit acknowledgment.
+    pub fn with_processing_pool_info_and_credit_ack(
+        req_id: u64,
+        status: u32,
+        payload_len: u32,
+        scheduler_seq: u64,
+        fetched_seq: u32,
+        pool_addr: u64,
+        pool_rkey: u32,
+        acked_seq: u64,
+    ) -> Self {
+        let context_switch_seq = ((fetched_seq as u64) << 32) | (scheduler_seq as u32 as u64);
+        Self {
+            magic: RESPONSE_MAGIC,
+            req_id,
+            status,
+            payload_len,
+            flags: response_flags::FLAG_CONTEXT_SWITCH | response_flags::FLAG_PROCESSING_POOL_INFO | response_flags::FLAG_CREDIT_ACK,
+            context_switch_seq,
+            processing_pool_addr: pool_addr,
+            processing_pool_rkey: pool_rkey,
+            _padding: 0,
+            acked_slot_seq: acked_seq,
         }
     }
 
@@ -342,6 +446,16 @@ impl ResponseHeader {
     /// Check if the response has processing pool info.
     pub fn has_processing_pool_info(&self) -> bool {
         self.flags & response_flags::FLAG_PROCESSING_POOL_INFO != 0
+    }
+
+    /// Check if the response has credit acknowledgment.
+    pub fn has_credit_ack(&self) -> bool {
+        self.flags & response_flags::FLAG_CREDIT_ACK != 0
+    }
+
+    /// Get the acknowledged slot sequence (valid when has_credit_ack() is true).
+    pub fn get_acked_slot_seq(&self) -> u64 {
+        self.acked_slot_seq
     }
 
     /// Get the scheduler's context switch sequence (valid when has_context_switch() is true).
@@ -522,14 +636,14 @@ mod tests {
 
     #[test]
     fn test_request_header_size() {
-        // Expected size: 4 + 8 + 2 + 2 + 8 + 4 + 4 = 32 bytes
-        assert_eq!(RequestHeader::SIZE, 32);
+        // Expected size: 4 + 8 + 2 + 2 + 8 + 4 + 4 + 8 = 40 bytes
+        assert_eq!(RequestHeader::SIZE, 40);
     }
 
     #[test]
     fn test_response_header_size() {
-        // Expected size: 4 + 8 + 4 + 4 + 4 + 8 + 8 + 4 + 4 = 48 bytes
-        assert_eq!(ResponseHeader::SIZE, 48);
+        // Expected size: 4 + 8 + 4 + 4 + 4 + 8 + 8 + 4 + 4 + 8 = 56 bytes
+        assert_eq!(ResponseHeader::SIZE, 56);
     }
 
     #[test]
@@ -549,6 +663,7 @@ mod tests {
             let client_slot_addr = { read_back.client_slot_addr };
             let client_slot_rkey = { read_back.client_slot_rkey };
             let sender_conn_id = { read_back.sender_conn_id };
+            let slot_seq = { read_back.slot_seq };
             assert_eq!(magic, REQUEST_MAGIC);
             assert_eq!(req_id, 123);
             assert_eq!(rpc_type, 1);
@@ -556,6 +671,21 @@ mod tests {
             assert_eq!(client_slot_addr, 0x1000);
             assert_eq!(client_slot_rkey, 0xABCD);
             assert_eq!(sender_conn_id, 5);
+            assert_eq!(slot_seq, 0); // Default is 0
+        }
+    }
+
+    #[test]
+    fn test_request_header_with_seq() {
+        let header = RequestHeader::new_with_seq(123, 1, 100, 0x1000, 0xABCD, 5, 42);
+        assert!(header.is_valid());
+
+        let mut buf = [0u8; RequestHeader::SIZE];
+        unsafe {
+            header.write_to(buf.as_mut_ptr());
+            let read_back = RequestHeader::read_from(buf.as_ptr());
+            let slot_seq = { read_back.slot_seq };
+            assert_eq!(slot_seq, 42);
         }
     }
 
@@ -717,5 +847,43 @@ mod tests {
         assert_eq!(entry.req_addr, 0);
         assert_eq!(entry.batch_size, 0);
         assert_eq!(entry.seq, 0);
+    }
+
+    #[test]
+    fn test_response_header_with_credit_ack() {
+        let header = ResponseHeader::with_credit_ack(123, 0, 50, 42);
+        assert!(header.is_valid());
+        assert!(header.is_success());
+        assert!(header.has_credit_ack());
+        assert!(!header.has_context_switch());
+        assert_eq!(header.get_acked_slot_seq(), 42);
+
+        let mut buf = [0u8; ResponseHeader::SIZE];
+        unsafe {
+            header.write_to(buf.as_mut_ptr());
+            let read_back = ResponseHeader::read_from(buf.as_ptr());
+            let flags = { read_back.flags };
+            assert_eq!(flags, response_flags::FLAG_CREDIT_ACK);
+            assert_eq!(read_back.get_acked_slot_seq(), 42);
+        }
+    }
+
+    #[test]
+    fn test_response_header_with_context_switch_and_credit_ack() {
+        let header = ResponseHeader::with_context_switch_and_credit_ack(123, 0, 50, 10, 5, 42);
+        assert!(header.is_valid());
+        assert!(header.has_context_switch());
+        assert!(header.has_credit_ack());
+        assert_eq!(header.get_context_switch_seq(), 10);
+        assert_eq!(header.get_fetched_seq(), 5);
+        assert_eq!(header.get_acked_slot_seq(), 42);
+
+        let mut buf = [0u8; ResponseHeader::SIZE];
+        unsafe {
+            header.write_to(buf.as_mut_ptr());
+            let read_back = ResponseHeader::read_from(buf.as_ptr());
+            assert!(read_back.has_context_switch());
+            assert!(read_back.has_credit_ack());
+        }
     }
 }

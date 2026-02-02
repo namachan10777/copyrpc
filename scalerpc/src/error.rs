@@ -23,6 +23,9 @@ pub enum Error {
     MaxActiveReached,
     /// Protocol error.
     Protocol(String),
+    /// No credits available for flow control.
+    /// Client has reached the window limit and must wait for server ACKs.
+    NoCredits,
 }
 
 impl fmt::Display for Error {
@@ -39,6 +42,7 @@ impl fmt::Display for Error {
             Error::NoAvailableConnection => write!(f, "no available connection"),
             Error::MaxActiveReached => write!(f, "maximum active connections reached"),
             Error::Protocol(msg) => write!(f, "protocol error: {}", msg),
+            Error::NoCredits => write!(f, "no credits available for flow control"),
         }
     }
 }

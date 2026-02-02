@@ -402,6 +402,8 @@ pub struct IncomingRequest {
     pub conn_id: ConnectionId,
     /// Slot index where request was received.
     pub slot_index: usize,
+    /// Slot sequence number for credit-based flow control.
+    pub slot_seq: u64,
 }
 
 impl IncomingRequest {
@@ -434,6 +436,7 @@ impl std::fmt::Debug for IncomingRequest {
             .field("client_slot_rkey", &self.client_slot_rkey)
             .field("conn_id", &self.conn_id)
             .field("slot_index", &self.slot_index)
+            .field("slot_seq", &self.slot_seq)
             .finish()
     }
 }
@@ -482,6 +485,9 @@ pub struct RpcServer {
     /// Reusable buffer for connection IDs during context switch.
     /// Avoids per-call Vec allocation in hot paths.
     conn_buf: RefCell<Vec<ConnectionId>>,
+    /// Per-connection last processed slot sequence for credit-based flow control.
+    /// Updated when processing requests, piggybacked on responses as acked_slot_seq.
+    last_processed_seq: RefCell<Vec<u64>>,
 }
 
 impl RpcServer {
@@ -523,6 +529,7 @@ impl RpcServer {
             pending_context_switch: RefCell::new(Vec::new()),
             next_expected_slot: RefCell::new(Vec::new()),
             conn_buf: RefCell::new(Vec::with_capacity(max_connections)),
+            last_processed_seq: RefCell::new(Vec::new()),
         })
     }
 
@@ -825,8 +832,8 @@ impl RpcServer {
 
         // Create shared CQs on first connection
         if self.shared_send_cq.is_none() {
-            // Size CQ to handle all connections: max_connections * 256 WQEs each
-            let cq_size = self.config.max_connections * 256;
+            // Size CQ to handle all connections: max_connections * 2048 WQEs each (deep pipelines)
+            let cq_size = self.config.max_connections * 2048;
             let (send_cq, recv_cq) = create_shared_cqs(ctx, cq_size)?;
             self.shared_send_cq = Some(send_cq);
             self.shared_recv_cq = Some(recv_cq);
@@ -1055,6 +1062,7 @@ impl RpcServer {
 
         // Use sender_conn_id from the request header for multi-QP routing
         let conn_id = { header.sender_conn_id } as usize;
+        let slot_seq = { header.slot_seq };
 
         Some(IncomingRequest {
             req_id: header.req_id,
@@ -1065,6 +1073,7 @@ impl RpcServer {
             client_slot_rkey: header.client_slot_rkey,
             conn_id,
             slot_index,
+            slot_seq,
         })
     }
 
@@ -1089,6 +1098,9 @@ impl RpcServer {
     ///
     /// If a context switch event is pending for this connection, it will be
     /// piggybacked on the response (ScaleRPC optimization).
+    ///
+    /// Credit-based flow control: The response includes acked_slot_seq to acknowledge
+    /// the highest slot sequence processed for this connection.
     pub fn send_response(
         &self,
         request: &IncomingRequest,
@@ -1118,11 +1130,24 @@ impl RpcServer {
                 request.slot_index
             )))?;
 
+        // Update last_processed_seq for credit-based flow control
+        let acked_seq = {
+            let mut seqs = self.last_processed_seq.borrow_mut();
+            while seqs.len() <= request.conn_id {
+                seqs.push(0);
+            }
+            // Update if this request's slot_seq is greater
+            if request.slot_seq > seqs[request.conn_id] {
+                seqs[request.conn_id] = request.slot_seq;
+            }
+            seqs[request.conn_id]
+        };
+
         // Check for pending context switch event to piggyback
         let response_header = if let Some((seq, fetched_seq)) = self.take_pending_context_switch(request.conn_id) {
             if fetched_seq > 0 {
                 // Warmup fetch complete → include processing pool info for Process mode transition
-                ResponseHeader::with_processing_pool_info(
+                ResponseHeader::with_processing_pool_info_and_credit_ack(
                     request.req_id,
                     status,
                     payload.len() as u32,
@@ -1130,13 +1155,21 @@ impl RpcServer {
                     fetched_seq,
                     self.processing_pool.slot_data_addr(0).unwrap_or(0),
                     self.processing_pool.rkey(),
+                    acked_seq,
                 )
             } else {
                 // Time-based context switch (Idle transition)
-                ResponseHeader::with_context_switch(request.req_id, status, payload.len() as u32, seq, fetched_seq)
+                ResponseHeader::with_context_switch_and_credit_ack(
+                    request.req_id,
+                    status,
+                    payload.len() as u32,
+                    seq,
+                    fetched_seq,
+                    acked_seq,
+                )
             }
         } else {
-            ResponseHeader::new(request.req_id, status, payload.len() as u32)
+            ResponseHeader::with_credit_ack(request.req_id, status, payload.len() as u32, acked_seq)
         };
 
         // Write response to response_pool slot
@@ -1188,6 +1221,9 @@ impl RpcServer {
     /// If a context switch event is pending for this connection, it will be
     /// piggybacked on the response (ScaleRPC optimization).
     ///
+    /// Credit-based flow control: The response includes acked_slot_seq to acknowledge
+    /// the highest slot sequence processed for this connection.
+    ///
     /// # Arguments
     /// * `request` - The original request
     /// * `status` - Response status code
@@ -1221,11 +1257,24 @@ impl RpcServer {
                 request.slot_index
             )))?;
 
+        // Update last_processed_seq for credit-based flow control
+        let acked_seq = {
+            let mut seqs = self.last_processed_seq.borrow_mut();
+            while seqs.len() <= request.conn_id {
+                seqs.push(0);
+            }
+            // Update if this request's slot_seq is greater
+            if request.slot_seq > seqs[request.conn_id] {
+                seqs[request.conn_id] = request.slot_seq;
+            }
+            seqs[request.conn_id]
+        };
+
         // Check for pending context switch event to piggyback
         let response_header = if let Some((seq, fetched_seq)) = self.take_pending_context_switch(request.conn_id) {
             if fetched_seq > 0 {
                 // Warmup fetch complete → include processing pool info for Process mode transition
-                ResponseHeader::with_processing_pool_info(
+                ResponseHeader::with_processing_pool_info_and_credit_ack(
                     request.req_id,
                     status,
                     payload_len as u32,
@@ -1233,13 +1282,21 @@ impl RpcServer {
                     fetched_seq,
                     self.processing_pool.slot_data_addr(0).unwrap_or(0),
                     self.processing_pool.rkey(),
+                    acked_seq,
                 )
             } else {
                 // Time-based context switch (Idle transition)
-                ResponseHeader::with_context_switch(request.req_id, status, payload_len as u32, seq, fetched_seq)
+                ResponseHeader::with_context_switch_and_credit_ack(
+                    request.req_id,
+                    status,
+                    payload_len as u32,
+                    seq,
+                    fetched_seq,
+                    acked_seq,
+                )
             }
         } else {
-            ResponseHeader::new(request.req_id, status, payload_len as u32)
+            ResponseHeader::with_credit_ack(request.req_id, status, payload_len as u32, acked_seq)
         };
 
         unsafe {
@@ -1704,6 +1761,7 @@ impl RpcServer {
 
             // Use sender_conn_id from the request header for multi-QP routing
             let conn_id = { header.sender_conn_id } as usize;
+            let slot_seq = { header.slot_seq };
 
             return Some(IncomingRequest {
                 req_id: header.req_id,
@@ -1714,6 +1772,7 @@ impl RpcServer {
                 client_slot_rkey: header.client_slot_rkey,
                 conn_id,
                 slot_index,
+                slot_seq,
             });
         }
 
@@ -1738,6 +1797,7 @@ impl RpcServer {
 
         // Use sender_conn_id from the request header for multi-QP routing
         let conn_id = { header.sender_conn_id } as usize;
+        let slot_seq = { header.slot_seq };
 
         Some(IncomingRequest {
             req_id: header.req_id,
@@ -1748,6 +1808,7 @@ impl RpcServer {
             client_slot_rkey: header.client_slot_rkey,
             conn_id,
             slot_index,
+            slot_seq,
         })
     }
 

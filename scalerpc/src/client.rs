@@ -331,6 +331,17 @@ struct ConnectionState {
     response_slots: Vec<usize>,
     /// Next response slot index for call_direct (cycles through response_slots).
     response_slot_index: Cell<usize>,
+
+    // Credit-based flow control fields
+    /// Next slot sequence number to send.
+    /// Incremented for each request sent via call_direct().
+    next_slot_seq: Cell<u64>,
+    /// Last acknowledged slot sequence from server.
+    /// Updated when server sends FLAG_CREDIT_ACK in response.
+    last_acked_seq: Cell<u64>,
+    /// Window size for flow control (= server_pool_num_slots).
+    /// Client can have at most window_size requests in flight.
+    credit_window_size: Cell<usize>,
 }
 
 /// RPC Client.
@@ -443,8 +454,8 @@ impl RpcClient {
 
         // Create shared CQs on first connection
         if self.shared_send_cq.is_none() {
-            // Size CQ to handle all connections: max_connections * 256 WQEs each
-            let cq_size = self.config.max_connections * 256;
+            // Size CQ to handle all connections: max_connections * 2048 WQEs each (deep pipelines)
+            let cq_size = self.config.max_connections * 2048;
             let (send_cq, recv_cq) = create_shared_cqs(ctx, cq_size)?;
             self.shared_send_cq = Some(send_cq);
             self.shared_recv_cq = Some(recv_cq);
@@ -479,9 +490,9 @@ impl RpcClient {
         let event_buffer = EventBuffer::new(pd)?;
 
         // Pre-allocate send slots for call_direct (avoid alloc on every call)
-        // Use min(128, available_slots/4) to leave room for response slots
+        // Use min(2048, available_slots/4) to leave room for response slots
         let available = self.pool.free_count();
-        let num_send_slots = std::cmp::min(128, available / 4).max(1);
+        let num_send_slots = std::cmp::min(2048, available / 4).max(1);
         let mut send_slots = Vec::with_capacity(num_send_slots);
         for _ in 0..num_send_slots {
             if let Ok(slot) = self.pool.alloc() {
@@ -492,9 +503,9 @@ impl RpcClient {
         }
 
         // Pre-allocate response slots for call_direct (avoid Mutex lock on every call)
-        // Need enough slots for pipeline depth (typically 64-128)
+        // Need enough slots for pipeline depth (typically 64-2048)
         let available = self.pool.free_count();
-        let num_response_slots = std::cmp::min(128, available / 2).max(8);
+        let num_response_slots = std::cmp::min(2048, available / 2).max(8);
         let mut response_slots = Vec::with_capacity(num_response_slots);
         for _ in 0..num_response_slots {
             if let Ok(slot) = self.pool.alloc() {
@@ -522,6 +533,10 @@ impl RpcClient {
             direct_send_slot_index: Cell::new(0),
             response_slots,
             response_slot_index: Cell::new(0),
+            // Credit-based flow control
+            next_slot_seq: Cell::new(0),
+            last_acked_seq: Cell::new(0),
+            credit_window_size: Cell::new(64), // Default, updated in connect()
         };
 
         self.connections.push(Some(conn));
@@ -554,6 +569,8 @@ impl RpcClient {
             // Store server's pool size for call_direct slot cycling
             if remote.pool_num_slots > 0 {
                 state.server_pool_num_slots.set(remote.pool_num_slots as usize);
+                // Initialize credit window size to match server pool size
+                state.credit_window_size.set(remote.pool_num_slots as usize);
             }
         }
 
@@ -905,6 +922,11 @@ impl RpcClient {
     /// bypassing the state machine. Ensure the mapping is configured with the
     /// correct server pool address before calling.
     ///
+    /// # Credit-based flow control
+    /// This method implements credit-based flow control to prevent the client
+    /// from overwriting server slots that haven't been processed yet. Returns
+    /// `Error::NoCredits` if the window is full (too many requests in flight).
+    ///
     /// # Arguments
     /// * `conn_id` - Connection to use
     /// * `rpc_type` - RPC method identifier
@@ -927,6 +949,18 @@ impl RpcClient {
             .and_then(|s| s.as_ref())
             .ok_or(Error::ConnectionNotFound(conn_id))?;
 
+        // Credit-based flow control check
+        let next_seq = conn_state.next_slot_seq.get();
+        let last_acked = conn_state.last_acked_seq.get();
+        let window = conn_state.credit_window_size.get() as u64;
+
+        // Check if we have credits available
+        // in_flight = next_seq - last_acked
+        // If in_flight >= window, we're at capacity
+        if window > 0 && next_seq.wrapping_sub(last_acked) >= window {
+            return Err(Error::NoCredits);
+        }
+
         // Get remote slot info from mapping (copy values to release borrow early)
         let (remote_base_addr, remote_rkey, server_slot_idx) = {
             let mapping = self.mapping.borrow();
@@ -947,13 +981,20 @@ impl RpcClient {
                 return Err(Error::Protocol("Server pool size not configured".into()));
             }
 
-            // Use sequential server slot indices (0, 1, 2, ...)
-            // direct_slot_index tracks which server slot to write to next
-            let server_slot_idx = conn_state.direct_slot_index.get() % server_pool_size;
+            // Use slot sequence % window for server slot index
+            // This ensures we cycle through server slots based on credit window
+            let server_slot_idx = if window > 0 {
+                (next_seq % window) as usize
+            } else {
+                conn_state.direct_slot_index.get() % server_pool_size
+            };
             conn_state.direct_slot_index.set(conn_state.direct_slot_index.get() + 1);
 
             (remote_base_addr, remote_rkey, server_slot_idx)
         };
+
+        // Increment slot sequence for next request
+        conn_state.next_slot_seq.set(next_seq + 1);
 
         // Use pre-allocated response slot (ring buffer, no Mutex lock needed)
         // The ring buffer is sized larger than pipeline depth to avoid reuse before response arrives
@@ -968,14 +1009,15 @@ impl RpcClient {
         // Use server_conn_id so server can route response through correct QP
         let sender_conn_id = conn_state.server_conn_id.get();
 
-        // Build request header
-        let header = RequestHeader::new(
+        // Build request header with slot sequence for flow control
+        let header = RequestHeader::new_with_seq(
             req_id,
             rpc_type,
             payload.len() as u16,
             response_slot_addr,
             self.pool.rkey(),
             sender_conn_id,
+            next_seq,
         );
 
         // Use pre-allocated send slot (ring buffer, no alloc needed)
@@ -1252,10 +1294,10 @@ impl RpcClient {
         }
     }
 
-    /// Poll a pending RPC and handle context switch events.
+    /// Poll a pending RPC and handle context switch events and credit ACKs.
     ///
     /// This is a convenience method that polls the pending RPC and automatically
-    /// processes any piggybacked context switch events.
+    /// processes any piggybacked context switch events and credit acknowledgments.
     ///
     /// # Arguments
     /// * `pending` - The pending RPC to poll
@@ -1266,10 +1308,50 @@ impl RpcClient {
         if let Some(response) = pending.poll() {
             // Process any piggybacked context switch event
             self.process_response_context_switch(pending.conn_id(), &response);
+
+            // Process credit acknowledgment
+            if let Some(acked_seq) = response.acked_slot_seq() {
+                self.process_credit_ack(pending.conn_id(), acked_seq);
+            }
+
             Some(response)
         } else {
             None
         }
+    }
+
+    /// Process credit acknowledgment from server response.
+    ///
+    /// Updates last_acked_seq to free up credits for sending more requests.
+    fn process_credit_ack(&self, conn_id: ConnectionId, acked_seq: u64) {
+        if let Some(Some(state)) = self.connection_states.get(conn_id) {
+            let current_acked = state.last_acked_seq.get();
+            // Only update if the new acked_seq is greater (handles reordering)
+            if acked_seq > current_acked {
+                state.last_acked_seq.set(acked_seq);
+            }
+        }
+    }
+
+    /// Get the current credit status for a connection.
+    ///
+    /// Returns (in_flight_requests, available_credits, window_size).
+    pub fn credit_status(&self, conn_id: ConnectionId) -> Option<(u64, u64, usize)> {
+        self.connection_states
+            .get(conn_id)
+            .and_then(|s| s.as_ref())
+            .map(|state| {
+                let next_seq = state.next_slot_seq.get();
+                let last_acked = state.last_acked_seq.get();
+                let window = state.credit_window_size.get();
+                let in_flight = next_seq.wrapping_sub(last_acked);
+                let available = if window as u64 > in_flight {
+                    window as u64 - in_flight
+                } else {
+                    0
+                };
+                (in_flight, available, window)
+            })
     }
 }
 
@@ -1349,11 +1431,19 @@ impl<'a> PendingRpc<'a> {
                 None
             };
 
+            // Check for credit acknowledgment
+            let acked_slot_seq = if header.has_credit_ack() {
+                Some(header.get_acked_slot_seq())
+            } else {
+                None
+            };
+
             Some(RpcResponse {
                 header,
                 payload_ptr: unsafe { data_ptr.add(ResponseHeader::SIZE) },
                 context_switch_seq,
                 processing_pool_info,
+                acked_slot_seq,
             })
         } else {
             None
@@ -1396,6 +1486,8 @@ pub struct RpcResponse {
     context_switch_seq: Option<u64>,
     /// Processing pool info (addr, rkey) from server for Process mode transition.
     processing_pool_info: Option<(u64, u32)>,
+    /// Acknowledged slot sequence for credit-based flow control.
+    acked_slot_seq: Option<u64>,
 }
 
 impl RpcResponse {
@@ -1462,5 +1554,18 @@ impl RpcResponse {
     /// Get the processing pool rkey (if present).
     pub fn get_processing_pool_rkey(&self) -> Option<u32> {
         self.processing_pool_info.map(|(_, rkey)| rkey)
+    }
+
+    /// Check if this response has credit acknowledgment.
+    pub fn has_credit_ack(&self) -> bool {
+        self.acked_slot_seq.is_some()
+    }
+
+    /// Get the acknowledged slot sequence (if present).
+    ///
+    /// This indicates the highest slot_seq that the server has processed.
+    /// The client can use this to calculate available credits.
+    pub fn acked_slot_seq(&self) -> Option<u64> {
+        self.acked_slot_seq
     }
 }
