@@ -25,7 +25,7 @@
 //! - The next group prepares requests in the Warmup pool
 //! - On context switch, pools are swapped and clients are notified
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, UnsafeCell};
 use std::rc::Rc;
 
 use minstant::Instant;
@@ -523,7 +523,11 @@ pub struct RpcServer<H = NoHandler> {
     /// Per-connection event buffer addresses for context switch notification.
     event_buffer_addrs: Vec<Option<(u64, u32)>>,
     /// Connections that need doorbell flush (for batching).
-    needs_flush: RefCell<Vec<ConnectionId>>,
+    ///
+    /// # Safety
+    /// Uses UnsafeCell for zero-overhead interior mutability.
+    /// Safe because RpcServer is single-threaded (!Sync).
+    needs_flush: UnsafeCell<Vec<ConnectionId>>,
     /// Per-connection warmup buffer info for RDMA READ.
     warmup_buffer_infos: Vec<Option<WarmupBufferInfo>>,
     /// Shared send completion queue (all QPs share this).
@@ -534,16 +538,28 @@ pub struct RpcServer<H = NoHandler> {
     endpoint_entries: Option<EndpointEntryPool>,
     /// Pending context switch events per connection (fetched_seq to piggyback on responses).
     /// When set, the next response to this connection will carry the context switch event.
-    pending_context_switch: RefCell<Vec<Option<(u64, u32)>>>, // (seq, fetched_seq)
+    ///
+    /// # Safety
+    /// Uses UnsafeCell for zero-overhead interior mutability.
+    pending_context_switch: UnsafeCell<Vec<Option<(u64, u32)>>>, // (seq, fetched_seq)
     /// Per-connection next expected slot index for ring buffer polling.
     /// Reset on context switch when transitioning to Process mode.
-    next_expected_slot: RefCell<Vec<usize>>,
+    ///
+    /// # Safety
+    /// Uses UnsafeCell for zero-overhead interior mutability.
+    next_expected_slot: UnsafeCell<Vec<usize>>,
     /// Reusable buffer for connection IDs during context switch.
     /// Avoids per-call Vec allocation in hot paths.
-    conn_buf: RefCell<Vec<ConnectionId>>,
+    ///
+    /// # Safety
+    /// Uses UnsafeCell for zero-overhead interior mutability.
+    conn_buf: UnsafeCell<Vec<ConnectionId>>,
     /// Per-connection last processed slot sequence for credit-based flow control.
     /// Updated when processing requests, piggybacked on responses as acked_slot_seq.
-    last_processed_seq: RefCell<Vec<u64>>,
+    ///
+    /// # Safety
+    /// Uses UnsafeCell for zero-overhead interior mutability.
+    last_processed_seq: UnsafeCell<Vec<u64>>,
 }
 
 impl RpcServer<NoHandler> {
@@ -587,15 +603,15 @@ impl RpcServer<NoHandler> {
             handler: NoHandler,
             scheduler,
             event_buffer_addrs: Vec::new(),
-            needs_flush: RefCell::new(Vec::new()),
+            needs_flush: UnsafeCell::new(Vec::new()),
             warmup_buffer_infos: Vec::new(),
             shared_send_cq: None,
             shared_recv_cq: None,
             endpoint_entries: Some(endpoint_entries),
-            pending_context_switch: RefCell::new(Vec::new()),
-            next_expected_slot: RefCell::new(Vec::new()),
-            conn_buf: RefCell::new(Vec::with_capacity(max_connections)),
-            last_processed_seq: RefCell::new(Vec::new()),
+            pending_context_switch: UnsafeCell::new(Vec::new()),
+            next_expected_slot: UnsafeCell::new(Vec::new()),
+            conn_buf: UnsafeCell::new(Vec::with_capacity(max_connections)),
+            last_processed_seq: UnsafeCell::new(Vec::new()),
         })
     }
 }
@@ -692,8 +708,9 @@ impl<H: RequestHandler> RpcServer<H> {
         }
 
         // Step 1: Copy connections to reusable buffer (no allocation)
-        {
-            let mut conn_buf = self.conn_buf.borrow_mut();
+        // SAFETY: Single-threaded access, no aliasing within this block
+        unsafe {
+            let conn_buf = &mut *self.conn_buf.get();
             conn_buf.clear();
             conn_buf.extend_from_slice(self.scheduler.current_group_connections());
         }
@@ -791,7 +808,9 @@ impl<H: RequestHandler> RpcServer<H> {
         if let Some(seq) = self.perform_context_switch()? {
             // Notify old group's clients (fetched_seq=0 for time-based switches)
             // conn_buf contains old connections from perform_context_switch
-            if let Err(e) = self.notify_context_switch(&self.conn_buf.borrow(), seq, 0) {
+            // SAFETY: Single-threaded access
+            let conn_buf = unsafe { &*self.conn_buf.get() };
+            if let Err(e) = self.notify_context_switch(conn_buf, seq, 0) {
                 eprintln!("Failed to notify context switch: {}", e);
             }
         }
@@ -810,7 +829,8 @@ impl<H: RequestHandler> RpcServer<H> {
     /// Instead of sending separate RDMA WRITEs, the context switch event will be
     /// piggybacked on the next response to each client. This reduces network overhead.
     pub fn queue_context_switch_for_piggyback(&self, conn_ids: &[ConnectionId], sequence: u64, fetched_seq: u32) {
-        let mut pending = self.pending_context_switch.borrow_mut();
+        // SAFETY: Single-threaded access, no aliasing
+        let pending = unsafe { &mut *self.pending_context_switch.get() };
         for &conn_id in conn_ids {
             while pending.len() <= conn_id {
                 pending.push(None);
@@ -823,7 +843,8 @@ impl<H: RequestHandler> RpcServer<H> {
     ///
     /// Returns (sequence, fetched_seq) and clears the pending event.
     fn take_pending_context_switch(&self, conn_id: ConnectionId) -> Option<(u64, u32)> {
-        let mut pending = self.pending_context_switch.borrow_mut();
+        // SAFETY: Single-threaded access, no aliasing
+        let pending = unsafe { &mut *self.pending_context_switch.get() };
         if conn_id < pending.len() {
             pending[conn_id].take()
         } else {
@@ -889,7 +910,8 @@ impl<H: RequestHandler> RpcServer<H> {
     /// Clients start writing from their first slot, so we reset to match.
     /// Note: next_expected_slot stores position index (0..n-1), not slot value.
     fn reset_next_expected_slots(&self, conn_ids: &[ConnectionId]) {
-        let mut next_slots = self.next_expected_slot.borrow_mut();
+        // SAFETY: Single-threaded access, no aliasing
+        let next_slots = unsafe { &mut *self.next_expected_slot.get() };
         for &conn_id in conn_ids {
             if self.mapping.get_connection(conn_id).is_some() {
                 if conn_id < next_slots.len() {
@@ -951,8 +973,9 @@ impl<H: RequestHandler> RpcServer<H> {
         self.scheduler.add_connection(conn_id);
 
         // Initialize ring buffer polling state (stores position index, not slot value)
-        {
-            let mut next_slots = self.next_expected_slot.borrow_mut();
+        // SAFETY: Single-threaded access, no aliasing
+        unsafe {
+            let next_slots = &mut *self.next_expected_slot.get();
             if conn_id >= next_slots.len() {
                 next_slots.resize(conn_id + 1, 0);
             }
@@ -1078,7 +1101,8 @@ impl<H: RequestHandler> RpcServer<H> {
         // 1. Server resets next_expected_slot on context switch (warmup fetch)
         // 2. Client sets direct_slot_index = warmup_request_count on Process mode entry
         // This accounts for warmup requests that were processed before Process mode starts.
-        let mut next_slots = self.next_expected_slot.borrow_mut();
+        // SAFETY: Single-threaded access, no aliasing
+        let next_slots = unsafe { &mut *self.next_expected_slot.get() };
         for &conn_id in active_conns {
             if let Some(entry) = self.mapping.get_connection(conn_id) {
                 if entry.slots.is_empty() {
@@ -1220,8 +1244,9 @@ impl<H: RequestHandler> RpcServer<H> {
             )))?;
 
         // Update last_processed_seq for credit-based flow control
-        let acked_seq = {
-            let mut seqs = self.last_processed_seq.borrow_mut();
+        // SAFETY: Single-threaded access, no aliasing
+        let acked_seq = unsafe {
+            let seqs = &mut *self.last_processed_seq.get();
             while seqs.len() <= request.conn_id {
                 seqs.push(0);
             }
@@ -1347,8 +1372,9 @@ impl<H: RequestHandler> RpcServer<H> {
             )))?;
 
         // Update last_processed_seq for credit-based flow control
-        let acked_seq = {
-            let mut seqs = self.last_processed_seq.borrow_mut();
+        // SAFETY: Single-threaded access, no aliasing
+        let acked_seq = unsafe {
+            let seqs = &mut *self.last_processed_seq.get();
             while seqs.len() <= request.conn_id {
                 seqs.push(0);
             }
@@ -1458,7 +1484,8 @@ impl<H: RequestHandler> RpcServer<H> {
 
         // Batch flush doorbells and drain CQs
         self.flush_doorbells();
-        self.needs_flush.borrow_mut().clear();
+        // SAFETY: Single-threaded access, no aliasing
+        unsafe { (*self.needs_flush.get()).clear() };
         self.poll_cqs();
 
         // Check context switch after processing batch (amortize overhead)
@@ -1490,7 +1517,8 @@ impl<H: RequestHandler> RpcServer<H> {
     ///
     /// The doorbell will be batched and issued in the next `poll()` call.
     fn mark_needs_flush(&self, conn_id: ConnectionId) {
-        let mut needs_flush = self.needs_flush.borrow_mut();
+        // SAFETY: Single-threaded access, no aliasing
+        let needs_flush = unsafe { &mut *self.needs_flush.get() };
         if !needs_flush.contains(&conn_id) {
             needs_flush.push(conn_id);
         }
@@ -1501,7 +1529,8 @@ impl<H: RequestHandler> RpcServer<H> {
     /// Issues doorbells for all connections with pending WQEs.
     /// This can be called directly to flush without draining CQs.
     pub fn flush_doorbells(&self) {
-        let needs_flush = self.needs_flush.borrow();
+        // SAFETY: Single-threaded access, no aliasing
+        let needs_flush = unsafe { &*self.needs_flush.get() };
         for &conn_id in needs_flush.iter() {
             if let Some(Some(conn)) = self.connections.get(conn_id) {
                 conn.ring_sq_doorbell();
@@ -1511,7 +1540,8 @@ impl<H: RequestHandler> RpcServer<H> {
 
     /// Clear the needs_flush list.
     pub fn clear_needs_flush(&self) {
-        self.needs_flush.borrow_mut().clear();
+        // SAFETY: Single-threaded access, no aliasing
+        unsafe { (*self.needs_flush.get()).clear() };
     }
 
     /// Receive the next incoming request.
@@ -1558,7 +1588,8 @@ impl<H: RequestHandler> RpcServer<H> {
     pub fn poll(&mut self) -> usize {
         // 1. Flush all pending doorbells
         self.flush_doorbells();
-        self.needs_flush.borrow_mut().clear();
+        // SAFETY: Single-threaded access, no aliasing
+        unsafe { (*self.needs_flush.get()).clear() };
 
         // 2. Drain all CQs
         let cq_processed = self.poll_cqs();
@@ -1573,19 +1604,22 @@ impl<H: RequestHandler> RpcServer<H> {
         let _did_switch = if fetched > 0 {
             // Force context switch to make fetched requests available for processing
             let seq = self.scheduler.do_context_switch();
-            {
-                let mut conn_buf = self.conn_buf.borrow_mut();
+            // SAFETY: Single-threaded access, no aliasing within this block
+            unsafe {
+                let conn_buf = &mut *self.conn_buf.get();
                 conn_buf.clear();
                 conn_buf.extend_from_slice(self.scheduler.current_group_connections());
             }
             std::mem::swap(&mut self.processing_pool, &mut self.warmup_pool);
             self.clear_pool_valid_flags(&self.warmup_pool);
             // Reset ring buffer pointers for new Process mode session
-            self.reset_next_expected_slots(&self.conn_buf.borrow());
-            let _ = self.notify_context_switch(&self.conn_buf.borrow(), seq, fetched_seq);
+            // SAFETY: Single-threaded access
+            self.reset_next_expected_slots(unsafe { &*self.conn_buf.get() });
+            let _ = self.notify_context_switch(unsafe { &*self.conn_buf.get() }, seq, fetched_seq);
             true
         } else if let Ok(Some(seq)) = self.perform_context_switch() {
-            let _ = self.notify_context_switch(&self.conn_buf.borrow(), seq, 0);
+            // SAFETY: Single-threaded access
+            let _ = self.notify_context_switch(unsafe { &*self.conn_buf.get() }, seq, 0);
             true
         } else {
             false
@@ -1618,7 +1652,8 @@ impl<H: RequestHandler> RpcServer<H> {
 
         // 6. Flush doorbells for responses
         self.flush_doorbells();
-        self.needs_flush.borrow_mut().clear();
+        // SAFETY: Single-threaded access, no aliasing
+        unsafe { (*self.needs_flush.get()).clear() };
 
         // 7. Drain CQs to ensure response WRITEs complete before next poll iteration
         // This prevents WRITE completions from being counted as READ completions in fetch_warmup_batch
@@ -1651,16 +1686,19 @@ impl<H: RequestHandler> RpcServer<H> {
         let mut last_seq = 0u32;
 
         // Copy connections to reusable buffer (no allocation)
-        {
-            let mut conn_buf = self.conn_buf.borrow_mut();
+        // SAFETY: Single-threaded access, no aliasing within this block
+        unsafe {
+            let conn_buf = &mut *self.conn_buf.get();
             conn_buf.clear();
             conn_buf.extend_from_slice(self.scheduler.next_group_connections());
         }
 
         // Iterate by index to avoid borrow conflicts
-        let num_conns = self.conn_buf.borrow().len();
+        // SAFETY: Single-threaded access
+        let num_conns = unsafe { (&*self.conn_buf.get()).len() };
         for i in 0..num_conns {
-            let conn_id = self.conn_buf.borrow()[i];
+            // SAFETY: Single-threaded access
+            let conn_id = unsafe { (&*self.conn_buf.get())[i] };
             // Check if this connection has a new batch via endpoint entry
             let entry_opt = self.endpoint_entries.as_mut().and_then(|e| e.has_new_batch(conn_id));
             let entry = match entry_opt {
