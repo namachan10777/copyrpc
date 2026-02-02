@@ -73,7 +73,8 @@ impl std::fmt::Display for TryRecvError {
 impl std::error::Error for TryRecvError {}
 
 /// Sender block - only accessed by the sender thread.
-#[repr(C)]
+/// Aligned to cache line boundary to prevent false sharing with RxBlock.
+#[repr(C, align(64))]
 struct TxBlock {
     /// Write position (only updated by sender).
     tail: AtomicUsize,
@@ -82,7 +83,8 @@ struct TxBlock {
 }
 
 /// Receiver block - only accessed by the receiver thread.
-#[repr(C)]
+/// Aligned to cache line boundary to prevent false sharing with TxBlock.
+#[repr(C, align(64))]
 struct RxBlock {
     /// Read position (only updated by receiver).
     head: AtomicUsize,
