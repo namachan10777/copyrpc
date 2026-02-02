@@ -132,15 +132,13 @@ fn test_latency() {
         };
 
         let mut server = match RpcServer::new(&ctx.pd, server_config) {
-            Ok(s) => s,
+            Ok(s) => s.with_handler(|_rpc_type: u16, payload: &[u8], response_buf: &mut [u8]| {
+                let len = payload.len().min(response_buf.len());
+                response_buf[..len].copy_from_slice(&payload[..len]);
+                (0, len)
+            }),
             Err(_) => return,
         };
-
-        server.set_handler(|_rpc_type, payload, response_buf| {
-            let len = payload.len().min(response_buf.len());
-            response_buf[..len].copy_from_slice(&payload[..len]);
-            (0, len)
-        });
 
         let conn_id = match server.add_connection(&ctx.ctx, &ctx.pd, ctx.port) {
             Ok(c) => c,
@@ -276,15 +274,13 @@ fn test_throughput() {
         };
 
         let mut server = match RpcServer::new(&ctx.pd, server_config) {
-            Ok(s) => s,
+            Ok(s) => s.with_handler(|_rpc_type: u16, payload: &[u8], response_buf: &mut [u8]| {
+                let len = payload.len().min(response_buf.len());
+                response_buf[..len].copy_from_slice(&payload[..len]);
+                (0, len)
+            }),
             Err(_) => return,
         };
-
-        server.set_handler(|_rpc_type, payload, response_buf| {
-            let len = payload.len().min(response_buf.len());
-            response_buf[..len].copy_from_slice(&payload[..len]);
-            (0, len)
-        });
 
         let conn_id = match server.add_connection(&ctx.ctx, &ctx.pd, ctx.port) {
             Ok(c) => c,
@@ -455,15 +451,13 @@ fn test_throughput_4kb() {
         };
 
         let mut server = match RpcServer::new(&ctx.pd, server_config) {
-            Ok(s) => s,
+            Ok(s) => s.with_handler(|_rpc_type: u16, payload: &[u8], response_buf: &mut [u8]| {
+                let len = payload.len().min(response_buf.len());
+                response_buf[..len].copy_from_slice(&payload[..len]);
+                (0, len)
+            }),
             Err(_) => return,
         };
-
-        server.set_handler(|_rpc_type, payload, response_buf| {
-            let len = payload.len().min(response_buf.len());
-            response_buf[..len].copy_from_slice(&payload[..len]);
-            (0, len)
-        });
 
         let conn_id = match server.add_connection(&ctx.ctx, &ctx.pd, ctx.port) {
             Ok(c) => c,
@@ -646,15 +640,13 @@ fn test_throughput_process_mode() {
         };
 
         let mut server = match RpcServer::new(&ctx.pd, server_config) {
-            Ok(s) => s,
+            Ok(s) => s.with_handler(|_rpc_type: u16, payload: &[u8], response_buf: &mut [u8]| {
+                let len = payload.len().min(response_buf.len());
+                response_buf[..len].copy_from_slice(&payload[..len]);
+                (0, len)
+            }),
             Err(_) => return,
         };
-
-        server.set_handler(|_rpc_type, payload, response_buf| {
-            let len = payload.len().min(response_buf.len());
-            response_buf[..len].copy_from_slice(&payload[..len]);
-            (0, len)
-        });
 
         let conn_id = match server.add_connection(&ctx.ctx, &ctx.pd, ctx.port) {
             Ok(c) => c,

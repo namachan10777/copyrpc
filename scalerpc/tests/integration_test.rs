@@ -123,15 +123,14 @@ fn test_server_creation() {
         ..Default::default()
     };
 
-    let mut server = RpcServer::new(&ctx.pd, config).expect("Failed to create server");
-
-    // Set a simple handler (zero-copy)
-    server.set_handler(|_rpc_type, payload, response_buf| {
-        // Echo handler
-        let len = payload.len().min(response_buf.len());
-        response_buf[..len].copy_from_slice(&payload[..len]);
-        (0, len)
-    });
+    let mut server = RpcServer::new(&ctx.pd, config)
+        .expect("Failed to create server")
+        .with_handler(|_rpc_type: u16, payload: &[u8], response_buf: &mut [u8]| {
+            // Echo handler
+            let len = payload.len().min(response_buf.len());
+            response_buf[..len].copy_from_slice(&payload[..len]);
+            (0, len)
+        });
 
     // Add a connection
     let conn_id = server
@@ -188,19 +187,18 @@ fn test_loopback_rpc() {
         },
         ..Default::default()
     };
-    let mut server = RpcServer::new(&ctx.pd, server_config).expect("Failed to create server");
-
-    // Set echo handler (zero-copy)
-    server.set_handler(|rpc_type, payload, response_buf| {
-        println!("Server received RPC type={}, payload_len={}", rpc_type, payload.len());
-        // Echo back with prefix
-        let prefix = b"ECHO: ";
-        let prefix_len = prefix.len();
-        let payload_len = payload.len().min(response_buf.len() - prefix_len);
-        response_buf[..prefix_len].copy_from_slice(prefix);
-        response_buf[prefix_len..prefix_len + payload_len].copy_from_slice(&payload[..payload_len]);
-        (0, prefix_len + payload_len)
-    });
+    let mut server = RpcServer::new(&ctx.pd, server_config)
+        .expect("Failed to create server")
+        .with_handler(|rpc_type: u16, payload: &[u8], response_buf: &mut [u8]| {
+            println!("Server received RPC type={}, payload_len={}", rpc_type, payload.len());
+            // Echo back with prefix
+            let prefix = b"ECHO: ";
+            let prefix_len = prefix.len();
+            let payload_len = payload.len().min(response_buf.len() - prefix_len);
+            response_buf[..prefix_len].copy_from_slice(prefix);
+            response_buf[prefix_len..prefix_len + payload_len].copy_from_slice(&payload[..payload_len]);
+            (0, prefix_len + payload_len)
+        });
 
     // Add connections
     let client_conn = client
@@ -240,13 +238,7 @@ fn test_loopback_rpc() {
     // - Fetching warmup requests via RDMA READ
     // - Context switch (swapping warmup/processing pools)
     // - Processing requests and sending responses
-    server.set_handler(|_rpc_type, payload, response_buf| {
-        let response = b"ECHO: ";
-        let len = response.len() + payload.len();
-        response_buf[..response.len()].copy_from_slice(response);
-        response_buf[response.len()..len].copy_from_slice(payload);
-        (0, len)
-    });
+    // Note: Handler was already set via with_handler() above
 
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(5);
@@ -353,19 +345,17 @@ fn test_context_switch_piggyback() {
         };
 
         let mut server = match RpcServer::new(&ctx.pd, server_config) {
-            Ok(s) => s,
+            Ok(s) => s.with_handler(|_rpc_type: u16, payload: &[u8], response_buf: &mut [u8]| {
+                // Echo handler
+                let len = payload.len().min(response_buf.len());
+                response_buf[..len].copy_from_slice(&payload[..len]);
+                (0, len)
+            }),
             Err(e) => {
                 eprintln!("Failed to create server: {}", e);
                 return;
             }
         };
-
-        // Echo handler
-        server.set_handler(|_rpc_type, payload, response_buf| {
-            let len = payload.len().min(response_buf.len());
-            response_buf[..len].copy_from_slice(&payload[..len]);
-            (0, len)
-        });
 
         let conn_id = match server.add_connection(&ctx.ctx, &ctx.pd, ctx.port) {
             Ok(c) => c,
@@ -510,21 +500,19 @@ fn test_flush_warmup_batching() {
             max_connections: 1,
         };
 
+        let requests_clone = requests_processed_clone.clone();
         let mut server = match RpcServer::new(&ctx.pd, server_config) {
-            Ok(s) => s,
+            Ok(s) => s.with_handler(move |_rpc_type: u16, payload: &[u8], response_buf: &mut [u8]| {
+                requests_clone.fetch_add(1, Ordering::Relaxed);
+                let len = payload.len().min(response_buf.len());
+                response_buf[..len].copy_from_slice(&payload[..len]);
+                (0, len)
+            }),
             Err(e) => {
                 eprintln!("Failed to create server: {}", e);
                 return;
             }
         };
-
-        let requests_clone = requests_processed_clone.clone();
-        server.set_handler(move |_rpc_type, payload, response_buf| {
-            requests_clone.fetch_add(1, Ordering::Relaxed);
-            let len = payload.len().min(response_buf.len());
-            response_buf[..len].copy_from_slice(&payload[..len]);
-            (0, len)
-        });
 
         let conn_id = match server.add_connection(&ctx.ctx, &ctx.pd, ctx.port) {
             Ok(c) => c,
@@ -691,18 +679,16 @@ fn test_poll_pending_with_state_transition() {
         };
 
         let mut server = match RpcServer::new(&ctx.pd, server_config) {
-            Ok(s) => s,
+            Ok(s) => s.with_handler(|_rpc_type: u16, payload: &[u8], response_buf: &mut [u8]| {
+                let len = payload.len().min(response_buf.len());
+                response_buf[..len].copy_from_slice(&payload[..len]);
+                (0, len)
+            }),
             Err(e) => {
                 eprintln!("Failed to create server: {}", e);
                 return;
             }
         };
-
-        server.set_handler(|_rpc_type, payload, response_buf| {
-            let len = payload.len().min(response_buf.len());
-            response_buf[..len].copy_from_slice(&payload[..len]);
-            (0, len)
-        });
 
         let conn_id = match server.add_connection(&ctx.ctx, &ctx.pd, ctx.port) {
             Ok(c) => c,
@@ -847,18 +833,16 @@ fn test_process_mode_transition() {
         };
 
         let mut server = match RpcServer::new(&ctx.pd, server_config) {
-            Ok(s) => s,
+            Ok(s) => s.with_handler(|_rpc_type: u16, payload: &[u8], response_buf: &mut [u8]| {
+                let len = payload.len().min(response_buf.len());
+                response_buf[..len].copy_from_slice(&payload[..len]);
+                (0, len)
+            }),
             Err(e) => {
                 eprintln!("Failed to create server: {}", e);
                 return;
             }
         };
-
-        server.set_handler(|_rpc_type, payload, response_buf| {
-            let len = payload.len().min(response_buf.len());
-            response_buf[..len].copy_from_slice(&payload[..len]);
-            (0, len)
-        });
 
         let conn_id = match server.add_connection(&ctx.ctx, &ctx.pd, ctx.port) {
             Ok(c) => c,

@@ -531,6 +531,7 @@ pub struct EmitResult {
 ///
 /// Posts a NOP to fill remaining slots, then emits SEND at ring beginning.
 #[cold]
+#[inline]
 pub fn emit_send_wrap<Q: SqState>(
     ctx: &Q,
     flags: WqeFlags,
@@ -612,6 +613,7 @@ pub fn emit_send_wrap<Q: SqState>(
 
 /// Wrap-around helper for WRITE WQE (cold path).
 #[cold]
+#[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn emit_write_wrap<Q: SqState>(
     ctx: &Q,

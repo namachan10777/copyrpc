@@ -46,12 +46,51 @@ use crate::protocol::{
     MESSAGE_BLOCK_SIZE,
 };
 
-/// Request handler function type (zero-copy).
+/// Request handler trait for processing RPC requests (zero-copy).
 ///
 /// Takes RPC type, request payload, and a mutable response buffer.
 /// Writes response directly to the buffer and returns (status, response_length).
 /// This avoids memory allocation on every request.
-pub type RequestHandler = Box<dyn Fn(u16, &[u8], &mut [u8]) -> (u32, usize)>;
+///
+/// The trait enables static dispatch and inlining of handler calls,
+/// improving throughput compared to `Box<dyn Fn>`.
+pub trait RequestHandler {
+    /// Handle an RPC request.
+    ///
+    /// # Arguments
+    /// * `rpc_type` - RPC type identifier
+    /// * `payload` - Request payload bytes
+    /// * `response_buf` - Mutable buffer to write response into
+    ///
+    /// # Returns
+    /// (status_code, response_length)
+    fn handle(&self, rpc_type: u16, payload: &[u8], response_buf: &mut [u8]) -> (u32, usize);
+}
+
+/// Blanket implementation for closures that match the handler signature.
+impl<F> RequestHandler for F
+where
+    F: Fn(u16, &[u8], &mut [u8]) -> (u32, usize),
+{
+    #[inline]
+    fn handle(&self, rpc_type: u16, payload: &[u8], response_buf: &mut [u8]) -> (u32, usize) {
+        self(rpc_type, payload, response_buf)
+    }
+}
+
+/// Marker type for RpcServer without a handler.
+///
+/// Used as the default type parameter for `RpcServer<H>` when no handler is set.
+#[derive(Clone, Copy, Default)]
+pub struct NoHandler;
+
+impl RequestHandler for NoHandler {
+    #[inline]
+    fn handle(&self, _rpc_type: u16, _payload: &[u8], _response_buf: &mut [u8]) -> (u32, usize) {
+        // NoHandler returns error status with no response
+        (1, 0)
+    }
+}
 
 /// Group ID type.
 pub type GroupId = usize;
@@ -445,7 +484,24 @@ impl std::fmt::Debug for IncomingRequest {
 ///
 /// Manages connections and processes incoming RPC requests.
 /// Implements the ScaleRPC time-sharing scheduler when enabled.
-pub struct RpcServer {
+///
+/// # Type Parameter
+/// * `H` - Request handler type, defaults to `NoHandler` when no handler is set
+///
+/// # Example
+/// ```ignore
+/// // Create server without handler
+/// let server = RpcServer::new(&pd, config)?;
+///
+/// // Add handler using with_handler (returns new typed server)
+/// let server = server.with_handler(|rpc_type, payload, response_buf| {
+///     // Echo handler
+///     let len = payload.len().min(response_buf.len());
+///     response_buf[..len].copy_from_slice(&payload[..len]);
+///     (0, len)
+/// });
+/// ```
+pub struct RpcServer<H = NoHandler> {
     /// Processing pool for active group's requests (inbound).
     processing_pool: MessagePool,
     /// Warmup pool for next group's requests (fetched via RDMA READ).
@@ -461,7 +517,7 @@ pub struct RpcServer {
     #[allow(dead_code)]
     config: ServerConfig,
     /// Request handler.
-    handler: Option<RequestHandler>,
+    handler: H,
     /// Group scheduler for time-sharing.
     scheduler: GroupScheduler,
     /// Per-connection event buffer addresses for context switch notification.
@@ -490,12 +546,22 @@ pub struct RpcServer {
     last_processed_seq: RefCell<Vec<u64>>,
 }
 
-impl RpcServer {
-    /// Create a new RPC server.
+impl RpcServer<NoHandler> {
+    /// Create a new RPC server without a handler.
+    ///
+    /// Use `with_handler` to add a request handler.
     ///
     /// # Arguments
     /// * `pd` - Protection domain for memory registration
     /// * `config` - Server configuration
+    ///
+    /// # Example
+    /// ```ignore
+    /// let server = RpcServer::new(&pd, config)?
+    ///     .with_handler(|rpc_type, payload, response_buf| {
+    ///         (0, 0)  // No-op handler
+    ///     });
+    /// ```
     pub fn new(pd: &Pd, config: ServerConfig) -> Result<Self> {
         let max_connections = config.max_connections;
         let processing_pool = MessagePool::new(pd, &config.pool)?;
@@ -518,7 +584,7 @@ impl RpcServer {
             mapping,
             connections: Vec::new(),
             config,
-            handler: None,
+            handler: NoHandler,
             scheduler,
             event_buffer_addrs: Vec::new(),
             needs_flush: RefCell::new(Vec::new()),
@@ -531,6 +597,46 @@ impl RpcServer {
             conn_buf: RefCell::new(Vec::with_capacity(max_connections)),
             last_processed_seq: RefCell::new(Vec::new()),
         })
+    }
+}
+
+impl<H: RequestHandler> RpcServer<H> {
+    /// Transform this server to use a different handler.
+    ///
+    /// This consumes the current server and returns a new one with the given handler.
+    /// The handler type `H2` must implement `RequestHandler`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let server = RpcServer::new(&pd, config)?
+    ///     .with_handler(|rpc_type, payload, response_buf| {
+    ///         // Echo handler
+    ///         let len = payload.len().min(response_buf.len());
+    ///         response_buf[..len].copy_from_slice(&payload[..len]);
+    ///         (0, len)
+    ///     });
+    /// ```
+    pub fn with_handler<H2: RequestHandler>(self, handler: H2) -> RpcServer<H2> {
+        RpcServer {
+            processing_pool: self.processing_pool,
+            warmup_pool: self.warmup_pool,
+            response_pool: self.response_pool,
+            mapping: self.mapping,
+            connections: self.connections,
+            config: self.config,
+            handler,
+            scheduler: self.scheduler,
+            event_buffer_addrs: self.event_buffer_addrs,
+            needs_flush: self.needs_flush,
+            warmup_buffer_infos: self.warmup_buffer_infos,
+            shared_send_cq: self.shared_send_cq,
+            shared_recv_cq: self.shared_recv_cq,
+            endpoint_entries: self.endpoint_entries,
+            pending_context_switch: self.pending_context_switch,
+            next_expected_slot: self.next_expected_slot,
+            conn_buf: self.conn_buf,
+            last_processed_seq: self.last_processed_seq,
+        }
     }
 
     /// Get the group scheduler.
@@ -640,11 +746,6 @@ impl RpcServer {
     ///
     /// Returns the number of requests processed.
     pub fn process_drained_requests(&self, requests: Vec<IncomingRequest>) -> usize {
-        let handler = match &self.handler {
-            Some(h) => h,
-            None => return 0,
-        };
-
         let mut processed = 0;
 
         for request in requests {
@@ -662,7 +763,7 @@ impl RpcServer {
                 std::slice::from_raw_parts_mut(buf_ptr, buf_len)
             };
 
-            let (status, response_len) = handler(request.rpc_type, request.payload(), response_buf);
+            let (status, response_len) = self.handler.handle(request.rpc_type, request.payload(), response_buf);
 
             if let Err(e) = self.send_response_zero_copy(&request, status, response_len) {
                 eprintln!("Failed to send response: {}", e);
@@ -798,16 +899,6 @@ impl RpcServer {
         }
     }
 
-    /// Set the request handler (zero-copy).
-    ///
-    /// The handler receives (rpc_type, request_payload, response_buffer) and
-    /// writes the response directly to the buffer, returning (status, response_length).
-    pub fn set_handler<F>(&mut self, handler: F)
-    where
-        F: Fn(u16, &[u8], &mut [u8]) -> (u32, usize) + 'static,
-    {
-        self.handler = Some(Box::new(handler));
-    }
 
     /// Add a new connection to the server.
     ///
@@ -1336,11 +1427,6 @@ impl RpcServer {
     /// Automatically performs context switch when time slice expires.
     /// Returns the number of requests processed.
     pub fn process(&self) -> usize {
-        let handler = match &self.handler {
-            Some(h) => h,
-            None => return 0,
-        };
-
         let mut processed = 0;
 
         while let Some(request) = self.poll_request() {
@@ -1359,7 +1445,8 @@ impl RpcServer {
             };
 
             // Call handler with request payload (zero-copy from processing_pool)
-            let (status, response_len) = handler(request.rpc_type, request.payload(), response_buf);
+            // Uses static dispatch via RequestHandler trait for inlining
+            let (status, response_len) = self.handler.handle(request.rpc_type, request.payload(), response_buf);
 
             // Send response (header only, payload already in response_pool slot)
             if let Err(e) = self.send_response_zero_copy(&request, status, response_len) {
@@ -1504,31 +1591,28 @@ impl RpcServer {
             false
         };
 
-        // 5. Process requests if handler is set
+        // 5. Process requests using the handler
         //    recv() scans processing_pool (which was warmup_pool before context switch)
         let mut requests_processed = 0;
-        if self.handler.is_some() {
-            while let Some(request) = self.recv() {
-                // Get the response_pool slot for zero-copy response building
-                let slot = match self.response_pool.get_slot(request.slot_index) {
-                    Some(s) => s,
-                    None => continue,
-                };
+        while let Some(request) = self.recv() {
+            // Get the response_pool slot for zero-copy response building
+            let slot = match self.response_pool.get_slot(request.slot_index) {
+                Some(s) => s,
+                None => continue,
+            };
 
-                // Get response buffer in response_pool
-                let slot_ptr = slot.data_ptr();
-                let response_buf = unsafe {
-                    let buf_ptr = slot_ptr.add(ResponseHeader::SIZE);
-                    let buf_len = MESSAGE_BLOCK_SIZE - ResponseHeader::SIZE - 8;
-                    std::slice::from_raw_parts_mut(buf_ptr, buf_len)
-                };
+            // Get response buffer in response_pool
+            let slot_ptr = slot.data_ptr();
+            let response_buf = unsafe {
+                let buf_ptr = slot_ptr.add(ResponseHeader::SIZE);
+                let buf_len = MESSAGE_BLOCK_SIZE - ResponseHeader::SIZE - 8;
+                std::slice::from_raw_parts_mut(buf_ptr, buf_len)
+            };
 
-                if let Some(handler) = &self.handler {
-                    let (status, response_len) = handler(request.rpc_type, request.payload(), response_buf);
-                    if self.reply_zero_copy(&request, status, response_len).is_ok() {
-                        requests_processed += 1;
-                    }
-                }
+            // Uses static dispatch via RequestHandler trait for inlining
+            let (status, response_len) = self.handler.handle(request.rpc_type, request.payload(), response_buf);
+            if self.reply_zero_copy(&request, status, response_len).is_ok() {
+                requests_processed += 1;
             }
         }
 

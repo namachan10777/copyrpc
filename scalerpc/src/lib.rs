@@ -48,4 +48,4 @@ pub use protocol::{
 };
 pub use connection::{Connection, RemoteEndpoint, ConnectionId};
 pub use client::{ClientState, PendingRpc, RpcClient, RpcResponse};
-pub use server::{GroupScheduler, IncomingRequest, RpcServer, SchedulerState};
+pub use server::{GroupScheduler, IncomingRequest, NoHandler, RequestHandler, RpcServer, SchedulerState};
