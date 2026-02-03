@@ -231,21 +231,14 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
         }
     }
 
-    /// Synchronizes with all peers.
-    ///
-    /// This loads each sender's tail (to see new data) and stores our head
-    /// (to notify senders of consumed slots).
-    fn sync(&mut self) {
-        for ch in &mut self.channels {
-            ch.rx.sync();
-        }
-    }
-
     /// Polls for messages from peers, processing them appropriately.
     ///
     /// - Automatically flushes pending writes
     /// - For responses: invokes the callback with user_data and response data
     /// - For requests: queues them for retrieval via `try_recv()`
+    ///
+    /// Note: SPSC's `poll()` internally syncs when the local view is empty,
+    /// so a single pass over all channels is sufficient.
     pub fn poll(&mut self) {
         // Auto-flush before receiving
         self.flush();
@@ -255,34 +248,7 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
             return;
         }
 
-        // First pass: check local views
-        for _ in 0..n {
-            let idx = self.recv_index;
-            self.recv_index = (self.recv_index + 1) % n;
-
-            while let Some(msg) = self.channels[idx].rx.poll() {
-                let peer_id = self.channels[idx].peer_id;
-                match msg.kind {
-                    MessageKind::Request => {
-                        self.recv_queue.push_back(RecvRequest {
-                            from: peer_id,
-                            req_num: msg.req_num,
-                            data: msg.data,
-                        });
-                    }
-                    MessageKind::Response => {
-                        let call_id = msg.req_num as usize;
-                        if let Some(mut user_data) = self.pending_calls.try_remove(call_id) {
-                            (self.on_response)(&mut user_data, msg.data);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Sync and try again
-        self.sync();
-
+        // Single pass: poll() auto-syncs when local view is empty
         for _ in 0..n {
             let idx = self.recv_index;
             self.recv_index = (self.recv_index + 1) % n;
