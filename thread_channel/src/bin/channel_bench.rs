@@ -82,29 +82,35 @@ struct BenchResult {
 }
 
 fn run_flux_benchmark(n: usize, capacity: usize, iterations: u64) -> Duration {
-    // Create shared completion counters for all nodes
-    let completed_counters: Vec<Arc<AtomicU64>> =
-        (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
-    let counters_clone: Vec<Arc<AtomicU64>> = completed_counters.clone();
+    // Per-node, per-peer completion counters: completed_counters[node][peer]
+    let completed_counters: Vec<Vec<Arc<AtomicU64>>> = (0..n)
+        .map(|_| (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect())
+        .collect();
+    let counters_clone: Vec<Vec<Arc<AtomicU64>>> = completed_counters
+        .iter()
+        .map(|v| v.iter().map(Arc::clone).collect())
+        .collect();
 
     // Create nodes with response callback
-    let nodes: Vec<Flux<Payload, usize, _>> = create_flux(n, capacity, move |node_idx: &mut usize, _: Payload| {
-        counters_clone[*node_idx].fetch_add(1, Ordering::Relaxed);
-    });
+    // user_data is (node_idx, peer) tuple to track per-peer completion
+    let nodes: Vec<Flux<Payload, (usize, usize), _>> =
+        create_flux(n, capacity, move |&mut (node_idx, peer): &mut (usize, usize), _: Payload| {
+            counters_clone[node_idx][peer].fetch_add(1, Ordering::Relaxed);
+        });
 
     let barrier = Arc::new(Barrier::new(n));
     let payload = Payload::default();
 
-    // Limit in-flight requests per peer to leave room for replies
-    // Keep this small to ensure channel never fills up (requests + replies must fit)
-    let max_in_flight_per_peer = (capacity / 8).max(1).min(128) as u64;
+    // Pipeline depth per peer - 256 allows good throughput while leaving room for replies
+    let max_in_flight_per_peer = 256u64;
 
     let handles: Vec<_> = nodes
         .into_iter()
         .enumerate()
         .map(|(thread_idx, mut node)| {
             let barrier = Arc::clone(&barrier);
-            let completed_counter = Arc::clone(&completed_counters[thread_idx]);
+            let my_counters: Vec<Arc<AtomicU64>> =
+                completed_counters[thread_idx].iter().map(Arc::clone).collect();
             thread::spawn(move || {
                 // Pin to core
                 pin_to_core(thread_idx);
@@ -117,28 +123,26 @@ fn run_flux_benchmark(n: usize, capacity: usize, iterations: u64) -> Duration {
                 let start = Instant::now();
 
                 let mut sent_per_peer = vec![0u64; n];
-                let expected_responses = iterations * (num_peers as u64);
                 let expected_requests = iterations * (num_peers as u64);
                 let mut sent_replies = 0u64;
+                let mut total_completed = 0u64;
+                let expected_responses = iterations * (num_peers as u64);
 
                 // Loop until all responses received AND all incoming requests processed
-                while completed_counter.load(Ordering::Relaxed) < expected_responses
-                    || sent_replies < expected_requests
-                {
-                    // Batch send: fill pipeline to max in-flight for all peers
+                while total_completed < expected_responses || sent_replies < expected_requests {
+                    // Batch send: fill pipeline to max in-flight for each peer
                     for &peer in &peers {
-                        while sent_per_peer[peer] < iterations {
-                            let completed = completed_counter.load(Ordering::Relaxed);
-                            // Approximate in-flight calculation
-                            let total_sent: u64 = sent_per_peer.iter().sum();
-                            let in_flight_total = total_sent.saturating_sub(completed);
-                            let in_flight_per_peer = in_flight_total / num_peers.max(1) as u64;
+                        let completed_from_peer = my_counters[peer].load(Ordering::Relaxed);
+                        let in_flight = sent_per_peer[peer].saturating_sub(completed_from_peer);
+                        let can_send = max_in_flight_per_peer.saturating_sub(in_flight);
 
-                            if in_flight_per_peer >= max_in_flight_per_peer {
+                        // Send up to can_send requests to this peer
+                        for _ in 0..can_send {
+                            if sent_per_peer[peer] >= iterations {
                                 break;
                             }
-                            // Pass thread_idx as user_data so callback knows which counter to update
-                            if node.call(peer, payload, thread_idx).is_ok() {
+                            // Pass (thread_idx, peer) as user_data for per-peer completion tracking
+                            if node.call(peer, payload, (thread_idx, peer)).is_ok() {
                                 sent_per_peer[peer] += 1;
                             } else {
                                 break; // channel full
@@ -146,10 +150,13 @@ fn run_flux_benchmark(n: usize, capacity: usize, iterations: u64) -> Duration {
                         }
                     }
 
-                    // Poll processes messages: auto-flushes, invokes response callback, queues requests
+                    // Poll: flushes pending writes, receives messages, invokes response callbacks
                     node.poll();
 
-                    // Process received requests
+                    // Update total completed count
+                    total_completed = peers.iter().map(|&p| my_counters[p].load(Ordering::Relaxed)).sum();
+
+                    // Process received requests and reply
                     while let Some(handle) = node.try_recv() {
                         let data = handle.data();
                         if handle.reply_or_requeue(data) {
@@ -159,12 +166,10 @@ fn run_flux_benchmark(n: usize, capacity: usize, iterations: u64) -> Duration {
                             break;
                         }
                     }
-
-                    // Explicit flush to ensure replies are visible to peers immediately
-                    // This prevents deadlock where both sides wait for responses
-                    // that are stuck in pending_tail buffers
-                    node.flush();
                 }
+
+                // Final flush to ensure all pending replies are visible to peers
+                node.poll();
 
                 start.elapsed()
             })

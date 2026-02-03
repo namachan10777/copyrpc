@@ -224,7 +224,8 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
     /// Flushes all pending writes to all peers.
     ///
     /// This makes all previously written messages visible to their respective peers.
-    pub fn flush(&mut self) {
+    /// Called automatically by `poll()`.
+    fn flush(&mut self) {
         for ch in &mut self.channels {
             ch.tx.flush();
         }
@@ -422,7 +423,7 @@ mod tests {
 
         // Node 0 calls node 1 with user_data=100
         nodes[0].call(1, 42, 100).unwrap();
-        nodes[0].flush();
+        nodes[0].poll(); // flush
 
         // Node 1 receives and replies
         nodes[1].poll();
@@ -430,7 +431,7 @@ mod tests {
         assert_eq!(handle.from(), 0);
         assert_eq!(handle.data(), 42);
         assert!(handle.reply(43).is_ok());
-        nodes[1].flush();
+        nodes[1].poll(); // flush reply
 
         // Node 0 receives response (callback is invoked)
         nodes[0].poll();
@@ -446,9 +447,9 @@ mod tests {
 
         // Node 1 and 2 both send to node 0
         nodes[1].call(0, 100, ()).unwrap();
-        nodes[1].flush();
+        nodes[1].poll(); // flush
         nodes[2].call(0, 200, ()).unwrap();
-        nodes[2].flush();
+        nodes[2].poll(); // flush
 
         nodes[0].poll();
 
@@ -503,7 +504,7 @@ mod tests {
                                 {
                                     Ok(_) => break,
                                     Err(SendError::Full(_)) => {
-                                        node.flush();
+                                        node.poll();
                                         std::hint::spin_loop();
                                     }
                                     Err(e) => panic!("send error: {:?}", e),
@@ -512,7 +513,7 @@ mod tests {
                         }
                     }
                 }
-                node.flush();
+                node.poll(); // final flush
 
                 // Receive from all peers and reply
                 let mut request_count = 0;

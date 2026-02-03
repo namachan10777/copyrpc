@@ -13,7 +13,7 @@ fn test_two_node_communication() {
     // Node 0 -> Node 1
     nodes[0].call(1, 100, ()).unwrap();
     nodes[0].call(1, 200, ()).unwrap();
-    nodes[0].flush();
+    nodes[0].poll(); // flush writes
 
     nodes[1].poll();
     let handle = nodes[1].try_recv().unwrap();
@@ -28,7 +28,7 @@ fn test_two_node_communication() {
 
     // Node 1 -> Node 0
     nodes[1].call(0, 300, ()).unwrap();
-    nodes[1].flush();
+    nodes[1].poll(); // flush writes
 
     nodes[0].poll();
     let handle = nodes[0].try_recv().unwrap();
@@ -50,7 +50,7 @@ fn test_call_reply_with_callback() {
     // Node 0 calls Node 1 with user_data
     nodes[0].call(1, 42, 100).unwrap(); // user_data = 100
     nodes[0].call(1, 43, 101).unwrap(); // user_data = 101
-    nodes[0].flush();
+    nodes[0].poll(); // flush writes
 
     // Node 1 receives requests and replies
     nodes[1].poll();
@@ -66,7 +66,7 @@ fn test_call_reply_with_callback() {
     assert_eq!(handle.data(), 43);
     let data = handle.data();
     assert!(handle.reply(data * 2).is_ok()); // reply with 86
-    nodes[1].flush();
+    nodes[1].poll(); // flush replies
 
     // Node 0 receives responses (via callback)
     nodes[0].poll();
@@ -92,7 +92,7 @@ fn test_all_to_all() {
                 nodes[i].call(j, (i, j), ()).unwrap();
             }
         }
-        nodes[i].flush();
+        nodes[i].poll(); // flush writes
     }
 
     // Each node receives from all other nodes
@@ -117,11 +117,11 @@ fn test_round_robin_poll() {
 
     // Nodes 1, 2, 3 all send to node 0
     nodes[1].call(0, 1, ()).unwrap();
-    nodes[1].flush();
+    nodes[1].poll(); // flush
     nodes[2].call(0, 2, ()).unwrap();
-    nodes[2].flush();
+    nodes[2].poll(); // flush
     nodes[3].call(0, 3, ()).unwrap();
-    nodes[3].flush();
+    nodes[3].poll(); // flush
 
     nodes[0].poll();
 
@@ -264,7 +264,7 @@ fn test_simple_ping_pong() {
     for i in 0..iterations {
         // Send request
         nodes[0].call(1, i, i).unwrap();
-        nodes[0].flush();
+        nodes[0].poll(); // flush
 
         // Node 1 receives and replies
         nodes[1].poll();
@@ -272,7 +272,7 @@ fn test_simple_ping_pong() {
         assert_eq!(handle.data(), i);
         let data = handle.data();
         assert!(handle.reply(data).is_ok());
-        nodes[1].flush();
+        nodes[1].poll(); // flush reply
 
         // Node 0 receives response (via callback)
         nodes[0].poll();

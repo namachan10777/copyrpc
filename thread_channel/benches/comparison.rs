@@ -55,7 +55,7 @@ fn bench_pingpong(c: &mut Criterion) {
         stop.store(true, Ordering::Relaxed);
         // Send one more message to wake up the responder thread
         node0.call(1, 0, Arc::new(AtomicBool::new(false))).ok();
-        node0.flush();
+        node0.poll(); // flush
         handle.join().unwrap();
     });
 
@@ -146,7 +146,7 @@ fn bench_fanout(c: &mut Criterion) {
                     // Use call with empty user_data as a notification
                     sender.call(peer, black_box(42), ()).unwrap();
                 }
-                sender.flush();
+                sender.poll(); // flush
             });
 
             stop.store(true, Ordering::Relaxed);
@@ -219,11 +219,11 @@ fn bench_fanin(c: &mut Criterion) {
                         while !stop.load(Ordering::Relaxed) {
                             match node.call(0, count, ()) {
                                 Ok(()) => {
-                                    node.flush();
+                                    node.poll(); // flush
                                     count += 1;
                                 }
                                 Err(SendError::Full(_)) => {
-                                    node.flush();
+                                    node.poll(); // flush
                                     std::hint::spin_loop();
                                 }
                                 Err(_) => break,
