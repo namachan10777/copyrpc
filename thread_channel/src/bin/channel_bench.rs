@@ -1,9 +1,9 @@
 //! Channel All-to-All Benchmark Binary
 //!
 //! Benchmarks Flux (SPSC-based) and Mesh (MPSC-based) n-to-n communication
-//! performance with all-to-all call pattern.
+//! performance with all-to-all call pattern using time-based RPS monitoring.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -40,15 +40,15 @@ impl Default for Payload {
 
 #[derive(Parser)]
 #[command(name = "channel_bench")]
-#[command(about = "Flux vs Mesh all-to-all call benchmark")]
+#[command(about = "Flux vs Mesh all-to-all call benchmark with RPS monitoring")]
 struct Args {
     /// Thread counts to benchmark (comma-separated)
     #[arg(short = 'n', long, value_delimiter = ',', default_value = "2,3,4")]
     threads: Vec<usize>,
 
-    /// Number of calls per peer from each thread
-    #[arg(short, long, default_value = "10000")]
-    iterations: u64,
+    /// Duration in seconds
+    #[arg(short, long, default_value = "10")]
+    duration: u64,
 
     /// Channel capacity (for Flux only)
     #[arg(short, long, default_value = "1024")]
@@ -70,7 +70,7 @@ struct Args {
 struct BenchResult {
     threads: u32,
     implementation: String,
-    iterations: u64,
+    duration_secs: u64,
     total_calls: u64,
     runs: u32,
     duration_ns_mean: f64,
@@ -81,115 +81,178 @@ struct BenchResult {
     latency_ns_mean: f64,
 }
 
-fn run_flux_benchmark(n: usize, capacity: usize, iterations: u64) -> Duration {
-    // Per-node, per-peer completion counters: completed_counters[node][peer]
-    let completed_counters: Vec<Vec<Arc<AtomicU64>>> = (0..n)
-        .map(|_| (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect())
-        .collect();
-    let counters_clone: Vec<Vec<Arc<AtomicU64>>> = completed_counters
-        .iter()
-        .map(|v| v.iter().map(Arc::clone).collect())
-        .collect();
+/// Result from the monitor thread
+struct MonitorResult {
+    #[allow(dead_code)]
+    samples: Vec<u64>,
+    median_rps: u64, // Actually min_rps for conservative estimate
+    max_rps: u64,
+}
 
-    // Create nodes with response callback
-    // user_data is (node_idx, peer) tuple to track per-peer completion
-    let nodes: Vec<Flux<Payload, (usize, usize), _>> =
-        create_flux(n, capacity, move |&mut (node_idx, peer): &mut (usize, usize), _: Payload| {
-            counters_clone[node_idx][peer].fetch_add(1, Ordering::Relaxed);
-        });
+/// Flux benchmark result
+struct FluxBenchResult {
+    duration: Duration,
+    total_completed: u64,
+    monitor_result: MonitorResult,
+}
 
-    let barrier = Arc::new(Barrier::new(n));
+/// Run Flux benchmark with RPS monitoring
+/// Main thread acts as monitor and controls timing
+fn run_flux_benchmark(n: usize, capacity: usize, duration_secs: u64) -> FluxBenchResult {
+    // Per-thread completed counters (no contention)
+    let per_thread_completed: Vec<Arc<AtomicU64>> =
+        (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+
+    // No-op callback
+    let nodes: Vec<Flux<Payload, (), _>> =
+        create_flux(n, capacity, |_: &mut (), _: Payload| {});
+
+    let barrier = Arc::new(Barrier::new(n + 1)); // +1 for main thread
     let payload = Payload::default();
-
-    // Pipeline depth per peer - 256 allows good throughput while leaving room for replies
-    let max_in_flight_per_peer = 256u64;
 
     let handles: Vec<_> = nodes
         .into_iter()
         .enumerate()
         .map(|(thread_idx, mut node)| {
             let barrier = Arc::clone(&barrier);
-            let my_counters: Vec<Arc<AtomicU64>> =
-                completed_counters[thread_idx].iter().map(Arc::clone).collect();
+            let stop_flag = Arc::clone(&stop_flag);
+            let my_completed = Arc::clone(&per_thread_completed[thread_idx]);
             thread::spawn(move || {
-                // Pin to core
-                pin_to_core(thread_idx);
+                // Worker threads on CPU 1+ (main is on CPU 0)
+                pin_to_core(thread_idx + 1);
 
                 let id = node.id();
-                let num_peers = node.num_peers();
                 let peers: Vec<usize> = (0..n).filter(|&p| p != id).collect();
 
                 barrier.wait();
-                let start = Instant::now();
 
-                let mut sent_per_peer = vec![0u64; n];
-                let expected_requests = iterations * (num_peers as u64);
-                let mut sent_replies = 0u64;
+                let mut total_sent = 0u64;
                 let mut total_completed = 0u64;
-                let expected_responses = iterations * (num_peers as u64);
 
-                // Loop until all responses received AND all incoming requests processed
-                while total_completed < expected_responses || sent_replies < expected_requests {
-                    // Batch send: fill pipeline to max in-flight for each peer
+                // Main loop: run until stop_flag is set
+                while !stop_flag.load(Relaxed) {
+                    // Aggressive pipelining: try to send to all peers
+                    let mut any_sent = false;
                     for &peer in &peers {
-                        let completed_from_peer = my_counters[peer].load(Ordering::Relaxed);
-                        let in_flight = sent_per_peer[peer].saturating_sub(completed_from_peer);
-                        let can_send = max_in_flight_per_peer.saturating_sub(in_flight);
+                        if node.call(peer, payload, ()).is_ok() {
+                            total_sent += 1;
+                            any_sent = true;
+                        }
+                    }
 
-                        // Send up to can_send requests to this peer
-                        for _ in 0..can_send {
-                            if sent_per_peer[peer] >= iterations {
+                    // Poll and process replies
+                    if !any_sent || (total_sent & 0x1F) == 0 {
+                        node.poll();
+                        while let Some(handle) = node.try_recv() {
+                            let data = handle.data();
+                            if !handle.reply_or_requeue(data) {
                                 break;
-                            }
-                            // Pass (thread_idx, peer) as user_data for per-peer completion tracking
-                            if node.call(peer, payload, (thread_idx, peer)).is_ok() {
-                                sent_per_peer[peer] += 1;
-                            } else {
-                                break; // channel full
                             }
                         }
                     }
 
-                    // Poll: flushes pending writes, receives messages, invokes response callbacks
-                    node.poll();
-
-                    // Update total completed count
-                    total_completed = peers.iter().map(|&p| my_counters[p].load(Ordering::Relaxed)).sum();
-
-                    // Process received requests and reply
-                    while let Some(handle) = node.try_recv() {
-                        let data = handle.data();
-                        if handle.reply_or_requeue(data) {
-                            sent_replies += 1;
-                        } else {
-                            // Requeued - break to poll again
-                            break;
+                    // Track completed accurately: completed = sent - pending
+                    // Update every 1024 sends to reduce pending_count() calls
+                    if (total_sent & 0x3FF) == 0 {
+                        let pending = node.pending_count() as u64;
+                        let new_completed = total_sent.saturating_sub(pending);
+                        if new_completed > total_completed {
+                            total_completed = new_completed;
+                            // Publish to per-thread counter (main will aggregate)
+                            my_completed.store(total_completed, Relaxed);
                         }
                     }
                 }
 
-                // Final flush to ensure all pending replies are visible to peers
-                node.poll();
+                // Final update
+                let pending = node.pending_count() as u64;
+                total_completed = total_sent.saturating_sub(pending);
+                my_completed.store(total_completed, Relaxed);
 
-                start.elapsed()
+                total_completed
             })
         })
         .collect();
 
-    handles
-        .into_iter()
-        .map(|h| h.join().unwrap())
-        .max()
-        .unwrap()
+    // Main thread on CPU 0
+    pin_to_core(0);
+
+    // Main thread acts as monitor
+    barrier.wait();
+    let start = Instant::now();
+    let run_duration = Duration::from_secs(duration_secs);
+
+    let mut samples = Vec::new();
+    let mut prev_total = 0u64;
+    let interval_ms = 500u64;
+
+    while start.elapsed() < run_duration {
+        thread::sleep(Duration::from_millis(interval_ms));
+
+        // Sum all per-thread counters
+        let current_total: u64 = per_thread_completed.iter().map(|c| c.load(Relaxed)).sum();
+        let delta = current_total.saturating_sub(prev_total);
+        let rps = (delta as f64 * 1000.0 / interval_ms as f64) as u64;
+
+        if delta > 0 {
+            samples.push(rps);
+        }
+        prev_total = current_total;
+    }
+
+    // Signal workers to stop
+    stop_flag.store(true, Relaxed);
+
+    let duration = start.elapsed();
+
+    // Collect results
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let total_completed: u64 = results.iter().sum();
+
+    // Calculate min and max (report min for conservative estimate)
+    let monitor_result = if samples.is_empty() {
+        MonitorResult {
+            samples: vec![],
+            median_rps: 0,
+            max_rps: 0,
+        }
+    } else {
+        samples.sort();
+        MonitorResult {
+            median_rps: *samples.first().unwrap(), // Use min for conservative RPS
+            max_rps: *samples.last().unwrap(),
+            samples,
+        }
+    };
+
+    FluxBenchResult {
+        duration,
+        total_completed,
+        monitor_result,
+    }
 }
 
-fn run_mesh_benchmark(n: usize, iterations: u64) -> Duration {
+/// Mesh benchmark result
+struct MeshBenchResult {
+    duration: Duration,
+    total_completed: u64,
+    monitor_result: MonitorResult,
+}
+
+/// Run Mesh benchmark with RPS monitoring
+/// Main thread acts as monitor and controls timing
+fn run_mesh_benchmark(n: usize, duration_secs: u64) -> MeshBenchResult {
+    // Per-thread completed counters (no contention)
+    let per_thread_completed: Vec<Arc<AtomicU64>> =
+        (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+
     let nodes: Vec<Mesh<Payload>> = create_mesh(n);
-    let barrier = Arc::new(Barrier::new(n));
+    let barrier = Arc::new(Barrier::new(n + 1)); // +1 for main thread
     let payload = Payload::default();
 
     // Mesh uses blocking send, so we need to limit in-flight requests
-    // to avoid deadlock (all threads blocked sending while no one receives)
     let max_in_flight_per_peer = 256usize;
 
     let handles: Vec<_> = nodes
@@ -197,37 +260,32 @@ fn run_mesh_benchmark(n: usize, iterations: u64) -> Duration {
         .enumerate()
         .map(|(thread_idx, mut node)| {
             let barrier = Arc::clone(&barrier);
+            let stop_flag = Arc::clone(&stop_flag);
+            let my_completed = Arc::clone(&per_thread_completed[thread_idx]);
             thread::spawn(move || {
-                // Pin to core
-                pin_to_core(thread_idx);
+                // Worker threads on CPU 1+
+                pin_to_core(thread_idx + 1);
 
                 let id = node.id();
-                let num_peers = node.num_peers();
                 let peers: Vec<usize> = (0..n).filter(|&p| p != id).collect();
 
                 barrier.wait();
-                let start = Instant::now();
 
                 let mut sent_per_peer = vec![0u64; n];
                 let mut completed_per_peer = vec![0u64; n];
-                let mut completed = 0u64;
-                let expected_responses = iterations * (num_peers as u64);
-                let expected_requests = iterations * (num_peers as u64);
-                let mut sent_replies = 0u64;
+                let mut total_completed = 0u64;
 
-                // Loop until all responses received AND all incoming requests processed
-                while completed < expected_responses || sent_replies < expected_requests {
+                // Main loop: run until stop_flag is set
+                while !stop_flag.load(Relaxed) {
                     // Fill pipeline to max in-flight for all peers
                     for &peer in &peers {
-                        while sent_per_peer[peer] < iterations {
-                            let in_flight = sent_per_peer[peer] - completed_per_peer[peer];
-                            if in_flight >= max_in_flight_per_peer as u64 {
-                                break;
-                            }
+                        while (sent_per_peer[peer] - completed_per_peer[peer])
+                            < max_in_flight_per_peer as u64
+                        {
                             if node.call(peer, payload).is_ok() {
                                 sent_per_peer[peer] += 1;
                             } else {
-                                break; // channel full
+                                break;
                             }
                         }
                     }
@@ -236,30 +294,87 @@ fn run_mesh_benchmark(n: usize, iterations: u64) -> Duration {
                     loop {
                         match node.try_recv() {
                             Ok((from, ReceivedMessage::Request { req_num, data })) => {
-                                node.reply(from, req_num, data).unwrap();
-                                sent_replies += 1;
+                                let _ = node.reply(from, req_num, data);
                             }
                             Ok((from, ReceivedMessage::Response { .. })) => {
                                 completed_per_peer[from] += 1;
-                                completed += 1;
+                                total_completed += 1;
                             }
                             Ok((_, ReceivedMessage::Notify(_))) => {}
                             Err(RecvError::Empty) => break,
                             Err(RecvError::Disconnected) => break,
                         }
                     }
+
+                    // Publish completed count periodically
+                    if (total_completed & 0x3FF) == 0 {
+                        my_completed.store(total_completed, Relaxed);
+                    }
                 }
 
-                start.elapsed()
+                // Final update
+                my_completed.store(total_completed, Relaxed);
+                total_completed
             })
         })
         .collect();
 
-    handles
-        .into_iter()
-        .map(|h| h.join().unwrap())
-        .max()
-        .unwrap()
+    // Main thread on CPU 0
+    pin_to_core(0);
+
+    // Main thread acts as monitor
+    barrier.wait();
+    let start = Instant::now();
+    let run_duration = Duration::from_secs(duration_secs);
+
+    let mut samples = Vec::new();
+    let mut prev_total = 0u64;
+    let interval_ms = 500u64;
+
+    while start.elapsed() < run_duration {
+        thread::sleep(Duration::from_millis(interval_ms));
+
+        // Sum all per-thread counters
+        let current_total: u64 = per_thread_completed.iter().map(|c| c.load(Relaxed)).sum();
+        let delta = current_total.saturating_sub(prev_total);
+        let rps = (delta as f64 * 1000.0 / interval_ms as f64) as u64;
+
+        if delta > 0 {
+            samples.push(rps);
+        }
+        prev_total = current_total;
+    }
+
+    // Signal workers to stop
+    stop_flag.store(true, Relaxed);
+
+    let duration = start.elapsed();
+
+    // Collect results
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let total_completed: u64 = results.iter().sum();
+
+    // Calculate min and max (report min for conservative estimate)
+    let monitor_result = if samples.is_empty() {
+        MonitorResult {
+            samples: vec![],
+            median_rps: 0,
+            max_rps: 0,
+        }
+    } else {
+        samples.sort();
+        MonitorResult {
+            median_rps: *samples.first().unwrap(), // Use min
+            max_rps: *samples.last().unwrap(),
+            samples,
+        }
+    };
+
+    MeshBenchResult {
+        duration,
+        total_completed,
+        monitor_result,
+    }
 }
 
 fn compute_stats(durations: &[Duration]) -> (f64, u64, u64, f64) {
@@ -283,108 +398,124 @@ fn main() {
             continue;
         }
 
-        let total_calls = (n as u64) * ((n - 1) as u64) * args.iterations;
-
         // Benchmark Flux
         println!(
-            "Benchmarking Flux: n={}, iterations={}, total_calls={}",
-            n, args.iterations, total_calls
+            "Benchmarking Flux: n={}, duration={}s",
+            n, args.duration
         );
 
         // Warmup
         for w in 0..args.warmup {
             println!("  Warmup {}/{}", w + 1, args.warmup);
-            run_flux_benchmark(n, args.capacity, args.iterations);
+            run_flux_benchmark(n, args.capacity, args.duration.min(3));
         }
 
         // Benchmark runs
-        let mut durations = Vec::with_capacity(args.runs);
+        let mut all_medians = Vec::new();
+        let mut all_maxes = Vec::new();
+        let mut durations = Vec::new();
+        let mut total_ops = Vec::new();
+
         for r in 0..args.runs {
             println!("  Run {}/{}", r + 1, args.runs);
-            let duration = run_flux_benchmark(n, args.capacity, args.iterations);
-            durations.push(duration);
-            println!("    Duration: {:?}", duration);
+            let result = run_flux_benchmark(n, args.capacity, args.duration);
+            durations.push(result.duration);
+            total_ops.push(result.total_completed);
+            all_medians.push(result.monitor_result.median_rps);
+            all_maxes.push(result.monitor_result.max_rps);
+            println!(
+                "    Duration: {:?}, Completed: {}, Min RPS: {:.2} Mops/s, Max RPS: {:.2} Mops/s",
+                result.duration,
+                result.total_completed,
+                result.monitor_result.median_rps as f64 / 1_000_000.0,
+                result.monitor_result.max_rps as f64 / 1_000_000.0
+            );
         }
 
+        // Aggregate results
+        let avg_median_mops =
+            all_medians.iter().sum::<u64>() as f64 / all_medians.len() as f64 / 1_000_000.0;
+        let max_mops = *all_maxes.iter().max().unwrap() as f64 / 1_000_000.0;
+        let total_calls: u64 = total_ops.iter().sum();
+
+        println!(
+            "  Summary: Avg Min={:.2} Mops/s, Best Max={:.2} Mops/s",
+            avg_median_mops, max_mops
+        );
+
         let (mean_ns, min_ns, max_ns, stddev_ns) = compute_stats(&durations);
-        let throughput_mops = (total_calls as f64) / (mean_ns / 1_000_000_000.0) / 1_000_000.0;
-        let latency_ns = mean_ns / (total_calls as f64);
-
-        println!(
-            "  Results: mean={:.2}ms, min={:.2}ms, max={:.2}ms, stddev={:.2}ms",
-            mean_ns / 1_000_000.0,
-            min_ns as f64 / 1_000_000.0,
-            max_ns as f64 / 1_000_000.0,
-            stddev_ns / 1_000_000.0
-        );
-        println!(
-            "  Throughput: {:.2} Mops/s, Latency: {:.2} ns/call",
-            throughput_mops, latency_ns
-        );
-
         results.push(BenchResult {
             threads: n as u32,
             implementation: "flux".to_string(),
-            iterations: args.iterations,
+            duration_secs: args.duration,
             total_calls,
             runs: args.runs as u32,
             duration_ns_mean: mean_ns,
             duration_ns_min: min_ns,
             duration_ns_max: max_ns,
             duration_ns_stddev: stddev_ns,
-            throughput_mops_mean: throughput_mops,
-            latency_ns_mean: latency_ns,
+            throughput_mops_mean: avg_median_mops,
+            latency_ns_mean: 1_000_000_000.0 / (avg_median_mops * 1_000_000.0),
         });
 
         // Benchmark Mesh
         println!(
-            "Benchmarking Mesh: n={}, iterations={}, total_calls={}",
-            n, args.iterations, total_calls
+            "Benchmarking Mesh: n={}, duration={}s",
+            n, args.duration
         );
 
         // Warmup
         for w in 0..args.warmup {
             println!("  Warmup {}/{}", w + 1, args.warmup);
-            run_mesh_benchmark(n, args.iterations);
+            run_mesh_benchmark(n, args.duration.min(3));
         }
 
         // Benchmark runs
-        let mut durations = Vec::with_capacity(args.runs);
+        let mut all_medians = Vec::new();
+        let mut all_maxes = Vec::new();
+        let mut durations = Vec::new();
+        let mut total_ops = Vec::new();
+
         for r in 0..args.runs {
             println!("  Run {}/{}", r + 1, args.runs);
-            let duration = run_mesh_benchmark(n, args.iterations);
-            durations.push(duration);
-            println!("    Duration: {:?}", duration);
+            let result = run_mesh_benchmark(n, args.duration);
+            durations.push(result.duration);
+            total_ops.push(result.total_completed);
+            all_medians.push(result.monitor_result.median_rps);
+            all_maxes.push(result.monitor_result.max_rps);
+            println!(
+                "    Duration: {:?}, Completed: {}, Min RPS: {:.2} Mops/s, Max RPS: {:.2} Mops/s",
+                result.duration,
+                result.total_completed,
+                result.monitor_result.median_rps as f64 / 1_000_000.0,
+                result.monitor_result.max_rps as f64 / 1_000_000.0
+            );
         }
 
+        // Aggregate results
+        let avg_median_mops =
+            all_medians.iter().sum::<u64>() as f64 / all_medians.len() as f64 / 1_000_000.0;
+        let max_mops = *all_maxes.iter().max().unwrap() as f64 / 1_000_000.0;
+        let total_calls: u64 = total_ops.iter().sum();
+
+        println!(
+            "  Summary: Avg Min={:.2} Mops/s, Best Max={:.2} Mops/s",
+            avg_median_mops, max_mops
+        );
+
         let (mean_ns, min_ns, max_ns, stddev_ns) = compute_stats(&durations);
-        let throughput_mops = (total_calls as f64) / (mean_ns / 1_000_000_000.0) / 1_000_000.0;
-        let latency_ns = mean_ns / (total_calls as f64);
-
-        println!(
-            "  Results: mean={:.2}ms, min={:.2}ms, max={:.2}ms, stddev={:.2}ms",
-            mean_ns / 1_000_000.0,
-            min_ns as f64 / 1_000_000.0,
-            max_ns as f64 / 1_000_000.0,
-            stddev_ns / 1_000_000.0
-        );
-        println!(
-            "  Throughput: {:.2} Mops/s, Latency: {:.2} ns/call",
-            throughput_mops, latency_ns
-        );
-
         results.push(BenchResult {
             threads: n as u32,
             implementation: "mesh".to_string(),
-            iterations: args.iterations,
+            duration_secs: args.duration,
             total_calls,
             runs: args.runs as u32,
             duration_ns_mean: mean_ns,
             duration_ns_min: min_ns,
             duration_ns_max: max_ns,
             duration_ns_stddev: stddev_ns,
-            throughput_mops_mean: throughput_mops,
-            latency_ns_mean: latency_ns,
+            throughput_mops_mean: avg_median_mops,
+            latency_ns_mean: 1_000_000_000.0 / (avg_median_mops * 1_000_000.0),
         });
     }
 
@@ -397,7 +528,7 @@ fn write_parquet(path: &str, results: &[BenchResult]) -> Result<(), Box<dyn std:
     let schema = Schema::new(vec![
         Field::new("threads", DataType::UInt32, false),
         Field::new("implementation", DataType::Utf8, false),
-        Field::new("iterations", DataType::UInt64, false),
+        Field::new("duration_secs", DataType::UInt64, false),
         Field::new("total_calls", DataType::UInt64, false),
         Field::new("runs", DataType::UInt32, false),
         Field::new("duration_ns_mean", DataType::Float64, false),
@@ -410,7 +541,7 @@ fn write_parquet(path: &str, results: &[BenchResult]) -> Result<(), Box<dyn std:
 
     let threads: Vec<u32> = results.iter().map(|r| r.threads).collect();
     let implementation: Vec<&str> = results.iter().map(|r| r.implementation.as_str()).collect();
-    let iterations: Vec<u64> = results.iter().map(|r| r.iterations).collect();
+    let duration_secs: Vec<u64> = results.iter().map(|r| r.duration_secs).collect();
     let total_calls: Vec<u64> = results.iter().map(|r| r.total_calls).collect();
     let runs: Vec<u32> = results.iter().map(|r| r.runs).collect();
     let duration_ns_mean: Vec<f64> = results.iter().map(|r| r.duration_ns_mean).collect();
@@ -425,7 +556,7 @@ fn write_parquet(path: &str, results: &[BenchResult]) -> Result<(), Box<dyn std:
         vec![
             Arc::new(UInt32Array::from(threads)),
             Arc::new(StringArray::from(implementation)),
-            Arc::new(UInt64Array::from(iterations)),
+            Arc::new(UInt64Array::from(duration_secs)),
             Arc::new(UInt64Array::from(total_calls)),
             Arc::new(UInt32Array::from(runs)),
             Arc::new(Float64Array::from(duration_ns_mean)),

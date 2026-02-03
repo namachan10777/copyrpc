@@ -301,6 +301,16 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
             data: req.data,
         })
     }
+
+    /// Returns the number of pending calls awaiting responses.
+    ///
+    /// This can be used for in-flight tracking without atomic overhead:
+    /// `in_flight = pending_count()` since each pending call represents
+    /// a request that hasn't received its response yet.
+    #[inline]
+    pub fn pending_count(&self) -> usize {
+        self.pending_calls.len()
+    }
 }
 
 /// Creates a Flux network with `n` nodes.
