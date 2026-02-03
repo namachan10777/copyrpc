@@ -183,13 +183,11 @@ impl<T: Serial> Sender<T> {
     /// The value is written to the slot but `pending_tail` is only updated locally.
     /// Call `flush()` to make all written values visible to the receiver.
     ///
-    /// Returns `Err` if the receiver has disconnected or the channel is full.
+    /// Returns `Err` if the channel is full.
+    ///
+    /// Note: This does not check for receiver disconnection for performance.
+    /// Disconnection can be detected via `is_disconnected()` if needed.
     pub fn write(&mut self, value: T) -> Result<(), SendError<T>> {
-        // Check if receiver is dead
-        if self.inner.tx.rx_dead.load(Ordering::Relaxed) {
-            return Err(SendError(value));
-        }
-
         let next_tail = (self.pending_tail + 1) & self.inner.mask;
 
         // Check if we have room using cached head
@@ -275,30 +273,39 @@ impl<T: Serial> Receiver<T> {
 
     /// Attempts to receive a value from this channel.
     ///
-    /// This is equivalent to `sync()` + `poll()` when needed.
-    ///
     /// Returns `Err(TryRecvError::Empty)` if the channel is empty.
     /// Returns `Err(TryRecvError::Disconnected)` if the sender has disconnected
     /// and the channel is empty.
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
-        // First try without sync
-        if let Some(value) = self.poll() {
-            // Store head to notify sender
+        // Check local view first
+        if self.local_head != self.local_tail {
+            // We have data, read it
+            let value = unsafe {
+                let slot = &*self.inner.slots[self.local_head].get();
+                std::ptr::read(slot.as_ptr() as *const T)
+            };
+            self.local_head = (self.local_head + 1) & self.inner.mask;
+            // Notify sender immediately
             self.inner.rx.head.store(self.local_head, Ordering::Release);
             return Ok(value);
         }
 
-        // Need to sync to see if there's new data
-        // Only load tail, don't store head yet (nothing consumed)
+        // Empty local view, sync to get latest data
         self.local_tail = self.inner.tx.tail.load(Ordering::Acquire);
 
-        if let Some(value) = self.poll() {
-            // Store head to notify sender
+        if self.local_head != self.local_tail {
+            // Got new data after sync
+            let value = unsafe {
+                let slot = &*self.inner.slots[self.local_head].get();
+                std::ptr::read(slot.as_ptr() as *const T)
+            };
+            self.local_head = (self.local_head + 1) & self.inner.mask;
+            // Notify sender immediately
             self.inner.rx.head.store(self.local_head, Ordering::Release);
             return Ok(value);
         }
 
-        // Check if sender is dead
+        // Still empty after sync, check if sender is dead
         if self.inner.rx.tx_dead.load(Ordering::Acquire) {
             return Err(TryRecvError::Disconnected);
         }
@@ -370,7 +377,9 @@ mod tests {
 
         drop(rx);
 
-        assert!(matches!(tx.write(1), Err(SendError(1))));
+        // write() doesn't check for disconnection for performance
+        assert!(tx.write(1).is_ok());
+        // Disconnection can be detected via is_disconnected()
         assert!(tx.is_disconnected());
     }
 
