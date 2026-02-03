@@ -11,9 +11,15 @@ fn bench_pingpong(c: &mut Criterion) {
     let mut group = c.benchmark_group("pingpong");
     group.throughput(Throughput::Elements(1));
 
-    // Flux
+    // Flux - using new callback-based API
     group.bench_function("flux", |b| {
-        let nodes: Vec<Flux<u64>> = create_flux(2, 64);
+        // Response counter shared between callback and main thread
+        let response_received = Arc::new(AtomicBool::new(false));
+
+        let nodes: Vec<Flux<u64, Arc<AtomicBool>, _>> =
+            create_flux(2, 64, move |flag: &mut Arc<AtomicBool>, _data: u64| {
+                flag.store(true, Ordering::Release);
+            });
         let mut nodes: Vec<_> = nodes.into_iter().collect();
         let mut node1 = nodes.pop().unwrap();
         let mut node0 = nodes.pop().unwrap();
@@ -23,35 +29,33 @@ fn bench_pingpong(c: &mut Criterion) {
 
         let handle = thread::spawn(move || {
             while !stop2.load(Ordering::Relaxed) {
-                match node1.try_recv() {
-                    Ok((from, ReceivedMessage::Request { req_num, data })) => {
-                        node1.reply(from, req_num, data).unwrap();
-                    }
-                    Ok(_) => {}
-                    Err(RecvError::Empty) => {}
-                    Err(e) => panic!("recv error: {:?}", e),
+                node1.poll();
+                while let Some(handle) = node1.try_recv() {
+                    let data = handle.data();
+                    handle.reply(data).ok();
                 }
             }
             node1
         });
 
         b.iter(|| {
-            let req_num = node0.call(1, black_box(42)).unwrap();
+            response_received.store(false, Ordering::Release);
+            node0.call(1, black_box(42), response_received.clone()).unwrap();
             loop {
-                match node0.try_recv() {
-                    Ok((_, ReceivedMessage::Response { req_num: r, data })) if r == req_num => {
-                        black_box(data);
-                        break;
-                    }
-                    Ok(_) => {}
-                    Err(RecvError::Empty) => std::hint::spin_loop(),
-                    Err(e) => panic!("recv error: {:?}", e),
+                node0.poll();
+                // Drain any queued requests (shouldn't be any for node0)
+                while node0.try_recv().is_some() {}
+                if response_received.load(Ordering::Acquire) {
+                    break;
                 }
+                std::hint::spin_loop();
             }
         });
 
         stop.store(true, Ordering::Relaxed);
-        node0.notify(1, 0).ok();
+        // Send one more message to wake up the responder thread
+        node0.call(1, 0, Arc::new(AtomicBool::new(false))).ok();
+        node0.flush();
         handle.join().unwrap();
     });
 
@@ -102,7 +106,7 @@ fn bench_pingpong(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark fan-out: 1 node -> N nodes.
+/// Benchmark fan-out: 1 node -> N nodes (using call with dummy callback).
 fn bench_fanout(c: &mut Criterion) {
     let mut group = c.benchmark_group("fanout");
 
@@ -110,7 +114,7 @@ fn bench_fanout(c: &mut Criterion) {
         group.throughput(Throughput::Elements((n - 1) as u64));
 
         group.bench_with_input(BenchmarkId::new("flux", n), &n, |b, &n| {
-            let nodes: Vec<Flux<u64>> = create_flux(n, 1024);
+            let nodes: Vec<Flux<u64, (), _>> = create_flux(n, 1024, |_, _| {});
             let mut nodes: Vec<_> = nodes.into_iter().collect();
             let mut sender = nodes.remove(0);
 
@@ -122,12 +126,14 @@ fn bench_fanout(c: &mut Criterion) {
                     thread::spawn(move || {
                         let mut count = 0u64;
                         while !stop.load(Ordering::Relaxed) {
-                            if node.try_recv().is_ok() {
+                            node.poll();
+                            while node.try_recv().is_some() {
                                 count += 1;
                             }
                         }
                         // Drain remaining
-                        while node.try_recv().is_ok() {
+                        node.poll();
+                        while node.try_recv().is_some() {
                             count += 1;
                         }
                         count
@@ -137,8 +143,10 @@ fn bench_fanout(c: &mut Criterion) {
 
             b.iter(|| {
                 for peer in 1..n {
-                    sender.notify(peer, black_box(42)).unwrap();
+                    // Use call with empty user_data as a notification
+                    sender.call(peer, black_box(42), ()).unwrap();
                 }
+                sender.flush();
             });
 
             stop.store(true, Ordering::Relaxed);
@@ -197,7 +205,7 @@ fn bench_fanin(c: &mut Criterion) {
         group.throughput(Throughput::Elements((n - 1) as u64));
 
         group.bench_with_input(BenchmarkId::new("flux", n), &n, |b, &n| {
-            let nodes: Vec<Flux<u64>> = create_flux(n, 1024);
+            let nodes: Vec<Flux<u64, (), _>> = create_flux(n, 1024, |_, _| {});
             let mut nodes: Vec<_> = nodes.into_iter().collect();
             let mut receiver = nodes.remove(0);
 
@@ -209,9 +217,13 @@ fn bench_fanin(c: &mut Criterion) {
                     thread::spawn(move || {
                         let mut count = 0u64;
                         while !stop.load(Ordering::Relaxed) {
-                            match node.try_notify(0, count) {
-                                Ok(()) => count += 1,
+                            match node.call(0, count, ()) {
+                                Ok(()) => {
+                                    node.flush();
+                                    count += 1;
+                                }
                                 Err(SendError::Full(_)) => {
+                                    node.flush();
                                     std::hint::spin_loop();
                                 }
                                 Err(_) => break,
@@ -224,7 +236,11 @@ fn bench_fanin(c: &mut Criterion) {
 
             b.iter(|| {
                 for _ in 1..n {
-                    while receiver.try_recv().is_err() {
+                    loop {
+                        receiver.poll();
+                        if receiver.try_recv().is_some() {
+                            break;
+                        }
                         std::hint::spin_loop();
                     }
                 }
@@ -285,48 +301,7 @@ fn bench_spsc_batch(c: &mut Criterion) {
     for batch_size in [1, 8, 32, 128, 256] {
         group.throughput(Throughput::Elements(batch_size as u64));
 
-        // Traditional try_send/try_recv
-        group.bench_with_input(
-            BenchmarkId::new("try_send_recv", batch_size),
-            &batch_size,
-            |b, &batch_size| {
-                let (mut tx, mut rx) = spsc::channel::<u64>(1024);
-
-                let stop = Arc::new(AtomicBool::new(false));
-                let stop2 = stop.clone();
-
-                let handle = thread::spawn(move || {
-                    let mut count = 0u64;
-                    while !stop2.load(Ordering::Relaxed) {
-                        if rx.try_recv().is_ok() {
-                            count += 1;
-                        }
-                    }
-                    // Drain remaining
-                    while rx.try_recv().is_ok() {
-                        count += 1;
-                    }
-                    count
-                });
-
-                b.iter(|| {
-                    for i in 0..batch_size {
-                        loop {
-                            match tx.try_send(black_box(i as u64)) {
-                                Ok(None) => break,
-                                Ok(Some(_)) => std::hint::spin_loop(),
-                                Err(e) => panic!("send error: {:?}", e),
-                            }
-                        }
-                    }
-                });
-
-                stop.store(true, Ordering::Relaxed);
-                handle.join().unwrap();
-            },
-        );
-
-        // Batch write/flush
+        // Batch write/flush (main API)
         group.bench_with_input(
             BenchmarkId::new("write_flush", batch_size),
             &batch_size,

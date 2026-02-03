@@ -1703,6 +1703,7 @@ dependencies = [
  "core_affinity",
  "criterion",
  "parquet",
+ "slab",
 ]
 
 [[package]]

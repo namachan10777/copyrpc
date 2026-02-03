@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+slab = "0.4"
 clap = { version = "4", features = ["derive"], optional = true }
 parquet = { version = "54", optional = true }
 arrow = { version = "54", optional = true }

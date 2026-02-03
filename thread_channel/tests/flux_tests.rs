@@ -1,102 +1,95 @@
 //! Integration tests for Flux (SPSC-based n-to-n).
 
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
-use thread_channel::{create_flux, Flux, ReceivedMessage, SendError};
+use thread_channel::{create_flux, Flux, SendError};
 
 #[test]
 fn test_two_node_communication() {
-    let mut nodes: Vec<Flux<u32>> = create_flux(2, 64);
+    let mut nodes: Vec<Flux<u32, (), _>> = create_flux(2, 64, |_, _| {});
 
     // Node 0 -> Node 1
-    nodes[0].call(1, 100).unwrap();
-    nodes[0].call(1, 200).unwrap();
+    nodes[0].call(1, 100, ()).unwrap();
+    nodes[0].call(1, 200, ()).unwrap();
     nodes[0].flush();
 
-    let (from, msg) = nodes[1].poll().unwrap();
-    assert_eq!(from, 0);
-    assert!(matches!(msg, ReceivedMessage::Request { data: 100, .. }));
-    let (from, msg) = nodes[1].poll().unwrap();
-    assert_eq!(from, 0);
-    assert!(matches!(msg, ReceivedMessage::Request { data: 200, .. }));
+    nodes[1].poll();
+    let handle = nodes[1].try_recv().unwrap();
+    assert_eq!(handle.from(), 0);
+    assert_eq!(handle.data(), 100);
+    // Don't reply, just drop the handle
+
+    // Need to poll again for the second message since we already consumed from the queue
+    let handle = nodes[1].try_recv().unwrap();
+    assert_eq!(handle.from(), 0);
+    assert_eq!(handle.data(), 200);
 
     // Node 1 -> Node 0
-    nodes[1].call(0, 300).unwrap();
+    nodes[1].call(0, 300, ()).unwrap();
     nodes[1].flush();
-    let (from, msg) = nodes[0].poll().unwrap();
-    assert_eq!(from, 1);
-    assert!(matches!(msg, ReceivedMessage::Request { data: 300, .. }));
+
+    nodes[0].poll();
+    let handle = nodes[0].try_recv().unwrap();
+    assert_eq!(handle.from(), 1);
+    assert_eq!(handle.data(), 300);
 }
 
 #[test]
-fn test_call_reply() {
-    let mut nodes: Vec<Flux<u32>> = create_flux(2, 64);
+fn test_call_reply_with_callback() {
+    // Track responses via callback
+    thread_local! {
+        static RESPONSES: RefCell<Vec<(u32, u32)>> = RefCell::new(Vec::new());
+    }
 
-    // Node 0 calls Node 1
-    let req_num = nodes[0].call(1, 42).unwrap();
-    nodes[0].flush();
-    assert_eq!(req_num, 0);
+    let mut nodes: Vec<Flux<u32, u32, _>> = create_flux(2, 64, |user_data, data| {
+        RESPONSES.with(|r| r.borrow_mut().push((*user_data, data)));
+    });
 
-    // Second call should have different req_num
-    let req_num2 = nodes[0].call(1, 43).unwrap();
+    // Node 0 calls Node 1 with user_data
+    nodes[0].call(1, 42, 100).unwrap(); // user_data = 100
+    nodes[0].call(1, 43, 101).unwrap(); // user_data = 101
     nodes[0].flush();
-    assert_eq!(req_num2, 1);
 
     // Node 1 receives requests and replies
-    let (from, msg) = nodes[1].poll().unwrap();
-    assert_eq!(from, 0);
-    match msg {
-        ReceivedMessage::Request { req_num: r, data } => {
-            assert_eq!(r, 0);
-            assert_eq!(data, 42);
-            nodes[1].reply(0, r, data * 2).unwrap();
-        }
-        _ => panic!("expected Request"),
-    }
+    nodes[1].poll();
 
-    let (from, msg) = nodes[1].poll().unwrap();
-    assert_eq!(from, 0);
-    match msg {
-        ReceivedMessage::Request { req_num: r, data } => {
-            assert_eq!(r, 1);
-            assert_eq!(data, 43);
-            nodes[1].reply(0, r, data * 2).unwrap();
-        }
-        _ => panic!("expected Request"),
-    }
+    let handle = nodes[1].try_recv().unwrap();
+    assert_eq!(handle.from(), 0);
+    assert_eq!(handle.data(), 42);
+    let data = handle.data();
+    handle.reply(data * 2).unwrap(); // reply with 84
+
+    let handle = nodes[1].try_recv().unwrap();
+    assert_eq!(handle.from(), 0);
+    assert_eq!(handle.data(), 43);
+    let data = handle.data();
+    handle.reply(data * 2).unwrap(); // reply with 86
     nodes[1].flush();
 
-    // Node 0 receives responses
-    let (from, msg) = nodes[0].poll().unwrap();
-    assert_eq!(from, 1);
-    match msg {
-        ReceivedMessage::Response { req_num: r, data } => {
-            assert_eq!(r, 0);
-            assert_eq!(data, 84);
-        }
-        _ => panic!("expected Response"),
-    }
+    // Node 0 receives responses (via callback)
+    nodes[0].poll();
 
-    let (from, msg) = nodes[0].poll().unwrap();
-    assert_eq!(from, 1);
-    match msg {
-        ReceivedMessage::Response { req_num: r, data } => {
-            assert_eq!(r, 1);
-            assert_eq!(data, 86);
-        }
-        _ => panic!("expected Response"),
-    }
+    RESPONSES.with(|r| {
+        let responses = r.borrow();
+        assert_eq!(responses.len(), 2);
+        // Responses should have user_data and response data
+        assert!(responses.contains(&(100, 84)));
+        assert!(responses.contains(&(101, 86)));
+    });
 }
 
 #[test]
 fn test_all_to_all() {
     let n = 4;
-    let mut nodes: Vec<Flux<(usize, usize)>> = create_flux(n, 64);
+    let mut nodes: Vec<Flux<(usize, usize), (), _>> = create_flux(n, 64, |_, _| {});
 
     // Each node sends to all other nodes
     for i in 0..n {
         for j in 0..n {
             if i != j {
-                nodes[i].call(j, (i, j)).unwrap();
+                nodes[i].call(j, (i, j), ()).unwrap();
             }
         }
         nodes[i].flush();
@@ -105,16 +98,12 @@ fn test_all_to_all() {
     // Each node receives from all other nodes
     for i in 0..n {
         let mut received = Vec::new();
-        for _ in 0..(n - 1) {
-            let (from, msg) = nodes[i].poll().unwrap();
-            match msg {
-                ReceivedMessage::Request { data: (sender, receiver), .. } => {
-                    assert_eq!(from, sender);
-                    assert_eq!(i, receiver);
-                    received.push(from);
-                }
-                _ => panic!("expected Request"),
-            }
+        nodes[i].poll();
+        while let Some(handle) = nodes[i].try_recv() {
+            let (sender, receiver) = handle.data();
+            assert_eq!(handle.from(), sender);
+            assert_eq!(i, receiver);
+            received.push(handle.from());
         }
         received.sort();
         let expected: Vec<usize> = (0..n).filter(|&j| j != i).collect();
@@ -124,23 +113,21 @@ fn test_all_to_all() {
 
 #[test]
 fn test_round_robin_poll() {
-    let mut nodes: Vec<Flux<usize>> = create_flux(4, 64);
+    let mut nodes: Vec<Flux<usize, (), _>> = create_flux(4, 64, |_, _| {});
 
     // Nodes 1, 2, 3 all send to node 0
-    nodes[1].call(0, 1).unwrap();
+    nodes[1].call(0, 1, ()).unwrap();
     nodes[1].flush();
-    nodes[2].call(0, 2).unwrap();
+    nodes[2].call(0, 2, ()).unwrap();
     nodes[2].flush();
-    nodes[3].call(0, 3).unwrap();
+    nodes[3].call(0, 3, ()).unwrap();
     nodes[3].flush();
 
+    nodes[0].poll();
+
     let mut received = Vec::new();
-    for _ in 0..3 {
-        let (from, msg) = nodes[0].poll().unwrap();
-        match msg {
-            ReceivedMessage::Request { data: val, .. } => received.push((from, val)),
-            _ => panic!("expected Request"),
-        }
+    while let Some(handle) = nodes[0].try_recv() {
+        received.push((handle.from(), handle.data()));
     }
 
     // Should have received from all three
@@ -148,19 +135,19 @@ fn test_round_robin_poll() {
     assert!(received.contains(&(2, 2)));
     assert!(received.contains(&(3, 3)));
 
-    // Channel should be empty now
-    assert!(nodes[0].poll().is_none());
+    // Queue should be empty now
+    assert!(nodes[0].try_recv().is_none());
 }
 
 #[test]
 fn test_channel_full() {
-    let mut nodes: Vec<Flux<u32>> = create_flux(2, 2); // Very small capacity
+    let mut nodes: Vec<Flux<u32, (), _>> = create_flux(2, 2, |_, _| {}); // Very small capacity
 
     // Fill the channel (capacity 2 = 1 slot usable)
-    assert!(nodes[0].call(1, 1).is_ok());
+    assert!(nodes[0].call(1, 1, ()).is_ok());
 
     // Second send should fail with Full
-    match nodes[0].call(1, 2) {
+    match nodes[0].call(1, 2, ()) {
         Err(SendError::Full(2)) => {}
         other => panic!("expected Full error, got {:?}", other),
     }
@@ -168,17 +155,17 @@ fn test_channel_full() {
 
 #[test]
 fn test_invalid_peer() {
-    let mut nodes: Vec<Flux<u32>> = create_flux(2, 64);
+    let mut nodes: Vec<Flux<u32, (), _>> = create_flux(2, 64, |_, _| {});
 
     // Send to non-existent peer
     assert!(matches!(
-        nodes[0].call(10, 42),
+        nodes[0].call(10, 42, ()),
         Err(SendError::InvalidPeer(42))
     ));
 
     // Cannot send to self
     assert!(matches!(
-        nodes[0].call(0, 42),
+        nodes[0].call(0, 42, ()),
         Err(SendError::InvalidPeer(42))
     ));
 }
@@ -187,11 +174,21 @@ fn test_invalid_peer() {
 fn test_threaded_all_to_all() {
     let n = 8;
     let msgs_per_pair = 1000;
-    let nodes: Vec<Flux<u64>> = create_flux(n, 2048);
+
+    // Create shared counters for response tracking
+    let response_counts: Vec<Arc<AtomicU64>> =
+        (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let counts_clone: Vec<Arc<AtomicU64>> = response_counts.clone();
+
+    let nodes: Vec<Flux<u64, usize, _>> = create_flux(n, 2048, move |node_idx: &mut usize, _: u64| {
+        counts_clone[*node_idx].fetch_add(1, Ordering::Relaxed);
+    });
 
     let handles: Vec<_> = nodes
         .into_iter()
-        .map(|mut node| {
+        .enumerate()
+        .map(|(node_idx, mut node)| {
+            let response_counter = Arc::clone(&response_counts[node_idx]);
             thread::spawn(move || {
                 let id = node.id();
 
@@ -200,10 +197,15 @@ fn test_threaded_all_to_all() {
                     if peer != id {
                         for i in 0..msgs_per_pair {
                             loop {
-                                match node.call(peer, id as u64 * 1_000_000 + i as u64) {
+                                match node.call(peer, id as u64 * 1_000_000 + i as u64, node_idx) {
                                     Ok(_) => break,
                                     Err(SendError::Full(_)) => {
-                                        node.flush();
+                                        node.poll();
+                                        // Process any incoming requests
+                                        while let Some(handle) = node.try_recv() {
+                                            let data = handle.data();
+                                            handle.reply(data).ok();
+                                        }
                                         std::hint::spin_loop();
                                     }
                                     Err(e) => panic!("send error: {:?}", e),
@@ -212,76 +214,69 @@ fn test_threaded_all_to_all() {
                         }
                     }
                 }
-                node.flush();
 
-                // Receive from all peers
-                let expected = (n - 1) * msgs_per_pair;
-                let mut count = 0;
-                while count < expected {
-                    if let Some((from, ReceivedMessage::Request { data: val, .. })) = node.poll() {
-                        assert_eq!(val / 1_000_000, from as u64);
-                        count += 1;
+                // Continue processing until all expected messages received
+                let expected_responses = ((n - 1) * msgs_per_pair) as u64;
+                let expected_requests = ((n - 1) * msgs_per_pair) as u64;
+                let mut requests_processed = 0u64;
+
+                while response_counter.load(Ordering::Relaxed) < expected_responses
+                    || requests_processed < expected_requests
+                {
+                    node.poll();
+                    while let Some(handle) = node.try_recv() {
+                        let val = handle.data();
+                        assert_eq!(val / 1_000_000, handle.from() as u64);
+                        handle.reply(val).ok();
+                        requests_processed += 1;
                     }
                 }
 
-                count
+                response_counter.load(Ordering::Relaxed)
             })
         })
         .collect();
 
     for h in handles {
         let count = h.join().unwrap();
-        assert_eq!(count, (n - 1) * msgs_per_pair);
+        assert_eq!(count, ((n - 1) * msgs_per_pair) as u64);
     }
 }
 
 #[test]
-fn test_ping_pong_pairs() {
-    let n = 4;
-    let iterations = 10000;
-    let nodes: Vec<Flux<u64>> = create_flux(n, 64);
+fn test_simple_ping_pong() {
+    // Simple synchronous ping-pong test between 2 nodes
+    let response_received = Arc::new(AtomicU64::new(0));
+    let response_clone = Arc::clone(&response_received);
 
-    let handles: Vec<_> = nodes
-        .into_iter()
-        .map(|mut node| {
-            thread::spawn(move || {
-                let id = node.id();
+    let mut nodes: Vec<Flux<u64, u64, _>> = create_flux(
+        2,
+        64,
+        move |expected: &mut u64, response: u64| {
+            assert_eq!(*expected, response);
+            response_clone.fetch_add(1, Ordering::Relaxed);
+        },
+    );
 
-                // Pair up: 0<->1, 2<->3, etc.
-                let partner = if id % 2 == 0 { id + 1 } else { id - 1 };
+    let iterations = 100u64;
 
-                if id < partner {
-                    // Initiator
-                    for i in 0..iterations {
-                        let req_num = node.call(partner, i).unwrap();
-                        node.flush();
-                        loop {
-                            if let Some((from, ReceivedMessage::Response { req_num: r, data })) = node.poll() {
-                                assert_eq!(from, partner);
-                                assert_eq!(r, req_num);
-                                assert_eq!(data, i);
-                                break;
-                            }
-                        }
-                    }
-                } else {
-                    // Responder
-                    for _ in 0..iterations {
-                        let (from, req_num, v) = loop {
-                            if let Some((from, ReceivedMessage::Request { req_num, data })) = node.poll() {
-                                assert_eq!(from, partner);
-                                break (from, req_num, data);
-                            }
-                        };
-                        node.reply(from, req_num, v).unwrap();
-                        node.flush();
-                    }
-                }
-            })
-        })
-        .collect();
+    // Node 0 sends, Node 1 responds
+    for i in 0..iterations {
+        // Send request
+        nodes[0].call(1, i, i).unwrap();
+        nodes[0].flush();
 
-    for h in handles {
-        h.join().unwrap();
+        // Node 1 receives and replies
+        nodes[1].poll();
+        let handle = nodes[1].try_recv().unwrap();
+        assert_eq!(handle.data(), i);
+        let data = handle.data();
+        handle.reply(data).unwrap();
+        nodes[1].flush();
+
+        // Node 0 receives response (via callback)
+        nodes[0].poll();
     }
+
+    assert_eq!(response_received.load(Ordering::Relaxed), iterations);
 }

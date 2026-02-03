@@ -3,6 +3,7 @@
 //! Benchmarks Flux (SPSC-based) and Mesh (MPSC-based) n-to-n communication
 //! performance with all-to-all call pattern.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -81,18 +82,28 @@ struct BenchResult {
 }
 
 fn run_flux_benchmark(n: usize, capacity: usize, iterations: u64) -> Duration {
-    let nodes: Vec<Flux<Payload>> = create_flux(n, capacity);
+    // Create shared completion counters for all nodes
+    let completed_counters: Vec<Arc<AtomicU64>> =
+        (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let counters_clone: Vec<Arc<AtomicU64>> = completed_counters.clone();
+
+    // Create nodes with response callback
+    let nodes: Vec<Flux<Payload, usize, _>> = create_flux(n, capacity, move |node_idx: &mut usize, _: Payload| {
+        counters_clone[*node_idx].fetch_add(1, Ordering::Relaxed);
+    });
+
     let barrier = Arc::new(Barrier::new(n));
     let payload = Payload::default();
 
     // Limit in-flight requests per peer to leave room for replies
-    let max_in_flight_per_peer = (capacity / 4).max(1);
+    let max_in_flight_per_peer = (capacity / 4).max(1) as u64;
 
     let handles: Vec<_> = nodes
         .into_iter()
         .enumerate()
         .map(|(thread_idx, mut node)| {
             let barrier = Arc::clone(&barrier);
+            let completed_counter = Arc::clone(&completed_counters[thread_idx]);
             thread::spawn(move || {
                 // Pin to core
                 pin_to_core(thread_idx);
@@ -105,58 +116,45 @@ fn run_flux_benchmark(n: usize, capacity: usize, iterations: u64) -> Duration {
                 let start = Instant::now();
 
                 let mut sent_per_peer = vec![0u64; n];
-                let mut completed_per_peer = vec![0u64; n];
-                let mut completed = 0u64;
                 let expected_responses = iterations * (num_peers as u64);
                 let expected_requests = iterations * (num_peers as u64);
-
-                // Pending replies that couldn't be sent due to full channel
-                let mut pending_replies: Vec<(usize, u64, Payload)> = Vec::new();
                 let mut sent_replies = 0u64;
 
                 // Loop until all responses received AND all incoming requests processed
-                while completed < expected_responses
-                    || (sent_replies + pending_replies.len() as u64) < expected_requests
+                while completed_counter.load(Ordering::Relaxed) < expected_responses
+                    || sent_replies < expected_requests
                 {
-                    // Try to flush pending replies first (highest priority)
-                    let old_pending = pending_replies.len();
-                    pending_replies.retain(|&(to, req_num, data)| node.reply(to, req_num, data).is_err());
-                    sent_replies += (old_pending - pending_replies.len()) as u64;
-
                     // Batch send: fill pipeline to max in-flight for all peers
                     for &peer in &peers {
                         while sent_per_peer[peer] < iterations {
-                            let in_flight = sent_per_peer[peer] - completed_per_peer[peer];
-                            if in_flight >= max_in_flight_per_peer as u64 {
+                            let completed = completed_counter.load(Ordering::Relaxed);
+                            // Approximate in-flight calculation
+                            let total_sent: u64 = sent_per_peer.iter().sum();
+                            let in_flight_total = total_sent.saturating_sub(completed);
+                            let in_flight_per_peer = in_flight_total / num_peers.max(1) as u64;
+
+                            if in_flight_per_peer >= max_in_flight_per_peer {
                                 break;
                             }
-                            if node.call(peer, payload).is_ok() {
+                            // Pass thread_idx as user_data so callback knows which counter to update
+                            if node.call(peer, payload, thread_idx).is_ok() {
                                 sent_per_peer[peer] += 1;
                             } else {
                                 break; // channel full
                             }
                         }
                     }
-                    node.flush();
 
-                    // Batch receive: poll all available
-                    while let Some((from, msg)) = node.poll() {
-                        match msg {
-                            ReceivedMessage::Request { req_num, data } => {
-                                if node.reply(from, req_num, data).is_ok() {
-                                    sent_replies += 1;
-                                } else {
-                                    pending_replies.push((from, req_num, data));
-                                }
-                            }
-                            ReceivedMessage::Response { .. } => {
-                                completed_per_peer[from] += 1;
-                                completed += 1;
-                            }
-                            ReceivedMessage::Notify(_) => {}
+                    // Poll processes messages: auto-flushes, invokes response callback, queues requests
+                    node.poll();
+
+                    // Process received requests
+                    while let Some(handle) = node.try_recv() {
+                        let data = handle.data();
+                        if handle.reply(data).is_ok() {
+                            sent_replies += 1;
                         }
                     }
-                    node.flush();
                 }
 
                 start.elapsed()

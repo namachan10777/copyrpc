@@ -10,7 +10,7 @@ pub mod spsc;
 
 pub(crate) mod mpsc;
 
-pub use flux::{create_flux, Flux};
+pub use flux::{create_flux, Flux, RecvHandle};
 pub use mesh::{create_mesh, Mesh};
 pub use spsc::Serial;
 
