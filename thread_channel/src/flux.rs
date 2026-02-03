@@ -63,11 +63,13 @@ pub struct RecvHandle<'a, T: Serial, U, F: FnMut(&mut U, T)> {
 
 impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T)> RecvHandle<'a, T, U, F> {
     /// Returns the sender's node ID.
+    #[inline]
     pub fn from(&self) -> usize {
         self.from
     }
 
     /// Returns a copy of the request data.
+    #[inline]
     pub fn data(&self) -> T {
         self.data
     }
@@ -77,6 +79,7 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T)> RecvHandle<'a, T, U, F> {
     /// On failure, returns the handle along with the error so it can be retried.
     /// The reply is written to the buffer but not flushed. The next `poll()` call
     /// will flush all pending writes.
+    #[inline]
     pub fn reply(self, value: T) -> Result<(), (Self, SendError<T>)> {
         let channel_idx = match self.flux.peer_to_channel_index(self.from) {
             Some(idx) => idx,
@@ -107,6 +110,7 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T)> RecvHandle<'a, T, U, F> {
     ///
     /// Returns `true` if the reply was sent successfully, `false` if it was requeued.
     /// Use this when you want to process multiple requests without blocking on any single one.
+    #[inline]
     pub fn reply_or_requeue(self, value: T) -> bool {
         let channel_idx = match self.flux.peer_to_channel_index(self.from) {
             Some(idx) => idx,
@@ -200,6 +204,7 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
     ///
     /// The message is written to the slot but not flushed. Call `flush()` or `poll()`
     /// to make all written messages visible to peers.
+    #[inline]
     pub fn call(&mut self, to: usize, value: T, user_data: U) -> Result<(), SendError<T>> {
         let channel_idx = match self.peer_to_channel_index(to) {
             Some(idx) => idx,
@@ -231,6 +236,7 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
     ///
     /// This makes all previously written messages visible to their respective peers.
     /// Called automatically by `poll()`.
+    #[inline]
     fn flush(&mut self) {
         for ch in &mut self.channels {
             ch.tx.flush();
@@ -245,6 +251,7 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
     ///
     /// Note: SPSC's `poll()` internally syncs when the local view is empty,
     /// so a single pass over all channels is sufficient.
+    #[inline]
     pub fn poll(&mut self) {
         // Auto-flush before receiving
         self.flush();
@@ -284,6 +291,7 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
     ///
     /// Returns a `RecvHandle` that can be used to read the data and send a reply.
     /// Returns `None` if no requests are queued (call `poll()` to receive more).
+    #[inline]
     pub fn try_recv(&mut self) -> Option<RecvHandle<'_, T, U, F>> {
         let req = self.recv_queue.pop_front()?;
         Some(RecvHandle {
