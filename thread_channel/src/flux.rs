@@ -78,30 +78,28 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T)> RecvHandle<'a, T, U, F> {
     /// The reply is written to the buffer but not flushed. The next `poll()` call
     /// will flush all pending writes.
     pub fn reply(self, value: T) -> Result<(), (Self, SendError<T>)> {
+        let channel_idx = match self.flux.peer_to_channel_index(self.from) {
+            Some(idx) => idx,
+            None => return Err((self, SendError::InvalidPeer(value))),
+        };
+
         let msg = Message {
             kind: MessageKind::Response,
             req_num: self.req_num,
             data: value,
         };
-        match self
-            .flux
-            .channels
-            .iter_mut()
-            .find(|c| c.peer_id == self.from)
-        {
-            Some(ch) => match ch.tx.write(msg) {
-                Ok(()) => Ok(()),
-                Err(spsc::SendError(m)) => Err((
-                    Self {
-                        flux: self.flux,
-                        from: self.from,
-                        req_num: self.req_num,
-                        data: self.data,
-                    },
-                    SendError::Full(m.data),
-                )),
-            },
-            None => Err((self, SendError::InvalidPeer(value))),
+
+        match self.flux.channels[channel_idx].tx.write(msg) {
+            Ok(()) => Ok(()),
+            Err(spsc::SendError(m)) => Err((
+                Self {
+                    flux: self.flux,
+                    from: self.from,
+                    req_num: self.req_num,
+                    data: self.data,
+                },
+                SendError::Full(m.data),
+            )),
         }
     }
 
@@ -110,31 +108,29 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T)> RecvHandle<'a, T, U, F> {
     /// Returns `true` if the reply was sent successfully, `false` if it was requeued.
     /// Use this when you want to process multiple requests without blocking on any single one.
     pub fn reply_or_requeue(self, value: T) -> bool {
+        let channel_idx = match self.flux.peer_to_channel_index(self.from) {
+            Some(idx) => idx,
+            None => {
+                // Invalid peer - requeue to avoid data loss
+                self.flux.recv_queue.push_front(RecvRequest {
+                    from: self.from,
+                    req_num: self.req_num,
+                    data: self.data,
+                });
+                return false;
+            }
+        };
+
         let msg = Message {
             kind: MessageKind::Response,
             req_num: self.req_num,
             data: value,
         };
-        match self
-            .flux
-            .channels
-            .iter_mut()
-            .find(|c| c.peer_id == self.from)
-        {
-            Some(ch) => match ch.tx.write(msg) {
-                Ok(()) => true,
-                Err(spsc::SendError(_)) => {
-                    // Requeue the request at the front
-                    self.flux.recv_queue.push_front(RecvRequest {
-                        from: self.from,
-                        req_num: self.req_num,
-                        data: self.data,
-                    });
-                    false
-                }
-            },
-            None => {
-                // Invalid peer - requeue anyway to avoid data loss
+
+        match self.flux.channels[channel_idx].tx.write(msg) {
+            Ok(()) => true,
+            Err(spsc::SendError(_)) => {
+                // Requeue the request at the front
                 self.flux.recv_queue.push_front(RecvRequest {
                     from: self.from,
                     req_num: self.req_num,
@@ -160,6 +156,7 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T)> RecvHandle<'a, T, U, F> {
 /// - `flush()` - Explicitly flush pending writes (poll does this automatically)
 pub struct Flux<T: Serial, U, F: FnMut(&mut U, T)> {
     id: usize,
+    num_nodes: usize,
     channels: Vec<FluxChannel<T>>,
     /// Round-robin index for poll
     recv_index: usize,
@@ -184,6 +181,18 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
         self.channels.len()
     }
 
+    /// Converts peer ID to channel index in O(1).
+    ///
+    /// Channels are ordered as [0, 1, ..., id-1, id+1, ..., n-1],
+    /// so peer j maps to index j if j < id, or j-1 if j > id.
+    #[inline]
+    fn peer_to_channel_index(&self, peer: usize) -> Option<usize> {
+        if peer >= self.num_nodes || peer == self.id {
+            return None;
+        }
+        Some(if peer < self.id { peer } else { peer - 1 })
+    }
+
     /// Writes a call to the specified peer without making it visible yet.
     ///
     /// The `user_data` is stored internally and passed to the response callback
@@ -192,6 +201,11 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
     /// The message is written to the slot but not flushed. Call `flush()` or `poll()`
     /// to make all written messages visible to peers.
     pub fn call(&mut self, to: usize, value: T, user_data: U) -> Result<(), SendError<T>> {
+        let channel_idx = match self.peer_to_channel_index(to) {
+            Some(idx) => idx,
+            None => return Err(SendError::InvalidPeer(value)),
+        };
+
         let call_id = self.pending_calls.insert(user_data);
         let req_num = call_id as u64;
 
@@ -201,22 +215,14 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
             data: value,
         };
 
-        match self.channels.iter_mut().find(|c| c.peer_id == to) {
-            Some(ch) => match ch.tx.write(msg) {
-                Ok(()) => {
-                    self.next_req_num = self.next_req_num.wrapping_add(1);
-                    Ok(())
-                }
-                Err(spsc::SendError(m)) => {
-                    // Remove the user_data we just inserted
-                    self.pending_calls.remove(call_id);
-                    Err(SendError::Full(m.data))
-                }
-            },
-            None => {
-                // Remove the user_data we just inserted
+        match self.channels[channel_idx].tx.write(msg) {
+            Ok(()) => {
+                self.next_req_num = self.next_req_num.wrapping_add(1);
+                Ok(())
+            }
+            Err(spsc::SendError(m)) => {
                 self.pending_calls.remove(call_id);
-                Err(SendError::InvalidPeer(value))
+                Err(SendError::Full(m.data))
             }
         }
     }
@@ -350,12 +356,13 @@ where
 
         nodes.push(Flux {
             id: i,
+            num_nodes: n,
             channels,
             recv_index: 0,
             next_req_num: 0,
-            pending_calls: Slab::new(),
+            pending_calls: Slab::with_capacity(capacity),
             on_response: on_response.clone(),
-            recv_queue: VecDeque::new(),
+            recv_queue: VecDeque::with_capacity(capacity),
         });
     }
 
