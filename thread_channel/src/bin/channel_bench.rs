@@ -131,37 +131,40 @@ fn run_flux_benchmark(n: usize, capacity: usize, duration_secs: u64) -> FluxBenc
                 let mut total_completed = 0u64;
 
                 // Main loop: run until stop_flag is set
-                while !stop_flag.load(Relaxed) {
-                    // Aggressive pipelining: try to send to all peers
-                    let mut any_sent = false;
-                    for &peer in &peers {
-                        if node.call(peer, payload, ()).is_ok() {
-                            total_sent += 1;
-                            any_sent = true;
+                // Check stop_flag only every 1024 iterations to reduce atomic overhead
+                'outer: loop {
+                    for _ in 0..1024 {
+                        // Aggressive pipelining: try to send to all peers
+                        let mut any_sent = false;
+                        for &peer in &peers {
+                            if node.call(peer, payload, ()).is_ok() {
+                                total_sent += 1;
+                                any_sent = true;
+                            }
                         }
-                    }
 
-                    // Poll and process replies
-                    if !any_sent || (total_sent & 0x1F) == 0 {
-                        node.poll();
-                        while let Some(handle) = node.try_recv() {
-                            let data = handle.data();
-                            if !handle.reply_or_requeue(data) {
-                                break;
+                        // Poll and process replies
+                        if !any_sent || (total_sent & 0x1F) == 0 {
+                            node.poll();
+                            while let Some(handle) = node.try_recv() {
+                                let data = handle.data();
+                                if !handle.reply_or_requeue(data) {
+                                    break;
+                                }
                             }
                         }
                     }
 
-                    // Track completed accurately: completed = sent - pending
-                    // Update every 1024 sends to reduce pending_count() calls
-                    if (total_sent & 0x3FF) == 0 {
-                        let pending = node.pending_count() as u64;
-                        let new_completed = total_sent.saturating_sub(pending);
-                        if new_completed > total_completed {
-                            total_completed = new_completed;
-                            // Publish to per-thread counter (main will aggregate)
-                            my_completed.store(total_completed, Relaxed);
-                        }
+                    // Update completed count and check stop_flag (every 1024 iterations)
+                    let pending = node.pending_count() as u64;
+                    let new_completed = total_sent.saturating_sub(pending);
+                    if new_completed > total_completed {
+                        total_completed = new_completed;
+                        my_completed.store(total_completed, Relaxed);
+                    }
+
+                    if stop_flag.load(Relaxed) {
+                        break 'outer;
                     }
                 }
 
@@ -276,39 +279,44 @@ fn run_mesh_benchmark(n: usize, duration_secs: u64) -> MeshBenchResult {
                 let mut total_completed = 0u64;
 
                 // Main loop: run until stop_flag is set
-                while !stop_flag.load(Relaxed) {
-                    // Fill pipeline to max in-flight for all peers
-                    for &peer in &peers {
-                        while (sent_per_peer[peer] - completed_per_peer[peer])
-                            < max_in_flight_per_peer as u64
-                        {
-                            if node.call(peer, payload).is_ok() {
-                                sent_per_peer[peer] += 1;
-                            } else {
-                                break;
+                // Check stop_flag only every 1024 iterations
+                'outer: loop {
+                    for _ in 0..1024 {
+                        // Fill pipeline to max in-flight for all peers
+                        for &peer in &peers {
+                            while (sent_per_peer[peer] - completed_per_peer[peer])
+                                < max_in_flight_per_peer as u64
+                            {
+                                if node.call(peer, payload).is_ok() {
+                                    sent_per_peer[peer] += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Process received messages
+                        loop {
+                            match node.try_recv() {
+                                Ok((from, ReceivedMessage::Request { req_num, data })) => {
+                                    let _ = node.reply(from, req_num, data);
+                                }
+                                Ok((from, ReceivedMessage::Response { .. })) => {
+                                    completed_per_peer[from] += 1;
+                                    total_completed += 1;
+                                }
+                                Ok((_, ReceivedMessage::Notify(_))) => {}
+                                Err(RecvError::Empty) => break,
+                                Err(RecvError::Disconnected) => break,
                             }
                         }
                     }
 
-                    // Process received messages
-                    loop {
-                        match node.try_recv() {
-                            Ok((from, ReceivedMessage::Request { req_num, data })) => {
-                                let _ = node.reply(from, req_num, data);
-                            }
-                            Ok((from, ReceivedMessage::Response { .. })) => {
-                                completed_per_peer[from] += 1;
-                                total_completed += 1;
-                            }
-                            Ok((_, ReceivedMessage::Notify(_))) => {}
-                            Err(RecvError::Empty) => break,
-                            Err(RecvError::Disconnected) => break,
-                        }
-                    }
+                    // Update and check stop_flag every 1024 iterations
+                    my_completed.store(total_completed, Relaxed);
 
-                    // Publish completed count periodically
-                    if (total_completed & 0x3FF) == 0 {
-                        my_completed.store(total_completed, Relaxed);
+                    if stop_flag.load(Relaxed) {
+                        break 'outer;
                     }
                 }
 

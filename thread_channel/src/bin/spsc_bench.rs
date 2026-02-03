@@ -327,26 +327,30 @@ fn bench_pingpong_timed(capacity: usize, duration_secs: u64) -> (Duration, u64) 
         let batch_size = 256u64;
         let max_in_flight = batch_size.min(capacity as u64 - 1);
 
-        while !stop_a.load(Ordering::Relaxed) {
-            // Send up to max in-flight
-            while (sent - received) < max_in_flight {
-                if tx_a_to_b.write(payload).is_ok() {
-                    sent += 1;
-                } else {
-                    break;
+        // Check stop_flag every 1024 iterations
+        'outer: loop {
+            for _ in 0..1024 {
+                // Send up to max in-flight
+                while (sent - received) < max_in_flight {
+                    if tx_a_to_b.write(payload).is_ok() {
+                        sent += 1;
+                    } else {
+                        break;
+                    }
                 }
-            }
-            tx_a_to_b.flush();
+                tx_a_to_b.flush();
 
-            // Receive replies
-            while let Some(_) = rx_b_to_a.poll() {
-                received += 1;
+                // Receive replies
+                while let Some(_) = rx_b_to_a.poll() {
+                    received += 1;
+                }
+                rx_b_to_a.sync();
             }
-            rx_b_to_a.sync();
 
-            // Update counter periodically
-            if (received & 0x3FF) == 0 {
-                counter_a.store(received, Ordering::Relaxed);
+            // Update counter and check stop_flag every 1024 iterations
+            counter_a.store(received, Ordering::Relaxed);
+            if stop_a.load(Ordering::Relaxed) {
+                break 'outer;
             }
         }
 
@@ -360,16 +364,23 @@ fn bench_pingpong_timed(capacity: usize, duration_secs: u64) -> (Duration, u64) 
         pin_to_core(2); // Worker on CPU 2
         barrier_b.wait();
 
-        while !stop_b.load(Ordering::Relaxed) {
-            // Receive and echo back
-            while let Some(msg) = rx_a_to_b.poll() {
-                if tx_b_to_a.write(msg).is_err() {
-                    tx_b_to_a.flush();
-                    break;
+        // Check stop_flag every 1024 iterations
+        'outer: loop {
+            for _ in 0..1024 {
+                // Receive and echo back
+                while let Some(msg) = rx_a_to_b.poll() {
+                    if tx_b_to_a.write(msg).is_err() {
+                        tx_b_to_a.flush();
+                        break;
+                    }
                 }
+                tx_b_to_a.flush();
+                rx_a_to_b.sync();
             }
-            tx_b_to_a.flush();
-            rx_a_to_b.sync();
+
+            if stop_b.load(Ordering::Relaxed) {
+                break 'outer;
+            }
         }
     });
 
