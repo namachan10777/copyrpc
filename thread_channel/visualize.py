@@ -24,16 +24,11 @@ import polars as pl
 
 
 def load_results(bench_dir: Path) -> pl.DataFrame:
-    """Load and combine all parquet files in the benchmark directory."""
-    frames = []
-    for parquet_file in bench_dir.glob("*.parquet"):
-        df = pl.read_parquet(parquet_file)
-        frames.append(df)
-
-    if not frames:
-        raise FileNotFoundError(f"No parquet files found in {bench_dir}")
-
-    return pl.concat(frames)
+    """Load benchmark results from the canonical results.parquet file."""
+    results_file = bench_dir / "results.parquet"
+    if not results_file.exists():
+        raise FileNotFoundError(f"Results file not found: {results_file}")
+    return pl.read_parquet(results_file)
 
 
 def create_throughput_chart(df: pl.DataFrame) -> alt.Chart:
@@ -50,24 +45,6 @@ def create_throughput_chart(df: pl.DataFrame) -> alt.Chart:
             strokeDash=alt.StrokeDash("implementation:N"),
         )
         .properties(title="All-to-All Throughput: Flux vs Mesh", width=600, height=400)
-    )
-    return chart
-
-
-def create_latency_chart(df: pl.DataFrame) -> alt.Chart:
-    """Create latency vs threads chart."""
-    chart = (
-        alt.Chart(df.to_pandas())
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("threads:Q", title="Number of Threads", scale=alt.Scale(domain=[2, 26])),
-            y=alt.Y("latency_ns_mean:Q", title="Latency (ns/call)"),
-            color=alt.Color("implementation:N", title="Implementation",
-                          scale=alt.Scale(domain=["flux", "mesh"],
-                                         range=["#1f77b4", "#ff7f0e"])),
-            strokeDash=alt.StrokeDash("implementation:N"),
-        )
-        .properties(title="All-to-All Latency: Flux vs Mesh", width=600, height=400)
     )
     return chart
 
@@ -191,7 +168,6 @@ def main():
     # Create and save charts
     charts = [
         ("throughput", create_throughput_chart(df)),
-        ("latency", create_latency_chart(df)),
         ("duration", create_duration_chart(df)),
         ("scaling", create_scaling_chart(df)),
         ("speedup", create_speedup_chart(df)),
@@ -204,10 +180,10 @@ def main():
         chart.save(str(png_path), scale_factor=2)
         print(f"Saved {svg_path} and {png_path}")
 
-    # Create combined chart
+    # Create combined chart (throughput + speedup)
     throughput_chart = create_throughput_chart(df)
-    latency_chart = create_latency_chart(df)
-    combined = alt.vconcat(throughput_chart, latency_chart).properties(
+    speedup_chart = create_speedup_chart(df)
+    combined = alt.vconcat(throughput_chart, speedup_chart).properties(
         title="Flux vs Mesh Benchmark Results"
     )
     combined_path = output_dir / "combined.svg"

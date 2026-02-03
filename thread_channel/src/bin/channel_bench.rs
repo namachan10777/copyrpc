@@ -123,14 +123,17 @@ fn run_flux_benchmark(n: usize, capacity: usize, iterations: u64) -> Duration {
                     pending_replies.retain(|&(to, req_num, data)| node.reply(to, req_num, data).is_err());
                     sent_replies += (old_pending - pending_replies.len()) as u64;
 
-                    // Batch send: write calls to all peers (with in-flight limit)
+                    // Batch send: fill pipeline to max in-flight for all peers
                     for &peer in &peers {
-                        if sent_per_peer[peer] < iterations {
+                        while sent_per_peer[peer] < iterations {
                             let in_flight = sent_per_peer[peer] - completed_per_peer[peer];
-                            if in_flight < max_in_flight_per_peer as u64 {
-                                if node.call(peer, payload).is_ok() {
-                                    sent_per_peer[peer] += 1;
-                                }
+                            if in_flight >= max_in_flight_per_peer as u64 {
+                                break;
+                            }
+                            if node.call(peer, payload).is_ok() {
+                                sent_per_peer[peer] += 1;
+                            } else {
+                                break; // channel full
                             }
                         }
                     }
@@ -202,14 +205,17 @@ fn run_mesh_benchmark(n: usize, iterations: u64) -> Duration {
 
                 // Loop until all responses received AND all incoming requests processed
                 while completed < expected_responses || sent_replies < expected_requests {
-                    // Try to send calls to all peers (with in-flight limit)
+                    // Fill pipeline to max in-flight for all peers
                     for &peer in &peers {
-                        if sent_per_peer[peer] < iterations {
+                        while sent_per_peer[peer] < iterations {
                             let in_flight = sent_per_peer[peer] - completed_per_peer[peer];
-                            if in_flight < max_in_flight_per_peer as u64 {
-                                if node.call(peer, payload).is_ok() {
-                                    sent_per_peer[peer] += 1;
-                                }
+                            if in_flight >= max_in_flight_per_peer as u64 {
+                                break;
+                            }
+                            if node.call(peer, payload).is_ok() {
+                                sent_per_peer[peer] += 1;
+                            } else {
+                                break; // channel full
                             }
                         }
                     }
