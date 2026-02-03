@@ -96,7 +96,8 @@ fn run_flux_benchmark(n: usize, capacity: usize, iterations: u64) -> Duration {
     let payload = Payload::default();
 
     // Limit in-flight requests per peer to leave room for replies
-    let max_in_flight_per_peer = (capacity / 4).max(1) as u64;
+    // Keep this small to ensure channel never fills up (requests + replies must fit)
+    let max_in_flight_per_peer = (capacity / 8).max(1).min(128) as u64;
 
     let handles: Vec<_> = nodes
         .into_iter()
@@ -151,10 +152,18 @@ fn run_flux_benchmark(n: usize, capacity: usize, iterations: u64) -> Duration {
                     // Process received requests
                     while let Some(handle) = node.try_recv() {
                         let data = handle.data();
-                        if handle.reply(data).is_ok() {
+                        if handle.reply_or_requeue(data) {
                             sent_replies += 1;
+                        } else {
+                            // Requeued - break to poll again
+                            break;
                         }
                     }
+
+                    // Explicit flush to ensure replies are visible to peers immediately
+                    // This prevents deadlock where both sides wait for responses
+                    // that are stuck in pending_tail buffers
+                    node.flush();
                 }
 
                 start.elapsed()

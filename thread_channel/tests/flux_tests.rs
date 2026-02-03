@@ -59,13 +59,13 @@ fn test_call_reply_with_callback() {
     assert_eq!(handle.from(), 0);
     assert_eq!(handle.data(), 42);
     let data = handle.data();
-    handle.reply(data * 2).unwrap(); // reply with 84
+    assert!(handle.reply(data * 2).is_ok()); // reply with 84
 
     let handle = nodes[1].try_recv().unwrap();
     assert_eq!(handle.from(), 0);
     assert_eq!(handle.data(), 43);
     let data = handle.data();
-    handle.reply(data * 2).unwrap(); // reply with 86
+    assert!(handle.reply(data * 2).is_ok()); // reply with 86
     nodes[1].flush();
 
     // Node 0 receives responses (via callback)
@@ -271,7 +271,7 @@ fn test_simple_ping_pong() {
         let handle = nodes[1].try_recv().unwrap();
         assert_eq!(handle.data(), i);
         let data = handle.data();
-        handle.reply(data).unwrap();
+        assert!(handle.reply(data).is_ok());
         nodes[1].flush();
 
         // Node 0 receives response (via callback)

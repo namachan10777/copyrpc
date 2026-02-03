@@ -72,11 +72,12 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T)> RecvHandle<'a, T, U, F> {
         self.data
     }
 
-    /// Sends a reply to the request, consuming the handle.
+    /// Sends a reply to the request, consuming the handle on success.
     ///
+    /// On failure, returns the handle along with the error so it can be retried.
     /// The reply is written to the buffer but not flushed. The next `poll()` call
     /// will flush all pending writes.
-    pub fn reply(self, value: T) -> Result<(), SendError<T>> {
+    pub fn reply(self, value: T) -> Result<(), (Self, SendError<T>)> {
         let msg = Message {
             kind: MessageKind::Response,
             req_num: self.req_num,
@@ -88,11 +89,59 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T)> RecvHandle<'a, T, U, F> {
             .iter_mut()
             .find(|c| c.peer_id == self.from)
         {
-            Some(ch) => ch
-                .tx
-                .write(msg)
-                .map_err(|spsc::SendError(m)| SendError::Full(m.data)),
-            None => Err(SendError::InvalidPeer(value)),
+            Some(ch) => match ch.tx.write(msg) {
+                Ok(()) => Ok(()),
+                Err(spsc::SendError(m)) => Err((
+                    Self {
+                        flux: self.flux,
+                        from: self.from,
+                        req_num: self.req_num,
+                        data: self.data,
+                    },
+                    SendError::Full(m.data),
+                )),
+            },
+            None => Err((self, SendError::InvalidPeer(value))),
+        }
+    }
+
+    /// Tries to send a reply. On failure, requeues the request for later retry.
+    ///
+    /// Returns `true` if the reply was sent successfully, `false` if it was requeued.
+    /// Use this when you want to process multiple requests without blocking on any single one.
+    pub fn reply_or_requeue(self, value: T) -> bool {
+        let msg = Message {
+            kind: MessageKind::Response,
+            req_num: self.req_num,
+            data: value,
+        };
+        match self
+            .flux
+            .channels
+            .iter_mut()
+            .find(|c| c.peer_id == self.from)
+        {
+            Some(ch) => match ch.tx.write(msg) {
+                Ok(()) => true,
+                Err(spsc::SendError(_)) => {
+                    // Requeue the request at the front
+                    self.flux.recv_queue.push_front(RecvRequest {
+                        from: self.from,
+                        req_num: self.req_num,
+                        data: self.data,
+                    });
+                    false
+                }
+            },
+            None => {
+                // Invalid peer - requeue anyway to avoid data loss
+                self.flux.recv_queue.push_front(RecvRequest {
+                    from: self.from,
+                    req_num: self.req_num,
+                    data: self.data,
+                });
+                false
+            }
         }
     }
 }
@@ -380,7 +429,7 @@ mod tests {
         let handle = nodes[1].try_recv().unwrap();
         assert_eq!(handle.from(), 0);
         assert_eq!(handle.data(), 42);
-        handle.reply(43).unwrap();
+        assert!(handle.reply(43).is_ok());
         nodes[1].flush();
 
         // Node 0 receives response (callback is invoked)
