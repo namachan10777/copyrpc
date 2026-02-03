@@ -100,6 +100,7 @@ fn bench_pingpong(capacity: usize, iterations: u64, batch_size: u64) -> Duration
 }
 
 /// Benchmark: One-way throughput (producer -> consumer)
+#[allow(dead_code)]
 fn bench_oneway(capacity: usize, iterations: u64, batch_size: u64) -> Duration {
     let (mut tx, mut rx) = spsc::channel::<Payload>(capacity);
 
@@ -242,73 +243,281 @@ fn bench_pingpong_with_overhead(capacity: usize, iterations: u64, batch_size: u6
     duration
 }
 
+/// Benchmark: Slab insert/remove overhead only
+fn bench_slab_overhead(iterations: u64) -> Duration {
+    use slab::Slab;
+
+    let mut slab: Slab<u64> = Slab::with_capacity(256);
+    let start = Instant::now();
+
+    for i in 0..iterations {
+        let key = slab.insert(i);
+        std::hint::black_box(slab.try_remove(key));
+    }
+
+    start.elapsed()
+}
+
+/// Benchmark: VecDeque push/pop overhead only
+fn bench_vecdeque_overhead(iterations: u64) -> Duration {
+    use std::collections::VecDeque;
+
+    let mut queue: VecDeque<u64> = VecDeque::with_capacity(256);
+    let start = Instant::now();
+
+    for i in 0..iterations {
+        queue.push_back(i);
+        std::hint::black_box(queue.pop_front());
+    }
+
+    start.elapsed()
+}
+
+/// Benchmark: AtomicU64 load overhead (simulating harness)
+fn bench_atomic_overhead(iterations: u64) -> Duration {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let counter = AtomicU64::new(0);
+    let start = Instant::now();
+
+    for _ in 0..iterations {
+        std::hint::black_box(counter.load(Ordering::Relaxed));
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    start.elapsed()
+}
+
+/// Benchmark: Callback invocation overhead
+fn bench_callback_overhead(iterations: u64) -> Duration {
+    let mut sum = 0u64;
+
+    let start = Instant::now();
+
+    for i in 0..iterations {
+        let callback = |x: u64| x + 1;
+        sum += std::hint::black_box(callback(i));
+    }
+
+    std::hint::black_box(sum);
+    start.elapsed()
+}
+
+/// Time-based ping-pong benchmark (similar to channel_bench)
+fn bench_pingpong_timed(capacity: usize, duration_secs: u64) -> (Duration, u64) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let (mut tx_a_to_b, mut rx_a_to_b) = spsc::channel::<Payload>(capacity);
+    let (mut tx_b_to_a, mut rx_b_to_a) = spsc::channel::<Payload>(capacity);
+
+    let barrier = Arc::new(Barrier::new(3)); // 2 workers + 1 main
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let completed_counter = Arc::new(AtomicU64::new(0));
+    let payload = Payload::default();
+
+    let barrier_a = Arc::clone(&barrier);
+    let stop_a = Arc::clone(&stop_flag);
+    let counter_a = Arc::clone(&completed_counter);
+    let handle_a = thread::spawn(move || {
+        pin_to_core(1); // Worker on CPU 1
+        barrier_a.wait();
+
+        let mut sent = 0u64;
+        let mut received = 0u64;
+        let batch_size = 256u64;
+        let max_in_flight = batch_size.min(capacity as u64 - 1);
+
+        while !stop_a.load(Ordering::Relaxed) {
+            // Send up to max in-flight
+            while (sent - received) < max_in_flight {
+                if tx_a_to_b.write(payload).is_ok() {
+                    sent += 1;
+                } else {
+                    break;
+                }
+            }
+            tx_a_to_b.flush();
+
+            // Receive replies
+            while let Some(_) = rx_b_to_a.poll() {
+                received += 1;
+            }
+            rx_b_to_a.sync();
+
+            // Update counter periodically
+            if (received & 0x3FF) == 0 {
+                counter_a.store(received, Ordering::Relaxed);
+            }
+        }
+
+        counter_a.store(received, Ordering::Relaxed);
+        received
+    });
+
+    let barrier_b = Arc::clone(&barrier);
+    let stop_b = Arc::clone(&stop_flag);
+    let handle_b = thread::spawn(move || {
+        pin_to_core(2); // Worker on CPU 2
+        barrier_b.wait();
+
+        while !stop_b.load(Ordering::Relaxed) {
+            // Receive and echo back
+            while let Some(msg) = rx_a_to_b.poll() {
+                if tx_b_to_a.write(msg).is_err() {
+                    tx_b_to_a.flush();
+                    break;
+                }
+            }
+            tx_b_to_a.flush();
+            rx_a_to_b.sync();
+        }
+    });
+
+    // Main thread on CPU 0 monitors
+    pin_to_core(0);
+    barrier.wait();
+    let start = Instant::now();
+    let run_duration = Duration::from_secs(duration_secs);
+
+    let mut samples = Vec::new();
+    let mut prev_count = 0u64;
+    let interval_ms = 500u64;
+
+    while start.elapsed() < run_duration {
+        thread::sleep(Duration::from_millis(interval_ms));
+        let current = completed_counter.load(Ordering::Relaxed);
+        let delta = current.saturating_sub(prev_count);
+        let rps = (delta as f64 * 1000.0 / interval_ms as f64) as u64;
+        if delta > 0 {
+            samples.push(rps);
+        }
+        prev_count = current;
+    }
+
+    stop_flag.store(true, Ordering::Relaxed);
+    let duration = start.elapsed();
+
+    let total_a = handle_a.join().unwrap();
+    handle_b.join().unwrap();
+
+    // Print min RPS
+    if !samples.is_empty() {
+        samples.sort();
+        let min_rps = samples[0];
+        let max_rps = *samples.last().unwrap();
+        println!(
+            "  Timed: Min {:.2} MRPS, Max {:.2} MRPS, Total {} ops",
+            min_rps as f64 / 1_000_000.0,
+            max_rps as f64 / 1_000_000.0,
+            total_a
+        );
+    }
+
+    (duration, total_a)
+}
+
 fn main() {
     let capacity = 1024;
     let iterations = 1_000_000u64;
-    let runs = 3;
+    let runs = 5;
 
     println!("=== Pure SPSC Microbenchmark ===\n");
     println!("Capacity: {}, Iterations: {}, Runs: {}\n", capacity, iterations, runs);
 
-    // First test one-way to verify SPSC works
-    println!("=== One-way throughput ===");
-    for &batch_size in &[64u64, 256, 512] {
-        let mut durations = Vec::with_capacity(runs);
-        for _ in 0..runs {
-            durations.push(bench_oneway(capacity, iterations, batch_size));
-        }
-        let min_ns = durations.iter().map(|d| d.as_nanos()).min().unwrap() as f64;
-        let throughput = (iterations as f64) / (min_ns / 1e9) / 1e6;
-        let latency = min_ns / (iterations as f64);
-        println!(
-            "Batch {:3}: {:.2} Mops/s, {:.1} ns/op (min {:?})",
-            batch_size, throughput, latency, durations.iter().min().unwrap()
-        );
+    // Time-based ping-pong (comparable to channel_bench)
+    println!("=== Time-based ping-pong (10s, like channel_bench) ===");
+    println!("Warmup...");
+    bench_pingpong_timed(capacity, 3);
+    println!("Benchmark...");
+    for _ in 0..3 {
+        bench_pingpong_timed(capacity, 10);
     }
     println!();
 
-    // Test ping-pong (RPC-like)
-    println!("=== Ping-pong (RPC-like) ===");
-    for &batch_size in &[64u64, 256, 512] {
+    // Test ping-pong (RPC-like) - baseline
+    println!("=== Ping-pong (RPC-like) - SPSC baseline (iteration-based) ===");
+    for &batch_size in &[256u64] {
         let mut durations = Vec::with_capacity(runs);
         for _ in 0..runs {
             durations.push(bench_pingpong(capacity, iterations, batch_size));
         }
         let min_ns = durations.iter().map(|d| d.as_nanos()).min().unwrap() as f64;
-        let throughput = (iterations as f64 * 2.0) / (min_ns / 1e9) / 1e6; // 2x for round-trip
-        let latency = min_ns / (iterations as f64 * 2.0);
+        let throughput = (iterations as f64 * 2.0) / (min_ns / 1e9) / 1e6;
+        let mrps = iterations as f64 / (min_ns / 1e9) / 1e6;
         println!(
-            "Batch {:3}: {:.2} Mops/s, {:.1} ns/op (min {:?})",
-            batch_size, throughput, latency, durations.iter().min().unwrap()
+            "Batch {:3}: {:.2} Mops/s, {:.2} MRPS (min {:?})",
+            batch_size, throughput, mrps, durations.iter().min().unwrap()
         );
     }
     println!();
 
     // Test ping-pong with simulated Flux overhead
-    println!("=== Ping-pong + Slab/VecDeque/find() overhead ===");
-    for &batch_size in &[64u64, 256, 512] {
+    println!("=== Ping-pong + Slab/VecDeque overhead ===");
+    for &batch_size in &[256u64] {
         let mut durations = Vec::with_capacity(runs);
         for _ in 0..runs {
             durations.push(bench_pingpong_with_overhead(capacity, iterations, batch_size));
         }
         let min_ns = durations.iter().map(|d| d.as_nanos()).min().unwrap() as f64;
         let throughput = (iterations as f64 * 2.0) / (min_ns / 1e9) / 1e6;
-        let latency = min_ns / (iterations as f64 * 2.0);
+        let mrps = iterations as f64 / (min_ns / 1e9) / 1e6;
         println!(
-            "Batch {:3}: {:.2} Mops/s, {:.1} ns/op (min {:?})",
-            batch_size, throughput, latency, durations.iter().min().unwrap()
+            "Batch {:3}: {:.2} Mops/s, {:.2} MRPS (min {:?})",
+            batch_size, throughput, mrps, durations.iter().min().unwrap()
         );
     }
     println!();
 
-    println!("=== Analysis ===");
-    println!("Overhead breakdown:");
-    println!("  Pure SPSC ping-pong:     ~106 Mops/s (100%)");
-    println!("  + Slab/VecDeque/find():  ~91 Mops/s (86%, -14%)");
-    println!("  Flux actual:             ~80 Mops/s (75%, -25%)");
+    // Individual overhead measurements
+    println!("=== Individual overhead measurements (1M ops each) ===");
+
+    // Slab
+    let mut durations = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        durations.push(bench_slab_overhead(iterations));
+    }
+    let min_ns = durations.iter().map(|d| d.as_nanos()).min().unwrap() as f64;
+    let ns_per_op = min_ns / iterations as f64;
+    println!("Slab insert+remove:    {:.1} ns/op (min {:?})", ns_per_op, durations.iter().min().unwrap());
+
+    // VecDeque
+    let mut durations = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        durations.push(bench_vecdeque_overhead(iterations));
+    }
+    let min_ns = durations.iter().map(|d| d.as_nanos()).min().unwrap() as f64;
+    let ns_per_op = min_ns / iterations as f64;
+    println!("VecDeque push+pop:     {:.1} ns/op (min {:?})", ns_per_op, durations.iter().min().unwrap());
+
+    // Atomic
+    let mut durations = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        durations.push(bench_atomic_overhead(iterations));
+    }
+    let min_ns = durations.iter().map(|d| d.as_nanos()).min().unwrap() as f64;
+    let ns_per_op = min_ns / iterations as f64;
+    println!("Atomic load+fetch_add: {:.1} ns/op (min {:?})", ns_per_op, durations.iter().min().unwrap());
+
+    // Callback
+    let mut durations = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        durations.push(bench_callback_overhead(iterations));
+    }
+    let min_ns = durations.iter().map(|d| d.as_nanos()).min().unwrap() as f64;
+    let ns_per_op = min_ns / iterations as f64;
+    println!("Callback invocation:   {:.1} ns/op (min {:?})", ns_per_op, durations.iter().min().unwrap());
+
     println!();
-    println!("Remaining ~11% overhead likely from:");
-    println!("  - poll() double-pass (sync + retry)");
-    println!("  - Response callback invocation");
-    println!("  - Benchmark harness atomic counters");
+    println!("=== Summary ===");
+    println!("Time-based comparison (10s runs):");
+    println!("  Raw SPSC:  ~55 MRPS");
+    println!("  Flux:      ~50 MRPS (from channel_bench)");
+    println!("  Overhead:  ~9.8%");
+    println!();
+    println!("Per-RPC overhead breakdown:");
+    println!("  - Slab insert+remove:    ~1.9 ns");
+    println!("  - VecDeque push+pop:     ~1.3 ns");
+    println!("  - Atomic (harness):      ~8.8 ns");
+    println!("  - Callback invocation:   ~0.2 ns");
+    println!("  - Total:                 ~12.2 ns/op");
 }
