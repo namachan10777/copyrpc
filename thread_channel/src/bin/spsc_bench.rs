@@ -303,6 +303,99 @@ fn bench_callback_overhead(iterations: u64) -> Duration {
     start.elapsed()
 }
 
+/// Benchmark: Full Flux call() overhead (single-threaded, no actual SPSC)
+fn bench_flux_call_overhead(iterations: u64) -> Duration {
+    use slab::Slab;
+    use std::collections::VecDeque;
+
+    // Simulate Flux internal structures
+    let mut pending_calls: Slab<(usize, u64)> = Slab::with_capacity(256);
+    let mut recv_queue: VecDeque<(usize, u64)> = VecDeque::with_capacity(256);
+
+    let start = Instant::now();
+
+    for i in 0..iterations {
+        // Simulate call(): insert into pending_calls
+        let call_id = pending_calls.insert((0, i));
+        std::hint::black_box(call_id);
+
+        // Simulate response: push to recv_queue
+        recv_queue.push_back((call_id, i));
+
+        // Simulate poll(): pop from recv_queue and remove from pending_calls
+        if let Some((id, data)) = recv_queue.pop_front() {
+            pending_calls.try_remove(id);
+            std::hint::black_box(data);
+        }
+    }
+
+    start.elapsed()
+}
+
+/// Benchmark: Flux with actual SPSC (single pair, measures full RPC path)
+fn bench_flux_single_pair(capacity: usize, iterations: u64) -> Duration {
+    use thread_channel::{create_flux, Flux};
+
+    // Create 2-node Flux network
+    let nodes: Vec<Flux<Payload, (), _>> =
+        create_flux(2, capacity, |_: &mut (), _: Payload| {});
+    let mut nodes: Vec<_> = nodes.into_iter().collect();
+    let mut node_b = nodes.pop().unwrap();
+    let mut node_a = nodes.pop().unwrap();
+
+    let payload = Payload::default();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let barrier_a = Arc::clone(&barrier);
+
+    // Node B: just replies
+    let handle_b = thread::spawn(move || {
+        pin_to_core(1);
+        barrier_a.wait();
+
+        let mut replied = 0u64;
+        while replied < iterations {
+            node_b.poll();
+            while let Some(handle) = node_b.try_recv() {
+                let data = handle.data();
+                if handle.reply_or_requeue(data) {
+                    replied += 1;
+                }
+            }
+        }
+    });
+
+    // Node A: sends and receives
+    pin_to_core(0);
+    barrier.wait();
+    let start = Instant::now();
+
+    let mut sent = 0u64;
+    let mut received = 0u64;
+    let max_in_flight = 256u64;
+
+    while received < iterations {
+        // Send
+        while sent < iterations && (sent - received) < max_in_flight {
+            if node_a.call(1, payload, ()).is_ok() {
+                sent += 1;
+            } else {
+                break;
+            }
+        }
+
+        // Poll and receive
+        node_a.poll();
+        while let Some(_handle) = node_a.try_recv() {
+            received += 1;
+        }
+    }
+
+    let duration = start.elapsed();
+    handle_b.join().unwrap();
+    duration
+}
+
 /// Time-based ping-pong benchmark (similar to channel_bench)
 fn bench_pingpong_timed(capacity: usize, duration_secs: u64) -> (Duration, u64) {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -518,17 +611,33 @@ fn main() {
     let ns_per_op = min_ns / iterations as f64;
     println!("Callback invocation:   {:.1} ns/op (min {:?})", ns_per_op, durations.iter().min().unwrap());
 
+    // Flux call overhead (Slab + VecDeque combined)
+    println!();
+    println!("=== Flux-specific overhead ===");
+    let mut durations = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        durations.push(bench_flux_call_overhead(iterations));
+    }
+    let min_ns = durations.iter().map(|d| d.as_nanos()).min().unwrap() as f64;
+    let ns_per_op = min_ns / iterations as f64;
+    println!("Flux call overhead (Slab+VecDeque): {:.1} ns/op (min {:?})", ns_per_op, durations.iter().min().unwrap());
+
+    // Flux single pair (full RPC path)
+    println!();
+    println!("=== Flux single-pair RPC (iteration-based) ===");
+    let mut durations = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        durations.push(bench_flux_single_pair(capacity, iterations));
+    }
+    let min_ns = durations.iter().map(|d| d.as_nanos()).min().unwrap() as f64;
+    let mrps = iterations as f64 / (min_ns / 1e9) / 1e6;
+    let ns_per_rpc = min_ns / iterations as f64;
+    println!("Flux single-pair: {:.2} MRPS, {:.1} ns/RPC (min {:?})", mrps, ns_per_rpc, durations.iter().min().unwrap());
+
     println!();
     println!("=== Summary ===");
     println!("Time-based comparison (10s runs):");
-    println!("  Raw SPSC:  ~55 MRPS");
-    println!("  Flux:      ~50 MRPS (from channel_bench)");
-    println!("  Overhead:  ~9.8%");
-    println!();
-    println!("Per-RPC overhead breakdown:");
-    println!("  - Slab insert+remove:    ~1.9 ns");
-    println!("  - VecDeque push+pop:     ~1.3 ns");
-    println!("  - Atomic (harness):      ~8.8 ns");
-    println!("  - Callback invocation:   ~0.2 ns");
-    println!("  - Total:                 ~12.2 ns/op");
+    println!("  Raw SPSC:  ~59 MRPS");
+    println!("  Flux:      ~48 MRPS (from channel_bench)");
+    println!("  Overhead:  ~18.6%");
 }

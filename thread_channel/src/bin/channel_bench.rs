@@ -65,6 +65,14 @@ struct Args {
     /// Output parquet file
     #[arg(short, long, default_value = "channel_bench.parquet")]
     output: String,
+
+    /// Run only Flux benchmark (skip Mesh)
+    #[arg(long)]
+    flux_only: bool,
+
+    /// Run only Mesh benchmark (skip Flux)
+    #[arg(long)]
+    mesh_only: bool,
 }
 
 struct BenchResult {
@@ -407,6 +415,7 @@ fn main() {
         }
 
         // Benchmark Flux
+        if !args.mesh_only {
         println!(
             "Benchmarking Flux: n={}, duration={}s",
             n, args.duration
@@ -465,8 +474,10 @@ fn main() {
             throughput_mops_mean: avg_median_mops,
             latency_ns_mean: 1_000_000_000.0 / (avg_median_mops * 1_000_000.0),
         });
+        }
 
         // Benchmark Mesh
+        if !args.flux_only {
         println!(
             "Benchmarking Mesh: n={}, duration={}s",
             n, args.duration
@@ -525,6 +536,7 @@ fn main() {
             throughput_mops_mean: avg_median_mops,
             latency_ns_mean: 1_000_000_000.0 / (avg_median_mops * 1_000_000.0),
         });
+        }
     }
 
     // Write to parquet
