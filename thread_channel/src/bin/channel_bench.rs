@@ -73,6 +73,10 @@ struct Args {
     /// Run only Mesh benchmark (skip Flux)
     #[arg(long)]
     mesh_only: bool,
+
+    /// Max inflight requests per thread (for Flux only)
+    #[arg(short = 'i', long, default_value = "256")]
+    inflight: usize,
 }
 
 struct BenchResult {
@@ -106,7 +110,7 @@ struct FluxBenchResult {
 
 /// Run Flux benchmark with RPS monitoring
 /// Main thread acts as monitor and controls timing
-fn run_flux_benchmark(n: usize, capacity: usize, duration_secs: u64) -> FluxBenchResult {
+fn run_flux_benchmark(n: usize, capacity: usize, duration_secs: u64, max_inflight: usize) -> FluxBenchResult {
     // Per-thread completed counters (no contention)
     let per_thread_completed: Vec<Arc<AtomicU64>> =
         (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
@@ -137,7 +141,6 @@ fn run_flux_benchmark(n: usize, capacity: usize, duration_secs: u64) -> FluxBenc
 
                 let mut total_sent = 0u64;
                 let mut total_completed = 0u64;
-                let max_inflight = 256usize;
                 let mut can_send = true;
 
                 // Main loop: run until stop_flag is set
@@ -430,7 +433,7 @@ fn main() {
         // Warmup
         for w in 0..args.warmup {
             println!("  Warmup {}/{}", w + 1, args.warmup);
-            run_flux_benchmark(n, args.capacity, args.duration.min(3));
+            run_flux_benchmark(n, args.capacity, args.duration.min(3), args.inflight);
         }
 
         // Benchmark runs
@@ -441,7 +444,7 @@ fn main() {
 
         for r in 0..args.runs {
             println!("  Run {}/{}", r + 1, args.runs);
-            let result = run_flux_benchmark(n, args.capacity, args.duration);
+            let result = run_flux_benchmark(n, args.capacity, args.duration, args.inflight);
             durations.push(result.duration);
             total_ops.push(result.total_completed);
             all_medians.push(result.monitor_result.median_rps);
