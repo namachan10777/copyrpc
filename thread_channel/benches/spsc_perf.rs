@@ -8,7 +8,7 @@ use thread_channel::spsc;
 const ITERATIONS: usize = 10_000_000;
 const CAPACITY: usize = 1024;
 
-fn bench_write_flush() {
+fn bench_send() {
     let (mut tx, mut rx) = spsc::channel::<u64>(CAPACITY);
     let barrier = Arc::new(Barrier::new(2));
     let barrier2 = barrier.clone();
@@ -17,8 +17,7 @@ fn bench_write_flush() {
         barrier2.wait();
         let mut count = 0;
         while count < ITERATIONS {
-            rx.sync();
-            while let Some(_) = rx.poll() {
+            while let Some(_) = rx.recv() {
                 count += 1;
             }
         }
@@ -29,26 +28,17 @@ fn bench_write_flush() {
 
     for i in 0..ITERATIONS {
         loop {
-            match tx.write(i as u64) {
-                Ok(()) => {
-                    if (i & 0xFF) == 0 {
-                        tx.flush();
-                    }
-                    break;
-                }
-                Err(_) => {
-                    tx.flush();
-                    std::hint::spin_loop();
-                }
+            match tx.send(i as u64) {
+                Ok(()) => break,
+                Err(_) => std::hint::spin_loop(),
             }
         }
     }
-    tx.flush();
 
     receiver.join().unwrap();
     let elapsed = start.elapsed();
 
-    println!("write/flush benchmark:");
+    println!("send benchmark:");
     println!("  Iterations: {}", ITERATIONS);
     println!("  Time: {:?}", elapsed);
     println!("  Throughput: {:.2} Mops/s", ITERATIONS as f64 / elapsed.as_secs_f64() / 1_000_000.0);
@@ -77,21 +67,12 @@ fn bench_try_recv() {
     barrier.wait();
     for i in 0..ITERATIONS {
         loop {
-            match tx.write(i as u64) {
-                Ok(()) => {
-                    if (i & 0xFF) == 0 {
-                        tx.flush();
-                    }
-                    break;
-                }
-                Err(_) => {
-                    tx.flush();
-                    std::hint::spin_loop();
-                }
+            match tx.send(i as u64) {
+                Ok(()) => break,
+                Err(_) => std::hint::spin_loop(),
             }
         }
     }
-    tx.flush();
 
     let (count, elapsed) = receiver.join().unwrap();
 
@@ -107,6 +88,6 @@ fn main() {
     println!("Capacity: {}", CAPACITY);
     println!();
 
-    bench_write_flush();
+    bench_send();
     bench_try_recv();
 }

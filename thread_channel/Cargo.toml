@@ -27,3 +27,7 @@ harness = false
 [[bin]]
 name = "channel_bench"
 required-features = ["bench-bin"]
+
+[[bin]]
+name = "spsc_bench"
+required-features = ["bench-bin"]

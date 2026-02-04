@@ -1,12 +1,15 @@
 //! Single-producer single-consumer bounded channel.
 //!
-//! This implementation is wait-free and uses local caching to minimize
-//! atomic operations. The design separates the tx and rx blocks to avoid
-//! false sharing.
+//! This implementation is based on the FastForward algorithm (PPoPP 2008).
+//! Key design principles:
+//! - Head/tail indices are local to each thread (not shared)
+//! - Slot validity flags determine empty/full status
+//! - Minimizes cache line thrashing
 
 use std::cell::UnsafeCell;
-use std::mem::{ManuallyDrop, MaybeUninit};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::mem::MaybeUninit;
+use std::ptr;
+use std::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Marker trait for types that can be safely transmitted through the channel.
@@ -72,51 +75,63 @@ impl std::fmt::Display for TryRecvError {
 
 impl std::error::Error for TryRecvError {}
 
-/// Sender block - only accessed by the sender thread.
-/// Aligned to cache line boundary to prevent false sharing with RxBlock.
-#[repr(C, align(64))]
-struct TxBlock {
-    /// Write position (only updated by sender).
-    tail: AtomicUsize,
-    /// Flag indicating the receiver has disconnected.
-    rx_dead: AtomicBool,
+/// FastForward style slot with validity flag.
+///
+/// The validity flag indicates whether the slot contains valid data:
+/// - `true`: data is present and can be read
+/// - `false`: slot is empty and can be written to
+///
+/// No atomics needed: x86-64 TSO guarantees aligned word access is atomic
+/// at hardware level, and volatile prevents compiler reordering.
+#[repr(C)]
+struct Slot<T> {
+    /// Validity flag: true = data present, false = empty
+    /// Uses UnsafeCell + volatile access (not atomic)
+    valid: UnsafeCell<bool>,
+    /// Padding to separate validity flag from data
+    _pad: [u8; 7],
+    /// The actual data storage
+    data: UnsafeCell<MaybeUninit<T>>,
 }
 
-/// Receiver block - only accessed by the receiver thread.
-/// Aligned to cache line boundary to prevent false sharing with TxBlock.
+impl<T> Slot<T> {
+    fn new() -> Self {
+        Self {
+            valid: UnsafeCell::new(false),
+            _pad: [0; 7],
+            data: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+}
+
+/// Shared state for disconnect detection only.
+///
+/// This is the only shared state between sender and receiver.
+/// The actual queue indices are local to each endpoint.
 #[repr(C, align(64))]
-struct RxBlock {
-    /// Read position (only updated by receiver).
-    head: AtomicUsize,
-    /// Flag indicating the sender has disconnected.
-    tx_dead: AtomicBool,
+struct Shared {
+    /// True if sender is still alive
+    tx_alive: AtomicBool,
+    /// True if receiver is still alive
+    rx_alive: AtomicBool,
 }
 
 /// Shared channel state.
 struct Inner<T> {
-    tx: TxBlock,
-    rx: RxBlock,
-    /// Bitmask for fast modulo: capacity - 1 (capacity is always power of 2)
-    mask: usize,
-    slots: Box<[UnsafeCell<ManuallyDrop<MaybeUninit<T>>>]>,
+    shared: Shared,
+    slots: Box<[Slot<T>]>,
 }
 
 unsafe impl<T: Send> Send for Inner<T> {}
 unsafe impl<T: Send> Sync for Inner<T> {}
 
-impl<T> Drop for Inner<T> {
-    fn drop(&mut self) {
-        // No need to drop elements as T: Serial implies T: Copy
-    }
-}
-
 /// The sending half of a SPSC channel.
 pub struct Sender<T> {
     inner: Arc<Inner<T>>,
-    /// Cached value of head to reduce atomic reads.
-    head_cache: usize,
-    /// Local tail position (not yet visible to receiver until flush()).
-    pending_tail: usize,
+    /// Local head index (not shared with receiver)
+    head: usize,
+    /// Bitmask for fast modulo
+    mask: usize,
 }
 
 unsafe impl<T: Send> Send for Sender<T> {}
@@ -124,10 +139,10 @@ unsafe impl<T: Send> Send for Sender<T> {}
 /// The receiving half of a SPSC channel.
 pub struct Receiver<T> {
     inner: Arc<Inner<T>>,
-    /// Local tail position (updated by sync()).
-    local_tail: usize,
-    /// Local head position (not yet visible to sender until sync()).
-    local_head: usize,
+    /// Local tail index (not shared with sender)
+    tail: usize,
+    /// Bitmask for fast modulo
+    mask: usize,
 }
 
 unsafe impl<T: Send> Send for Receiver<T> {}
@@ -145,130 +160,117 @@ pub fn channel<T: Serial>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     let cap = capacity.next_power_of_two();
     let mask = cap - 1;
 
-    let slots: Box<[_]> = (0..cap)
-        .map(|_| UnsafeCell::new(ManuallyDrop::new(MaybeUninit::uninit())))
-        .collect();
+    let slots: Box<[Slot<T>]> = (0..cap).map(|_| Slot::new()).collect();
 
     let inner = Arc::new(Inner {
-        tx: TxBlock {
-            tail: AtomicUsize::new(0),
-            rx_dead: AtomicBool::new(false),
+        shared: Shared {
+            tx_alive: AtomicBool::new(true),
+            rx_alive: AtomicBool::new(true),
         },
-        rx: RxBlock {
-            head: AtomicUsize::new(0),
-            tx_dead: AtomicBool::new(false),
-        },
-        mask,
         slots,
     });
 
     let sender = Sender {
         inner: Arc::clone(&inner),
-        head_cache: 0,
-        pending_tail: 0,
+        head: 0,
+        mask,
     };
 
     let receiver = Receiver {
         inner,
-        local_tail: 0,
-        local_head: 0,
+        tail: 0,
+        mask,
     };
 
     (sender, receiver)
 }
 
 impl<T: Serial> Sender<T> {
-    /// Writes a value to the channel without making it visible to the receiver.
+    /// Sends a value through the channel.
     ///
-    /// The value is written to the slot but `pending_tail` is only updated locally.
-    /// Call `flush()` to make all written values visible to the receiver.
+    /// The value is immediately visible to the receiver after this call.
     ///
-    /// Returns `Err` if the channel is full.
+    /// Returns `Err(SendError(value))` if the channel is full.
     ///
     /// Note: This does not check for receiver disconnection for performance.
     /// Disconnection can be detected via `is_disconnected()` if needed.
-    pub fn write(&mut self, value: T) -> Result<(), SendError<T>> {
-        let next_tail = (self.pending_tail + 1) & self.inner.mask;
+    #[inline]
+    pub fn send(&mut self, value: T) -> Result<(), SendError<T>> {
+        let slot = &self.inner.slots[self.head];
 
-        // Check if we have room using cached head
-        if next_tail == self.head_cache {
-            // Cache miss - reload head
-            self.head_cache = self.inner.rx.head.load(Ordering::Acquire);
-            if next_tail == self.head_cache {
-                // Channel is full
-                return Err(SendError(value));
-            }
+        // Check if slot is empty (valid == false)
+        // Volatile read prevents compiler from caching/reordering
+        if unsafe { ptr::read_volatile(slot.valid.get()) } {
+            // Slot is full - channel is full
+            return Err(SendError(value));
         }
 
         // Write the value
         unsafe {
-            let slot = &*self.inner.slots[self.pending_tail].get();
-            std::ptr::write(slot.as_ptr() as *mut T, value);
+            ptr::write((*slot.data.get()).as_mut_ptr(), value);
         }
 
-        // Update local pending_tail (not visible to receiver yet)
-        self.pending_tail = next_tail;
+        // Compiler fence ensures data write is not reordered after flag write
+        // x86-64 TSO guarantees hardware ordering; this is for the compiler only
+        compiler_fence(Ordering::Release);
+
+        // Volatile write to make data visible
+        unsafe {
+            ptr::write_volatile(slot.valid.get(), true);
+        }
+
+        // Advance head
+        self.head = (self.head + 1) & self.mask;
 
         Ok(())
-    }
-
-    /// Makes all written values visible to the receiver.
-    ///
-    /// This performs an atomic store with Release ordering.
-    #[inline]
-    pub fn flush(&mut self) {
-        self.inner.tx.tail.store(self.pending_tail, Ordering::Release);
     }
 
     /// Returns true if the receiver has disconnected.
     #[allow(dead_code)]
     pub fn is_disconnected(&self) -> bool {
-        self.inner.tx.rx_dead.load(Ordering::Relaxed)
+        !self.inner.shared.rx_alive.load(Ordering::Relaxed)
     }
 }
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        self.inner.rx.tx_dead.store(true, Ordering::Release);
+        self.inner.shared.tx_alive.store(false, Ordering::Release);
     }
 }
 
 impl<T: Serial> Receiver<T> {
-    /// Polls for a value, syncing automatically if the local view is empty.
+    /// Receives a value from the channel if available.
     ///
-    /// Returns `Some(value)` if data is available.
-    /// Returns `None` if no data is available even after sync.
+    /// Returns `Some(value)` if data is available, `None` otherwise.
     #[inline]
-    pub fn poll(&mut self) -> Option<T> {
-        if self.local_head == self.local_tail {
-            // Empty local view, sync to get latest data
-            self.sync();
-            if self.local_head == self.local_tail {
-                return None;
-            }
+    pub fn recv(&mut self) -> Option<T> {
+        let slot = &self.inner.slots[self.tail];
+
+        // Check if slot has data (valid == true)
+        // Volatile read prevents compiler from caching/reordering
+        if !unsafe { ptr::read_volatile(slot.valid.get()) } {
+            // Slot is empty
+            return None;
         }
 
-        // Read the value (normal load - NT store data will miss cache, which is fine)
-        let value = unsafe {
-            let slot = &*self.inner.slots[self.local_head].get();
-            std::ptr::read(slot.as_ptr() as *const T)
-        };
+        // Compiler fence ensures flag read happens before data read
+        compiler_fence(Ordering::Acquire);
 
-        // Update local head (not visible to sender yet)
-        self.local_head = (self.local_head + 1) & self.inner.mask;
+        // Read the value
+        let value = unsafe { ptr::read((*slot.data.get()).as_ptr()) };
+
+        // Compiler fence ensures data read completes before we mark slot empty
+        compiler_fence(Ordering::Release);
+
+        // Volatile write to mark slot as empty
+        unsafe {
+            ptr::write_volatile(slot.valid.get(), false);
+        }
+
+        // Advance tail
+        self.tail = (self.tail + 1) & self.mask;
 
         Some(value)
-    }
-
-    /// Synchronizes with the sender.
-    ///
-    /// This loads the sender's tail (Acquire) and stores our head (Release).
-    #[inline]
-    pub fn sync(&mut self) {
-        // Load sender's tail to see new data
-        self.local_tail = self.inner.tx.tail.load(Ordering::Acquire);
-        // Store our head to notify sender of consumed slots
-        self.inner.rx.head.store(self.local_head, Ordering::Release);
     }
 
     /// Attempts to receive a value from this channel.
@@ -277,36 +279,12 @@ impl<T: Serial> Receiver<T> {
     /// Returns `Err(TryRecvError::Disconnected)` if the sender has disconnected
     /// and the channel is empty.
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
-        // Check local view first
-        if self.local_head != self.local_tail {
-            // We have data, read it
-            let value = unsafe {
-                let slot = &*self.inner.slots[self.local_head].get();
-                std::ptr::read(slot.as_ptr() as *const T)
-            };
-            self.local_head = (self.local_head + 1) & self.inner.mask;
-            // Notify sender immediately
-            self.inner.rx.head.store(self.local_head, Ordering::Release);
+        if let Some(value) = self.recv() {
             return Ok(value);
         }
 
-        // Empty local view, sync to get latest data
-        self.local_tail = self.inner.tx.tail.load(Ordering::Acquire);
-
-        if self.local_head != self.local_tail {
-            // Got new data after sync
-            let value = unsafe {
-                let slot = &*self.inner.slots[self.local_head].get();
-                std::ptr::read(slot.as_ptr() as *const T)
-            };
-            self.local_head = (self.local_head + 1) & self.inner.mask;
-            // Notify sender immediately
-            self.inner.rx.head.store(self.local_head, Ordering::Release);
-            return Ok(value);
-        }
-
-        // Still empty after sync, check if sender is dead
-        if self.inner.rx.tx_dead.load(Ordering::Acquire) {
+        // Empty, check if sender is dead
+        if !self.inner.shared.tx_alive.load(Ordering::Acquire) {
             return Err(TryRecvError::Disconnected);
         }
 
@@ -316,13 +294,13 @@ impl<T: Serial> Receiver<T> {
     /// Returns true if the sender has disconnected.
     #[allow(dead_code)]
     pub fn is_disconnected(&self) -> bool {
-        self.inner.rx.tx_dead.load(Ordering::Relaxed)
+        !self.inner.shared.tx_alive.load(Ordering::Relaxed)
     }
 }
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        self.inner.tx.rx_dead.store(true, Ordering::Release);
+        self.inner.shared.rx_alive.store(false, Ordering::Release);
     }
 }
 
@@ -334,9 +312,8 @@ mod tests {
     fn test_send_recv() {
         let (mut tx, mut rx) = channel::<u32>(4);
 
-        tx.write(1).unwrap();
-        tx.write(2).unwrap();
-        tx.flush();
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
 
         assert_eq!(rx.try_recv().unwrap(), 1);
         assert_eq!(rx.try_recv().unwrap(), 2);
@@ -347,18 +324,18 @@ mod tests {
     fn test_capacity() {
         let (mut tx, mut rx) = channel::<u32>(2);
 
-        // Can send one item (capacity - 1 due to ring buffer)
-        tx.write(1).unwrap();
-        tx.flush();
-        // Second write should fail (full)
-        assert!(tx.write(2).is_err());
+        // FastForward uses validity flags, so full capacity is available
+        // capacity=2 rounds up to 2, so can hold 2 items
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        // Third should fail (full)
+        assert!(tx.send(3).is_err());
 
         // Receive to make room
         assert_eq!(rx.try_recv().unwrap(), 1);
 
         // Now can write again
-        tx.write(2).unwrap();
-        tx.flush();
+        tx.send(3).unwrap();
     }
 
     #[test]
@@ -377,8 +354,8 @@ mod tests {
 
         drop(rx);
 
-        // write() doesn't check for disconnection for performance
-        assert!(tx.write(1).is_ok());
+        // send() doesn't check for disconnection for performance
+        assert!(tx.send(1).is_ok());
         // Disconnection can be detected via is_disconnected()
         assert!(tx.is_disconnected());
     }
@@ -390,11 +367,8 @@ mod tests {
         let sender = std::thread::spawn(move || {
             for i in 0..10000 {
                 loop {
-                    match tx.write(i) {
-                        Ok(()) => {
-                            tx.flush();
-                            break;
-                        }
+                    match tx.send(i) {
+                        Ok(()) => break,
                         Err(_) => std::hint::spin_loop(),
                     }
                 }
@@ -421,61 +395,49 @@ mod tests {
     }
 
     #[test]
-    fn test_write_flush() {
+    fn test_immediate_visibility() {
         let (mut tx, mut rx) = channel::<u32>(8);
 
-        // Write multiple values without flush
-        tx.write(1).unwrap();
-        tx.write(2).unwrap();
-        tx.write(3).unwrap();
+        // Send values - they should be immediately visible
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        tx.send(3).unwrap();
 
-        // Receiver should not see any data yet (poll auto-syncs but data not flushed)
-        assert!(rx.poll().is_none());
-
-        // Flush to make visible
-        tx.flush();
-
-        // Now receiver can see all values (poll auto-syncs)
-        assert_eq!(rx.poll(), Some(1));
-        assert_eq!(rx.poll(), Some(2));
-        assert_eq!(rx.poll(), Some(3));
-        assert!(rx.poll().is_none());
+        // Receiver can see all values immediately (no flush needed)
+        assert_eq!(rx.recv(), Some(1));
+        assert_eq!(rx.recv(), Some(2));
+        assert_eq!(rx.recv(), Some(3));
+        assert!(rx.recv().is_none());
     }
 
     #[test]
-    fn test_poll_auto_sync() {
+    fn test_recv_returns_none_when_empty() {
         let (mut tx, mut rx) = channel::<u32>(8);
 
-        // Write and flush some values
-        tx.write(1).unwrap();
-        tx.write(2).unwrap();
-        tx.flush();
+        // Send and recv some values
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
 
-        // poll auto-syncs and returns values
-        assert_eq!(rx.poll(), Some(1));
-        assert_eq!(rx.poll(), Some(2));
-        assert!(rx.poll().is_none());
-
-        // Another sync to notify sender of consumed slots
-        rx.sync();
+        // recv() returns values
+        assert_eq!(rx.recv(), Some(1));
+        assert_eq!(rx.recv(), Some(2));
+        assert!(rx.recv().is_none());
     }
 
     #[test]
     fn test_batch_send_recv() {
         let (mut tx, mut rx) = channel::<u64>(64);
 
-        // Batch write
+        // Batch send
         for i in 0..32 {
-            tx.write(i).unwrap();
+            tx.send(i).unwrap();
         }
-        tx.flush();
 
-        // Batch receive (poll auto-syncs)
+        // Batch receive
         let mut received = Vec::new();
-        while let Some(v) = rx.poll() {
+        while let Some(v) = rx.recv() {
             received.push(v);
         }
-        rx.sync(); // Notify sender of consumed slots
 
         assert_eq!(received.len(), 32);
         for (i, v) in received.iter().enumerate() {
@@ -484,13 +446,15 @@ mod tests {
     }
 
     #[test]
-    fn test_write_full() {
+    fn test_send_full() {
         let (mut tx, mut _rx) = channel::<u32>(2);
 
-        // Fill the channel (capacity - 1 = 1)
-        tx.write(1).unwrap();
-        // Next write should fail with SendError
-        assert!(matches!(tx.write(2), Err(SendError(2))));
+        // FastForward uses validity flags, so full capacity is available
+        // capacity=2 rounds up to 2, so can hold 2 items
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        // Next send should fail with SendError
+        assert!(matches!(tx.send(3), Err(SendError(3))));
     }
 
     #[test]
@@ -503,18 +467,14 @@ mod tests {
             for batch in 0..NUM_BATCHES {
                 for i in 0..BATCH_SIZE {
                     let val = batch * BATCH_SIZE + i;
-                    // Spin until we can write
+                    // Spin until we can send
                     loop {
-                        match tx.write(val) {
+                        match tx.send(val) {
                             Ok(()) => break,
-                            Err(_) => {
-                                tx.flush(); // Flush pending writes first
-                                std::hint::spin_loop();
-                            }
+                            Err(_) => std::hint::spin_loop(),
                         }
                     }
                 }
-                tx.flush();
             }
         });
 
@@ -522,8 +482,7 @@ mod tests {
             let mut expected = 0u64;
             let total = BATCH_SIZE * NUM_BATCHES;
             while expected < total {
-                // poll auto-syncs when empty
-                while let Some(v) = rx.poll() {
+                while let Some(v) = rx.recv() {
                     assert_eq!(v, expected);
                     expected += 1;
                 }
@@ -532,5 +491,69 @@ mod tests {
 
         sender.join().unwrap();
         receiver.join().unwrap();
+    }
+
+    #[test]
+    fn test_fastforward_no_index_sharing() {
+        // This test verifies that the FastForward implementation doesn't share indices
+        // by checking that send/recv work correctly even under contention
+        let (mut tx, mut rx) = channel::<u64>(256);
+
+        let sender = std::thread::spawn(move || {
+            for i in 0..100_000u64 {
+                loop {
+                    if tx.send(i).is_ok() {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+        });
+
+        let receiver = std::thread::spawn(move || {
+            let mut expected = 0u64;
+            while expected < 100_000 {
+                if let Some(v) = rx.recv() {
+                    assert_eq!(v, expected);
+                    expected += 1;
+                }
+            }
+        });
+
+        sender.join().unwrap();
+        receiver.join().unwrap();
+    }
+
+    #[test]
+    fn test_full_then_consume_then_send() {
+        let (mut tx, mut rx) = channel::<u32>(4);
+
+        // FastForward uses validity flags, so full capacity is available
+        // capacity=4 rounds up to 4, so can hold 4 items
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        tx.send(3).unwrap();
+        tx.send(4).unwrap();
+        assert!(tx.send(5).is_err()); // Should be full
+
+        // Consume all
+        assert_eq!(rx.recv(), Some(1));
+        assert_eq!(rx.recv(), Some(2));
+        assert_eq!(rx.recv(), Some(3));
+        assert_eq!(rx.recv(), Some(4));
+        assert!(rx.recv().is_none());
+
+        // Should be able to send again
+        tx.send(10).unwrap();
+        tx.send(11).unwrap();
+        tx.send(12).unwrap();
+        tx.send(13).unwrap();
+        assert!(tx.send(14).is_err());
+
+        assert_eq!(rx.recv(), Some(10));
+        assert_eq!(rx.recv(), Some(11));
+        assert_eq!(rx.recv(), Some(12));
+        assert_eq!(rx.recv(), Some(13));
+        assert!(rx.recv().is_none());
     }
 }

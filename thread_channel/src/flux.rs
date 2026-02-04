@@ -4,8 +4,8 @@
 //! communication at the cost of O(N^2) memory usage.
 //!
 //! This module uses a copyrpc-style API:
-//! - `call(to, payload, user_data)` writes a request (user_data tracked internally)
-//! - `poll()` processes messages (auto-flush, responses invoke callback)
+//! - `call(to, payload, user_data)` sends a request (user_data tracked internally)
+//! - `poll()` processes messages (responses invoke callback)
 //! - `try_recv()` returns received requests via `RecvHandle`
 //! - Response handling is done via callbacks, not manual req_num matching
 
@@ -77,8 +77,6 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T)> RecvHandle<'a, T, U, F> {
     /// Sends a reply to the request, consuming the handle on success.
     ///
     /// On failure, returns the handle along with the error so it can be retried.
-    /// The reply is written to the buffer but not flushed. The next `poll()` call
-    /// will flush all pending writes.
     #[inline]
     pub fn reply(self, value: T) -> Result<(), (Self, SendError<T>)> {
         let channel_idx = match self.flux.peer_to_channel_index(self.from) {
@@ -92,7 +90,7 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T)> RecvHandle<'a, T, U, F> {
             data: value,
         };
 
-        match self.flux.channels[channel_idx].tx.write(msg) {
+        match self.flux.channels[channel_idx].tx.send(msg) {
             Ok(()) => Ok(()),
             Err(spsc::SendError(m)) => Err((
                 Self {
@@ -131,7 +129,7 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T)> RecvHandle<'a, T, U, F> {
             data: value,
         };
 
-        match self.flux.channels[channel_idx].tx.write(msg) {
+        match self.flux.channels[channel_idx].tx.send(msg) {
             Ok(()) => true,
             Err(spsc::SendError(_)) => {
                 // Requeue the request at the front
@@ -154,10 +152,9 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T)> RecvHandle<'a, T, U, F> {
 ///
 /// ## API Overview
 ///
-/// - `call(to, value, user_data)` - Write a request to peer (user_data for callback)
-/// - `poll()` - Process messages (auto-flush, responses invoke callback)
+/// - `call(to, value, user_data)` - Send a request to peer (user_data for callback)
+/// - `poll()` - Process messages (responses invoke callback)
 /// - `try_recv()` - Get next received request as `RecvHandle`
-/// - `flush()` - Explicitly flush pending writes (poll does this automatically)
 pub struct Flux<T: Serial, U, F: FnMut(&mut U, T)> {
     id: usize,
     num_nodes: usize,
@@ -197,13 +194,10 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
         Some(if peer < self.id { peer } else { peer - 1 })
     }
 
-    /// Writes a call to the specified peer without making it visible yet.
+    /// Sends a call to the specified peer.
     ///
     /// The `user_data` is stored internally and passed to the response callback
     /// when the response arrives.
-    ///
-    /// The message is written to the slot but not flushed. Call `flush()` or `poll()`
-    /// to make all written messages visible to peers.
     #[inline]
     pub fn call(&mut self, to: usize, value: T, user_data: U) -> Result<(), SendError<T>> {
         let channel_idx = match self.peer_to_channel_index(to) {
@@ -220,7 +214,7 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
             data: value,
         };
 
-        match self.channels[channel_idx].tx.write(msg) {
+        match self.channels[channel_idx].tx.send(msg) {
             Ok(()) => {
                 self.next_req_num = self.next_req_num.wrapping_add(1);
                 Ok(())
@@ -232,41 +226,23 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
         }
     }
 
-    /// Flushes all pending writes to all peers.
-    ///
-    /// This makes all previously written messages visible to their respective peers.
-    /// Called automatically by `poll()`.
-    #[inline]
-    fn flush(&mut self) {
-        for ch in &mut self.channels {
-            ch.tx.flush();
-        }
-    }
-
     /// Polls for messages from peers, processing them appropriately.
     ///
-    /// - Automatically flushes pending writes
     /// - For responses: invokes the callback with user_data and response data
     /// - For requests: queues them for retrieval via `try_recv()`
-    ///
-    /// Note: SPSC's `poll()` internally syncs when the local view is empty,
-    /// so a single pass over all channels is sufficient.
     #[inline]
     pub fn poll(&mut self) {
-        // Auto-flush before receiving
-        self.flush();
-
         let n = self.channels.len();
         if n == 0 {
             return;
         }
 
-        // Single pass: poll() auto-syncs when local view is empty
+        // Single pass over all channels
         for _ in 0..n {
             let idx = self.recv_index;
             self.recv_index = (self.recv_index + 1) % n;
 
-            while let Some(msg) = self.channels[idx].rx.poll() {
+            while let Some(msg) = self.channels[idx].rx.recv() {
                 let peer_id = self.channels[idx].peer_id;
                 match msg.kind {
                     MessageKind::Request => {

@@ -143,12 +143,14 @@ fn test_round_robin_poll() {
 fn test_channel_full() {
     let mut nodes: Vec<Flux<u32, (), _>> = create_flux(2, 2, |_, _| {}); // Very small capacity
 
-    // Fill the channel (capacity 2 = 1 slot usable)
+    // FastForward uses validity flags, so full capacity is available
+    // capacity 2 rounds up to 2, so can hold 2 messages
     assert!(nodes[0].call(1, 1, ()).is_ok());
+    assert!(nodes[0].call(1, 2, ()).is_ok());
 
-    // Second send should fail with Full
-    match nodes[0].call(1, 2, ()) {
-        Err(SendError::Full(2)) => {}
+    // Third send should fail with Full
+    match nodes[0].call(1, 3, ()) {
+        Err(SendError::Full(3)) => {}
         other => panic!("expected Full error, got {:?}", other),
     }
 }

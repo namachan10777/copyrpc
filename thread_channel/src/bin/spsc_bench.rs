@@ -53,19 +53,17 @@ fn bench_pingpong(capacity: usize, iterations: u64, batch_size: u64) -> Duration
             // Send batch up to in-flight limit
             let max_in_flight = batch_size.min(capacity as u64 - 1);
             while sent < iterations && (sent - received) < max_in_flight {
-                if tx_a_to_b.write(payload).is_ok() {
+                if tx_a_to_b.send(payload).is_ok() {
                     sent += 1;
                 } else {
                     break;
                 }
             }
-            tx_a_to_b.flush();
 
             // Receive replies
-            while let Some(_) = rx_b_to_a.poll() {
+            while let Some(_) = rx_b_to_a.recv() {
                 received += 1;
             }
-            rx_b_to_a.sync();
         }
 
         start.elapsed()
@@ -80,17 +78,14 @@ fn bench_pingpong(capacity: usize, iterations: u64, batch_size: u64) -> Duration
 
         while replied < iterations {
             // Receive and echo back
-            while let Some(msg) = rx_a_to_b.poll() {
-                if tx_b_to_a.write(msg).is_ok() {
+            while let Some(msg) = rx_a_to_b.recv() {
+                if tx_b_to_a.send(msg).is_ok() {
                     replied += 1;
                 } else {
-                    // Channel full - flush and break
-                    tx_b_to_a.flush();
+                    // Channel full - break
                     break;
                 }
             }
-            tx_b_to_a.flush();
-            rx_a_to_b.sync();
         }
     });
 
@@ -117,15 +112,13 @@ fn bench_oneway(capacity: usize, iterations: u64, batch_size: u64) -> Duration {
         while sent < iterations {
             let batch_end = (sent + batch_size).min(iterations);
             while sent < batch_end {
-                if tx.write(payload).is_ok() {
+                if tx.send(payload).is_ok() {
                     sent += 1;
                 } else {
-                    // Channel full, flush and retry
-                    tx.flush();
+                    // Channel full, spin
                     break;
                 }
             }
-            tx.flush();
         }
 
         start.elapsed()
@@ -138,10 +131,9 @@ fn bench_oneway(capacity: usize, iterations: u64, batch_size: u64) -> Duration {
 
         let mut received = 0u64;
         while received < iterations {
-            while let Some(_) = rx.poll() {
+            while let Some(_) = rx.recv() {
                 received += 1;
             }
-            rx.sync();
         }
     });
 
@@ -186,23 +178,21 @@ fn bench_pingpong_with_overhead(capacity: usize, iterations: u64, batch_size: u6
                 let call_id = pending_calls.insert(sent);
                 pending_keys.push_back(call_id);
                 let _ch = channels_a.iter().find(|c| c.peer_id == 1);
-                if tx_a_to_b.write(payload).is_ok() {
+                if tx_a_to_b.send(payload).is_ok() {
                     sent += 1;
                 } else {
                     pending_calls.remove(pending_keys.pop_back().unwrap());
                     break;
                 }
             }
-            tx_a_to_b.flush();
 
             // Receive replies, simulate Slab remove (FIFO order)
-            while let Some(_) = rx_b_to_a.poll() {
+            while let Some(_) = rx_b_to_a.recv() {
                 if let Some(key) = pending_keys.pop_front() {
                     pending_calls.try_remove(key);
                 }
                 received += 1;
             }
-            rx_b_to_a.sync();
         }
 
         start.elapsed()
@@ -218,23 +208,20 @@ fn bench_pingpong_with_overhead(capacity: usize, iterations: u64, batch_size: u6
 
         while replied < iterations {
             // Receive and queue
-            while let Some(msg) = rx_a_to_b.poll() {
+            while let Some(msg) = rx_a_to_b.recv() {
                 recv_queue.push_back(msg);
             }
-            rx_a_to_b.sync();
 
             // Process queue with iter().find() for reply
             while let Some(msg) = recv_queue.pop_front() {
                 let _ch = channels_b.iter().find(|c| c.peer_id == 0);
-                if tx_b_to_a.write(msg).is_ok() {
+                if tx_b_to_a.send(msg).is_ok() {
                     replied += 1;
                 } else {
                     recv_queue.push_front(msg);
-                    tx_b_to_a.flush();
                     break;
                 }
             }
-            tx_b_to_a.flush();
         }
     });
 
@@ -334,11 +321,18 @@ fn bench_flux_call_overhead(iterations: u64) -> Duration {
 
 /// Benchmark: Flux with actual SPSC (single pair, measures full RPC path)
 fn bench_flux_single_pair(capacity: usize, iterations: u64) -> Duration {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use thread_channel::{create_flux, Flux};
 
-    // Create 2-node Flux network
+    // Counter for received responses (incremented in callback)
+    let received_counter = Arc::new(AtomicU64::new(0));
+    let counter_clone = Arc::clone(&received_counter);
+
+    // Create 2-node Flux network with callback that counts responses
     let nodes: Vec<Flux<Payload, (), _>> =
-        create_flux(2, capacity, |_: &mut (), _: Payload| {});
+        create_flux(2, capacity, move |_: &mut (), _: Payload| {
+            counter_clone.fetch_add(1, Ordering::Relaxed);
+        });
     let mut nodes: Vec<_> = nodes.into_iter().collect();
     let mut node_b = nodes.pop().unwrap();
     let mut node_a = nodes.pop().unwrap();
@@ -371,10 +365,10 @@ fn bench_flux_single_pair(capacity: usize, iterations: u64) -> Duration {
     let start = Instant::now();
 
     let mut sent = 0u64;
-    let mut received = 0u64;
     let max_in_flight = 256u64;
 
-    while received < iterations {
+    while received_counter.load(Ordering::Relaxed) < iterations {
+        let received = received_counter.load(Ordering::Relaxed);
         // Send
         while sent < iterations && (sent - received) < max_in_flight {
             if node_a.call(1, payload, ()).is_ok() {
@@ -384,11 +378,8 @@ fn bench_flux_single_pair(capacity: usize, iterations: u64) -> Duration {
             }
         }
 
-        // Poll and receive
+        // Poll to process responses (callback increments counter)
         node_a.poll();
-        while let Some(_handle) = node_a.try_recv() {
-            received += 1;
-        }
     }
 
     let duration = start.elapsed();
@@ -425,19 +416,17 @@ fn bench_pingpong_timed(capacity: usize, duration_secs: u64) -> (Duration, u64) 
             for _ in 0..1024 {
                 // Send up to max in-flight
                 while (sent - received) < max_in_flight {
-                    if tx_a_to_b.write(payload).is_ok() {
+                    if tx_a_to_b.send(payload).is_ok() {
                         sent += 1;
                     } else {
                         break;
                     }
                 }
-                tx_a_to_b.flush();
 
                 // Receive replies
-                while let Some(_) = rx_b_to_a.poll() {
+                while let Some(_) = rx_b_to_a.recv() {
                     received += 1;
                 }
-                rx_b_to_a.sync();
             }
 
             // Update counter and check stop_flag every 1024 iterations
@@ -461,14 +450,11 @@ fn bench_pingpong_timed(capacity: usize, duration_secs: u64) -> (Duration, u64) 
         'outer: loop {
             for _ in 0..1024 {
                 // Receive and echo back
-                while let Some(msg) = rx_a_to_b.poll() {
-                    if tx_b_to_a.write(msg).is_err() {
-                        tx_b_to_a.flush();
+                while let Some(msg) = rx_a_to_b.recv() {
+                    if tx_b_to_a.send(msg).is_err() {
                         break;
                     }
                 }
-                tx_b_to_a.flush();
-                rx_a_to_b.sync();
             }
 
             if stop_b.load(Ordering::Relaxed) {
