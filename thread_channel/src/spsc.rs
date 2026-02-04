@@ -248,7 +248,7 @@ impl<T: Serial> Receiver<T> {
             }
         }
 
-        // Read the value
+        // Read the value (normal load - NT store data will miss cache, which is fine)
         let value = unsafe {
             let slot = &*self.inner.slots[self.local_head].get();
             std::ptr::read(slot.as_ptr() as *const T)
