@@ -1,63 +1,61 @@
 //! SPSC-based n-to-n communication with callback-based response handling.
 //!
-//! Each node pair has a dedicated SPSC channel, providing zero-contention
+//! Each node pair has dedicated SPSC channels, providing zero-contention
 //! communication at the cost of O(N^2) memory usage.
 //!
-//! This module uses a copyrpc-style API:
-//! - `call(to, payload, user_data)` sends a request (user_data tracked internally)
+//! This module uses producer-only write SPSC for requests:
+//! - Request channel: consumer is read-only (producer frees slots on response)
+//! - Response channel: standard SPSC
+//!
+//! API:
+//! - `call(to, payload, user_data)` sends a request
 //! - `poll()` processes messages (responses invoke callback)
 //! - `try_recv()` returns received requests via `RecvHandle`
-//! - Response handling is done via callbacks, not manual req_num matching
 
 use std::collections::VecDeque;
 
-use slab::Slab;
-
 use crate::spsc::{self, Serial};
+use crate::spsc_rpc;
 use crate::SendError;
 
-/// Message kind for internal protocol.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-enum MessageKind {
-    Request = 1,
-    Response = 2,
-}
-
-/// Internal message wrapper that includes protocol information.
+/// Response message containing slot index for freeing.
 #[derive(Clone, Copy)]
 #[repr(C)]
-struct Message<T: Serial> {
-    kind: MessageKind,
-    req_num: u64,
+struct Response<T: Serial> {
+    slot_idx: usize,
     data: T,
 }
 
-// SAFETY: Message<T> is Copy if T is Copy (which Serial implies), and has no padding issues
-// since all fields are themselves Serial-compatible types.
-unsafe impl<T: Serial> Serial for Message<T> {}
+unsafe impl<T: Serial> Serial for Response<T> {}
 
-/// A bidirectional channel to a single peer (internal).
+/// A bidirectional channel to a single peer.
+///
+/// Uses producer-only write SPSC for requests (consumer is read-only),
+/// and standard SPSC for responses.
 struct FluxChannel<T: Serial> {
     peer_id: usize,
-    tx: spsc::Sender<Message<T>>,
-    rx: spsc::Receiver<Message<T>>,
+    /// Request sender (producer-only write)
+    req_tx: spsc_rpc::Sender<T>,
+    /// Request receiver (read-only)
+    req_rx: spsc_rpc::Receiver<T>,
+    /// Response sender (standard SPSC)
+    resp_tx: spsc::Sender<Response<T>>,
+    /// Response receiver (standard SPSC)
+    resp_rx: spsc::Receiver<Response<T>>,
 }
 
 /// A received request, stored in the internal queue.
 struct RecvRequest<T> {
     from: usize,
-    req_num: u64,
+    slot_idx: usize,
     data: T,
 }
 
 /// Handle for a received request that allows replying.
-///
-/// This handle hides the internal `req_num` from users, providing a cleaner API.
 pub struct RecvHandle<'a, T: Serial, U, F: FnMut(&mut U, T)> {
     flux: &'a mut Flux<T, U, F>,
     from: usize,
-    req_num: u64,
+    slot_idx: usize,
     data: T,
 }
 
@@ -75,8 +73,6 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T)> RecvHandle<'a, T, U, F> {
     }
 
     /// Sends a reply to the request, consuming the handle on success.
-    ///
-    /// On failure, returns the handle along with the error so it can be retried.
     #[inline]
     pub fn reply(self, value: T) -> Result<(), (Self, SendError<T>)> {
         let channel_idx = match self.flux.peer_to_channel_index(self.from) {
@@ -84,58 +80,51 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T)> RecvHandle<'a, T, U, F> {
             None => return Err((self, SendError::InvalidPeer(value))),
         };
 
-        let msg = Message {
-            kind: MessageKind::Response,
-            req_num: self.req_num,
+        let resp = Response {
+            slot_idx: self.slot_idx,
             data: value,
         };
 
-        match self.flux.channels[channel_idx].tx.send(msg) {
+        match self.flux.channels[channel_idx].resp_tx.send(resp) {
             Ok(()) => Ok(()),
-            Err(spsc::SendError(m)) => Err((
+            Err(spsc::SendError(r)) => Err((
                 Self {
                     flux: self.flux,
                     from: self.from,
-                    req_num: self.req_num,
+                    slot_idx: self.slot_idx,
                     data: self.data,
                 },
-                SendError::Full(m.data),
+                SendError::Full(r.data),
             )),
         }
     }
 
     /// Tries to send a reply. On failure, requeues the request for later retry.
-    ///
-    /// Returns `true` if the reply was sent successfully, `false` if it was requeued.
-    /// Use this when you want to process multiple requests without blocking on any single one.
     #[inline]
     pub fn reply_or_requeue(self, value: T) -> bool {
         let channel_idx = match self.flux.peer_to_channel_index(self.from) {
             Some(idx) => idx,
             None => {
-                // Invalid peer - requeue to avoid data loss
                 self.flux.recv_queue.push_front(RecvRequest {
                     from: self.from,
-                    req_num: self.req_num,
+                    slot_idx: self.slot_idx,
                     data: self.data,
                 });
                 return false;
             }
         };
 
-        let msg = Message {
-            kind: MessageKind::Response,
-            req_num: self.req_num,
+        let resp = Response {
+            slot_idx: self.slot_idx,
             data: value,
         };
 
-        match self.flux.channels[channel_idx].tx.send(msg) {
+        match self.flux.channels[channel_idx].resp_tx.send(resp) {
             Ok(()) => true,
             Err(spsc::SendError(_)) => {
-                // Requeue the request at the front
                 self.flux.recv_queue.push_front(RecvRequest {
                     from: self.from,
-                    req_num: self.req_num,
+                    slot_idx: self.slot_idx,
                     data: self.data,
                 });
                 false
@@ -146,26 +135,18 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T)> RecvHandle<'a, T, U, F> {
 
 /// A node in a Flux network with callback-based response handling.
 ///
-/// Each node can send to and receive from any other node through dedicated
-/// SPSC channels. Responses are handled via callbacks, eliminating manual
-/// req_num management.
-///
-/// ## API Overview
-///
-/// - `call(to, value, user_data)` - Send a request to peer (user_data for callback)
-/// - `poll()` - Process messages (responses invoke callback)
-/// - `try_recv()` - Get next received request as `RecvHandle`
+/// Uses producer-only write SPSC for requests, eliminating cache line
+/// bouncing on the consumer side.
 pub struct Flux<T: Serial, U, F: FnMut(&mut U, T)> {
     id: usize,
     num_nodes: usize,
     channels: Vec<FluxChannel<T>>,
     /// Round-robin index for poll
     recv_index: usize,
-    /// Next request number for call()
-    next_req_num: u64,
-    /// Pending calls: maps call_id (internal req_num) to user_data
-    pending_calls: Slab<U>,
-    /// Response callback (called for each response received)
+    /// Pending calls: maps slot_idx to user_data (fixed-size array per channel)
+    /// Outer vec is per-channel, inner vec is per-slot
+    pending_calls: Vec<Vec<Option<U>>>,
+    /// Response callback
     on_response: F,
     /// Queue of received requests
     recv_queue: VecDeque<RecvRequest<T>>,
@@ -183,9 +164,6 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
     }
 
     /// Converts peer ID to channel index in O(1).
-    ///
-    /// Channels are ordered as [0, 1, ..., id-1, id+1, ..., n-1],
-    /// so peer j maps to index j if j < id, or j-1 if j > id.
     #[inline]
     fn peer_to_channel_index(&self, peer: usize) -> Option<usize> {
         if peer >= self.num_nodes || peer == self.id {
@@ -195,9 +173,6 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
     }
 
     /// Sends a call to the specified peer.
-    ///
-    /// The `user_data` is stored internally and passed to the response callback
-    /// when the response arrives.
     #[inline]
     pub fn call(&mut self, to: usize, value: T, user_data: U) -> Result<(), SendError<T>> {
         let channel_idx = match self.peer_to_channel_index(to) {
@@ -205,31 +180,20 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
             None => return Err(SendError::InvalidPeer(value)),
         };
 
-        let call_id = self.pending_calls.insert(user_data);
-        let req_num = call_id as u64;
-
-        let msg = Message {
-            kind: MessageKind::Request,
-            req_num,
-            data: value,
-        };
-
-        match self.channels[channel_idx].tx.send(msg) {
-            Ok(()) => {
-                self.next_req_num = self.next_req_num.wrapping_add(1);
+        match self.channels[channel_idx].req_tx.send(value) {
+            Ok(slot_idx) => {
+                // Store user_data for this slot
+                self.pending_calls[channel_idx][slot_idx] = Some(user_data);
                 Ok(())
             }
-            Err(spsc::SendError(m)) => {
-                self.pending_calls.remove(call_id);
-                Err(SendError::Full(m.data))
-            }
+            Err(spsc_rpc::SendError(v)) => Err(SendError::Full(v)),
         }
     }
 
-    /// Polls for messages from peers, processing them appropriately.
+    /// Polls for messages from peers.
     ///
-    /// - For responses: invokes the callback with user_data and response data
-    /// - For requests: queues them for retrieval via `try_recv()`
+    /// - Requests: queued for retrieval via `try_recv()`
+    /// - Responses: invokes callback and frees the request slot
     #[inline]
     pub fn poll(&mut self) {
         let n = self.channels.len();
@@ -237,66 +201,59 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
             return;
         }
 
-        // Single pass over all channels
         for _ in 0..n {
             let idx = self.recv_index;
             self.recv_index = (self.recv_index + 1) % n;
 
-            while let Some(msg) = self.channels[idx].rx.recv() {
-                let peer_id = self.channels[idx].peer_id;
-                match msg.kind {
-                    MessageKind::Request => {
-                        self.recv_queue.push_back(RecvRequest {
-                            from: peer_id,
-                            req_num: msg.req_num,
-                            data: msg.data,
-                        });
-                    }
-                    MessageKind::Response => {
-                        let call_id = msg.req_num as usize;
-                        if let Some(mut user_data) = self.pending_calls.try_remove(call_id) {
-                            (self.on_response)(&mut user_data, msg.data);
-                        }
-                    }
+            let channel = &mut self.channels[idx];
+            let peer_id = channel.peer_id;
+
+            // Receive requests (read-only from consumer perspective)
+            while let Some((slot_idx, data)) = channel.req_rx.recv() {
+                self.recv_queue.push_back(RecvRequest {
+                    from: peer_id,
+                    slot_idx,
+                    data,
+                });
+            }
+
+            // Receive responses and free slots
+            while let Some(resp) = channel.resp_rx.recv() {
+                // Free the request slot (producer writes valid=false)
+                channel.req_tx.free_slot(resp.slot_idx);
+
+                // Get user_data and invoke callback
+                if let Some(mut user_data) = self.pending_calls[idx][resp.slot_idx].take() {
+                    (self.on_response)(&mut user_data, resp.data);
                 }
             }
         }
     }
 
     /// Tries to receive the next request from the queue.
-    ///
-    /// Returns a `RecvHandle` that can be used to read the data and send a reply.
-    /// Returns `None` if no requests are queued (call `poll()` to receive more).
     #[inline]
     pub fn try_recv(&mut self) -> Option<RecvHandle<'_, T, U, F>> {
         let req = self.recv_queue.pop_front()?;
         Some(RecvHandle {
             flux: self,
             from: req.from,
-            req_num: req.req_num,
+            slot_idx: req.slot_idx,
             data: req.data,
         })
     }
 
     /// Returns the number of pending calls awaiting responses.
-    ///
-    /// This can be used for in-flight tracking without atomic overhead:
-    /// `in_flight = pending_count()` since each pending call represents
-    /// a request that hasn't received its response yet.
     #[inline]
     pub fn pending_count(&self) -> usize {
-        self.pending_calls.len()
+        self.pending_calls
+            .iter()
+            .flat_map(|v| v.iter())
+            .filter(|o| o.is_some())
+            .count()
     }
 }
 
 /// Creates a Flux network with `n` nodes.
-///
-/// Returns a vector of `Flux` nodes, each capable of communicating with
-/// all other nodes through dedicated SPSC channels.
-///
-/// The `on_response` callback is invoked for each response received, with
-/// the user_data that was passed to the corresponding `call()` and the
-/// response data.
 ///
 /// # Panics
 /// Panics if `n` is 0 or `capacity` is 0.
@@ -309,22 +266,50 @@ where
     assert!(n > 0, "must have at least one node");
     assert!(capacity > 0, "capacity must be greater than 0");
 
+    // Actual capacity after power-of-2 rounding
+    let actual_capacity = capacity.next_power_of_two();
+
     // Create all channel pairs
-    // For nodes i and j (i < j), we create two SPSC channels:
-    // - i -> j
-    // - j -> i
-    let mut channel_pairs: Vec<Vec<Option<(spsc::Sender<Message<T>>, spsc::Receiver<Message<T>>)>>> =
+    // For nodes i and j (i < j), we create:
+    // - Request channel i -> j (spsc_rpc)
+    // - Request channel j -> i (spsc_rpc)
+    // - Response channel i -> j (spsc)
+    // - Response channel j -> i (spsc)
+    struct ChannelPair<T: Serial> {
+        req_tx: spsc_rpc::Sender<T>,
+        req_rx: spsc_rpc::Receiver<T>,
+        resp_tx: spsc::Sender<Response<T>>,
+        resp_rx: spsc::Receiver<Response<T>>,
+    }
+
+    let mut channel_pairs: Vec<Vec<Option<ChannelPair<T>>>> =
         (0..n).map(|_| (0..n).map(|_| None).collect()).collect();
 
     for i in 0..n {
         for j in (i + 1)..n {
-            // Channel from i to j
-            let (tx_i_j, rx_i_j) = spsc::channel(capacity);
-            // Channel from j to i
-            let (tx_j_i, rx_j_i) = spsc::channel(capacity);
+            // Channels from i to j
+            let (req_tx_i_j, req_rx_i_j) = spsc_rpc::channel(capacity);
+            let (resp_tx_i_j, resp_rx_i_j) = spsc::channel(capacity);
 
-            channel_pairs[i][j] = Some((tx_i_j, rx_j_i)); // i sends to j, i receives from j
-            channel_pairs[j][i] = Some((tx_j_i, rx_i_j)); // j sends to i, j receives from i
+            // Channels from j to i
+            let (req_tx_j_i, req_rx_j_i) = spsc_rpc::channel(capacity);
+            let (resp_tx_j_i, resp_rx_j_i) = spsc::channel(capacity);
+
+            // i's view: send requests to j, receive responses from j
+            channel_pairs[i][j] = Some(ChannelPair {
+                req_tx: req_tx_i_j,
+                req_rx: req_rx_j_i,
+                resp_tx: resp_tx_j_i,
+                resp_rx: resp_rx_i_j,
+            });
+
+            // j's view: send requests to i, receive responses from i
+            channel_pairs[j][i] = Some(ChannelPair {
+                req_tx: req_tx_j_i,
+                req_rx: req_rx_i_j,
+                resp_tx: resp_tx_i_j,
+                resp_rx: resp_rx_j_i,
+            });
         }
     }
 
@@ -333,18 +318,23 @@ where
 
     for i in 0..n {
         let mut channels = Vec::with_capacity(n - 1);
+        let mut pending_calls = Vec::with_capacity(n - 1);
 
         for j in 0..n {
             if i == j {
                 continue;
             }
 
-            if let Some((tx, rx)) = channel_pairs[i][j].take() {
+            if let Some(pair) = channel_pairs[i][j].take() {
                 channels.push(FluxChannel {
                     peer_id: j,
-                    tx,
-                    rx,
+                    req_tx: pair.req_tx,
+                    req_rx: pair.req_rx,
+                    resp_tx: pair.resp_tx,
+                    resp_rx: pair.resp_rx,
                 });
+                // Fixed-size array for pending calls per channel
+                pending_calls.push((0..actual_capacity).map(|_| None).collect());
             }
         }
 
@@ -353,8 +343,7 @@ where
             num_nodes: n,
             channels,
             recv_index: 0,
-            next_req_num: 0,
-            pending_calls: Slab::with_capacity(capacity),
+            pending_calls,
             on_response: on_response.clone(),
             recv_queue: VecDeque::with_capacity(capacity),
         });
@@ -390,7 +379,7 @@ mod tests {
 
         // Node 0 calls node 1 with user_data=100
         nodes[0].call(1, 42, 100).unwrap();
-        nodes[0].poll(); // flush
+        nodes[0].poll();
 
         // Node 1 receives and replies
         nodes[1].poll();
@@ -398,14 +387,14 @@ mod tests {
         assert_eq!(handle.from(), 0);
         assert_eq!(handle.data(), 42);
         assert!(handle.reply(43).is_ok());
-        nodes[1].poll(); // flush reply
+        nodes[1].poll();
 
         // Node 0 receives response (callback is invoked)
         nodes[0].poll();
 
         let responses = responses.borrow();
         assert_eq!(responses.len(), 1);
-        assert_eq!(responses[0], (100, 43)); // user_data=100, response=43
+        assert_eq!(responses[0], (100, 43));
     }
 
     #[test]
@@ -414,9 +403,9 @@ mod tests {
 
         // Node 1 and 2 both send to node 0
         nodes[1].call(0, 100, ()).unwrap();
-        nodes[1].poll(); // flush
+        nodes[1].poll();
         nodes[2].call(0, 200, ()).unwrap();
-        nodes[2].poll(); // flush
+        nodes[2].poll();
 
         nodes[0].poll();
 
@@ -480,7 +469,7 @@ mod tests {
                         }
                     }
                 }
-                node.poll(); // final flush
+                node.poll();
 
                 // Receive from all peers and reply
                 let mut request_count = 0;
@@ -499,7 +488,7 @@ mod tests {
         }
 
         for h in handles {
-            assert_eq!(h.join().unwrap(), 300); // 3 peers * 100 messages
+            assert_eq!(h.join().unwrap(), 300);
         }
     }
 
@@ -513,11 +502,9 @@ mod tests {
         let capacity = 1024;
         let max_in_flight = (capacity / 4).max(1) as u64;
 
-        // Global response counter shared by all callbacks
         let global_response_count = Arc::new(AtomicU64::new(0));
         let global_count_clone = Arc::clone(&global_response_count);
 
-        // Each node's callback increments the global counter
         let nodes: Vec<Flux<u64, (), _>> =
             create_flux(n, capacity, move |_: &mut (), _: u64| {
                 global_count_clone.fetch_add(1, Ordering::Relaxed);
@@ -540,10 +527,8 @@ mod tests {
                         let mut sent_replies = 0u64;
                         let total_sent_target = iterations * (num_peers as u64);
 
-                        // Send all calls first
                         let mut total_sent = 0u64;
                         while total_sent < total_sent_target || sent_replies < expected_requests {
-                            // Try to send calls to all peers (with in-flight limit)
                             for &peer in &peers {
                                 if sent_per_peer[peer] < iterations {
                                     let in_flight = sent_per_peer[peer]
@@ -557,7 +542,6 @@ mod tests {
                                 }
                             }
 
-                            // Process received messages
                             node.poll();
 
                             while let Some(handle) = node.try_recv() {
@@ -568,13 +552,11 @@ mod tests {
                             }
                         }
 
-                        // Final flush and poll to ensure all responses are processed
                         for _ in 0..10 {
                             node.poll();
                             while node.try_recv().is_some() {}
                         }
 
-                        // Wait for all threads to complete before dropping node
                         end_barrier.wait();
                         sent_replies
                     })
@@ -587,7 +569,6 @@ mod tests {
             }
         });
 
-        // Verify total responses received via callback
         let total_responses = global_response_count.load(Ordering::Relaxed);
         assert_eq!(total_responses, n as u64 * iterations * ((n - 1) as u64));
     }

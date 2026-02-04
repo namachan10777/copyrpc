@@ -7,6 +7,7 @@
 pub mod flux;
 pub mod mesh;
 pub mod spsc;
+pub(crate) mod spsc_rpc;
 
 pub(crate) mod mpsc;
 
