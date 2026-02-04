@@ -137,21 +137,25 @@ fn run_flux_benchmark(n: usize, capacity: usize, duration_secs: u64) -> FluxBenc
 
                 let mut total_sent = 0u64;
                 let mut total_completed = 0u64;
+                let max_inflight = 256usize;
+                let mut can_send = true;
 
                 // Main loop: run until stop_flag is set
                 // Check stop_flag only every 1024 iterations to reduce atomic overhead
                 'outer: loop {
                     for _ in 0..1024 {
-                        // Aggressive pipelining: try to send to all peers
+                        // Aggressive pipelining: try to send to all peers (with inflight limit)
                         let mut any_sent = false;
-                        for &peer in &peers {
-                            if node.call(peer, payload, ()).is_ok() {
-                                total_sent += 1;
-                                any_sent = true;
+                        if can_send {
+                            for &peer in &peers {
+                                if node.call(peer, payload, ()).is_ok() {
+                                    total_sent += 1;
+                                    any_sent = true;
+                                }
                             }
                         }
 
-                        // Poll and process replies
+                        // Poll and process replies (also check inflight every 32 sends)
                         if !any_sent || (total_sent & 0x1F) == 0 {
                             node.poll();
                             while let Some(handle) = node.try_recv() {
@@ -160,6 +164,8 @@ fn run_flux_benchmark(n: usize, capacity: usize, duration_secs: u64) -> FluxBenc
                                     break;
                                 }
                             }
+                            // Update can_send based on inflight
+                            can_send = node.pending_count() < max_inflight;
                         }
                     }
 
