@@ -32,3 +32,4 @@ target
 
 # Benchmark results
 thread_channel/bench_results/
+*.parquet
