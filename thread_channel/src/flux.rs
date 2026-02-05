@@ -69,7 +69,7 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport> RecvHandle<'a,
 
         match self.flux.channels[channel_idx].endpoint.reply(self.token, value) {
             Ok(()) => Ok(()),
-            Err(TransportError::Full(v)) => Err((
+            Err(TransportError::Full(v)) | Err(TransportError::InflightExceeded(v)) => Err((
                 Self {
                     flux: self.flux,
                     from: self.from,
@@ -107,7 +107,11 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport> RecvHandle<'a,
 
         match self.flux.channels[channel_idx].endpoint.reply(self.token, value) {
             Ok(()) => true,
-            Err(TransportError::Full(_) | TransportError::Disconnected(_)) => {
+            Err(
+                TransportError::Full(_)
+                | TransportError::Disconnected(_)
+                | TransportError::InflightExceeded(_),
+            ) => {
                 self.flux.recv_queue.push_front(RecvRequest {
                     from: self.from,
                     token: self.token,
@@ -187,7 +191,9 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport> Flux<T, U, F, Tr> 
                 self.pending_calls[channel_idx][slot] = Some(user_data);
                 Ok(())
             }
-            Err(TransportError::Full(v)) => Err(SendError::Full(v)),
+            Err(TransportError::Full(v) | TransportError::InflightExceeded(v)) => {
+                Err(SendError::Full(v))
+            }
             Err(TransportError::Disconnected(v)) => Err(SendError::Disconnected(v)),
         }
     }
@@ -317,7 +323,7 @@ where
     for i in 0..n {
         for j in (i + 1)..n {
             // Create bidirectional channel between i and j
-            let (endpoint_i, endpoint_j) = Tr::channel(capacity);
+            let (endpoint_i, endpoint_j) = Tr::channel(capacity, inflight_max);
 
             // Node i's endpoint for peer j
             channel_endpoints[i][j] = Some(endpoint_i);

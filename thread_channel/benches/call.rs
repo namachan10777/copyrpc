@@ -3,7 +3,7 @@
 //! Measures raw call/reply performance without Flux overhead.
 //! Tests the bidirectional RPC pattern with proper flow control.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -41,7 +41,7 @@ fn bench_pingpong(c: &mut Criterion) {
 }
 
 fn run_pingpong_bench<Tr: Transport>(b: &mut criterion::Bencher) {
-    let (mut endpoint_a, mut endpoint_b) = Tr::channel::<Payload, Payload>(64);
+    let (mut endpoint_a, mut endpoint_b) = Tr::channel::<Payload, Payload>(64, 32);
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);
@@ -83,83 +83,80 @@ fn run_pingpong_bench<Tr: Transport>(b: &mut criterion::Bencher) {
     handle.join().unwrap();
 }
 
-/// Benchmark throughput with pipelined calls.
+/// Benchmark sustained throughput with pipelined calls.
+/// Uses QUEUE_DEPTH=32 and processes 1024 requests per iteration to measure steady-state.
 fn bench_throughput(c: &mut Criterion) {
+    const REQUESTS_PER_ITER: usize = 1024;
+
     let mut group = c.benchmark_group("transport_throughput");
+    group.throughput(Throughput::Elements(REQUESTS_PER_ITER as u64));
 
-    for batch_size in [8, 32, 128] {
-        group.throughput(Throughput::Elements(batch_size as u64));
+    group.bench_function("onesided", |b| {
+        run_throughput_bench::<OnesidedTransport>(b, REQUESTS_PER_ITER);
+    });
 
-        group.bench_with_input(
-            BenchmarkId::new("onesided", batch_size),
-            &batch_size,
-            |b, &batch_size| {
-                run_throughput_bench::<OnesidedTransport>(b, batch_size);
-            },
-        );
+    group.bench_function("fastforward", |b| {
+        run_throughput_bench::<FastForwardTransport>(b, REQUESTS_PER_ITER);
+    });
 
-        group.bench_with_input(
-            BenchmarkId::new("fastforward", batch_size),
-            &batch_size,
-            |b, &batch_size| {
-                run_throughput_bench::<FastForwardTransport>(b, batch_size);
-            },
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("lamport", batch_size),
-            &batch_size,
-            |b, &batch_size| {
-                run_throughput_bench::<LamportTransport>(b, batch_size);
-            },
-        );
-    }
+    group.bench_function("lamport", |b| {
+        run_throughput_bench::<LamportTransport>(b, REQUESTS_PER_ITER);
+    });
 
     group.finish();
 }
 
-fn run_throughput_bench<Tr: Transport>(b: &mut criterion::Bencher, batch_size: usize) {
-    let capacity = (batch_size * 4).next_power_of_two();
-    let (mut endpoint_a, mut endpoint_b) = Tr::channel::<Payload, Payload>(capacity);
+fn run_throughput_bench<Tr: Transport>(b: &mut criterion::Bencher, requests: usize) {
+    const QUEUE_DEPTH: usize = 32;
+    let capacity = QUEUE_DEPTH * 4; // Ensure enough capacity for pipelining
+    let (mut endpoint_a, mut endpoint_b) = Tr::channel::<Payload, Payload>(capacity, QUEUE_DEPTH);
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);
 
+    // Responder thread: poll() syncs both recv and send, then process requests
     let handle = thread::spawn(move || {
         while !stop2.load(Ordering::Relaxed) {
-            // poll() does sync for Lamport: makes peer's calls visible, our replies visible
-            // Single poll() per batch - this enables proper batching
+            // poll() syncs: makes peer's calls visible, makes our replies visible
             endpoint_b.poll();
-            let mut count = 0;
+            // recv() as much as possible and reply() without polling
             while let Some((token, data)) = endpoint_b.recv() {
-                loop {
-                    if endpoint_b.reply(token, data).is_ok() {
-                        count += 1;
-                        break;
-                    }
+                while endpoint_b.reply(token, data).is_err() {
                     std::hint::spin_loop();
                 }
             }
-            black_box(count);
         }
     });
 
     let payload = Payload { data: [42; 4] };
 
     b.iter(|| {
-        // Send batch of calls
-        for _ in 0..batch_size {
-            loop {
+        let mut sent = 0usize;
+        let mut received = 0usize;
+        let mut inflight = 0usize;
+
+        // Pipeline: maintain inflight = QUEUE_DEPTH while sending requests
+        while sent < requests {
+            // Fill up to QUEUE_DEPTH
+            while inflight < QUEUE_DEPTH && sent < requests {
                 if endpoint_a.call(black_box(payload)).is_ok() {
+                    sent += 1;
+                    inflight += 1;
+                } else {
                     break;
                 }
-                std::hint::spin_loop();
+            }
+
+            // poll() to receive responses and free up inflight slots
+            while let Some((_, data)) = endpoint_a.poll() {
+                black_box(data);
+                received += 1;
+                inflight -= 1;
             }
         }
 
-        // Receive batch of responses
-        let mut received = 0;
-        while received < batch_size {
+        // Drain: receive remaining responses
+        while received < requests {
             if let Some((_, data)) = endpoint_a.poll() {
                 black_box(data);
                 received += 1;
@@ -172,74 +169,5 @@ fn run_throughput_bench<Tr: Transport>(b: &mut criterion::Bencher, batch_size: u
     handle.join().unwrap();
 }
 
-/// Benchmark one-way call throughput (caller sends, callee receives but doesn't reply).
-/// This tests the request channel only, not the full RPC pattern.
-fn bench_oneway(c: &mut Criterion) {
-    let mut group = c.benchmark_group("transport_oneway");
-
-    for batch_size in [8, 32, 128] {
-        group.throughput(Throughput::Elements(batch_size as u64));
-
-        group.bench_with_input(
-            BenchmarkId::new("onesided", batch_size),
-            &batch_size,
-            |b, &batch_size| {
-                run_oneway_bench::<OnesidedTransport>(b, batch_size);
-            },
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("fastforward", batch_size),
-            &batch_size,
-            |b, &batch_size| {
-                run_oneway_bench::<FastForwardTransport>(b, batch_size);
-            },
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("lamport", batch_size),
-            &batch_size,
-            |b, &batch_size| {
-                run_oneway_bench::<LamportTransport>(b, batch_size);
-            },
-        );
-    }
-
-    group.finish();
-}
-
-fn run_oneway_bench<Tr: Transport>(b: &mut criterion::Bencher, batch_size: usize) {
-    let capacity = (batch_size * 4).next_power_of_two();
-    let (mut endpoint_a, mut endpoint_b) = Tr::channel::<Payload, Payload>(capacity);
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop2 = Arc::clone(&stop);
-
-    let handle = thread::spawn(move || {
-        while !stop2.load(Ordering::Relaxed) {
-            // poll() does sync for Lamport
-            endpoint_b.poll();
-            while endpoint_b.recv().is_some() {}
-        }
-    });
-
-    let payload = Payload { data: [42; 4] };
-
-    b.iter(|| {
-        for _ in 0..batch_size {
-            loop {
-                if endpoint_a.call(black_box(payload)).is_ok() {
-                    break;
-                }
-                std::hint::spin_loop();
-            }
-        }
-    });
-
-    stop.store(true, Ordering::Relaxed);
-    endpoint_a.call(payload).ok();
-    handle.join().unwrap();
-}
-
-criterion_group!(benches, bench_pingpong, bench_throughput, bench_oneway);
+criterion_group!(benches, bench_pingpong, bench_throughput);
 criterion_main!(benches);

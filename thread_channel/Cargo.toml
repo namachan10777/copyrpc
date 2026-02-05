@@ -23,3 +23,11 @@ harness = false
 [[bin]]
 name = "cluster_bench"
 required-features = ["bench-bin"]
+
+[[bin]]
+name = "perf_bench"
+required-features = ["bench-bin"]
+
+[[bin]]
+name = "raw_spsc_bench"
+required-features = ["bench-bin"]

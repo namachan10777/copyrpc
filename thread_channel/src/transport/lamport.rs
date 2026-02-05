@@ -279,6 +279,10 @@ pub struct LamportEndpoint<Req: Serial + Send, Resp: Serial + Send> {
     recv_count: u64,
     /// Capacity
     capacity: usize,
+    /// Current number of inflight requests
+    inflight: usize,
+    /// Maximum allowed inflight requests
+    max_inflight: usize,
 }
 
 impl<Req: Serial + Send, Resp: Serial + Send> LamportEndpoint<Req, Resp> {
@@ -306,10 +310,14 @@ impl<Req: Serial + Send, Resp: Serial + Send> TransportEndpoint<Req, Resp>
 {
     #[inline]
     fn call(&mut self, req: Req) -> Result<u64, TransportError<Req>> {
+        if self.inflight >= self.max_inflight {
+            return Err(TransportError::InflightExceeded(req));
+        }
         match self.call_tx.send(req) {
             Ok(()) => {
                 let token = self.send_count;
                 self.send_count += 1;
+                self.inflight += 1;
                 Ok(token)
             }
             Err(SendError(v)) => Err(TransportError::Full(v)),
@@ -321,7 +329,10 @@ impl<Req: Serial + Send, Resp: Serial + Send> TransportEndpoint<Req, Resp>
         // Sync all channels: publish our calls/responses, free slots for peer
         self.sync_call();
         self.sync_recv();
-        self.resp_rx.recv().map(|resp| (resp.token, resp.data))
+        self.resp_rx.recv().map(|resp| {
+            self.inflight = self.inflight.saturating_sub(1);
+            (resp.token, resp.data)
+        })
     }
 
     #[inline]
@@ -347,6 +358,16 @@ impl<Req: Serial + Send, Resp: Serial + Send> TransportEndpoint<Req, Resp>
     fn capacity(&self) -> usize {
         self.capacity
     }
+
+    #[inline]
+    fn inflight(&self) -> usize {
+        self.inflight
+    }
+
+    #[inline]
+    fn max_inflight(&self) -> usize {
+        self.max_inflight
+    }
 }
 
 /// Lamport transport factory.
@@ -360,6 +381,7 @@ impl Transport for LamportTransport {
 
     fn channel<Req: Serial + Send, Resp: Serial + Send>(
         capacity: usize,
+        max_inflight: usize,
     ) -> (Self::Endpoint<Req, Resp>, Self::Endpoint<Req, Resp>) {
         let actual_capacity = capacity.next_power_of_two();
 
@@ -382,6 +404,8 @@ impl Transport for LamportTransport {
                 send_count: 0,
                 recv_count: 0,
                 capacity: actual_capacity,
+                inflight: 0,
+                max_inflight,
             },
             LamportEndpoint {
                 call_tx: call_b_to_a_tx,
@@ -391,6 +415,8 @@ impl Transport for LamportTransport {
                 send_count: 0,
                 recv_count: 0,
                 capacity: actual_capacity,
+                inflight: 0,
+                max_inflight,
             },
         )
     }
@@ -532,7 +558,7 @@ mod tests {
 
     #[test]
     fn test_call_reply() {
-        let (mut endpoint_a, mut endpoint_b) = LamportTransport::channel::<u32, u32>(8);
+        let (mut endpoint_a, mut endpoint_b) = LamportTransport::channel::<u32, u32>(8, 8);
 
         // Endpoint A sends requests
         let token0 = endpoint_a.call(100).unwrap();
@@ -577,7 +603,7 @@ mod tests {
 
     #[test]
     fn test_bidirectional() {
-        let (mut endpoint_a, mut endpoint_b) = LamportTransport::channel::<u32, u32>(8);
+        let (mut endpoint_a, mut endpoint_b) = LamportTransport::channel::<u32, u32>(8, 8);
 
         // Both endpoints can call each other simultaneously
         let token_a = endpoint_a.call(100).unwrap();
@@ -613,13 +639,13 @@ mod tests {
 
     #[test]
     fn test_capacity() {
-        let (endpoint_a, _endpoint_b) = LamportTransport::channel::<u32, u32>(8);
+        let (endpoint_a, _endpoint_b) = LamportTransport::channel::<u32, u32>(8, 8);
         assert_eq!(endpoint_a.capacity(), 8);
     }
 
     #[test]
     fn test_monotonic_tokens() {
-        let (mut endpoint_a, mut endpoint_b) = LamportTransport::channel::<u32, u32>(16);
+        let (mut endpoint_a, mut endpoint_b) = LamportTransport::channel::<u32, u32>(32, 20);
 
         // Tokens should be monotonically increasing
         for i in 0..10 {
@@ -657,7 +683,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let (mut endpoint_a, mut endpoint_b) = LamportTransport::channel::<u64, u64>(256);
+        let (mut endpoint_a, mut endpoint_b) = LamportTransport::channel::<u64, u64>(256, 256);
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = Arc::clone(&stop);

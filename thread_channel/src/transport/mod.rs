@@ -23,6 +23,8 @@ pub enum TransportError<T> {
     Full(T),
     /// The peer has disconnected.
     Disconnected(T),
+    /// The inflight limit has been exceeded.
+    InflightExceeded(T),
 }
 
 impl<T> std::fmt::Display for TransportError<T> {
@@ -30,6 +32,7 @@ impl<T> std::fmt::Display for TransportError<T> {
         match self {
             TransportError::Full(_) => write!(f, "channel is full"),
             TransportError::Disconnected(_) => write!(f, "peer has disconnected"),
+            TransportError::InflightExceeded(_) => write!(f, "inflight limit exceeded"),
         }
     }
 }
@@ -50,12 +53,14 @@ pub trait TransportEndpoint<Req: Serial + Send, Resp: Serial + Send>: Send {
     /// Sends a request and returns a token for response matching.
     ///
     /// The token will be included in the response when `poll()` returns.
+    /// Returns `InflightExceeded` if the inflight limit has been reached.
     fn call(&mut self, req: Req) -> Result<u64, TransportError<Req>>;
 
     /// Receives a response if available.
     ///
     /// Returns `Some((token, response))` where token matches the one from `call()`.
     /// For batched transports, this also synchronizes state.
+    /// This decrements the inflight count.
     fn poll(&mut self) -> Option<(u64, Resp)>;
 
     /// Receives a request if available.
@@ -71,6 +76,12 @@ pub trait TransportEndpoint<Req: Serial + Send, Resp: Serial + Send>: Send {
 
     /// Returns the capacity of the channel.
     fn capacity(&self) -> usize;
+
+    /// Returns the current number of inflight requests (calls without responses).
+    fn inflight(&self) -> usize;
+
+    /// Returns the maximum allowed inflight requests.
+    fn max_inflight(&self) -> usize;
 }
 
 /// Factory trait for creating bidirectional RPC transport channels.
@@ -81,15 +92,17 @@ pub trait Transport: Send + Sync + 'static {
     /// The endpoint type for this transport.
     type Endpoint<Req: Serial + Send, Resp: Serial + Send>: TransportEndpoint<Req, Resp>;
 
-    /// Creates a new bidirectional RPC channel pair with the given capacity.
+    /// Creates a new bidirectional RPC channel pair with the given capacity and inflight limit.
     ///
     /// Returns two connected endpoints. Each endpoint can:
     /// - Call the peer via `call()` and receive responses via `poll()`
     /// - Receive calls from the peer via `recv()` and respond via `reply()`
     ///
     /// The actual capacity may be rounded up to a power of 2.
+    /// `max_inflight` limits the number of outstanding calls (calls without responses).
     fn channel<Req: Serial + Send, Resp: Serial + Send>(
         capacity: usize,
+        max_inflight: usize,
     ) -> (Self::Endpoint<Req, Resp>, Self::Endpoint<Req, Resp>);
 }
 
@@ -120,10 +133,11 @@ mod tests {
     /// This catches deadlocks/hangs in sync logic.
     fn test_two_ring_wraps_with_timeout<T: Transport>() {
         let capacity = 8usize;
+        let max_inflight = capacity / 2;
         let iterations = capacity * 2; // 2 ring wraps
         let timeout = Duration::from_secs(5);
 
-        let (mut endpoint_a, mut endpoint_b) = T::channel::<u64, u64>(capacity);
+        let (mut endpoint_a, mut endpoint_b) = T::channel::<u64, u64>(capacity, max_inflight);
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = Arc::clone(&stop);

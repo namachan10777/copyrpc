@@ -414,6 +414,10 @@ pub struct OnesidedEndpoint<Req: Serial + Send, Resp: Serial + Send> {
     call_rx: Receiver<Req>,
     /// Channel for sending responses (this endpoint → peer)
     resp_tx: Sender<Response<Resp>>,
+    /// Current number of inflight requests
+    inflight: usize,
+    /// Maximum allowed inflight requests
+    max_inflight: usize,
 }
 
 impl<Req: Serial + Send, Resp: Serial + Send> TransportEndpoint<Req, Resp>
@@ -421,8 +425,14 @@ impl<Req: Serial + Send, Resp: Serial + Send> TransportEndpoint<Req, Resp>
 {
     #[inline]
     fn call(&mut self, req: Req) -> Result<u64, TransportError<Req>> {
+        if self.inflight >= self.max_inflight {
+            return Err(TransportError::InflightExceeded(req));
+        }
         match self.call_tx.send(req) {
-            Ok(slot_idx) => Ok(slot_idx as u64),
+            Ok(slot_idx) => {
+                self.inflight += 1;
+                Ok(slot_idx as u64)
+            }
             Err(SendError(v)) => Err(TransportError::Full(v)),
         }
     }
@@ -430,7 +440,10 @@ impl<Req: Serial + Send, Resp: Serial + Send> TransportEndpoint<Req, Resp>
     #[inline]
     fn poll(&mut self) -> Option<(u64, Resp)> {
         // Use recv_no_idx() since we don't need the slot index for responses
-        self.resp_rx.recv_no_idx().map(|resp| (resp.token, resp.data))
+        self.resp_rx.recv_no_idx().map(|resp| {
+            self.inflight = self.inflight.saturating_sub(1);
+            (resp.token, resp.data)
+        })
     }
 
     #[inline]
@@ -452,6 +465,16 @@ impl<Req: Serial + Send, Resp: Serial + Send> TransportEndpoint<Req, Resp>
     fn capacity(&self) -> usize {
         self.call_tx.capacity()
     }
+
+    #[inline]
+    fn inflight(&self) -> usize {
+        self.inflight
+    }
+
+    #[inline]
+    fn max_inflight(&self) -> usize {
+        self.max_inflight
+    }
 }
 
 /// Onesided transport factory.
@@ -466,6 +489,7 @@ impl Transport for OnesidedTransport {
 
     fn channel<Req: Serial + Send, Resp: Serial + Send>(
         capacity: usize,
+        max_inflight: usize,
     ) -> (Self::Endpoint<Req, Resp>, Self::Endpoint<Req, Resp>) {
         // Endpoint A calls → Endpoint B receives
         let (call_a_to_b_tx, call_a_to_b_rx) = channel(capacity);
@@ -483,12 +507,16 @@ impl Transport for OnesidedTransport {
                 resp_rx: resp_b_to_a_rx,
                 call_rx: call_b_to_a_rx,
                 resp_tx: resp_a_to_b_tx,
+                inflight: 0,
+                max_inflight,
             },
             OnesidedEndpoint {
                 call_tx: call_b_to_a_tx,
                 resp_rx: resp_a_to_b_rx,
                 call_rx: call_a_to_b_rx,
                 resp_tx: resp_b_to_a_tx,
+                inflight: 0,
+                max_inflight,
             },
         )
     }
@@ -625,7 +653,7 @@ mod tests {
 
     #[test]
     fn test_call_reply() {
-        let (mut endpoint_a, mut endpoint_b) = OnesidedTransport::channel::<u32, u32>(8);
+        let (mut endpoint_a, mut endpoint_b) = OnesidedTransport::channel::<u32, u32>(8, 8);
 
         // Endpoint A sends request to B
         let token0 = endpoint_a.call(100).unwrap();
@@ -664,7 +692,7 @@ mod tests {
 
     #[test]
     fn test_bidirectional() {
-        let (mut endpoint_a, mut endpoint_b) = OnesidedTransport::channel::<u32, u32>(8);
+        let (mut endpoint_a, mut endpoint_b) = OnesidedTransport::channel::<u32, u32>(8, 8);
 
         // Both endpoints can call each other simultaneously
         let token_a = endpoint_a.call(100).unwrap();
@@ -692,7 +720,7 @@ mod tests {
 
     #[test]
     fn test_capacity() {
-        let (endpoint_a, _endpoint_b) = OnesidedTransport::channel::<u32, u32>(8);
+        let (endpoint_a, _endpoint_b) = OnesidedTransport::channel::<u32, u32>(8, 8);
         assert_eq!(endpoint_a.capacity(), 8);
     }
 
@@ -700,7 +728,7 @@ mod tests {
     fn test_wrap_around() {
         // Test that tokens (slot indices) wrap around correctly
         // This SPSC uses sentinel, so use capacity=8 and send batches of 4
-        let (mut endpoint_a, mut endpoint_b) = OnesidedTransport::channel::<u32, u32>(8);
+        let (mut endpoint_a, mut endpoint_b) = OnesidedTransport::channel::<u32, u32>(8, 8);
 
         for round in 0..3u32 {
             // Send 4 items
@@ -736,7 +764,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let (mut endpoint_a, mut endpoint_b) = OnesidedTransport::channel::<u64, u64>(256);
+        let (mut endpoint_a, mut endpoint_b) = OnesidedTransport::channel::<u64, u64>(256, 256);
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = Arc::clone(&stop);

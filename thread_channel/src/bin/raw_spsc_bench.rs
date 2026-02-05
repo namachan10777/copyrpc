@@ -46,7 +46,8 @@ struct Args {
 
 fn run_bench<Tr: Transport>(duration_secs: u64) {
     let capacity = 1024;
-    let (mut endpoint_a, mut endpoint_b) = Tr::channel::<Payload, Payload>(capacity);
+    let inflight_max = 256;
+    let (mut endpoint_a, mut endpoint_b) = Tr::channel::<Payload, Payload>(capacity, inflight_max);
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);
@@ -82,10 +83,9 @@ fn run_bench<Tr: Transport>(duration_secs: u64) {
 
     let mut sent = 0u64;
     let mut received = 0u64;
-    let inflight_max = 256usize;
 
     while start.elapsed() < run_duration {
-        // Send requests
+        // Send requests (Transport limits inflight via InflightExceeded error)
         while sent - received < inflight_max as u64 {
             if endpoint_a.call(payload).is_ok() {
                 sent += 1;

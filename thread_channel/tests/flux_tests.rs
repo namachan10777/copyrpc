@@ -8,7 +8,7 @@ use thread_channel::{create_flux, Flux, SendError};
 
 #[test]
 fn test_two_node_communication() {
-    let mut nodes: Vec<Flux<u32, (), _>> = create_flux(2, 64, |_, _| {});
+    let mut nodes: Vec<Flux<u32, (), _>> = create_flux(2, 64, 32, |_, _| {});
 
     // Node 0 -> Node 1
     nodes[0].call(1, 100, ()).unwrap();
@@ -43,7 +43,7 @@ fn test_call_reply_with_callback() {
         static RESPONSES: RefCell<Vec<(u32, u32)>> = RefCell::new(Vec::new());
     }
 
-    let mut nodes: Vec<Flux<u32, u32, _>> = create_flux(2, 64, |user_data, data| {
+    let mut nodes: Vec<Flux<u32, u32, _>> = create_flux(2, 64, 32, |user_data: &mut u32, data| {
         RESPONSES.with(|r| r.borrow_mut().push((*user_data, data)));
     });
 
@@ -83,7 +83,7 @@ fn test_call_reply_with_callback() {
 #[test]
 fn test_all_to_all() {
     let n = 4;
-    let mut nodes: Vec<Flux<(usize, usize), (), _>> = create_flux(n, 64, |_, _| {});
+    let mut nodes: Vec<Flux<(usize, usize), (), _>> = create_flux(n, 64, 32, |_, _| {});
 
     // Each node sends to all other nodes
     for i in 0..n {
@@ -113,7 +113,7 @@ fn test_all_to_all() {
 
 #[test]
 fn test_round_robin_poll() {
-    let mut nodes: Vec<Flux<usize, (), _>> = create_flux(4, 64, |_, _| {});
+    let mut nodes: Vec<Flux<usize, (), _>> = create_flux(4, 64, 32, |_, _| {});
 
     // Nodes 1, 2, 3 all send to node 0
     nodes[1].call(0, 1, ()).unwrap();
@@ -141,7 +141,7 @@ fn test_round_robin_poll() {
 
 #[test]
 fn test_channel_full() {
-    let mut nodes: Vec<Flux<u32, (), _>> = create_flux(2, 2, |_, _| {}); // Very small capacity
+    let mut nodes: Vec<Flux<u32, (), _>> = create_flux(2, 2, 2, |_, _| {}); // Very small capacity
 
     // FastForward uses validity flags, so full capacity is available
     // capacity 2 rounds up to 2, so can hold 2 messages
@@ -157,7 +157,7 @@ fn test_channel_full() {
 
 #[test]
 fn test_invalid_peer() {
-    let mut nodes: Vec<Flux<u32, (), _>> = create_flux(2, 64, |_, _| {});
+    let mut nodes: Vec<Flux<u32, (), _>> = create_flux(2, 64, 32, |_, _| {});
 
     // Send to non-existent peer
     assert!(matches!(
@@ -182,7 +182,7 @@ fn test_threaded_all_to_all() {
         (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
     let counts_clone: Vec<Arc<AtomicU64>> = response_counts.clone();
 
-    let nodes: Vec<Flux<u64, usize, _>> = create_flux(n, 2048, move |node_idx: &mut usize, _: u64| {
+    let nodes: Vec<Flux<u64, usize, _>> = create_flux(n, 2048, 256, move |node_idx: &mut usize, _: u64| {
         counts_clone[*node_idx].fetch_add(1, Ordering::Relaxed);
     });
 
@@ -254,6 +254,7 @@ fn test_simple_ping_pong() {
     let mut nodes: Vec<Flux<u64, u64, _>> = create_flux(
         2,
         64,
+        32,
         move |expected: &mut u64, response: u64| {
             assert_eq!(*expected, response);
             response_clone.fetch_add(1, Ordering::Relaxed);
