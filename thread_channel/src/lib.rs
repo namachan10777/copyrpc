@@ -6,8 +6,10 @@
 
 pub mod flux;
 pub mod mesh;
+pub mod peer_channel;
 pub mod spsc;
-pub(crate) mod spsc_rpc;
+pub mod spsc_lamport;
+pub mod spsc_rpc;
 
 pub(crate) mod mpsc;
 
