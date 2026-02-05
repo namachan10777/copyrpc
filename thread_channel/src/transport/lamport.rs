@@ -325,10 +325,15 @@ impl<Req: Serial + Send, Resp: Serial + Send> TransportEndpoint<Req, Resp>
     }
 
     #[inline]
-    fn poll(&mut self) -> Option<(u64, Resp)> {
+    fn sync(&mut self) {
         // Sync all channels: publish our calls/responses, free slots for peer
         self.sync_call();
         self.sync_recv();
+    }
+
+    #[inline]
+    fn try_recv_response(&mut self) -> Option<(u64, Resp)> {
+        // No sync - call sync() first
         self.resp_rx.recv().map(|resp| {
             self.inflight = self.inflight.saturating_sub(1);
             (resp.token, resp.data)
@@ -337,7 +342,7 @@ impl<Req: Serial + Send, Resp: Serial + Send> TransportEndpoint<Req, Resp>
 
     #[inline]
     fn recv(&mut self) -> Option<(u64, Req)> {
-        // No sync here - poll() handles all synchronization
+        // No sync - call sync() first
         self.call_rx.recv().map(|req| {
             let token = self.recv_count;
             self.recv_count += 1;
@@ -567,9 +572,9 @@ mod tests {
         assert_eq!(token0, 0);
         assert_eq!(token1, 1);
 
-        // poll() performs sync, making calls visible to peer
-        endpoint_a.poll();
-        endpoint_b.poll(); // B needs to poll to see A's calls
+        // sync() makes calls visible to peer
+        endpoint_a.sync();
+        endpoint_b.sync();
 
         // Endpoint B receives requests
         let (t0, req0) = endpoint_b.recv().unwrap();
@@ -586,19 +591,20 @@ mod tests {
         endpoint_b.reply(t0, req0 + 1000).unwrap();
         endpoint_b.reply(t1, req1 + 1000).unwrap();
 
-        // poll() performs sync, making responses visible to peer
-        endpoint_b.poll();
+        // sync() makes responses visible to peer
+        endpoint_b.sync();
 
-        // Endpoint A receives responses (poll performs sync)
-        let (rt0, resp0) = endpoint_a.poll().unwrap();
+        // Endpoint A receives responses
+        endpoint_a.sync();
+        let (rt0, resp0) = endpoint_a.try_recv_response().unwrap();
         assert_eq!(rt0, 0);
         assert_eq!(resp0, 1100);
 
-        let (rt1, resp1) = endpoint_a.poll().unwrap();
+        let (rt1, resp1) = endpoint_a.try_recv_response().unwrap();
         assert_eq!(rt1, 1);
         assert_eq!(resp1, 1200);
 
-        assert!(endpoint_a.poll().is_none());
+        assert!(endpoint_a.try_recv_response().is_none());
     }
 
     #[test]
@@ -609,9 +615,9 @@ mod tests {
         let token_a = endpoint_a.call(100).unwrap();
         let token_b = endpoint_b.call(200).unwrap();
 
-        // poll() syncs to make calls visible
-        endpoint_a.poll();
-        endpoint_b.poll();
+        // sync() makes calls visible
+        endpoint_a.sync();
+        endpoint_b.sync();
 
         // A receives B's call
         let (t, req) = endpoint_a.recv().unwrap();
@@ -623,16 +629,16 @@ mod tests {
         assert_eq!(req, 100);
         endpoint_b.reply(t, 101).unwrap();
 
-        // poll() syncs to make responses visible and receives them
-        // First poll syncs A's reply, but B's reply not yet visible
-        assert!(endpoint_a.poll().is_none());
-        // B's poll makes B's reply visible AND receives A's reply
-        let (t, resp) = endpoint_b.poll().unwrap();
+        // sync() makes responses visible
+        endpoint_a.sync();
+        endpoint_b.sync();
+
+        // Now both can receive responses
+        let (t, resp) = endpoint_b.try_recv_response().unwrap();
         assert_eq!(t, token_b);
         assert_eq!(resp, 201);
 
-        // Now A can receive B's reply
-        let (t, resp) = endpoint_a.poll().unwrap();
+        let (t, resp) = endpoint_a.try_recv_response().unwrap();
         assert_eq!(t, token_a);
         assert_eq!(resp, 101);
     }
@@ -652,8 +658,8 @@ mod tests {
             let token = endpoint_a.call(i).unwrap();
             assert_eq!(token, i as u64);
         }
-        endpoint_a.poll(); // sync to make calls visible
-        endpoint_b.poll(); // B needs to poll to see A's calls
+        endpoint_a.sync();
+        endpoint_b.sync();
 
         for i in 0..10 {
             let (token, value) = endpoint_b.recv().unwrap();
@@ -661,7 +667,7 @@ mod tests {
             assert_eq!(value, i);
             endpoint_b.reply(token, value).unwrap();
         }
-        endpoint_b.poll(); // sync to make responses visible to A
+        endpoint_b.sync();
 
         // After wrap, tokens continue increasing
         for i in 10..20 {
@@ -670,8 +676,9 @@ mod tests {
         }
 
         // Receive responses from first batch
+        endpoint_a.sync();
         for i in 0..10 {
-            let (token, resp) = endpoint_a.poll().unwrap();
+            let (token, resp) = endpoint_a.try_recv_response().unwrap();
             assert_eq!(token, i as u64);
             assert_eq!(resp, i);
         }
@@ -691,15 +698,15 @@ mod tests {
         let handle = thread::spawn(move || {
             let mut count = 0u64;
             while !stop2.load(Ordering::Relaxed) {
-                // poll() does sync - makes peer's calls visible and our responses visible
-                endpoint_b.poll();
+                // sync() makes peer's calls visible and our responses visible
+                endpoint_b.sync();
                 if let Some((token, data)) = endpoint_b.recv() {
                     endpoint_b.reply(token, data + 1000).unwrap();
                     count += 1;
                 }
             }
             // Drain remaining
-            endpoint_b.poll();
+            endpoint_b.sync();
             while let Some((token, data)) = endpoint_b.recv() {
                 endpoint_b.reply(token, data + 1000).unwrap();
                 count += 1;
@@ -721,8 +728,9 @@ mod tests {
                 }
             }
 
-            // Receive responses (poll does sync automatically)
-            while let Some((token, resp)) = endpoint_a.poll() {
+            // Receive responses
+            endpoint_a.sync();
+            while let Some((token, resp)) = endpoint_a.try_recv_response() {
                 assert_eq!(token, received);
                 assert_eq!(resp, received + 1000);
                 received += 1;

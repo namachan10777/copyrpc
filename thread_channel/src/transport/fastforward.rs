@@ -416,7 +416,12 @@ impl<Req: Serial + Send, Resp: Serial + Send> TransportEndpoint<Req, Resp>
     }
 
     #[inline]
-    fn poll(&mut self) -> Option<(u64, Resp)> {
+    fn sync(&mut self) {
+        // No-op for FastForward: validity flags provide immediate visibility
+    }
+
+    #[inline]
+    fn try_recv_response(&mut self) -> Option<(u64, Resp)> {
         self.resp_rx.recv().map(|resp| {
             self.inflight = self.inflight.saturating_sub(1);
             (resp.token, resp.data)
@@ -797,15 +802,16 @@ mod tests {
         endpoint_b.reply(t1, req1 + 1000).unwrap();
 
         // Endpoint A receives responses
-        let (rt0, resp0) = endpoint_a.poll().unwrap();
+        endpoint_a.sync();
+        let (rt0, resp0) = endpoint_a.try_recv_response().unwrap();
         assert_eq!(rt0, 0);
         assert_eq!(resp0, 1100);
 
-        let (rt1, resp1) = endpoint_a.poll().unwrap();
+        let (rt1, resp1) = endpoint_a.try_recv_response().unwrap();
         assert_eq!(rt1, 1);
         assert_eq!(resp1, 1200);
 
-        assert!(endpoint_a.poll().is_none());
+        assert!(endpoint_a.try_recv_response().is_none());
     }
 
     #[test]
@@ -827,11 +833,13 @@ mod tests {
         endpoint_b.reply(t, 101).unwrap();
 
         // Both receive responses
-        let (t, resp) = endpoint_a.poll().unwrap();
+        endpoint_a.sync();
+        let (t, resp) = endpoint_a.try_recv_response().unwrap();
         assert_eq!(t, token_a);
         assert_eq!(resp, 101);
 
-        let (t, resp) = endpoint_b.poll().unwrap();
+        endpoint_b.sync();
+        let (t, resp) = endpoint_b.try_recv_response().unwrap();
         assert_eq!(t, token_b);
         assert_eq!(resp, 201);
     }
@@ -866,8 +874,9 @@ mod tests {
         }
 
         // Receive responses from first batch
+        endpoint_a.sync();
         for i in 0..10 {
-            let (token, resp) = endpoint_a.poll().unwrap();
+            let (token, resp) = endpoint_a.try_recv_response().unwrap();
             assert_eq!(token, i as u64);
             assert_eq!(resp, i);
         }
@@ -915,7 +924,8 @@ mod tests {
             }
 
             // Receive responses
-            while let Some((token, resp)) = endpoint_a.poll() {
+            endpoint_a.sync();
+            while let Some((token, resp)) = endpoint_a.try_recv_response() {
                 assert_eq!(token, received);
                 assert_eq!(resp, received + 1000);
                 received += 1;

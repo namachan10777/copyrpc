@@ -438,7 +438,12 @@ impl<Req: Serial + Send, Resp: Serial + Send> TransportEndpoint<Req, Resp>
     }
 
     #[inline]
-    fn poll(&mut self) -> Option<(u64, Resp)> {
+    fn sync(&mut self) {
+        // No-op for Onesided: validity flags provide immediate visibility
+    }
+
+    #[inline]
+    fn try_recv_response(&mut self) -> Option<(u64, Resp)> {
         // Use recv_no_idx() since we don't need the slot index for responses
         self.resp_rx.recv_no_idx().map(|resp| {
             self.inflight = self.inflight.saturating_sub(1);
@@ -679,15 +684,16 @@ mod tests {
         endpoint_b.reply(t1, req1 + 1000).unwrap();
 
         // Endpoint A receives responses
-        let (rt0, resp0) = endpoint_a.poll().unwrap();
+        endpoint_a.sync();
+        let (rt0, resp0) = endpoint_a.try_recv_response().unwrap();
         assert_eq!(rt0, 0);
         assert_eq!(resp0, 1100);
 
-        let (rt1, resp1) = endpoint_a.poll().unwrap();
+        let (rt1, resp1) = endpoint_a.try_recv_response().unwrap();
         assert_eq!(rt1, 1);
         assert_eq!(resp1, 1200);
 
-        assert!(endpoint_a.poll().is_none());
+        assert!(endpoint_a.try_recv_response().is_none());
     }
 
     #[test]
@@ -709,11 +715,13 @@ mod tests {
         endpoint_b.reply(t, 101).unwrap();
 
         // Both receive responses
-        let (t, resp) = endpoint_a.poll().unwrap();
+        endpoint_a.sync();
+        let (t, resp) = endpoint_a.try_recv_response().unwrap();
         assert_eq!(t, token_a);
         assert_eq!(resp, 101);
 
-        let (t, resp) = endpoint_b.poll().unwrap();
+        endpoint_b.sync();
+        let (t, resp) = endpoint_b.try_recv_response().unwrap();
         assert_eq!(t, token_b);
         assert_eq!(resp, 201);
     }
@@ -749,8 +757,9 @@ mod tests {
             }
 
             // Endpoint A receives responses
+            endpoint_a.sync();
             for i in 0..4u32 {
-                let (token, resp) = endpoint_a.poll().unwrap();
+                let (token, resp) = endpoint_a.try_recv_response().unwrap();
                 let expected_token = (round * 4 + i) as u64 % 8;
                 assert_eq!(token, expected_token);
                 assert_eq!(resp, round * 4 + i + 1000);
@@ -801,7 +810,8 @@ mod tests {
             }
 
             // Receive responses
-            while let Some((_token, resp)) = endpoint_a.poll() {
+            endpoint_a.sync();
+            while let Some((_token, resp)) = endpoint_a.try_recv_response() {
                 // Note: responses may not be in order due to batching
                 assert!(resp >= 1000);
                 received += 1;

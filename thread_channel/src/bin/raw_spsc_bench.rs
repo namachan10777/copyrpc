@@ -61,7 +61,9 @@ fn run_bench<Tr: Transport>(duration_secs: u64) {
         barrier2.wait();
         let mut count = 0u64;
         while !stop2.load(Ordering::Relaxed) {
-            // Receive request
+            // sync() makes peer's calls visible, makes our replies visible
+            endpoint_b.sync();
+            // Receive requests and reply
             while let Some((token, data)) = endpoint_b.recv() {
                 // Send response with same token
                 loop {
@@ -95,14 +97,16 @@ fn run_bench<Tr: Transport>(duration_secs: u64) {
         }
 
         // Receive responses
-        while let Some(_) = endpoint_a.poll() {
+        endpoint_a.sync();
+        while let Some(_) = endpoint_a.try_recv_response() {
             received += 1;
         }
     }
 
     // Drain remaining
     while received < sent {
-        while let Some(_) = endpoint_a.poll() {
+        endpoint_a.sync();
+        while let Some(_) = endpoint_a.try_recv_response() {
             received += 1;
         }
         std::hint::spin_loop();

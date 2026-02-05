@@ -43,30 +43,34 @@ impl<T: std::fmt::Debug> std::error::Error for TransportError<T> {}
 ///
 /// Each endpoint can both send and receive requests/responses:
 /// - `call()` sends a request and returns a token for response matching
-/// - `poll()` receives responses to previous calls
+/// - `sync()` synchronizes channel state (required before recv/try_recv_response for Lamport)
+/// - `try_recv_response()` receives responses to previous calls
 /// - `recv()` receives requests from the peer
 /// - `reply()` sends a response for a received request
-///
-/// For transports with batched synchronization (like Lamport), sync is performed
-/// automatically at appropriate times (typically in poll/recv).
 pub trait TransportEndpoint<Req: Serial + Send, Resp: Serial + Send>: Send {
     /// Sends a request and returns a token for response matching.
     ///
-    /// The token will be included in the response when `poll()` returns.
     /// Returns `InflightExceeded` if the inflight limit has been reached.
     fn call(&mut self, req: Req) -> Result<u64, TransportError<Req>>;
 
-    /// Receives a response if available.
+    /// Synchronizes channel state.
     ///
-    /// Returns `Some((token, response))` where token matches the one from `call()`.
-    /// For batched transports, this also synchronizes state.
-    /// This decrements the inflight count.
-    fn poll(&mut self) -> Option<(u64, Resp)>;
+    /// For Lamport-style transports, this performs atomic operations to make
+    /// pending messages visible. Call this once before draining responses/requests.
+    /// For FastForward/Onesided, this is a no-op.
+    fn sync(&mut self);
 
-    /// Receives a request if available.
+    /// Returns the next response without synchronizing.
     ///
+    /// Call `sync()` first to ensure responses are visible.
+    /// Returns `Some((token, response))` where token matches the one from `call()`.
+    /// This decrements the inflight count.
+    fn try_recv_response(&mut self) -> Option<(u64, Resp)>;
+
+    /// Returns the next request without synchronizing.
+    ///
+    /// Call `sync()` first to ensure requests are visible.
     /// Returns `Some((token, request))`. The token must be passed to `reply()`.
-    /// For batched transports, this also synchronizes state.
     fn recv(&mut self) -> Option<(u64, Req)>;
 
     /// Sends a response for the given token.
@@ -124,8 +128,8 @@ unsafe impl<T: Serial> Serial for Response<T> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::Duration;
 
@@ -146,14 +150,14 @@ mod tests {
         let handle = thread::spawn(move || {
             let mut count = 0usize;
             while count < iterations && !stop2.load(Ordering::Relaxed) {
-                // poll() does sync for Lamport
-                endpoint_b.poll();
+                // sync() makes messages visible
+                endpoint_b.sync();
                 if let Some((token, data)) = endpoint_b.recv() {
                     loop {
                         if endpoint_b.reply(token, data + 1000).is_ok() {
                             count += 1;
                             // Final sync after reply to make response visible
-                            endpoint_b.poll();
+                            endpoint_b.sync();
                             break;
                         }
                         if stop2.load(Ordering::Relaxed) {
@@ -189,8 +193,9 @@ mod tests {
                 }
             }
 
-            // Receive responses (don't check token value, as it may wrap around)
-            while let Some((_token, resp)) = endpoint_a.poll() {
+            // Receive responses
+            endpoint_a.sync();
+            while let Some((_token, resp)) = endpoint_a.try_recv_response() {
                 // Response should be data + 1000
                 assert!(resp >= 1000);
                 received += 1;

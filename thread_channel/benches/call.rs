@@ -48,12 +48,9 @@ fn run_pingpong_bench<Tr: Transport>(b: &mut criterion::Bencher) {
 
     let handle = thread::spawn(move || {
         while !stop2.load(Ordering::Relaxed) {
-            // poll() does sync for Lamport: makes peer's calls visible, our replies visible
-            // Single poll() handles both directions - this is the pipeline model
-            if let Some((token, data)) = {
-                endpoint_b.poll();
-                endpoint_b.recv()
-            } {
+            // sync() makes peer's calls visible, our replies visible
+            endpoint_b.sync();
+            if let Some((token, data)) = endpoint_b.recv() {
                 loop {
                     if endpoint_b.reply(token, data).is_ok() {
                         break;
@@ -69,7 +66,8 @@ fn run_pingpong_bench<Tr: Transport>(b: &mut criterion::Bencher) {
     b.iter(|| {
         let token = endpoint_a.call(black_box(payload)).unwrap();
         loop {
-            if let Some((t, data)) = endpoint_a.poll() {
+            endpoint_a.sync();
+            if let Some((t, data)) = endpoint_a.try_recv_response() {
                 debug_assert_eq!(t, token);
                 black_box(data);
                 break;
@@ -114,12 +112,12 @@ fn run_throughput_bench<Tr: Transport>(b: &mut criterion::Bencher, requests: usi
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);
 
-    // Responder thread: poll() syncs both recv and send, then process requests
+    // Responder thread: sync() then process all requests
     let handle = thread::spawn(move || {
         while !stop2.load(Ordering::Relaxed) {
-            // poll() syncs: makes peer's calls visible, makes our replies visible
-            endpoint_b.poll();
-            // recv() as much as possible and reply() without polling
+            // sync() makes peer's calls visible, makes our replies visible
+            endpoint_b.sync();
+            // recv() as much as possible and reply() without syncing
             while let Some((token, data)) = endpoint_b.recv() {
                 while endpoint_b.reply(token, data).is_err() {
                     std::hint::spin_loop();
@@ -147,8 +145,9 @@ fn run_throughput_bench<Tr: Transport>(b: &mut criterion::Bencher, requests: usi
                 }
             }
 
-            // poll() to receive responses and free up inflight slots
-            while let Some((_, data)) = endpoint_a.poll() {
+            // sync() then receive responses to free up inflight slots
+            endpoint_a.sync();
+            while let Some((_, data)) = endpoint_a.try_recv_response() {
                 black_box(data);
                 received += 1;
                 inflight -= 1;
@@ -157,7 +156,8 @@ fn run_throughput_bench<Tr: Transport>(b: &mut criterion::Bencher, requests: usi
 
         // Drain: receive remaining responses
         while received < requests {
-            if let Some((_, data)) = endpoint_a.poll() {
+            endpoint_a.sync();
+            if let Some((_, data)) = endpoint_a.try_recv_response() {
                 black_box(data);
                 received += 1;
             }

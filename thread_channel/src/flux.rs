@@ -216,6 +216,9 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport> Flux<T, U, F, Tr> 
             let channel = &mut self.channels[idx];
             let peer_id = channel.peer_id;
 
+            // Sync once per channel (for Lamport, this does 4 atomic ops)
+            channel.endpoint.sync();
+
             // Receive requests (from peer's calls)
             while let Some((token, data)) = channel.endpoint.recv() {
                 self.recv_queue.push_back(RecvRequest {
@@ -225,8 +228,8 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport> Flux<T, U, F, Tr> 
                 });
             }
 
-            // Receive responses (to our calls)
-            while let Some((token, data)) = channel.endpoint.poll() {
+            // Receive responses (to our calls) - no sync needed, already done above
+            while let Some((token, data)) = channel.endpoint.try_recv_response() {
                 // Decrement inflight count
                 channel.inflight_count -= 1;
 
