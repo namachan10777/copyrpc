@@ -19,8 +19,8 @@ pub use flux::{create_flux, create_flux_with_transport, Flux, RecvHandle};
 pub use mesh::{create_mesh, Mesh};
 pub use spsc::Serial;
 pub use transport::{
-    FastForwardTransport, LamportTransport, OnesidedTransport, Transport, TransportError,
-    TransportReceiver, TransportSender,
+    FastForwardTransport, LamportTransport, OnesidedTransport, Transport, TransportEndpoint,
+    TransportError,
 };
 
 /// A received message, distinguishing between notifications, requests, and responses.

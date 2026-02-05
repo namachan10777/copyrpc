@@ -17,32 +17,16 @@ use std::collections::VecDeque;
 use std::marker::PhantomData;
 
 use crate::spsc::Serial;
-use crate::transport::{OnesidedTransport, Transport, TransportError, TransportReceiver, TransportSender};
+use crate::transport::{OnesidedTransport, Transport, TransportEndpoint, TransportError};
 use crate::SendError;
-
-/// Response message containing token.
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct Response<T: Serial> {
-    token: u64,
-    data: T,
-}
-
-unsafe impl<T: Serial> Serial for Response<T> {}
 
 /// A bidirectional channel to a single peer.
 ///
-/// Uses the specified transport for both requests and responses.
+/// Uses a single TransportEndpoint for all RPC communication.
 struct FluxChannel<T: Serial + Send, Tr: Transport> {
     peer_id: usize,
-    /// Request sender
-    req_tx: Tr::Sender<T>,
-    /// Request receiver
-    req_rx: Tr::Receiver<T>,
-    /// Response sender
-    resp_tx: Tr::Sender<Response<T>>,
-    /// Response receiver
-    resp_rx: Tr::Receiver<Response<T>>,
+    /// Bidirectional endpoint for this peer
+    endpoint: Tr::Endpoint<T, T>,
     /// Current inflight count for this channel
     inflight_count: usize,
 }
@@ -83,33 +67,25 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport> RecvHandle<'a,
             None => return Err((self, SendError::InvalidPeer(value))),
         };
 
-        let resp = Response {
-            token: self.token,
-            data: value,
-        };
-
-        match self.flux.channels[channel_idx].resp_tx.send(resp) {
-            Ok(_) => {
-                self.flux.channels[channel_idx].resp_tx.sync();
-                Ok(())
-            }
-            Err(TransportError::Full(r)) => Err((
+        match self.flux.channels[channel_idx].endpoint.reply(self.token, value) {
+            Ok(()) => Ok(()),
+            Err(TransportError::Full(v)) => Err((
                 Self {
                     flux: self.flux,
                     from: self.from,
                     token: self.token,
                     data: self.data,
                 },
-                SendError::Full(r.data),
+                SendError::Full(v),
             )),
-            Err(TransportError::Disconnected(r)) => Err((
+            Err(TransportError::Disconnected(v)) => Err((
                 Self {
                     flux: self.flux,
                     from: self.from,
                     token: self.token,
                     data: self.data,
                 },
-                SendError::Disconnected(r.data),
+                SendError::Disconnected(v),
             )),
         }
     }
@@ -129,16 +105,8 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport> RecvHandle<'a,
             }
         };
 
-        let resp = Response {
-            token: self.token,
-            data: value,
-        };
-
-        match self.flux.channels[channel_idx].resp_tx.send(resp) {
-            Ok(_) => {
-                self.flux.channels[channel_idx].resp_tx.sync();
-                true
-            }
+        match self.flux.channels[channel_idx].endpoint.reply(self.token, value) {
+            Ok(()) => true,
             Err(TransportError::Full(_) | TransportError::Disconnected(_)) => {
                 self.flux.recv_queue.push_front(RecvRequest {
                     from: self.from,
@@ -176,11 +144,13 @@ pub struct Flux<T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport = Onesid
 
 impl<T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport> Flux<T, U, F, Tr> {
     /// Returns this node's ID.
+    #[inline]
     pub fn id(&self) -> usize {
         self.id
     }
 
     /// Returns the number of peers (excluding self).
+    #[inline]
     pub fn num_peers(&self) -> usize {
         self.channels.len()
     }
@@ -209,9 +179,8 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport> Flux<T, U, F, Tr> 
             return Err(SendError::Full(value));
         }
 
-        match channel.req_tx.send(value) {
+        match channel.endpoint.call(value) {
             Ok(token) => {
-                channel.req_tx.sync();
                 channel.inflight_count += 1;
                 // Store user_data for this token (using token % capacity for indexing)
                 let slot = (token as usize) % self.channel_capacity;
@@ -241,28 +210,26 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport> Flux<T, U, F, Tr> 
             let channel = &mut self.channels[idx];
             let peer_id = channel.peer_id;
 
-            // Receive requests
-            while let Some((token, data)) = channel.req_rx.recv() {
+            // Receive requests (from peer's calls)
+            while let Some((token, data)) = channel.endpoint.recv() {
                 self.recv_queue.push_back(RecvRequest {
                     from: peer_id,
                     token,
                     data,
                 });
             }
-            channel.req_rx.sync();
 
-            // Receive responses
-            while let Some((_, resp)) = channel.resp_rx.recv() {
+            // Receive responses (to our calls)
+            while let Some((token, data)) = channel.endpoint.poll() {
                 // Decrement inflight count
                 channel.inflight_count -= 1;
 
                 // Get user_data and invoke callback
-                let slot = (resp.token as usize) % self.channel_capacity;
+                let slot = (token as usize) % self.channel_capacity;
                 if let Some(mut user_data) = self.pending_calls[idx][slot].take() {
-                    (self.on_response)(&mut user_data, resp.data);
+                    (self.on_response)(&mut user_data, data);
                 }
             }
-            channel.resp_rx.sync();
         }
     }
 
@@ -341,42 +308,21 @@ where
         "inflight_max must be less than capacity"
     );
 
-    // Create all channel pairs using the specified transport
-    struct ChannelPair<T: Serial + Send, Tr: Transport> {
-        req_tx: Tr::Sender<T>,
-        req_rx: Tr::Receiver<T>,
-        resp_tx: Tr::Sender<Response<T>>,
-        resp_rx: Tr::Receiver<Response<T>>,
-    }
-
-    let mut channel_pairs: Vec<Vec<Option<ChannelPair<T, Tr>>>> =
+    // Store endpoints separately for each (i, j) directed pair
+    // channel_endpoints[i][j] = Some(endpoint) means:
+    //   - endpoint: node i uses this to communicate with node j
+    let mut channel_endpoints: Vec<Vec<Option<Tr::Endpoint<T, T>>>> =
         (0..n).map(|_| (0..n).map(|_| None).collect()).collect();
 
     for i in 0..n {
         for j in (i + 1)..n {
-            // Channels from i to j
-            let (req_tx_i_j, req_rx_i_j) = Tr::channel(capacity);
-            let (resp_tx_i_j, resp_rx_i_j) = Tr::channel(capacity);
+            // Create bidirectional channel between i and j
+            let (endpoint_i, endpoint_j) = Tr::channel(capacity);
 
-            // Channels from j to i
-            let (req_tx_j_i, req_rx_j_i) = Tr::channel(capacity);
-            let (resp_tx_j_i, resp_rx_j_i) = Tr::channel(capacity);
-
-            // i's view: send requests to j, receive responses from j
-            channel_pairs[i][j] = Some(ChannelPair {
-                req_tx: req_tx_i_j,
-                req_rx: req_rx_j_i,
-                resp_tx: resp_tx_j_i,
-                resp_rx: resp_rx_i_j,
-            });
-
-            // j's view: send requests to i, receive responses from i
-            channel_pairs[j][i] = Some(ChannelPair {
-                req_tx: req_tx_j_i,
-                req_rx: req_rx_i_j,
-                resp_tx: resp_tx_i_j,
-                resp_rx: resp_rx_j_i,
-            });
+            // Node i's endpoint for peer j
+            channel_endpoints[i][j] = Some(endpoint_i);
+            // Node j's endpoint for peer i
+            channel_endpoints[j][i] = Some(endpoint_j);
         }
     }
 
@@ -392,18 +338,15 @@ where
                 continue;
             }
 
-            if let Some(pair) = channel_pairs[i][j].take() {
-                channels.push(FluxChannel {
-                    peer_id: j,
-                    req_tx: pair.req_tx,
-                    req_rx: pair.req_rx,
-                    resp_tx: pair.resp_tx,
-                    resp_rx: pair.resp_rx,
-                    inflight_count: 0,
-                });
-                // Fixed-size array for pending calls per channel
-                pending_calls.push((0..actual_capacity).map(|_| None).collect());
-            }
+            let endpoint = channel_endpoints[i][j].take().unwrap();
+
+            channels.push(FluxChannel {
+                peer_id: j,
+                endpoint,
+                inflight_count: 0,
+            });
+            // Fixed-size array for pending calls per channel
+            pending_calls.push((0..actual_capacity).map(|_| None).collect());
         }
 
         nodes.push(Flux {

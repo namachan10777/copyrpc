@@ -1,12 +1,14 @@
-//! Transport abstraction for SPSC channel implementations.
+//! Transport abstraction for bidirectional RPC channels.
 //!
-//! This module provides a unified interface for different SPSC implementations:
+//! This module provides a unified interface for different SPSC-based RPC implementations:
 //! - `FastForwardTransport`: Based on FastForward algorithm with validity flags
-//! - `OnesidedTransport`: Producer-only write pattern (based on spsc_rpc)
+//! - `OnesidedTransport`: Producer-only write pattern for requests (based on spsc_rpc)
 //! - `LamportTransport`: Lamport-style with batched index synchronization
 //!
-//! Each transport provides `TransportSender` and `TransportReceiver` with
-//! consistent APIs for sending values and receiving (token, value) pairs.
+//! Transport abstracts a bidirectional RPC channel where a single endpoint can:
+//! - Send requests via `call()` and receive responses via `poll()`
+//! - Receive requests via `recv()` and send responses via `reply()`
+//! - Tokens flow from one endpoint to the other for request/response matching
 
 pub mod fastforward;
 pub mod lamport;
@@ -19,7 +21,7 @@ use crate::spsc::Serial;
 pub enum TransportError<T> {
     /// The channel is full.
     Full(T),
-    /// The receiver has disconnected.
+    /// The peer has disconnected.
     Disconnected(T),
 }
 
@@ -27,63 +29,81 @@ impl<T> std::fmt::Display for TransportError<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TransportError::Full(_) => write!(f, "channel is full"),
-            TransportError::Disconnected(_) => write!(f, "receiver has disconnected"),
+            TransportError::Disconnected(_) => write!(f, "peer has disconnected"),
         }
     }
 }
 
 impl<T: std::fmt::Debug> std::error::Error for TransportError<T> {}
 
-/// Sender half of a transport channel.
+/// A bidirectional RPC endpoint.
 ///
-/// Provides methods to send values and optionally synchronize (for batched transports).
-pub trait TransportSender<T: Serial + Send>: Send {
-    /// Sends a value and returns a token for response matching.
+/// Each endpoint can both send and receive requests/responses:
+/// - `call()` sends a request and returns a token for response matching
+/// - `poll()` receives responses to previous calls
+/// - `recv()` receives requests from the peer
+/// - `reply()` sends a response for a received request
+///
+/// For transports with batched synchronization (like Lamport), sync is performed
+/// automatically at appropriate times (typically in poll/recv).
+pub trait TransportEndpoint<Req: Serial + Send, Resp: Serial + Send>: Send {
+    /// Sends a request and returns a token for response matching.
     ///
-    /// The token can be used to correlate responses with requests.
-    fn send(&mut self, value: T) -> Result<u64, TransportError<T>>;
+    /// The token will be included in the response when `poll()` returns.
+    fn call(&mut self, req: Req) -> Result<u64, TransportError<Req>>;
 
-    /// Synchronizes state (for batched transports like Lamport).
+    /// Receives a response if available.
     ///
-    /// For non-batched transports, this is a no-op.
-    fn sync(&mut self) {}
+    /// Returns `Some((token, response))` where token matches the one from `call()`.
+    /// For batched transports, this also synchronizes state.
+    fn poll(&mut self) -> Option<(u64, Resp)>;
+
+    /// Receives a request if available.
+    ///
+    /// Returns `Some((token, request))`. The token must be passed to `reply()`.
+    /// For batched transports, this also synchronizes state.
+    fn recv(&mut self) -> Option<(u64, Req)>;
+
+    /// Sends a response for the given token.
+    ///
+    /// The token should be the one received from `recv()`.
+    fn reply(&mut self, token: u64, resp: Resp) -> Result<(), TransportError<Resp>>;
 
     /// Returns the capacity of the channel.
     fn capacity(&self) -> usize;
 }
 
-/// Receiver half of a transport channel.
+/// Factory trait for creating bidirectional RPC transport channels.
 ///
-/// Provides methods to receive (token, value) pairs and optionally synchronize.
-pub trait TransportReceiver<T: Serial + Send>: Send {
-    /// Receives a (token, value) pair if available.
-    ///
-    /// The token corresponds to the one returned by the sender's `send()`.
-    fn recv(&mut self) -> Option<(u64, T)>;
-
-    /// Synchronizes state (for batched transports like Lamport).
-    ///
-    /// For non-batched transports, this is a no-op.
-    fn sync(&mut self) {}
-}
-
-/// Factory trait for creating transport channels.
-///
-/// Uses generic associated types (GAT) to allow different sender/receiver
-/// types for different transport implementations.
+/// Creates pairs of connected endpoints where each endpoint can both
+/// send and receive requests/responses.
 pub trait Transport: Send + Sync + 'static {
-    /// The sender type for this transport.
-    type Sender<T: Serial + Send>: TransportSender<T>;
-    /// The receiver type for this transport.
-    type Receiver<T: Serial + Send>: TransportReceiver<T>;
+    /// The endpoint type for this transport.
+    type Endpoint<Req: Serial + Send, Resp: Serial + Send>: TransportEndpoint<Req, Resp>;
 
-    /// Creates a new channel pair with the given capacity.
+    /// Creates a new bidirectional RPC channel pair with the given capacity.
+    ///
+    /// Returns two connected endpoints. Each endpoint can:
+    /// - Call the peer via `call()` and receive responses via `poll()`
+    /// - Receive calls from the peer via `recv()` and respond via `reply()`
     ///
     /// The actual capacity may be rounded up to a power of 2.
-    fn channel<T: Serial + Send>(capacity: usize) -> (Self::Sender<T>, Self::Receiver<T>);
+    fn channel<Req: Serial + Send, Resp: Serial + Send>(
+        capacity: usize,
+    ) -> (Self::Endpoint<Req, Resp>, Self::Endpoint<Req, Resp>);
 }
 
 // Re-export transport types
 pub use fastforward::FastForwardTransport;
 pub use lamport::LamportTransport;
 pub use onesided::OnesidedTransport;
+
+/// Response wrapper that carries the token.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub(crate) struct Response<T: Serial> {
+    pub token: u64,
+    pub data: T,
+}
+
+unsafe impl<T: Serial> Serial for Response<T> {}
