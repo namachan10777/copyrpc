@@ -1,14 +1,19 @@
 //! Onesided (producer-only write) transport implementation.
 //!
-//! This transport uses spsc_rpc for the request channel (producer-only write)
-//! and spsc (FastForward) for the response channel.
+//! This transport uses spsc_rpc for both request and response channels,
+//! achieving producer-only write semantics for all operations.
 //!
 //! Token: uses slot_idx from spsc_rpc (0 to capacity-1, wraps around).
 //!
 //! Flow control: The slot_idx flows from caller → callee → caller.
 //! When callee sends a response with slot_idx, caller knows that slot is consumed.
+//!
+//! Store/Load characteristics:
+//! - call(): producer stores to request channel
+//! - recv(): consumer loads from request channel (read-only)
+//! - reply(): producer stores to response channel
+//! - poll(): consumer loads from response channel (read-only)
 
-use crate::spsc;
 use crate::spsc::Serial;
 use crate::spsc_rpc;
 
@@ -18,18 +23,20 @@ use super::{Response, Transport, TransportEndpoint, TransportError};
 ///
 /// Each endpoint contains:
 /// - Outgoing request channel using spsc_rpc (producer-only write)
-/// - Incoming response channel using spsc (FastForward)
+/// - Incoming response channel using spsc_rpc (producer-only write, consumer read-only)
 /// - Incoming request channel using spsc_rpc (producer-only write)
-/// - Outgoing response channel using spsc (FastForward)
+/// - Outgoing response channel using spsc_rpc (producer-only write, consumer read-only)
+///
+/// All channels use producer-only write semantics, ensuring optimal cache behavior.
 pub struct OnesidedEndpoint<Req: Serial + Send, Resp: Serial + Send> {
     /// Channel for sending requests (this endpoint → peer) using spsc_rpc
     call_tx: spsc_rpc::Sender<Req>,
-    /// Channel for receiving responses (peer → this endpoint) using spsc
-    resp_rx: spsc::Receiver<Response<Resp>>,
+    /// Channel for receiving responses (peer → this endpoint) using spsc_rpc
+    resp_rx: spsc_rpc::Receiver<Response<Resp>>,
     /// Channel for receiving requests (peer → this endpoint) using spsc_rpc
     call_rx: spsc_rpc::Receiver<Req>,
-    /// Channel for sending responses (this endpoint → peer) using spsc
-    resp_tx: spsc::Sender<Response<Resp>>,
+    /// Channel for sending responses (this endpoint → peer) using spsc_rpc
+    resp_tx: spsc_rpc::Sender<Response<Resp>>,
 }
 
 impl<Req: Serial + Send, Resp: Serial + Send> TransportEndpoint<Req, Resp>
@@ -45,7 +52,8 @@ impl<Req: Serial + Send, Resp: Serial + Send> TransportEndpoint<Req, Resp>
 
     #[inline]
     fn poll(&mut self) -> Option<(u64, Resp)> {
-        self.resp_rx.recv().map(|resp| (resp.token, resp.data))
+        // Use recv_no_idx() since we don't need the slot index for responses
+        self.resp_rx.recv_no_idx().map(|resp| (resp.token, resp.data))
     }
 
     #[inline]
@@ -56,9 +64,10 @@ impl<Req: Serial + Send, Resp: Serial + Send> TransportEndpoint<Req, Resp>
     #[inline]
     fn reply(&mut self, token: u64, resp: Resp) -> Result<(), TransportError<Resp>> {
         let response = Response { token, data: resp };
-        match self.resp_tx.send(response) {
+        // Use send_no_idx() since we don't need slot tracking for responses
+        match self.resp_tx.send_no_idx(response) {
             Ok(()) => Ok(()),
-            Err(spsc::SendError(r)) => Err(TransportError::Full(r.data)),
+            Err(spsc_rpc::SendError(r)) => Err(TransportError::Full(r.data)),
         }
     }
 
@@ -70,9 +79,9 @@ impl<Req: Serial + Send, Resp: Serial + Send> TransportEndpoint<Req, Resp>
 
 /// Onesided transport factory.
 ///
-/// Uses spsc_rpc (producer-only write) for requests and spsc (FastForward)
-/// for responses. This is the default transport for Flux, optimized for
-/// RPC patterns where the producer never reads from the request channel.
+/// Uses spsc_rpc (producer-only write) for both requests and responses.
+/// This is the default transport for Flux, optimized for RPC patterns where
+/// all channels have producer-only write and consumer-only read semantics.
 pub struct OnesidedTransport;
 
 impl Transport for OnesidedTransport {
@@ -83,13 +92,13 @@ impl Transport for OnesidedTransport {
     ) -> (Self::Endpoint<Req, Resp>, Self::Endpoint<Req, Resp>) {
         // Endpoint A calls → Endpoint B receives (spsc_rpc)
         let (call_a_to_b_tx, call_a_to_b_rx) = spsc_rpc::channel(capacity);
-        // Endpoint B responds → Endpoint A receives response (spsc)
-        let (resp_b_to_a_tx, resp_b_to_a_rx) = spsc::channel(capacity);
+        // Endpoint B responds → Endpoint A receives response (spsc_rpc)
+        let (resp_b_to_a_tx, resp_b_to_a_rx) = spsc_rpc::channel(capacity);
 
         // Endpoint B calls → Endpoint A receives (spsc_rpc)
         let (call_b_to_a_tx, call_b_to_a_rx) = spsc_rpc::channel(capacity);
-        // Endpoint A responds → Endpoint B receives response (spsc)
-        let (resp_a_to_b_tx, resp_a_to_b_rx) = spsc::channel(capacity);
+        // Endpoint A responds → Endpoint B receives response (spsc_rpc)
+        let (resp_a_to_b_tx, resp_a_to_b_rx) = spsc_rpc::channel(capacity);
 
         (
             OnesidedEndpoint {

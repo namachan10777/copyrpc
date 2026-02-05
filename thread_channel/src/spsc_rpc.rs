@@ -172,6 +172,26 @@ impl<T: Serial> Sender<T> {
     /// so overwriting slots is safe (consumer already read them).
     #[inline]
     pub fn send(&mut self, value: T) -> Result<usize, SendError<T>> {
+        let slot_idx = self.send_inner(value)?;
+        Ok(slot_idx)
+    }
+
+    /// Sends a value through the channel without returning slot index.
+    ///
+    /// This is a convenience method for cases where the slot index is not needed,
+    /// such as response channels in RPC patterns.
+    ///
+    /// # Safety
+    /// Same constraints as `send()` - caller must ensure inflight count does not exceed capacity.
+    #[inline]
+    pub fn send_no_idx(&mut self, value: T) -> Result<(), SendError<T>> {
+        self.send_inner(value)?;
+        Ok(())
+    }
+
+    /// Internal send implementation.
+    #[inline]
+    fn send_inner(&mut self, value: T) -> Result<usize, SendError<T>> {
         let slot_idx = self.head;
         let slot = &self.inner.slots[slot_idx];
 
@@ -257,7 +277,24 @@ impl<T: Serial> Receiver<T> {
     #[inline]
     pub fn recv(&mut self) -> Option<(usize, T)> {
         let slot_idx = self.tail;
-        let slot = &self.inner.slots[slot_idx];
+        self.recv_inner().map(|value| (slot_idx, value))
+    }
+
+    /// Receives a value from the channel without returning slot index.
+    ///
+    /// This is a convenience method for cases where the slot index is not needed,
+    /// such as response channels in RPC patterns.
+    ///
+    /// **This method is READ-ONLY** - it does not write to the channel!
+    #[inline]
+    pub fn recv_no_idx(&mut self) -> Option<T> {
+        self.recv_inner()
+    }
+
+    /// Internal receive implementation.
+    #[inline]
+    fn recv_inner(&mut self) -> Option<T> {
+        let slot = &self.inner.slots[self.tail];
 
         // Check if slot has data (consumer reads)
         if !unsafe { ptr::read_volatile(slot.valid.get()) } {
@@ -275,7 +312,7 @@ impl<T: Serial> Receiver<T> {
         // The producer will invalidate it before writing new data.
         self.tail = (self.tail + 1) & self.mask;
 
-        Some((slot_idx, value))
+        Some(value)
     }
 
     /// Returns true if the sender has disconnected.
