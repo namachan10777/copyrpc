@@ -133,6 +133,8 @@ impl<T: Serial> Sender<T> {
     /// Sends a value through the channel.
     ///
     /// Returns `Ok(())` on success, `Err(SendError(value))` if the channel is full.
+    ///
+    /// NOTE: Call poll() after sending a batch to make items visible to receiver.
     #[inline]
     pub fn send(&mut self, value: T) -> Result<(), SendError<T>> {
         // Check if we have room using cached tail
@@ -153,12 +155,8 @@ impl<T: Serial> Sender<T> {
             ptr::write((*self.inner.buffer[slot].get()).as_mut_ptr(), value);
         }
 
-        // Advance local head
+        // Advance local head (no atomic store here - deferred to poll())
         self.local_head = self.local_head.wrapping_add(1);
-
-        // Publish head immediately (for low latency)
-        // In a batched version, this could be deferred to poll()
-        self.inner.shared_head.store(self.local_head, Ordering::Release);
 
         Ok(())
     }
@@ -195,6 +193,8 @@ impl<T: Serial> Receiver<T> {
     /// Receives a value from the channel if available.
     ///
     /// Returns `Some(value)` if data is available, `None` if empty.
+    ///
+    /// NOTE: Call poll() after receiving a batch to free slots for sender.
     #[inline]
     pub fn recv(&mut self) -> Option<T> {
         // Check if we have items using cached head
@@ -212,19 +212,16 @@ impl<T: Serial> Receiver<T> {
         let slot = self.local_tail & self.mask;
         let value = unsafe { ptr::read((*self.inner.buffer[slot].get()).as_ptr()) };
 
-        // Advance local tail
+        // Advance local tail (no atomic store here - deferred to poll())
         self.local_tail = self.local_tail.wrapping_add(1);
-
-        // Publish tail immediately (for flow control)
-        self.inner.shared_tail.store(self.local_tail, Ordering::Release);
 
         Some(value)
     }
 
     /// Polls to synchronize state.
     ///
-    /// This publishes the current tail to free slots for the sender.
-    /// With immediate publish in recv(), this is a no-op but kept for API consistency.
+    /// Publishes current head (sender) or tail (receiver) to make changes visible.
+    /// Call this after sending/receiving a batch.
     #[inline]
     pub fn poll(&mut self) {
         self.inner.shared_tail.store(self.local_tail, Ordering::Release);
@@ -253,6 +250,7 @@ mod tests {
 
         tx.send(1).unwrap();
         tx.send(2).unwrap();
+        tx.poll();  // Make visible
 
         assert_eq!(rx.recv(), Some(1));
         assert_eq!(rx.recv(), Some(2));
@@ -269,8 +267,10 @@ mod tests {
         // Third should fail (full)
         assert!(tx.send(3).is_err());
 
+        tx.poll();  // Make visible
         // Receive to make room
         assert_eq!(rx.recv(), Some(1));
+        rx.poll();  // Free slot
 
         // Now can send again
         tx.send(3).unwrap();
@@ -306,7 +306,10 @@ mod tests {
             for i in 0..100_000u64 {
                 loop {
                     match tx.send(i) {
-                        Ok(()) => break,
+                        Ok(()) => {
+                            tx.poll();  // Make visible
+                            break;
+                        }
                         Err(_) => std::hint::spin_loop(),
                     }
                 }
@@ -317,6 +320,7 @@ mod tests {
             let mut expected = 0u64;
             while expected < 100_000 {
                 if let Some(v) = rx.recv() {
+                    rx.poll();  // Free slot
                     assert_eq!(v, expected);
                     expected += 1;
                 }
@@ -336,6 +340,7 @@ mod tests {
         tx.send(2).unwrap();
         tx.send(3).unwrap();
         tx.send(4).unwrap();
+        tx.poll();  // Make visible
         assert!(tx.send(5).is_err()); // Should be full
 
         // Consume all
@@ -343,6 +348,7 @@ mod tests {
         assert_eq!(rx.recv(), Some(2));
         assert_eq!(rx.recv(), Some(3));
         assert_eq!(rx.recv(), Some(4));
+        rx.poll();  // Free slots
         assert!(rx.recv().is_none());
 
         // Should be able to send again
@@ -350,6 +356,7 @@ mod tests {
         tx.send(11).unwrap();
         tx.send(12).unwrap();
         tx.send(13).unwrap();
+        tx.poll();  // Make visible
         assert!(tx.send(14).is_err());
 
         assert_eq!(rx.recv(), Some(10));

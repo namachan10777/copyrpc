@@ -1,6 +1,6 @@
 //! SPSC implementation comparison benchmark.
 //!
-//! Compares four SPSC implementations:
+//! Compares four SPSC implementations using call/response (pingpong) pattern:
 //! - Producer-Only Write SPSC (spsc_rpc): Consumer read-only, sentinel pattern
 //! - FastForward SPSC (spsc): Valid flag based, bidirectional writes
 //! - Lamport SPSC (spsc_lamport): Batched index synchronization
@@ -24,12 +24,12 @@ fn pin_to_core(core_id: usize) {
 #[command(name = "spsc_compare")]
 #[command(about = "Compare SPSC implementations")]
 struct Args {
-    /// Number of iterations
-    #[arg(short, long, default_value_t = 10_000_000)]
+    /// Number of iterations (call/response pairs)
+    #[arg(short, long, default_value_t = 1_000_000)]
     iterations: u64,
 
     /// Queue capacity
-    #[arg(short, long, default_value_t = 1024)]
+    #[arg(short, long, default_value_t = 256)]
     capacity: usize,
 
     /// Which implementations to benchmark (all, fastforward, lamport, mpsc, producer-only)
@@ -37,10 +37,10 @@ struct Args {
     target: String,
 
     /// Number of warmup iterations
-    #[arg(short, long, default_value_t = 100_000)]
+    #[arg(short, long, default_value_t = 10_000)]
     warmup: u64,
 
-    /// Max in-flight requests (for producer-only)
+    /// Max in-flight requests
     #[arg(long, default_value_t = 128)]
     inflight: usize,
 
@@ -51,6 +51,10 @@ struct Args {
     /// Receiver CPU core
     #[arg(long, default_value_t = 1)]
     receiver_core: usize,
+
+    /// Benchmark mode: "both", "oneway", "pingpong"
+    #[arg(long, default_value = "both")]
+    mode: String,
 }
 
 /// Throughput benchmark result
@@ -66,175 +70,16 @@ impl BenchResult {
     }
 }
 
-/// Benchmark FastForward SPSC (bidirectional valid flag writes)
-fn bench_fastforward(iterations: u64, capacity: usize, sender_core: usize, receiver_core: usize) -> BenchResult {
-    let (mut tx, mut rx) = thread_channel::spsc::channel::<u64>(capacity);
+/// Benchmark FastForward SPSC with call/response pattern
+fn bench_fastforward(iterations: u64, capacity: usize, inflight_max: usize, sender_core: usize, receiver_core: usize) -> BenchResult {
+    let (mut tx_req, mut rx_req) = thread_channel::spsc::channel::<u64>(capacity);
+    let (mut tx_resp, mut rx_resp) = thread_channel::spsc::channel::<u64>(capacity);
 
     let barrier = Arc::new(Barrier::new(2));
     let barrier_clone = Arc::clone(&barrier);
 
-    // Sender: sends as fast as possible, spin-waits only when full
-    let sender = thread::spawn(move || {
-        pin_to_core(sender_core);
-        barrier_clone.wait();
-        let start = Instant::now();
-
-        let mut i = 0u64;
-        while i < iterations {
-            while i < iterations {
-                match tx.send(i) {
-                    Ok(()) => i += 1,
-                    Err(_) => break,
-                }
-            }
-            if i < iterations {
-                std::hint::spin_loop();
-            }
-        }
-        start.elapsed()
-    });
-
-    // Receiver: receives as fast as possible
-    let receiver = thread::spawn(move || {
-        pin_to_core(receiver_core);
-        barrier.wait();
-
-        let mut received = 0u64;
-        while received < iterations {
-            while let Some(v) = rx.recv() {
-                debug_assert_eq!(v, received);
-                received += 1;
-            }
-            if received < iterations {
-                std::hint::spin_loop();
-            }
-        }
-    });
-
-    let duration = sender.join().unwrap();
-    receiver.join().unwrap();
-
-    BenchResult {
-        name: "FastForward",
-        iterations,
-        duration,
-    }
-}
-
-/// Benchmark Lamport SPSC (batched index synchronization)
-fn bench_lamport(iterations: u64, capacity: usize, sender_core: usize, receiver_core: usize) -> BenchResult {
-    let (mut tx, mut rx) = thread_channel::spsc_lamport::channel::<u64>(capacity);
-
-    let barrier = Arc::new(Barrier::new(2));
-    let barrier_clone = Arc::clone(&barrier);
-
-    // Sender: sends as fast as possible, spin-waits only when full
-    let sender = thread::spawn(move || {
-        pin_to_core(sender_core);
-        barrier_clone.wait();
-        let start = Instant::now();
-
-        let mut i = 0u64;
-        while i < iterations {
-            while i < iterations {
-                match tx.send(i) {
-                    Ok(()) => i += 1,
-                    Err(_) => break,
-                }
-            }
-            if i < iterations {
-                std::hint::spin_loop();
-            }
-        }
-        start.elapsed()
-    });
-
-    // Receiver: receives as fast as possible
-    let receiver = thread::spawn(move || {
-        pin_to_core(receiver_core);
-        barrier.wait();
-
-        let mut received = 0u64;
-        while received < iterations {
-            while let Some(v) = rx.recv() {
-                debug_assert_eq!(v, received);
-                received += 1;
-            }
-            if received < iterations {
-                std::hint::spin_loop();
-            }
-        }
-    });
-
-    let duration = sender.join().unwrap();
-    receiver.join().unwrap();
-
-    BenchResult {
-        name: "Lamport",
-        iterations,
-        duration,
-    }
-}
-
-/// Benchmark std::sync::mpsc
-fn bench_std_mpsc(iterations: u64, sender_core: usize, receiver_core: usize) -> BenchResult {
-    let (tx, rx) = mpsc::channel::<u64>();
-
-    let barrier = Arc::new(Barrier::new(2));
-    let barrier_clone = Arc::clone(&barrier);
-
-    let sender = thread::spawn(move || {
-        pin_to_core(sender_core);
-        barrier_clone.wait();
-        let start = Instant::now();
-
-        for i in 0..iterations {
-            tx.send(i).unwrap();
-        }
-        start.elapsed()
-    });
-
-    let receiver = thread::spawn(move || {
-        pin_to_core(receiver_core);
-        barrier.wait();
-
-        let mut received = 0u64;
-        while received < iterations {
-            match rx.try_recv() {
-                Ok(v) => {
-                    debug_assert_eq!(v, received);
-                    received += 1;
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    std::hint::spin_loop();
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    panic!("sender disconnected");
-                }
-            }
-        }
-    });
-
-    let duration = sender.join().unwrap();
-    receiver.join().unwrap();
-
-    BenchResult {
-        name: "std::mpsc",
-        iterations,
-        duration,
-    }
-}
-
-/// Benchmark Producer-Only Write SPSC with RPC pattern (request/response)
-fn bench_producer_only_rpc(iterations: u64, capacity: usize, inflight_max: usize, sender_core: usize, receiver_core: usize) -> BenchResult {
-    let (mut req_tx, mut req_rx) = thread_channel::spsc_rpc::channel::<u64>(capacity);
-    let (mut resp_tx, mut resp_rx) = thread_channel::spsc::channel::<u64>(capacity);
-
-    let barrier = Arc::new(Barrier::new(2));
-    let barrier_clone = Arc::clone(&barrier);
-
-    // Producer: sends requests, receives responses
-    let producer = thread::spawn(move || {
+    // Client: sends requests, receives responses
+    let client = thread::spawn(move || {
         pin_to_core(sender_core);
         barrier_clone.wait();
         let start = Instant::now();
@@ -246,13 +91,16 @@ fn bench_producer_only_rpc(iterations: u64, capacity: usize, inflight_max: usize
         while received < iterations {
             // Send requests (up to inflight_max)
             while sent < iterations && inflight < inflight_max {
-                req_tx.send(sent).unwrap();
-                inflight += 1;
-                sent += 1;
+                if tx_req.send(sent).is_ok() {
+                    inflight += 1;
+                    sent += 1;
+                } else {
+                    break;
+                }
             }
 
             // Receive responses
-            while let Some(resp_val) = resp_rx.recv() {
+            while let Some(resp_val) = rx_resp.recv() {
                 debug_assert_eq!(resp_val, received);
                 inflight -= 1;
                 received += 1;
@@ -262,19 +110,18 @@ fn bench_producer_only_rpc(iterations: u64, capacity: usize, inflight_max: usize
         start.elapsed()
     });
 
-    // Consumer: receives requests, sends responses
-    let consumer = thread::spawn(move || {
+    // Server: receives requests, sends responses
+    let server = thread::spawn(move || {
         pin_to_core(receiver_core);
         barrier.wait();
 
         let mut processed = 0u64;
 
         while processed < iterations {
-            while let Some((_, req_val)) = req_rx.recv() {
+            while let Some(req_val) = rx_req.recv() {
                 debug_assert_eq!(req_val, processed);
-                // Send response
                 loop {
-                    if resp_tx.send(req_val).is_ok() {
+                    if tx_resp.send(req_val).is_ok() {
                         break;
                     }
                     std::hint::spin_loop();
@@ -284,11 +131,232 @@ fn bench_producer_only_rpc(iterations: u64, capacity: usize, inflight_max: usize
         }
     });
 
-    let duration = producer.join().unwrap();
-    consumer.join().unwrap();
+    let duration = client.join().unwrap();
+    server.join().unwrap();
 
     BenchResult {
-        name: "Producer-Only (RPC)",
+        name: "FastForward",
+        iterations,
+        duration,
+    }
+}
+
+/// Benchmark Lamport SPSC with call/response pattern
+fn bench_lamport(iterations: u64, capacity: usize, inflight_max: usize, sender_core: usize, receiver_core: usize) -> BenchResult {
+    let (mut tx_req, mut rx_req) = thread_channel::spsc_lamport::channel::<u64>(capacity);
+    let (mut tx_resp, mut rx_resp) = thread_channel::spsc_lamport::channel::<u64>(capacity);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let barrier_clone = Arc::clone(&barrier);
+
+    // Client: sends requests, receives responses
+    let client = thread::spawn(move || {
+        pin_to_core(sender_core);
+        barrier_clone.wait();
+        let start = Instant::now();
+
+        let mut inflight = 0usize;
+        let mut sent = 0u64;
+        let mut received = 0u64;
+
+        while received < iterations {
+            // Send requests (up to inflight_max)
+            while sent < iterations && inflight < inflight_max {
+                if tx_req.send(sent).is_ok() {
+                    inflight += 1;
+                    sent += 1;
+                } else {
+                    break;
+                }
+            }
+            tx_req.poll();  // Publish batch
+
+            // Receive responses
+            while let Some(resp_val) = rx_resp.recv() {
+                debug_assert_eq!(resp_val, received);
+                inflight -= 1;
+                received += 1;
+            }
+            rx_resp.poll();  // Free slots for sender
+        }
+
+        start.elapsed()
+    });
+
+    // Server: receives requests, sends responses
+    let server = thread::spawn(move || {
+        pin_to_core(receiver_core);
+        barrier.wait();
+
+        let mut processed = 0u64;
+
+        while processed < iterations {
+            // Receive batch
+            while let Some(req_val) = rx_req.recv() {
+                debug_assert_eq!(req_val, processed);
+                loop {
+                    if tx_resp.send(req_val).is_ok() {
+                        break;
+                    }
+                    tx_resp.poll();  // Publish what we have
+                    rx_req.poll();   // Free slots
+                    std::hint::spin_loop();
+                }
+                processed += 1;
+            }
+            tx_resp.poll();  // Publish responses
+            rx_req.poll();   // Free slots
+        }
+    });
+
+    let duration = client.join().unwrap();
+    server.join().unwrap();
+
+    BenchResult {
+        name: "Lamport",
+        iterations,
+        duration,
+    }
+}
+
+/// Benchmark std::sync::mpsc with call/response pattern
+fn bench_std_mpsc(iterations: u64, inflight_max: usize, sender_core: usize, receiver_core: usize) -> BenchResult {
+    let (tx_req, rx_req) = mpsc::channel::<u64>();
+    let (tx_resp, rx_resp) = mpsc::channel::<u64>();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let barrier_clone = Arc::clone(&barrier);
+
+    // Client: sends requests, receives responses
+    let client = thread::spawn(move || {
+        pin_to_core(sender_core);
+        barrier_clone.wait();
+        let start = Instant::now();
+
+        let mut inflight = 0usize;
+        let mut sent = 0u64;
+        let mut received = 0u64;
+
+        while received < iterations {
+            // Send requests (up to inflight_max)
+            while sent < iterations && inflight < inflight_max {
+                tx_req.send(sent).unwrap();
+                inflight += 1;
+                sent += 1;
+            }
+
+            // Receive responses (must receive at least one if inflight > 0)
+            if inflight > 0 {
+                // Block until at least one response
+                let resp_val = rx_resp.recv().unwrap();
+                debug_assert_eq!(resp_val, received);
+                inflight -= 1;
+                received += 1;
+
+                // Drain any additional responses
+                while let Ok(resp_val) = rx_resp.try_recv() {
+                    debug_assert_eq!(resp_val, received);
+                    inflight -= 1;
+                    received += 1;
+                }
+            }
+        }
+
+        start.elapsed()
+    });
+
+    // Server: receives requests, sends responses
+    let server = thread::spawn(move || {
+        pin_to_core(receiver_core);
+        barrier.wait();
+
+        let mut processed = 0u64;
+
+        while processed < iterations {
+            match rx_req.recv() {
+                Ok(req_val) => {
+                    debug_assert_eq!(req_val, processed);
+                    tx_resp.send(req_val).unwrap();
+                    processed += 1;
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let duration = client.join().unwrap();
+    server.join().unwrap();
+
+    BenchResult {
+        name: "std::mpsc",
+        iterations,
+        duration,
+    }
+}
+
+/// Benchmark Producer-Only Write SPSC with call/response pattern
+fn bench_producer_only(iterations: u64, capacity: usize, inflight_max: usize, sender_core: usize, receiver_core: usize) -> BenchResult {
+    let (mut tx_req, mut rx_req) = thread_channel::spsc_rpc::channel::<u64>(capacity);
+    let (mut tx_resp, mut rx_resp) = thread_channel::spsc::channel::<u64>(capacity);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let barrier_clone = Arc::clone(&barrier);
+
+    // Client: sends requests, receives responses
+    let client = thread::spawn(move || {
+        pin_to_core(sender_core);
+        barrier_clone.wait();
+        let start = Instant::now();
+
+        let mut inflight = 0usize;
+        let mut sent = 0u64;
+        let mut received = 0u64;
+
+        while received < iterations {
+            // Send requests (up to inflight_max)
+            while sent < iterations && inflight < inflight_max {
+                tx_req.send(sent).unwrap();
+                inflight += 1;
+                sent += 1;
+            }
+
+            // Receive responses
+            while let Some(resp_val) = rx_resp.recv() {
+                debug_assert_eq!(resp_val, received);
+                inflight -= 1;
+                received += 1;
+            }
+        }
+
+        start.elapsed()
+    });
+
+    // Server: receives requests, sends responses
+    let server = thread::spawn(move || {
+        pin_to_core(receiver_core);
+        barrier.wait();
+
+        let mut processed = 0u64;
+
+        while processed < iterations {
+            while let Some((_, req_val)) = rx_req.recv() {
+                debug_assert_eq!(req_val, processed);
+                loop {
+                    if tx_resp.send(req_val).is_ok() {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                processed += 1;
+            }
+        }
+    });
+
+    let duration = client.join().unwrap();
+    server.join().unwrap();
+
+    BenchResult {
+        name: "Producer-Only",
         iterations,
         duration,
     }
@@ -305,15 +373,103 @@ fn print_result(result: &BenchResult) {
     );
 }
 
+/// Benchmark Lamport SPSC one-way (no response)
+fn bench_lamport_oneway(iterations: u64, capacity: usize, sender_core: usize, receiver_core: usize) -> BenchResult {
+    let (mut tx, mut rx) = thread_channel::spsc_lamport::channel::<u64>(capacity);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let barrier_clone = Arc::clone(&barrier);
+
+    let sender = thread::spawn(move || {
+        pin_to_core(sender_core);
+        barrier_clone.wait();
+        let start = Instant::now();
+
+        let mut i = 0u64;
+        while i < iterations {
+            while i < iterations {
+                if tx.send(i).is_ok() { i += 1; } else { break; }
+            }
+            tx.poll();  // Publish batch
+            if i < iterations { std::hint::spin_loop(); }
+        }
+        start.elapsed()
+    });
+
+    let receiver = thread::spawn(move || {
+        pin_to_core(receiver_core);
+        barrier.wait();
+
+        let mut received = 0u64;
+        while received < iterations {
+            while let Some(_) = rx.recv() { received += 1; }
+            rx.poll();  // Free slots
+            if received < iterations { std::hint::spin_loop(); }
+        }
+    });
+
+    let duration = sender.join().unwrap();
+    receiver.join().unwrap();
+
+    BenchResult {
+        name: "Lamport (oneway)",
+        iterations,
+        duration,
+    }
+}
+
+/// Benchmark FastForward SPSC one-way (no response)
+fn bench_fastforward_oneway(iterations: u64, capacity: usize, sender_core: usize, receiver_core: usize) -> BenchResult {
+    let (mut tx, mut rx) = thread_channel::spsc::channel::<u64>(capacity);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let barrier_clone = Arc::clone(&barrier);
+
+    let sender = thread::spawn(move || {
+        pin_to_core(sender_core);
+        barrier_clone.wait();
+        let start = Instant::now();
+
+        let mut i = 0u64;
+        while i < iterations {
+            while i < iterations {
+                if tx.send(i).is_ok() { i += 1; } else { break; }
+            }
+            if i < iterations { std::hint::spin_loop(); }
+        }
+        start.elapsed()
+    });
+
+    let receiver = thread::spawn(move || {
+        pin_to_core(receiver_core);
+        barrier.wait();
+
+        let mut received = 0u64;
+        while received < iterations {
+            while let Some(_) = rx.recv() { received += 1; }
+            if received < iterations { std::hint::spin_loop(); }
+        }
+    });
+
+    let duration = sender.join().unwrap();
+    receiver.join().unwrap();
+
+    BenchResult {
+        name: "FastForward (oneway)",
+        iterations,
+        duration,
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
     println!("SPSC Implementation Comparison Benchmark");
-    println!("========================================");
+    println!("=========================================================");
     println!("Iterations: {}", args.iterations);
     println!("Capacity: {}", args.capacity);
+    println!("Inflight max: {}", args.inflight);
     println!("Warmup: {}", args.warmup);
-    println!("Inflight (producer-only): {}", args.inflight);
     println!("Sender core: {}, Receiver core: {}", args.sender_core, args.receiver_core);
     println!();
 
@@ -323,36 +479,52 @@ fn main() {
         args.target.split(',').collect()
     };
 
-    // Throughput benchmarks
-    println!("== Throughput Benchmark ==");
+    // One-way benchmarks
+    if args.mode == "both" || args.mode == "oneway" {
+        println!("== One-way Throughput (sender -> receiver only) ==");
+        if targets.contains(&"fastforward") || args.target == "all" {
+            let _ = bench_fastforward_oneway(args.warmup, args.capacity, args.sender_core, args.receiver_core);
+            print_result(&bench_fastforward_oneway(args.iterations, args.capacity, args.sender_core, args.receiver_core));
+        }
+        if targets.contains(&"lamport") || args.target == "all" {
+            let _ = bench_lamport_oneway(args.warmup, args.capacity, args.sender_core, args.receiver_core);
+            print_result(&bench_lamport_oneway(args.iterations, args.capacity, args.sender_core, args.receiver_core));
+        }
+        println!();
+    }
+
+    if args.mode != "oneway" {
+        // Call/response benchmarks
+        println!("== Call/Response Throughput (pingpong) ==");
 
     for target in &targets {
         // Warmup
         match *target {
             "fastforward" => {
-                let _ = bench_fastforward(args.warmup, args.capacity, args.sender_core, args.receiver_core);
-                let result = bench_fastforward(args.iterations, args.capacity, args.sender_core, args.receiver_core);
+                let _ = bench_fastforward(args.warmup, args.capacity, args.inflight, args.sender_core, args.receiver_core);
+                let result = bench_fastforward(args.iterations, args.capacity, args.inflight, args.sender_core, args.receiver_core);
                 print_result(&result);
             }
             "lamport" => {
-                let _ = bench_lamport(args.warmup, args.capacity, args.sender_core, args.receiver_core);
-                let result = bench_lamport(args.iterations, args.capacity, args.sender_core, args.receiver_core);
+                let _ = bench_lamport(args.warmup, args.capacity, args.inflight, args.sender_core, args.receiver_core);
+                let result = bench_lamport(args.iterations, args.capacity, args.inflight, args.sender_core, args.receiver_core);
                 print_result(&result);
             }
             "mpsc" => {
-                let _ = bench_std_mpsc(args.warmup, args.sender_core, args.receiver_core);
-                let result = bench_std_mpsc(args.iterations, args.sender_core, args.receiver_core);
+                let _ = bench_std_mpsc(args.warmup, args.inflight, args.sender_core, args.receiver_core);
+                let result = bench_std_mpsc(args.iterations, args.inflight, args.sender_core, args.receiver_core);
                 print_result(&result);
             }
             "producer-only" => {
-                let _ = bench_producer_only_rpc(args.warmup, args.capacity, args.inflight, args.sender_core, args.receiver_core);
-                let result = bench_producer_only_rpc(args.iterations, args.capacity, args.inflight, args.sender_core, args.receiver_core);
+                let _ = bench_producer_only(args.warmup, args.capacity, args.inflight, args.sender_core, args.receiver_core);
+                let result = bench_producer_only(args.iterations, args.capacity, args.inflight, args.sender_core, args.receiver_core);
                 print_result(&result);
             }
             _ => {
                 eprintln!("Unknown target: {}", target);
             }
         }
+    }
     }
 
     println!();
