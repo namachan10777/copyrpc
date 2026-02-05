@@ -70,8 +70,6 @@ impl<Req: Serial + Send, Resp: Serial + Send> TransportEndpoint<Req, Resp>
             Ok(()) => {
                 let token = self.send_count;
                 self.send_count += 1;
-                // Sync immediately to make call visible to peer
-                self.sync_call();
                 Ok(token)
             }
             Err(spsc_lamport::SendError(v)) => Err(TransportError::Full(v)),
@@ -80,17 +78,15 @@ impl<Req: Serial + Send, Resp: Serial + Send> TransportEndpoint<Req, Resp>
 
     #[inline]
     fn poll(&mut self) -> Option<(u64, Resp)> {
-        // Sync before polling to ensure we see latest responses
-        // and our calls are visible to peer
+        // Sync all channels: publish our calls/responses, free slots for peer
         self.sync_call();
+        self.sync_recv();
         self.resp_rx.recv().map(|resp| (resp.token, resp.data))
     }
 
     #[inline]
     fn recv(&mut self) -> Option<(u64, Req)> {
-        // Sync before receiving to ensure we see latest calls
-        // and our responses are visible to peer
-        self.sync_recv();
+        // No sync here - poll() handles all synchronization
         self.call_rx.recv().map(|req| {
             let token = self.recv_count;
             self.recv_count += 1;
@@ -102,11 +98,7 @@ impl<Req: Serial + Send, Resp: Serial + Send> TransportEndpoint<Req, Resp>
     fn reply(&mut self, token: u64, resp: Resp) -> Result<(), TransportError<Resp>> {
         let response = Response { token, data: resp };
         match self.resp_tx.send(response) {
-            Ok(()) => {
-                // Sync immediately to make response visible to peer
-                self.sync_recv();
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(spsc_lamport::SendError(r)) => Err(TransportError::Full(r.data)),
         }
     }
@@ -179,8 +171,11 @@ mod tests {
         assert_eq!(token0, 0);
         assert_eq!(token1, 1);
 
-        // poll() performs sync automatically
-        // Endpoint B receives requests (recv performs sync)
+        // poll() performs sync, making calls visible to peer
+        endpoint_a.poll();
+        endpoint_b.poll(); // B needs to poll to see A's calls
+
+        // Endpoint B receives requests
         let (t0, req0) = endpoint_b.recv().unwrap();
         assert_eq!(t0, 0);
         assert_eq!(req0, 100);
@@ -194,6 +189,9 @@ mod tests {
         // Endpoint B sends responses
         endpoint_b.reply(t0, req0 + 1000).unwrap();
         endpoint_b.reply(t1, req1 + 1000).unwrap();
+
+        // poll() performs sync, making responses visible to peer
+        endpoint_b.poll();
 
         // Endpoint A receives responses (poll performs sync)
         let (rt0, resp0) = endpoint_a.poll().unwrap();
@@ -215,24 +213,32 @@ mod tests {
         let token_a = endpoint_a.call(100).unwrap();
         let token_b = endpoint_b.call(200).unwrap();
 
-        // A receives B's call (recv does sync)
+        // poll() syncs to make calls visible
+        endpoint_a.poll();
+        endpoint_b.poll();
+
+        // A receives B's call
         let (t, req) = endpoint_a.recv().unwrap();
         assert_eq!(req, 200);
         endpoint_a.reply(t, 201).unwrap();
 
-        // B receives A's call (recv does sync)
+        // B receives A's call
         let (t, req) = endpoint_b.recv().unwrap();
         assert_eq!(req, 100);
         endpoint_b.reply(t, 101).unwrap();
 
-        // Both receive responses (poll does sync)
-        let (t, resp) = endpoint_a.poll().unwrap();
-        assert_eq!(t, token_a);
-        assert_eq!(resp, 101);
-
+        // poll() syncs to make responses visible and receives them
+        // First poll syncs A's reply, but B's reply not yet visible
+        assert!(endpoint_a.poll().is_none());
+        // B's poll makes B's reply visible AND receives A's reply
         let (t, resp) = endpoint_b.poll().unwrap();
         assert_eq!(t, token_b);
         assert_eq!(resp, 201);
+
+        // Now A can receive B's reply
+        let (t, resp) = endpoint_a.poll().unwrap();
+        assert_eq!(t, token_a);
+        assert_eq!(resp, 101);
     }
 
     #[test]
@@ -250,6 +256,8 @@ mod tests {
             let token = endpoint_a.call(i).unwrap();
             assert_eq!(token, i as u64);
         }
+        endpoint_a.poll(); // sync to make calls visible
+        endpoint_b.poll(); // B needs to poll to see A's calls
 
         for i in 0..10 {
             let (token, value) = endpoint_b.recv().unwrap();
@@ -257,6 +265,7 @@ mod tests {
             assert_eq!(value, i);
             endpoint_b.reply(token, value).unwrap();
         }
+        endpoint_b.poll(); // sync to make responses visible to A
 
         // After wrap, tokens continue increasing
         for i in 10..20 {
@@ -286,13 +295,15 @@ mod tests {
         let handle = thread::spawn(move || {
             let mut count = 0u64;
             while !stop2.load(Ordering::Relaxed) {
-                // recv() and poll() do sync automatically
+                // poll() does sync - makes peer's calls visible and our responses visible
+                endpoint_b.poll();
                 if let Some((token, data)) = endpoint_b.recv() {
                     endpoint_b.reply(token, data + 1000).unwrap();
                     count += 1;
                 }
             }
             // Drain remaining
+            endpoint_b.poll();
             while let Some((token, data)) = endpoint_b.recv() {
                 endpoint_b.reply(token, data + 1000).unwrap();
                 count += 1;

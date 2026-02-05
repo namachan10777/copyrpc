@@ -107,3 +107,100 @@ pub(crate) struct Response<T: Serial> {
 }
 
 unsafe impl<T: Serial> Serial for Response<T> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    /// Generic test that verifies transport can complete 2 ring wraps with timeout.
+    /// This catches deadlocks/hangs in sync logic.
+    fn test_two_ring_wraps_with_timeout<T: Transport>() {
+        let capacity = 8usize;
+        let iterations = capacity * 2; // 2 ring wraps
+        let timeout = Duration::from_secs(5);
+
+        let (mut endpoint_a, mut endpoint_b) = T::channel::<u64, u64>(capacity);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = Arc::clone(&stop);
+
+        // Responder thread
+        let handle = thread::spawn(move || {
+            let mut count = 0usize;
+            while count < iterations && !stop2.load(Ordering::Relaxed) {
+                // poll() does sync for Lamport
+                endpoint_b.poll();
+                if let Some((token, data)) = endpoint_b.recv() {
+                    loop {
+                        if endpoint_b.reply(token, data + 1000).is_ok() {
+                            count += 1;
+                            // Final sync after reply to make response visible
+                            endpoint_b.poll();
+                            break;
+                        }
+                        if stop2.load(Ordering::Relaxed) {
+                            return count;
+                        }
+                        std::hint::spin_loop();
+                    }
+                }
+            }
+            count
+        });
+
+        let start = std::time::Instant::now();
+        let mut sent = 0usize;
+        let mut received = 0usize;
+
+        while received < iterations {
+            if start.elapsed() > timeout {
+                stop.store(true, Ordering::Relaxed);
+                let responder_count = handle.join().unwrap();
+                panic!(
+                    "Timeout after {:?}! sent={}, received={}, responder={}",
+                    timeout, sent, received, responder_count
+                );
+            }
+
+            // Send requests (limit inflight to half capacity)
+            while sent < iterations && sent - received < capacity / 2 {
+                if endpoint_a.call(sent as u64).is_ok() {
+                    sent += 1;
+                } else {
+                    break;
+                }
+            }
+
+            // Receive responses (don't check token value, as it may wrap around)
+            while let Some((_token, resp)) = endpoint_a.poll() {
+                // Response should be data + 1000
+                assert!(resp >= 1000);
+                received += 1;
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let responder_count = handle.join().unwrap();
+        assert_eq!(received, iterations);
+        assert_eq!(responder_count, iterations);
+    }
+
+    #[test]
+    fn test_onesided_two_ring_wraps() {
+        test_two_ring_wraps_with_timeout::<OnesidedTransport>();
+    }
+
+    #[test]
+    fn test_fastforward_two_ring_wraps() {
+        test_two_ring_wraps_with_timeout::<FastForwardTransport>();
+    }
+
+    #[test]
+    fn test_lamport_two_ring_wraps() {
+        test_two_ring_wraps_with_timeout::<LamportTransport>();
+    }
+}

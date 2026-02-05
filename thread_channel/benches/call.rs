@@ -48,7 +48,12 @@ fn run_pingpong_bench<Tr: Transport>(b: &mut criterion::Bencher) {
 
     let handle = thread::spawn(move || {
         while !stop2.load(Ordering::Relaxed) {
-            if let Some((token, data)) = endpoint_b.recv() {
+            // poll() does sync for Lamport: makes peer's calls visible, our replies visible
+            // Single poll() handles both directions - this is the pipeline model
+            if let Some((token, data)) = {
+                endpoint_b.poll();
+                endpoint_b.recv()
+            } {
                 loop {
                     if endpoint_b.reply(token, data).is_ok() {
                         break;
@@ -122,6 +127,9 @@ fn run_throughput_bench<Tr: Transport>(b: &mut criterion::Bencher, batch_size: u
 
     let handle = thread::spawn(move || {
         while !stop2.load(Ordering::Relaxed) {
+            // poll() does sync for Lamport: makes peer's calls visible, our replies visible
+            // Single poll() per batch - this enables proper batching
+            endpoint_b.poll();
             let mut count = 0;
             while let Some((token, data)) = endpoint_b.recv() {
                 loop {
@@ -209,6 +217,8 @@ fn run_oneway_bench<Tr: Transport>(b: &mut criterion::Bencher, batch_size: usize
 
     let handle = thread::spawn(move || {
         while !stop2.load(Ordering::Relaxed) {
+            // poll() does sync for Lamport
+            endpoint_b.poll();
             while endpoint_b.recv().is_some() {}
         }
     });
