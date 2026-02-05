@@ -133,26 +133,35 @@ pub fn channel<T: Serial>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 impl<T: Serial> Sender<T> {
     /// Sends a value through the channel.
     ///
-    /// Returns `Ok(slot_idx)` on success, where `slot_idx` should be used
-    /// to free the slot later via `free_slot()`.
+    /// Returns `Ok(slot_idx)` on success.
     ///
-    /// Returns `Err(SendError(value))` if the channel is full.
+    /// # Safety
+    /// Caller must ensure inflight count does not exceed capacity.
+    /// With proper inflight management, head never overtakes tail,
+    /// so overwriting slots is safe (consumer already read them).
     #[inline]
     pub fn send(&mut self, value: T) -> Result<usize, SendError<T>> {
         let slot_idx = self.head;
         let slot = &self.inner.slots[slot_idx];
 
-        // Check if slot is empty (producer reads its own flag)
-        if unsafe { ptr::read_volatile(slot.valid.get()) } {
-            return Err(SendError(value));
+        // FIRST: Invalidate the NEXT slot to create sentinel
+        // This MUST happen before writing data to prevent race where consumer
+        // reads old valid=true data before we place the sentinel
+        let next_slot_idx = (self.head + 1) & self.mask;
+        let next_slot = &self.inner.slots[next_slot_idx];
+        unsafe {
+            ptr::write_volatile(next_slot.valid.get(), false);
         }
+
+        // Fence ensures sentinel is visible before we write data
+        compiler_fence(Ordering::Release);
 
         // Write the value
         unsafe {
             ptr::write((*slot.data.get()).as_mut_ptr(), value);
         }
 
-        // Compiler fence ensures data write completes before flag write
+        // Fence ensures data write completes before valid flag
         compiler_fence(Ordering::Release);
 
         // Mark slot as valid (producer writes)
@@ -168,9 +177,10 @@ impl<T: Serial> Sender<T> {
 
     /// Frees a slot after receiving its response.
     ///
-    /// This should be called when the response for the request in this slot
-    /// has been received, indicating the consumer has finished reading it.
+    /// DEPRECATED: With inflight constraint management, explicit slot freeing
+    /// is no longer needed. Keeping for backward compatibility.
     #[inline]
+    #[allow(dead_code)]
     pub fn free_slot(&mut self, slot_idx: usize) {
         debug_assert!(slot_idx <= self.mask, "slot_idx out of bounds");
         let slot = &self.inner.slots[slot_idx];
@@ -225,7 +235,7 @@ impl<T: Serial> Receiver<T> {
 
         // Advance tail
         // NOTE: We do NOT mark the slot as invalid here!
-        // The producer will do that when it receives the response.
+        // The producer will invalidate it before writing new data.
         self.tail = (self.tail + 1) & self.mask;
 
         Some((slot_idx, value))
@@ -249,7 +259,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_send_recv_free() {
+    fn test_send_recv() {
         let (mut tx, mut rx) = channel::<u32>(4);
 
         // Send
@@ -271,31 +281,9 @@ mod tests {
         // No more data
         assert!(rx.recv().is_none());
 
-        // Free slots (simulating response received)
-        tx.free_slot(slot0);
-        tx.free_slot(slot1);
-
-        // Can send again
+        // With inflight management, we can send more without explicit free_slot
         let slot2 = tx.send(300).unwrap();
         assert_eq!(slot2, 2);
-    }
-
-    #[test]
-    fn test_full_channel() {
-        let (mut tx, mut _rx) = channel::<u32>(2);
-
-        // Fill the channel
-        tx.send(1).unwrap();
-        tx.send(2).unwrap();
-
-        // Should fail (full)
-        assert!(tx.send(3).is_err());
-
-        // Free a slot
-        tx.free_slot(0);
-
-        // Can send again
-        tx.send(3).unwrap();
     }
 
     #[test]
@@ -303,33 +291,27 @@ mod tests {
         let (mut tx, mut rx) = channel::<u64>(4);
 
         // Send some values
-        let slot0 = tx.send(1).unwrap();
-        let slot1 = tx.send(2).unwrap();
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
 
         // Receive values (this should NOT modify the valid flags)
         let (_, _) = rx.recv().unwrap();
         let (_, _) = rx.recv().unwrap();
 
-        // Slots should still be "in use" from producer's perspective
-        // because free_slot hasn't been called
-        // Fill remaining slots
+        // With inflight management (external), we can keep sending
+        // The consumer doesn't write to the channel
         tx.send(3).unwrap();
         tx.send(4).unwrap();
 
-        // Now all slots are full (2 consumed but not freed + 2 new)
-        assert!(tx.send(5).is_err());
-
-        // Free the consumed slots
-        tx.free_slot(slot0);
-        tx.free_slot(slot1);
-
-        // Now we can send again
-        tx.send(5).unwrap();
-        tx.send(6).unwrap();
+        // Receive all
+        let (_, val) = rx.recv().unwrap();
+        assert_eq!(val, 3);
+        let (_, val) = rx.recv().unwrap();
+        assert_eq!(val, 4);
     }
 
     #[test]
-    fn test_threaded_rpc_pattern() {
+    fn test_threaded_with_inflight_limit() {
         use std::sync::Barrier;
         use std::thread;
 
@@ -338,31 +320,28 @@ mod tests {
 
         let barrier = Arc::new(Barrier::new(2));
         let iterations = 100_000u64;
+        let inflight_max = 128usize;
 
         let barrier_clone = Arc::clone(&barrier);
         let producer = thread::spawn(move || {
             barrier_clone.wait();
 
-            let mut pending = 0usize;
+            let mut inflight = 0usize;
             let mut sent = 0u64;
             let mut received = 0u64;
 
             while received < iterations {
-                // Send requests (up to capacity in flight)
-                while sent < iterations && pending < 128 {
-                    if let Ok(_slot_idx) = tx.send(sent) {
-                        pending += 1;
-                        sent += 1;
-                    } else {
-                        break;
-                    }
+                // Send requests (up to inflight_max in flight)
+                while sent < iterations && inflight < inflight_max {
+                    tx.send(sent).unwrap();
+                    inflight += 1;
+                    sent += 1;
                 }
 
-                // Receive responses and free slots
-                while let Some((slot_idx, resp_val)) = resp_rx.recv() {
+                // Receive responses (no free_slot needed)
+                while let Some((_, resp_val)) = resp_rx.recv() {
                     assert_eq!(resp_val, received);
-                    tx.free_slot(slot_idx);
-                    pending -= 1;
+                    inflight -= 1;
                     received += 1;
                 }
             }
