@@ -3,9 +3,10 @@
 //! Each node pair has dedicated SPSC channels, providing zero-contention
 //! communication at the cost of O(N^2) memory usage.
 //!
-//! This module uses producer-only write SPSC for requests:
-//! - Request channel: consumer is read-only (producer frees slots on response)
-//! - Response channel: standard SPSC
+//! This module is generic over the transport implementation:
+//! - `OnesidedTransport` (default): Producer-only write pattern
+//! - `FastForwardTransport`: FastForward algorithm with validity flags
+//! - `LamportTransport`: Batched index synchronization
 //!
 //! API:
 //! - `call(to, payload, user_data)` sends a request
@@ -13,16 +14,17 @@
 //! - `try_recv()` returns received requests via `RecvHandle`
 
 use std::collections::VecDeque;
+use std::marker::PhantomData;
 
-use crate::spsc::{self, Serial};
-use crate::spsc_rpc;
+use crate::spsc::Serial;
+use crate::transport::{OnesidedTransport, Transport, TransportError, TransportReceiver, TransportSender};
 use crate::SendError;
 
-/// Response message containing slot index for freeing.
+/// Response message containing token.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Response<T: Serial> {
-    slot_idx: usize,
+    token: u64,
     data: T,
 }
 
@@ -30,36 +32,37 @@ unsafe impl<T: Serial> Serial for Response<T> {}
 
 /// A bidirectional channel to a single peer.
 ///
-/// Uses producer-only write SPSC for requests (consumer is read-only),
-/// and standard SPSC for responses.
-struct FluxChannel<T: Serial> {
+/// Uses the specified transport for both requests and responses.
+struct FluxChannel<T: Serial + Send, Tr: Transport> {
     peer_id: usize,
-    /// Request sender (producer-only write)
-    req_tx: spsc_rpc::Sender<T>,
-    /// Request receiver (read-only)
-    req_rx: spsc_rpc::Receiver<T>,
-    /// Response sender (standard SPSC)
-    resp_tx: spsc::Sender<Response<T>>,
-    /// Response receiver (standard SPSC)
-    resp_rx: spsc::Receiver<Response<T>>,
+    /// Request sender
+    req_tx: Tr::Sender<T>,
+    /// Request receiver
+    req_rx: Tr::Receiver<T>,
+    /// Response sender
+    resp_tx: Tr::Sender<Response<T>>,
+    /// Response receiver
+    resp_rx: Tr::Receiver<Response<T>>,
+    /// Current inflight count for this channel
+    inflight_count: usize,
 }
 
 /// A received request, stored in the internal queue.
 struct RecvRequest<T> {
     from: usize,
-    slot_idx: usize,
+    token: u64,
     data: T,
 }
 
 /// Handle for a received request that allows replying.
-pub struct RecvHandle<'a, T: Serial, U, F: FnMut(&mut U, T)> {
-    flux: &'a mut Flux<T, U, F>,
+pub struct RecvHandle<'a, T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport = OnesidedTransport> {
+    flux: &'a mut Flux<T, U, F, Tr>,
     from: usize,
-    slot_idx: usize,
+    token: u64,
     data: T,
 }
 
-impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T)> RecvHandle<'a, T, U, F> {
+impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport> RecvHandle<'a, T, U, F, Tr> {
     /// Returns the sender's node ID.
     #[inline]
     pub fn from(&self) -> usize {
@@ -81,20 +84,32 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T)> RecvHandle<'a, T, U, F> {
         };
 
         let resp = Response {
-            slot_idx: self.slot_idx,
+            token: self.token,
             data: value,
         };
 
         match self.flux.channels[channel_idx].resp_tx.send(resp) {
-            Ok(()) => Ok(()),
-            Err(spsc::SendError(r)) => Err((
+            Ok(_) => {
+                self.flux.channels[channel_idx].resp_tx.sync();
+                Ok(())
+            }
+            Err(TransportError::Full(r)) => Err((
                 Self {
                     flux: self.flux,
                     from: self.from,
-                    slot_idx: self.slot_idx,
+                    token: self.token,
                     data: self.data,
                 },
                 SendError::Full(r.data),
+            )),
+            Err(TransportError::Disconnected(r)) => Err((
+                Self {
+                    flux: self.flux,
+                    from: self.from,
+                    token: self.token,
+                    data: self.data,
+                },
+                SendError::Disconnected(r.data),
             )),
         }
     }
@@ -107,7 +122,7 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T)> RecvHandle<'a, T, U, F> {
             None => {
                 self.flux.recv_queue.push_front(RecvRequest {
                     from: self.from,
-                    slot_idx: self.slot_idx,
+                    token: self.token,
                     data: self.data,
                 });
                 return false;
@@ -115,16 +130,19 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T)> RecvHandle<'a, T, U, F> {
         };
 
         let resp = Response {
-            slot_idx: self.slot_idx,
+            token: self.token,
             data: value,
         };
 
         match self.flux.channels[channel_idx].resp_tx.send(resp) {
-            Ok(()) => true,
-            Err(spsc::SendError(_)) => {
+            Ok(_) => {
+                self.flux.channels[channel_idx].resp_tx.sync();
+                true
+            }
+            Err(TransportError::Full(_) | TransportError::Disconnected(_)) => {
                 self.flux.recv_queue.push_front(RecvRequest {
                     from: self.from,
-                    slot_idx: self.slot_idx,
+                    token: self.token,
                     data: self.data,
                 });
                 false
@@ -135,24 +153,28 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T)> RecvHandle<'a, T, U, F> {
 
 /// A node in a Flux network with callback-based response handling.
 ///
-/// Uses producer-only write SPSC for requests, eliminating cache line
-/// bouncing on the consumer side.
-pub struct Flux<T: Serial, U, F: FnMut(&mut U, T)> {
+/// Generic over the transport implementation.
+pub struct Flux<T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport = OnesidedTransport> {
     id: usize,
     num_nodes: usize,
-    channels: Vec<FluxChannel<T>>,
+    channels: Vec<FluxChannel<T, Tr>>,
     /// Round-robin index for poll
     recv_index: usize,
-    /// Pending calls: maps slot_idx to user_data (fixed-size array per channel)
+    /// Pending calls: maps token % capacity to user_data (fixed-size array per channel)
     /// Outer vec is per-channel, inner vec is per-slot
     pending_calls: Vec<Vec<Option<U>>>,
     /// Response callback
     on_response: F,
     /// Queue of received requests
     recv_queue: VecDeque<RecvRequest<T>>,
+    /// Maximum inflight requests per channel
+    inflight_max: usize,
+    /// Capacity per channel (for token % capacity mapping)
+    channel_capacity: usize,
+    _marker: PhantomData<Tr>,
 }
 
-impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
+impl<T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport> Flux<T, U, F, Tr> {
     /// Returns this node's ID.
     pub fn id(&self) -> usize {
         self.id
@@ -180,20 +202,31 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
             None => return Err(SendError::InvalidPeer(value)),
         };
 
-        match self.channels[channel_idx].req_tx.send(value) {
-            Ok(slot_idx) => {
-                // Store user_data for this slot
-                self.pending_calls[channel_idx][slot_idx] = Some(user_data);
+        let channel = &mut self.channels[channel_idx];
+
+        // Check inflight limit
+        if channel.inflight_count >= self.inflight_max {
+            return Err(SendError::Full(value));
+        }
+
+        match channel.req_tx.send(value) {
+            Ok(token) => {
+                channel.req_tx.sync();
+                channel.inflight_count += 1;
+                // Store user_data for this token (using token % capacity for indexing)
+                let slot = (token as usize) % self.channel_capacity;
+                self.pending_calls[channel_idx][slot] = Some(user_data);
                 Ok(())
             }
-            Err(spsc_rpc::SendError(v)) => Err(SendError::Full(v)),
+            Err(TransportError::Full(v)) => Err(SendError::Full(v)),
+            Err(TransportError::Disconnected(v)) => Err(SendError::Disconnected(v)),
         }
     }
 
     /// Polls for messages from peers.
     ///
     /// - Requests: queued for retrieval via `try_recv()`
-    /// - Responses: invokes callback and frees the request slot
+    /// - Responses: invokes callback
     #[inline]
     pub fn poll(&mut self) {
         let n = self.channels.len();
@@ -208,36 +241,39 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
             let channel = &mut self.channels[idx];
             let peer_id = channel.peer_id;
 
-            // Receive requests (read-only from consumer perspective)
-            while let Some((slot_idx, data)) = channel.req_rx.recv() {
+            // Receive requests
+            while let Some((token, data)) = channel.req_rx.recv() {
                 self.recv_queue.push_back(RecvRequest {
                     from: peer_id,
-                    slot_idx,
+                    token,
                     data,
                 });
             }
+            channel.req_rx.sync();
 
-            // Receive responses and free slots
-            while let Some(resp) = channel.resp_rx.recv() {
-                // Free the request slot (producer writes valid=false)
-                channel.req_tx.free_slot(resp.slot_idx);
+            // Receive responses
+            while let Some((_, resp)) = channel.resp_rx.recv() {
+                // Decrement inflight count
+                channel.inflight_count -= 1;
 
                 // Get user_data and invoke callback
-                if let Some(mut user_data) = self.pending_calls[idx][resp.slot_idx].take() {
+                let slot = (resp.token as usize) % self.channel_capacity;
+                if let Some(mut user_data) = self.pending_calls[idx][slot].take() {
                     (self.on_response)(&mut user_data, resp.data);
                 }
             }
+            channel.resp_rx.sync();
         }
     }
 
     /// Tries to receive the next request from the queue.
     #[inline]
-    pub fn try_recv(&mut self) -> Option<RecvHandle<'_, T, U, F>> {
+    pub fn try_recv(&mut self) -> Option<RecvHandle<'_, T, U, F, Tr>> {
         let req = self.recv_queue.pop_front()?;
         Some(RecvHandle {
             flux: self,
             from: req.from,
-            slot_idx: req.slot_idx,
+            token: req.token,
             data: req.data,
         })
     }
@@ -245,55 +281,86 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T)> Flux<T, U, F> {
     /// Returns the number of pending calls awaiting responses.
     #[inline]
     pub fn pending_count(&self) -> usize {
-        self.pending_calls
-            .iter()
-            .flat_map(|v| v.iter())
-            .filter(|o| o.is_some())
-            .count()
+        self.channels.iter().map(|c| c.inflight_count).sum()
     }
 }
 
-/// Creates a Flux network with `n` nodes.
+/// Creates a Flux network with `n` nodes using the default transport (OnesidedTransport).
+///
+/// # Arguments
+/// * `n` - Number of nodes
+/// * `capacity` - Channel buffer capacity (will be rounded to power of 2)
+/// * `inflight_max` - Maximum inflight requests per channel (must be < capacity)
+/// * `on_response` - Callback invoked when responses arrive
 ///
 /// # Panics
-/// Panics if `n` is 0 or `capacity` is 0.
-pub fn create_flux<T, U, F>(n: usize, capacity: usize, on_response: F) -> Vec<Flux<T, U, F>>
+/// Panics if `n` is 0, `capacity` is 0, or `inflight_max >= capacity`.
+pub fn create_flux<T, U, F>(
+    n: usize,
+    capacity: usize,
+    inflight_max: usize,
+    on_response: F,
+) -> Vec<Flux<T, U, F, OnesidedTransport>>
 where
     T: Serial + Send,
     U: Send,
     F: FnMut(&mut U, T) + Clone,
+{
+    create_flux_with_transport::<T, U, F, OnesidedTransport>(n, capacity, inflight_max, on_response)
+}
+
+/// Creates a Flux network with `n` nodes using the specified transport.
+///
+/// # Arguments
+/// * `n` - Number of nodes
+/// * `capacity` - Channel buffer capacity (will be rounded to power of 2)
+/// * `inflight_max` - Maximum inflight requests per channel (must be < capacity)
+/// * `on_response` - Callback invoked when responses arrive
+///
+/// # Panics
+/// Panics if `n` is 0, `capacity` is 0, or `inflight_max >= capacity`.
+pub fn create_flux_with_transport<T, U, F, Tr>(
+    n: usize,
+    capacity: usize,
+    inflight_max: usize,
+    on_response: F,
+) -> Vec<Flux<T, U, F, Tr>>
+where
+    T: Serial + Send,
+    U: Send,
+    F: FnMut(&mut U, T) + Clone,
+    Tr: Transport,
 {
     assert!(n > 0, "must have at least one node");
     assert!(capacity > 0, "capacity must be greater than 0");
 
     // Actual capacity after power-of-2 rounding
     let actual_capacity = capacity.next_power_of_two();
+    assert!(
+        inflight_max < actual_capacity,
+        "inflight_max must be less than capacity"
+    );
 
-    // Create all channel pairs
-    // For nodes i and j (i < j), we create:
-    // - Request channel i -> j (spsc_rpc)
-    // - Request channel j -> i (spsc_rpc)
-    // - Response channel i -> j (spsc)
-    // - Response channel j -> i (spsc)
-    struct ChannelPair<T: Serial> {
-        req_tx: spsc_rpc::Sender<T>,
-        req_rx: spsc_rpc::Receiver<T>,
-        resp_tx: spsc::Sender<Response<T>>,
-        resp_rx: spsc::Receiver<Response<T>>,
+    // Create all channel pairs using the specified transport
+    struct ChannelPair<T: Serial + Send, Tr: Transport> {
+        req_tx: Tr::Sender<T>,
+        req_rx: Tr::Receiver<T>,
+        resp_tx: Tr::Sender<Response<T>>,
+        resp_rx: Tr::Receiver<Response<T>>,
     }
 
-    let mut channel_pairs: Vec<Vec<Option<ChannelPair<T>>>> =
+    let mut channel_pairs: Vec<Vec<Option<ChannelPair<T, Tr>>>> =
         (0..n).map(|_| (0..n).map(|_| None).collect()).collect();
 
     for i in 0..n {
         for j in (i + 1)..n {
             // Channels from i to j
-            let (req_tx_i_j, req_rx_i_j) = spsc_rpc::channel(capacity);
-            let (resp_tx_i_j, resp_rx_i_j) = spsc::channel(capacity);
+            let (req_tx_i_j, req_rx_i_j) = Tr::channel(capacity);
+            let (resp_tx_i_j, resp_rx_i_j) = Tr::channel(capacity);
 
             // Channels from j to i
-            let (req_tx_j_i, req_rx_j_i) = spsc_rpc::channel(capacity);
-            let (resp_tx_j_i, resp_rx_j_i) = spsc::channel(capacity);
+            let (req_tx_j_i, req_rx_j_i) = Tr::channel(capacity);
+            let (resp_tx_j_i, resp_rx_j_i) = Tr::channel(capacity);
 
             // i's view: send requests to j, receive responses from j
             channel_pairs[i][j] = Some(ChannelPair {
@@ -332,6 +399,7 @@ where
                     req_rx: pair.req_rx,
                     resp_tx: pair.resp_tx,
                     resp_rx: pair.resp_rx,
+                    inflight_count: 0,
                 });
                 // Fixed-size array for pending calls per channel
                 pending_calls.push((0..actual_capacity).map(|_| None).collect());
@@ -346,6 +414,9 @@ where
             pending_calls,
             on_response: on_response.clone(),
             recv_queue: VecDeque::with_capacity(capacity),
+            inflight_max,
+            channel_capacity: actual_capacity,
+            _marker: PhantomData,
         });
     }
 
@@ -355,10 +426,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::{FastForwardTransport, LamportTransport};
 
     #[test]
     fn test_create_flux() {
-        let nodes: Vec<Flux<u32, (), _>> = create_flux(3, 16, |_, _| {});
+        let nodes: Vec<Flux<u32, (), _, OnesidedTransport>> = create_flux(3, 16, 8, |_, _| {});
         assert_eq!(nodes.len(), 3);
         assert_eq!(nodes[0].num_peers(), 2);
         assert_eq!(nodes[1].num_peers(), 2);
@@ -373,9 +445,10 @@ mod tests {
         let responses: Rc<RefCell<Vec<(u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
         let responses_clone = Rc::clone(&responses);
 
-        let mut nodes: Vec<Flux<u32, u32, _>> = create_flux(2, 16, move |user_data, data| {
-            responses_clone.borrow_mut().push((*user_data, data));
-        });
+        let mut nodes: Vec<Flux<u32, u32, _, OnesidedTransport>> =
+            create_flux(2, 16, 8, move |user_data, data| {
+                responses_clone.borrow_mut().push((*user_data, data));
+            });
 
         // Node 0 calls node 1 with user_data=100
         nodes[0].call(1, 42, 100).unwrap();
@@ -399,7 +472,7 @@ mod tests {
 
     #[test]
     fn test_poll_round_robin() {
-        let mut nodes: Vec<Flux<u32, (), _>> = create_flux(3, 16, |_, _| {});
+        let mut nodes: Vec<Flux<u32, (), _, OnesidedTransport>> = create_flux(3, 16, 8, |_, _| {});
 
         // Node 1 and 2 both send to node 0
         nodes[1].call(0, 100, ()).unwrap();
@@ -421,12 +494,39 @@ mod tests {
 
     #[test]
     fn test_invalid_peer() {
-        let mut nodes: Vec<Flux<u32, (), _>> = create_flux(2, 16, |_, _| {});
+        let mut nodes: Vec<Flux<u32, (), _, OnesidedTransport>> = create_flux(2, 16, 8, |_, _| {});
 
         assert!(matches!(
             nodes[0].call(5, 42, ()),
             Err(SendError::InvalidPeer(42))
         ));
+    }
+
+    #[test]
+    fn test_inflight_limit() {
+        let mut nodes: Vec<Flux<u32, (), _, OnesidedTransport>> = create_flux(2, 16, 4, |_, _| {});
+
+        // Send up to inflight_max
+        for i in 0..4 {
+            assert!(nodes[0].call(1, i, ()).is_ok());
+        }
+
+        // Next call should fail (inflight limit reached)
+        assert!(matches!(
+            nodes[0].call(1, 4, ()),
+            Err(SendError::Full(4))
+        ));
+
+        // Process responses to free up slots
+        nodes[1].poll();
+        while let Some(handle) = nodes[1].try_recv() {
+            let data = handle.data();
+            assert!(handle.reply(data).is_ok());
+        }
+        nodes[0].poll();
+
+        // Now we can send again
+        assert!(nodes[0].call(1, 5, ()).is_ok());
     }
 
     #[test]
@@ -437,9 +537,9 @@ mod tests {
 
         let completed_count = Arc::new(AtomicU64::new(0));
 
-        let nodes: Vec<Flux<u64, Arc<AtomicU64>, _>> = {
+        let nodes: Vec<Flux<u64, Arc<AtomicU64>, _, OnesidedTransport>> = {
             let completed = Arc::clone(&completed_count);
-            create_flux(4, 1024, move |_, _| {
+            create_flux(4, 1024, 256, move |_, _| {
                 completed.fetch_add(1, Ordering::Relaxed);
             })
         };
@@ -500,16 +600,18 @@ mod tests {
         let n = 2;
         let iterations = 100u64;
         let capacity = 1024;
-        let max_in_flight = (capacity / 4).max(1) as u64;
+        let inflight_max = (capacity / 4).max(1);
 
         let global_response_count = Arc::new(AtomicU64::new(0));
         let global_count_clone = Arc::clone(&global_response_count);
 
-        let nodes: Vec<Flux<u64, (), _>> =
-            create_flux(n, capacity, move |_: &mut (), _: u64| {
+        let nodes: Vec<Flux<u64, (), _, OnesidedTransport>> =
+            create_flux(n, capacity, inflight_max, move |_: &mut (), _: u64| {
                 global_count_clone.fetch_add(1, Ordering::Relaxed);
             });
         let end_barrier = Arc::new(Barrier::new(n));
+        let expected_total = n as u64 * iterations * ((n - 1) as u64);
+        let global_response_count_clone = Arc::clone(&global_response_count);
 
         std::thread::scope(|s| {
             let handles: Vec<_> = nodes
@@ -517,6 +619,7 @@ mod tests {
                 .enumerate()
                 .map(|(_, mut node)| {
                     let end_barrier = Arc::clone(&end_barrier);
+                    let global_count = Arc::clone(&global_response_count_clone);
                     s.spawn(move || {
                         let id = node.id();
                         let num_peers = node.num_peers();
@@ -531,13 +634,9 @@ mod tests {
                         while total_sent < total_sent_target || sent_replies < expected_requests {
                             for &peer in &peers {
                                 if sent_per_peer[peer] < iterations {
-                                    let in_flight = sent_per_peer[peer]
-                                        .saturating_sub(sent_per_peer[peer].min(max_in_flight));
-                                    if in_flight < max_in_flight {
-                                        if node.call(peer, sent_per_peer[peer], ()).is_ok() {
-                                            sent_per_peer[peer] += 1;
-                                            total_sent += 1;
-                                        }
+                                    if node.call(peer, sent_per_peer[peer], ()).is_ok() {
+                                        sent_per_peer[peer] += 1;
+                                        total_sent += 1;
                                     }
                                 }
                             }
@@ -552,9 +651,14 @@ mod tests {
                             }
                         }
 
-                        for _ in 0..10 {
+                        // Wait for all responses to be processed globally
+                        while global_count.load(Ordering::Relaxed) < expected_total {
                             node.poll();
-                            while node.try_recv().is_some() {}
+                            while let Some(handle) = node.try_recv() {
+                                let data = handle.data();
+                                handle.reply(data).ok();
+                            }
+                            std::hint::spin_loop();
                         }
 
                         end_barrier.wait();
@@ -570,6 +674,102 @@ mod tests {
         });
 
         let total_responses = global_response_count.load(Ordering::Relaxed);
-        assert_eq!(total_responses, n as u64 * iterations * ((n - 1) as u64));
+        assert_eq!(total_responses, expected_total);
+    }
+
+    #[test]
+    fn test_ring_wrap() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let response_count = Arc::new(AtomicU64::new(0));
+        let response_count_clone = Arc::clone(&response_count);
+
+        let mut nodes: Vec<Flux<u64, (), _, OnesidedTransport>> =
+            create_flux(2, 8, 4, move |_: &mut (), _: u64| {
+                response_count_clone.fetch_add(1, Ordering::Relaxed);
+            });
+
+        // Send many iterations to test ring buffer wrap
+        for iteration in 0..24u64 {
+            // Node 0 calls node 1 (up to inflight limit)
+            while nodes[0].pending_count() < 4 {
+                nodes[0].call(1, iteration, ()).unwrap();
+            }
+
+            // Node 1 processes all requests and replies
+            nodes[1].poll();
+            while let Some(handle) = nodes[1].try_recv() {
+                let data = handle.data();
+                assert!(handle.reply(data + 1000).is_ok());
+            }
+
+            // Node 0 receives all responses
+            nodes[0].poll();
+        }
+
+        assert!(response_count.load(Ordering::Relaxed) >= 24);
+    }
+
+    // Tests for different transport implementations
+
+    #[test]
+    fn test_fastforward_transport() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let responses: Rc<RefCell<Vec<(u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
+        let responses_clone = Rc::clone(&responses);
+
+        let mut nodes: Vec<Flux<u32, u32, _, FastForwardTransport>> =
+            create_flux_with_transport(2, 16, 8, move |user_data, data| {
+                responses_clone.borrow_mut().push((*user_data, data));
+            });
+
+        nodes[0].call(1, 42, 100).unwrap();
+        nodes[0].poll();
+
+        nodes[1].poll();
+        let handle = nodes[1].try_recv().unwrap();
+        assert_eq!(handle.from(), 0);
+        assert_eq!(handle.data(), 42);
+        assert!(handle.reply(43).is_ok());
+        nodes[1].poll();
+
+        nodes[0].poll();
+
+        let responses = responses.borrow();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0], (100, 43));
+    }
+
+    #[test]
+    fn test_lamport_transport() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let responses: Rc<RefCell<Vec<(u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
+        let responses_clone = Rc::clone(&responses);
+
+        let mut nodes: Vec<Flux<u32, u32, _, LamportTransport>> =
+            create_flux_with_transport(2, 16, 8, move |user_data, data| {
+                responses_clone.borrow_mut().push((*user_data, data));
+            });
+
+        nodes[0].call(1, 42, 100).unwrap();
+        nodes[0].poll();
+
+        nodes[1].poll();
+        let handle = nodes[1].try_recv().unwrap();
+        assert_eq!(handle.from(), 0);
+        assert_eq!(handle.data(), 42);
+        assert!(handle.reply(43).is_ok());
+        nodes[1].poll();
+
+        nodes[0].poll();
+
+        let responses = responses.borrow();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0], (100, 43));
     }
 }

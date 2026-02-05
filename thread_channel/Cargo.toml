@@ -17,21 +17,9 @@ bench-bin = ["clap", "parquet", "arrow", "core_affinity"]
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
-name = "comparison"
-harness = false
-
-[[bench]]
-name = "spsc_perf"
+name = "call"
 harness = false
 
 [[bin]]
-name = "channel_bench"
-required-features = ["bench-bin"]
-
-[[bin]]
-name = "spsc_bench"
-required-features = ["bench-bin"]
-
-[[bin]]
-name = "spsc_compare"
+name = "cluster_bench"
 required-features = ["bench-bin"]

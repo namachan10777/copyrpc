@@ -10,8 +10,22 @@
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::ptr;
-use std::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use std::sync::atomic::{compiler_fence, AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// Slip maintenance constants (FastForward PPoPP 2008 Section 3.4.1)
+const CACHE_LINE_SIZE: usize = 64;
+const ENTRY_SIZE: usize = 8; // pointer size
+const ENTRIES_PER_LINE: usize = CACHE_LINE_SIZE / ENTRY_SIZE; // = 8
+
+/// DANGER: slip lost threshold (2 cache lines)
+const SLIP_DANGER: usize = ENTRIES_PER_LINE * 2; // = 16
+
+/// GOOD: target slip (6 cache lines)
+const SLIP_GOOD: usize = ENTRIES_PER_LINE * 6; // = 48
+
+/// Slip adjustment frequency
+const SLIP_CHECK_INTERVAL: usize = 64;
 
 use crate::spsc::Serial;
 
@@ -60,9 +74,15 @@ struct Shared {
     rx_alive: AtomicBool,
 }
 
+/// Cache-padded atomic for producer head (slip measurement)
+#[repr(C, align(64))]
+struct CachePaddedAtomicUsize(AtomicUsize);
+
 /// Inner channel state.
 struct Inner<T> {
     shared: Shared,
+    /// Producer head for distance calculation (slip maintenance)
+    producer_head: CachePaddedAtomicUsize,
     slots: Box<[Slot<T>]>,
 }
 
@@ -93,6 +113,10 @@ pub struct Receiver<T> {
     tail: usize,
     /// Bitmask for fast modulo
     mask: usize,
+    /// Receive counter for slip check interval
+    recv_count: usize,
+    /// Whether initial slip has been established
+    slip_initialized: bool,
 }
 
 unsafe impl<T: Send> Send for Receiver<T> {}
@@ -116,6 +140,7 @@ pub fn channel<T: Serial>(capacity: usize) -> (Sender<T>, Receiver<T>) {
             tx_alive: AtomicBool::new(true),
             rx_alive: AtomicBool::new(true),
         },
+        producer_head: CachePaddedAtomicUsize(AtomicUsize::new(0)),
         slots,
     });
 
@@ -125,7 +150,13 @@ pub fn channel<T: Serial>(capacity: usize) -> (Sender<T>, Receiver<T>) {
         mask,
     };
 
-    let receiver = Receiver { inner, tail: 0, mask };
+    let receiver = Receiver {
+        inner,
+        tail: 0,
+        mask,
+        recv_count: 0,
+        slip_initialized: false,
+    };
 
     (sender, receiver)
 }
@@ -171,6 +202,12 @@ impl<T: Serial> Sender<T> {
 
         // Advance head
         self.head = (self.head + 1) & self.mask;
+
+        // Publish head for slip measurement (relaxed - no sync needed)
+        self.inner
+            .producer_head
+            .0
+            .store(self.head, Ordering::Relaxed);
 
         Ok(slot_idx)
     }
@@ -245,6 +282,57 @@ impl<T: Serial> Receiver<T> {
     #[allow(dead_code)]
     pub fn is_disconnected(&self) -> bool {
         !self.inner.shared.tx_alive.load(Ordering::Relaxed)
+    }
+
+    /// Returns the distance (number of items) between producer and consumer.
+    ///
+    /// This is used for temporal slipping to ensure producer and consumer
+    /// operate on different cache lines.
+    #[inline]
+    fn distance(&self) -> usize {
+        let head = self.inner.producer_head.0.load(Ordering::Relaxed);
+        head.wrapping_sub(self.tail) & self.mask
+    }
+
+    /// Establishes and maintains temporal slip.
+    ///
+    /// Temporal slipping (FastForward PPoPP 2008 Section 3.4.1) delays the
+    /// consumer to ensure producer and consumer operate on different cache lines,
+    /// reducing cache line bouncing.
+    ///
+    /// On first call: waits until producer is SLIP_GOOD entries ahead.
+    /// On subsequent calls (every SLIP_CHECK_INTERVAL): if slip drops below
+    /// SLIP_DANGER, waits until it recovers to SLIP_GOOD.
+    #[inline]
+    pub fn maintain_slip(&mut self) {
+        self.recv_count = self.recv_count.wrapping_add(1);
+
+        // Check only every SLIP_CHECK_INTERVAL iterations (after initialization)
+        if self.slip_initialized && self.recv_count % SLIP_CHECK_INTERVAL != 0 {
+            return;
+        }
+
+        let dist = self.distance();
+
+        if !self.slip_initialized {
+            // Initial slip establishment: wait until SLIP_GOOD
+            while self.distance() < SLIP_GOOD {
+                std::hint::spin_loop();
+            }
+            self.slip_initialized = true;
+        } else if dist < SLIP_DANGER {
+            // Slip recovery: wait until SLIP_GOOD (with progress check)
+            let mut prev_dist = dist;
+            while self.distance() < SLIP_GOOD {
+                let curr_dist = self.distance();
+                // Break if producer stopped making progress
+                if curr_dist <= prev_dist && curr_dist > 0 {
+                    break;
+                }
+                prev_dist = curr_dist;
+                std::hint::spin_loop();
+            }
+        }
     }
 }
 
