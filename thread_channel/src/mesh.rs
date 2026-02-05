@@ -5,7 +5,7 @@
 //! nodes send to the same target.
 
 use crate::mpsc::{self, MpscReceiver, MpscSender};
-use crate::spsc::Serial;
+use crate::serial::Serial;
 use crate::{ReceivedMessage, RecvError, SendError};
 
 /// Message kind for internal protocol.

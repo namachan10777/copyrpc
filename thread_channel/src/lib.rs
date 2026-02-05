@@ -7,17 +7,14 @@
 
 pub mod flux;
 pub mod mesh;
-pub mod peer_channel;
-pub mod spsc;
-pub mod spsc_lamport;
-pub mod spsc_rpc;
+pub mod serial;
 pub mod transport;
 
 pub(crate) mod mpsc;
 
 pub use flux::{create_flux, create_flux_with_transport, Flux, RecvHandle};
 pub use mesh::{create_mesh, Mesh};
-pub use spsc::Serial;
+pub use serial::Serial;
 pub use transport::{
     FastForwardTransport, LamportTransport, OnesidedTransport, Transport, TransportEndpoint,
     TransportError,

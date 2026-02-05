@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
-use thread_channel::spsc::Serial;
+use thread_channel::Serial;
 use thread_channel::{
     FastForwardTransport, LamportTransport, OnesidedTransport, Transport, TransportEndpoint,
 };

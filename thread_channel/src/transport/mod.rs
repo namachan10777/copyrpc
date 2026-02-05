@@ -14,7 +14,7 @@ pub mod fastforward;
 pub mod lamport;
 pub mod onesided;
 
-use crate::spsc::Serial;
+use crate::serial::Serial;
 
 /// Error returned when transport operations fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -16,7 +16,7 @@
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 
-use crate::spsc::Serial;
+use crate::serial::Serial;
 use crate::transport::{OnesidedTransport, Transport, TransportEndpoint, TransportError};
 use crate::SendError;
 

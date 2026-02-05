@@ -7,7 +7,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use thread_channel::spsc::Serial;
+use thread_channel::Serial;
 use thread_channel::{
     FastForwardTransport, LamportTransport, OnesidedTransport, Transport, TransportEndpoint,
 };

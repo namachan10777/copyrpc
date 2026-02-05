@@ -14,7 +14,7 @@ use arrow::record_batch::RecordBatch;
 use clap::{Parser, ValueEnum};
 use core_affinity::CoreId;
 use parquet::arrow::ArrowWriter;
-use thread_channel::spsc::Serial;
+use thread_channel::Serial;
 use thread_channel::{
     create_flux_with_transport, FastForwardTransport, Flux, LamportTransport, OnesidedTransport,
     Transport,
