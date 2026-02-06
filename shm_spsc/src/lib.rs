@@ -1,35 +1,15 @@
-//! Process-to-process SPSC communication over shared memory.
+//! RPC slot-based communication over shared memory.
 //!
-//! This crate provides a dual-lane SPSC channel for inter-process communication
-//! using `/dev/shm`. The design follows a server-client model where:
-//!
-//! - The server creates the shared memory and waits for a client to connect.
-//! - The client connects to existing shared memory.
-//! - Both sides can send and receive through dedicated lanes.
-//!
-//! # Example
-//!
-//! ```ignore
-//! // Server process
-//! let server = unsafe { Server::<u64>::create("/my_channel", 1024)? };
-//! server.send(42)?;
-//! let response = server.recv()?;
-//!
-//! // Client process
-//! let client = unsafe { Client::<u64>::connect("/my_channel", 1024)? };
-//! let value = client.recv()?;
-//! client.send(value + 1)?;
-//! ```
+//! Each client gets a dedicated request/response slot pair.
+//! The server polls all slots and responds to each client.
 
 pub mod shm;
 
 use shm::SharedMemory;
-use std::cell::UnsafeCell;
 use std::io;
 use std::marker::PhantomData;
-use std::mem::{ManuallyDrop, MaybeUninit};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 /// Marker trait for types that can be safely transmitted through the channel.
 ///
@@ -38,7 +18,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// suitable for inter-process communication.
 pub unsafe trait Serial: Copy {}
 
-// Implement Serial for common types
 unsafe impl Serial for u8 {}
 unsafe impl Serial for u16 {}
 unsafe impl Serial for u32 {}
@@ -56,193 +35,181 @@ unsafe impl Serial for f64 {}
 unsafe impl Serial for bool {}
 unsafe impl<T: Copy, const N: usize> Serial for [T; N] {}
 
-/// Error returned when sending fails.
+/// Identifies a client slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ClientId(pub u32);
+
+/// Slot state machine:
+/// IDLE(0) → REQUEST_READY(1) → PROCESSING(2) → RESPONSE_READY(3) → IDLE(0)
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SendError<T> {
-    /// The channel is full.
-    Full(T),
-    /// The peer has disconnected.
-    Disconnected(T),
+enum SlotState {
+    Idle = 0,
+    RequestReady = 1,
+    Processing = 2,
+    ResponseReady = 3,
 }
 
-impl<T> std::fmt::Display for SendError<T> {
+/// Error returned when `Client::call()` fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallError {
+    ServerDisconnected,
+}
+
+impl std::fmt::Display for CallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SendError::Full(_) => write!(f, "channel is full"),
-            SendError::Disconnected(_) => write!(f, "peer has disconnected"),
+            CallError::ServerDisconnected => write!(f, "server disconnected"),
         }
     }
 }
 
-impl<T: std::fmt::Debug> std::error::Error for SendError<T> {}
+impl std::error::Error for CallError {}
 
-/// Error returned when receiving fails.
+/// Error returned when `Server::respond()` fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecvError {
-    /// The channel is empty.
-    Empty,
-    /// The peer has disconnected.
-    Disconnected,
+pub enum RespondError {
+    InvalidClient,
+    NoRequest,
+    ClientDisconnected,
 }
 
-impl std::fmt::Display for RecvError {
+impl std::fmt::Display for RespondError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RecvError::Empty => write!(f, "channel is empty"),
-            RecvError::Disconnected => write!(f, "peer has disconnected"),
+            RespondError::InvalidClient => write!(f, "invalid client id"),
+            RespondError::NoRequest => write!(f, "no pending request from this client"),
+            RespondError::ClientDisconnected => write!(f, "client disconnected"),
         }
     }
 }
 
-impl std::error::Error for RecvError {}
+impl std::error::Error for RespondError {}
 
-/// Magic number to identify valid shared memory layout.
-const MAGIC: u64 = 0x5350_5343_4348_414E; // "SPSCHAN"
+/// Error returned when `Client::connect()` fails.
+#[derive(Debug)]
+pub enum ConnectError {
+    ServerNotAlive,
+    ServerFull,
+    LayoutMismatch,
+    Io(io::Error),
+}
 
-/// Version of the shared memory layout.
-const VERSION: u32 = 1;
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectError::ServerNotAlive => write!(f, "server not alive"),
+            ConnectError::ServerFull => write!(f, "server is full"),
+            ConnectError::LayoutMismatch => write!(f, "layout mismatch"),
+            ConnectError::Io(e) => write!(f, "io error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for ConnectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ConnectError::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for ConnectError {
+    fn from(e: io::Error) -> Self {
+        ConnectError::Io(e)
+    }
+}
+
+const MAGIC: u64 = 0x5250_4353_4C4F_5421; // "RPCSLOT!"
+const VERSION: u32 = 2;
+const HEADER_SIZE: usize = 64;
 
 /// Header stored at the beginning of shared memory.
+/// Fixed 64 bytes.
 #[repr(C)]
 struct Header {
-    magic: u64,
-    version: u32,
-    capacity: u32,
-    slot_size: u32,
-    _padding: u32,
-    /// Server -> Client lane
-    s2c_head: AtomicUsize,
-    s2c_tail: AtomicUsize,
-    /// Client -> Server lane
-    c2s_head: AtomicUsize,
-    c2s_tail: AtomicUsize,
-    /// Connection state
-    server_alive: AtomicBool,
-    client_alive: AtomicBool,
-    client_connected: AtomicBool,
+    magic: u64,           // 8
+    version: u32,         // 4
+    max_clients: u32,     // 4
+    req_size: u32,        // 4
+    resp_size: u32,       // 4
+    req_align: u32,       // 4
+    resp_align: u32,      // 4
+    server_alive: AtomicBool, // 1
+    _pad: [u8; 3],       // 3
+    next_client_id: AtomicU32, // 4
+    _reserved: [u8; 24],  // 24
+    // total = 64
 }
 
-/// Calculate the total size needed for shared memory.
-fn calc_shm_size<T>(capacity: usize) -> usize {
-    let header_size = std::mem::size_of::<Header>();
-    let slot_size = std::mem::size_of::<T>();
-    // Two lanes: S2C and C2S
-    let lane_size = slot_size * capacity;
-    header_size + lane_size * 2
+const _: () = assert!(std::mem::size_of::<Header>() == HEADER_SIZE);
+
+/// Layout of a single slot in shared memory.
+struct SlotLayout {
+    slot_size: usize,
+    state_offset: usize,      // 0
+    alive_offset: usize,      // 1
+    req_offset: usize,
+    resp_offset: usize,
 }
 
-/// A lane (one direction of communication).
-struct Lane<T> {
-    slots: *mut UnsafeCell<ManuallyDrop<MaybeUninit<T>>>,
-    capacity: usize,
-    head: *const AtomicUsize,
-    tail: *const AtomicUsize,
-    /// Cached values for reduced atomic reads
-    head_cache: usize,
-    tail_cache: usize,
-    /// Am I the sender or receiver on this lane?
-    is_sender: bool,
-}
+fn calc_slot_layout<Req, Resp>() -> SlotLayout {
+    let align = std::mem::align_of::<Req>()
+        .max(std::mem::align_of::<Resp>())
+        .max(8);
 
-impl<T: Serial> Lane<T> {
-    unsafe fn new(
-        slots: *mut u8,
-        capacity: usize,
-        head: *const AtomicUsize,
-        tail: *const AtomicUsize,
-        is_sender: bool,
-    ) -> Self {
-        Self {
-            slots: slots as *mut UnsafeCell<ManuallyDrop<MaybeUninit<T>>>,
-            capacity,
-            head,
-            tail,
-            head_cache: 0,
-            tail_cache: 0,
-            is_sender,
-        }
-    }
+    // [state: AtomicU8(1)] [client_alive: AtomicBool(1)] [padding to align] [req] [padding to align] [resp] [padding to align]
+    let state_offset = 0;
+    let alive_offset = 1;
+    let req_offset = align_up(2, align);
+    let resp_offset = align_up(req_offset + std::mem::size_of::<Req>(), align);
+    let slot_size = align_up(resp_offset + std::mem::size_of::<Resp>(), align);
 
-    fn try_send(&mut self, value: T) -> Result<(), T> {
-        debug_assert!(self.is_sender);
-
-        let tail = unsafe { (*self.tail).load(Ordering::Relaxed) };
-        let next_tail = (tail + 1) % self.capacity;
-
-        // Check if we have room
-        if next_tail == self.head_cache {
-            self.head_cache = unsafe { (*self.head).load(Ordering::Acquire) };
-            if next_tail == self.head_cache {
-                return Err(value);
-            }
-        }
-
-        // Write the value
-        unsafe {
-            let slot = &*self.slots.add(tail);
-            std::ptr::write_volatile((*slot.get()).as_mut_ptr(), value);
-        }
-
-        // Update tail
-        unsafe { (*self.tail).store(next_tail, Ordering::Release) };
-
-        Ok(())
-    }
-
-    fn try_recv(&mut self) -> Result<T, ()> {
-        debug_assert!(!self.is_sender);
-
-        let head = unsafe { (*self.head).load(Ordering::Relaxed) };
-
-        // Check if we have data
-        if head == self.tail_cache {
-            self.tail_cache = unsafe { (*self.tail).load(Ordering::Acquire) };
-            if head == self.tail_cache {
-                return Err(());
-            }
-        }
-
-        // Read the value
-        let value = unsafe {
-            let slot = &*self.slots.add(head);
-            std::ptr::read_volatile((*slot.get()).as_ptr())
-        };
-
-        // Update head
-        let next_head = (head + 1) % self.capacity;
-        unsafe { (*self.head).store(next_head, Ordering::Release) };
-
-        Ok(value)
+    SlotLayout {
+        slot_size,
+        state_offset,
+        alive_offset,
+        req_offset,
+        resp_offset,
     }
 }
 
-/// Server side of the shared memory channel.
-///
-/// The server creates the shared memory and owns its lifecycle.
-pub struct Server<T: Serial> {
+fn calc_shm_size<Req, Resp>(max_clients: u32) -> usize {
+    let layout = calc_slot_layout::<Req, Resp>();
+    HEADER_SIZE + layout.slot_size * max_clients as usize
+}
+
+fn align_up(val: usize, align: usize) -> usize {
+    (val + align - 1) & !(align - 1)
+}
+
+/// Server side of the RPC slot channel.
+pub struct Server<Req: Serial, Resp: Serial> {
     _shm: SharedMemory,
     header: *mut Header,
-    tx: Lane<T>,
-    rx: Lane<T>,
-    _marker: PhantomData<T>,
+    base: *mut u8,
+    layout: SlotLayout,
+    max_clients: u32,
+    poll_cursor: u32,
+    _marker: PhantomData<(Req, Resp)>,
 }
 
-unsafe impl<T: Serial + Send> Send for Server<T> {}
+unsafe impl<Req: Serial + Send, Resp: Serial + Send> Send for Server<Req, Resp> {}
 
-impl<T: Serial> Server<T> {
+impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
     /// Creates a new server and shared memory region.
     ///
     /// # Safety
     /// The caller must ensure that `path` is a valid shared memory path
     /// and that no other process is using the same path.
-    pub unsafe fn create<P: AsRef<Path>>(path: P, capacity: usize) -> io::Result<Self> {
-        assert!(capacity > 1, "capacity must be greater than 1");
+    pub unsafe fn create<P: AsRef<Path>>(path: P, max_clients: u32) -> io::Result<Self> {
+        assert!(max_clients > 0, "max_clients must be > 0");
 
-        let size = calc_shm_size::<T>(capacity);
+        let size = calc_shm_size::<Req, Resp>(max_clients);
         let shm = unsafe { SharedMemory::create(path, size)? };
         let base = shm.as_ptr();
 
-        // Initialize header
         let header = base as *mut Header;
         unsafe {
             std::ptr::write(
@@ -250,118 +217,148 @@ impl<T: Serial> Server<T> {
                 Header {
                     magic: MAGIC,
                     version: VERSION,
-                    capacity: capacity as u32,
-                    slot_size: std::mem::size_of::<T>() as u32,
-                    _padding: 0,
-                    s2c_head: AtomicUsize::new(0),
-                    s2c_tail: AtomicUsize::new(0),
-                    c2s_head: AtomicUsize::new(0),
-                    c2s_tail: AtomicUsize::new(0),
+                    max_clients,
+                    req_size: std::mem::size_of::<Req>() as u32,
+                    resp_size: std::mem::size_of::<Resp>() as u32,
+                    req_align: std::mem::align_of::<Req>() as u32,
+                    resp_align: std::mem::align_of::<Resp>() as u32,
                     server_alive: AtomicBool::new(true),
-                    client_alive: AtomicBool::new(false),
-                    client_connected: AtomicBool::new(false),
+                    _pad: [0; 3],
+                    next_client_id: AtomicU32::new(0),
+                    _reserved: [0; 24],
                 },
             );
         }
 
-        let header_size = std::mem::size_of::<Header>();
-        let lane_size = std::mem::size_of::<T>() * capacity;
+        let layout = calc_slot_layout::<Req, Resp>();
 
-        // S2C lane (server sends, client receives)
-        let s2c_slots = unsafe { base.add(header_size) };
-        let tx = unsafe {
-            Lane::new(
-                s2c_slots,
-                capacity,
-                &(*header).s2c_head,
-                &(*header).s2c_tail,
-                true, // sender
-            )
-        };
-
-        // C2S lane (client sends, server receives)
-        let c2s_slots = unsafe { base.add(header_size + lane_size) };
-        let rx = unsafe {
-            Lane::new(
-                c2s_slots,
-                capacity,
-                &(*header).c2s_head,
-                &(*header).c2s_tail,
-                false, // receiver
-            )
-        };
+        // Initialize all slots to IDLE
+        for i in 0..max_clients {
+            let slot_base = unsafe { base.add(HEADER_SIZE + layout.slot_size * i as usize) };
+            unsafe {
+                let state = &*(slot_base.add(layout.state_offset) as *const AtomicU8);
+                state.store(SlotState::Idle as u8, Ordering::Relaxed);
+                let alive = &*(slot_base.add(layout.alive_offset) as *const AtomicBool);
+                alive.store(false, Ordering::Relaxed);
+            }
+        }
 
         Ok(Self {
             _shm: shm,
             header,
-            tx,
-            rx,
+            base,
+            layout,
+            max_clients,
+            poll_cursor: 0,
             _marker: PhantomData,
         })
     }
 
-    /// Returns true if a client is connected.
-    pub fn is_connected(&self) -> bool {
-        unsafe { (*self.header).client_connected.load(Ordering::Acquire) }
-    }
-
-    /// Returns true if the client has disconnected (was connected but is now gone).
-    pub fn is_disconnected(&self) -> bool {
+    fn slot_base(&self, client_id: u32) -> *mut u8 {
         unsafe {
-            (*self.header).client_connected.load(Ordering::Acquire)
-                && !(*self.header).client_alive.load(Ordering::Acquire)
+            self.base
+                .add(HEADER_SIZE + self.layout.slot_size * client_id as usize)
         }
     }
 
-    /// Attempts to send a value to the client.
-    pub fn try_send(&mut self, value: T) -> Result<(), SendError<T>> {
-        if self.is_disconnected() {
-            return Err(SendError::Disconnected(value));
-        }
-        self.tx.try_send(value).map_err(SendError::Full)
+    fn slot_state(&self, client_id: u32) -> &AtomicU8 {
+        unsafe { &*(self.slot_base(client_id).add(self.layout.state_offset) as *const AtomicU8) }
     }
 
-    /// Sends a value, blocking until space is available.
-    pub fn send(&mut self, mut value: T) -> Result<(), SendError<T>> {
-        loop {
-            match self.try_send(value) {
-                Ok(()) => return Ok(()),
-                Err(SendError::Full(v)) => {
-                    value = v;
-                    std::hint::spin_loop();
-                }
-                Err(e) => return Err(e),
+    fn slot_alive(&self, client_id: u32) -> &AtomicBool {
+        unsafe { &*(self.slot_base(client_id).add(self.layout.alive_offset) as *const AtomicBool) }
+    }
+
+    fn slot_req_ptr(&self, client_id: u32) -> *const Req {
+        unsafe { self.slot_base(client_id).add(self.layout.req_offset) as *const Req }
+    }
+
+    fn slot_resp_ptr(&self, client_id: u32) -> *mut Resp {
+        unsafe { self.slot_base(client_id).add(self.layout.resp_offset) as *mut Resp }
+    }
+
+    /// Polls for a pending request using round-robin across all allocated slots.
+    pub fn try_poll(&mut self) -> Option<(ClientId, Req)> {
+        let allocated = unsafe { (*self.header).next_client_id.load(Ordering::Relaxed) };
+        if allocated == 0 {
+            return None;
+        }
+
+        for _ in 0..allocated {
+            let id = self.poll_cursor;
+            self.poll_cursor = (self.poll_cursor + 1) % allocated;
+
+            // Skip dead clients
+            if !self.slot_alive(id).load(Ordering::Acquire) {
+                continue;
+            }
+
+            let state = self.slot_state(id);
+            if state.load(Ordering::Acquire) == SlotState::RequestReady as u8 {
+                // Read request
+                let req = unsafe { std::ptr::read_volatile(self.slot_req_ptr(id)) };
+                // Transition to PROCESSING
+                state.store(SlotState::Processing as u8, Ordering::Relaxed);
+                return Some((ClientId(id), req));
             }
         }
+
+        None
     }
 
-    /// Attempts to receive a value from the client.
-    pub fn try_recv(&mut self) -> Result<T, RecvError> {
-        match self.rx.try_recv() {
-            Ok(v) => Ok(v),
-            Err(()) => {
-                if self.is_disconnected() {
-                    Err(RecvError::Disconnected)
-                } else {
-                    Err(RecvError::Empty)
-                }
-            }
+    /// Sends a response to a client.
+    pub fn respond(&mut self, client_id: ClientId, resp: Resp) -> Result<(), RespondError> {
+        let id = client_id.0;
+        if id >= self.max_clients {
+            return Err(RespondError::InvalidClient);
         }
+
+        let allocated = unsafe { (*self.header).next_client_id.load(Ordering::Relaxed) };
+        if id >= allocated {
+            return Err(RespondError::InvalidClient);
+        }
+
+        if !self.slot_alive(id).load(Ordering::Acquire) {
+            return Err(RespondError::ClientDisconnected);
+        }
+
+        let state = self.slot_state(id);
+        if state.load(Ordering::Relaxed) != SlotState::Processing as u8 {
+            return Err(RespondError::NoRequest);
+        }
+
+        // Write response
+        unsafe { std::ptr::write_volatile(self.slot_resp_ptr(id), resp) };
+        // Transition to RESPONSE_READY
+        state.store(SlotState::ResponseReady as u8, Ordering::Release);
+
+        Ok(())
     }
 
-    /// Receives a value, blocking until one is available.
-    pub fn recv(&mut self) -> Result<T, RecvError> {
-        loop {
-            match self.try_recv() {
-                Ok(v) => return Ok(v),
-                Err(RecvError::Empty) => std::hint::spin_loop(),
-                Err(e) => return Err(e),
+    /// Returns true if a specific client is connected.
+    pub fn is_client_connected(&self, client_id: ClientId) -> bool {
+        let id = client_id.0;
+        let allocated = unsafe { (*self.header).next_client_id.load(Ordering::Relaxed) };
+        if id >= allocated {
+            return false;
+        }
+        self.slot_alive(id).load(Ordering::Acquire)
+    }
+
+    /// Returns the number of currently connected clients.
+    pub fn connected_clients(&self) -> u32 {
+        let allocated = unsafe { (*self.header).next_client_id.load(Ordering::Relaxed) };
+        let mut count = 0;
+        for i in 0..allocated {
+            if self.slot_alive(i).load(Ordering::Acquire) {
+                count += 1;
             }
         }
+        count
     }
 }
 
-impl<T: Serial> Drop for Server<T> {
+impl<Req: Serial, Resp: Serial> Drop for Server<Req, Resp> {
     fn drop(&mut self) {
         unsafe {
             (*self.header).server_alive.store(false, Ordering::Release);
@@ -369,163 +366,141 @@ impl<T: Serial> Drop for Server<T> {
     }
 }
 
-/// Client side of the shared memory channel.
-pub struct Client<T: Serial> {
+/// Client side of the RPC slot channel.
+pub struct Client<Req: Serial, Resp: Serial> {
     _shm: SharedMemory,
     header: *mut Header,
-    tx: Lane<T>,
-    rx: Lane<T>,
-    _marker: PhantomData<T>,
+    slot_base: *mut u8,
+    layout: SlotLayout,
+    client_id: u32,
+    _marker: PhantomData<(Req, Resp)>,
 }
 
-unsafe impl<T: Serial + Send> Send for Client<T> {}
+unsafe impl<Req: Serial + Send, Resp: Serial + Send> Send for Client<Req, Resp> {}
 
-impl<T: Serial> Client<T> {
+impl<Req: Serial, Resp: Serial> Client<Req, Resp> {
     /// Connects to an existing shared memory region.
     ///
     /// # Safety
     /// The caller must ensure that a server has created the shared memory
-    /// with the same type `T` and at least `capacity` slots.
-    pub unsafe fn connect<P: AsRef<Path>>(path: P, capacity: usize) -> io::Result<Self> {
-        let size = calc_shm_size::<T>(capacity);
-        let shm = unsafe { SharedMemory::open(path, size)? };
-        let base = shm.as_ptr();
+    /// with the same types `Req` and `Resp`.
+    pub unsafe fn connect<P: AsRef<Path>>(path: P) -> Result<Self, ConnectError> {
+        // First open with just the header to validate
+        let header_shm = unsafe { SharedMemory::open(&path, HEADER_SIZE)? };
+        let header = header_shm.as_ptr() as *const Header;
 
-        let header = base as *mut Header;
-
-        // Verify header
-        unsafe {
+        let (max_clients, shm_size) = unsafe {
             if (*header).magic != MAGIC {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid magic number",
-                ));
+                return Err(ConnectError::LayoutMismatch);
             }
             if (*header).version != VERSION {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "version mismatch",
-                ));
+                return Err(ConnectError::LayoutMismatch);
             }
-            if (*header).capacity != capacity as u32 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "capacity mismatch",
-                ));
-            }
-            if (*header).slot_size != std::mem::size_of::<T>() as u32 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "slot size mismatch",
-                ));
+            if (*header).req_size != std::mem::size_of::<Req>() as u32
+                || (*header).resp_size != std::mem::size_of::<Resp>() as u32
+                || (*header).req_align != std::mem::align_of::<Req>() as u32
+                || (*header).resp_align != std::mem::align_of::<Resp>() as u32
+            {
+                return Err(ConnectError::LayoutMismatch);
             }
             if !(*header).server_alive.load(Ordering::Acquire) {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    "server not alive",
-                ));
+                return Err(ConnectError::ServerNotAlive);
             }
+            let mc = (*header).max_clients;
+            (mc, calc_shm_size::<Req, Resp>(mc))
+        };
+
+        drop(header_shm);
+
+        // Re-open with full size
+        let shm = unsafe { SharedMemory::open(path, shm_size)? };
+        let base = shm.as_ptr();
+        let header = base as *mut Header;
+
+        // Allocate a slot
+        let client_id = unsafe { (*header).next_client_id.fetch_add(1, Ordering::Relaxed) };
+        if client_id >= max_clients {
+            // Undo the allocation (best-effort; slot won't be reused anyway)
+            return Err(ConnectError::ServerFull);
         }
 
-        let header_size = std::mem::size_of::<Header>();
-        let lane_size = std::mem::size_of::<T>() * capacity;
+        let layout = calc_slot_layout::<Req, Resp>();
+        let slot_base = unsafe { base.add(HEADER_SIZE + layout.slot_size * client_id as usize) };
 
-        // S2C lane (server sends, client receives)
-        let s2c_slots = unsafe { base.add(header_size) };
-        let rx = unsafe {
-            Lane::new(
-                s2c_slots,
-                capacity,
-                &(*header).s2c_head,
-                &(*header).s2c_tail,
-                false, // receiver
-            )
-        };
-
-        // C2S lane (client sends, server receives)
-        let c2s_slots = unsafe { base.add(header_size + lane_size) };
-        let tx = unsafe {
-            Lane::new(
-                c2s_slots,
-                capacity,
-                &(*header).c2s_head,
-                &(*header).c2s_tail,
-                true, // sender
-            )
-        };
-
-        // Mark as connected
+        // Mark as alive
         unsafe {
-            (*header).client_alive.store(true, Ordering::Release);
-            (*header).client_connected.store(true, Ordering::Release);
+            let alive = &*(slot_base.add(layout.alive_offset) as *const AtomicBool);
+            alive.store(true, Ordering::Release);
         }
 
         Ok(Self {
             _shm: shm,
             header,
-            tx,
-            rx,
+            slot_base,
+            layout,
+            client_id,
             _marker: PhantomData,
         })
     }
 
-    /// Returns true if the server has disconnected.
-    pub fn is_disconnected(&self) -> bool {
-        unsafe { !(*self.header).server_alive.load(Ordering::Acquire) }
+    fn slot_state(&self) -> &AtomicU8 {
+        unsafe { &*(self.slot_base.add(self.layout.state_offset) as *const AtomicU8) }
     }
 
-    /// Attempts to send a value to the server.
-    pub fn try_send(&mut self, value: T) -> Result<(), SendError<T>> {
-        if self.is_disconnected() {
-            return Err(SendError::Disconnected(value));
-        }
-        self.tx.try_send(value).map_err(SendError::Full)
+    fn req_ptr(&self) -> *mut Req {
+        unsafe { self.slot_base.add(self.layout.req_offset) as *mut Req }
     }
 
-    /// Sends a value, blocking until space is available.
-    pub fn send(&mut self, mut value: T) -> Result<(), SendError<T>> {
+    fn resp_ptr(&self) -> *const Resp {
+        unsafe { self.slot_base.add(self.layout.resp_offset) as *const Resp }
+    }
+
+    /// Synchronous blocking RPC call.
+    pub fn call(&mut self, req: Req) -> Result<Resp, CallError> {
+        let state = self.slot_state();
+
+        // Write request
+        unsafe { std::ptr::write_volatile(self.req_ptr(), req) };
+        // Transition: IDLE → REQUEST_READY
+        state.store(SlotState::RequestReady as u8, Ordering::Release);
+
+        // Spin until RESPONSE_READY
         loop {
-            match self.try_send(value) {
-                Ok(()) => return Ok(()),
-                Err(SendError::Full(v)) => {
-                    value = v;
-                    std::hint::spin_loop();
-                }
-                Err(e) => return Err(e),
+            let s = state.load(Ordering::Acquire);
+            if s == SlotState::ResponseReady as u8 {
+                break;
             }
+            // Check server liveness
+            if !self.is_server_alive() {
+                return Err(CallError::ServerDisconnected);
+            }
+            std::hint::spin_loop();
         }
+
+        // Read response
+        let resp = unsafe { std::ptr::read_volatile(self.resp_ptr()) };
+        // Transition: RESPONSE_READY → IDLE
+        state.store(SlotState::Idle as u8, Ordering::Release);
+
+        Ok(resp)
     }
 
-    /// Attempts to receive a value from the server.
-    pub fn try_recv(&mut self) -> Result<T, RecvError> {
-        match self.rx.try_recv() {
-            Ok(v) => Ok(v),
-            Err(()) => {
-                if self.is_disconnected() {
-                    Err(RecvError::Disconnected)
-                } else {
-                    Err(RecvError::Empty)
-                }
-            }
-        }
+    /// Returns the client's slot ID.
+    pub fn id(&self) -> ClientId {
+        ClientId(self.client_id)
     }
 
-    /// Receives a value, blocking until one is available.
-    pub fn recv(&mut self) -> Result<T, RecvError> {
-        loop {
-            match self.try_recv() {
-                Ok(v) => return Ok(v),
-                Err(RecvError::Empty) => std::hint::spin_loop(),
-                Err(e) => return Err(e),
-            }
-        }
+    /// Returns true if the server is still alive.
+    pub fn is_server_alive(&self) -> bool {
+        unsafe { (*self.header).server_alive.load(Ordering::Acquire) }
     }
 }
 
-impl<T: Serial> Drop for Client<T> {
+impl<Req: Serial, Resp: Serial> Drop for Client<Req, Resp> {
     fn drop(&mut self) {
         unsafe {
-            (*self.header).client_alive.store(false, Ordering::Release);
+            let alive = &*(self.slot_base.add(self.layout.alive_offset) as *const AtomicBool);
+            alive.store(false, Ordering::Release);
         }
     }
 }
@@ -535,40 +510,122 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_server_client() {
-        let name = format!("/shm_spsc_test_{}", std::process::id());
+    fn test_basic_rpc() {
+        let name = format!("/shm_rpc_basic_{}", std::process::id());
 
         unsafe {
-            let mut server = Server::<u64>::create(&name, 64).unwrap();
-            assert!(!server.is_connected());
+            let mut server = Server::<u64, u64>::create(&name, 4).unwrap();
 
-            let mut client = Client::<u64>::connect(&name, 64).unwrap();
-            assert!(server.is_connected());
+            let name_clone = name.clone();
+            let client_thread = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                let mut client = Client::<u64, u64>::connect(&name_clone).unwrap();
+                let resp = client.call(42).unwrap();
+                assert_eq!(resp, 43);
+            });
 
-            // Server -> Client
-            server.send(42).unwrap();
-            assert_eq!(client.recv().unwrap(), 42);
+            // Poll for request
+            loop {
+                if let Some((cid, req)) = server.try_poll() {
+                    assert_eq!(req, 42);
+                    server.respond(cid, req + 1).unwrap();
+                    break;
+                }
+                std::hint::spin_loop();
+            }
 
-            // Client -> Server
-            client.send(123).unwrap();
-            assert_eq!(server.recv().unwrap(), 123);
+            client_thread.join().unwrap();
         }
     }
 
     #[test]
     fn test_disconnect_detection() {
-        let name = format!("/shm_spsc_disc_{}", std::process::id());
+        let name = format!("/shm_rpc_disc_{}", std::process::id());
 
         unsafe {
-            let server = Server::<u64>::create(&name, 64).unwrap();
+            let server = Server::<u64, u64>::create(&name, 4).unwrap();
 
+            let name_clone = name.clone();
             {
-                let _client = Client::<u64>::connect(&name, 64).unwrap();
-                assert!(server.is_connected());
+                let client = Client::<u64, u64>::connect(&name_clone).unwrap();
+                assert!(server.is_client_connected(client.id()));
+                let cid = client.id();
+                drop(client);
+                assert!(!server.is_client_connected(cid));
+            }
+        }
+    }
+
+    #[test]
+    fn test_server_disconnect() {
+        let name = format!("/shm_rpc_sdisc_{}", std::process::id());
+
+        unsafe {
+            let server = Server::<u64, u64>::create(&name, 4).unwrap();
+            let name_clone = name.clone();
+            let client = Client::<u64, u64>::connect(&name_clone).unwrap();
+            assert!(client.is_server_alive());
+            drop(server);
+            assert!(!client.is_server_alive());
+        }
+    }
+
+    #[test]
+    fn test_multiple_calls() {
+        let name = format!("/shm_rpc_multi_{}", std::process::id());
+
+        unsafe {
+            let mut server = Server::<u64, u64>::create(&name, 4).unwrap();
+
+            let name_clone = name.clone();
+            let client_thread = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                let mut client = Client::<u64, u64>::connect(&name_clone).unwrap();
+                for i in 0..100u64 {
+                    let resp = client.call(i).unwrap();
+                    assert_eq!(resp, i * 2);
+                }
+            });
+
+            let mut served = 0;
+            while served < 100 {
+                if let Some((cid, req)) = server.try_poll() {
+                    server.respond(cid, req * 2).unwrap();
+                    served += 1;
+                } else {
+                    std::hint::spin_loop();
+                }
             }
 
-            // Client dropped
-            assert!(server.is_disconnected());
+            client_thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_different_req_resp_types() {
+        let name = format!("/shm_rpc_types_{}", std::process::id());
+
+        unsafe {
+            let mut server = Server::<u32, u64>::create(&name, 4).unwrap();
+
+            let name_clone = name.clone();
+            let client_thread = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                let mut client = Client::<u32, u64>::connect(&name_clone).unwrap();
+                let resp = client.call(10u32).unwrap();
+                assert_eq!(resp, 100u64);
+            });
+
+            loop {
+                if let Some((cid, req)) = server.try_poll() {
+                    assert_eq!(req, 10u32);
+                    server.respond(cid, req as u64 * 10).unwrap();
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+
+            client_thread.join().unwrap();
         }
     }
 }

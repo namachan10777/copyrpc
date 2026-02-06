@@ -1,251 +1,136 @@
-//! Benchmark for shm_spsc ping-pong latency.
+//! Benchmark for shm_spsc RPC call latency.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use shm_spsc::{Client, Server};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use uuid::Uuid;
 
-fn bench_pingpong(c: &mut Criterion) {
-    let mut group = c.benchmark_group("shm_spsc_pingpong");
+fn bench_call_latency(c: &mut Criterion) {
+    let mut group = c.benchmark_group("shm_rpc_call");
     group.throughput(Throughput::Elements(1));
 
-    for capacity in [64, 256, 1024, 4096] {
-        group.bench_with_input(
-            BenchmarkId::new("capacity", capacity),
-            &capacity,
-            |b, &capacity| {
-                let name = format!("/shm_bench_{}", Uuid::now_v7());
-
-                unsafe {
-                    let mut server = Server::<u64>::create(&name, capacity).unwrap();
-
-                    let name_clone = name.clone();
-                    let stop = Arc::new(AtomicBool::new(false));
-                    let stop_clone = stop.clone();
-
-                    let client_thread = thread::spawn(move || {
-                        let mut client =
-                            Client::<u64>::connect(&name_clone, capacity).unwrap();
-
-                        while !stop_clone.load(Ordering::Relaxed) {
-                            if let Ok(val) = client.try_recv() {
-                                client.send(val).unwrap();
-                            }
-                        }
-                    });
-
-                    // Wait for connection
-                    while !server.is_connected() {
-                        std::hint::spin_loop();
-                    }
-
-                    // Warmup
-                    for _ in 0..1000 {
-                        server.send(0).unwrap();
-                        server.recv().unwrap();
-                    }
-
-                    b.iter(|| {
-                        server.send(black_box(42u64)).unwrap();
-                        black_box(server.recv().unwrap());
-                    });
-
-                    stop.store(true, Ordering::Relaxed);
-                    // Send one more to wake up the client
-                    server.send(0).ok();
-                    client_thread.join().unwrap();
-                }
-            },
-        );
-    }
-
-    group.finish();
-}
-
-fn bench_throughput(c: &mut Criterion) {
-    let mut group = c.benchmark_group("shm_spsc_throughput");
-
-    for capacity in [256, 1024, 4096] {
-        group.throughput(Throughput::Elements(1000));
-
-        group.bench_with_input(
-            BenchmarkId::new("capacity", capacity),
-            &capacity,
-            |b, &capacity| {
-                let name = format!("/shm_tput_{}", Uuid::now_v7());
-                let batch_size = 1000u64;
-
-                unsafe {
-                    let mut server = Server::<u64>::create(&name, capacity).unwrap();
-
-                    let name_clone = name.clone();
-                    let stop = Arc::new(AtomicBool::new(false));
-                    let stop_clone = stop.clone();
-
-                    let client_thread = thread::spawn(move || {
-                        let mut client =
-                            Client::<u64>::connect(&name_clone, capacity).unwrap();
-                        let mut count = 0u64;
-
-                        while !stop_clone.load(Ordering::Relaxed) {
-                            if client.try_recv().is_ok() {
-                                count += 1;
-                            }
-                        }
-
-                        // Drain remaining
-                        while client.try_recv().is_ok() {
-                            count += 1;
-                        }
-
-                        count
-                    });
-
-                    // Wait for connection
-                    while !server.is_connected() {
-                        std::hint::spin_loop();
-                    }
-
-                    // Warmup
-                    for i in 0..1000 {
-                        server.send(i).unwrap();
-                    }
-                    thread::sleep(std::time::Duration::from_millis(10));
-
-                    b.iter(|| {
-                        for i in 0..batch_size {
-                            server.send(black_box(i)).unwrap();
-                        }
-                    });
-
-                    stop.store(true, Ordering::Relaxed);
-                    client_thread.join().unwrap();
-                }
-            },
-        );
-    }
-
-    group.finish();
-}
-
-fn bench_message_sizes(c: &mut Criterion) {
-    let mut group = c.benchmark_group("shm_spsc_sizes");
-    group.throughput(Throughput::Elements(1));
-
-    // 8 bytes
-    group.bench_function("8_bytes", |b| {
-        let name = format!("/shm_size8_{}", Uuid::now_v7());
-        let capacity = 1024;
+    // u64 request/response
+    group.bench_function("u64", |b| {
+        let name = format!("/shm_rpc_bench_{}", Uuid::now_v7());
 
         unsafe {
-            let mut server = Server::<u64>::create(&name, capacity).unwrap();
+            let mut server = Server::<u64, u64>::create(&name, 4).unwrap();
 
             let name_clone = name.clone();
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = stop.clone();
 
-            let client_thread = thread::spawn(move || {
-                let mut client = Client::<u64>::connect(&name_clone, capacity).unwrap();
+            let server_thread = thread::spawn(move || {
                 while !stop_clone.load(Ordering::Relaxed) {
-                    if let Ok(val) = client.try_recv() {
-                        client.send(val).unwrap();
+                    if let Some((cid, req)) = server.try_poll() {
+                        server.respond(cid, req + 1).unwrap();
                     }
                 }
             });
 
-            while !server.is_connected() {
-                std::hint::spin_loop();
+            // Wait for server to be ready
+            thread::sleep(std::time::Duration::from_millis(10));
+
+            let mut client = Client::<u64, u64>::connect(&name_clone).unwrap();
+
+            // Warmup
+            for _ in 0..1000 {
+                client.call(0).unwrap();
             }
 
             b.iter(|| {
-                server.send(black_box(42u64)).unwrap();
-                black_box(server.recv().unwrap());
+                black_box(client.call(black_box(42u64)).unwrap());
             });
 
             stop.store(true, Ordering::Relaxed);
-            server.send(0).ok();
-            client_thread.join().unwrap();
+            server_thread.join().unwrap();
         }
     });
 
-    // 64 bytes
+    // [u8; 64] request/response
     group.bench_function("64_bytes", |b| {
-        let name = format!("/shm_size64_{}", Uuid::now_v7());
-        let capacity = 1024;
+        let name = format!("/shm_rpc_bench64_{}", Uuid::now_v7());
 
         unsafe {
-            let mut server = Server::<[u8; 64]>::create(&name, capacity).unwrap();
+            let mut server =
+                Server::<[u8; 64], [u8; 64]>::create(&name, 4).unwrap();
 
             let name_clone = name.clone();
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = stop.clone();
 
-            let client_thread = thread::spawn(move || {
-                let mut client = Client::<[u8; 64]>::connect(&name_clone, capacity).unwrap();
+            let server_thread = thread::spawn(move || {
                 while !stop_clone.load(Ordering::Relaxed) {
-                    if let Ok(val) = client.try_recv() {
-                        client.send(val).unwrap();
+                    if let Some((cid, req)) = server.try_poll() {
+                        server.respond(cid, req).unwrap();
                     }
                 }
             });
 
-            while !server.is_connected() {
-                std::hint::spin_loop();
+            thread::sleep(std::time::Duration::from_millis(10));
+
+            let mut client =
+                Client::<[u8; 64], [u8; 64]>::connect(&name_clone).unwrap();
+
+            // Warmup
+            for _ in 0..1000 {
+                client.call([0u8; 64]).unwrap();
             }
 
-            let data = [0u8; 64];
+            let data = [0xABu8; 64];
             b.iter(|| {
-                server.send(black_box(data)).unwrap();
-                black_box(server.recv().unwrap());
+                black_box(client.call(black_box(data)).unwrap());
             });
 
             stop.store(true, Ordering::Relaxed);
-            server.send([0u8; 64]).ok();
-            client_thread.join().unwrap();
+            server_thread.join().unwrap();
         }
     });
 
-    // 256 bytes
+    // [u8; 256] request/response
     group.bench_function("256_bytes", |b| {
-        let name = format!("/shm_size256_{}", Uuid::now_v7());
-        let capacity = 1024;
+        let name = format!("/shm_rpc_bench256_{}", Uuid::now_v7());
 
         unsafe {
-            let mut server = Server::<[u8; 256]>::create(&name, capacity).unwrap();
+            let mut server =
+                Server::<[u8; 256], [u8; 256]>::create(&name, 4).unwrap();
 
             let name_clone = name.clone();
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = stop.clone();
 
-            let client_thread = thread::spawn(move || {
-                let mut client = Client::<[u8; 256]>::connect(&name_clone, capacity).unwrap();
+            let server_thread = thread::spawn(move || {
                 while !stop_clone.load(Ordering::Relaxed) {
-                    if let Ok(val) = client.try_recv() {
-                        client.send(val).unwrap();
+                    if let Some((cid, req)) = server.try_poll() {
+                        server.respond(cid, req).unwrap();
                     }
                 }
             });
 
-            while !server.is_connected() {
-                std::hint::spin_loop();
+            thread::sleep(std::time::Duration::from_millis(10));
+
+            let mut client =
+                Client::<[u8; 256], [u8; 256]>::connect(&name_clone).unwrap();
+
+            // Warmup
+            for _ in 0..1000 {
+                client.call([0u8; 256]).unwrap();
             }
 
-            let data = [0u8; 256];
+            let data = [0xABu8; 256];
             b.iter(|| {
-                server.send(black_box(data)).unwrap();
-                black_box(server.recv().unwrap());
+                black_box(client.call(black_box(data)).unwrap());
             });
 
             stop.store(true, Ordering::Relaxed);
-            server.send([0u8; 256]).ok();
-            client_thread.join().unwrap();
+            server_thread.join().unwrap();
         }
     });
 
     group.finish();
 }
 
-criterion_group!(benches, bench_pingpong, bench_throughput, bench_message_sizes);
+criterion_group!(benches, bench_call_latency);
 criterion_main!(benches);
