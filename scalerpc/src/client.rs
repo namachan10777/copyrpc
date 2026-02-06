@@ -356,9 +356,6 @@ pub struct RpcClient {
     connection_states: Vec<Option<ConnectionState>>,
     /// Configuration.
     config: ClientConfig,
-    /// Protection domain reference for buffer allocation.
-    #[allow(dead_code)]
-    pd_ptr: *const Pd,
     /// Connections that need doorbell flush (for batching).
     needs_flush: RefCell<Vec<ConnectionId>>,
     /// Shared send completion queue (all QPs share this).
@@ -383,7 +380,6 @@ impl RpcClient {
             connections: Vec::new(),
             connection_states: Vec::new(),
             config,
-            pd_ptr: pd as *const Pd,
             needs_flush: RefCell::new(Vec::new()),
             shared_send_cq: None,
             shared_recv_cq: None,
@@ -411,14 +407,6 @@ impl RpcClient {
                 s.warmup_buffer.borrow().request_count(),
                 s.last_notified_count.get(),
             ))
-    }
-
-    /// Transition connection to a new state.
-    #[allow(dead_code)]
-    fn set_state(&self, conn_id: ConnectionId, new_state: ClientState) {
-        if let Some(Some(state)) = self.connection_states.get(conn_id) {
-            state.state.set(new_state);
-        }
     }
 
     /// Get the event buffer address for a connection.

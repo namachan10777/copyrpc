@@ -348,22 +348,6 @@ impl<U: 'static> Rpc<U> {
         Ok(BufInfo { idx: buf_idx })
     }
 
-    /// Check if sending is allowed now based on Timely rate limiting.
-    /// Reserved for future use when blocking/queuing on rate limit is implemented.
-    #[allow(dead_code)]
-    fn can_send_now(&self, session: SessionHandle) -> bool {
-        if !self.config.enable_cc {
-            return true;
-        }
-
-        let sessions = self.sessions.borrow();
-        if let Some(sess) = sessions.get(session)
-            && sess.cc_state.is_some() {
-                return current_time_us() >= sess.next_send_time_us.get();
-            }
-        true
-    }
-
     /// Update the next allowed send time based on Timely rate and bytes sent.
     fn update_next_send_time(&self, session: SessionHandle, bytes_sent: usize, now: u64) {
         if !self.config.enable_cc {
@@ -798,66 +782,6 @@ impl<U: 'static> Rpc<U> {
         // Note: Credit is implicitly returned with the response packet.
         // The client's handle_response() calls sess.return_credit() upon receiving this.
         // Explicit CreditReturn packets are only needed for one-way messages without responses.
-
-        Ok(())
-    }
-
-    /// Send a CreditReturn packet to return credits to the client.
-    /// Used for one-way messages where no response is sent.
-    #[allow(dead_code)]
-    fn send_credit_return(&self, session_num: u16) -> Result<()> {
-        // Get session info
-        let remote_session_num = {
-            let sessions = self.sessions.borrow();
-            let handle = SessionHandle(session_num);
-            let sess = sessions
-                .get(handle)
-                .ok_or(Error::SessionNotFound(session_num))?;
-            sess.remote_session_num
-        };
-
-        // Prepare CreditReturn packet (header only, no payload)
-        let hdr = PktHdr::new(
-            0,                   // req_type (unused for CreditReturn)
-            1,                   // msg_size: 1 credit being returned
-            remote_session_num,
-            PktType::CreditReturn,
-            0,                   // pkt_num
-            0,                   // req_num (unused)
-        );
-
-        // Allocate and prepare buffer
-        let (buf_idx, addr, lkey) = {
-            let mut send_buffers = self.send_buffers.borrow_mut();
-            let (buf_idx, buf) = send_buffers.alloc().ok_or(Error::RequestQueueFull)?;
-
-            unsafe {
-                hdr.write_to(buf.as_mut_ptr());
-            }
-
-            let addr = send_buffers.slot_addr(buf_idx);
-            let lkey = send_buffers.lkey();
-            (buf_idx, addr, lkey)
-        };
-
-        // Post send
-        let av = {
-            let sessions = self.sessions.borrow();
-            let handle = SessionHandle(session_num);
-            let sess = sessions.get(handle).ok_or(Error::SessionNotFound(session_num))?;
-            let ah = sess.ah.as_ref().ok_or(Error::SessionNotConnected(session_num))?;
-            UdTransport::ah_to_av(ah)
-        };
-
-        let entry = TransportEntry {
-            buf_idx,
-            session_num,
-            context: 0,
-            buf_type: BufferType::Response, // Free on send completion
-        };
-
-        self.transport.post_send_raw(av, addr, PKT_HDR_SIZE as u32, lkey, entry)?;
-        // Doorbell is batched in run_event_loop_once()
 
         Ok(())
     }

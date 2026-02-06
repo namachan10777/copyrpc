@@ -24,8 +24,6 @@ use mlx5::srq::SrqConfig;
 // Constants
 // =============================================================================
 
-const NUM_ENDPOINTS: usize = 1;
-const REQUESTS_PER_EP: usize = 32;
 const MESSAGE_SIZE: usize = 32;
 const RING_SIZE: usize = 1 << 20; // 1 MB
 
@@ -118,7 +116,7 @@ struct BenchmarkSetup {
     _server_handle: ServerHandle,
 }
 
-fn setup_copyrpc_benchmark() -> Option<BenchmarkSetup> {
+fn setup_copyrpc_benchmark(config: &BenchConfig) -> Option<BenchmarkSetup> {
     // Reset response counter
     get_and_reset_response_count();
 

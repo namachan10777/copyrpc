@@ -114,7 +114,6 @@ pub struct MessagePool {
     /// Raw pointer to the allocated buffer.
     buffer: *mut u8,
     /// Total size of the buffer in bytes.
-    #[allow(dead_code)]
     buffer_size: usize,
     /// Memory region registered with the HCA.
     mr: MemoryRegion,
@@ -188,6 +187,11 @@ impl MessagePool {
     /// Get the data size per slot.
     pub fn slot_data_size(&self) -> usize {
         self.slot_data_size
+    }
+
+    /// Get the total buffer size in bytes.
+    pub fn buffer_size(&self) -> usize {
+        self.buffer_size
     }
 
     /// Get the local key for this memory region.

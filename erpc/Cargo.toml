@@ -5,10 +5,11 @@ edition = "2024"
 
 [dependencies]
 mlx5 = { path = "../mlx5" }
-libc = "0.2"
+libc.workspace = true
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion.workspace = true
+mlx5 = { path = "../mlx5", features = ["test-utils"] }
 
 [[bench]]
 name = "rpc_bench"

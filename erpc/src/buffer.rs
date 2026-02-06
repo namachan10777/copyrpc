@@ -413,12 +413,6 @@ impl FreeListRing {
         self.tail.wrapping_sub(self.head) as usize
     }
 
-    /// Check if the ring buffer is empty.
-    #[inline]
-    #[allow(dead_code)]
-    fn is_empty(&self) -> bool {
-        self.head == self.tail
-    }
 }
 
 /// A zero-copy buffer pool with single MR registration.

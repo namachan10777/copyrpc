@@ -7,19 +7,19 @@ edition = "2024"
 fastmap = { version = "0.1.0", path = "../fastmap" }
 mlx5 = { version = "0.1.0", path = "../mlx5" }
 mlx5_sys = { version = "0.1.0", path = "../mlx5_sys" }
-slab = "0.4"
-mpi = { version = "0.8", optional = true }
-clap = { version = "4", features = ["derive"], optional = true }
-parquet = { version = "54", optional = true }
-arrow = { version = "54", optional = true }
-libc = { version = "0.2", optional = true }
+slab.workspace = true
+mpi = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+parquet = { workspace = true, optional = true }
+arrow = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
 
 [features]
 bench-bin = ["mpi", "clap", "parquet", "arrow", "libc"]
 
 [dev-dependencies]
-criterion = "0.5"
-libc = "0.2"
+criterion.workspace = true
+libc.workspace = true
 
 [[bench]]
 name = "copyrpc_pingpong"

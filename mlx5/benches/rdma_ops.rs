@@ -31,6 +31,7 @@ use mlx5::emit_ud_wqe;
 use mlx5::mono_cq::MonoCqRc;
 use mlx5::pd::{AccessFlags, MemoryRegion, Pd};
 use mlx5::qp::{RcQpConfig, RcQpForMonoCq};
+use mlx5::test_utils::{self, AlignedBuffer};
 use mlx5::ud::{UdQpConfig, UdQpIb};
 use mlx5::transport::IbRemoteQpInfo;
 use mlx5::wqe::WqeFlags;
@@ -55,7 +56,6 @@ const RDMA_BUFFER_SIZE: usize = 1024 * 1024; // 1MiB total (WQEs write to same b
 
 // Common constants
 const SMALL_MSG_SIZE: usize = 32;
-const PAGE_SIZE: usize = 4096;
 
 // UD Send/Recv benchmark constants
 const UD_QUEUE_DEPTH: usize = 1024;
@@ -64,62 +64,11 @@ const UD_RECV_ENTRY_SIZE: usize = 128;
 const UD_BUFFER_SIZE: usize = UD_QUEUE_DEPTH * UD_RECV_ENTRY_SIZE;
 
 // =============================================================================
-// Aligned Buffer
-// =============================================================================
-
-struct AlignedBuffer {
-    ptr: *mut u8,
-    size: usize,
-}
-
-impl AlignedBuffer {
-    fn new(size: usize) -> Self {
-        let aligned_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let ptr = unsafe {
-            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            let ret = libc::posix_memalign(&mut ptr, PAGE_SIZE, aligned_size);
-            if ret != 0 {
-                panic!("posix_memalign failed: {}", ret);
-            }
-            std::ptr::write_bytes(ptr as *mut u8, 0, aligned_size);
-            ptr as *mut u8
-        };
-        Self {
-            ptr,
-            size: aligned_size,
-        }
-    }
-
-    fn as_ptr(&self) -> *mut u8 {
-        self.ptr
-    }
-
-    fn addr(&self) -> u64 {
-        self.ptr as u64
-    }
-
-    fn size(&self) -> usize {
-        self.size
-    }
-}
-
-impl Drop for AlignedBuffer {
-    fn drop(&mut self) {
-        unsafe {
-            libc::free(self.ptr as *mut std::ffi::c_void);
-        }
-    }
-}
-
-// =============================================================================
 // Full Access Flags
 // =============================================================================
 
 fn full_access() -> AccessFlags {
-    AccessFlags::LOCAL_WRITE
-        | AccessFlags::REMOTE_WRITE
-        | AccessFlags::REMOTE_READ
-        | AccessFlags::REMOTE_ATOMIC
+    test_utils::full_access()
 }
 
 fn full_access_relaxed() -> AccessFlags {

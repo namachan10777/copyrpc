@@ -7,6 +7,17 @@ resolver = "3"
 libc = "0.2"
 anyhow = "1"
 bindgen = "0.72"
+criterion = { version = "0.5", features = ["html_reports"] }
+slab = "0.4"
+mpi = "0.8"
+clap = { version = "4", features = ["derive"] }
+parquet = "54"
+arrow = "54"
+core_affinity = "0.8"
+bitflags = "2"
+rapidhash = "1"
+nix = { version = "0.30", features = ["fs", "mman"] }
+minstant = "0.1"
 
 # ベンチマーク用最適化設定
 [profile.bench]

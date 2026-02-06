@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use crate::serial::Serial;
 
+use super::common::CachePadded;
 use super::{Response, Transport, TransportEndpoint, TransportError};
 
 // ============================================================================
@@ -35,25 +36,6 @@ impl<T> std::fmt::Display for SendError<T> {
 }
 
 impl<T: std::fmt::Debug> std::error::Error for SendError<T> {}
-
-/// Cache-line padded atomic usize for avoiding false sharing.
-#[repr(C, align(64))]
-struct CachePadded<T> {
-    value: T,
-}
-
-impl<T> CachePadded<T> {
-    fn new(value: T) -> Self {
-        Self { value }
-    }
-}
-
-impl<T> std::ops::Deref for CachePadded<T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        &self.value
-    }
-}
 
 /// Inner channel state shared between sender and receiver.
 struct Inner<T> {

@@ -245,19 +245,15 @@ impl RequestReliability {
 pub struct ResponseReliability {
     /// Go-Back-N state for receiving response packets.
     gbn: GoBackNState,
-    /// Expected total message size (reserved for future use).
-    #[allow(dead_code)]
-    msg_size: usize,
     /// Bytes received so far.
     bytes_recvd: usize,
 }
 
 impl ResponseReliability {
     /// Create a new response reliability state.
-    pub fn new(num_pkts: u16, msg_size: usize) -> Self {
+    pub fn new(num_pkts: u16) -> Self {
         Self {
             gbn: GoBackNState::new(num_pkts, MAX_PKT_NUM),
-            msg_size,
             bytes_recvd: 0,
         }
     }

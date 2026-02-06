@@ -96,6 +96,9 @@ pub mod types;
 pub mod ud;
 pub mod wqe;
 
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
+
 /// Trait for queues that can receive completion notifications from a CQ.
 ///
 /// Implemented by RcQp, UdQp, Dci, TmSrq, etc.

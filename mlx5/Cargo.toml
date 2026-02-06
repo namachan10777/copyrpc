@@ -3,23 +3,29 @@ name = "mlx5"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+test-utils = ["dep:libc"]
+
 [dependencies]
-bitflags = "2"
+bitflags.workspace = true
 fastmap = { version = "0.1.0", path = "../fastmap" }
 mlx5_sys = { version = "0.1.0", path = "../mlx5_sys" }
-rapidhash = "1"
+rapidhash.workspace = true
+libc = { workspace = true, optional = true }
 
 [dev-dependencies]
-libc = "0.2"
-criterion = { version = "0.5", features = ["html_reports"] }
+libc.workspace = true
+criterion.workspace = true
 
 [[bench]]
 name = "rdma_ops"
 harness = false
+required-features = ["test-utils"]
 
 [[bench]]
 name = "multi_qp"
 harness = false
+required-features = ["test-utils"]
 
 [lints.clippy]
 manual_div_ceil = "allow"

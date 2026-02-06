@@ -196,10 +196,6 @@ struct RecvMessage<U> {
     data_offset: usize,
     /// Length of the payload.
     data_len: usize,
-    /// Position in the receive ring (for consumer advancement).
-    recv_pos: u64,
-    /// Receive ring length.
-    recv_ring_len: usize,
 }
 
 /// RPC context managing multiple endpoints.
@@ -527,14 +523,12 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
     /// Returns `None` if no request is available.
     pub fn recv(&self) -> Option<RecvHandle<'_, U, F>> {
         self.recv_stack.borrow_mut().pop().map(|msg| RecvHandle {
-            ctx: self,
+            _lifetime: PhantomData,
             endpoint: msg.endpoint,
             qpn: msg.qpn,
             call_id: msg.call_id,
             data_offset: msg.data_offset,
             data_len: msg.data_len,
-            recv_pos: msg.recv_pos,
-            recv_ring_len: msg.recv_ring_len,
         })
     }
 
@@ -625,8 +619,6 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
                     call_id,
                     data_offset: header_offset + HEADER_SIZE,
                     data_len: payload_len as usize,
-                    recv_pos: pos,
-                    recv_ring_len,
                 });
             }
         }
@@ -653,9 +645,6 @@ struct EndpointInner<U> {
     remote_recv_ring: Cell<Option<RemoteRingInfo>>,
     /// Send ring producer position (virtual).
     send_ring_producer: Cell<u64>,
-    /// Send ring consumer position (from remote pigbyback).
-    #[allow(dead_code)]
-    send_ring_consumer: Cell<u64>,
     /// Receive ring producer position (updated on receive).
     recv_ring_producer: Cell<u64>,
     /// Last received message position (consumer).
@@ -758,7 +747,6 @@ impl<U> EndpointInner<U> {
             recv_ring_mr,
             remote_recv_ring: Cell::new(None),
             send_ring_producer: Cell::new(0),
-            send_ring_consumer: Cell::new(0),
             recv_ring_producer: Cell::new(0),
             last_recv_pos: Cell::new(0),
             remote_consumer: RemoteConsumer::new(),
@@ -1104,17 +1092,12 @@ pub struct RecvHandle<'a, U, F>
 where
     F: Fn(U, &[u8]),
 {
-    #[allow(dead_code)]
-    ctx: &'a Context<U, F>,
+    _lifetime: PhantomData<&'a Context<U, F>>,
     endpoint: Rc<RefCell<EndpointInner<U>>>,
     qpn: u32,
     call_id: u32,
     data_offset: usize,
     data_len: usize,
-    #[allow(dead_code)]
-    recv_pos: u64,
-    #[allow(dead_code)]
-    recv_ring_len: usize,
 }
 
 impl<U, F: Fn(U, &[u8])> RecvHandle<'_, U, F> {
@@ -1212,10 +1195,3 @@ impl<U, F: Fn(U, &[u8])> RecvHandle<'_, U, F> {
     }
 }
 
-impl<U, F: Fn(U, &[u8])> Drop for RecvHandle<'_, U, F> {
-    fn drop(&mut self) {
-        // Consumer position is already advanced in process_cqe().
-        // No need to update here - doing so would cause incorrect behavior
-        // when multiple messages are popped from recv_stack in reverse order.
-    }
-}

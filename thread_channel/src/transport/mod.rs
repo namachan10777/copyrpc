@@ -10,6 +10,7 @@
 //! - Receive requests via `recv()` and send responses via `reply()`
 //! - Tokens flow from one endpoint to the other for request/response matching
 
+pub(crate) mod common;
 pub mod fastforward;
 pub mod lamport;
 #[cfg(feature = "omango")]

@@ -4,13 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-nix = { version = "0.30", features = ["mman", "fs"] }
-libc = "0.2"
+nix.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion.workspace = true
 uuid = { version = "1", features = ["v7"] }
-core_affinity = "0.8"
+core_affinity.workspace = true
 
 [[bench]]
 name = "pingpong"

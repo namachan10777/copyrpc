@@ -401,19 +401,6 @@ fn multi_qp_server_thread(
 // Server Thread
 // =============================================================================
 
-#[allow(dead_code)]
-fn server_thread_main(
-    info_tx: Sender<ConnectionInfo>,
-    info_rx: Receiver<ConnectionInfo>,
-    ready_signal: Arc<AtomicU32>,
-    stop_flag: Arc<AtomicBool>,
-) {
-    let config = RpcConfig::default()
-        .with_req_window(16)
-        .with_session_credits(64);
-    server_thread_main_with_config(info_tx, info_rx, ready_signal, stop_flag, config);
-}
-
 fn server_thread_main_with_config(
     info_tx: Sender<ConnectionInfo>,
     info_rx: Receiver<ConnectionInfo>,

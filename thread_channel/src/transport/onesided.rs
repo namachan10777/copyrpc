@@ -24,25 +24,12 @@ use std::sync::Arc;
 
 use crate::serial::Serial;
 
+use super::common::{self, CachePadded, DisconnectState};
 use super::{Response, Transport, TransportEndpoint, TransportError};
 
 // ============================================================================
 // SPSC Implementation (Producer-only write, index-based)
 // ============================================================================
-
-/// Slip maintenance constants (FastForward PPoPP 2008 Section 3.4.1)
-const CACHE_LINE_SIZE: usize = 64;
-const ENTRY_SIZE: usize = 8; // pointer size
-const ENTRIES_PER_LINE: usize = CACHE_LINE_SIZE / ENTRY_SIZE; // = 8
-
-/// DANGER: slip lost threshold (2 cache lines)
-const SLIP_DANGER: usize = ENTRIES_PER_LINE * 2; // = 16
-
-/// GOOD: target slip (6 cache lines)
-const SLIP_GOOD: usize = ENTRIES_PER_LINE * 6; // = 48
-
-/// Slip adjustment frequency
-const SLIP_CHECK_INTERVAL: usize = 64;
 
 /// Error returned when sending fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,16 +43,6 @@ impl<T> std::fmt::Display for SendError<T> {
 
 impl<T: std::fmt::Debug> std::error::Error for SendError<T> {}
 
-/// Shared state for disconnect detection.
-#[repr(C, align(64))]
-struct Shared {
-    tx_alive: AtomicBool,
-    rx_alive: AtomicBool,
-}
-
-/// Cache-padded atomic usize.
-#[repr(C, align(64))]
-struct CachePaddedAtomicUsize(AtomicUsize);
 
 /// Slot with embedded generation counter for adaptive visibility.
 ///
@@ -89,9 +66,9 @@ impl<T> Slot<T> {
 
 /// Inner channel state.
 struct Inner<T> {
-    shared: Shared,
+    shared: DisconnectState,
     /// Producer head published via sync() (only producer writes)
-    shared_head: CachePaddedAtomicUsize,
+    shared_head: CachePadded<AtomicUsize>,
     /// Ring buffer with embedded generation counters
     slots: Box<[Slot<T>]>,
 }
@@ -148,11 +125,11 @@ pub fn channel<T: Serial>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     let slots: Box<[Slot<T>]> = (0..cap).map(|_| Slot::new()).collect();
 
     let inner = Arc::new(Inner {
-        shared: Shared {
+        shared: DisconnectState {
             tx_alive: AtomicBool::new(true),
             rx_alive: AtomicBool::new(true),
         },
-        shared_head: CachePaddedAtomicUsize(AtomicUsize::new(0)),
+        shared_head: CachePadded::new(AtomicUsize::new(0)),
         slots,
     });
 
@@ -224,7 +201,6 @@ impl<T: Serial> Sender<T> {
         if self.sends_since_publish > 0 {
             self.inner
                 .shared_head
-                .0
                 .store(self.head, Ordering::Release);
             self.sends_since_publish = 0;
         }
@@ -295,7 +271,7 @@ impl<T: Serial> Receiver<T> {
         }
 
         // Batch path: load shared_head
-        self.cached_head = self.inner.shared_head.0.load(Ordering::Acquire);
+        self.cached_head = self.inner.shared_head.load(Ordering::Acquire);
         if self.tail < self.cached_head {
             let value = unsafe { ptr::read((*slot.data.get()).as_ptr()) };
             self.tail = self.tail.wrapping_add(1);
@@ -311,13 +287,6 @@ impl<T: Serial> Receiver<T> {
         !self.inner.shared.tx_alive.load(Ordering::Relaxed)
     }
 
-    /// Returns the distance (number of items) between producer and consumer.
-    #[inline]
-    fn distance(&self) -> usize {
-        let head = self.inner.shared_head.0.load(Ordering::Relaxed);
-        head.wrapping_sub(self.tail)
-    }
-
     /// Establishes and maintains temporal slip.
     ///
     /// Temporal slipping (FastForward PPoPP 2008 Section 3.4.1) delays the
@@ -325,34 +294,12 @@ impl<T: Serial> Receiver<T> {
     /// reducing cache line bouncing.
     #[inline]
     pub fn maintain_slip(&mut self) {
-        self.recv_count = self.recv_count.wrapping_add(1);
-
-        // Check only every SLIP_CHECK_INTERVAL iterations (after initialization)
-        if self.slip_initialized && !self.recv_count.is_multiple_of(SLIP_CHECK_INTERVAL) {
-            return;
-        }
-
-        let dist = self.distance();
-
-        if !self.slip_initialized {
-            // Initial slip establishment: wait until SLIP_GOOD
-            while self.distance() < SLIP_GOOD {
-                std::hint::spin_loop();
-            }
-            self.slip_initialized = true;
-        } else if dist < SLIP_DANGER {
-            // Slip recovery: wait until SLIP_GOOD (with progress check)
-            let mut prev_dist = dist;
-            while self.distance() < SLIP_GOOD {
-                let curr_dist = self.distance();
-                // Break if producer stopped making progress
-                if curr_dist <= prev_dist && curr_dist > 0 {
-                    break;
-                }
-                prev_dist = curr_dist;
-                std::hint::spin_loop();
-            }
-        }
+        let inner = &self.inner;
+        let tail = self.tail;
+        common::maintain_slip(&mut self.recv_count, &mut self.slip_initialized, || {
+            let head = inner.shared_head.load(Ordering::Relaxed);
+            head.wrapping_sub(tail)
+        });
     }
 }
 
@@ -634,7 +581,7 @@ impl<T> ValiditySlot<T> {
 }
 
 struct ValidityInner<T> {
-    shared: Shared,
+    shared: DisconnectState,
     slots: Box<[ValiditySlot<T>]>,
 }
 
@@ -663,7 +610,7 @@ fn validity_channel<T: Serial>(capacity: usize) -> (ValiditySender<T>, ValidityR
     let mask = cap - 1;
     let slots: Box<[ValiditySlot<T>]> = (0..cap).map(|_| ValiditySlot::new()).collect();
     let inner = Arc::new(ValidityInner {
-        shared: Shared {
+        shared: DisconnectState {
             tx_alive: AtomicBool::new(true),
             rx_alive: AtomicBool::new(true),
         },

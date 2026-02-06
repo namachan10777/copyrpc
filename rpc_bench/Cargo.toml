@@ -8,11 +8,11 @@ copyrpc = { path = "../copyrpc" }
 erpc = { path = "../erpc" }
 mlx5 = { path = "../mlx5" }
 mlx5_sys = { path = "../mlx5_sys" }
-mpi = "0.8"
-clap = { version = "4", features = ["derive"] }
-parquet = "54"
-arrow = "54"
-libc = { workspace = true }
+mpi.workspace = true
+clap.workspace = true
+parquet.workspace = true
+arrow.workspace = true
+libc.workspace = true
 
 [[bin]]
 name = "rpc_bench"

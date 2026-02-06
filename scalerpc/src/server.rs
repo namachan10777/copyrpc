@@ -514,7 +514,6 @@ pub struct RpcServer<H = NoHandler> {
     /// Connections indexed by ID.
     connections: Vec<Option<Connection>>,
     /// Configuration.
-    #[allow(dead_code)]
     config: ServerConfig,
     /// Request handler.
     handler: H,

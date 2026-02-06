@@ -27,7 +27,7 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
 use mlx5::cq::{Cq, CqConfig, Cqe};
 use mlx5::dc::{DciConfig, DciForMonoCq, DctConfig};
-use mlx5::device::{Context, DeviceList};
+use mlx5::device::Context;
 use mlx5::emit_dci_wqe;
 use mlx5::emit_ud_wqe;
 use mlx5::emit_wqe;
@@ -35,6 +35,7 @@ use mlx5::mono_cq::MonoCqRc;
 use mlx5::pd::{AccessFlags, MemoryRegion, Pd};
 use mlx5::qp::{RcQpConfig, RcQpForMonoCq};
 use mlx5::srq::SrqConfig;
+use mlx5::test_utils::{self, AlignedBuffer};
 use mlx5::transport::IbRemoteQpInfo;
 use mlx5::ud::{UdQpConfig, UdQpForMonoCq};
 use mlx5::wqe::WqeFlags;
@@ -50,7 +51,6 @@ const QPS_PER_THREAD: usize = NUM_CONNECTIONS / NUM_SERVER_THREADS; // 32
 const SMALL_MSG_SIZE: usize = 32;
 const RECV_BUF_ENTRY_SIZE: usize = 64;
 const UD_RECV_ENTRY_SIZE: usize = 128;
-const PAGE_SIZE: usize = 4096;
 const DC_KEY: u64 = 0x1234_5678_ABCD_EF00;
 const SIGNAL_INTERVAL: usize = 8;
 
@@ -59,72 +59,15 @@ const RC_MAX_SEND_WR: u32 = 16;
 const RC_MAX_RECV_WR: u32 = 16;
 
 // =============================================================================
-// Aligned Buffer
-// =============================================================================
-
-struct AlignedBuffer {
-    ptr: *mut u8,
-    size: usize,
-}
-
-impl AlignedBuffer {
-    fn new(size: usize) -> Self {
-        let aligned_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let ptr = unsafe {
-            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            let ret = libc::posix_memalign(&mut ptr, PAGE_SIZE, aligned_size);
-            if ret != 0 {
-                panic!("posix_memalign failed: {}", ret);
-            }
-            std::ptr::write_bytes(ptr as *mut u8, 0, aligned_size);
-            ptr as *mut u8
-        };
-        Self {
-            ptr,
-            size: aligned_size,
-        }
-    }
-
-    fn as_ptr(&self) -> *mut u8 {
-        self.ptr
-    }
-
-    fn addr(&self) -> u64 {
-        self.ptr as u64
-    }
-
-    fn size(&self) -> usize {
-        self.size
-    }
-}
-
-impl Drop for AlignedBuffer {
-    fn drop(&mut self) {
-        unsafe {
-            libc::free(self.ptr as *mut std::ffi::c_void);
-        }
-    }
-}
-
-// =============================================================================
 // Helpers
 // =============================================================================
 
 fn full_access() -> AccessFlags {
-    AccessFlags::LOCAL_WRITE
-        | AccessFlags::REMOTE_WRITE
-        | AccessFlags::REMOTE_READ
-        | AccessFlags::REMOTE_ATOMIC
+    test_utils::full_access()
 }
 
 fn open_mlx5_device() -> Option<Context> {
-    let device_list = DeviceList::list().ok()?;
-    for device in device_list.iter() {
-        if let Ok(ctx) = device.open() {
-            return Some(ctx);
-        }
-    }
-    None
+    test_utils::open_mlx5_device()
 }
 
 // =============================================================================
