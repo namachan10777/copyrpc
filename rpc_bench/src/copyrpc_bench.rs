@@ -136,7 +136,6 @@ fn run_one_to_one(
 ) -> Vec<BenchRow> {
     let rank = world.rank();
     let is_client = rank == 0;
-
     type OnResponseFn = fn((), &[u8]);
     let ctx: Context<(), OnResponseFn> = ContextBuilder::new()
         .device_index(common.device_index)
@@ -398,7 +397,8 @@ fn run_one_to_one_threaded(
     // Main thread: collect all local infos ordered by thread id
     let mut all_local_infos: Vec<Option<Vec<EndpointConnectionInfo>>> =
         (0..num_threads).map(|_| None).collect();
-    for (tid, infos) in info_rx {
+    for _ in 0..num_threads {
+        let (tid, infos) = info_rx.recv().expect("Failed to receive endpoint info from worker");
         all_local_infos[tid] = Some(infos);
     }
     let all_local_infos: Vec<Vec<EndpointConnectionInfo>> =
@@ -686,7 +686,8 @@ fn run_client_duration<F: Fn((), &[u8])>(
     }
 
     // Drain
-    while inflight > 0 {
+    let drain_deadline = Instant::now() + Duration::from_secs(2);
+    while inflight > 0 && Instant::now() < drain_deadline {
         ctx.poll();
         let new = get_and_reset_response_count();
         inflight = inflight.saturating_sub(new as usize);

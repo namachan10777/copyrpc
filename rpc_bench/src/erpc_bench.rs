@@ -414,7 +414,8 @@ fn run_one_to_one_threaded(
     // Main thread: collect local infos ordered by thread id
     let mut all_local_infos: Vec<Option<ErpcConnectionInfo>> =
         (0..num_threads).map(|_| None).collect();
-    for (tid, info) in info_rx {
+    for _ in 0..num_threads {
+        let (tid, info) = info_rx.recv().expect("Failed to receive info from worker");
         all_local_infos[tid] = Some(info);
     }
     let all_local_infos: Vec<ErpcConnectionInfo> =
