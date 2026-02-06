@@ -112,6 +112,7 @@ fn run_one_to_one(
 ) -> Vec<BenchRow> {
     let rank = world.rank();
     let is_client = rank == 0;
+    crate::affinity::pin_thread_if_configured(common.affinity_mode, common.affinity_start, rank, 1, 0);
 
     let (ctx, port) = open_mlx5_device(common.device_index, common.port);
 
@@ -271,6 +272,9 @@ fn run_one_to_one_threaded(
 
     let mut handles = Vec::with_capacity(num_threads);
 
+    let affinity_mode = common.affinity_mode;
+    let affinity_start = common.affinity_start;
+
     for (tid, remote_rx) in remote_rxs.into_iter().enumerate() {
         let info_tx = info_tx.clone();
         let stop = stop_flag.clone();
@@ -281,6 +285,8 @@ fn run_one_to_one_threaded(
         let message_size = common.message_size;
 
         handles.push(std::thread::spawn(move || {
+            crate::affinity::pin_thread_if_configured(affinity_mode, affinity_start, rank, num_threads, tid);
+
             let (ctx, mlx5_port) = open_mlx5_device(device_index, port);
 
             let config = RpcConfig::default()
@@ -729,6 +735,7 @@ fn run_multi_client(
     let size = world.size();
     let is_server = rank == 0;
     let num_clients = (size - 1) as usize;
+    crate::affinity::pin_thread_if_configured(common.affinity_mode, common.affinity_start, rank, 1, 0);
 
     let (ctx, port) = open_mlx5_device(common.device_index, common.port);
 

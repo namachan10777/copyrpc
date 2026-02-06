@@ -1,3 +1,4 @@
+mod affinity;
 mod copyrpc_bench;
 mod epoch;
 mod erpc_bench;
@@ -6,7 +7,7 @@ mod parquet_out;
 mod rc_send_recv_bench;
 mod ucx_am_bench;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(name = "rpc_bench")]
@@ -44,8 +45,24 @@ struct Cli {
     #[arg(long, default_value = "1")]
     port: u8,
 
+    /// CPU affinity mode for thread pinning (cores assigned downward from affinity-start)
+    #[arg(long)]
+    affinity_mode: Option<AffinityMode>,
+
+    /// Starting core ID for affinity (default: num_online_cores - 1)
+    #[arg(long)]
+    affinity_start: Option<usize>,
+
     #[command(subcommand)]
     system: SystemCmd,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+pub enum AffinityMode {
+    /// Each rank independently pins from the back (for multi-node)
+    Multinode,
+    /// Ranks share a node; cores partitioned by local rank (for single-node)
+    Singlenode,
 }
 
 #[derive(Subcommand, Debug)]
@@ -120,6 +137,8 @@ pub struct CommonConfig {
     pub runs: u32,
     pub device_index: usize,
     pub port: u8,
+    pub affinity_mode: Option<AffinityMode>,
+    pub affinity_start: Option<usize>,
 }
 
 fn main() {
@@ -137,6 +156,8 @@ fn main() {
         runs: cli.runs,
         device_index: cli.device_index,
         port: cli.port,
+        affinity_mode: cli.affinity_mode,
+        affinity_start: cli.affinity_start,
     };
 
     let rows = match cli.system {

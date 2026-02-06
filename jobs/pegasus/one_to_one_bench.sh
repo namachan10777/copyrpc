@@ -32,6 +32,7 @@ for QD in 1 32 256; do
       [[ $E -lt $T || $((E % T)) -ne 0 ]] && continue
       echo "=== copyrpc QD=$QD T=$T E=$E ==="
       timeout 120 mpirun -np 2 "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
+        --affinity-mode multinode --affinity-start 47 \
         copyrpc one-to-one -e $E -i $QD -t $T \
         -o "$OUTDIR/copyrpc_qd${QD}_t${T}_e${E}.parquet" \
         || echo "FAILED: copyrpc QD=$QD T=$T E=$E"
@@ -44,6 +45,7 @@ for QD in 1 32 256; do
   for T in 1 2 4 8 16; do
     echo "=== erpc QD=$QD T=$T ==="
     timeout 120 mpirun -np 2 "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
+      --affinity-mode multinode --affinity-start 47 \
       erpc one-to-one -i $QD -t $T \
       -o "$OUTDIR/erpc_qd${QD}_t${T}.parquet" \
       || echo "FAILED: erpc QD=$QD T=$T"
@@ -55,6 +57,7 @@ for QD in 1 32 256; do
   for T in 1 2 4 8 16; do
     echo "=== rc-send QD=$QD T=$T ==="
     timeout 120 mpirun -np 2 "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
+      --affinity-mode multinode --affinity-start 47 \
       rc-send one-to-one -i $QD -t $T \
       -o "$OUTDIR/rc_send_qd${QD}_t${T}.parquet" \
       || echo "FAILED: rc-send QD=$QD T=$T"

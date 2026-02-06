@@ -45,12 +45,14 @@ for NC in 1 2 3 4 6 8 12 16 24 32 48 64 96 128; do
 
   echo "=== copyrpc NC=$NC ==="
   timeout 120 mpirun -np $NP --rankfile "$RANKFILE" "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
+    --affinity-mode multinode --affinity-start 47 \
     copyrpc multi-client -i $QD \
     -o "$OUTDIR/copyrpc_mc_nc${NC}.parquet" \
     || echo "FAILED: copyrpc NC=$NC"
 
   echo "=== erpc NC=$NC ==="
   timeout 120 mpirun -np $NP --rankfile "$RANKFILE" "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
+    --affinity-mode multinode --affinity-start 47 \
     erpc multi-client -i $QD \
     -o "$OUTDIR/erpc_mc_nc${NC}.parquet" \
     || echo "FAILED: erpc NC=$NC"
