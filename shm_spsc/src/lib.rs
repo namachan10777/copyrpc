@@ -99,6 +99,16 @@ impl From<io::Error> for ConnectError {
     }
 }
 
+/// Demote a cache line from L1/L2 to L3 (Intel CLDEMOTE).
+/// This is a hint; on CPUs that don't support it, it's a NOP.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn cldemote(ptr: *const u8) {
+    unsafe {
+        std::arch::asm!("cldemote [{ptr}]", ptr = in(reg) ptr, options(nostack, preserves_flags));
+    }
+}
+
 const MAGIC: u64 = 0x5250_4353_4C4F_5421; // "RPCSLOT!"
 const VERSION: u32 = 5;
 const HEADER_SIZE: usize = 64;
@@ -335,6 +345,8 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
                     unsafe { *self.server_seqs.get_unchecked_mut(seq_idx) = new_seq };
                     self.slot_server_seq(global)
                         .store(new_seq, Ordering::Release);
+                    #[cfg(target_arch = "x86_64")]
+                    cldemote(self.slot_base(global) as *const u8);
                     count += 1;
                 }
             }
