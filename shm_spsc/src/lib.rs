@@ -109,6 +109,15 @@ fn cldemote(ptr: *const u8) {
     }
 }
 
+/// Prefetch a cache line for reading into L1.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn prefetch_read(ptr: *const u8) {
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+}
+
 const MAGIC: u64 = 0x5250_4353_4C4F_5421; // "RPCSLOT!"
 const VERSION: u32 = 5;
 const HEADER_SIZE: usize = 64;
@@ -326,6 +335,11 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
 
         for client_idx in 0..allocated {
             let base_slot = client_idx * spc;
+            // Prefetch next client's first slot while processing this one
+            #[cfg(target_arch = "x86_64")]
+            if client_idx + 1 < allocated {
+                prefetch_read(self.slot_base((client_idx + 1) * spc) as *const u8);
+            }
             // Check alive on first slot only
             if !self.slot_alive(base_slot).load(Ordering::Acquire) {
                 continue;
