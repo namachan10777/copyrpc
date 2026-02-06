@@ -176,6 +176,7 @@ pub struct Server<Req: Serial, Resp: Serial> {
     layout: SlotLayout,
     slots_per_client: u32,
     server_seqs: Vec<u8>,
+    deferred_bitmap: Vec<u32>,
     _marker: PhantomData<(Req, Resp)>,
 }
 
@@ -256,6 +257,7 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
             layout,
             slots_per_client,
             server_seqs: vec![0u8; total_slots as usize],
+            deferred_bitmap: vec![0u32; max_clients as usize],
             _marker: PhantomData,
         })
     }
@@ -341,6 +343,97 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
         }
 
         count
+    }
+
+    /// Processes all pending requests, allowing deferred responses.
+    ///
+    /// Like [`process_batch`], but the callback returns `Option<Resp>`:
+    /// - `Some(resp)`: immediate response (same as `process_batch`)
+    /// - `None`: deferred — the slot is marked pending and must be completed
+    ///   later via [`complete_request`]
+    ///
+    /// The callback receives `(ClientId, u32, Req)` where the `u32` is the
+    /// slot index within the client's slot group (0..slots_per_client).
+    ///
+    /// Returns the number of requests processed (both immediate and deferred).
+    pub fn process_batch_deferred(
+        &mut self,
+        mut f: impl FnMut(ClientId, u32, Req) -> Option<Resp>,
+    ) -> u32 {
+        let allocated = unsafe { (*self.header).next_client_id.load(Ordering::Relaxed) };
+        if allocated == 0 {
+            return 0;
+        }
+
+        let spc = self.slots_per_client;
+        let mut count = 0u32;
+
+        for client_idx in 0..allocated {
+            let base_slot = client_idx * spc;
+            if !self.slot_alive(base_slot).load(Ordering::Acquire) {
+                continue;
+            }
+            let bitmap = unsafe { *self.deferred_bitmap.get_unchecked(client_idx as usize) };
+            for s in 0..spc {
+                // Skip slots that are already deferred
+                if bitmap & (1 << s) != 0 {
+                    continue;
+                }
+                let global = base_slot + s;
+                let seq_idx = global as usize;
+                let client_seq = self.slot_client_seq(global).load(Ordering::Acquire);
+                let server_seq = unsafe { *self.server_seqs.get_unchecked(seq_idx) };
+                if client_seq != server_seq {
+                    let req = unsafe { std::ptr::read_volatile(self.slot_req_ptr(global)) };
+                    match f(ClientId(client_idx), s, req) {
+                        Some(resp) => {
+                            unsafe { std::ptr::write_volatile(self.slot_resp_ptr(global), resp) };
+                            let new_seq = server_seq.wrapping_add(1);
+                            unsafe { *self.server_seqs.get_unchecked_mut(seq_idx) = new_seq };
+                            self.slot_server_seq(global)
+                                .store(new_seq, Ordering::Release);
+                        }
+                        None => {
+                            // Mark as deferred
+                            unsafe {
+                                *self.deferred_bitmap.get_unchecked_mut(client_idx as usize) |=
+                                    1 << s;
+                            }
+                        }
+                    }
+                    count += 1;
+                }
+            }
+        }
+
+        count
+    }
+
+    /// Completes a previously deferred request by writing the response.
+    ///
+    /// # Panics
+    /// Panics if the slot was not deferred.
+    pub fn complete_request(&mut self, client_id: ClientId, slot_index: u32, resp: Resp) {
+        let cid = client_id.0;
+        let global = cid * self.slots_per_client + slot_index;
+        let seq_idx = global as usize;
+
+        debug_assert!(
+            unsafe { *self.deferred_bitmap.get_unchecked(cid as usize) } & (1 << slot_index) != 0,
+            "complete_request called on non-deferred slot"
+        );
+
+        unsafe { std::ptr::write_volatile(self.slot_resp_ptr(global), resp) };
+        let server_seq = unsafe { *self.server_seqs.get_unchecked(seq_idx) };
+        let new_seq = server_seq.wrapping_add(1);
+        unsafe { *self.server_seqs.get_unchecked_mut(seq_idx) = new_seq };
+        self.slot_server_seq(global)
+            .store(new_seq, Ordering::Release);
+
+        // Clear the deferred bit
+        unsafe {
+            *self.deferred_bitmap.get_unchecked_mut(cid as usize) &= !(1 << slot_index);
+        }
     }
 
     /// Returns true if a specific client is connected.
@@ -698,6 +791,65 @@ mod tests {
             }
 
             client_thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_deferred_response() {
+        let name = format!("/shm_rpc_defer_{}", std::process::id());
+
+        unsafe {
+            let mut server = Server::<u64, u64>::create(&name, 4, 4).unwrap();
+
+            let name_clone = name.clone();
+            let client_thread = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                let mut client = Client::<u64, u64>::connect(&name_clone).unwrap();
+
+                // Send 4 requests (fills pipeline)
+                for i in 0..4u64 {
+                    client.send(i).unwrap();
+                }
+
+                // Receive all 4 responses (server will complete deferred ones)
+                let mut results = Vec::new();
+                for _ in 0..4 {
+                    results.push(client.recv().unwrap());
+                }
+                results
+            });
+
+            // Collect deferred requests
+            let mut deferred: Vec<(ClientId, u32, u64)> = Vec::new();
+            let mut served = 0u32;
+
+            while served < 4 {
+                served += server.process_batch_deferred(|cid, slot_idx, req| {
+                    if req % 2 == 0 {
+                        // Defer even requests
+                        deferred.push((cid, slot_idx, req));
+                        None
+                    } else {
+                        // Respond immediately to odd requests
+                        Some(req * 10)
+                    }
+                });
+                std::hint::spin_loop();
+            }
+
+            // Complete deferred requests
+            for (cid, slot_idx, req) in &deferred {
+                server.complete_request(*cid, *slot_idx, req * 100);
+            }
+
+            let results = client_thread.join().unwrap();
+            assert_eq!(results.len(), 4);
+            // Slots are received in FIFO order. req 0 (even→*100), req 1 (odd→*10),
+            // req 2 (even→*100), req 3 (odd→*10)
+            assert_eq!(results[0], 0);   // 0 * 100
+            assert_eq!(results[1], 10);  // 1 * 10
+            assert_eq!(results[2], 200); // 2 * 100
+            assert_eq!(results[3], 30);  // 3 * 10
         }
     }
 

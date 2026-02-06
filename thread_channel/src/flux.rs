@@ -259,6 +259,38 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport> Flux<T, U, F, Tr> 
     pub fn pending_count(&self) -> usize {
         self.channels.iter().map(|c| c.inflight_count).sum()
     }
+
+    /// Pops the next received request without holding a borrow on Flux.
+    ///
+    /// Returns `(from_peer, token, data)`. Use [`reply`] to send a response later.
+    /// Unlike [`try_recv`], this does not create a `RecvHandle`, so the caller
+    /// can hold multiple pending requests and reply asynchronously.
+    #[inline]
+    pub fn try_recv_raw(&mut self) -> Option<(usize, u64, T)> {
+        let req = self.recv_queue.pop_front()?;
+        Some((req.from, req.token, req.data))
+    }
+
+    /// Replies to a previously received request identified by peer ID and token.
+    ///
+    /// This is the deferred counterpart to [`RecvHandle::reply`].
+    #[inline]
+    pub fn reply(&mut self, to: usize, token: u64, value: T) -> Result<(), SendError<T>> {
+        let channel_idx = match self.peer_to_channel_index(to) {
+            Some(idx) => idx,
+            None => return Err(SendError::InvalidPeer(value)),
+        };
+
+        self.channels[channel_idx]
+            .endpoint
+            .reply(token, value)
+            .map_err(|e| match e {
+                TransportError::Full(v) | TransportError::InflightExceeded(v) => {
+                    SendError::Full(v)
+                }
+                TransportError::Disconnected(v) => SendError::Disconnected(v),
+            })
+    }
 }
 
 /// Creates a Flux network with `n` nodes using the default transport (OnesidedTransport).
@@ -669,6 +701,81 @@ mod tests {
         }
 
         assert!(response_count.load(Ordering::Relaxed) >= 24);
+    }
+
+    #[test]
+    fn test_try_recv_raw_and_reply() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let responses: Rc<RefCell<Vec<(u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
+        let responses_clone = Rc::clone(&responses);
+
+        let mut nodes: Vec<Flux<u32, u32, _, OnesidedTransport>> =
+            create_flux(2, 16, 8, move |user_data, data| {
+                responses_clone.borrow_mut().push((*user_data, data));
+            });
+
+        // Node 0 calls node 1 with user_data=100
+        nodes[0].call(1, 42, 100).unwrap();
+        nodes[0].poll();
+
+        // Node 1 receives via try_recv_raw and replies via reply()
+        nodes[1].poll();
+        let (from, token, data) = nodes[1].try_recv_raw().unwrap();
+        assert_eq!(from, 0);
+        assert_eq!(data, 42);
+
+        // Can do other work between recv_raw and reply
+        assert!(nodes[1].try_recv_raw().is_none());
+
+        // Reply using the stored token
+        nodes[1].reply(from, token, 43).unwrap();
+        nodes[1].poll();
+
+        // Node 0 receives response
+        nodes[0].poll();
+
+        let responses = responses.borrow();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0], (100, 43));
+    }
+
+    #[test]
+    fn test_multiple_deferred_replies() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let responses: Rc<RefCell<Vec<(u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
+        let responses_clone = Rc::clone(&responses);
+
+        let mut nodes: Vec<Flux<u32, u32, _, OnesidedTransport>> =
+            create_flux(3, 16, 8, move |user_data, data| {
+                responses_clone.borrow_mut().push((*user_data, data));
+            });
+
+        // Node 1 and 2 both call node 0
+        nodes[1].call(0, 100, 10).unwrap();
+        nodes[1].poll();
+        nodes[2].call(0, 200, 20).unwrap();
+        nodes[2].poll();
+
+        // Node 0 receives both via try_recv_raw (no borrow conflict)
+        nodes[0].poll();
+        let req1 = nodes[0].try_recv_raw().unwrap();
+        let req2 = nodes[0].try_recv_raw().unwrap();
+
+        // Reply in reverse order
+        nodes[0].reply(req2.0, req2.1, req2.2 + 1).unwrap();
+        nodes[0].reply(req1.0, req1.1, req1.2 + 1).unwrap();
+        nodes[0].poll();
+
+        // Both callers receive responses
+        nodes[1].poll();
+        nodes[2].poll();
+
+        let responses = responses.borrow();
+        assert_eq!(responses.len(), 2);
     }
 
     // Tests for different transport implementations
