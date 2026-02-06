@@ -17,6 +17,7 @@ pub struct BenchRow {
     pub endpoints: u32,
     pub inflight_per_ep: u32,
     pub clients: u32,
+    pub threads: u32,
     pub run_index: u32,
 }
 
@@ -28,6 +29,7 @@ pub fn rows_from_epochs(
     endpoints: u32,
     inflight_per_ep: u32,
     clients: u32,
+    threads: u32,
     run_index: u32,
 ) -> Vec<BenchRow> {
     epochs
@@ -43,6 +45,7 @@ pub fn rows_from_epochs(
                 endpoints,
                 inflight_per_ep,
                 clients,
+                threads,
                 run_index,
             }
         })
@@ -63,6 +66,7 @@ pub fn write_parquet(path: &str, rows: &[BenchRow]) -> Result<(), Box<dyn std::e
         Field::new("endpoints", DataType::UInt32, false),
         Field::new("inflight_per_ep", DataType::UInt32, false),
         Field::new("clients", DataType::UInt32, false),
+        Field::new("threads", DataType::UInt32, false),
         Field::new("run_index", DataType::UInt32, false),
     ]));
 
@@ -92,6 +96,9 @@ pub fn write_parquet(path: &str, rows: &[BenchRow]) -> Result<(), Box<dyn std::e
             )) as ArrayRef,
             Arc::new(UInt32Array::from(
                 rows.iter().map(|r| r.clients).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(UInt32Array::from(
+                rows.iter().map(|r| r.threads).collect::<Vec<_>>(),
             )) as ArrayRef,
             Arc::new(UInt32Array::from(
                 rows.iter().map(|r| r.run_index).collect::<Vec<_>>(),

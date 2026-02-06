@@ -1,4 +1,6 @@
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mpi::collective::CommunicatorCollectives;
@@ -67,6 +69,7 @@ pub fn run(
         ModeCmd::OneToOne {
             endpoints: _,
             inflight,
+            threads,
         } => {
             if world.size() != 2 {
                 if rank == 0 {
@@ -74,7 +77,19 @@ pub fn run(
                 }
                 return Vec::new();
             }
-            run_one_to_one(common, world, session_credits, req_window, *inflight as usize)
+            let num_threads = *threads as usize;
+            if num_threads > 1 {
+                run_one_to_one_threaded(
+                    common,
+                    world,
+                    session_credits,
+                    req_window,
+                    *inflight as usize,
+                    num_threads,
+                )
+            } else {
+                run_one_to_one(common, world, session_credits, req_window, *inflight as usize)
+            }
         }
         ModeCmd::MultiClient { inflight } => {
             if world.size() < 2 {
@@ -168,6 +183,7 @@ fn run_one_to_one(
                 1,
                 inflight as u32,
                 1,
+                1,
                 run,
             );
 
@@ -227,6 +243,381 @@ fn run_one_to_one(
         }
 
         Vec::new()
+    }
+}
+
+fn run_one_to_one_threaded(
+    common: &CommonConfig,
+    world: &mpi::topology::SimpleCommunicator,
+    session_credits: usize,
+    req_window: usize,
+    inflight: usize,
+    num_threads: usize,
+) -> Vec<BenchRow> {
+    let rank = world.rank();
+    let is_client = rank == 0;
+
+    // Phase 1: spawn workers, each creates its own Rpc + session
+    let (info_tx, info_rx) = std::sync::mpsc::channel::<(usize, ErpcConnectionInfo)>();
+    let (remote_txs, remote_rxs): (Vec<_>, Vec<_>) = (0..num_threads)
+        .map(|_| std::sync::mpsc::channel::<ErpcConnectionInfo>())
+        .unzip();
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let barrier = Arc::new(std::sync::Barrier::new(num_threads + 1));
+    let completions: Vec<Arc<AtomicU64>> = (0..num_threads)
+        .map(|_| Arc::new(AtomicU64::new(0)))
+        .collect();
+
+    let mut handles = Vec::with_capacity(num_threads);
+
+    for (tid, remote_rx) in remote_rxs.into_iter().enumerate() {
+        let info_tx = info_tx.clone();
+        let stop = stop_flag.clone();
+        let bar = barrier.clone();
+        let comp = completions[tid].clone();
+        let device_index = common.device_index;
+        let port = common.port;
+        let message_size = common.message_size;
+
+        handles.push(std::thread::spawn(move || {
+            let (ctx, mlx5_port) = open_mlx5_device(device_index, port);
+
+            let config = RpcConfig::default()
+                .with_req_window(req_window)
+                .with_session_credits(session_credits)
+                .with_num_recv_buffers(req_window * 4)
+                .with_max_send_wr((req_window * 4) as u32)
+                .with_max_recv_wr((req_window * 4) as u32);
+
+            if is_client {
+                let rpc: Rpc<()> = Rpc::new(&ctx, mlx5_port, config, |_, _| {
+                    COMPLETED.with(|c| *c.borrow_mut() += 1);
+                })
+                .expect("Failed to create client Rpc");
+
+                let local = rpc.local_info();
+                info_tx
+                    .send((
+                        tid,
+                        ErpcConnectionInfo {
+                            qpn: local.qpn,
+                            qkey: local.qkey,
+                            lid: local.lid,
+                            _pad: 0,
+                        },
+                    ))
+                    .unwrap();
+
+                let remote_info = remote_rx.recv().unwrap();
+                let session = rpc
+                    .create_session(&RemoteInfo {
+                        qpn: remote_info.qpn,
+                        qkey: remote_info.qkey,
+                        lid: remote_info.lid,
+                    })
+                    .expect("Failed to create session");
+
+                // Handshake
+                let handshake_start = Instant::now();
+                while handshake_start.elapsed() < Duration::from_secs(5) {
+                    rpc.run_event_loop_once();
+                    if rpc.is_session_connected(session) {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                assert!(
+                    rpc.is_session_connected(session),
+                    "eRPC session handshake failed on thread {}",
+                    tid
+                );
+
+                bar.wait(); // post-connect barrier
+
+                loop {
+                    bar.wait(); // run start
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    run_erpc_client_duration_atomic(
+                        &rpc,
+                        session,
+                        message_size,
+                        inflight,
+                        &comp,
+                        &stop,
+                    );
+
+                    bar.wait(); // run end
+                }
+            } else {
+                // Server thread
+                let rpc: Rpc<()> = Rpc::new(&ctx, mlx5_port, config, |_, _| {})
+                    .expect("Failed to create server Rpc");
+
+                let local = rpc.local_info();
+                info_tx
+                    .send((
+                        tid,
+                        ErpcConnectionInfo {
+                            qpn: local.qpn,
+                            qkey: local.qkey,
+                            lid: local.lid,
+                            _pad: 0,
+                        },
+                    ))
+                    .unwrap();
+
+                let remote_info = remote_rx.recv().unwrap();
+                let session = rpc
+                    .create_session(&RemoteInfo {
+                        qpn: remote_info.qpn,
+                        qkey: remote_info.qkey,
+                        lid: remote_info.lid,
+                    })
+                    .expect("Failed to create server session");
+
+                // Handshake
+                let handshake_start = Instant::now();
+                while handshake_start.elapsed() < Duration::from_secs(5) {
+                    rpc.run_event_loop_once();
+                    if rpc.is_session_connected(session) {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                assert!(
+                    rpc.is_session_connected(session),
+                    "eRPC server session handshake failed on thread {}",
+                    tid
+                );
+
+                bar.wait(); // post-connect barrier
+
+                loop {
+                    bar.wait(); // run start
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    run_erpc_server_duration_atomic(&rpc, message_size, &stop);
+
+                    bar.wait(); // run end
+                }
+            }
+        }));
+    }
+    drop(info_tx);
+
+    // Main thread: collect local infos ordered by thread id
+    let mut all_local_infos: Vec<Option<ErpcConnectionInfo>> =
+        (0..num_threads).map(|_| None).collect();
+    for (tid, info) in info_rx {
+        all_local_infos[tid] = Some(info);
+    }
+    let all_local_infos: Vec<ErpcConnectionInfo> =
+        all_local_infos.into_iter().map(|o| o.unwrap()).collect();
+
+    // Phase 2: MPI exchange (T infos per side)
+    let mut local_bytes = Vec::with_capacity(num_threads * ERPC_INFO_SIZE);
+    for info in &all_local_infos {
+        local_bytes.extend_from_slice(&info.to_bytes());
+    }
+
+    let remote_bytes = mpi_util::exchange_bytes(world, rank, 1 - rank, &local_bytes);
+
+    // Distribute remote infos
+    for tid in 0..num_threads {
+        let offset = tid * ERPC_INFO_SIZE;
+        let remote_info = ErpcConnectionInfo::from_bytes(&remote_bytes[offset..offset + ERPC_INFO_SIZE]);
+        remote_txs[tid].send(remote_info).unwrap();
+    }
+
+    // Wait for all handshakes
+    std::thread::sleep(Duration::from_millis(100));
+    world.barrier();
+    barrier.wait(); // release workers after MPI barrier + handshakes
+
+    // Phase 3: run benchmarks
+    let duration = Duration::from_secs(common.duration_secs);
+    let interval = Duration::from_millis(common.interval_ms);
+    let mut all_rows = Vec::new();
+
+    for run in 0..common.runs {
+        world.barrier();
+
+        for c in &completions {
+            c.store(0, Ordering::Release);
+        }
+        stop_flag.store(false, Ordering::Release);
+
+        barrier.wait(); // start run
+
+        if is_client {
+            let mut collector = EpochCollector::new(interval);
+            let start = Instant::now();
+
+            while start.elapsed() < duration {
+                std::thread::sleep(Duration::from_millis(1));
+                let mut total_delta = 0u64;
+                for c in &completions {
+                    total_delta += c.swap(0, Ordering::Relaxed);
+                }
+                if total_delta > 0 {
+                    collector.record(total_delta);
+                }
+            }
+
+            stop_flag.store(true, Ordering::Release);
+            barrier.wait(); // wait for run end
+
+            let mut remaining = 0u64;
+            for c in &completions {
+                remaining += c.swap(0, Ordering::Relaxed);
+            }
+            if remaining > 0 {
+                collector.record(remaining);
+            }
+            collector.finish();
+
+            let steady = collector.steady_state(common.trim);
+            let rows = parquet_out::rows_from_epochs(
+                "erpc",
+                "1to1",
+                steady,
+                common.message_size as u64,
+                1,
+                inflight as u32,
+                1,
+                num_threads as u32,
+                run,
+            );
+
+            if !steady.is_empty() {
+                let avg_rps: f64 = rows.iter().map(|r| r.rps).sum::<f64>() / rows.len() as f64;
+                eprintln!(
+                    "  Run {}: avg {:.0} RPS ({} steady epochs, {} threads)",
+                    run + 1,
+                    avg_rps,
+                    steady.len(),
+                    num_threads
+                );
+            }
+
+            all_rows.extend(rows);
+        } else {
+            std::thread::sleep(duration);
+            stop_flag.store(true, Ordering::Release);
+            barrier.wait();
+        }
+    }
+
+    stop_flag.store(true, Ordering::Release);
+    barrier.wait();
+
+    for h in handles {
+        h.join().expect("Worker thread panicked");
+    }
+
+    all_rows
+}
+
+fn run_erpc_client_duration_atomic(
+    rpc: &Rpc<()>,
+    session: erpc::SessionHandle,
+    message_size: usize,
+    inflight: usize,
+    completions: &AtomicU64,
+    stop_flag: &AtomicBool,
+) {
+    let request_data = vec![0xAAu8; message_size];
+
+    COMPLETED.with(|c| *c.borrow_mut() = 0);
+    let mut sent = 0u64;
+    let mut completed_base = 0u64;
+
+    // Initial fill
+    for _ in 0..inflight {
+        if rpc.try_call(session, 1, &request_data, ()).is_ok() {
+            sent += 1;
+        } else {
+            break;
+        }
+    }
+
+    while !stop_flag.load(Ordering::Relaxed) {
+        rpc.run_event_loop_once();
+
+        let total_completed = COMPLETED.with(|c| *c.borrow());
+        let new = total_completed - completed_base;
+        if new > 0 {
+            completed_base = total_completed;
+            completions.fetch_add(new, Ordering::Relaxed);
+        }
+
+        // Refill
+        while sent - total_completed < inflight as u64 {
+            if rpc.try_call(session, 1, &request_data, ()).is_ok() {
+                sent += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Drain
+    let drain_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < drain_deadline {
+        rpc.run_event_loop_once();
+        let total_completed = COMPLETED.with(|c| *c.borrow());
+        if total_completed >= sent {
+            break;
+        }
+    }
+}
+
+fn run_erpc_server_duration_atomic(
+    rpc: &Rpc<()>,
+    message_size: usize,
+    stop_flag: &AtomicBool,
+) {
+    let mut response_buf = vec![0u8; message_size];
+
+    while !stop_flag.load(Ordering::Relaxed) {
+        rpc.run_event_loop_once();
+        for _ in 0..16 {
+            if let Some(req) = rpc.recv() {
+                let data = req.data(rpc);
+                let len = data.len().min(response_buf.len());
+                response_buf[..len].copy_from_slice(&data[..len]);
+                let _ = rpc.reply(&req, &response_buf[..len]);
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Drain
+    let drain_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < drain_deadline {
+        rpc.run_event_loop_once();
+        let mut got_any = false;
+        for _ in 0..16 {
+            if let Some(req) = rpc.recv() {
+                got_any = true;
+                let data = req.data(rpc);
+                let len = data.len().min(response_buf.len());
+                response_buf[..len].copy_from_slice(&data[..len]);
+                let _ = rpc.reply(&req, &response_buf[..len]);
+            } else {
+                break;
+            }
+        }
+        if !got_any {
+            break;
+        }
     }
 }
 
@@ -401,6 +792,7 @@ fn run_multi_client(
                 1,
                 inflight as u32,
                 num_clients as u32,
+                1,
                 run,
             );
 

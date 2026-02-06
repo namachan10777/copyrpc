@@ -99,6 +99,10 @@ enum ModeCmd {
         /// In-flight requests per endpoint
         #[arg(short = 'i', long, default_value = "256")]
         inflight: u32,
+
+        /// Number of worker threads per rank
+        #[arg(short = 't', long, default_value = "1")]
+        threads: u32,
     },
     /// Multi-client benchmark (rank 0 = server, rank 1..N = clients)
     MultiClient {
@@ -121,7 +125,8 @@ pub struct CommonConfig {
 fn main() {
     let cli = Cli::parse();
 
-    let universe = mpi::initialize().expect("Failed to initialize MPI");
+    let (universe, _threading) = mpi::initialize_with_threading(mpi::Threading::Funneled)
+        .expect("Failed to initialize MPI with threading");
     let world = universe.world();
 
     let common = CommonConfig {
