@@ -1,0 +1,18 @@
+[package]
+name = "rpc_bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+copyrpc = { path = "../copyrpc" }
+erpc = { path = "../erpc" }
+mlx5 = { path = "../mlx5" }
+mlx5_sys = { path = "../mlx5_sys" }
+mpi = "0.8"
+clap = { version = "4", features = ["derive"] }
+parquet = "54"
+arrow = "54"
+libc = { workspace = true }
+
+[[bin]]
+name = "rpc_bench"

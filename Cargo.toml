@@ -1,6 +1,6 @@
 [workspace]
 edition = "2025"
-members = ["mlx5", "mlx5_sys", "ibverbs_sys", "copyrpc", "fastmap", "erpc", "scalerpc", "thread_channel", "shm_spsc"]
+members = ["mlx5", "mlx5_sys", "ibverbs_sys", "copyrpc", "fastmap", "erpc", "scalerpc", "thread_channel", "shm_spsc", "rpc_bench"]
 resolver = "3"
 
 [workspace.dependencies]
