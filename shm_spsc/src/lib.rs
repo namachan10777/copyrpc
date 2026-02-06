@@ -99,25 +99,6 @@ impl From<io::Error> for ConnectError {
     }
 }
 
-/// Demote a cache line from L1/L2 to L3 (Intel CLDEMOTE).
-/// This is a hint; on CPUs that don't support it, it's a NOP.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-fn cldemote(ptr: *const u8) {
-    unsafe {
-        std::arch::asm!("cldemote [{ptr}]", ptr = in(reg) ptr, options(nostack, preserves_flags));
-    }
-}
-
-/// Prefetch a cache line for reading into L1.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-fn prefetch_read(ptr: *const u8) {
-    unsafe {
-        std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
-    }
-}
-
 const MAGIC: u64 = 0x5250_4353_4C4F_5421; // "RPCSLOT!"
 const VERSION: u32 = 5;
 const HEADER_SIZE: usize = 64;
@@ -335,11 +316,6 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
 
         for client_idx in 0..allocated {
             let base_slot = client_idx * spc;
-            // Prefetch next client's first slot while processing this one
-            #[cfg(target_arch = "x86_64")]
-            if client_idx + 1 < allocated {
-                prefetch_read(self.slot_base((client_idx + 1) * spc) as *const u8);
-            }
             // Check alive on first slot only
             if !self.slot_alive(base_slot).load(Ordering::Acquire) {
                 continue;
@@ -359,8 +335,6 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
                     unsafe { *self.server_seqs.get_unchecked_mut(seq_idx) = new_seq };
                     self.slot_server_seq(global)
                         .store(new_seq, Ordering::Release);
-                    #[cfg(target_arch = "x86_64")]
-                    cldemote(self.slot_base(global) as *const u8);
                     count += 1;
                 }
             }
