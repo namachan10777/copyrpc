@@ -3,6 +3,7 @@
 //! Measures raw call/reply performance without Flux overhead.
 //! Tests the bidirectional RPC pattern with proper flow control.
 
+use core_affinity::CoreId;
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -46,7 +47,12 @@ fn run_pingpong_bench<Tr: Transport>(b: &mut criterion::Bencher) {
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);
 
+    // Pin client (main) thread to core 0
+    core_affinity::set_for_current(CoreId { id: 0 });
+
     let handle = thread::spawn(move || {
+        // Pin responder thread to core 1
+        core_affinity::set_for_current(CoreId { id: 1 });
         while !stop2.load(Ordering::Relaxed) {
             // sync() makes peer's calls visible, our replies visible
             endpoint_b.sync();
@@ -112,8 +118,13 @@ fn run_throughput_bench<Tr: Transport>(b: &mut criterion::Bencher, requests: usi
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);
 
+    // Pin client (main) thread to core 0
+    core_affinity::set_for_current(CoreId { id: 0 });
+
     // Responder thread: sync() then process all requests
     let handle = thread::spawn(move || {
+        // Pin responder thread to core 1
+        core_affinity::set_for_current(CoreId { id: 1 });
         while !stop2.load(Ordering::Relaxed) {
             // sync() makes peer's calls visible, makes our replies visible
             endpoint_b.sync();
