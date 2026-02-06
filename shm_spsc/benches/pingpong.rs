@@ -16,7 +16,7 @@ fn bench_call_latency(c: &mut Criterion) {
         let name = format!("/shm_rpc_bench_{}", Uuid::now_v7());
 
         unsafe {
-            let mut server = Server::<u64, u64>::create(&name, 4).unwrap();
+            let mut server = Server::<u64, u64>::create(&name, 4, 1).unwrap();
 
             let name_clone = name.clone();
             let stop = Arc::new(AtomicBool::new(false));
@@ -24,9 +24,7 @@ fn bench_call_latency(c: &mut Criterion) {
 
             let server_thread = thread::spawn(move || {
                 while !stop_clone.load(Ordering::Relaxed) {
-                    if let Some((cid, req)) = server.try_poll() {
-                        server.respond(cid, req + 1).unwrap();
-                    }
+                    server.process_batch(|_cid, req| req + 1);
                 }
             });
 
@@ -55,7 +53,7 @@ fn bench_call_latency(c: &mut Criterion) {
 
         unsafe {
             let mut server =
-                Server::<[u8; 64], [u8; 64]>::create(&name, 4).unwrap();
+                Server::<[u8; 64], [u8; 64]>::create(&name, 4, 1).unwrap();
 
             let name_clone = name.clone();
             let stop = Arc::new(AtomicBool::new(false));
@@ -63,9 +61,7 @@ fn bench_call_latency(c: &mut Criterion) {
 
             let server_thread = thread::spawn(move || {
                 while !stop_clone.load(Ordering::Relaxed) {
-                    if let Some((cid, req)) = server.try_poll() {
-                        server.respond(cid, req).unwrap();
-                    }
+                    server.process_batch(|_cid, req| req);
                 }
             });
 
@@ -95,7 +91,7 @@ fn bench_call_latency(c: &mut Criterion) {
 
         unsafe {
             let mut server =
-                Server::<[u8; 256], [u8; 256]>::create(&name, 4).unwrap();
+                Server::<[u8; 256], [u8; 256]>::create(&name, 4, 1).unwrap();
 
             let name_clone = name.clone();
             let stop = Arc::new(AtomicBool::new(false));
@@ -103,9 +99,7 @@ fn bench_call_latency(c: &mut Criterion) {
 
             let server_thread = thread::spawn(move || {
                 while !stop_clone.load(Ordering::Relaxed) {
-                    if let Some((cid, req)) = server.try_poll() {
-                        server.respond(cid, req).unwrap();
-                    }
+                    server.process_batch(|_cid, req| req);
                 }
             });
 
