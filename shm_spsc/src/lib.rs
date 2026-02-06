@@ -324,13 +324,17 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
                 let global = base_slot + s;
                 let seq_idx = global as usize;
                 let client_seq = self.slot_client_seq(global).load(Ordering::Acquire);
-                if client_seq != self.server_seqs[seq_idx] {
+                // SAFETY: seq_idx = client_idx * spc + s where client_idx < allocated <= max_clients
+                // and s < spc, so seq_idx < max_clients * spc = server_seqs.len()
+                let server_seq = unsafe { *self.server_seqs.get_unchecked(seq_idx) };
+                if client_seq != server_seq {
                     let req = unsafe { std::ptr::read_volatile(self.slot_req_ptr(global)) };
                     let resp = f(ClientId(client_idx), req);
                     unsafe { std::ptr::write_volatile(self.slot_resp_ptr(global), resp) };
-                    self.server_seqs[seq_idx] = self.server_seqs[seq_idx].wrapping_add(1);
+                    let new_seq = server_seq.wrapping_add(1);
+                    unsafe { *self.server_seqs.get_unchecked_mut(seq_idx) = new_seq };
                     self.slot_server_seq(global)
-                        .store(self.server_seqs[seq_idx], Ordering::Release);
+                        .store(new_seq, Ordering::Release);
                     count += 1;
                 }
             }
@@ -511,12 +515,17 @@ impl<Req: Serial, Resp: Serial> Client<Req, Resp> {
 
         let global = self.global_slot(slot_idx);
         unsafe { std::ptr::write_volatile(self.slot_req_ptr(global), req) };
-        self.client_seqs[slot_idx as usize] = self.client_seqs[slot_idx as usize].wrapping_add(1);
-        self.slot_client_seq(global)
-            .store(self.client_seqs[slot_idx as usize], Ordering::Release);
+        // SAFETY: slot_idx = trailing_zeros(free_bitmap) < slots_per_client <= 32 = client_seqs.len()
+        let new_seq = unsafe {
+            let seq = self.client_seqs.get_unchecked_mut(slot_idx as usize);
+            *seq = seq.wrapping_add(1);
+            *seq
+        };
+        self.slot_client_seq(global).store(new_seq, Ordering::Release);
 
         let mask = self.slots_per_client - 1;
-        self.pending_queue[self.pq_tail as usize] = slot_idx as u8;
+        // SAFETY: pq_tail is masked by (spc - 1) < 32 = pending_queue.len()
+        unsafe { *self.pending_queue.get_unchecked_mut(self.pq_tail as usize) = slot_idx as u8 };
         self.pq_tail = (self.pq_tail + 1) & mask;
         Ok(())
     }
@@ -524,14 +533,15 @@ impl<Req: Serial, Resp: Serial> Client<Req, Resp> {
     /// Receives the response for the oldest pending request (blocks until ready).
     pub fn recv(&mut self) -> Result<Resp, CallError> {
         let mask = self.slots_per_client - 1;
-        let slot_idx = self.pending_queue[self.pq_head as usize] as u32;
+        // SAFETY: pq_head is masked by (spc - 1) < 32 = pending_queue.len()
+        let slot_idx = unsafe { *self.pending_queue.get_unchecked(self.pq_head as usize) } as u32;
         self.pq_head = (self.pq_head + 1) & mask;
 
         let global = self.global_slot(slot_idx);
+        // SAFETY: slot_idx came from pending_queue which stores values < slots_per_client <= 32
+        let expected_seq = unsafe { *self.client_seqs.get_unchecked(slot_idx as usize) };
         loop {
-            if self.slot_server_seq(global).load(Ordering::Acquire)
-                == self.client_seqs[slot_idx as usize]
-            {
+            if self.slot_server_seq(global).load(Ordering::Acquire) == expected_seq {
                 break;
             }
             if !self.is_server_alive() {
