@@ -24,8 +24,8 @@ use mlx5::srq::SrqConfig;
 // Constants
 // =============================================================================
 
-const NUM_ENDPOINTS: usize = 8;
-const REQUESTS_PER_EP: usize = 256;
+const NUM_ENDPOINTS: usize = 1;
+const REQUESTS_PER_EP: usize = 32;
 const MESSAGE_SIZE: usize = 32;
 const RING_SIZE: usize = 1 << 20; // 1 MB
 

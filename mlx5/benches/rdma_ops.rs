@@ -1139,6 +1139,152 @@ where
     start.elapsed()
 }
 
+/// 32B inline send throughput benchmark with limited in-flight (matching copyrpc config).
+fn run_send_inline_limited_inflight<SF, RF>(
+    client: &mut SendRecvEndpoint<SF, RF>,
+    iters: u64,
+    max_inflight: usize,
+) -> Duration
+where
+    SF: Fn(Cqe, u64),
+    RF: Fn(Cqe, u64),
+{
+    let send_data = vec![0xAAu8; SMALL_MSG_SIZE];
+    let signal_interval = SEND_RECV_SIGNAL_INTERVAL.min(iters as usize).max(1);
+
+    // Initial fill limited to max_inflight
+    let initial_fill = (iters as usize).min(max_inflight);
+    {
+        let qp = client.qp.borrow();
+        let ctx = qp.emit_ctx().expect("emit_ctx failed");
+        let full_batches = initial_fill / signal_interval;
+        let remainder = initial_fill % signal_interval;
+
+        for batch in 0..full_batches {
+            let base = batch * signal_interval;
+            for _ in 0..(signal_interval - 1) {
+                let _ = emit_wqe!(&ctx, send {
+                    flags: WqeFlags::empty(),
+                    inline: send_data.as_slice(),
+                });
+            }
+            let idx = base + signal_interval - 1;
+            let _ = emit_wqe!(&ctx, send {
+                flags: WqeFlags::empty(),
+                inline: send_data.as_slice(),
+                signaled: idx as u64,
+            });
+        }
+
+        for j in 0..remainder {
+            let idx = full_batches * signal_interval + j;
+            let _ = emit_wqe!(&ctx, send {
+                flags: WqeFlags::empty(),
+                inline: send_data.as_slice(),
+                signaled: idx as u64,
+            });
+        }
+        qp.ring_sq_doorbell();
+    }
+
+    let start = std::time::Instant::now();
+    let mut completed = 0u64;
+    let mut inflight = initial_fill as u64;
+    let mut sent = initial_fill as u64;
+    let mut recv_idx = 0usize;
+    let mut send_count = initial_fill;
+
+    while completed < iters {
+        client.shared_state.reset();
+        client.recv_cq.poll();
+        client.recv_cq.flush();
+        let rx_count = client.shared_state.rx_count.get();
+
+        completed += rx_count as u64;
+        inflight -= rx_count as u64;
+
+        if rx_count == 0 {
+            continue;
+        }
+
+        client.send_cq.poll();
+        client.send_cq.flush();
+
+        // Repost receives
+        {
+            let qp = client.qp.borrow();
+            for _ in 0..rx_count {
+                let idx = recv_idx % SEND_RECV_QUEUE_DEPTH;
+                let offset = (idx * 64) as u64;
+                qp.post_recv(idx as u64, client.recv_buf.addr() + offset, 64, client.recv_mr.lkey())
+                    .unwrap();
+                recv_idx += 1;
+            }
+        }
+
+        // Send more, limited by max_inflight
+        let remaining = iters.saturating_sub(sent);
+        let can_send = (max_inflight as u64).saturating_sub(inflight).min(remaining) as usize;
+        let to_send = can_send.min(rx_count);
+
+        if to_send > 0 {
+            let qp = client.qp.borrow();
+            let ctx = qp.emit_ctx().expect("emit_ctx failed");
+            let full_batches = to_send / signal_interval;
+            let remainder = to_send % signal_interval;
+
+            for _ in 0..full_batches {
+                for _ in 0..(signal_interval - 1) {
+                    let _ = emit_wqe!(&ctx, send {
+                        flags: WqeFlags::empty(),
+                        inline: send_data.as_slice(),
+                    });
+                }
+                let _ = emit_wqe!(&ctx, send {
+                    flags: WqeFlags::empty(),
+                    inline: send_data.as_slice(),
+                    signaled: send_count as u64,
+                });
+                send_count += signal_interval;
+            }
+
+            for _ in 0..remainder {
+                let _ = emit_wqe!(&ctx, send {
+                    flags: WqeFlags::empty(),
+                    inline: send_data.as_slice(),
+                    signaled: send_count as u64,
+                });
+                send_count += 1;
+            }
+
+            inflight += to_send as u64;
+            sent += to_send as u64;
+        }
+
+        // Ring doorbells
+        {
+            let qp = client.qp.borrow();
+            qp.ring_rq_doorbell();
+            if to_send > 0 {
+                qp.ring_sq_doorbell();
+            }
+        }
+    }
+
+    // Drain remaining inflight
+    while inflight > 0 {
+        client.shared_state.reset();
+        client.recv_cq.poll();
+        client.recv_cq.flush();
+        inflight -= client.shared_state.rx_count.get() as u64;
+
+        client.send_cq.poll();
+        client.send_cq.flush();
+    }
+
+    start.elapsed()
+}
+
 /// 32B inline send latency benchmark (ping-pong, queue depth = 1).
 fn run_send_latency<SF, RF>(
     client: &mut SendRecvEndpoint<SF, RF>,
@@ -1556,6 +1702,34 @@ fn bench_send_inline_32b(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_send_inline_32b_32inflight(c: &mut Criterion) {
+    let setup = match setup_send_recv_benchmark() {
+        Some(s) => s,
+        None => {
+            eprintln!("Skipping benchmark: no mlx5 device available");
+            return;
+        }
+    };
+
+    let _ctx = setup._ctx;
+    let _pd = setup._pd;
+    let client = RefCell::new(setup.client);
+    let _server_handle = setup._server_handle;
+
+    let mut group = c.benchmark_group("send_inline_32inflight");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(5));
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("32B", |b| {
+        b.iter_custom(|iters| {
+            run_send_inline_limited_inflight(&mut client.borrow_mut(), iters, 32)
+        });
+    });
+
+    group.finish();
+}
+
 fn bench_send_latency_32b(c: &mut Criterion) {
     let setup = match setup_send_recv_benchmark() {
         Some(s) => s,
@@ -1755,6 +1929,7 @@ fn bench_ud_send_latency_32b(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_send_inline_32b,
+    bench_send_inline_32b_32inflight,
     bench_send_latency_32b,
     bench_ud_send_inline_32b,
     bench_ud_send_latency_32b,
