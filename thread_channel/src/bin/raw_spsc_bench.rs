@@ -42,9 +42,17 @@ struct Args {
 
     #[arg(short, long, default_value = "3")]
     duration: u64,
+
+    /// Starting core ID for thread pinning (threads count down from this core)
+    #[arg(long, default_value = "31")]
+    start_core: usize,
 }
 
-fn run_bench<Tr: Transport>(duration_secs: u64) {
+fn pin_to_core(core_id: usize) {
+    core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
+}
+
+fn run_bench<Tr: Transport>(duration_secs: u64, start_core: usize) {
     let capacity = 1024;
     let inflight_max = 256;
     let (mut endpoint_a, mut endpoint_b) = Tr::channel::<Payload, Payload>(capacity, inflight_max);
@@ -58,6 +66,7 @@ fn run_bench<Tr: Transport>(duration_secs: u64) {
 
     // Responder thread
     let handle = thread::spawn(move || {
+        pin_to_core(start_core - 1);
         barrier2.wait();
         let mut count = 0u64;
         while !stop2.load(Ordering::Relaxed) {
@@ -79,6 +88,7 @@ fn run_bench<Tr: Transport>(duration_secs: u64) {
     });
 
     // Sender thread (main)
+    pin_to_core(start_core);
     barrier.wait();
     let start = Instant::now();
     let run_duration = Duration::from_secs(duration_secs);
@@ -129,8 +139,8 @@ fn main() {
     println!("Running {:?} transport for {}s", args.transport, args.duration);
 
     match args.transport {
-        TransportType::Onesided => run_bench::<OnesidedTransport>(args.duration),
-        TransportType::FastForward => run_bench::<FastForwardTransport>(args.duration),
-        TransportType::Lamport => run_bench::<LamportTransport>(args.duration),
+        TransportType::Onesided => run_bench::<OnesidedTransport>(args.duration, args.start_core),
+        TransportType::FastForward => run_bench::<FastForwardTransport>(args.duration, args.start_core),
+        TransportType::Lamport => run_bench::<LamportTransport>(args.duration, args.start_core),
     }
 }

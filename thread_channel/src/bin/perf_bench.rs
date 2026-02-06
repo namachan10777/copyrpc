@@ -48,9 +48,17 @@ struct Args {
 
     #[arg(short, long, default_value = "32")]
     inflight: usize,
+
+    /// Starting core ID for thread pinning (threads count down from this core)
+    #[arg(long, default_value = "31")]
+    start_core: usize,
 }
 
-fn run_bench<Tr: Transport>(duration_secs: u64, inflight_max: usize) {
+fn pin_to_core(core_id: usize) {
+    core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
+}
+
+fn run_bench<Tr: Transport>(duration_secs: u64, inflight_max: usize, start_core: usize) {
     let capacity = 1024;
     let completed = Arc::new(AtomicU64::new(0));
     let completed_clone = Arc::clone(&completed);
@@ -73,6 +81,7 @@ fn run_bench<Tr: Transport>(duration_secs: u64, inflight_max: usize) {
 
     // Responder thread
     let handle = thread::spawn(move || {
+        pin_to_core(start_core - 1);
         barrier2.wait();
         while !stop2.load(Ordering::Relaxed) {
             node1.poll();
@@ -84,6 +93,7 @@ fn run_bench<Tr: Transport>(duration_secs: u64, inflight_max: usize) {
     });
 
     // Sender thread (main)
+    pin_to_core(start_core);
     barrier.wait();
     let start = Instant::now();
     let run_duration = Duration::from_secs(duration_secs);
@@ -128,10 +138,10 @@ fn main() {
     );
 
     match args.transport {
-        TransportType::Onesided => run_bench::<OnesidedTransport>(args.duration, args.inflight),
+        TransportType::Onesided => run_bench::<OnesidedTransport>(args.duration, args.inflight, args.start_core),
         TransportType::FastForward => {
-            run_bench::<FastForwardTransport>(args.duration, args.inflight)
+            run_bench::<FastForwardTransport>(args.duration, args.inflight, args.start_core)
         }
-        TransportType::Lamport => run_bench::<LamportTransport>(args.duration, args.inflight),
+        TransportType::Lamport => run_bench::<LamportTransport>(args.duration, args.inflight, args.start_core),
     }
 }

@@ -16,6 +16,7 @@ libc = { workspace = true, optional = true }
 [dev-dependencies]
 libc.workspace = true
 criterion.workspace = true
+core_affinity.workspace = true
 
 [[bench]]
 name = "rdma_ops"

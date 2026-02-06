@@ -23,6 +23,10 @@ use mlx5::types::PortAttr;
 
 use erpc::{RemoteInfo, Rpc, RpcConfig};
 
+fn pin_to_core(core_id: usize) {
+    core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -146,6 +150,7 @@ fn setup_benchmark() -> Option<BenchmarkSetup> {
 
     let server_config = config.clone();
     let handle = thread::spawn(move || {
+        pin_to_core(14);
         server_thread_main_with_config(server_info_tx, client_info_rx, server_ready_clone, server_stop, server_config);
     });
 
@@ -249,6 +254,7 @@ fn setup_multi_qp_benchmark(num_qps: usize, pipeline_depth: usize) -> Option<Mul
 
     let server_config = config.clone();
     let handle = thread::spawn(move || {
+        pin_to_core(14);
         multi_qp_server_thread(
             server_infos_tx,
             client_infos_rx,
@@ -637,6 +643,8 @@ fn run_multi_qp_throughput_bench(
 // =============================================================================
 
 fn bench_latency(c: &mut Criterion) {
+    pin_to_core(15);
+
     let setup = match setup_benchmark() {
         Some(s) => s,
         None => {
@@ -668,6 +676,8 @@ fn bench_latency(c: &mut Criterion) {
 }
 
 fn bench_throughput(c: &mut Criterion) {
+    pin_to_core(15);
+
     let setup = match setup_benchmark() {
         Some(s) => s,
         None => {
@@ -713,6 +723,8 @@ fn bench_throughput(c: &mut Criterion) {
 }
 
 fn bench_multi_qp_throughput(c: &mut Criterion) {
+    pin_to_core(15);
+
     let setup = match setup_multi_qp_benchmark(NUM_QPS, PIPELINE_DEPTH_PER_QP) {
         Some(s) => s,
         None => {
@@ -800,6 +812,7 @@ fn setup_multi_session_benchmark(num_sessions: usize) -> Option<MultiSessionBenc
 
     let server_config = config.clone();
     let handle = thread::spawn(move || {
+        pin_to_core(14);
         multi_session_server_thread(
             server_infos_tx,
             client_info_rx,
@@ -1018,6 +1031,8 @@ fn run_multi_session_throughput_bench(
 }
 
 fn bench_erpc_paper_conditions(c: &mut Criterion) {
+    pin_to_core(15);
+
     // Test different session counts to find optimal configuration
     // eRPC paper achieves peak throughput with many sessions
     for num_sessions in [2, 8] {

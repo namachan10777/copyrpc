@@ -38,6 +38,14 @@ use mlx5::wqe::WqeFlags;
 use mlx5::wqe::emit::UdAvIb;
 
 // =============================================================================
+// CPU Pinning Helper
+// =============================================================================
+
+fn pin_to_core(core_id: usize) {
+    core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
+}
+
+// =============================================================================
 // Constants
 // =============================================================================
 
@@ -340,6 +348,7 @@ fn setup_send_recv_benchmark() -> Option<SendRecvBenchmarkSetup<impl Fn(Cqe, u64
     let server_stop = stop_flag.clone();
 
     let handle = thread::spawn(move || {
+        pin_to_core(14);
         server_thread_main(
             server_info_tx,
             client_info_rx,
@@ -462,6 +471,7 @@ fn setup_write_imm_benchmark() -> Option<WriteImmBenchmarkSetup<impl Fn(Cqe, u64
     let server_stop = stop_flag.clone();
 
     let handle = thread::spawn(move || {
+        pin_to_core(14);
         write_imm_server_thread_main(
             server_info_tx,
             client_info_rx,
@@ -1234,6 +1244,7 @@ fn setup_ud_send_recv_benchmark() -> Option<UdSendRecvBenchmarkSetup> {
     let server_stop = stop_flag.clone();
 
     let handle = thread::spawn(move || {
+        pin_to_core(14);
         ud_server_thread_main(
             server_info_tx,
             client_info_rx,
@@ -2150,6 +2161,8 @@ fn bench_send_inline_32b(c: &mut Criterion) {
         }
     };
 
+    pin_to_core(15);
+
     let _ctx = setup._ctx;
     let _pd = setup._pd;
     let client = RefCell::new(setup.client);
@@ -2177,6 +2190,8 @@ fn bench_send_inline_32b_32inflight(c: &mut Criterion) {
             return;
         }
     };
+
+    pin_to_core(15);
 
     let _ctx = setup._ctx;
     let _pd = setup._pd;
@@ -2206,6 +2221,8 @@ fn bench_send_latency_32b(c: &mut Criterion) {
         }
     };
 
+    pin_to_core(15);
+
     let _ctx = setup._ctx;
     let _pd = setup._pd;
     let client = RefCell::new(setup.client);
@@ -2234,6 +2251,8 @@ fn bench_write_1m(c: &mut Criterion) {
         }
     };
 
+    pin_to_core(15);
+
     let _ctx = setup._ctx;
     let _pd = setup._pd;
     let endpoint = RefCell::new(setup.endpoint);
@@ -2260,6 +2279,8 @@ fn bench_write_1m_relaxed(c: &mut Criterion) {
             return;
         }
     };
+
+    pin_to_core(15);
 
     let _ctx = setup._ctx;
     let _pd = setup._pd;
@@ -2288,6 +2309,8 @@ fn bench_read_1m(c: &mut Criterion) {
         }
     };
 
+    pin_to_core(15);
+
     let _ctx = setup._ctx;
     let _pd = setup._pd;
     let endpoint = RefCell::new(setup.endpoint);
@@ -2314,6 +2337,8 @@ fn bench_read_1m_relaxed(c: &mut Criterion) {
             return;
         }
     };
+
+    pin_to_core(15);
 
     let _ctx = setup._ctx;
     let _pd = setup._pd;
@@ -2346,6 +2371,8 @@ fn bench_ud_send_inline_32b(c: &mut Criterion) {
         }
     };
 
+    pin_to_core(15);
+
     let _ctx = setup._ctx;
     let _pd = setup._pd;
     let client = RefCell::new(setup.client);
@@ -2373,6 +2400,8 @@ fn bench_ud_send_latency_32b(c: &mut Criterion) {
             return;
         }
     };
+
+    pin_to_core(15);
 
     let _ctx = setup._ctx;
     let _pd = setup._pd;
@@ -2405,6 +2434,8 @@ fn bench_write_imm_inline_32b(c: &mut Criterion) {
             return;
         }
     };
+
+    pin_to_core(15);
 
     let _ctx = setup._ctx;
     let _pd = setup._pd;

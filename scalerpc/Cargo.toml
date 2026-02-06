@@ -10,6 +10,7 @@ minstant.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+core_affinity.workspace = true
 mlx5 = { version = "0.1.0", path = "../mlx5", features = ["test-utils"] }
 
 [[bench]]

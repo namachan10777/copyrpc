@@ -42,12 +42,20 @@ use mlx5::wqe::WqeFlags;
 use mlx5::wqe::emit::{DcAvIb, UdAvIb};
 
 // =============================================================================
+// CPU Pinning Helper
+// =============================================================================
+
+fn pin_to_core(core_id: usize) {
+    core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
+}
+
+// =============================================================================
 // Constants
 // =============================================================================
 
 const NUM_CONNECTIONS: usize = 512;
-const NUM_SERVER_THREADS: usize = 16;
-const QPS_PER_THREAD: usize = NUM_CONNECTIONS / NUM_SERVER_THREADS; // 32
+const NUM_SERVER_THREADS: usize = 13;
+const QPS_PER_THREAD: usize = NUM_CONNECTIONS / NUM_SERVER_THREADS; // 39
 const SMALL_MSG_SIZE: usize = 32;
 const RECV_BUF_ENTRY_SIZE: usize = 64;
 const UD_RECV_ENTRY_SIZE: usize = 128;
@@ -416,13 +424,14 @@ fn setup_rc_multi_qp_benchmark() -> Option<RcMultiQpSetup<impl Fn(Cqe, u64), imp
     let mut server_info_rxs = Vec::new();
     let mut client_info_txs = Vec::new();
 
-    for _ in 0..NUM_SERVER_THREADS {
+    for thread_idx in 0..NUM_SERVER_THREADS {
         let (si_tx, si_rx) = mpsc::channel::<Vec<ConnectionInfo>>();
         let (ci_tx, ci_rx) = mpsc::channel::<Vec<ConnectionInfo>>();
         let ready = ready_counter.clone();
         let stop = stop_flag.clone();
 
         handles.push(thread::spawn(move || {
+            pin_to_core(14 - thread_idx);
             rc_server_thread_main(si_tx, ci_rx, ready, stop);
         }));
 
@@ -836,13 +845,14 @@ fn setup_ud_multi_qp_benchmark() -> Option<UdMultiQpSetup> {
     let mut server_info_rxs = Vec::new();
     let mut client_info_txs = Vec::new();
 
-    for _ in 0..NUM_SERVER_THREADS {
+    for thread_idx in 0..NUM_SERVER_THREADS {
         let (si_tx, si_rx) = mpsc::channel::<UdConnectionInfo>();
         let (ci_tx, ci_rx) = mpsc::channel::<UdConnectionInfo>();
         let ready = ready_counter.clone();
         let stop = stop_flag.clone();
 
         handles.push(thread::spawn(move || {
+            pin_to_core(14 - thread_idx);
             ud_server_thread_main(si_tx, ci_rx, ready, stop);
         }));
 
@@ -1265,13 +1275,14 @@ fn setup_dc_multi_qp_benchmark() -> Option<DcMultiQpSetup> {
     let mut server_info_rxs = Vec::new();
     let mut client_info_txs = Vec::new();
 
-    for _ in 0..NUM_SERVER_THREADS {
+    for thread_idx in 0..NUM_SERVER_THREADS {
         let (si_tx, si_rx) = mpsc::channel::<DcConnectionInfo>();
         let (ci_tx, ci_rx) = mpsc::channel::<DcConnectionInfo>();
         let ready = ready_counter.clone();
         let stop = stop_flag.clone();
 
         handles.push(thread::spawn(move || {
+            pin_to_core(14 - thread_idx);
             dc_server_thread_main(si_tx, ci_rx, ready, stop);
         }));
 
@@ -1451,6 +1462,8 @@ fn bench_rc_512qp(c: &mut Criterion) {
         }
     };
 
+    pin_to_core(15);
+
     let mut group = c.benchmark_group("multi_qp_512");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(5));
@@ -1472,6 +1485,8 @@ fn bench_ud_512qp(c: &mut Criterion) {
         }
     };
 
+    pin_to_core(15);
+
     let mut group = c.benchmark_group("multi_qp_512");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(5));
@@ -1492,6 +1507,8 @@ fn bench_dc_512qp(c: &mut Criterion) {
             return;
         }
     };
+
+    pin_to_core(15);
 
     let mut group = c.benchmark_group("multi_qp_512");
     group.sample_size(10);

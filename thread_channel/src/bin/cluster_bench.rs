@@ -94,6 +94,10 @@ struct Args {
     /// Max inflight requests per channel
     #[arg(short = 'i', long, default_value = "256")]
     inflight: usize,
+
+    /// Starting core ID for thread pinning (threads count down from this core)
+    #[arg(long, default_value = "31")]
+    start_core: usize,
 }
 
 struct BenchResult {
@@ -118,6 +122,10 @@ struct RunResult {
     max_rps: u64,
 }
 
+fn pin_to_core(core_id: usize) {
+    core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
+}
+
 // ============================================================================
 // Flux benchmark (SPSC Transport based)
 // ============================================================================
@@ -128,6 +136,7 @@ fn run_flux_benchmark<Tr: Transport>(
     capacity: usize,
     duration_secs: u64,
     max_inflight: usize,
+    start_core: usize,
 ) -> RunResult {
     let per_thread_completed: Vec<Arc<AtomicU64>> =
         (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
@@ -146,7 +155,9 @@ fn run_flux_benchmark<Tr: Transport>(
             let barrier = Arc::clone(&barrier);
             let stop_flag = Arc::clone(&stop_flag);
             let my_completed = Arc::clone(&per_thread_completed[thread_idx]);
+            let core = start_core - thread_idx;
             thread::spawn(move || {
+                pin_to_core(core);
                 let id = node.id();
                 let peers: Vec<usize> = (0..n).filter(|&p| p != id).collect();
 
@@ -214,6 +225,7 @@ fn run_mesh_benchmark<M: MpscChannel>(
     _capacity: usize,
     duration_secs: u64,
     max_inflight: usize,
+    start_core: usize,
 ) -> RunResult {
     let per_thread_completed: Vec<Arc<AtomicU64>> =
         (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
@@ -231,7 +243,9 @@ fn run_mesh_benchmark<M: MpscChannel>(
             let barrier = Arc::clone(&barrier);
             let stop_flag = Arc::clone(&stop_flag);
             let my_completed = Arc::clone(&per_thread_completed[thread_idx]);
+            let core = start_core - thread_idx;
             thread::spawn(move || {
+                pin_to_core(core);
                 let id = node.id();
                 let peers: Vec<usize> = (0..n).filter(|&p| p != id).collect();
 
@@ -371,7 +385,8 @@ fn run_transport_benchmark(
     inflight: usize,
     warmup: usize,
     runs: usize,
-    run_fn: fn(usize, usize, u64, usize) -> RunResult,
+    start_core: usize,
+    run_fn: fn(usize, usize, u64, usize, usize) -> RunResult,
 ) -> BenchResult {
     println!(
         "Benchmarking {} ({}/{}): n={}, duration={}s",
@@ -381,7 +396,7 @@ fn run_transport_benchmark(
     // Warmup
     for w in 0..warmup {
         println!("  Warmup {}/{}", w + 1, warmup);
-        run_fn(n, capacity, duration_secs.min(3), inflight);
+        run_fn(n, capacity, duration_secs.min(3), inflight, start_core);
     }
 
     // Benchmark runs
@@ -392,7 +407,7 @@ fn run_transport_benchmark(
 
     for r in 0..runs {
         println!("  Run {}/{}", r + 1, runs);
-        let result = run_fn(n, capacity, duration_secs, inflight);
+        let result = run_fn(n, capacity, duration_secs, inflight, start_core);
         durations.push(result.duration);
         total_ops.push(result.total_completed);
         all_mins.push(result.min_rps);
@@ -455,6 +470,7 @@ fn main() {
             args.inflight,
             args.warmup,
             args.runs,
+            args.start_core,
             run_flux_benchmark::<OnesidedTransport>,
         ));
     }
@@ -470,6 +486,7 @@ fn main() {
             args.inflight,
             args.warmup,
             args.runs,
+            args.start_core,
             run_flux_benchmark::<OnesidedImmediateTransport>,
         ));
     }
@@ -485,6 +502,7 @@ fn main() {
             args.inflight,
             args.warmup,
             args.runs,
+            args.start_core,
             run_flux_benchmark::<OnesidedValidityTransport>,
         ));
     }
@@ -500,6 +518,7 @@ fn main() {
             args.inflight,
             args.warmup,
             args.runs,
+            args.start_core,
             run_flux_benchmark::<FastForwardTransport>,
         ));
     }
@@ -515,6 +534,7 @@ fn main() {
             args.inflight,
             args.warmup,
             args.runs,
+            args.start_core,
             run_flux_benchmark::<LamportTransport>,
         ));
     }
@@ -531,6 +551,7 @@ fn main() {
             args.inflight,
             args.warmup,
             args.runs,
+            args.start_core,
             run_flux_benchmark::<RtrbTransport>,
         ));
     }
@@ -547,6 +568,7 @@ fn main() {
             args.inflight,
             args.warmup,
             args.runs,
+            args.start_core,
             run_flux_benchmark::<OmangoTransport>,
         ));
     }
@@ -564,6 +586,7 @@ fn main() {
             args.inflight,
             args.warmup,
             args.runs,
+            args.start_core,
             run_mesh_benchmark::<StdMpsc>,
         ));
 
@@ -578,6 +601,7 @@ fn main() {
             args.inflight,
             args.warmup,
             args.runs,
+            args.start_core,
             run_mesh_benchmark::<CrossbeamMpsc>,
         ));
     }

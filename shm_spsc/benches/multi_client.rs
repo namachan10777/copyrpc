@@ -16,7 +16,6 @@ use uuid::Uuid;
 
 const NUM_CLIENTS: usize = 16;
 const SERVER_CORE: usize = 31;
-const CLIENT_CORE_BASE: usize = 15;
 
 fn pin_to_core(core_id: usize) {
     core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
@@ -50,7 +49,7 @@ fn run_bench(b: &mut criterion::Bencher, depth: u32) {
             let stop_clone = stop.clone();
             let start_b = start_barrier.clone();
             let end_b = end_barrier.clone();
-            let core_id = CLIENT_CORE_BASE + client_idx;
+            let core_id = 31 - 1 - client_idx;
 
             client_handles.push(thread::spawn(move || {
                 pin_to_core(core_id);

@@ -16,6 +16,10 @@ use thread_channel::RtrbTransport;
 #[cfg(feature = "omango")]
 use thread_channel::OmangoTransport;
 
+fn pin_to_core(core_id: usize) {
+    core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
+}
+
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct Payload {
@@ -61,6 +65,7 @@ fn run_pingpong_bench<Tr: Transport>(b: &mut criterion::Bencher) {
     let stop2 = Arc::clone(&stop);
 
     let handle = thread::spawn(move || {
+        pin_to_core(30);
         while !stop2.load(Ordering::Relaxed) {
             // sync() makes peer's calls visible, our replies visible
             endpoint_b.sync();
@@ -78,6 +83,7 @@ fn run_pingpong_bench<Tr: Transport>(b: &mut criterion::Bencher) {
     let payload = Payload { data: [42; 4] };
 
     b.iter(|| {
+        pin_to_core(31);
         let token = endpoint_a.call(black_box(payload)).unwrap();
         loop {
             endpoint_a.sync();
@@ -138,6 +144,7 @@ fn run_throughput_bench<Tr: Transport>(b: &mut criterion::Bencher, requests: usi
 
     // Responder thread: sync() then process all requests
     let handle = thread::spawn(move || {
+        pin_to_core(30);
         while !stop2.load(Ordering::Relaxed) {
             // sync() makes peer's calls visible, makes our replies visible
             endpoint_b.sync();
@@ -153,6 +160,7 @@ fn run_throughput_bench<Tr: Transport>(b: &mut criterion::Bencher, requests: usi
     let payload = Payload { data: [42; 4] };
 
     b.iter(|| {
+        pin_to_core(31);
         let mut sent = 0usize;
         let mut received = 0usize;
         let mut inflight = 0usize;

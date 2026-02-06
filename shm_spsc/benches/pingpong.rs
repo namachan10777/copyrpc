@@ -7,6 +7,10 @@ use std::sync::Arc;
 use std::thread;
 use uuid::Uuid;
 
+fn pin_to_core(core_id: usize) {
+    core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
+}
+
 fn bench_call_latency(c: &mut Criterion) {
     let mut group = c.benchmark_group("shm_rpc_call");
     group.throughput(Throughput::Elements(1));
@@ -23,6 +27,7 @@ fn bench_call_latency(c: &mut Criterion) {
             let stop_clone = stop.clone();
 
             let server_thread = thread::spawn(move || {
+                pin_to_core(30);
                 while !stop_clone.load(Ordering::Relaxed) {
                     server.process_batch(|_cid, req| req + 1);
                 }
@@ -39,6 +44,7 @@ fn bench_call_latency(c: &mut Criterion) {
             }
 
             b.iter(|| {
+                pin_to_core(31);
                 black_box(client.call(black_box(42u64)).unwrap());
             });
 
@@ -60,6 +66,7 @@ fn bench_call_latency(c: &mut Criterion) {
             let stop_clone = stop.clone();
 
             let server_thread = thread::spawn(move || {
+                pin_to_core(30);
                 while !stop_clone.load(Ordering::Relaxed) {
                     server.process_batch(|_cid, req| req);
                 }
@@ -77,6 +84,7 @@ fn bench_call_latency(c: &mut Criterion) {
 
             let data = [0xABu8; 64];
             b.iter(|| {
+                pin_to_core(31);
                 black_box(client.call(black_box(data)).unwrap());
             });
 
@@ -98,6 +106,7 @@ fn bench_call_latency(c: &mut Criterion) {
             let stop_clone = stop.clone();
 
             let server_thread = thread::spawn(move || {
+                pin_to_core(30);
                 while !stop_clone.load(Ordering::Relaxed) {
                     server.process_batch(|_cid, req| req);
                 }
@@ -115,6 +124,7 @@ fn bench_call_latency(c: &mut Criterion) {
 
             let data = [0xABu8; 256];
             b.iter(|| {
+                pin_to_core(31);
                 black_box(client.call(black_box(data)).unwrap());
             });
 

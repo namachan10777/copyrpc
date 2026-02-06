@@ -11,6 +11,10 @@ use thread_channel::{
 #[cfg(feature = "crossbeam")]
 use thread_channel::CrossbeamMpsc;
 
+fn pin_to_core(core_id: usize) {
+    core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
+}
+
 use thread_channel::mpsc::MpscChannel;
 use thread_channel::Serial;
 use thread_channel::{
@@ -63,10 +67,11 @@ fn run_mesh_notify_bench<M: MpscChannel>(
         let nodes: Vec<Mesh<Payload, M>> = create_mesh_with(num_nodes);
         let mut handles = Vec::new();
 
-        for mut node in nodes.into_iter() {
+        for (node_index, mut node) in nodes.into_iter().enumerate() {
             let n = num_nodes;
             let msgs = msgs_per_node;
             handles.push(thread::spawn(move || {
+                pin_to_core(31 - node_index);
                 let id = node.id();
                 let payload = Payload { data: [id as u64; 4] };
 
@@ -132,10 +137,11 @@ fn run_mesh_call_reply_bench<M: MpscChannel>(
         let nodes: Vec<Mesh<Payload, M>> = create_mesh_with(num_nodes);
         let mut handles = Vec::new();
 
-        for mut node in nodes.into_iter() {
+        for (node_index, mut node) in nodes.into_iter().enumerate() {
             let n = num_nodes;
             let calls = calls_per_node;
             handles.push(thread::spawn(move || {
+                pin_to_core(31 - node_index);
                 let id = node.id();
                 let payload = Payload { data: [id as u64; 4] };
 
@@ -244,12 +250,13 @@ fn run_flux_call_reply_bench<Tr: Transport>(
         };
         let mut handles = Vec::new();
 
-        for mut node in nodes.into_iter() {
+        for (node_index, mut node) in nodes.into_iter().enumerate() {
             let n = num_nodes;
             let calls = calls_per_node;
             let global_count = Arc::clone(&global_response_count);
             let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
+                pin_to_core(31 - node_index);
                 let id = node.id();
                 let payload = Payload { data: [id as u64; 4] };
                 let peers: Vec<usize> = (0..n).filter(|&p| p != id).collect();

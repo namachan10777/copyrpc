@@ -616,6 +616,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "clap",
+ "core_affinity",
  "criterion",
  "fastmap",
  "libc",
@@ -781,6 +782,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 name = "erpc"
 version = "0.1.0"
 dependencies = [
+ "core_affinity",
  "criterion",
  "libc",
  "mlx5",
@@ -1171,6 +1173,7 @@ name = "mlx5"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.10.0",
+ "core_affinity",
  "criterion",
  "fastmap",
  "libc",
@@ -1635,6 +1638,7 @@ dependencies = [
 name = "scalerpc"
 version = "0.1.0"
 dependencies = [
+ "core_affinity",
  "criterion",
  "libc",
  "minstant",

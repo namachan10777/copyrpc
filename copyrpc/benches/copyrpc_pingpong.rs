@@ -20,6 +20,10 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use copyrpc::{Context, ContextBuilder, Endpoint, EndpointConfig, RemoteEndpointInfo};
 use mlx5::srq::SrqConfig;
 
+fn pin_to_core(core_id: usize) {
+    core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -179,6 +183,7 @@ fn setup_copyrpc_benchmark(config: &BenchConfig) -> Option<BenchmarkSetup> {
 
     let num_endpoints = config.num_endpoints;
     let handle = thread::spawn(move || {
+        pin_to_core(14);
         server_thread_main(server_info_tx, client_info_rx, server_ready_clone, server_stop, num_endpoints);
     });
 
@@ -418,6 +423,8 @@ fn run_copyrpc_bench(client: &mut CopyrpcClient, iters: u64) -> Duration {
 // =============================================================================
 
 fn benchmarks(c: &mut Criterion) {
+    pin_to_core(15);
+
     let configs = [
         BenchConfig { num_endpoints: 8, requests_per_ep: 256 },
         BenchConfig { num_endpoints: 1, requests_per_ep: 32 },

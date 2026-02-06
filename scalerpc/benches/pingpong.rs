@@ -34,6 +34,10 @@ use scalerpc::{
 };
 use scalerpc::connection::RemoteEndpoint;
 
+fn pin_to_core(core_id: usize) {
+    core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
+}
+
 // =============================================================================
 // BenchConfig - Environment Variable Configuration
 // =============================================================================
@@ -251,6 +255,7 @@ fn setup_benchmark(config: &BenchConfig) -> Option<BenchmarkSetup> {
 
     let server_config = config.clone();
     let handle = thread::spawn(move || {
+        pin_to_core(14);
         server_thread_main(&server_config, server_info_tx, client_info_rx, server_ready_clone, server_stop);
     });
 
@@ -463,6 +468,8 @@ fn run_throughput_bench(
 // =============================================================================
 
 fn bench_latency(c: &mut Criterion) {
+    pin_to_core(15);
+
     let config = BenchConfig::load();
 
     let setup = match setup_benchmark(&config) {
@@ -492,6 +499,8 @@ fn bench_latency(c: &mut Criterion) {
 }
 
 fn bench_throughput(c: &mut Criterion) {
+    pin_to_core(15);
+
     let config = BenchConfig::load();
 
     let setup = match setup_benchmark(&config) {
@@ -588,6 +597,7 @@ fn setup_multi_qp_benchmark(config: &BenchConfig) -> Option<MultiQpBenchmarkSetu
 
     let server_config = config.clone();
     let handle = thread::spawn(move || {
+        pin_to_core(14);
         multi_qp_server_thread_main(&server_config, server_info_tx, client_info_rx, server_ready_clone, server_stop);
     });
 
@@ -768,6 +778,8 @@ fn run_multi_qp_throughput_bench(
 }
 
 fn bench_multi_qp_throughput(c: &mut Criterion) {
+    pin_to_core(15);
+
     let config = BenchConfig::load();
 
     let setup = match setup_multi_qp_benchmark(&config) {

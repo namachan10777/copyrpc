@@ -20,6 +20,7 @@ bench-bin = ["mpi", "clap", "parquet", "arrow", "libc"]
 [dev-dependencies]
 criterion.workspace = true
 libc.workspace = true
+core_affinity.workspace = true
 
 [[bench]]
 name = "copyrpc_pingpong"
