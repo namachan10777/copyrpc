@@ -6,7 +6,8 @@
 //! Key characteristics:
 //! - Connectionless: No QP state machine, no connection setup
 //! - Unreliable: No retransmission, no guaranteed delivery
-//! - Unordered: No message ordering guarantees
+//! - Unordered delivery: No network-level message delivery ordering between different senders
+//!   (HCA completion ordering within a single QP is guaranteed, same as RC)
 //! - One-to-many: Single QP can send to multiple destinations
 
 use std::cell::{Cell, RefCell};

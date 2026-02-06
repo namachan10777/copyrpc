@@ -17,6 +17,10 @@ criterion = { version = "0.5", features = ["html_reports"] }
 name = "rdma_ops"
 harness = false
 
+[[bench]]
+name = "multi_qp"
+harness = false
+
 [lints.clippy]
 manual_div_ceil = "allow"
 type_complexity = "allow"

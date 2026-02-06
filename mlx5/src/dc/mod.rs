@@ -12,6 +12,7 @@ use crate::BuildResult;
 use crate::CompletionTarget;
 use crate::builder_common::register_with_send_cq;
 use crate::cq::{Cq, Cqe};
+use crate::mono_cq::CompletionSource;
 use crate::device::Context;
 use crate::mono_cq::MonoCq;
 use crate::pd::Pd;
@@ -761,6 +762,23 @@ where
         {
             (self.callback)(cqe, entry);
         }
+    }
+}
+
+// =============================================================================
+// CompletionSource impl for DciForMonoCq
+// =============================================================================
+
+impl<Entry> CompletionSource for DciForMonoCq<Entry> {
+    type Entry = Entry;
+
+    fn qpn(&self) -> u32 {
+        Dci::qpn(self)
+    }
+
+    fn process_cqe(&self, cqe: Cqe) -> Option<Entry> {
+        // DCI only has SQ (no RQ)
+        self.sq.as_ref()?.process_completion(cqe.wqe_counter)
     }
 }
 
