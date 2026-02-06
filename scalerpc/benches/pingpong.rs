@@ -10,8 +10,6 @@
 //! ```
 //!
 //! Environment variables for configuration:
-//! - `SCALERPC_CLIENT_CORE`: CPU core for client (default: 0)
-//! - `SCALERPC_SERVER_CORE`: CPU core for server (default: 1)
 //! - `SCALERPC_NUM_SLOTS`: Number of slots for single QP tests (default: 1024)
 //! - `SCALERPC_PIPELINE_DEPTH`: Pipeline depth for throughput test (default: 16)
 //! - `SCALERPC_NUM_QPS`: Number of QPs for multi-QP test (default: 64)
@@ -49,9 +47,6 @@ fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
 
 #[derive(Clone)]
 struct BenchConfig {
-    // CPU affinity
-    client_core: usize,
-    server_core: usize,
     // Single QP
     num_slots: usize,
     pipeline_depth: usize,
@@ -65,8 +60,6 @@ struct BenchConfig {
 impl BenchConfig {
     fn load() -> Self {
         Self {
-            client_core: env_or("SCALERPC_CLIENT_CORE", 0),
-            server_core: env_or("SCALERPC_SERVER_CORE", 1),
             num_slots: env_or("SCALERPC_NUM_SLOTS", 256),
             pipeline_depth: env_or("SCALERPC_PIPELINE_DEPTH", 16),
             num_qps: env_or("SCALERPC_NUM_QPS", 64),
@@ -84,22 +77,6 @@ impl BenchConfig {
     /// Total slots needed - based on group size (only one group active at a time).
     fn multi_qp_num_slots(&self) -> usize {
         self.group_size() * self.slots_per_conn
-    }
-}
-
-// =============================================================================
-// CPU Affinity
-// =============================================================================
-
-fn set_cpu_affinity(core_id: usize) {
-    unsafe {
-        let mut cpuset: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(&mut cpuset);
-        libc::CPU_SET(core_id, &mut cpuset);
-        let result = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpuset);
-        if result != 0 {
-            eprintln!("Warning: Failed to set CPU affinity to core {}", core_id);
-        }
     }
 }
 
@@ -245,8 +222,6 @@ struct BenchmarkSetup {
 }
 
 fn setup_benchmark(config: &BenchConfig) -> Option<BenchmarkSetup> {
-    set_cpu_affinity(config.client_core);
-
     let test_ctx = TestContext::new()?;
 
     let client_config = ClientConfig {
@@ -316,8 +291,6 @@ fn server_thread_main(
     ready_signal: Arc<AtomicU32>,
     stop_flag: Arc<AtomicBool>,
 ) {
-    set_cpu_affinity(config.server_core);
-
     let ctx = match open_mlx5_device() {
         Some(c) => c,
         None => return,
@@ -585,8 +558,6 @@ struct MultiQpBenchmarkSetup {
 }
 
 fn setup_multi_qp_benchmark(config: &BenchConfig) -> Option<MultiQpBenchmarkSetup> {
-    set_cpu_affinity(config.client_core);
-
     let test_ctx = TestContext::new()?;
 
     let num_qps = config.num_qps;
@@ -664,8 +635,6 @@ fn multi_qp_server_thread_main(
     ready_signal: Arc<AtomicU32>,
     stop_flag: Arc<AtomicBool>,
 ) {
-    set_cpu_affinity(config.server_core);
-
     let ctx = match open_mlx5_device() {
         Some(c) => c,
         None => return,

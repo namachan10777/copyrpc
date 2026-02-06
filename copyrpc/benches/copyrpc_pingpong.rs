@@ -21,25 +21,6 @@ use copyrpc::{Context, ContextBuilder, Endpoint, EndpointConfig, RemoteEndpointI
 use mlx5::srq::SrqConfig;
 
 // =============================================================================
-// CPU Affinity
-// =============================================================================
-
-fn set_cpu_affinity(core_id: usize) {
-    unsafe {
-        let mut cpuset: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(&mut cpuset);
-        libc::CPU_SET(core_id, &mut cpuset);
-        let result = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpuset);
-        if result != 0 {
-            eprintln!("Warning: Failed to set CPU affinity to core {}", core_id);
-        }
-    }
-}
-
-const CLIENT_CORE: usize = 0;
-const SERVER_CORE: usize = 1;
-
-// =============================================================================
 // Constants
 // =============================================================================
 
@@ -131,8 +112,6 @@ struct BenchmarkSetup {
 }
 
 fn setup_copyrpc_benchmark() -> Option<BenchmarkSetup> {
-    set_cpu_affinity(CLIENT_CORE);
-
     // Reset response counter
     get_and_reset_response_count();
 
@@ -253,8 +232,6 @@ fn server_thread_main(
     ready_signal: Arc<AtomicU32>,
     stop_flag: Arc<AtomicBool>,
 ) {
-    set_cpu_affinity(SERVER_CORE);
-
     let on_response: fn((), &[u8]) = |_user_data, _data| {};
 
     let ctx: Context<(), _> = match ContextBuilder::new()

@@ -24,25 +24,6 @@ use mlx5::types::PortAttr;
 use erpc::{RemoteInfo, Rpc, RpcConfig};
 
 // =============================================================================
-// CPU Affinity
-// =============================================================================
-
-fn set_cpu_affinity(core_id: usize) {
-    unsafe {
-        let mut cpuset: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(&mut cpuset);
-        libc::CPU_SET(core_id, &mut cpuset);
-        let result = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpuset);
-        if result != 0 {
-            eprintln!("Warning: Failed to set CPU affinity to core {}", core_id);
-        }
-    }
-}
-
-const CLIENT_CORE: usize = 0;
-const SERVER_CORE: usize = 1;
-
-// =============================================================================
 // Constants
 // =============================================================================
 
@@ -132,8 +113,6 @@ thread_local! {
 }
 
 fn setup_benchmark() -> Option<BenchmarkSetup> {
-    set_cpu_affinity(CLIENT_CORE);
-
     let (ctx, port, _port_attr) = open_mlx5_device()?;
 
     let pipeline_depth = 1024;
@@ -220,8 +199,6 @@ thread_local! {
 }
 
 fn setup_multi_qp_benchmark(num_qps: usize, pipeline_depth: usize) -> Option<MultiQpBenchmarkSetup> {
-    set_cpu_affinity(CLIENT_CORE);
-
     let (ctx, port, _port_attr) = open_mlx5_device()?;
 
     let config = RpcConfig::default()
@@ -347,8 +324,6 @@ fn multi_qp_server_thread(
     config: RpcConfig,
     num_qps: usize,
 ) {
-    set_cpu_affinity(SERVER_CORE);
-
     let (ctx, port, _port_attr) = match open_mlx5_device() {
         Some(c) => c,
         None => return,
@@ -447,8 +422,6 @@ fn server_thread_main_with_config(
     stop_flag: Arc<AtomicBool>,
     config: RpcConfig,
 ) {
-    set_cpu_affinity(SERVER_CORE);
-
     let (ctx, port, _port_attr) = match open_mlx5_device() {
         Some(c) => c,
         None => return,
@@ -810,8 +783,6 @@ thread_local! {
 }
 
 fn setup_multi_session_benchmark(num_sessions: usize) -> Option<MultiSessionBenchmarkSetup> {
-    set_cpu_affinity(CLIENT_CORE);
-
     let (ctx, port, _port_attr) = open_mlx5_device()?;
 
     // eRPC paper: B=8 session credits, large req_window for pipelining
@@ -917,8 +888,6 @@ fn multi_session_server_thread(
     stop_flag: Arc<AtomicBool>,
     config: RpcConfig,
 ) {
-    set_cpu_affinity(SERVER_CORE);
-
     let (ctx, port, _port_attr) = match open_mlx5_device() {
         Some(c) => c,
         None => return,

@@ -13,7 +13,6 @@ use arrow::array::{Float64Array, StringArray, UInt32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use clap::{Parser, ValueEnum};
-use core_affinity::CoreId;
 use parquet::arrow::ArrowWriter;
 use thread_channel::Serial;
 use thread_channel::{
@@ -29,12 +28,6 @@ use thread_channel::OmangoTransport;
 use thread_channel::CrossbeamMpsc;
 
 use thread_channel::mpsc::MpscChannel;
-
-/// Pin current thread to the specified core
-fn pin_to_core(core_id: usize) {
-    let core = CoreId { id: core_id };
-    core_affinity::set_for_current(core);
-}
 
 /// 32-byte payload for benchmarking
 #[derive(Clone, Copy, Debug)]
@@ -151,8 +144,6 @@ fn run_flux_benchmark<Tr: Transport>(
             let stop_flag = Arc::clone(&stop_flag);
             let my_completed = Arc::clone(&per_thread_completed[thread_idx]);
             thread::spawn(move || {
-                pin_to_core(thread_idx + 1);
-
                 let id = node.id();
                 let peers: Vec<usize> = (0..n).filter(|&p| p != id).collect();
 
@@ -238,8 +229,6 @@ fn run_mesh_benchmark<M: MpscChannel>(
             let stop_flag = Arc::clone(&stop_flag);
             let my_completed = Arc::clone(&per_thread_completed[thread_idx]);
             thread::spawn(move || {
-                pin_to_core(thread_idx + 1);
-
                 let id = node.id();
                 let peers: Vec<usize> = (0..n).filter(|&p| p != id).collect();
 
@@ -318,9 +307,6 @@ fn monitor_and_collect(
     handles: Vec<thread::JoinHandle<u64>>,
     duration_secs: u64,
 ) -> RunResult {
-    // Monitor thread on CPU 0
-    pin_to_core(0);
-
     barrier.wait();
     let start = Instant::now();
     let run_duration = Duration::from_secs(duration_secs);

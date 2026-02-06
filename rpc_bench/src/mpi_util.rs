@@ -56,16 +56,3 @@ pub fn exchange_bytes_variable(
     }
     remote
 }
-
-pub fn set_cpu_affinity(core_id: usize) {
-    unsafe {
-        let mut cpuset: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(&mut cpuset);
-        libc::CPU_SET(core_id, &mut cpuset);
-        let result =
-            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpuset);
-        if result != 0 {
-            eprintln!("Warning: Failed to set CPU affinity to core {}", core_id);
-        }
-    }
-}

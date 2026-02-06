@@ -62,7 +62,6 @@ pub fn run(
     mode: &ModeCmd,
 ) -> Vec<BenchRow> {
     let rank = world.rank();
-    mpi_util::set_cpu_affinity(rank as usize);
 
     match mode {
         ModeCmd::OneToOne {

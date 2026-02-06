@@ -2,7 +2,6 @@
 //!
 //! Measures n-to-n communication performance with different backends.
 
-use core_affinity::CoreId;
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::thread;
 use thread_channel::{
@@ -64,11 +63,10 @@ fn run_mesh_notify_bench<M: MpscChannel>(
         let nodes: Vec<Mesh<Payload, M>> = create_mesh_with(num_nodes);
         let mut handles = Vec::new();
 
-        for (idx, mut node) in nodes.into_iter().enumerate() {
+        for mut node in nodes.into_iter() {
             let n = num_nodes;
             let msgs = msgs_per_node;
             handles.push(thread::spawn(move || {
-                core_affinity::set_for_current(CoreId { id: idx });
                 let id = node.id();
                 let payload = Payload { data: [id as u64; 4] };
 
@@ -134,11 +132,10 @@ fn run_mesh_call_reply_bench<M: MpscChannel>(
         let nodes: Vec<Mesh<Payload, M>> = create_mesh_with(num_nodes);
         let mut handles = Vec::new();
 
-        for (idx, mut node) in nodes.into_iter().enumerate() {
+        for mut node in nodes.into_iter() {
             let n = num_nodes;
             let calls = calls_per_node;
             handles.push(thread::spawn(move || {
-                core_affinity::set_for_current(CoreId { id: idx });
                 let id = node.id();
                 let payload = Payload { data: [id as u64; 4] };
 
@@ -247,13 +244,12 @@ fn run_flux_call_reply_bench<Tr: Transport>(
         };
         let mut handles = Vec::new();
 
-        for (idx, mut node) in nodes.into_iter().enumerate() {
+        for mut node in nodes.into_iter() {
             let n = num_nodes;
             let calls = calls_per_node;
             let global_count = Arc::clone(&global_response_count);
             let barrier = Arc::clone(&barrier);
             handles.push(thread::spawn(move || {
-                core_affinity::set_for_current(CoreId { id: idx });
                 let id = node.id();
                 let payload = Payload { data: [id as u64; 4] };
                 let peers: Vec<usize> = (0..n).filter(|&p| p != id).collect();
