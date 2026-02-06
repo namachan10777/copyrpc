@@ -29,6 +29,11 @@ const REQUESTS_PER_EP: usize = 32;
 const MESSAGE_SIZE: usize = 32;
 const RING_SIZE: usize = 1 << 20; // 1 MB
 
+struct BenchConfig {
+    num_endpoints: usize,
+    requests_per_ep: usize,
+}
+
 // =============================================================================
 // Connection Info
 // =============================================================================
@@ -76,6 +81,8 @@ type OnResponseFn = fn((), &[u8]);
 struct CopyrpcClient {
     ctx: Context<(), OnResponseFn>,
     endpoints: Vec<Endpoint<()>>,
+    num_endpoints: usize,
+    requests_per_ep: usize,
 }
 
 // =============================================================================
@@ -136,10 +143,10 @@ fn setup_copyrpc_benchmark() -> Option<BenchmarkSetup> {
         ..Default::default()
     };
 
-    let mut endpoints = Vec::with_capacity(NUM_ENDPOINTS);
-    let mut client_infos = Vec::with_capacity(NUM_ENDPOINTS);
+    let mut endpoints = Vec::with_capacity(config.num_endpoints);
+    let mut client_infos = Vec::with_capacity(config.num_endpoints);
 
-    for _ in 0..NUM_ENDPOINTS {
+    for _ in 0..config.num_endpoints {
         let ep = ctx.create_endpoint(&ep_config).ok()?;
         let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
 
@@ -172,8 +179,9 @@ fn setup_copyrpc_benchmark() -> Option<BenchmarkSetup> {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let server_stop = stop_flag.clone();
 
+    let num_endpoints = config.num_endpoints;
     let handle = thread::spawn(move || {
-        server_thread_main(server_info_tx, client_info_rx, server_ready_clone, server_stop);
+        server_thread_main(server_info_tx, client_info_rx, server_ready_clone, server_stop, num_endpoints);
     });
 
     client_info_tx
@@ -217,6 +225,8 @@ fn setup_copyrpc_benchmark() -> Option<BenchmarkSetup> {
         client: CopyrpcClient {
             ctx,
             endpoints,
+            num_endpoints: config.num_endpoints,
+            requests_per_ep: config.requests_per_ep,
         },
         _server_handle: server_handle,
     })
@@ -231,6 +241,7 @@ fn server_thread_main(
     info_rx: Receiver<MultiEndpointConnectionInfo>,
     ready_signal: Arc<AtomicU32>,
     stop_flag: Arc<AtomicBool>,
+    num_endpoints: usize,
 ) {
     let on_response: fn((), &[u8]) = |_user_data, _data| {};
 
@@ -258,10 +269,10 @@ fn server_thread_main(
         ..Default::default()
     };
 
-    let mut endpoints = Vec::with_capacity(NUM_ENDPOINTS);
-    let mut server_infos = Vec::with_capacity(NUM_ENDPOINTS);
+    let mut endpoints = Vec::with_capacity(num_endpoints);
+    let mut server_infos = Vec::with_capacity(num_endpoints);
 
-    for _ in 0..NUM_ENDPOINTS {
+    for _ in 0..num_endpoints {
         let ep = match ctx.create_endpoint(&ep_config) {
             Ok(e) => e,
             Err(_) => return,
@@ -356,7 +367,7 @@ fn run_copyrpc_bench(client: &mut CopyrpcClient, iters: u64) -> Duration {
 
     // Initial fill: send initial requests on each endpoint
     for ep in client.endpoints.iter() {
-        for _ in 0..REQUESTS_PER_EP {
+        for _ in 0..client.requests_per_ep {
             if ep.call(&request_data, ()).is_ok() {
                 inflight += 1;
             }
@@ -379,12 +390,13 @@ fn run_copyrpc_bench(client: &mut CopyrpcClient, iters: u64) -> Duration {
 
         // Send new requests to maintain queue depth
         let remaining = iters.saturating_sub(completed);
-        let can_send = (NUM_ENDPOINTS * REQUESTS_PER_EP)
+        let can_send = (client.num_endpoints * client.requests_per_ep)
             .saturating_sub(inflight)
             .min(remaining as usize);
 
+        let ep_mask = client.num_endpoints - 1;
         for i in 0..can_send {
-            let ep_id = i % NUM_ENDPOINTS;
+            let ep_id = i & ep_mask;
             let ep = &client.endpoints[ep_id];
 
             if ep.call(&request_data, ()).is_ok() {
@@ -408,23 +420,31 @@ fn run_copyrpc_bench(client: &mut CopyrpcClient, iters: u64) -> Duration {
 // =============================================================================
 
 fn benchmarks(c: &mut Criterion) {
+    let configs = [
+        BenchConfig { num_endpoints: 8, requests_per_ep: 256 },
+        BenchConfig { num_endpoints: 1, requests_per_ep: 32 },
+        BenchConfig { num_endpoints: 1, requests_per_ep: 1 },
+    ];
+
     let mut group = c.benchmark_group("copyrpc_api");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(5));
     group.throughput(Throughput::Elements(1));
 
-    if let Some(setup) = setup_copyrpc_benchmark() {
-        let client = RefCell::new(setup.client);
-        let mut server_handle = setup._server_handle;
+    for config in &configs {
+        if let Some(setup) = setup_copyrpc_benchmark(config) {
+            let client = RefCell::new(setup.client);
+            let mut server_handle = setup._server_handle;
 
-        group.bench_function(
-            BenchmarkId::new("copyrpc", format!("{}ep_{}c_{}B", NUM_ENDPOINTS, REQUESTS_PER_EP, MESSAGE_SIZE)),
-            |b| {
-                b.iter_custom(|iters| run_copyrpc_bench(&mut client.borrow_mut(), iters));
-            },
-        );
+            group.bench_function(
+                BenchmarkId::new("copyrpc", format!("{}ep_{}qd_{}B", config.num_endpoints, config.requests_per_ep, MESSAGE_SIZE)),
+                |b| {
+                    b.iter_custom(|iters| run_copyrpc_bench(&mut client.borrow_mut(), iters));
+                },
+            );
 
-        server_handle.stop();
+            server_handle.stop();
+        }
     }
 
     group.finish();
