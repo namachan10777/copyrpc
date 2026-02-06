@@ -10,15 +10,22 @@ pub mod mesh;
 pub mod serial;
 pub mod transport;
 
-pub(crate) mod mpsc;
+pub mod mpsc;
 
 pub use flux::{create_flux, create_flux_with_transport, Flux, RecvHandle};
-pub use mesh::{create_mesh, Mesh};
+pub use mesh::{create_mesh, create_mesh_with, Mesh};
+#[cfg(feature = "crossbeam")]
+pub use mesh::CrossbeamMpsc;
+pub use mpsc::StdMpsc;
 pub use serial::Serial;
 pub use transport::{
     FastForwardTransport, LamportTransport, OnesidedTransport, Transport, TransportEndpoint,
     TransportError,
 };
+#[cfg(feature = "omango")]
+pub use transport::OmangoTransport;
+#[cfg(feature = "rtrb")]
+pub use transport::RtrbTransport;
 
 /// A received message, distinguishing between notifications, requests, and responses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -9,9 +9,15 @@ clap = { version = "4", features = ["derive"], optional = true }
 parquet = { version = "54", optional = true }
 arrow = { version = "54", optional = true }
 core_affinity = { version = "0.8", optional = true }
+rtrb = { version = "0.3", optional = true }
+omango = { version = "0.2", optional = true }
+crossbeam-channel = { version = "0.5", optional = true }
 
 [features]
 bench-bin = ["clap", "parquet", "arrow", "core_affinity"]
+rtrb = ["dep:rtrb"]
+omango = ["dep:omango"]
+crossbeam = ["dep:crossbeam-channel"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -19,6 +25,10 @@ core_affinity = "0.8"
 
 [[bench]]
 name = "call"
+harness = false
+
+[[bench]]
+name = "mesh"
 harness = false
 
 [[bin]]

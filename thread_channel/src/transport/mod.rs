@@ -12,7 +12,11 @@
 
 pub mod fastforward;
 pub mod lamport;
+#[cfg(feature = "omango")]
+pub mod omango;
 pub mod onesided;
+#[cfg(feature = "rtrb")]
+pub mod rtrb;
 
 use crate::serial::Serial;
 
@@ -113,7 +117,11 @@ pub trait Transport: Send + Sync + 'static {
 // Re-export transport types
 pub use fastforward::FastForwardTransport;
 pub use lamport::LamportTransport;
+#[cfg(feature = "omango")]
+pub use omango::OmangoTransport;
 pub use onesided::OnesidedTransport;
+#[cfg(feature = "rtrb")]
+pub use rtrb::RtrbTransport;
 
 /// Response wrapper that carries the token.
 #[derive(Clone, Copy)]
@@ -221,5 +229,17 @@ mod tests {
     #[test]
     fn test_lamport_two_ring_wraps() {
         test_two_ring_wraps_with_timeout::<LamportTransport>();
+    }
+
+    #[cfg(feature = "rtrb")]
+    #[test]
+    fn test_rtrb_two_ring_wraps() {
+        test_two_ring_wraps_with_timeout::<RtrbTransport>();
+    }
+
+    #[cfg(feature = "omango")]
+    #[test]
+    fn test_omango_two_ring_wraps() {
+        test_two_ring_wraps_with_timeout::<OmangoTransport>();
     }
 }

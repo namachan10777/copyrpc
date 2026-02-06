@@ -3,10 +3,21 @@
 //! Each node has a single MPSC receive queue shared by all senders.
 //! This uses O(N) channels but has potential contention when multiple
 //! nodes send to the same target.
+//!
+//! The `Mesh` struct is generic over the MPSC channel implementation:
+//! - `StdMpsc`: default, uses `std::sync::mpsc`
+//! - `CrossbeamMpsc` (feature `crossbeam`): uses `crossbeam-channel`
 
-use crate::mpsc::{self, MpscReceiver, MpscSender};
+use std::marker::PhantomData;
+
+use crate::mpsc::{
+    MpscChannel, MpscChannelReceiver, MpscChannelSender, SendError, StdMpsc, TryRecvError,
+};
 use crate::serial::Serial;
-use crate::{ReceivedMessage, RecvError, SendError};
+use crate::{ReceivedMessage, RecvError, SendError as CrateSendError};
+
+#[cfg(feature = "crossbeam")]
+pub use crate::mpsc::CrossbeamMpsc;
 
 /// Message kind for internal protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,15 +39,20 @@ struct TaggedMessage<T> {
 /// A node in a Mesh network.
 ///
 /// Each node has a single receive queue that all other nodes send to.
-pub struct Mesh<T> {
+///
+/// The `M` type parameter selects the MPSC channel implementation.
+/// Use [`create_mesh`] for the default `StdMpsc` implementation, or
+/// [`create_mesh_with`] to select a different implementation.
+pub struct Mesh<T: Send, M: MpscChannel = StdMpsc> {
     id: usize,
     num_nodes: usize,
-    rx: MpscReceiver<TaggedMessage<T>>,
-    txs: Vec<Option<MpscSender<TaggedMessage<T>>>>,
+    rx: M::Receiver<TaggedMessage<T>>,
+    txs: Vec<Option<M::Sender<TaggedMessage<T>>>>,
     next_req_num: u64,
+    _marker: PhantomData<M>,
 }
 
-impl<T: Serial + Send> Mesh<T> {
+impl<T: Serial + Send, M: MpscChannel> Mesh<T, M> {
     /// Returns this node's ID.
     pub fn id(&self) -> usize {
         self.id
@@ -48,9 +64,9 @@ impl<T: Serial + Send> Mesh<T> {
     }
 
     /// Sends a one-way notification to a specific peer.
-    pub fn notify(&self, to: usize, value: T) -> Result<(), SendError<T>> {
+    pub fn notify(&self, to: usize, value: T) -> Result<(), CrateSendError<T>> {
         if to >= self.num_nodes || to == self.id {
-            return Err(SendError::InvalidPeer(value));
+            return Err(CrateSendError::InvalidPeer(value));
         }
 
         match &self.txs[to] {
@@ -61,17 +77,17 @@ impl<T: Serial + Send> Mesh<T> {
                     req_num: 0,
                     data: value,
                 })
-                .map_err(|mpsc::SendError(msg)| SendError::Disconnected(msg.data)),
-            None => Err(SendError::InvalidPeer(value)),
+                .map_err(|SendError(msg)| CrateSendError::Disconnected(msg.data)),
+            None => Err(CrateSendError::InvalidPeer(value)),
         }
     }
 
     /// Sends a request to a specific peer.
     ///
     /// Returns the request number on success, which can be used to match the response.
-    pub fn call(&mut self, to: usize, value: T) -> Result<u64, SendError<T>> {
+    pub fn call(&mut self, to: usize, value: T) -> Result<u64, CrateSendError<T>> {
         if to >= self.num_nodes || to == self.id {
-            return Err(SendError::InvalidPeer(value));
+            return Err(CrateSendError::InvalidPeer(value));
         }
 
         let req_num = self.next_req_num;
@@ -86,16 +102,16 @@ impl<T: Serial + Send> Mesh<T> {
                     self.next_req_num = self.next_req_num.wrapping_add(1);
                     Ok(req_num)
                 }
-                Err(mpsc::SendError(msg)) => Err(SendError::Disconnected(msg.data)),
+                Err(SendError(msg)) => Err(CrateSendError::Disconnected(msg.data)),
             },
-            None => Err(SendError::InvalidPeer(value)),
+            None => Err(CrateSendError::InvalidPeer(value)),
         }
     }
 
     /// Sends a reply to a previous request.
-    pub fn reply(&self, to: usize, req_num: u64, value: T) -> Result<(), SendError<T>> {
+    pub fn reply(&self, to: usize, req_num: u64, value: T) -> Result<(), CrateSendError<T>> {
         if to >= self.num_nodes || to == self.id {
-            return Err(SendError::InvalidPeer(value));
+            return Err(CrateSendError::InvalidPeer(value));
         }
 
         match &self.txs[to] {
@@ -106,8 +122,8 @@ impl<T: Serial + Send> Mesh<T> {
                     req_num,
                     data: value,
                 })
-                .map_err(|mpsc::SendError(msg)| SendError::Disconnected(msg.data)),
-            None => Err(SendError::InvalidPeer(value)),
+                .map_err(|SendError(msg)| CrateSendError::Disconnected(msg.data)),
+            None => Err(CrateSendError::InvalidPeer(value)),
         }
     }
 
@@ -130,8 +146,8 @@ impl<T: Serial + Send> Mesh<T> {
                 };
                 Ok((msg.from, received))
             }
-            Err(mpsc::TryRecvError::Empty) => Err(RecvError::Empty),
-            Err(mpsc::TryRecvError::Disconnected) => Err(RecvError::Disconnected),
+            Err(TryRecvError::Empty) => Err(RecvError::Empty),
+            Err(TryRecvError::Disconnected) => Err(RecvError::Disconnected),
         }
     }
 
@@ -152,29 +168,40 @@ impl<T: Serial + Send> Mesh<T> {
                 };
                 Ok((msg.from, received))
             }
-            Err(mpsc::TryRecvError::Empty) => Err(RecvError::Empty),
-            Err(mpsc::TryRecvError::Disconnected) => Err(RecvError::Disconnected),
+            Err(TryRecvError::Empty) => Err(RecvError::Empty),
+            Err(TryRecvError::Disconnected) => Err(RecvError::Disconnected),
         }
     }
 }
 
-/// Creates a Mesh network with `n` nodes.
+/// Creates a Mesh network with `n` nodes using the default `StdMpsc` channel.
 ///
 /// Returns a vector of `Mesh` nodes, each capable of communicating with
 /// all other nodes through a single shared MPSC receive queue.
 ///
 /// # Panics
 /// Panics if `n` is 0.
-pub fn create_mesh<T: Serial + Send>(n: usize) -> Vec<Mesh<T>> {
+pub fn create_mesh<T: Serial + Send>(n: usize) -> Vec<Mesh<T, StdMpsc>> {
+    create_mesh_with::<T, StdMpsc>(n)
+}
+
+/// Creates a Mesh network with `n` nodes using a custom MPSC channel implementation.
+///
+/// Returns a vector of `Mesh` nodes, each capable of communicating with
+/// all other nodes through a single shared MPSC receive queue.
+///
+/// # Panics
+/// Panics if `n` is 0.
+pub fn create_mesh_with<T: Serial + Send, M: MpscChannel>(n: usize) -> Vec<Mesh<T, M>> {
     assert!(n > 0, "must have at least one node");
 
     // Create receivers and collect senders
     let mut receivers = Vec::with_capacity(n);
-    let mut all_senders: Vec<Vec<Option<MpscSender<TaggedMessage<T>>>>> =
+    let mut all_senders: Vec<Vec<Option<M::Sender<TaggedMessage<T>>>>> =
         (0..n).map(|_| (0..n).map(|_| None).collect()).collect();
 
     for i in 0..n {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = M::channel();
         receivers.push(rx);
 
         // All other nodes get a clone of this sender
@@ -196,8 +223,23 @@ pub fn create_mesh<T: Serial + Send>(n: usize) -> Vec<Mesh<T>> {
             rx,
             txs,
             next_req_num: 0,
+            _marker: PhantomData,
         })
         .collect()
+}
+
+// ============================================================================
+// Backward compatibility: specialized implementation for StdMpsc
+// ============================================================================
+
+impl<T: Serial + Send> Mesh<T, StdMpsc> {
+    /// Creates a Mesh network with `n` nodes using the default channel.
+    ///
+    /// This is a convenience method equivalent to `create_mesh(n)`.
+    #[allow(dead_code)]
+    fn new(n: usize) -> Vec<Self> {
+        create_mesh(n)
+    }
 }
 
 #[cfg(test)]
@@ -218,10 +260,16 @@ mod tests {
         let mut nodes: Vec<Mesh<u32>> = create_mesh(2);
 
         nodes[0].notify(1, 42).unwrap();
-        assert_eq!(nodes[1].try_recv().unwrap(), (0, ReceivedMessage::Notify(42)));
+        assert_eq!(
+            nodes[1].try_recv().unwrap(),
+            (0, ReceivedMessage::Notify(42))
+        );
 
         nodes[1].notify(0, 123).unwrap();
-        assert_eq!(nodes[0].try_recv().unwrap(), (1, ReceivedMessage::Notify(123)));
+        assert_eq!(
+            nodes[0].try_recv().unwrap(),
+            (1, ReceivedMessage::Notify(123))
+        );
     }
 
     #[test]
@@ -280,11 +328,11 @@ mod tests {
 
         assert!(matches!(
             nodes[0].notify(5, 42),
-            Err(SendError::InvalidPeer(42))
+            Err(CrateSendError::InvalidPeer(42))
         ));
         assert!(matches!(
             nodes[0].notify(0, 42),
-            Err(SendError::InvalidPeer(42))
+            Err(CrateSendError::InvalidPeer(42))
         )); // Can't send to self
     }
 
@@ -293,6 +341,66 @@ mod tests {
         use std::thread;
 
         let nodes: Vec<Mesh<u64>> = create_mesh(4);
+        let mut handles = Vec::new();
+
+        for mut node in nodes {
+            handles.push(thread::spawn(move || {
+                let id = node.id();
+                let n = node.num_peers() + 1;
+
+                // Send to all peers
+                for peer in 0..n {
+                    if peer != id {
+                        for i in 0..100 {
+                            node.notify(peer, (id * 1000 + i) as u64).unwrap();
+                        }
+                    }
+                }
+
+                // Receive from all peers
+                let mut count = 0;
+                let expected = (n - 1) * 100;
+                while count < expected {
+                    match node.try_recv() {
+                        Ok(_) => count += 1,
+                        Err(RecvError::Empty) => std::hint::spin_loop(),
+                        Err(RecvError::Disconnected) => break,
+                    }
+                }
+
+                count
+            }));
+        }
+
+        for h in handles {
+            assert_eq!(h.join().unwrap(), 300); // 3 peers * 100 messages
+        }
+    }
+
+    #[cfg(feature = "crossbeam")]
+    #[test]
+    fn test_crossbeam_mesh() {
+        let mut nodes: Vec<Mesh<u32, CrossbeamMpsc>> = create_mesh_with(2);
+
+        nodes[0].notify(1, 42).unwrap();
+        assert_eq!(
+            nodes[1].try_recv().unwrap(),
+            (0, ReceivedMessage::Notify(42))
+        );
+
+        nodes[1].notify(0, 123).unwrap();
+        assert_eq!(
+            nodes[0].try_recv().unwrap(),
+            (1, ReceivedMessage::Notify(123))
+        );
+    }
+
+    #[cfg(feature = "crossbeam")]
+    #[test]
+    fn test_crossbeam_mesh_threaded() {
+        use std::thread;
+
+        let nodes: Vec<Mesh<u64, CrossbeamMpsc>> = create_mesh_with(4);
         let mut handles = Vec::new();
 
         for mut node in nodes {

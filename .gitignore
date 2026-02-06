@@ -33,3 +33,6 @@ target
 # Benchmark results
 thread_channel/bench_results/
 *.parquet
+
+# Job logs
+jobs/*/logs/

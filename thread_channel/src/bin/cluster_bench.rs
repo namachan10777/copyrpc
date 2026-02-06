@@ -1,7 +1,8 @@
 //! Cluster All-to-All Benchmark Binary
 //!
-//! Benchmarks Transport implementations with 16-thread all-to-all communication pattern.
-//! Uses a management thread for monitoring and statistics collection.
+//! Benchmarks Transport (Flux) and MPSC (Mesh) implementations with N-thread
+//! all-to-all communication pattern. Uses a management thread for monitoring
+//! and statistics collection.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Barrier};
@@ -16,9 +17,18 @@ use core_affinity::CoreId;
 use parquet::arrow::ArrowWriter;
 use thread_channel::Serial;
 use thread_channel::{
-    create_flux_with_transport, FastForwardTransport, Flux, LamportTransport, OnesidedTransport,
-    Transport,
+    create_flux_with_transport, create_mesh_with, FastForwardTransport, Flux, LamportTransport,
+    Mesh, OnesidedTransport, ReceivedMessage, StdMpsc, Transport,
 };
+
+#[cfg(feature = "rtrb")]
+use thread_channel::RtrbTransport;
+#[cfg(feature = "omango")]
+use thread_channel::OmangoTransport;
+#[cfg(feature = "crossbeam")]
+use thread_channel::CrossbeamMpsc;
+
+use thread_channel::mpsc::MpscChannel;
 
 /// Pin current thread to the specified core
 fn pin_to_core(core_id: usize) {
@@ -46,12 +56,16 @@ enum TransportType {
     Onesided,
     FastForward,
     Lamport,
+    #[cfg(feature = "rtrb")]
+    Rtrb,
+    #[cfg(feature = "omango")]
+    Omango,
     All,
 }
 
 #[derive(Parser)]
 #[command(name = "cluster_bench")]
-#[command(about = "16-thread all-to-all benchmark with Transport comparison")]
+#[command(about = "N-thread all-to-all benchmark: Flux (Transport) vs Mesh (MPSC)")]
 struct Args {
     /// Number of worker threads
     #[arg(short = 'n', long, default_value = "16")]
@@ -88,6 +102,7 @@ struct Args {
 
 struct BenchResult {
     threads: u32,
+    kind: String,
     transport: String,
     duration_secs: u64,
     total_calls: u64,
@@ -107,23 +122,25 @@ struct RunResult {
     max_rps: u64,
 }
 
-/// Run benchmark for a specific transport implementation
-fn run_benchmark<Tr: Transport>(
+// ============================================================================
+// Flux benchmark (SPSC Transport based)
+// ============================================================================
+
+/// Run Flux benchmark for a specific transport implementation
+fn run_flux_benchmark<Tr: Transport>(
     n: usize,
     capacity: usize,
     duration_secs: u64,
     max_inflight: usize,
 ) -> RunResult {
-    // Per-thread completed counters (no contention)
     let per_thread_completed: Vec<Arc<AtomicU64>> =
         (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
     let stop_flag = Arc::new(AtomicBool::new(false));
 
-    // No-op callback
     let nodes: Vec<Flux<Payload, (), _, Tr>> =
         create_flux_with_transport(n, capacity, max_inflight, |_: &mut (), _: Payload| {});
 
-    let barrier = Arc::new(Barrier::new(n + 1)); // +1 for monitor thread
+    let barrier = Arc::new(Barrier::new(n + 1));
     let payload = Payload::default();
 
     let handles: Vec<_> = nodes
@@ -134,7 +151,6 @@ fn run_benchmark<Tr: Transport>(
             let stop_flag = Arc::clone(&stop_flag);
             let my_completed = Arc::clone(&per_thread_completed[thread_idx]);
             thread::spawn(move || {
-                // Worker threads on CPU 1+ (monitor is on CPU 0)
                 pin_to_core(thread_idx + 1);
 
                 let id = node.id();
@@ -146,10 +162,8 @@ fn run_benchmark<Tr: Transport>(
                 let mut total_completed = 0u64;
                 let mut can_send = true;
 
-                // Main loop: run until stop_flag is set
                 'outer: loop {
                     for _ in 0..1024 {
-                        // Aggressive pipelining: try to send to all peers
                         let mut any_sent = false;
                         if can_send {
                             for &peer in &peers {
@@ -160,7 +174,6 @@ fn run_benchmark<Tr: Transport>(
                             }
                         }
 
-                        // Poll and process replies
                         if !any_sent || (total_sent & 0x1F) == 0 {
                             node.poll();
                             while let Some(handle) = node.try_recv() {
@@ -173,7 +186,6 @@ fn run_benchmark<Tr: Transport>(
                         }
                     }
 
-                    // Update completed count and check stop_flag
                     let pending = node.pending_count() as u64;
                     let new_completed = total_sent.saturating_sub(pending);
                     if new_completed > total_completed {
@@ -186,7 +198,6 @@ fn run_benchmark<Tr: Transport>(
                     }
                 }
 
-                // Final update
                 let pending = node.pending_count() as u64;
                 total_completed = total_sent.saturating_sub(pending);
                 my_completed.store(total_completed, Relaxed);
@@ -196,6 +207,117 @@ fn run_benchmark<Tr: Transport>(
         })
         .collect();
 
+    monitor_and_collect(per_thread_completed, stop_flag, barrier, handles, duration_secs)
+}
+
+// ============================================================================
+// Mesh benchmark (MPSC based)
+// ============================================================================
+
+/// Run Mesh benchmark for a specific MPSC implementation
+fn run_mesh_benchmark<M: MpscChannel>(
+    n: usize,
+    _capacity: usize,
+    duration_secs: u64,
+    max_inflight: usize,
+) -> RunResult {
+    let per_thread_completed: Vec<Arc<AtomicU64>> =
+        (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+
+    let nodes: Vec<Mesh<Payload, M>> = create_mesh_with(n);
+
+    let barrier = Arc::new(Barrier::new(n + 1));
+    let payload = Payload::default();
+
+    let handles: Vec<_> = nodes
+        .into_iter()
+        .enumerate()
+        .map(|(thread_idx, mut node)| {
+            let barrier = Arc::clone(&barrier);
+            let stop_flag = Arc::clone(&stop_flag);
+            let my_completed = Arc::clone(&per_thread_completed[thread_idx]);
+            thread::spawn(move || {
+                pin_to_core(thread_idx + 1);
+
+                let id = node.id();
+                let peers: Vec<usize> = (0..n).filter(|&p| p != id).collect();
+
+                barrier.wait();
+
+                let mut total_completed = 0u64;
+                let mut inflight = 0usize;
+
+                'outer: loop {
+                    for _ in 0..1024 {
+                        // Send requests to all peers (with inflight limiting)
+                        if inflight < max_inflight {
+                            for &peer in &peers {
+                                if inflight >= max_inflight {
+                                    break;
+                                }
+                                if node.call(peer, payload).is_ok() {
+                                    inflight += 1;
+                                }
+                            }
+                        }
+
+                        // Process incoming messages
+                        loop {
+                            match node.try_recv() {
+                                Ok((from, ReceivedMessage::Request { req_num, data })) => {
+                                    node.reply(from, req_num, data).ok();
+                                }
+                                Ok((_, ReceivedMessage::Response { .. })) => {
+                                    total_completed += 1;
+                                    inflight -= 1;
+                                }
+                                Ok((_, ReceivedMessage::Notify(_))) => {}
+                                Err(_) => break,
+                            }
+                        }
+                    }
+
+                    my_completed.store(total_completed, Relaxed);
+
+                    if stop_flag.load(Relaxed) {
+                        break 'outer;
+                    }
+                }
+
+                // Drain remaining
+                loop {
+                    match node.try_recv() {
+                        Ok((from, ReceivedMessage::Request { req_num, data })) => {
+                            node.reply(from, req_num, data).ok();
+                        }
+                        Ok((_, ReceivedMessage::Response { .. })) => {
+                            total_completed += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                my_completed.store(total_completed, Relaxed);
+
+                total_completed
+            })
+        })
+        .collect();
+
+    monitor_and_collect(per_thread_completed, stop_flag, barrier, handles, duration_secs)
+}
+
+// ============================================================================
+// Shared monitoring infrastructure
+// ============================================================================
+
+fn monitor_and_collect(
+    per_thread_completed: Vec<Arc<AtomicU64>>,
+    stop_flag: Arc<AtomicBool>,
+    barrier: Arc<Barrier>,
+    handles: Vec<thread::JoinHandle<u64>>,
+    duration_secs: u64,
+) -> RunResult {
     // Monitor thread on CPU 0
     pin_to_core(0);
 
@@ -252,6 +374,7 @@ fn compute_stats(durations: &[Duration]) -> (f64, u64, u64, f64) {
 }
 
 fn run_transport_benchmark(
+    kind: &str,
     transport_name: &str,
     n: usize,
     capacity: usize,
@@ -262,8 +385,8 @@ fn run_transport_benchmark(
     run_fn: fn(usize, usize, u64, usize) -> RunResult,
 ) -> BenchResult {
     println!(
-        "Benchmarking {}: n={}, duration={}s",
-        transport_name, n, duration_secs
+        "Benchmarking {} ({}/{}): n={}, duration={}s",
+        transport_name, kind, transport_name, n, duration_secs
     );
 
     // Warmup
@@ -306,6 +429,7 @@ fn run_transport_benchmark(
     let (mean_ns, min_ns, max_ns, stddev_ns) = compute_stats(&durations);
     BenchResult {
         threads: n as u32,
+        kind: kind.to_string(),
         transport: transport_name.to_string(),
         duration_secs,
         total_calls,
@@ -329,9 +453,12 @@ fn main() {
 
     let mut results = Vec::new();
 
+    // --- Flux benchmarks (SPSC Transport) ---
+
     // Onesided
     if matches!(args.transport, TransportType::Onesided | TransportType::All) {
         results.push(run_transport_benchmark(
+            "flux",
             "onesided",
             args.threads,
             args.capacity,
@@ -339,13 +466,14 @@ fn main() {
             args.inflight,
             args.warmup,
             args.runs,
-            run_benchmark::<OnesidedTransport>,
+            run_flux_benchmark::<OnesidedTransport>,
         ));
     }
 
     // FastForward
     if matches!(args.transport, TransportType::FastForward | TransportType::All) {
         results.push(run_transport_benchmark(
+            "flux",
             "fastforward",
             args.threads,
             args.capacity,
@@ -353,13 +481,14 @@ fn main() {
             args.inflight,
             args.warmup,
             args.runs,
-            run_benchmark::<FastForwardTransport>,
+            run_flux_benchmark::<FastForwardTransport>,
         ));
     }
 
     // Lamport
     if matches!(args.transport, TransportType::Lamport | TransportType::All) {
         results.push(run_transport_benchmark(
+            "flux",
             "lamport",
             args.threads,
             args.capacity,
@@ -367,7 +496,70 @@ fn main() {
             args.inflight,
             args.warmup,
             args.runs,
-            run_benchmark::<LamportTransport>,
+            run_flux_benchmark::<LamportTransport>,
+        ));
+    }
+
+    // Rtrb
+    #[cfg(feature = "rtrb")]
+    if matches!(args.transport, TransportType::Rtrb | TransportType::All) {
+        results.push(run_transport_benchmark(
+            "flux",
+            "rtrb",
+            args.threads,
+            args.capacity,
+            args.duration,
+            args.inflight,
+            args.warmup,
+            args.runs,
+            run_flux_benchmark::<RtrbTransport>,
+        ));
+    }
+
+    // Omango
+    #[cfg(feature = "omango")]
+    if matches!(args.transport, TransportType::Omango | TransportType::All) {
+        results.push(run_transport_benchmark(
+            "flux",
+            "omango",
+            args.threads,
+            args.capacity,
+            args.duration,
+            args.inflight,
+            args.warmup,
+            args.runs,
+            run_flux_benchmark::<OmangoTransport>,
+        ));
+    }
+
+    // --- Mesh benchmarks (MPSC) ---
+
+    if matches!(args.transport, TransportType::All) {
+        // StdMpsc
+        results.push(run_transport_benchmark(
+            "mesh",
+            "std_mpsc",
+            args.threads,
+            args.capacity,
+            args.duration,
+            args.inflight,
+            args.warmup,
+            args.runs,
+            run_mesh_benchmark::<StdMpsc>,
+        ));
+
+        // CrossbeamMpsc
+        #[cfg(feature = "crossbeam")]
+        results.push(run_transport_benchmark(
+            "mesh",
+            "crossbeam",
+            args.threads,
+            args.capacity,
+            args.duration,
+            args.inflight,
+            args.warmup,
+            args.runs,
+            run_mesh_benchmark::<CrossbeamMpsc>,
         ));
     }
 
@@ -379,6 +571,7 @@ fn main() {
 fn write_parquet(path: &str, results: &[BenchResult]) -> Result<(), Box<dyn std::error::Error>> {
     let schema = Schema::new(vec![
         Field::new("threads", DataType::UInt32, false),
+        Field::new("kind", DataType::Utf8, false),
         Field::new("transport", DataType::Utf8, false),
         Field::new("duration_secs", DataType::UInt64, false),
         Field::new("total_calls", DataType::UInt64, false),
@@ -392,6 +585,7 @@ fn write_parquet(path: &str, results: &[BenchResult]) -> Result<(), Box<dyn std:
     ]);
 
     let threads: Vec<u32> = results.iter().map(|r| r.threads).collect();
+    let kind: Vec<&str> = results.iter().map(|r| r.kind.as_str()).collect();
     let transport: Vec<&str> = results.iter().map(|r| r.transport.as_str()).collect();
     let duration_secs: Vec<u64> = results.iter().map(|r| r.duration_secs).collect();
     let total_calls: Vec<u64> = results.iter().map(|r| r.total_calls).collect();
@@ -407,6 +601,7 @@ fn write_parquet(path: &str, results: &[BenchResult]) -> Result<(), Box<dyn std:
         Arc::new(schema),
         vec![
             Arc::new(UInt32Array::from(threads)),
+            Arc::new(StringArray::from(kind)),
             Arc::new(StringArray::from(transport)),
             Arc::new(UInt64Array::from(duration_secs)),
             Arc::new(UInt64Array::from(total_calls)),

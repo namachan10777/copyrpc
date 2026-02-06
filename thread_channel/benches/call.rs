@@ -4,14 +4,18 @@
 //! Tests the bidirectional RPC pattern with proper flow control.
 
 use core_affinity::CoreId;
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use std::sync::atomic::{AtomicBool, Ordering};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use thread_channel::Serial;
 use thread_channel::{
     FastForwardTransport, LamportTransport, OnesidedTransport, Transport, TransportEndpoint,
 };
+#[cfg(feature = "rtrb")]
+use thread_channel::RtrbTransport;
+#[cfg(feature = "omango")]
+use thread_channel::OmangoTransport;
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -36,6 +40,16 @@ fn bench_pingpong(c: &mut Criterion) {
 
     group.bench_function("lamport", |b| {
         run_pingpong_bench::<LamportTransport>(b);
+    });
+
+    #[cfg(feature = "rtrb")]
+    group.bench_function("rtrb", |b| {
+        run_pingpong_bench::<RtrbTransport>(b);
+    });
+
+    #[cfg(feature = "omango")]
+    group.bench_function("omango", |b| {
+        run_pingpong_bench::<OmangoTransport>(b);
     });
 
     group.finish();
@@ -105,6 +119,16 @@ fn bench_throughput(c: &mut Criterion) {
 
     group.bench_function("lamport", |b| {
         run_throughput_bench::<LamportTransport>(b, REQUESTS_PER_ITER);
+    });
+
+    #[cfg(feature = "rtrb")]
+    group.bench_function("rtrb", |b| {
+        run_throughput_bench::<RtrbTransport>(b, REQUESTS_PER_ITER);
+    });
+
+    #[cfg(feature = "omango")]
+    group.bench_function("omango", |b| {
+        run_throughput_bench::<OmangoTransport>(b, REQUESTS_PER_ITER);
     });
 
     group.finish();

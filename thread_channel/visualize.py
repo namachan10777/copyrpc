@@ -12,132 +12,87 @@
 """
 Visualize Flux vs Mesh benchmark results.
 
+Auto-discovers qd{N}_n{M}.parquet files and generates per-queue-depth
+throughput charts. Falls back to results.parquet for legacy mode.
+
 Usage:
-    ./visualize.py [--output-dir DIR]
+    ./visualize.py [--bench-dir DIR] [--output-dir DIR]
 """
 
 import argparse
+import re
 from pathlib import Path
 
 import altair as alt
 import polars as pl
 
 
-def load_results(bench_dir: Path) -> pl.DataFrame:
-    """Load benchmark results from the canonical results.parquet file."""
-    results_file = bench_dir / "results.parquet"
-    if not results_file.exists():
-        raise FileNotFoundError(f"Results file not found: {results_file}")
-    return pl.read_parquet(results_file)
+# Color palettes: blue shades for Flux, orange shades for Mesh
+FLUX_COLORS = {
+    "onesided": "#1f77b4",
+    "fastforward": "#4a90d9",
+    "lamport": "#7eb3e8",
+    "rtrb": "#a8d0f0",
+    "omango": "#c6e2f7",
+}
+
+MESH_COLORS = {
+    "std_mpsc": "#ff7f0e",
+    "crossbeam": "#ffb366",
+}
 
 
-def create_throughput_chart(df: pl.DataFrame) -> alt.Chart:
-    """Create throughput vs threads chart."""
+def load_qd_results(bench_dir: Path) -> dict[int, pl.DataFrame]:
+    """Load per-queue-depth parquet files into a dict keyed by QD."""
+    pattern = re.compile(r"qd(\d+)_n(\d+)\.parquet")
+    qd_frames: dict[int, list[pl.DataFrame]] = {}
+
+    for f in sorted(bench_dir.glob("qd*_n*.parquet")):
+        m = pattern.match(f.name)
+        if not m:
+            continue
+        qd = int(m.group(1))
+        df = pl.read_parquet(f)
+        if "kind" not in df.columns:
+            df = df.with_columns(pl.lit("flux").alias("kind"))
+        df = df.with_columns(
+            (pl.col("kind") + "/" + pl.col("transport")).alias("implementation")
+        )
+        qd_frames.setdefault(qd, []).append(df)
+
+    return {qd: pl.concat(frames) for qd, frames in sorted(qd_frames.items())}
+
+
+def _build_color_scale(df: pl.DataFrame) -> alt.Scale:
+    """Build a color scale mapping implementation labels to colors."""
+    impls = df["implementation"].unique().sort().to_list()
+    colors = []
+    for impl_name in impls:
+        kind, transport = impl_name.split("/", 1)
+        if kind == "flux":
+            colors.append(FLUX_COLORS.get(transport, "#1f77b4"))
+        else:
+            colors.append(MESH_COLORS.get(transport, "#ff7f0e"))
+    return alt.Scale(domain=impls, range=colors)
+
+
+def create_throughput_chart(df: pl.DataFrame, title: str) -> alt.Chart:
+    """Create throughput vs threads chart with all implementation variants."""
+    color_scale = _build_color_scale(df)
+
     chart = (
         alt.Chart(df.to_pandas())
         .mark_line(point=True)
         .encode(
-            x=alt.X("threads:Q", title="Number of Threads", scale=alt.Scale(domain=[2, 26])),
+            x=alt.X("threads:Q", title="Number of Threads"),
             y=alt.Y("throughput_mops_mean:Q", title="Throughput (Mops/s)"),
             color=alt.Color("implementation:N", title="Implementation",
-                          scale=alt.Scale(domain=["flux", "mesh"],
-                                         range=["#1f77b4", "#ff7f0e"])),
-            strokeDash=alt.StrokeDash("implementation:N"),
+                            scale=color_scale),
+            strokeDash=alt.StrokeDash("kind:N", title="Kind"),
         )
-        .properties(title="All-to-All Throughput: Flux vs Mesh", width=600, height=400)
+        .properties(title=title, width=700, height=450)
     )
     return chart
-
-
-def create_duration_chart(df: pl.DataFrame) -> alt.Chart:
-    """Create duration vs threads chart with error bars."""
-    df_with_ms = df.with_columns(
-        [
-            (pl.col("duration_ns_mean") / 1_000_000).alias("duration_ms_mean"),
-            (pl.col("duration_ns_min") / 1_000_000).alias("duration_ms_min"),
-            (pl.col("duration_ns_max") / 1_000_000).alias("duration_ms_max"),
-        ]
-    )
-
-    base = alt.Chart(df_with_ms.to_pandas())
-
-    line = base.mark_line(point=True).encode(
-        x=alt.X("threads:Q", title="Number of Threads", scale=alt.Scale(domain=[2, 18])),
-        y=alt.Y("duration_ms_mean:Q", title="Duration (ms)"),
-        color=alt.Color("implementation:N", title="Implementation",
-                       scale=alt.Scale(domain=["flux", "mesh"],
-                                      range=["#1f77b4", "#ff7f0e"])),
-    )
-
-    error_bars = base.mark_errorbar().encode(
-        x=alt.X("threads:Q"),
-        y=alt.Y("duration_ms_min:Q", title="Duration (ms)"),
-        y2=alt.Y2("duration_ms_max:Q"),
-        color=alt.Color("implementation:N"),
-    )
-
-    chart = (line + error_bars).properties(title="All-to-All Duration: Flux vs Mesh", width=600, height=400)
-    return chart
-
-
-def create_scaling_chart(df: pl.DataFrame) -> alt.Chart:
-    """Create scaling efficiency chart (throughput / total_calls)."""
-    df_with_scaling = df.with_columns(
-        # Normalize throughput by number of thread pairs: n*(n-1)
-        (pl.col("throughput_mops_mean") / (pl.col("threads") * (pl.col("threads") - 1))).alias(
-            "throughput_per_pair"
-        ),
-    )
-
-    chart = (
-        alt.Chart(df_with_scaling.to_pandas())
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("threads:Q", title="Number of Threads", scale=alt.Scale(domain=[2, 26])),
-            y=alt.Y("throughput_per_pair:Q", title="Throughput per Thread Pair (Mops/s)"),
-            color=alt.Color("implementation:N", title="Implementation",
-                          scale=alt.Scale(domain=["flux", "mesh"],
-                                         range=["#1f77b4", "#ff7f0e"])),
-            strokeDash=alt.StrokeDash("implementation:N"),
-        )
-        .properties(title="Scaling Efficiency: Flux vs Mesh", width=600, height=400)
-    )
-    return chart
-
-
-def create_speedup_chart(df: pl.DataFrame) -> alt.Chart:
-    """Create Flux speedup over Mesh chart."""
-    # Pivot to get flux and mesh throughput side by side
-    flux_df = df.filter(pl.col("implementation") == "flux").select(
-        ["threads", pl.col("throughput_mops_mean").alias("flux_throughput")]
-    )
-    mesh_df = df.filter(pl.col("implementation") == "mesh").select(
-        ["threads", pl.col("throughput_mops_mean").alias("mesh_throughput")]
-    )
-
-    speedup_df = flux_df.join(mesh_df, on="threads").with_columns(
-        (pl.col("flux_throughput") / pl.col("mesh_throughput")).alias("speedup")
-    )
-
-    chart = (
-        alt.Chart(speedup_df.to_pandas())
-        .mark_bar()
-        .encode(
-            x=alt.X("threads:O", title="Number of Threads"),
-            y=alt.Y("speedup:Q", title="Speedup (Flux / Mesh)"),
-            color=alt.condition(
-                alt.datum.speedup >= 1,
-                alt.value("#2ca02c"),  # green if flux is faster
-                alt.value("#d62728"),  # red if mesh is faster
-            ),
-        )
-        .properties(title="Flux Speedup over Mesh", width=600, height=400)
-    )
-
-    # Add reference line at y=1
-    rule = alt.Chart(pl.DataFrame({"y": [1.0]}).to_pandas()).mark_rule(strokeDash=[4, 4], color="gray").encode(y="y:Q")
-
-    return chart + rule
 
 
 def main():
@@ -156,41 +111,27 @@ def main():
     )
     args = parser.parse_args()
 
-    print(f"Loading results from {args.bench_dir}")
-    df = load_results(args.bench_dir)
-
-    print(f"Loaded {len(df)} benchmark results")
-    print(df)
-
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create and save charts
-    charts = [
-        ("throughput", create_throughput_chart(df)),
-        ("duration", create_duration_chart(df)),
-        ("scaling", create_scaling_chart(df)),
-        ("speedup", create_speedup_chart(df)),
-    ]
+    qd_data = load_qd_results(args.bench_dir)
 
-    for name, chart in charts:
-        svg_path = output_dir / f"{name}.svg"
-        png_path = output_dir / f"{name}.png"
+    if not qd_data:
+        print("No qd*_n*.parquet files found")
+        return
+
+    for qd, df in qd_data.items():
+        print(f"\n=== Queue Depth {qd} ({len(df)} rows) ===")
+        print(df.select(["threads", "kind", "transport", "throughput_mops_mean"]))
+
+        title = f"All-to-All Throughput (Queue Depth = {qd})"
+        chart = create_throughput_chart(df, title)
+
+        svg_path = output_dir / f"throughput_qd{qd}.svg"
+        png_path = output_dir / f"throughput_qd{qd}.png"
         chart.save(str(svg_path))
         chart.save(str(png_path), scale_factor=2)
         print(f"Saved {svg_path} and {png_path}")
-
-    # Create combined chart (throughput + speedup)
-    throughput_chart = create_throughput_chart(df)
-    speedup_chart = create_speedup_chart(df)
-    combined = alt.vconcat(throughput_chart, speedup_chart).properties(
-        title="Flux vs Mesh Benchmark Results"
-    )
-    combined_path = output_dir / "combined.svg"
-    combined_png_path = output_dir / "combined.png"
-    combined.save(str(combined_path))
-    combined.save(str(combined_png_path), scale_factor=2)
-    print(f"Saved {combined_path} and {combined_png_path}")
 
     print("\nDone!")
 
