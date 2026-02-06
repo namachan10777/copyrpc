@@ -14,3 +14,7 @@ uuid = { version = "1", features = ["v7"] }
 [[bench]]
 name = "pingpong"
 harness = false
+
+[[bench]]
+name = "multi_client"
+harness = false

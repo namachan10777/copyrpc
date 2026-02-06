@@ -122,8 +122,9 @@ impl From<io::Error> for ConnectError {
 }
 
 const MAGIC: u64 = 0x5250_4353_4C4F_5421; // "RPCSLOT!"
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const HEADER_SIZE: usize = 64;
+const CACHE_LINE_SIZE: usize = 64;
 
 /// Header stored at the beginning of shared memory.
 /// Fixed 64 bytes.
@@ -164,7 +165,7 @@ fn calc_slot_layout<Req, Resp>() -> SlotLayout {
     let alive_offset = 1;
     let req_offset = align_up(2, align);
     let resp_offset = align_up(req_offset + std::mem::size_of::<Req>(), align);
-    let slot_size = align_up(resp_offset + std::mem::size_of::<Resp>(), align);
+    let slot_size = align_up(resp_offset + std::mem::size_of::<Resp>(), CACHE_LINE_SIZE);
 
     SlotLayout {
         slot_size,
