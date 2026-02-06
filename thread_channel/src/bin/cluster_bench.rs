@@ -17,7 +17,8 @@ use parquet::arrow::ArrowWriter;
 use thread_channel::Serial;
 use thread_channel::{
     create_flux_with_transport, create_mesh_with, FastForwardTransport, Flux, LamportTransport,
-    Mesh, OnesidedTransport, ReceivedMessage, StdMpsc, Transport,
+    Mesh, OnesidedTransport, OnesidedImmediateTransport, OnesidedValidityTransport,
+    ReceivedMessage, StdMpsc, Transport,
 };
 
 #[cfg(feature = "rtrb")]
@@ -47,6 +48,8 @@ impl Default for Payload {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum TransportType {
     Onesided,
+    OnesidedImmediate,
+    OnesidedValidity,
     FastForward,
     Lamport,
     #[cfg(feature = "rtrb")]
@@ -453,6 +456,36 @@ fn main() {
             args.warmup,
             args.runs,
             run_flux_benchmark::<OnesidedTransport>,
+        ));
+    }
+
+    // Onesided Immediate (index-based, per-send publish)
+    if matches!(args.transport, TransportType::OnesidedImmediate | TransportType::All) {
+        results.push(run_transport_benchmark(
+            "flux",
+            "onesided-immediate",
+            args.threads,
+            args.capacity,
+            args.duration,
+            args.inflight,
+            args.warmup,
+            args.runs,
+            run_flux_benchmark::<OnesidedImmediateTransport>,
+        ));
+    }
+
+    // Onesided Validity (validity flag, per-send publish)
+    if matches!(args.transport, TransportType::OnesidedValidity | TransportType::All) {
+        results.push(run_transport_benchmark(
+            "flux",
+            "onesided-validity",
+            args.threads,
+            args.capacity,
+            args.duration,
+            args.inflight,
+            args.warmup,
+            args.runs,
+            run_flux_benchmark::<OnesidedValidityTransport>,
         ));
     }
 

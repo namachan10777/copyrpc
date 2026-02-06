@@ -19,8 +19,8 @@ pub use mesh::CrossbeamMpsc;
 pub use mpsc::StdMpsc;
 pub use serial::Serial;
 pub use transport::{
-    FastForwardTransport, LamportTransport, OnesidedTransport, Transport, TransportEndpoint,
-    TransportError,
+    FastForwardTransport, LamportTransport, OnesidedTransport, OnesidedImmediateTransport,
+    OnesidedValidityTransport, Transport, TransportEndpoint, TransportError,
 };
 #[cfg(feature = "omango")]
 pub use transport::OmangoTransport;

@@ -469,12 +469,19 @@ mod tests {
             Err(SendError::Full(4))
         ));
 
+        // Publish calls so peer can see them
+        nodes[0].poll();
+
         // Process responses to free up slots
         nodes[1].poll();
         while let Some(handle) = nodes[1].try_recv() {
             let data = handle.data();
             assert!(handle.reply(data).is_ok());
         }
+        // Publish replies
+        nodes[1].poll();
+
+        // Receive responses
         nodes[0].poll();
 
         // Now we can send again

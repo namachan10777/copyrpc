@@ -120,6 +120,8 @@ pub use lamport::LamportTransport;
 #[cfg(feature = "omango")]
 pub use omango::OmangoTransport;
 pub use onesided::OnesidedTransport;
+pub use onesided::OnesidedImmediateTransport;
+pub use onesided::OnesidedValidityTransport;
 #[cfg(feature = "rtrb")]
 pub use rtrb::RtrbTransport;
 
