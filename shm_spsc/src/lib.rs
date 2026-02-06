@@ -2,6 +2,12 @@
 //!
 //! Each client gets a dedicated request/response slot pair.
 //! The server polls all slots and responds to each client.
+//!
+//! Uses a toggle-bit protocol (inspired by ffwd, SOSP 2017):
+//! - `client_seq` incremented by client when posting a request
+//! - `server_seq` incremented by server when posting a response
+//! - `client_seq != server_seq` → request pending
+//! - `client_seq == server_seq` → idle / response ready
 
 pub mod shm;
 
@@ -38,17 +44,6 @@ unsafe impl<T: Copy, const N: usize> Serial for [T; N] {}
 /// Identifies a client slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClientId(pub u32);
-
-/// Slot state machine:
-/// IDLE(0) → REQUEST_READY(1) → PROCESSING(2) → RESPONSE_READY(3) → IDLE(0)
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SlotState {
-    Idle = 0,
-    RequestReady = 1,
-    Processing = 2,
-    ResponseReady = 3,
-}
 
 /// Error returned when `Client::call()` fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,7 +117,7 @@ impl From<io::Error> for ConnectError {
 }
 
 const MAGIC: u64 = 0x5250_4353_4C4F_5421; // "RPCSLOT!"
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const HEADER_SIZE: usize = 64;
 const CACHE_LINE_SIZE: usize = 64;
 
@@ -149,8 +144,9 @@ const _: () = assert!(std::mem::size_of::<Header>() == HEADER_SIZE);
 /// Layout of a single slot in shared memory.
 struct SlotLayout {
     slot_size: usize,
-    state_offset: usize,      // 0
-    alive_offset: usize,      // 1
+    client_seq_offset: usize,  // 0
+    server_seq_offset: usize,  // 1
+    alive_offset: usize,       // 2
     req_offset: usize,
     resp_offset: usize,
 }
@@ -160,16 +156,18 @@ fn calc_slot_layout<Req, Resp>() -> SlotLayout {
         .max(std::mem::align_of::<Resp>())
         .max(8);
 
-    // [state: AtomicU8(1)] [client_alive: AtomicBool(1)] [padding to align] [req] [padding to align] [resp] [padding to align]
-    let state_offset = 0;
-    let alive_offset = 1;
-    let req_offset = align_up(2, align);
+    // [client_seq: AtomicU8(1)] [server_seq: AtomicU8(1)] [alive: AtomicBool(1)] [padding to align] [req] [padding to align] [resp] [padding to cache line]
+    let client_seq_offset = 0;
+    let server_seq_offset = 1;
+    let alive_offset = 2;
+    let req_offset = align_up(3, align);
     let resp_offset = align_up(req_offset + std::mem::size_of::<Req>(), align);
     let slot_size = align_up(resp_offset + std::mem::size_of::<Resp>(), CACHE_LINE_SIZE);
 
     SlotLayout {
         slot_size,
-        state_offset,
+        client_seq_offset,
+        server_seq_offset,
         alive_offset,
         req_offset,
         resp_offset,
@@ -193,6 +191,8 @@ pub struct Server<Req: Serial, Resp: Serial> {
     layout: SlotLayout,
     max_clients: u32,
     poll_cursor: u32,
+    server_seqs: Vec<u8>,
+    in_processing: u64,
     _marker: PhantomData<(Req, Resp)>,
 }
 
@@ -206,6 +206,7 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
     /// and that no other process is using the same path.
     pub unsafe fn create<P: AsRef<Path>>(path: P, max_clients: u32) -> io::Result<Self> {
         assert!(max_clients > 0, "max_clients must be > 0");
+        assert!(max_clients <= 64, "max_clients must be <= 64");
 
         let size = calc_shm_size::<Req, Resp>(max_clients);
         let shm = unsafe { SharedMemory::create(path, size)? };
@@ -233,12 +234,16 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
 
         let layout = calc_slot_layout::<Req, Resp>();
 
-        // Initialize all slots to IDLE
+        // Initialize all slots
         for i in 0..max_clients {
             let slot_base = unsafe { base.add(HEADER_SIZE + layout.slot_size * i as usize) };
             unsafe {
-                let state = &*(slot_base.add(layout.state_offset) as *const AtomicU8);
-                state.store(SlotState::Idle as u8, Ordering::Relaxed);
+                let client_seq =
+                    &*(slot_base.add(layout.client_seq_offset) as *const AtomicU8);
+                client_seq.store(0, Ordering::Relaxed);
+                let server_seq =
+                    &*(slot_base.add(layout.server_seq_offset) as *const AtomicU8);
+                server_seq.store(0, Ordering::Relaxed);
                 let alive = &*(slot_base.add(layout.alive_offset) as *const AtomicBool);
                 alive.store(false, Ordering::Relaxed);
             }
@@ -251,6 +256,8 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
             layout,
             max_clients,
             poll_cursor: 0,
+            server_seqs: vec![0u8; max_clients as usize],
+            in_processing: 0,
             _marker: PhantomData,
         })
     }
@@ -262,12 +269,22 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
         }
     }
 
-    fn slot_state(&self, client_id: u32) -> &AtomicU8 {
-        unsafe { &*(self.slot_base(client_id).add(self.layout.state_offset) as *const AtomicU8) }
+    fn slot_client_seq(&self, client_id: u32) -> &AtomicU8 {
+        unsafe {
+            &*(self.slot_base(client_id).add(self.layout.client_seq_offset) as *const AtomicU8)
+        }
+    }
+
+    fn slot_server_seq(&self, client_id: u32) -> &AtomicU8 {
+        unsafe {
+            &*(self.slot_base(client_id).add(self.layout.server_seq_offset) as *const AtomicU8)
+        }
     }
 
     fn slot_alive(&self, client_id: u32) -> &AtomicBool {
-        unsafe { &*(self.slot_base(client_id).add(self.layout.alive_offset) as *const AtomicBool) }
+        unsafe {
+            &*(self.slot_base(client_id).add(self.layout.alive_offset) as *const AtomicBool)
+        }
     }
 
     fn slot_req_ptr(&self, client_id: u32) -> *const Req {
@@ -289,17 +306,21 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
             let id = self.poll_cursor;
             self.poll_cursor = (self.poll_cursor + 1) % allocated;
 
+            // Skip in-processing clients
+            if self.in_processing & (1 << id) != 0 {
+                continue;
+            }
+
             // Skip dead clients
             if !self.slot_alive(id).load(Ordering::Acquire) {
                 continue;
             }
 
-            let state = self.slot_state(id);
-            if state.load(Ordering::Acquire) == SlotState::RequestReady as u8 {
-                // Read request
+            let client_seq = self.slot_client_seq(id).load(Ordering::Acquire);
+            if client_seq != self.server_seqs[id as usize] {
+                // New request
                 let req = unsafe { std::ptr::read_volatile(self.slot_req_ptr(id)) };
-                // Transition to PROCESSING
-                state.store(SlotState::Processing as u8, Ordering::Relaxed);
+                self.in_processing |= 1 << id;
                 return Some((ClientId(id), req));
             }
         }
@@ -323,15 +344,17 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
             return Err(RespondError::ClientDisconnected);
         }
 
-        let state = self.slot_state(id);
-        if state.load(Ordering::Relaxed) != SlotState::Processing as u8 {
+        if self.in_processing & (1 << id) == 0 {
             return Err(RespondError::NoRequest);
         }
 
         // Write response
         unsafe { std::ptr::write_volatile(self.slot_resp_ptr(id), resp) };
-        // Transition to RESPONSE_READY
-        state.store(SlotState::ResponseReady as u8, Ordering::Release);
+        // Flip server_seq to match client_seq
+        self.server_seqs[id as usize] = self.server_seqs[id as usize].wrapping_add(1);
+        self.slot_server_seq(id)
+            .store(self.server_seqs[id as usize], Ordering::Release);
+        self.in_processing &= !(1 << id);
 
         Ok(())
     }
@@ -374,6 +397,7 @@ pub struct Client<Req: Serial, Resp: Serial> {
     slot_base: *mut u8,
     layout: SlotLayout,
     client_id: u32,
+    client_seq: u8,
     _marker: PhantomData<(Req, Resp)>,
 }
 
@@ -440,12 +464,21 @@ impl<Req: Serial, Resp: Serial> Client<Req, Resp> {
             slot_base,
             layout,
             client_id,
+            client_seq: 0,
             _marker: PhantomData,
         })
     }
 
-    fn slot_state(&self) -> &AtomicU8 {
-        unsafe { &*(self.slot_base.add(self.layout.state_offset) as *const AtomicU8) }
+    fn slot_client_seq(&self) -> &AtomicU8 {
+        unsafe {
+            &*(self.slot_base.add(self.layout.client_seq_offset) as *const AtomicU8)
+        }
+    }
+
+    fn slot_server_seq(&self) -> &AtomicU8 {
+        unsafe {
+            &*(self.slot_base.add(self.layout.server_seq_offset) as *const AtomicU8)
+        }
     }
 
     fn req_ptr(&self) -> *mut Req {
@@ -458,17 +491,16 @@ impl<Req: Serial, Resp: Serial> Client<Req, Resp> {
 
     /// Synchronous blocking RPC call.
     pub fn call(&mut self, req: Req) -> Result<Resp, CallError> {
-        let state = self.slot_state();
-
         // Write request
         unsafe { std::ptr::write_volatile(self.req_ptr(), req) };
-        // Transition: IDLE → REQUEST_READY
-        state.store(SlotState::RequestReady as u8, Ordering::Release);
+        // Flip client_seq
+        self.client_seq = self.client_seq.wrapping_add(1);
+        self.slot_client_seq()
+            .store(self.client_seq, Ordering::Release);
 
-        // Spin until RESPONSE_READY
+        // Spin until server_seq matches client_seq
         loop {
-            let s = state.load(Ordering::Acquire);
-            if s == SlotState::ResponseReady as u8 {
+            if self.slot_server_seq().load(Ordering::Acquire) == self.client_seq {
                 break;
             }
             // Check server liveness
@@ -480,9 +512,6 @@ impl<Req: Serial, Resp: Serial> Client<Req, Resp> {
 
         // Read response
         let resp = unsafe { std::ptr::read_volatile(self.resp_ptr()) };
-        // Transition: RESPONSE_READY → IDLE
-        state.store(SlotState::Idle as u8, Ordering::Release);
-
         Ok(resp)
     }
 
