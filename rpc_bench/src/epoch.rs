@@ -6,11 +6,14 @@ pub struct EpochData {
     pub duration_ns: u64,
 }
 
+const CHECK_INTERVAL: u64 = 1024;
+
 pub struct EpochCollector {
     interval: Duration,
     epochs: Vec<EpochData>,
     epoch_start: Instant,
     epoch_completed: u64,
+    since_last_check: u64,
     next_index: u32,
 }
 
@@ -21,13 +24,25 @@ impl EpochCollector {
             epochs: Vec::new(),
             epoch_start: Instant::now(),
             epoch_completed: 0,
+            since_last_check: 0,
             next_index: 0,
         }
     }
 
-    /// Add completed operations. Returns true if an epoch boundary was crossed.
+    /// Add completed operations. Time check runs only every CHECK_INTERVAL calls.
+    #[inline]
     pub fn record(&mut self, delta: u64) -> bool {
         self.epoch_completed += delta;
+        self.since_last_check += delta;
+        if self.since_last_check < CHECK_INTERVAL {
+            return false;
+        }
+        self.since_last_check = 0;
+        self.check_epoch()
+    }
+
+    #[cold]
+    fn check_epoch(&mut self) -> bool {
         let elapsed = self.epoch_start.elapsed();
         if elapsed >= self.interval {
             self.epochs.push(EpochData {
