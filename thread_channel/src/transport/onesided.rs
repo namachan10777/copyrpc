@@ -24,8 +24,8 @@ use std::sync::Arc;
 
 use crate::serial::Serial;
 
-use super::common::{self, CachePadded, DisconnectState};
-use super::{Response, Transport, TransportEndpoint, TransportError};
+use super::common::{CachePadded, DisconnectState};
+use super::{cldemote, Response, Transport, TransportEndpoint, TransportError};
 
 // ============================================================================
 // SPSC Implementation (Producer-only write, index-based)
@@ -102,10 +102,6 @@ pub struct Receiver<T> {
     cached_head: usize,
     /// Bitmask for fast modulo
     mask: usize,
-    /// Receive counter for slip check interval
-    recv_count: usize,
-    /// Whether initial slip has been established
-    slip_initialized: bool,
 }
 
 unsafe impl<T: Send> Send for Receiver<T> {}
@@ -145,8 +141,6 @@ pub fn channel<T: Serial>(capacity: usize) -> (Sender<T>, Receiver<T>) {
         tail: 0,
         cached_head: 0,
         mask,
-        recv_count: 0,
-        slip_initialized: false,
     };
 
     (sender, receiver)
@@ -180,6 +174,7 @@ impl<T: Serial> Sender<T> {
             unsafe {
                 ptr::write_volatile(slot.generation.get(), self.head);
             }
+            cldemote(slot as *const Slot<T> as *const u8);
         }
 
         self.head = self.head.wrapping_add(1);
@@ -287,20 +282,6 @@ impl<T: Serial> Receiver<T> {
         !self.inner.shared.tx_alive.load(Ordering::Relaxed)
     }
 
-    /// Establishes and maintains temporal slip.
-    ///
-    /// Temporal slipping (FastForward PPoPP 2008 Section 3.4.1) delays the
-    /// consumer to ensure producer and consumer operate on different cache lines,
-    /// reducing cache line bouncing.
-    #[inline]
-    pub fn maintain_slip(&mut self) {
-        let inner = &self.inner;
-        let tail = self.tail;
-        common::maintain_slip(&mut self.recv_count, &mut self.slip_initialized, || {
-            let head = inner.shared_head.load(Ordering::Relaxed);
-            head.wrapping_sub(tail)
-        });
-    }
 }
 
 impl<T> Drop for Receiver<T> {

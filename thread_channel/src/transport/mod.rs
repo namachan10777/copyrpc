@@ -21,6 +21,20 @@ pub mod rtrb;
 
 use crate::serial::Serial;
 
+/// Demote a cache line from L1/L2 to shared LLC (L3).
+/// Hint instruction — may be treated as NOP by the microarchitecture.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) fn cldemote(ptr: *const u8) {
+    unsafe {
+        std::arch::asm!("cldemote [{ptr}]", ptr = in(reg) ptr, options(nostack, preserves_flags));
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+pub(crate) fn cldemote(_ptr: *const u8) {}
+
 /// Error returned when transport operations fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportError<T> {

@@ -8,12 +8,12 @@
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::ptr;
-use std::sync::atomic::{compiler_fence, AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::serial::Serial;
 
-use super::common::{self, CachePadded, DisconnectState};
+use super::common::DisconnectState;
 use super::{Response, Transport, TransportEndpoint, TransportError};
 
 // ============================================================================
@@ -85,8 +85,6 @@ impl<T> Slot<T> {
 /// Shared channel state.
 struct Inner<T> {
     shared: DisconnectState,
-    /// Producer head for distance calculation (slip maintenance)
-    producer_head: CachePadded<AtomicUsize>,
     slots: Box<[Slot<T>]>,
 }
 
@@ -111,10 +109,6 @@ pub struct Receiver<T> {
     tail: usize,
     /// Bitmask for fast modulo
     mask: usize,
-    /// Receive counter for slip check interval
-    recv_count: usize,
-    /// Whether initial slip has been established
-    slip_initialized: bool,
 }
 
 unsafe impl<T: Send> Send for Receiver<T> {}
@@ -139,7 +133,6 @@ pub fn channel<T: Serial>(capacity: usize) -> (Sender<T>, Receiver<T>) {
             tx_alive: AtomicBool::new(true),
             rx_alive: AtomicBool::new(true),
         },
-        producer_head: CachePadded::new(AtomicUsize::new(0)),
         slots,
     });
 
@@ -153,8 +146,6 @@ pub fn channel<T: Serial>(capacity: usize) -> (Sender<T>, Receiver<T>) {
         inner,
         tail: 0,
         mask,
-        recv_count: 0,
-        slip_initialized: false,
     };
 
     (sender, receiver)
@@ -196,11 +187,6 @@ impl<T: Serial> Sender<T> {
 
         // Advance head
         self.head = (self.head + 1) & self.mask;
-
-        // Publish head for slip measurement (relaxed - no sync needed)
-        self.inner
-            .producer_head
-            .store(self.head, Ordering::Relaxed);
 
         Ok(())
     }
@@ -277,25 +263,6 @@ impl<T: Serial> Receiver<T> {
         !self.inner.shared.tx_alive.load(Ordering::Relaxed)
     }
 
-    /// Establishes and maintains temporal slip.
-    ///
-    /// Temporal slipping (FastForward PPoPP 2008 Section 3.4.1) delays the
-    /// consumer to ensure producer and consumer operate on different cache lines,
-    /// reducing cache line bouncing.
-    ///
-    /// On first call: waits until producer is SLIP_GOOD entries ahead.
-    /// On subsequent calls (every SLIP_CHECK_INTERVAL): if slip drops below
-    /// SLIP_DANGER, waits until it recovers to SLIP_GOOD.
-    #[inline]
-    pub fn maintain_slip(&mut self) {
-        let inner = &self.inner;
-        let tail = self.tail;
-        let mask = self.mask;
-        common::maintain_slip(&mut self.recv_count, &mut self.slip_initialized, || {
-            let head = inner.producer_head.load(Ordering::Relaxed);
-            head.wrapping_sub(tail) & mask
-        });
-    }
 }
 
 impl<T> Drop for Receiver<T> {
