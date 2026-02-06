@@ -11,6 +11,7 @@ use crate::wqe::{
     update_ctrl_seg_wqe_idx, write_address_vector_ib, write_address_vector_roce,
     write_atomic_seg_cas, write_atomic_seg_fa, write_ctrl_seg, write_data_seg,
     write_inline_header, write_rdma_seg,
+    emit::bf_finish_sq,
 };
 
 use super::{DciIb, DciRoCE, DciSendQueueState};
@@ -19,13 +20,7 @@ use super::{DciIb, DciRoCE, DciSendQueueState};
 // Maximum WQEBB Calculation Functions for DCI
 // =============================================================================
 
-/// Calculate the padded inline data size (16-byte aligned).
-///
-/// inline_padded = ((4 + max_inline_data + 15) & !15)
-#[inline]
-fn calc_inline_padded(max_inline_data: u32) -> usize {
-    ((4 + max_inline_data as usize) + 15) & !15
-}
+use crate::wqe::calc_inline_padded;
 
 /// Calculate maximum WQEBB count for DCI SEND operation.
 ///
@@ -939,8 +934,7 @@ impl<Entry, OnComplete> DciRoCE<Entry, OnComplete> {
 // DCI BlueFlame Batch Builder
 // =============================================================================
 
-/// BlueFlame buffer size in bytes (256B doorbell window).
-const BLUEFLAME_BUFFER_SIZE: usize = 256;
+use crate::wqe::BLUEFLAME_BUFFER_SIZE;
 
 /// BlueFlame WQE batch builder for DCI (InfiniBand transport).
 ///
@@ -987,35 +981,16 @@ impl<'a, Entry> DciBlueflameWqeBatch<'a, Entry> {
             return;
         }
 
-        mmio_flush_writes!();
-
         unsafe {
-            std::ptr::write_volatile(
-                self.sq.dbrec.add(1),
-                (self.sq.pi.get() as u32).to_be(),
+            bf_finish_sq(
+                self.sq.dbrec,
+                self.sq.pi.get(),
+                self.sq.bf_reg,
+                self.sq.bf_size,
+                &self.sq.bf_offset,
+                &self.buffer,
+                self.offset,
             );
-        }
-
-        udma_to_device_barrier!();
-
-        if self.sq.bf_size > 0 {
-            let bf_offset = self.sq.bf_offset.get();
-            let bf = unsafe { self.sq.bf_reg.add(bf_offset as usize) };
-
-            let mut src = self.buffer.as_ptr();
-            let mut dst = bf;
-            let mut remaining = self.offset;
-            while remaining > 0 {
-                unsafe {
-                    mlx5_bf_copy!(dst, src);
-                    src = src.add(WQEBB_SIZE);
-                    dst = dst.add(WQEBB_SIZE);
-                }
-                remaining = remaining.saturating_sub(WQEBB_SIZE);
-            }
-
-            mmio_flush_writes!();
-            self.sq.bf_offset.set(bf_offset ^ self.sq.bf_size);
         }
     }
 }
@@ -1334,35 +1309,16 @@ impl<'a, Entry> DciRoceBlueflameWqeBatch<'a, Entry> {
             return;
         }
 
-        mmio_flush_writes!();
-
         unsafe {
-            std::ptr::write_volatile(
-                self.sq.dbrec.add(1),
-                (self.sq.pi.get() as u32).to_be(),
+            bf_finish_sq(
+                self.sq.dbrec,
+                self.sq.pi.get(),
+                self.sq.bf_reg,
+                self.sq.bf_size,
+                &self.sq.bf_offset,
+                &self.buffer,
+                self.offset,
             );
-        }
-
-        udma_to_device_barrier!();
-
-        if self.sq.bf_size > 0 {
-            let bf_offset = self.sq.bf_offset.get();
-            let bf = unsafe { self.sq.bf_reg.add(bf_offset as usize) };
-
-            let mut src = self.buffer.as_ptr();
-            let mut dst = bf;
-            let mut remaining = self.offset;
-            while remaining > 0 {
-                unsafe {
-                    mlx5_bf_copy!(dst, src);
-                    src = src.add(WQEBB_SIZE);
-                    dst = dst.add(WQEBB_SIZE);
-                }
-                remaining = remaining.saturating_sub(WQEBB_SIZE);
-            }
-
-            mmio_flush_writes!();
-            self.sq.bf_offset.set(bf_offset ^ self.sq.bf_size);
         }
     }
 }

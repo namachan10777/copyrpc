@@ -68,6 +68,18 @@ use crate::types::GrhAttr;
 /// WQEBB (Work Queue Element Basic Block) size in bytes.
 pub(crate) const WQEBB_SIZE: usize = 64;
 
+/// BlueFlame buffer size in bytes (256 bytes = 4 WQEBBs).
+pub(crate) const BLUEFLAME_BUFFER_SIZE: usize = 256;
+
+/// Calculate inline data size padded to 16-byte alignment.
+///
+/// inline_padded = ((4 + max_inline_data + 15) & !15)
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn calc_inline_padded(max_inline_data: u32) -> usize {
+    ((4 + max_inline_data as usize) + 15) & !15
+}
+
 // =============================================================================
 // WQE Segments
 // =============================================================================

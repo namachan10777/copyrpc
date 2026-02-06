@@ -21,7 +21,7 @@ use crate::wqe::{
     // Transport type tags
     InfiniBand, RoCE,
     // Macro-based emission
-    emit::{EmitContext, SqCapability, SqState},
+    emit::{EmitContext, SendQueueState, bf_finish_rq},
 };
 
 /// RC QP configuration.
@@ -95,123 +95,9 @@ pub(crate) struct QpInfo {
 // Send Queue State
 // =============================================================================
 
-/// Send Queue state for direct WQE posting.
-///
-/// Generic over the table type `TableType`.
-/// Uses interior mutability (Cell) so no RefCell wrapper is needed.
-pub(crate) struct SendQueueState<Entry, TableType> {
-    /// SQ buffer base address
-    buf: *mut u8,
-    /// Number of WQEBBs (64-byte blocks)
-    pub(super) wqe_cnt: u16,
-    /// SQ number
-    pub(super) sqn: u32,
-    /// Producer index (next WQE slot)
-    pub(super) pi: Cell<u16>,
-    /// Consumer index (last completed WQE)
-    ci: Cell<u16>,
-    /// Last posted WQE pointer and size (for BlueFlame)
-    last_wqe: Cell<Option<(*mut u8, usize)>>,
-    /// Doorbell record pointer
-    pub(super) dbrec: *mut u32,
-    /// BlueFlame register pointer
-    pub(super) bf_reg: *mut u8,
-    /// BlueFlame size (64 or 0 if not available)
-    pub(super) bf_size: u32,
-    /// Current BlueFlame offset (alternates between 0 and bf_size)
-    pub(super) bf_offset: Cell<u32>,
-    /// WQE table for tracking in-flight operations.
-    /// Uses interior mutability (Cell<Option<Entry>>) so no RefCell needed.
-    pub(super) table: TableType,
-    /// Phantom for entry type
-    _marker: std::marker::PhantomData<Entry>,
-}
-
-impl<Entry, TableType> SendQueueState<Entry, TableType> {
-    #[inline]
-    pub(super) fn available(&self) -> u16 {
-        self.wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
-    }
-
-    /// Ring the doorbell with minimum 8-byte BlueFlame write.
-    ///
-    /// Updates DBREC and writes minimum 8 bytes (Control Segment) to BlueFlame register.
-    /// The NIC fetches remaining WQE data via DMA.
-    #[inline]
-    fn ring_doorbell(&self) {
-        let Some((last_wqe_ptr, _wqe_size)) = self.last_wqe.take() else {
-            return;
-        };
-
-        mmio_flush_writes!();
-
-        unsafe {
-            std::ptr::write_volatile(self.dbrec.add(1), (self.pi.get() as u32).to_be());
-        }
-
-        udma_to_device_barrier!();
-
-        // Minimum 8-byte BF write (first 8 bytes of Control Segment)
-        let bf_offset = self.bf_offset.get();
-        let bf = unsafe { self.bf_reg.add(bf_offset as usize) as *mut u64 };
-        unsafe {
-            std::ptr::write_volatile(bf, *(last_wqe_ptr as *const u64));
-        }
-
-        mmio_flush_writes!();
-        self.bf_offset.set(bf_offset ^ self.bf_size);
-    }
-
-    /// Ring the doorbell with BlueFlame write of entire WQE.
-    ///
-    /// Copies the last WQE (up to bf_size bytes) to the BlueFlame register
-    /// using non-temporal (streaming) stores.
-    /// For WQEs larger than bf_size, only the first bf_size bytes are copied via BF,
-    /// and the NIC reads the rest from host memory.
-    #[inline]
-    fn ring_doorbell_bf(&self) {
-        let Some((last_wqe_ptr, wqe_size)) = self.last_wqe.take() else {
-            return;
-        };
-
-        mmio_flush_writes!();
-
-        unsafe {
-            std::ptr::write_volatile(self.dbrec.add(1), (self.pi.get() as u32).to_be());
-        }
-
-        udma_to_device_barrier!();
-
-        // Copy WQE to BF register using non-temporal stores (64 bytes at a time)
-        let bf_offset = self.bf_offset.get();
-        let mut bf = unsafe { self.bf_reg.add(bf_offset as usize) };
-        let mut src = last_wqe_ptr;
-        let copy_size = wqe_size.min(self.bf_size as usize);
-        let mut remaining = copy_size;
-
-        while remaining > 0 {
-            unsafe {
-                mlx5_bf_copy!(bf, src);
-                src = src.add(WQEBB_SIZE);
-                bf = bf.add(WQEBB_SIZE);
-            }
-            remaining = remaining.saturating_sub(WQEBB_SIZE);
-        }
-
-        mmio_flush_writes!();
-        self.bf_offset.set(bf_offset ^ self.bf_size);
-    }
-}
+// SendQueueState is now defined in crate::wqe::emit and imported above.
 
 impl<Entry> SendQueueState<Entry, OrderedWqeTable<Entry>> {
-    #[inline]
-    fn process_completion(&self, wqe_idx: u16) -> Option<Entry> {
-        let entry = self.table.take(wqe_idx)?;
-        // ci_delta is the accumulated PI value at completion
-        self.ci.set(entry.ci_delta);
-        Some(entry.data)
-    }
-
     /// Get an EmitContext for macro-based WQE emission.
     #[inline]
     pub(crate) fn emit_ctx(&self) -> EmitContext<'_, Entry> {
@@ -224,79 +110,6 @@ impl<Entry> SendQueueState<Entry, OrderedWqeTable<Entry>> {
             last_wqe: &self.last_wqe,
             table: &self.table,
         }
-    }
-}
-
-/// RC QP Send Queue capability.
-///
-/// RC QPはAV不要で、SEND/WRITE/READ/Atomicを全てサポート。
-impl<Entry> SqCapability for SendQueueState<Entry, OrderedWqeTable<Entry>> {
-    const REQUIRES_AV: bool = false;
-    const SUPPORTS_SEND: bool = true;
-    const SUPPORTS_RDMA: bool = true;
-    const SUPPORTS_ATOMIC: bool = true;
-}
-
-/// SqState implementation for SendQueueState.
-///
-/// This allows the `emit_wqe!` macro to work directly with SendQueueState
-/// via the SqState trait.
-impl<Entry> SqState for SendQueueState<Entry, OrderedWqeTable<Entry>> {
-    type Entry = Entry;
-
-    #[inline]
-    fn sq_buf(&self) -> *mut u8 {
-        self.buf
-    }
-
-    #[inline]
-    fn wqe_cnt(&self) -> u16 {
-        self.wqe_cnt
-    }
-
-    #[inline]
-    fn sqn(&self) -> u32 {
-        self.sqn
-    }
-
-    #[inline]
-    fn pi(&self) -> &Cell<u16> {
-        &self.pi
-    }
-
-    #[inline]
-    fn ci(&self) -> &Cell<u16> {
-        &self.ci
-    }
-
-    #[inline]
-    fn last_wqe(&self) -> &Cell<Option<(*mut u8, usize)>> {
-        &self.last_wqe
-    }
-
-    #[inline]
-    fn table(&self) -> &OrderedWqeTable<Entry> {
-        &self.table
-    }
-
-    #[inline]
-    fn dbrec(&self) -> *mut u32 {
-        self.dbrec
-    }
-
-    #[inline]
-    fn bf_reg(&self) -> *mut u8 {
-        self.bf_reg
-    }
-
-    #[inline]
-    fn bf_size(&self) -> u32 {
-        self.bf_size
-    }
-
-    #[inline]
-    fn bf_offset(&self) -> &Cell<u32> {
-        &self.bf_offset
     }
 }
 
@@ -1365,8 +1178,7 @@ impl<Entry: Clone + 'static, OnSq: Fn(Cqe, Entry)> CompletionTarget for RcQpForM
 // RQ BlueFlame Batch Builder
 // =============================================================================
 
-/// BlueFlame buffer size in bytes (256B doorbell window).
-const BLUEFLAME_BUFFER_SIZE: usize = 256;
+use crate::wqe::BLUEFLAME_BUFFER_SIZE;
 
 /// RQ WQE size in bytes (single DataSeg).
 const RQ_WQE_SIZE: usize = DATA_SEG_SIZE;
@@ -1460,37 +1272,16 @@ impl<'a, Entry> RqBlueflameWqeBatch<'a, Entry> {
             return; // No WQEs to submit
         }
 
-        mmio_flush_writes!();
-
-        // Update doorbell record
         unsafe {
-            std::ptr::write_volatile(
+            bf_finish_rq(
                 self.rq.dbrec,
-                (self.rq.pi.get() as u32).to_be(),
+                self.rq.pi.get() as u32,
+                self.bf_reg,
+                self.bf_size,
+                &self.bf_offset,
+                &self.buffer,
+                self.offset,
             );
-        }
-
-        udma_to_device_barrier!();
-
-        // Copy buffer to BlueFlame register
-        if self.bf_size > 0 {
-            let bf_offset = self.bf_offset.get();
-            let bf = unsafe { self.bf_reg.add(bf_offset as usize) };
-
-            let mut src = self.buffer.as_ptr();
-            let mut dst = bf;
-            let mut remaining = self.offset;
-            while remaining > 0 {
-                unsafe {
-                    mlx5_bf_copy!(dst, src);
-                    src = src.add(WQEBB_SIZE);
-                    dst = dst.add(WQEBB_SIZE);
-                }
-                remaining = remaining.saturating_sub(WQEBB_SIZE);
-            }
-
-            mmio_flush_writes!();
-            self.bf_offset.set(bf_offset ^ self.bf_size);
         }
     }
 }

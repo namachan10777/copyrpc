@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::{io, mem::MaybeUninit, ptr::NonNull};
 
 use crate::pd::Pd;
-use crate::wqe::{SubmissionError, WQEBB_SIZE, write_data_seg};
+use crate::wqe::{SubmissionError, WQEBB_SIZE, write_data_seg, emit::bf_finish_rq};
 
 /// SRQ configuration.
 #[derive(Debug, Clone)]
@@ -487,8 +487,7 @@ impl<T> Srq<T> {
 // SRQ BlueFlame Batch Builder
 // =============================================================================
 
-/// BlueFlame buffer size in bytes (256B doorbell window).
-const BLUEFLAME_BUFFER_SIZE: usize = 256;
+use crate::wqe::BLUEFLAME_BUFFER_SIZE;
 
 /// SRQ WQE size in bytes (Next Seg + Data Seg).
 const SRQ_WQE_SIZE: usize = 32;
@@ -594,34 +593,16 @@ impl<'a, T> SrqBlueflameWqeBatch<'a, T> {
         // Advance SRQ producer index
         self.state.pi.set(self.state.pi.get().wrapping_add(self.wqe_count));
 
-        mmio_flush_writes!();
-
-        // Update doorbell record
         unsafe {
-            std::ptr::write_volatile(self.state.dbrec, self.state.pi.get().to_be());
-        }
-
-        udma_to_device_barrier!();
-
-        // Copy buffer to BlueFlame register
-        if self.bf_size > 0 {
-            let bf_offset = self.bf_offset.get();
-            let bf = unsafe { self.bf_reg.add(bf_offset as usize) };
-
-            let mut src = self.buffer.as_ptr();
-            let mut dst = bf;
-            let mut remaining = self.offset;
-            while remaining > 0 {
-                unsafe {
-                    mlx5_bf_copy!(dst, src);
-                    src = src.add(WQEBB_SIZE);
-                    dst = dst.add(WQEBB_SIZE);
-                }
-                remaining = remaining.saturating_sub(WQEBB_SIZE);
-            }
-
-            mmio_flush_writes!();
-            self.bf_offset.set(bf_offset ^ self.bf_size);
+            bf_finish_rq(
+                self.state.dbrec,
+                self.state.pi.get(),
+                self.bf_reg,
+                self.bf_size,
+                &self.bf_offset,
+                &self.buffer,
+                self.offset,
+            );
         }
     }
 }

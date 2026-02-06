@@ -46,7 +46,7 @@ use crate::cq::{Cq, Cqe, CqeOpcode};
 use crate::device::Context;
 use crate::pd::Pd;
 use crate::srq::SrqInfo;
-use crate::wqe::{OrderedWqeTable, UnorderedWqeTable, emit::{SqState, TmCmdEmitContext}};
+use crate::wqe::{OrderedWqeTable, UnorderedWqeTable, emit::{SendQueueState, TmCmdEmitContext}};
 
 // =============================================================================
 // TM-SRQ Completion Types
@@ -105,160 +105,9 @@ impl Default for TmSrqConfig {
 // Command QP State
 // =============================================================================
 
-/// Command QP state for TM tag operations.
-///
-/// Generic over `CmdTableType` to support both sparse (signaled-only) and dense (all WQE)
-/// completion modes, similar to the main Send Queue implementation.
-pub(super) struct CmdQpState<CmdEntry, CmdTableType> {
-    /// QP number.
-    pub(super) qpn: u32,
-    /// Send queue buffer.
-    pub(super) sq_buf: *mut u8,
-    /// Send queue WQE count (power of 2).
-    pub(super) sq_wqe_cnt: u16,
-    /// Producer index.
-    pub(super) pi: Cell<u16>,
-    /// Consumer index (for optimistic available calculation).
-    pub(super) ci: Cell<u16>,
-    /// Doorbell record pointer.
-    pub(super) dbrec: *mut u32,
-    /// BlueFlame register.
-    pub(super) bf_reg: *mut u8,
-    /// BlueFlame size.
-    pub(super) bf_size: u32,
-    /// BlueFlame offset.
-    pub(super) bf_offset: Cell<u32>,
-    /// Last WQE pointer and size for doorbell.
-    pub(super) last_wqe: Cell<Option<(*mut u8, usize)>>,
-    /// WQE table for tracking in-flight operations.
-    pub(super) table: CmdTableType,
-    /// Phantom for entry type.
-    pub(super) _marker: std::marker::PhantomData<CmdEntry>,
-}
-
-impl<CmdEntry, CmdTableType> CmdQpState<CmdEntry, CmdTableType> {
-    pub(super) fn optimistic_available(&self) -> u16 {
-        self.sq_wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
-    }
-
-    /// Ring the doorbell using regular doorbell write.
-    pub(super) fn ring_doorbell(&self) {
-        let Some((wqe_ptr, _)) = self.last_wqe.get() else {
-            return;
-        };
-        self.last_wqe.set(None);
-
-        mmio_flush_writes!();
-
-        // Update doorbell record (dbrec[1] is SQ doorbell)
-        unsafe {
-            std::ptr::write_volatile(self.dbrec.add(1), (self.pi.get() as u32).to_be());
-        }
-
-        udma_to_device_barrier!();
-
-        self.ring_db(wqe_ptr);
-    }
-
-    fn ring_db(&self, wqe_ptr: *mut u8) {
-        let bf = unsafe { self.bf_reg.add(self.bf_offset.get() as usize) as *mut u64 };
-        let ctrl = wqe_ptr as *const u64;
-        unsafe {
-            std::ptr::write_volatile(bf, *ctrl);
-        }
-        mmio_flush_writes!();
-        self.bf_offset.set(self.bf_offset.get() ^ self.bf_size);
-    }
-}
-
-impl<CmdEntry> CmdQpState<CmdEntry, OrderedWqeTable<CmdEntry>> {
-    /// Process a single completion.
-    fn process_completion(&self, wqe_idx: u16) -> Option<CmdEntry> {
-        let entry = self.table.take(wqe_idx)?;
-        // ci_delta is the accumulated PI value at completion
-        self.ci.set(entry.ci_delta);
-        Some(entry.data)
-    }
-
-    /// Get an emit context for macro-based WQE emission.
-    ///
-    /// Returns `Err` if the Command QP is full.
-    #[doc(hidden)]
-    pub fn emit_ctx(&self) -> io::Result<TmCmdEmitContext<'_, CmdEntry>> {
-        if !self.table.is_available(self.pi.get()) {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Command QP full"));
-        }
-        Ok(TmCmdEmitContext {
-            buf: self.sq_buf,
-            wqe_cnt: self.sq_wqe_cnt,
-            qpn: self.qpn,
-            pi: &self.pi,
-            ci: &self.ci,
-            last_wqe: &self.last_wqe,
-            table: &self.table,
-        })
-    }
-}
-
-/// SqState implementation for CmdQpState.
-impl<CmdEntry> SqState for CmdQpState<CmdEntry, OrderedWqeTable<CmdEntry>> {
-    type Entry = CmdEntry;
-
-    #[inline]
-    fn sq_buf(&self) -> *mut u8 {
-        self.sq_buf
-    }
-
-    #[inline]
-    fn wqe_cnt(&self) -> u16 {
-        self.sq_wqe_cnt
-    }
-
-    #[inline]
-    fn sqn(&self) -> u32 {
-        self.qpn
-    }
-
-    #[inline]
-    fn pi(&self) -> &Cell<u16> {
-        &self.pi
-    }
-
-    #[inline]
-    fn ci(&self) -> &Cell<u16> {
-        &self.ci
-    }
-
-    #[inline]
-    fn last_wqe(&self) -> &Cell<Option<(*mut u8, usize)>> {
-        &self.last_wqe
-    }
-
-    #[inline]
-    fn table(&self) -> &OrderedWqeTable<CmdEntry> {
-        &self.table
-    }
-
-    #[inline]
-    fn dbrec(&self) -> *mut u32 {
-        self.dbrec
-    }
-
-    #[inline]
-    fn bf_reg(&self) -> *mut u8 {
-        self.bf_reg
-    }
-
-    #[inline]
-    fn bf_size(&self) -> u32 {
-        self.bf_size
-    }
-
-    #[inline]
-    fn bf_offset(&self) -> &Cell<u32> {
-        &self.bf_offset
-    }
-}
+// CmdQpState is now the unified SendQueueState from crate::wqe::emit.
+// Type alias for backward compatibility.
+pub(super) type CmdQpState<CmdEntry, CmdTableType> = SendQueueState<CmdEntry, CmdTableType>;
 
 // =============================================================================
 // SRQ State
@@ -464,9 +313,9 @@ impl Context {
                     table: UnorderedWqeTable::new(wqe_cnt as u16),
                 }),
                 cmd_qp: Some(CmdQpState {
-                    qpn: cmd_info.qpn,
-                    sq_buf: cmd_info.sq_buf,
-                    sq_wqe_cnt: cmd_info.sq_wqe_cnt,
+                    sqn: cmd_info.qpn,
+                    buf: cmd_info.sq_buf,
+                    wqe_cnt: cmd_info.sq_wqe_cnt,
                     pi: Cell::new(cmd_info.current_pi),
                     ci: Cell::new(cmd_info.current_pi),
                     dbrec: cmd_info.dbrec,
@@ -525,7 +374,7 @@ impl<CmdEntry, RecvEntry, OnComplete> Drop for TmSrq<CmdEntry, RecvEntry, OnComp
         if let Some(cmd_qp) = &self.cmd_qp
             && let Some(cq) = self.send_cq.upgrade()
         {
-            cq.unregister_queue(cmd_qp.qpn);
+            cq.unregister_queue(cmd_qp.sqn);
         }
 
         unsafe {
@@ -730,7 +579,7 @@ impl<CmdEntry, RecvEntry, OnComplete> TmSrq<CmdEntry, RecvEntry, OnComplete> {
     ///
     /// Based on pi - ci, but actual availability may be less due to gaps.
     pub fn cmd_optimistic_available(&self) -> u16 {
-        self.cmd_qp().optimistic_available()
+        self.cmd_qp().available()
     }
 
     /// Ring the Command QP doorbell to submit TM operations.
@@ -775,7 +624,19 @@ impl<CmdEntry, RecvEntry, OnComplete> TmSrq<CmdEntry, RecvEntry, OnComplete> {
     /// tm_srq.ring_cmd_doorbell();
     /// ```
     pub fn cmd_emit_ctx(&self) -> io::Result<TmCmdEmitContext<'_, CmdEntry>> {
-        self.cmd_qp().emit_ctx()
+        let sq = self.cmd_qp();
+        if sq.available() == 0 {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "SQ full"));
+        }
+        Ok(TmCmdEmitContext {
+            buf: sq.buf,
+            wqe_cnt: sq.wqe_cnt,
+            sqn: sq.sqn,
+            pi: &sq.pi,
+            ci: &sq.ci,
+            last_wqe: &sq.last_wqe,
+            table: &sq.table,
+        })
     }
 }
 
@@ -788,7 +649,7 @@ where
     OnComplete: Fn(TmSrqCompletion<CmdEntry, RecvEntry>),
 {
     fn qpn(&self) -> u32 {
-        self.cmd_qp().qpn
+        self.cmd_qp().sqn
     }
 
     fn dispatch_cqe(&self, cqe: Cqe) {

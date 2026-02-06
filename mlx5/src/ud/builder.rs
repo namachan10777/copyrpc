@@ -10,9 +10,11 @@ use crate::wqe::{
     SubmissionError, WqeFlags, WQEBB_SIZE, WqeHandle, WqeOpcode, calc_wqebb_cnt,
     set_ctrl_seg_completion_flag, update_ctrl_seg_ds_cnt, update_ctrl_seg_wqe_idx,
     write_ctrl_seg, write_data_seg, write_inline_header,
+    emit::{bf_finish_sq, bf_finish_rq},
 };
 
-use super::{UdAddressSeg, UdQpIb, UdRecvQueueState, UdSendQueueState};
+use crate::wqe::emit::SendQueueState;
+use super::{UdAddressSeg, UdQpIb, UdRecvQueueState};
 
 // =============================================================================
 // Maximum WQEBB Calculation Functions
@@ -30,7 +32,7 @@ fn calc_ud_max_wqebb_send(max_inline_data: u32) -> u16 {
 
 /// Internal WQE builder core for UD operations.
 struct UdWqeCore<'a, Entry> {
-    sq: &'a UdSendQueueState<Entry, OrderedWqeTable<Entry>>,
+    sq: &'a SendQueueState<Entry, OrderedWqeTable<Entry>>,
     wqe_ptr: *mut u8,
     wqe_idx: u16,
     offset: usize,
@@ -41,7 +43,7 @@ struct UdWqeCore<'a, Entry> {
 
 impl<'a, Entry> UdWqeCore<'a, Entry> {
     #[inline]
-    fn new(sq: &'a UdSendQueueState<Entry, OrderedWqeTable<Entry>>, entry: Option<Entry>) -> Self {
+    fn new(sq: &'a SendQueueState<Entry, OrderedWqeTable<Entry>>, entry: Option<Entry>) -> Self {
         let wqe_idx = sq.pi.get();
         let wqe_ptr = sq.get_wqe_ptr(wqe_idx);
         Self {
@@ -209,7 +211,7 @@ impl<'a, Entry> UdSqWqeEntryPoint<'a, Entry> {
     /// Create a new entry point.
     #[inline]
     pub(super) fn new(
-        sq: &'a UdSendQueueState<Entry, OrderedWqeTable<Entry>>,
+        sq: &'a SendQueueState<Entry, OrderedWqeTable<Entry>>,
         ah: &'a AddressHandle,
         qkey: u32,
     ) -> Self {
@@ -451,8 +453,7 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIb<SqEntry, RqEntry, OnSq
 // UD RQ BlueFlame Batch Builder
 // =============================================================================
 
-/// BlueFlame buffer size in bytes (256B doorbell window).
-const BLUEFLAME_BUFFER_SIZE: usize = 256;
+use crate::wqe::BLUEFLAME_BUFFER_SIZE;
 
 /// RQ WQE size in bytes (single DataSeg).
 const RQ_WQE_SIZE: usize = DATA_SEG_SIZE;
@@ -553,34 +554,16 @@ impl<'a, Entry> UdRqBlueflameWqeBatch<'a, Entry> {
         // Advance RQ producer index
         self.rq.pi.set(self.rq.pi.get().wrapping_add(self.wqe_count));
 
-        mmio_flush_writes!();
-
-        // Update doorbell record
         unsafe {
-            std::ptr::write_volatile(self.rq.dbrec, (self.rq.pi.get() as u32).to_be());
-        }
-
-        udma_to_device_barrier!();
-
-        // Copy buffer to BlueFlame register
-        if self.bf_size > 0 {
-            let bf_offset = self.bf_offset.get();
-            let bf = unsafe { self.bf_reg.add(bf_offset as usize) };
-
-            let mut src = self.buffer.as_ptr();
-            let mut dst = bf;
-            let mut remaining = self.offset;
-            while remaining > 0 {
-                unsafe {
-                    mlx5_bf_copy!(dst, src);
-                    src = src.add(WQEBB_SIZE);
-                    dst = dst.add(WQEBB_SIZE);
-                }
-                remaining = remaining.saturating_sub(WQEBB_SIZE);
-            }
-
-            mmio_flush_writes!();
-            self.bf_offset.set(bf_offset ^ self.bf_size);
+            bf_finish_rq(
+                self.rq.dbrec,
+                self.rq.pi.get() as u32,
+                self.bf_reg,
+                self.bf_size,
+                &self.bf_offset,
+                &self.buffer,
+                self.offset,
+            );
         }
     }
 }
@@ -595,7 +578,7 @@ impl<'a, Entry> UdRqBlueflameWqeBatch<'a, Entry> {
 /// Each WQE is copied to a contiguous buffer and submitted via BlueFlame doorbell
 /// when `finish()` is called.
 pub struct UdBlueflameWqeBatch<'a, Entry> {
-    sq: &'a UdSendQueueState<Entry, OrderedWqeTable<Entry>>,
+    sq: &'a SendQueueState<Entry, OrderedWqeTable<Entry>>,
     ah: &'a AddressHandle,
     qkey: u32,
     buffer: [u8; BLUEFLAME_BUFFER_SIZE],
@@ -603,7 +586,7 @@ pub struct UdBlueflameWqeBatch<'a, Entry> {
 }
 
 impl<'a, Entry> UdBlueflameWqeBatch<'a, Entry> {
-    pub(super) fn new(sq: &'a UdSendQueueState<Entry, OrderedWqeTable<Entry>>, ah: &'a AddressHandle, qkey: u32) -> Self {
+    pub(super) fn new(sq: &'a SendQueueState<Entry, OrderedWqeTable<Entry>>, ah: &'a AddressHandle, qkey: u32) -> Self {
         Self {
             sq,
             ah,
@@ -632,35 +615,16 @@ impl<'a, Entry> UdBlueflameWqeBatch<'a, Entry> {
             return;
         }
 
-        mmio_flush_writes!();
-
         unsafe {
-            std::ptr::write_volatile(
-                self.sq.dbrec.add(1),
-                (self.sq.pi.get() as u32).to_be(),
+            bf_finish_sq(
+                self.sq.dbrec,
+                self.sq.pi.get(),
+                self.sq.bf_reg,
+                self.sq.bf_size,
+                &self.sq.bf_offset,
+                &self.buffer,
+                self.offset,
             );
-        }
-
-        udma_to_device_barrier!();
-
-        if self.sq.bf_size > 0 {
-            let bf_offset = self.sq.bf_offset.get();
-            let bf = unsafe { self.sq.bf_reg.add(bf_offset as usize) };
-
-            let mut src = self.buffer.as_ptr();
-            let mut dst = bf;
-            let mut remaining = self.offset;
-            while remaining > 0 {
-                unsafe {
-                    mlx5_bf_copy!(dst, src);
-                    src = src.add(WQEBB_SIZE);
-                    dst = dst.add(WQEBB_SIZE);
-                }
-                remaining = remaining.saturating_sub(WQEBB_SIZE);
-            }
-
-            mmio_flush_writes!();
-            self.sq.bf_offset.set(bf_offset ^ self.sq.bf_size);
         }
     }
 }

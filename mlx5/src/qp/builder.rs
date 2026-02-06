@@ -17,6 +17,7 @@ use crate::wqe::{
     ADDRESS_VECTOR_SIZE, write_address_vector_roce,
     // Address Vector trait and types
     Av, NoData,
+    emit::{bf_finish_sq, bf_finish_rq},
 };
 
 use super::SendQueueState;
@@ -25,13 +26,7 @@ use super::SendQueueState;
 // Maximum WQEBB Calculation Functions
 // =============================================================================
 
-/// Calculate the padded inline data size (16-byte aligned).
-///
-/// inline_padded = ((4 + max_inline_data + 15) & !15)
-#[inline]
-fn calc_inline_padded(max_inline_data: u32) -> usize {
-    ((4 + max_inline_data as usize) + 15) & !15
-}
+use crate::wqe::calc_inline_padded;
 
 /// Calculate maximum WQEBB count for SEND operation.
 ///
@@ -82,19 +77,19 @@ fn calc_max_wqebb_nop() -> u16 {
 // =============================================================================
 
 /// Internal WQE builder core that handles direct buffer writes.
-pub(super) struct WqeCore<'a, Entry> {
-    sq: &'a SendQueueState<Entry, OrderedWqeTable<Entry>>,
-    wqe_ptr: *mut u8,
-    wqe_idx: u16,
-    offset: usize,
-    ds_count: u8,
-    pub(super) signaled: bool,
-    pub(super) entry: Option<Entry>,
+pub(crate) struct WqeCore<'a, Entry> {
+    pub(crate) sq: &'a SendQueueState<Entry, OrderedWqeTable<Entry>>,
+    pub(crate) wqe_ptr: *mut u8,
+    pub(crate) wqe_idx: u16,
+    pub(crate) offset: usize,
+    pub(crate) ds_count: u8,
+    pub(crate) signaled: bool,
+    pub(crate) entry: Option<Entry>,
 }
 
 impl<'a, Entry> WqeCore<'a, Entry> {
     #[inline]
-    pub(super) fn new(sq: &'a SendQueueState<Entry, OrderedWqeTable<Entry>>, entry: Option<Entry>) -> Self {
+    pub(crate) fn new(sq: &'a SendQueueState<Entry, OrderedWqeTable<Entry>>, entry: Option<Entry>) -> Self {
         let wqe_idx = sq.pi.get();
         let wqe_ptr = sq.get_wqe_ptr(wqe_idx);
         Self {
@@ -109,17 +104,17 @@ impl<'a, Entry> WqeCore<'a, Entry> {
     }
 
     #[inline]
-    pub(super) fn available(&self) -> u16 {
+    pub(crate) fn available(&self) -> u16 {
         self.sq.available()
     }
 
     #[inline]
-    pub(super) fn max_inline_data(&self) -> u32 {
+    pub(crate) fn max_inline_data(&self) -> u32 {
         self.sq.max_inline_data()
     }
 
     #[inline]
-    pub(super) fn write_ctrl(&mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) {
+    pub(crate) fn write_ctrl(&mut self, opcode: WqeOpcode, flags: WqeFlags, imm: u32) {
         let flags = if self.signaled {
             flags | WqeFlags::COMPLETION
         } else {
@@ -143,9 +138,22 @@ impl<'a, Entry> WqeCore<'a, Entry> {
         self.ds_count = 1;
     }
 
+    /// Get current write pointer (for custom segment writes).
+    #[inline]
+    pub(crate) fn current_ptr(&self) -> *mut u8 {
+        unsafe { self.wqe_ptr.add(self.offset) }
+    }
+
+    /// Advance offset and ds_count after writing a custom segment.
+    #[inline]
+    pub(crate) fn advance(&mut self, size: usize, ds_count: u8) {
+        self.offset += size;
+        self.ds_count += ds_count;
+    }
+
     /// Write Address Vector segment using the Av trait.
     #[inline]
-    pub(super) fn write_av<A: Av>(&mut self, av: A) {
+    pub(crate) fn write_av<A: Av>(&mut self, av: A) {
         unsafe {
             av.write_av(self.wqe_ptr.add(self.offset));
         }
@@ -154,7 +162,7 @@ impl<'a, Entry> WqeCore<'a, Entry> {
     }
 
     #[inline]
-    pub(super) fn write_rdma(&mut self, addr: u64, rkey: u32) {
+    pub(crate) fn write_rdma(&mut self, addr: u64, rkey: u32) {
         unsafe {
             write_rdma_seg(self.wqe_ptr.add(self.offset), addr, rkey);
         }
@@ -163,7 +171,7 @@ impl<'a, Entry> WqeCore<'a, Entry> {
     }
 
     #[inline]
-    pub(super) fn write_sge(&mut self, addr: u64, len: u32, lkey: u32) {
+    pub(crate) fn write_sge(&mut self, addr: u64, len: u32, lkey: u32) {
         unsafe {
             write_data_seg(self.wqe_ptr.add(self.offset), len, lkey, addr);
         }
@@ -172,7 +180,7 @@ impl<'a, Entry> WqeCore<'a, Entry> {
     }
 
     #[inline]
-    pub(super) fn write_inline(&mut self, data: &[u8]) {
+    pub(crate) fn write_inline(&mut self, data: &[u8]) {
         let padded_size = unsafe {
             let ptr = self.wqe_ptr.add(self.offset);
             let size = write_inline_header(ptr, data.len() as u32);
@@ -184,7 +192,7 @@ impl<'a, Entry> WqeCore<'a, Entry> {
     }
 
     #[inline]
-    pub(super) fn write_atomic_cas(&mut self, swap: u64, compare: u64) {
+    pub(crate) fn write_atomic_cas(&mut self, swap: u64, compare: u64) {
         unsafe {
             write_atomic_seg_cas(self.wqe_ptr.add(self.offset), swap, compare);
         }
@@ -193,7 +201,7 @@ impl<'a, Entry> WqeCore<'a, Entry> {
     }
 
     #[inline]
-    pub(super) fn write_atomic_fa(&mut self, add_value: u64) {
+    pub(crate) fn write_atomic_fa(&mut self, add_value: u64) {
         unsafe {
             write_atomic_seg_fa(self.wqe_ptr.add(self.offset), add_value);
         }
@@ -202,7 +210,7 @@ impl<'a, Entry> WqeCore<'a, Entry> {
     }
 
     #[inline]
-    pub(super) fn finish_internal(self) -> io::Result<WqeHandle> {
+    pub(crate) fn finish_internal(self) -> io::Result<WqeHandle> {
         let wqebb_cnt = calc_wqebb_cnt(self.offset);
         let slots_to_end = self.sq.slots_to_end();
 
@@ -689,8 +697,7 @@ impl<'a, Entry> NopWqeBuilder<'a, Entry> {
 // RQ BlueFlame Batch Builder
 // =============================================================================
 
-/// BlueFlame buffer size in bytes (256B doorbell window).
-const BLUEFLAME_BUFFER_SIZE: usize = 256;
+use crate::wqe::BLUEFLAME_BUFFER_SIZE;
 
 /// RQ WQE size in bytes (single DataSeg).
 const RQ_WQE_SIZE: usize = DATA_SEG_SIZE;
@@ -784,37 +791,16 @@ impl<'a, Entry> RqBlueflameWqeBatch<'a, Entry> {
             return; // No WQEs to submit
         }
 
-        mmio_flush_writes!();
-
-        // Update doorbell record
         unsafe {
-            std::ptr::write_volatile(
+            bf_finish_rq(
                 self.rq.dbrec,
-                (self.rq.pi.get() as u32).to_be(),
+                self.rq.pi.get() as u32,
+                self.bf_reg,
+                self.bf_size,
+                &self.bf_offset,
+                &self.buffer,
+                self.offset,
             );
-        }
-
-        udma_to_device_barrier!();
-
-        // Copy buffer to BlueFlame register
-        if self.bf_size > 0 {
-            let bf_offset = self.bf_offset.get();
-            let bf = unsafe { self.bf_reg.add(bf_offset as usize) };
-
-            let mut src = self.buffer.as_ptr();
-            let mut dst = bf;
-            let mut remaining = self.offset;
-            while remaining > 0 {
-                unsafe {
-                    mlx5_bf_copy!(dst, src);
-                    src = src.add(WQEBB_SIZE);
-                    dst = dst.add(WQEBB_SIZE);
-                }
-                remaining = remaining.saturating_sub(WQEBB_SIZE);
-            }
-
-            mmio_flush_writes!();
-            self.bf_offset.set(bf_offset ^ self.bf_size);
         }
     }
 }
@@ -875,37 +861,16 @@ impl<'a, Entry> BlueflameWqeBatch<'a, Entry> {
             return; // No WQEs to submit
         }
 
-        mmio_flush_writes!();
-
         unsafe {
-            // Update doorbell record with new PI
-            std::ptr::write_volatile(
-                self.sq.dbrec.add(1),
-                (self.sq.pi.get() as u32).to_be(),
+            bf_finish_sq(
+                self.sq.dbrec,
+                self.sq.pi.get(),
+                self.sq.bf_reg,
+                self.sq.bf_size,
+                &self.sq.bf_offset,
+                &self.buffer,
+                self.offset,
             );
-        }
-
-        udma_to_device_barrier!();
-
-        if self.sq.bf_size > 0 {
-            let bf_offset = self.sq.bf_offset.get();
-            let bf = unsafe { self.sq.bf_reg.add(bf_offset as usize) };
-
-            // Copy buffer to BlueFlame register in 64-byte chunks
-            let mut src = self.buffer.as_ptr();
-            let mut dst = bf;
-            let mut remaining = self.offset;
-            while remaining > 0 {
-                unsafe {
-                    mlx5_bf_copy!(dst, src);
-                    src = src.add(WQEBB_SIZE);
-                    dst = dst.add(WQEBB_SIZE);
-                }
-                remaining = remaining.saturating_sub(WQEBB_SIZE);
-            }
-
-            mmio_flush_writes!();
-            self.sq.bf_offset.set(bf_offset ^ self.sq.bf_size);
         }
     }
 }
@@ -1186,37 +1151,16 @@ impl<'a, Entry> RoceBlueflameWqeBatch<'a, Entry> {
             return; // No WQEs to submit
         }
 
-        mmio_flush_writes!();
-
         unsafe {
-            // Update doorbell record with new PI
-            std::ptr::write_volatile(
-                self.sq.dbrec.add(1),
-                (self.sq.pi.get() as u32).to_be(),
+            bf_finish_sq(
+                self.sq.dbrec,
+                self.sq.pi.get(),
+                self.sq.bf_reg,
+                self.sq.bf_size,
+                &self.sq.bf_offset,
+                &self.buffer,
+                self.offset,
             );
-        }
-
-        udma_to_device_barrier!();
-
-        if self.sq.bf_size > 0 {
-            let bf_offset = self.sq.bf_offset.get();
-            let bf = unsafe { self.sq.bf_reg.add(bf_offset as usize) };
-
-            // Copy buffer to BlueFlame register in 64-byte chunks
-            let mut src = self.buffer.as_ptr();
-            let mut dst = bf;
-            let mut remaining = self.offset;
-            while remaining > 0 {
-                unsafe {
-                    mlx5_bf_copy!(dst, src);
-                    src = src.add(WQEBB_SIZE);
-                    dst = dst.add(WQEBB_SIZE);
-                }
-                remaining = remaining.saturating_sub(WQEBB_SIZE);
-            }
-
-            mmio_flush_writes!();
-            self.sq.bf_offset.set(bf_offset ^ self.sq.bf_size);
         }
     }
 }

@@ -300,22 +300,288 @@ impl<'a, Q: SqState> BlueframeBatch<'a, Q> {
 }
 
 // =============================================================================
+// BlueFlame Finish Helpers
+// =============================================================================
+
+/// Copy buffer to BlueFlame register and toggle the BF offset.
+///
+/// This is the common BF copy logic shared across all BlueFlame batch finish methods.
+/// Copies `data_len` bytes from `buffer` to the BF register in WQEBB (64B) chunks,
+/// then toggles the BF offset for double-buffering.
+///
+/// # Safety
+/// - `bf_reg` must be a valid MMIO BlueFlame register pointer
+/// - `buffer` must contain at least `data_len` bytes of valid WQE data
+/// - `data_len` must be > 0
+#[inline]
+pub(crate) unsafe fn bf_copy_and_toggle(
+    bf_reg: *mut u8,
+    bf_size: u32,
+    bf_offset: &Cell<u32>,
+    buffer: &[u8],
+    data_len: usize,
+) {
+    if bf_size > 0 {
+        let offset = bf_offset.get();
+        let bf = bf_reg.add(offset as usize);
+
+        let mut src = buffer.as_ptr();
+        let mut dst = bf;
+        let mut remaining = data_len;
+        while remaining > 0 {
+            mlx5_bf_copy!(dst, src);
+            src = src.add(WQEBB_SIZE);
+            dst = dst.add(WQEBB_SIZE);
+            remaining = remaining.saturating_sub(WQEBB_SIZE);
+        }
+
+        mmio_flush_writes!();
+        bf_offset.set(offset ^ bf_size);
+    }
+}
+
+/// SQ BlueFlame batch finish: update dbrec[1] with PI, then copy buffer to BF register.
+///
+/// Common finish logic for all SQ BlueFlame batch types (RC, DCI, UD).
+///
+/// # Safety
+/// - `dbrec` must point to a valid doorbell record (at least 2 u32 entries)
+/// - `bf_reg` must be a valid MMIO BlueFlame register pointer
+/// - `buffer` must contain at least `data_len` bytes of valid WQE data
+#[inline]
+#[allow(dead_code)]
+pub(crate) unsafe fn bf_finish_sq(
+    dbrec: *mut u32,
+    pi: u16,
+    bf_reg: *mut u8,
+    bf_size: u32,
+    bf_offset: &Cell<u32>,
+    buffer: &[u8],
+    data_len: usize,
+) {
+    mmio_flush_writes!();
+
+    std::ptr::write_volatile(dbrec.add(1), (pi as u32).to_be());
+
+    udma_to_device_barrier!();
+
+    bf_copy_and_toggle(bf_reg, bf_size, bf_offset, buffer, data_len);
+}
+
+/// RQ BlueFlame batch finish: update dbrec[0] with PI (as u32), then copy buffer to BF register.
+///
+/// Common finish logic for all RQ BlueFlame batch types.
+///
+/// # Safety
+/// - `dbrec` must point to a valid doorbell record
+/// - `bf_reg` must be a valid MMIO BlueFlame register pointer
+/// - `buffer` must contain at least `data_len` bytes of valid WQE data
+#[inline]
+pub(crate) unsafe fn bf_finish_rq(
+    dbrec: *mut u32,
+    pi: u32,
+    bf_reg: *mut u8,
+    bf_size: u32,
+    bf_offset: &Cell<u32>,
+    buffer: &[u8],
+    data_len: usize,
+) {
+    mmio_flush_writes!();
+
+    std::ptr::write_volatile(dbrec, pi.to_be());
+
+    udma_to_device_barrier!();
+
+    bf_copy_and_toggle(bf_reg, bf_size, bf_offset, buffer, data_len);
+}
+
+// =============================================================================
 // SQ Capability Trait
 // =============================================================================
 
-/// Marker trait for Send Queue capabilities.
+// =============================================================================
+// Unified Send Queue State
+// =============================================================================
+
+use std::marker::PhantomData;
+
+/// Unified Send Queue state shared across all QP types (RC, UD, DCI, TM-SRQ cmd QP).
 ///
-/// Different QP types (RC, UD, DCI) have different capabilities regarding
-/// which operations they support and whether an Address Vector is required.
-pub trait SqCapability {
-    /// Whether this SQ type requires an Address Vector for all operations.
-    const REQUIRES_AV: bool;
-    /// Whether this SQ type supports SEND operations.
-    const SUPPORTS_SEND: bool;
-    /// Whether this SQ type supports RDMA WRITE/READ operations.
-    const SUPPORTS_RDMA: bool;
-    /// Whether this SQ type supports Atomic operations.
-    const SUPPORTS_ATOMIC: bool;
+/// Generic over the entry type `Entry` and table type `TableType`.
+/// Uses interior mutability (Cell) so no RefCell wrapper is needed.
+pub(crate) struct SendQueueState<Entry, TableType> {
+    /// SQ buffer base address.
+    pub(crate) buf: *mut u8,
+    /// Number of WQEBBs (64-byte blocks, power of 2).
+    pub(crate) wqe_cnt: u16,
+    /// SQ number (QPN for RC/UD, SQN for DCI, QPN for TM cmd QP).
+    pub(crate) sqn: u32,
+    /// Producer index (next WQE slot).
+    pub(crate) pi: Cell<u16>,
+    /// Consumer index (last completed WQE).
+    pub(crate) ci: Cell<u16>,
+    /// Last posted WQE pointer and size (for BlueFlame).
+    pub(crate) last_wqe: Cell<Option<(*mut u8, usize)>>,
+    /// Doorbell record pointer.
+    pub(crate) dbrec: *mut u32,
+    /// BlueFlame register pointer.
+    pub(crate) bf_reg: *mut u8,
+    /// BlueFlame size (64 or 0 if not available).
+    pub(crate) bf_size: u32,
+    /// Current BlueFlame offset (alternates between 0 and bf_size).
+    pub(crate) bf_offset: Cell<u32>,
+    /// WQE table for tracking in-flight operations.
+    pub(crate) table: TableType,
+    /// Phantom for entry type.
+    pub(crate) _marker: PhantomData<Entry>,
+}
+
+impl<Entry, TableType> SendQueueState<Entry, TableType> {
+    /// Get the number of available WQEBBs.
+    #[inline]
+    pub(crate) fn available(&self) -> u16 {
+        self.wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
+    }
+
+    /// Ring the doorbell with minimum 8-byte BlueFlame write.
+    ///
+    /// Updates DBREC and writes minimum 8 bytes (Control Segment) to BlueFlame register.
+    /// The NIC fetches remaining WQE data via DMA.
+    #[inline]
+    pub(crate) fn ring_doorbell(&self) {
+        let Some((last_wqe_ptr, _wqe_size)) = self.last_wqe.take() else {
+            return;
+        };
+
+        mmio_flush_writes!();
+
+        unsafe {
+            std::ptr::write_volatile(self.dbrec.add(1), (self.pi.get() as u32).to_be());
+        }
+
+        udma_to_device_barrier!();
+
+        self.ring_db(last_wqe_ptr);
+    }
+
+    /// Ring the doorbell with BlueFlame write of entire WQE.
+    ///
+    /// Copies the last WQE (up to bf_size bytes) to the BlueFlame register
+    /// using non-temporal (streaming) stores.
+    #[inline]
+    pub(crate) fn ring_doorbell_bf(&self) {
+        let Some((last_wqe_ptr, wqe_size)) = self.last_wqe.take() else {
+            return;
+        };
+
+        mmio_flush_writes!();
+
+        unsafe {
+            std::ptr::write_volatile(self.dbrec.add(1), (self.pi.get() as u32).to_be());
+        }
+
+        udma_to_device_barrier!();
+
+        let bf_offset = self.bf_offset.get();
+        let mut bf = unsafe { self.bf_reg.add(bf_offset as usize) };
+        let mut src = last_wqe_ptr;
+        let copy_size = wqe_size.min(self.bf_size as usize);
+        let mut remaining = copy_size;
+
+        while remaining > 0 {
+            unsafe {
+                mlx5_bf_copy!(bf, src);
+                src = src.add(WQEBB_SIZE);
+                bf = bf.add(WQEBB_SIZE);
+            }
+            remaining = remaining.saturating_sub(WQEBB_SIZE);
+        }
+
+        mmio_flush_writes!();
+        self.bf_offset.set(bf_offset ^ self.bf_size);
+    }
+
+    /// Write 8-byte doorbell to BF register (minimum BF write).
+    #[inline]
+    fn ring_db(&self, wqe_ptr: *mut u8) {
+        let bf = unsafe { self.bf_reg.add(self.bf_offset.get() as usize) as *mut u64 };
+        let ctrl = wqe_ptr as *const u64;
+        unsafe {
+            std::ptr::write_volatile(bf, *ctrl);
+        }
+        mmio_flush_writes!();
+        self.bf_offset.set(self.bf_offset.get() ^ self.bf_size);
+    }
+}
+
+impl<Entry> SendQueueState<Entry, OrderedWqeTable<Entry>> {
+    /// Process a single completion, updating CI from the stored ci_delta.
+    #[inline]
+    pub(crate) fn process_completion(&self, wqe_idx: u16) -> Option<Entry> {
+        let entry = self.table.take(wqe_idx)?;
+        self.ci.set(entry.ci_delta);
+        Some(entry.data)
+    }
+}
+
+/// SqState implementation for the unified SendQueueState.
+impl<Entry> SqState for SendQueueState<Entry, OrderedWqeTable<Entry>> {
+    type Entry = Entry;
+
+    #[inline]
+    fn sq_buf(&self) -> *mut u8 {
+        self.buf
+    }
+
+    #[inline]
+    fn wqe_cnt(&self) -> u16 {
+        self.wqe_cnt
+    }
+
+    #[inline]
+    fn sqn(&self) -> u32 {
+        self.sqn
+    }
+
+    #[inline]
+    fn pi(&self) -> &Cell<u16> {
+        &self.pi
+    }
+
+    #[inline]
+    fn ci(&self) -> &Cell<u16> {
+        &self.ci
+    }
+
+    #[inline]
+    fn last_wqe(&self) -> &Cell<Option<(*mut u8, usize)>> {
+        &self.last_wqe
+    }
+
+    #[inline]
+    fn table(&self) -> &OrderedWqeTable<Entry> {
+        &self.table
+    }
+
+    #[inline]
+    fn dbrec(&self) -> *mut u32 {
+        self.dbrec
+    }
+
+    #[inline]
+    fn bf_reg(&self) -> *mut u8 {
+        self.bf_reg
+    }
+
+    #[inline]
+    fn bf_size(&self) -> u32 {
+        self.bf_size
+    }
+
+    #[inline]
+    fn bf_offset(&self) -> &Cell<u32> {
+        &self.bf_offset
+    }
 }
 
 // =============================================================================
@@ -2092,166 +2358,8 @@ impl<'a> DcAvRoCE<'a> {
     }
 }
 
-// =============================================================================
-// DCI EmitContext
-// =============================================================================
-
-/// Context for DCI WQE emission.
-///
-/// DCI requires Address Vector (AV) for all operations.
-pub struct DciEmitContext<'a, Entry> {
-    /// SQ buffer base address
-    pub buf: *mut u8,
-    /// Number of WQEBBs (mask = wqe_cnt - 1)
-    pub wqe_cnt: u16,
-    /// SQ number
-    pub sqn: u32,
-    /// Producer index (next WQE slot)
-    pub pi: &'a Cell<u16>,
-    /// Consumer index (last completed WQE)
-    pub ci: &'a Cell<u16>,
-    /// Last posted WQE pointer and size
-    pub last_wqe: &'a Cell<Option<(*mut u8, usize)>>,
-    /// WQE table for entry storage
-    pub table: &'a OrderedWqeTable<Entry>,
-}
-
-impl<'a, Entry> DciEmitContext<'a, Entry> {
-    /// Get the number of available WQEBBs.
-    #[inline]
-    pub fn available(&self) -> u16 {
-        self.wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
-    }
-
-    /// Get pointer to WQE at given index.
-    #[inline]
-    pub fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
-        let offset = ((idx & (self.wqe_cnt - 1)) as usize) * WQEBB_SIZE;
-        unsafe { self.buf.add(offset) }
-    }
-
-    /// Get the number of slots from PI to the end of ring buffer.
-    #[inline]
-    pub fn slots_to_end(&self) -> u16 {
-        self.wqe_cnt - (self.pi.get() & (self.wqe_cnt - 1))
-    }
-
-    /// Advance the producer index.
-    #[inline]
-    pub fn advance_pi(&self, count: u16) {
-        self.pi.set(self.pi.get().wrapping_add(count));
-    }
-
-    /// Set last WQE info for doorbell.
-    #[inline]
-    pub fn set_last_wqe(&self, ptr: *mut u8, size: usize) {
-        self.last_wqe.set(Some((ptr, size)));
-    }
-
-    /// Post a NOP WQE to fill remaining slots.
-    ///
-    /// # Safety
-    /// Caller must ensure there are enough available slots.
-    #[inline]
-    pub unsafe fn post_nop(&self, nop_wqebb_cnt: u16) {
-        let wqe_idx = self.pi.get();
-        let wqe_ptr = self.get_wqe_ptr(wqe_idx);
-        write_nop_wqe(wqe_ptr, wqe_idx, self.sqn, nop_wqebb_cnt);
-        self.advance_pi(nop_wqebb_cnt);
-        self.set_last_wqe(wqe_ptr, (nop_wqebb_cnt as usize) * WQEBB_SIZE);
-    }
-
-    // SqState-compatible accessors
-    #[inline]
-    pub fn pi(&self) -> &Cell<u16> {
-        self.pi
-    }
-
-    #[inline]
-    pub fn ci(&self) -> &Cell<u16> {
-        self.ci
-    }
-
-    #[inline]
-    pub fn sqn(&self) -> u32 {
-        self.sqn
-    }
-
-    #[inline]
-    pub fn wqe_cnt(&self) -> u16 {
-        self.wqe_cnt
-    }
-
-    #[inline]
-    pub fn sq_buf(&self) -> *mut u8 {
-        self.buf
-    }
-
-    #[inline]
-    pub fn last_wqe(&self) -> &Cell<Option<(*mut u8, usize)>> {
-        self.last_wqe
-    }
-
-    #[inline]
-    pub fn table(&self) -> &OrderedWqeTable<Entry> {
-        self.table
-    }
-}
-
-impl<'a, Entry> SqState for DciEmitContext<'a, Entry> {
-    type Entry = Entry;
-
-    #[inline]
-    fn sq_buf(&self) -> *mut u8 {
-        self.buf
-    }
-
-    #[inline]
-    fn wqe_cnt(&self) -> u16 {
-        self.wqe_cnt
-    }
-
-    #[inline]
-    fn sqn(&self) -> u32 {
-        self.sqn
-    }
-
-    #[inline]
-    fn pi(&self) -> &Cell<u16> {
-        self.pi
-    }
-
-    #[inline]
-    fn ci(&self) -> &Cell<u16> {
-        self.ci
-    }
-
-    #[inline]
-    fn last_wqe(&self) -> &Cell<Option<(*mut u8, usize)>> {
-        self.last_wqe
-    }
-
-    #[inline]
-    fn table(&self) -> &OrderedWqeTable<Self::Entry> {
-        self.table
-    }
-
-    fn dbrec(&self) -> *mut u32 {
-        panic!("DciEmitContext does not support BlueFlame doorbell; use DCI directly")
-    }
-
-    fn bf_reg(&self) -> *mut u8 {
-        panic!("DciEmitContext does not support BlueFlame register; use DCI directly")
-    }
-
-    fn bf_size(&self) -> u32 {
-        panic!("DciEmitContext does not support BlueFlame; use DCI directly")
-    }
-
-    fn bf_offset(&self) -> &Cell<u32> {
-        panic!("DciEmitContext does not support BlueFlame; use DCI directly")
-    }
-}
+/// Type alias for DCI EmitContext (identical to EmitContext).
+pub type DciEmitContext<'a, Entry> = EmitContext<'a, Entry>;
 
 // =============================================================================
 // DCI WRITE WQE Emission
@@ -2540,166 +2648,8 @@ pub unsafe fn write_ud_address_vector_ib(ptr: *mut u8, av: &UdAvIb) {
     std::ptr::write_bytes(ptr.add(16), 0, 32);
 }
 
-// =============================================================================
-// UD EmitContext
-// =============================================================================
-
-/// Context for UD WQE emission.
-///
-/// UD requires Address Vector (AV) for all operations and only supports SEND.
-pub struct UdEmitContext<'a, Entry> {
-    /// SQ buffer base address
-    pub buf: *mut u8,
-    /// Number of WQEBBs (mask = wqe_cnt - 1)
-    pub wqe_cnt: u16,
-    /// SQ number
-    pub sqn: u32,
-    /// Producer index (next WQE slot)
-    pub pi: &'a Cell<u16>,
-    /// Consumer index (last completed WQE)
-    pub ci: &'a Cell<u16>,
-    /// Last posted WQE pointer and size
-    pub last_wqe: &'a Cell<Option<(*mut u8, usize)>>,
-    /// WQE table for entry storage
-    pub table: &'a OrderedWqeTable<Entry>,
-}
-
-impl<'a, Entry> UdEmitContext<'a, Entry> {
-    /// Get the number of available WQEBBs.
-    #[inline]
-    pub fn available(&self) -> u16 {
-        self.wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
-    }
-
-    /// Get pointer to WQE at given index.
-    #[inline]
-    pub fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
-        let offset = ((idx & (self.wqe_cnt - 1)) as usize) * WQEBB_SIZE;
-        unsafe { self.buf.add(offset) }
-    }
-
-    /// Get the number of slots from PI to the end of ring buffer.
-    #[inline]
-    pub fn slots_to_end(&self) -> u16 {
-        self.wqe_cnt - (self.pi.get() & (self.wqe_cnt - 1))
-    }
-
-    /// Advance the producer index.
-    #[inline]
-    pub fn advance_pi(&self, count: u16) {
-        self.pi.set(self.pi.get().wrapping_add(count));
-    }
-
-    /// Set last WQE info for doorbell.
-    #[inline]
-    pub fn set_last_wqe(&self, ptr: *mut u8, size: usize) {
-        self.last_wqe.set(Some((ptr, size)));
-    }
-
-    /// Post a NOP WQE to fill remaining slots.
-    ///
-    /// # Safety
-    /// Caller must ensure there are enough available slots.
-    #[inline]
-    pub unsafe fn post_nop(&self, nop_wqebb_cnt: u16) {
-        let wqe_idx = self.pi.get();
-        let wqe_ptr = self.get_wqe_ptr(wqe_idx);
-        write_nop_wqe(wqe_ptr, wqe_idx, self.sqn, nop_wqebb_cnt);
-        self.advance_pi(nop_wqebb_cnt);
-        self.set_last_wqe(wqe_ptr, (nop_wqebb_cnt as usize) * WQEBB_SIZE);
-    }
-
-    // SqState-compatible accessors
-    #[inline]
-    pub fn pi(&self) -> &Cell<u16> {
-        self.pi
-    }
-
-    #[inline]
-    pub fn ci(&self) -> &Cell<u16> {
-        self.ci
-    }
-
-    #[inline]
-    pub fn sqn(&self) -> u32 {
-        self.sqn
-    }
-
-    #[inline]
-    pub fn wqe_cnt(&self) -> u16 {
-        self.wqe_cnt
-    }
-
-    #[inline]
-    pub fn sq_buf(&self) -> *mut u8 {
-        self.buf
-    }
-
-    #[inline]
-    pub fn last_wqe(&self) -> &Cell<Option<(*mut u8, usize)>> {
-        self.last_wqe
-    }
-
-    #[inline]
-    pub fn table(&self) -> &OrderedWqeTable<Entry> {
-        self.table
-    }
-}
-
-impl<'a, Entry> SqState for UdEmitContext<'a, Entry> {
-    type Entry = Entry;
-
-    #[inline]
-    fn sq_buf(&self) -> *mut u8 {
-        self.buf
-    }
-
-    #[inline]
-    fn wqe_cnt(&self) -> u16 {
-        self.wqe_cnt
-    }
-
-    #[inline]
-    fn sqn(&self) -> u32 {
-        self.sqn
-    }
-
-    #[inline]
-    fn pi(&self) -> &Cell<u16> {
-        self.pi
-    }
-
-    #[inline]
-    fn ci(&self) -> &Cell<u16> {
-        self.ci
-    }
-
-    #[inline]
-    fn last_wqe(&self) -> &Cell<Option<(*mut u8, usize)>> {
-        self.last_wqe
-    }
-
-    #[inline]
-    fn table(&self) -> &OrderedWqeTable<Self::Entry> {
-        self.table
-    }
-
-    fn dbrec(&self) -> *mut u32 {
-        panic!("UdEmitContext does not support BlueFlame doorbell; use UdQp directly")
-    }
-
-    fn bf_reg(&self) -> *mut u8 {
-        panic!("UdEmitContext does not support BlueFlame register; use UdQp directly")
-    }
-
-    fn bf_size(&self) -> u32 {
-        panic!("UdEmitContext does not support BlueFlame; use UdQp directly")
-    }
-
-    fn bf_offset(&self) -> &Cell<u32> {
-        panic!("UdEmitContext does not support BlueFlame; use UdQp directly")
-    }
-}
+/// Type alias for UD EmitContext (identical to EmitContext).
+pub type UdEmitContext<'a, Entry> = EmitContext<'a, Entry>;
 
 // =============================================================================
 // UD SEND WQE Wrap-around Helper (Direct Parameters)
@@ -2777,142 +2727,8 @@ pub fn emit_ud_send_wrap<'a, Entry>(
     })
 }
 
-// =============================================================================
-// TM-SRQ Command QP EmitContext
-// =============================================================================
-
-/// Context for TM-SRQ Command QP WQE emission.
-///
-/// TM-SRQ uses a Command QP for tag operations (TAG_ADD/TAG_DEL).
-pub struct TmCmdEmitContext<'a, Entry> {
-    /// SQ buffer base address
-    pub buf: *mut u8,
-    /// Number of WQEBBs (mask = wqe_cnt - 1)
-    pub wqe_cnt: u16,
-    /// QP number
-    pub qpn: u32,
-    /// Producer index (next WQE slot)
-    pub pi: &'a Cell<u16>,
-    /// Consumer index (last completed WQE)
-    pub ci: &'a Cell<u16>,
-    /// Last posted WQE pointer and size
-    pub last_wqe: &'a Cell<Option<(*mut u8, usize)>>,
-    /// WQE table for entry storage
-    pub table: &'a OrderedWqeTable<Entry>,
-}
-
-impl<'a, Entry> TmCmdEmitContext<'a, Entry> {
-    /// Get the number of available WQEBBs.
-    #[inline]
-    pub fn available(&self) -> u16 {
-        self.wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
-    }
-
-    /// Get pointer to WQE at given index.
-    #[inline]
-    pub fn get_wqe_ptr(&self, idx: u16) -> *mut u8 {
-        let offset = ((idx & (self.wqe_cnt - 1)) as usize) * WQEBB_SIZE;
-        unsafe { self.buf.add(offset) }
-    }
-
-    /// Advance the producer index.
-    #[inline]
-    pub fn advance_pi(&self, count: u16) {
-        self.pi.set(self.pi.get().wrapping_add(count));
-    }
-
-    /// Set last WQE info for doorbell.
-    #[inline]
-    pub fn set_last_wqe(&self, ptr: *mut u8, size: usize) {
-        self.last_wqe.set(Some((ptr, size)));
-    }
-
-    // SqState-compatible accessors
-    #[inline]
-    pub fn pi(&self) -> &Cell<u16> {
-        self.pi
-    }
-
-    #[inline]
-    pub fn ci(&self) -> &Cell<u16> {
-        self.ci
-    }
-
-    #[inline]
-    pub fn wqe_cnt(&self) -> u16 {
-        self.wqe_cnt
-    }
-
-    #[inline]
-    pub fn sq_buf(&self) -> *mut u8 {
-        self.buf
-    }
-
-    #[inline]
-    pub fn last_wqe(&self) -> &Cell<Option<(*mut u8, usize)>> {
-        self.last_wqe
-    }
-
-    #[inline]
-    pub fn table(&self) -> &OrderedWqeTable<Entry> {
-        self.table
-    }
-}
-
-impl<'a, Entry> SqState for TmCmdEmitContext<'a, Entry> {
-    type Entry = Entry;
-
-    #[inline]
-    fn sq_buf(&self) -> *mut u8 {
-        self.buf
-    }
-
-    #[inline]
-    fn wqe_cnt(&self) -> u16 {
-        self.wqe_cnt
-    }
-
-    #[inline]
-    fn sqn(&self) -> u32 {
-        self.qpn
-    }
-
-    #[inline]
-    fn pi(&self) -> &Cell<u16> {
-        self.pi
-    }
-
-    #[inline]
-    fn ci(&self) -> &Cell<u16> {
-        self.ci
-    }
-
-    #[inline]
-    fn last_wqe(&self) -> &Cell<Option<(*mut u8, usize)>> {
-        self.last_wqe
-    }
-
-    #[inline]
-    fn table(&self) -> &OrderedWqeTable<Self::Entry> {
-        self.table
-    }
-
-    fn dbrec(&self) -> *mut u32 {
-        panic!("TmCmdEmitContext does not support BlueFlame doorbell; use TmSrq directly")
-    }
-
-    fn bf_reg(&self) -> *mut u8 {
-        panic!("TmCmdEmitContext does not support BlueFlame register; use TmSrq directly")
-    }
-
-    fn bf_size(&self) -> u32 {
-        panic!("TmCmdEmitContext does not support BlueFlame; use TmSrq directly")
-    }
-
-    fn bf_offset(&self) -> &Cell<u32> {
-        panic!("TmCmdEmitContext does not support BlueFlame; use TmSrq directly")
-    }
-}
+/// Type alias for TM-SRQ Command QP EmitContext (identical to EmitContext).
+pub type TmCmdEmitContext<'a, Entry> = EmitContext<'a, Entry>;
 
 // =============================================================================
 // emit_tm_wqe! Macro (Direct Expansion Version)
@@ -2979,7 +2795,7 @@ macro_rules! emit_tm_wqe {
                     opmod: 0,
                     opcode: $crate::wqe::WqeOpcode::TagMatching as u8,
                     wqe_idx,
-                    qpn: ctx.qpn,
+                    qpn: ctx.sqn,
                     ds_cnt: (WQE_SIZE / 16) as u8,
                     flags: $crate::wqe::WqeFlags::COMPLETION,
                     imm: 0,
@@ -3036,7 +2852,7 @@ macro_rules! emit_tm_wqe {
                     opmod: 0,
                     opcode: $crate::wqe::WqeOpcode::TagMatching as u8,
                     wqe_idx,
-                    qpn: ctx.qpn,
+                    qpn: ctx.sqn,
                     ds_cnt: (WQE_SIZE / 16) as u8,
                     flags: $crate::wqe::WqeFlags::COMPLETION,
                     imm: 0,
@@ -3089,7 +2905,7 @@ macro_rules! emit_tm_wqe {
                     opmod: 0,
                     opcode: $crate::wqe::WqeOpcode::TagMatching as u8,
                     wqe_idx,
-                    qpn: ctx.qpn,
+                    qpn: ctx.sqn,
                     ds_cnt: (WQE_SIZE / 16) as u8,
                     flags: $crate::wqe::WqeFlags::COMPLETION,
                     imm: 0,
@@ -3135,7 +2951,7 @@ macro_rules! emit_tm_wqe {
                     opmod: 0,
                     opcode: $crate::wqe::WqeOpcode::TagMatching as u8,
                     wqe_idx,
-                    qpn: ctx.qpn,
+                    qpn: ctx.sqn,
                     ds_cnt: (WQE_SIZE / 16) as u8,
                     flags: $crate::wqe::WqeFlags::COMPLETION,
                     imm: 0,

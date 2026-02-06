@@ -20,8 +20,8 @@ use crate::qp::QpInfo;
 use crate::srq::Srq;
 use crate::transport::IbRemoteDctInfo;
 use crate::wqe::{
-    InfiniBand, OrderedWqeTable, RoCE, WQEBB_SIZE,
-    emit::{DciEmitContext, SqCapability, SqState},
+    InfiniBand, OrderedWqeTable, RoCE,
+    emit::{DciEmitContext, SendQueueState},
 };
 
 /// DCI configuration.
@@ -66,194 +66,9 @@ pub enum DcQpState {
 // DCI Send Queue State
 // =============================================================================
 
-/// Send Queue state for DCI.
-///
-/// Generic over the table type `TableType` which determines dense vs sparse behavior.
-/// Both table types use interior mutability (Cell) so no RefCell wrapper is needed.
-pub(super) struct DciSendQueueState<Entry, TableType> {
-    pub(super) buf: *mut u8,
-    pub(super) wqe_cnt: u16,
-    pub(super) sqn: u32,
-    pub(super) pi: Cell<u16>,
-    pub(super) ci: Cell<u16>,
-    pub(super) last_wqe: Cell<Option<(*mut u8, usize)>>,
-    pub(super) dbrec: *mut u32,
-    pub(super) bf_reg: *mut u8,
-    pub(super) bf_size: u32,
-    pub(super) bf_offset: Cell<u32>,
-    /// WQE table for tracking in-flight operations.
-    /// Uses interior mutability (Cell<Option<Entry>>) so no RefCell needed.
-    pub(super) table: TableType,
-    _marker: PhantomData<Entry>,
-}
-
-impl<Entry, TableType> DciSendQueueState<Entry, TableType> {
-    pub(super) fn available(&self) -> u16 {
-        self.wqe_cnt - self.pi.get().wrapping_sub(self.ci.get())
-    }
-
-    /// Ring the doorbell with minimum 8-byte BlueFlame write.
-    ///
-    /// Updates DBREC and writes minimum 8 bytes (Control Segment) to BlueFlame register.
-    /// The NIC fetches remaining WQE data via DMA.
-    fn ring_doorbell(&self) {
-        let Some((last_wqe_ptr, _wqe_size)) = self.last_wqe.take() else {
-            return;
-        };
-
-        mmio_flush_writes!();
-
-        unsafe {
-            std::ptr::write_volatile(self.dbrec.add(1), (self.pi.get() as u32).to_be());
-        }
-
-        udma_to_device_barrier!();
-
-        self.ring_db(last_wqe_ptr);
-    }
-
-    /// Ring the doorbell with BlueFlame write of entire WQE.
-    ///
-    /// Copies the last WQE (up to bf_size bytes) to the BlueFlame register
-    /// using non-temporal (streaming) stores.
-    /// For WQEs larger than bf_size, only the first bf_size bytes are copied via BF,
-    /// and the NIC reads the rest from host memory.
-    fn ring_doorbell_bf(&self) {
-        let Some((last_wqe_ptr, wqe_size)) = self.last_wqe.take() else {
-            return;
-        };
-
-        mmio_flush_writes!();
-
-        unsafe {
-            std::ptr::write_volatile(self.dbrec.add(1), (self.pi.get() as u32).to_be());
-        }
-
-        udma_to_device_barrier!();
-
-        // Copy WQE to BF register using non-temporal stores (64 bytes at a time)
-        let bf_offset = self.bf_offset.get();
-        let mut bf = unsafe { self.bf_reg.add(bf_offset as usize) };
-        let mut src = last_wqe_ptr;
-        let copy_size = wqe_size.min(self.bf_size as usize);
-        let mut remaining = copy_size;
-
-        while remaining > 0 {
-            unsafe {
-                mlx5_bf_copy!(bf, src);
-                src = src.add(WQEBB_SIZE);
-                bf = bf.add(WQEBB_SIZE);
-            }
-            remaining = remaining.saturating_sub(WQEBB_SIZE);
-        }
-
-        mmio_flush_writes!();
-        self.bf_offset.set(bf_offset ^ self.bf_size);
-    }
-
-    fn ring_db(&self, wqe_ptr: *mut u8) {
-        let bf = unsafe { self.bf_reg.add(self.bf_offset.get() as usize) as *mut u64 };
-        let ctrl = wqe_ptr as *const u64;
-        unsafe {
-            std::ptr::write_volatile(bf, *ctrl);
-        }
-        mmio_flush_writes!();
-        self.bf_offset.set(self.bf_offset.get() ^ self.bf_size);
-    }
-}
-
-impl<Entry> DciSendQueueState<Entry, OrderedWqeTable<Entry>> {
-    fn process_completion(&self, wqe_idx: u16) -> Option<Entry> {
-        let entry = self.table.take(wqe_idx)?;
-        // ci_delta is the accumulated PI value at completion
-        self.ci.set(entry.ci_delta);
-        Some(entry.data)
-    }
-
-    /// Get a DciEmitContext for macro-based WQE emission.
-    #[inline]
-    pub(crate) fn emit_ctx(&self) -> DciEmitContext<'_, Entry> {
-        DciEmitContext {
-            buf: self.buf,
-            wqe_cnt: self.wqe_cnt,
-            sqn: self.sqn,
-            pi: &self.pi,
-            ci: &self.ci,
-            last_wqe: &self.last_wqe,
-            table: &self.table,
-        }
-    }
-}
-
-/// DCI Send Queue capability.
-///
-/// DCIはAV必須で、SEND/WRITE/READ/Atomicを全てサポート。
-impl<Entry> SqCapability for DciSendQueueState<Entry, OrderedWqeTable<Entry>> {
-    const REQUIRES_AV: bool = true;
-    const SUPPORTS_SEND: bool = true;
-    const SUPPORTS_RDMA: bool = true;
-    const SUPPORTS_ATOMIC: bool = true;
-}
-
-/// SqState implementation for DciSendQueueState.
-impl<Entry> SqState for DciSendQueueState<Entry, OrderedWqeTable<Entry>> {
-    type Entry = Entry;
-
-    #[inline]
-    fn sq_buf(&self) -> *mut u8 {
-        self.buf
-    }
-
-    #[inline]
-    fn wqe_cnt(&self) -> u16 {
-        self.wqe_cnt
-    }
-
-    #[inline]
-    fn sqn(&self) -> u32 {
-        self.sqn
-    }
-
-    #[inline]
-    fn pi(&self) -> &Cell<u16> {
-        &self.pi
-    }
-
-    #[inline]
-    fn ci(&self) -> &Cell<u16> {
-        &self.ci
-    }
-
-    #[inline]
-    fn last_wqe(&self) -> &Cell<Option<(*mut u8, usize)>> {
-        &self.last_wqe
-    }
-
-    #[inline]
-    fn table(&self) -> &OrderedWqeTable<Entry> {
-        &self.table
-    }
-
-    #[inline]
-    fn dbrec(&self) -> *mut u32 {
-        self.dbrec
-    }
-
-    #[inline]
-    fn bf_reg(&self) -> *mut u8 {
-        self.bf_reg
-    }
-
-    #[inline]
-    fn bf_size(&self) -> u32 {
-        self.bf_size
-    }
-
-    #[inline]
-    fn bf_offset(&self) -> &Cell<u32> {
-        &self.bf_offset
-    }
-}
+// DciSendQueueState is now the unified SendQueueState from crate::wqe::emit.
+// Type alias for backward compatibility.
+pub(super) type DciSendQueueState<Entry, TableType> = SendQueueState<Entry, TableType>;
 
 // =============================================================================
 // DCI
@@ -702,7 +517,15 @@ impl<Entry, OnComplete> DciWithTable<Entry, OnComplete> {
     pub fn emit_ctx(&self) -> io::Result<DciEmitContext<'_, Entry>> {
         let sq = self.sq.as_ref()
             .ok_or_else(|| io::Error::other("direct access not initialized"))?;
-        Ok(sq.emit_ctx())
+        Ok(DciEmitContext {
+            buf: sq.buf,
+            wqe_cnt: sq.wqe_cnt,
+            sqn: sq.sqn,
+            pi: &sq.pi,
+            ci: &sq.ci,
+            last_wqe: &sq.last_wqe,
+            table: &sq.table,
+        })
     }
 }
 
