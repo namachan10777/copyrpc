@@ -190,7 +190,7 @@ fn open_mlx5_device() -> Option<Context> {
 struct TestContext {
     ctx: Context,
     pd: Pd,
-    port_attr: PortAttr,
+    _port_attr: PortAttr,
     port: u8,
 }
 
@@ -205,7 +205,7 @@ impl TestContext {
             ctx,
             pd,
             port,
-            port_attr,
+            _port_attr: port_attr,
         })
     }
 }
@@ -321,17 +321,14 @@ fn server_thread_main(
     };
 
     let mut server = match RpcServer::new(&pd, server_config) {
-        Ok(s) => s,
+        Ok(s) => s.with_handler(|_rpc_type: u16, payload: &[u8], response_buf: &mut [u8]| {
+            // Echo back the payload (zero-copy)
+            let len = payload.len().min(response_buf.len());
+            response_buf[..len].copy_from_slice(&payload[..len]);
+            (0, len)
+        }),
         Err(_) => return,
     };
-
-    // Echo handler (zero-copy)
-    server.set_handler(|_rpc_type, payload, response_buf| {
-        // Echo back the payload (zero-copy)
-        let len = payload.len().min(response_buf.len());
-        response_buf[..len].copy_from_slice(&payload[..len]);
-        (0, len)
-    });
 
     let conn_id = match server.add_connection(&ctx, &pd, port) {
         Ok(c) => c,
@@ -418,12 +415,9 @@ fn run_throughput_bench(
 
     // Initial fill (using call_async for pipelining)
     for _ in 0..pipeline_depth.min(iters as usize) {
-        match client.call_async(conn_id, 1, &request_data) {
-            Ok(p) => {
-                pending_requests.push(p);
-                sent += 1;
-            }
-            Err(_) => {}
+        if let Ok(p) = client.call_async(conn_id, 1, &request_data) {
+            pending_requests.push(p);
+            sent += 1;
         }
     }
 
@@ -447,12 +441,9 @@ fn run_throughput_bench(
 
                 // Send new request
                 if sent < iters {
-                    match client.call_async(conn_id, 1, &request_data) {
-                        Ok(p) => {
-                            pending_requests.push(p);
-                            sent += 1;
-                        }
-                        Err(_) => {}
+                    if let Ok(p) = client.call_async(conn_id, 1, &request_data) {
+                        pending_requests.push(p);
+                        sent += 1;
                     }
                 }
             } else {
@@ -671,16 +662,13 @@ fn multi_qp_server_thread_main(
     };
 
     let mut server = match RpcServer::new(&pd, server_config) {
-        Ok(s) => s,
+        Ok(s) => s.with_handler(|_rpc_type: u16, payload: &[u8], response_buf: &mut [u8]| {
+            let len = payload.len().min(response_buf.len());
+            response_buf[..len].copy_from_slice(&payload[..len]);
+            (0, len)
+        }),
         Err(_) => return,
     };
-
-    // Echo handler (zero-copy)
-    server.set_handler(|_rpc_type, payload, response_buf| {
-        let len = payload.len().min(response_buf.len());
-        response_buf[..len].copy_from_slice(&payload[..len]);
-        (0, len)
-    });
 
     // Create num_qps connections on server side
     let mut server_infos = Vec::with_capacity(num_qps);
@@ -743,12 +731,9 @@ fn run_multi_qp_throughput_bench(
     // Initial fill - distribute across QPs round-robin
     for i in 0..pipeline_depth.min(iters as usize) {
         let conn_id = conn_ids[i % num_qps];
-        match client.call_async(conn_id, 1, &request_data) {
-            Ok(p) => {
-                pending_requests.push((conn_id, p));
-                sent += 1;
-            }
-            Err(_) => {}
+        if let Ok(p) = client.call_async(conn_id, 1, &request_data) {
+            pending_requests.push((conn_id, p));
+            sent += 1;
         }
     }
 
@@ -765,12 +750,9 @@ fn run_multi_qp_throughput_bench(
 
                 if sent < iters {
                     let conn_id = conn_ids[(sent as usize) % num_qps];
-                    match client.call_async(conn_id, 1, &request_data) {
-                        Ok(p) => {
-                            pending_requests.push((conn_id, p));
-                            sent += 1;
-                        }
-                        Err(_) => {}
+                    if let Ok(p) = client.call_async(conn_id, 1, &request_data) {
+                        pending_requests.push((conn_id, p));
+                        sent += 1;
                     }
                 }
             } else {
@@ -808,7 +790,6 @@ fn bench_multi_qp_throughput(c: &mut Criterion) {
 
     let num_qps = config.num_qps;
     let pipeline_depth = config.multi_qp_pipeline_depth;
-    let group_size = config.group_size();
     let num_slots = config.multi_qp_num_slots();
 
     // Multi-QP, 32B messages

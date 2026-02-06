@@ -122,7 +122,7 @@ impl TimelyState {
         }
 
         // Apply rate limits
-        let final_rate = new_rate.max(1.0).min(1000.0); // 1-1000 Mpps
+        let final_rate = new_rate.clamp(1.0, 1000.0); // 1-1000 Mpps
         self.rate.set(final_rate);
 
         true

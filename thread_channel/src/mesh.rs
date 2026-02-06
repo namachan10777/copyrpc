@@ -16,6 +16,9 @@ use crate::mpsc::{
 use crate::serial::Serial;
 use crate::{ReceivedMessage, RecvError, SendError as CrateSendError};
 
+/// Sender matrix: `all_senders[j][i]` holds node j's sender to node i's receive queue.
+type SenderMatrix<T, M> = Vec<Vec<Option<<M as MpscChannel>::Sender<TaggedMessage<T>>>>>;
+
 #[cfg(feature = "crossbeam")]
 pub use crate::mpsc::CrossbeamMpsc;
 
@@ -197,9 +200,10 @@ pub fn create_mesh_with<T: Serial + Send, M: MpscChannel>(n: usize) -> Vec<Mesh<
 
     // Create receivers and collect senders
     let mut receivers = Vec::with_capacity(n);
-    let mut all_senders: Vec<Vec<Option<M::Sender<TaggedMessage<T>>>>> =
+    let mut all_senders: SenderMatrix<T, M> =
         (0..n).map(|_| (0..n).map(|_| None).collect()).collect();
 
+    #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         let (tx, rx) = M::channel();
         receivers.push(rx);

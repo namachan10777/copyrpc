@@ -80,11 +80,10 @@ fn open_mlx5_device() -> Option<(mlx5::device::Context, u8, PortAttr)> {
     for device in device_list.iter() {
         if let Ok(ctx) = device.open() {
             for port in 1..=2u8 {
-                if let Ok(port_attr) = ctx.query_port(port) {
-                    if port_attr.state == mlx5::types::PortState::Active {
+                if let Ok(port_attr) = ctx.query_port(port)
+                    && port_attr.state == mlx5::types::PortState::Active {
                         return Some((ctx, port, port_attr));
                     }
-                }
             }
         }
     }
@@ -109,7 +108,7 @@ struct MultiQpBenchmarkSetup {
 
 // Shared completion counter for client callbacks
 thread_local! {
-    static COMPLETED: RefCell<u64> = RefCell::new(0);
+    static COMPLETED: RefCell<u64> = const { RefCell::new(0) };
 }
 
 fn setup_benchmark() -> Option<BenchmarkSetup> {
@@ -195,7 +194,7 @@ fn setup_benchmark() -> Option<BenchmarkSetup> {
 
 // Per-QP completion counters for multi-QP benchmark
 thread_local! {
-    static MULTI_QP_COMPLETED: RefCell<Vec<u64>> = RefCell::new(Vec::new());
+    static MULTI_QP_COMPLETED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
 }
 
 fn setup_multi_qp_benchmark(num_qps: usize, pipeline_depth: usize) -> Option<MultiQpBenchmarkSetup> {
@@ -779,7 +778,7 @@ struct MultiSessionBenchmarkSetup {
 
 // Completion counter for multi-session benchmark
 thread_local! {
-    static MULTI_SESSION_COMPLETED: RefCell<u64> = RefCell::new(0);
+    static MULTI_SESSION_COMPLETED: RefCell<u64> = const { RefCell::new(0) };
 }
 
 fn setup_multi_session_benchmark(num_sessions: usize) -> Option<MultiSessionBenchmarkSetup> {
@@ -841,11 +840,11 @@ fn setup_multi_session_benchmark(num_sessions: usize) -> Option<MultiSessionBenc
 
     // Create sessions to server
     let mut sessions = Vec::with_capacity(num_sessions);
-    for i in 0..num_sessions {
+    for server_info in &server_infos {
         let server_remote = RemoteInfo {
-            qpn: server_infos[i].qpn,
-            qkey: server_infos[i].qkey,
-            lid: server_infos[i].lid,
+            qpn: server_info.qpn,
+            qkey: server_info.qkey,
+            lid: server_info.lid,
         };
         let session = client.create_session(&server_remote).ok()?;
         sessions.push(session);
@@ -1024,7 +1023,7 @@ fn run_multi_session_throughput_bench(
     static ITER_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let iter_num = ITER_COUNT.fetch_add(1, Ordering::Relaxed);
     let stalls_this_run = client.stall_count() - baseline_stall;
-    if iter_num % 10 == 0 {
+    if iter_num.is_multiple_of(10) {
         eprintln!("DEBUG: stalls_this_run={}", stalls_this_run);
     }
 

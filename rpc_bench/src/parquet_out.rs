@@ -21,6 +21,7 @@ pub struct BenchRow {
     pub run_index: u32,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn rows_from_epochs(
     system: &str,
     mode: &str,

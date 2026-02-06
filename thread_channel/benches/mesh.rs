@@ -265,12 +265,11 @@ fn run_flux_call_reply_bench<Tr: Transport>(
                 while total_sent < total_to_send || requests_handled < expected_requests {
                     // Send calls (a few at a time)
                     for &peer in &peers {
-                        if sent_per_peer[peer] < calls {
-                            if node.call(peer, black_box(payload), ()).is_ok() {
+                        if sent_per_peer[peer] < calls
+                            && node.call(peer, black_box(payload), ()).is_ok() {
                                 sent_per_peer[peer] += 1;
                                 total_sent += 1;
                             }
-                        }
                     }
 
                     // Poll, process requests, and receive responses

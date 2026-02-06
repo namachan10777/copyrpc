@@ -397,7 +397,7 @@ impl PktHdr {
         if msg_size == 0 {
             1
         } else {
-            ((msg_size + data_per_pkt - 1) / data_per_pkt) as u16
+            msg_size.div_ceil(data_per_pkt) as u16
         }
     }
 }

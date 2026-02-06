@@ -1750,12 +1750,11 @@ where
             let qpn = qp_rc.borrow().qpn();
 
             // Register with send CQ only (recv CQ is MonoCq)
-            if let Some(send_cq) = &send_cq_for_register {
-                if let Some(cq) = send_cq.upgrade() {
+            if let Some(send_cq) = &send_cq_for_register
+                && let Some(cq) = send_cq.upgrade() {
                     let weak: Weak<RefCell<dyn CompletionTarget>> = Rc::downgrade(&(qp_rc.clone() as Rc<RefCell<dyn CompletionTarget>>));
                     cq.register_queue(qpn, weak);
                 }
-            }
 
             Ok(qp_rc)
         }

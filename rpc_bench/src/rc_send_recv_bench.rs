@@ -32,8 +32,8 @@ struct RcConnectionInfo {
 const RC_INFO_SIZE: usize = std::mem::size_of::<RcConnectionInfo>();
 
 impl RcConnectionInfo {
-    fn to_bytes(&self) -> Vec<u8> {
-        let ptr = self as *const Self as *const u8;
+    fn to_bytes(self) -> Vec<u8> {
+        let ptr = &self as *const Self as *const u8;
         unsafe { std::slice::from_raw_parts(ptr, RC_INFO_SIZE).to_vec() }
     }
 
@@ -89,8 +89,7 @@ pub fn run(
 fn open_mlx5_device(device_index: usize) -> mlx5::device::Context {
     let device_list = DeviceList::list().expect("Failed to list devices");
     let device = device_list
-        .iter()
-        .nth(device_index)
+        .get(device_index)
         .expect("Device not found");
     device.open().expect("Failed to open device")
 }
@@ -244,7 +243,7 @@ fn run_one_to_one(
                 let qp_ref = qp.borrow();
                 let emit = qp_ref.emit_ctx().expect("emit_ctx failed");
                 *send_count += 1;
-                if *send_count % SIGNAL_INTERVAL == 0 {
+                if (*send_count).is_multiple_of(SIGNAL_INTERVAL) {
                     // Signaled: on completion, all unsignaled slots before this are also done
                     emit_wqe!(&emit, send {
                         flags: WqeFlags::empty(),
@@ -453,7 +452,7 @@ fn run_one_to_one(
                     let qp_ref = qp.borrow();
                     let emit = qp_ref.emit_ctx().expect("emit_ctx failed");
                     send_count += 1;
-                    if send_count % SIGNAL_INTERVAL == 0 {
+                    if send_count.is_multiple_of(SIGNAL_INTERVAL) {
                         emit_wqe!(&emit, send {
                             flags: WqeFlags::empty(),
                             sge: { addr: send_addr(send_slot_idx), len: msg_size as u32, lkey: send_lkey },
@@ -680,7 +679,7 @@ fn run_one_to_one_threaded(
                         let qp_ref = qp.borrow();
                         let emit = qp_ref.emit_ctx().expect("emit_ctx failed");
                         *send_count += 1;
-                        if *send_count % SIGNAL_INTERVAL == 0 {
+                        if (*send_count).is_multiple_of(SIGNAL_INTERVAL) {
                             emit_wqe!(&emit, send {
                                 flags: WqeFlags::empty(),
                                 sge: { addr: send_addr(slot_idx), len: msg_size as u32, lkey: send_lkey },
@@ -835,7 +834,7 @@ fn run_one_to_one_threaded(
                             let qp_ref = qp.borrow();
                             let emit = qp_ref.emit_ctx().expect("emit_ctx failed");
                             send_count += 1;
-                            if send_count % SIGNAL_INTERVAL == 0 {
+                            if send_count.is_multiple_of(SIGNAL_INTERVAL) {
                                 emit_wqe!(&emit, send {
                                     flags: WqeFlags::empty(),
                                     sge: { addr: send_addr(send_si), len: msg_size as u32, lkey: send_lkey },
@@ -917,10 +916,10 @@ fn run_one_to_one_threaded(
 
     let remote_bytes = mpi_util::exchange_bytes(world, rank, 1 - rank, &local_bytes);
 
-    for tid in 0..num_threads {
+    for (tid, remote_tx) in remote_txs.iter().enumerate() {
         let offset = tid * RC_INFO_SIZE;
         let remote_info = RcConnectionInfo::from_bytes(&remote_bytes[offset..offset + RC_INFO_SIZE]);
-        remote_txs[tid].send(remote_info).unwrap();
+        remote_tx.send(remote_info).unwrap();
     }
 
     std::thread::sleep(Duration::from_millis(10));

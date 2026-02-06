@@ -40,7 +40,7 @@ fn test_two_node_communication() {
 fn test_call_reply_with_callback() {
     // Track responses via callback
     thread_local! {
-        static RESPONSES: RefCell<Vec<(u32, u32)>> = RefCell::new(Vec::new());
+        static RESPONSES: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
     }
 
     let mut nodes: Vec<Flux<u32, u32, _>> = create_flux(2, 64, 32, |user_data: &mut u32, data| {
@@ -86,20 +86,20 @@ fn test_all_to_all() {
     let mut nodes: Vec<Flux<(usize, usize), (), _>> = create_flux(n, 64, 32, |_, _| {});
 
     // Each node sends to all other nodes
-    for i in 0..n {
+    for (i, node) in nodes.iter_mut().enumerate() {
         for j in 0..n {
             if i != j {
-                nodes[i].call(j, (i, j), ()).unwrap();
+                node.call(j, (i, j), ()).unwrap();
             }
         }
-        nodes[i].poll(); // flush writes
+        node.poll(); // flush writes
     }
 
     // Each node receives from all other nodes
-    for i in 0..n {
+    for (i, node) in nodes.iter_mut().enumerate() {
         let mut received = Vec::new();
-        nodes[i].poll();
-        while let Some(handle) = nodes[i].try_recv() {
+        node.poll();
+        while let Some(handle) = node.try_recv() {
             let (sender, receiver) = handle.data();
             assert_eq!(handle.from(), sender);
             assert_eq!(i, receiver);

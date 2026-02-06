@@ -27,11 +27,10 @@ fn core_for_thread(
 /// Get the local rank of this process on the node.
 /// Uses OMPI_COMM_WORLD_LOCAL_RANK (OpenMPI), falling back to global MPI rank.
 fn get_local_rank(mpi_rank: i32) -> usize {
-    if let Ok(val) = std::env::var("OMPI_COMM_WORLD_LOCAL_RANK") {
-        if let Ok(lr) = val.parse::<usize>() {
+    if let Ok(val) = std::env::var("OMPI_COMM_WORLD_LOCAL_RANK")
+        && let Ok(lr) = val.parse::<usize>() {
             return lr;
         }
-    }
     mpi_rank as usize
 }
 

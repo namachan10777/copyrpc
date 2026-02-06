@@ -79,7 +79,6 @@ fn test_client_creation() {
             slot_data_size: 4080,
         },
         max_connections: 4, // 32 / 4 = 8 slots per connection
-        ..Default::default()
     };
 
     let mut client = RpcClient::new(&ctx.pd, config).expect("Failed to create client");
@@ -422,7 +421,7 @@ fn test_context_switch_piggyback() {
             }
             if start.elapsed() > Duration::from_secs(5) {
                 eprintln!("Timeout on request {}", i);
-                break None::<scalerpc::RpcResponse>.expect("timeout");
+                panic!("timeout");
             }
             std::hint::spin_loop();
         };

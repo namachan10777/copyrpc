@@ -100,12 +100,11 @@ impl VirtualMapping {
         if let Some(entry) = self.entries[conn_id].take() {
             // Remove all slot mappings for this connection
             for &slot in &entry.slots {
-                if slot < self.slot_to_conn.len() {
-                    if self.slot_to_conn[slot].is_some() {
+                if slot < self.slot_to_conn.len()
+                    && self.slot_to_conn[slot].is_some() {
                         self.slot_to_conn[slot] = None;
                         self.num_bound_slots -= 1;
                     }
-                }
             }
             self.num_connections -= 1;
             Some(entry)

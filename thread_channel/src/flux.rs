@@ -323,6 +323,7 @@ where
     let mut channel_endpoints: Vec<Vec<Option<Tr::Endpoint<T, T>>>> =
         (0..n).map(|_| (0..n).map(|_| None).collect()).collect();
 
+    #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         for j in (i + 1)..n {
             // Create bidirectional channel between i and j
@@ -338,6 +339,7 @@ where
     // Build nodes
     let mut nodes = Vec::with_capacity(n);
 
+    #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         let mut channels = Vec::with_capacity(n - 1);
         let mut pending_calls = Vec::with_capacity(n - 1);
@@ -575,8 +577,8 @@ mod tests {
         std::thread::scope(|s| {
             let handles: Vec<_> = nodes
                 .into_iter()
-                .enumerate()
-                .map(|(_, mut node)| {
+                
+                .map(|mut node| {
                     let end_barrier = Arc::clone(&end_barrier);
                     let global_count = Arc::clone(&global_response_count_clone);
                     s.spawn(move || {
@@ -592,12 +594,11 @@ mod tests {
                         let mut total_sent = 0u64;
                         while total_sent < total_sent_target || sent_replies < expected_requests {
                             for &peer in &peers {
-                                if sent_per_peer[peer] < iterations {
-                                    if node.call(peer, sent_per_peer[peer], ()).is_ok() {
+                                if sent_per_peer[peer] < iterations
+                                    && node.call(peer, sent_per_peer[peer], ()).is_ok() {
                                         sent_per_peer[peer] += 1;
                                         total_sent += 1;
                                     }
-                                }
                             }
 
                             node.poll();

@@ -370,7 +370,7 @@ impl UdTransport {
         // Use signaled interval: every Nth send is signaled
         // Unsignaled Response buffers are queued for deferred deallocation
         let count = self.send_counter.get();
-        let should_signal = count % SIGNALED_INTERVAL == 0;
+        let should_signal = count.is_multiple_of(SIGNALED_INTERVAL);
         self.send_counter.set(count.wrapping_add(1));
 
         let ctx = qp.emit_ctx()?;
@@ -419,7 +419,7 @@ impl UdTransport {
         // Use signaled interval: every Nth send is signaled
         // Unsignaled Response buffers are queued for deferred deallocation
         let count = self.send_counter.get();
-        let should_signal = count % SIGNALED_INTERVAL == 0;
+        let should_signal = count.is_multiple_of(SIGNALED_INTERVAL);
         self.send_counter.set(count.wrapping_add(1));
 
         let ctx = qp.emit_ctx()?;
@@ -504,7 +504,7 @@ impl UdTransport {
         // Use signaled interval like post_send
         // Inline sends don't need buffer deallocation, so interval is sufficient
         let count = self.send_counter.get();
-        let should_signal = force_signaled || count % SIGNALED_INTERVAL == 0;
+        let should_signal = force_signaled || count.is_multiple_of(SIGNALED_INTERVAL);
         self.send_counter.set(count.wrapping_add(1));
 
         if should_signal {
@@ -616,7 +616,7 @@ impl UdTransport {
             let pending = self.pending_recvs.get();
             self.pending_recvs.set(pending.saturating_sub(count as u32));
         }
-        count as usize
+        count
     }
 
     /// Poll the send CQ and dispatch completions (discarding them).

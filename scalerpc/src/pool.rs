@@ -96,15 +96,6 @@ impl MessageSlot {
         }
     }
 
-    /// Get the data area as a mutable slice.
-    ///
-    /// # Safety
-    /// The caller must ensure the slot is properly owned and not
-    /// being accessed concurrently.
-    pub unsafe fn data_mut(&self, data_size: usize) -> &mut [u8] {
-        std::slice::from_raw_parts_mut(self.data_ptr(), data_size)
-    }
-
     /// Get the data area as a slice.
     ///
     /// # Safety
@@ -376,14 +367,6 @@ impl<'a> SlotHandle<'a> {
         self.pool.slot_addr(self.index).unwrap()
     }
 
-    /// Get the data area as a mutable slice.
-    ///
-    /// # Safety
-    /// The caller must ensure no concurrent access to the data.
-    pub unsafe fn data_mut(&self) -> &mut [u8] {
-        self.slot().data_mut(self.pool.slot_data_size)
-    }
-
     /// Get the data area as a slice.
     ///
     /// # Safety
@@ -399,8 +382,7 @@ impl<'a> SlotHandle<'a> {
     pub fn write(&self, data: &[u8]) -> usize {
         let len = data.len().min(self.pool.slot_data_size);
         unsafe {
-            let dst = self.slot().data_mut(self.pool.slot_data_size);
-            dst[..len].copy_from_slice(&data[..len]);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), self.slot().data_ptr(), len);
         }
         len
     }

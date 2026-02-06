@@ -913,11 +913,10 @@ impl<H: RequestHandler> RpcServer<H> {
         // SAFETY: Single-threaded access, no aliasing
         let next_slots = unsafe { &mut *self.next_expected_slot.get() };
         for &conn_id in conn_ids {
-            if self.mapping.get_connection(conn_id).is_some() {
-                if conn_id < next_slots.len() {
+            if self.mapping.get_connection(conn_id).is_some()
+                && conn_id < next_slots.len() {
                     next_slots[conn_id] = 0; // Reset to first position
                 }
-            }
         }
     }
 

@@ -34,8 +34,8 @@ struct EndpointConnectionInfo {
 const CONNECTION_INFO_SIZE: usize = std::mem::size_of::<EndpointConnectionInfo>();
 
 impl EndpointConnectionInfo {
-    fn to_bytes(&self) -> Vec<u8> {
-        let ptr = self as *const Self as *const u8;
+    fn to_bytes(self) -> Vec<u8> {
+        let ptr = &self as *const Self as *const u8;
         unsafe { std::slice::from_raw_parts(ptr, CONNECTION_INFO_SIZE).to_vec() }
     }
 
@@ -88,7 +88,7 @@ pub fn run(
             let num_threads = *threads as usize;
             let num_endpoints = *endpoints as usize;
             if num_threads > 1 {
-                if num_endpoints < num_threads || num_endpoints % num_threads != 0 {
+                if num_endpoints < num_threads || !num_endpoints.is_multiple_of(num_threads) {
                     if rank == 0 {
                         eprintln!(
                             "copyrpc: endpoints ({}) must be >= threads ({}) and divisible by threads",
@@ -423,7 +423,7 @@ fn run_one_to_one_threaded(
     let remote_bytes = mpi_util::exchange_bytes(world, rank, 1 - rank, &local_bytes);
 
     // Distribute remote infos back to each thread
-    for tid in 0..num_threads {
+    for (tid, remote_tx) in remote_txs.iter().enumerate() {
         let start = tid * eps_per_thread;
         let mut thread_remote_infos = Vec::with_capacity(eps_per_thread);
         for i in 0..eps_per_thread {
@@ -431,7 +431,7 @@ fn run_one_to_one_threaded(
             thread_remote_infos
                 .push(EndpointConnectionInfo::from_bytes(&remote_bytes[offset..offset + CONNECTION_INFO_SIZE]));
         }
-        remote_txs[tid].send(thread_remote_infos).unwrap();
+        remote_tx.send(thread_remote_infos).unwrap();
     }
 
     // Wait for all workers to finish connecting

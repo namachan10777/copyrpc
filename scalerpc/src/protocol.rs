@@ -393,6 +393,7 @@ impl ResponseHeader {
     }
 
     /// Create a new response header with processing pool info AND credit acknowledgment.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_processing_pool_info_and_credit_ack(
         req_id: u64,
         status: u32,
@@ -462,7 +463,7 @@ impl ResponseHeader {
     ///
     /// This is the lower 32 bits of context_switch_seq.
     pub fn get_context_switch_seq(&self) -> u64 {
-        (self.context_switch_seq & 0xFFFFFFFF) as u64
+        self.context_switch_seq & 0xFFFFFFFF
     }
 
     /// Get the fetched endpoint entry sequence (valid when has_context_switch() is true).

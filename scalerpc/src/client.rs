@@ -57,8 +57,10 @@ fn next_req_id() -> u64 {
 
 /// Client state in the ScaleRPC protocol (Figure 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum ClientState {
     /// Initial state before first request.
+    #[default]
     Connected,
     /// Preparing requests in local buffer for server RDMA READ.
     Warmup,
@@ -68,11 +70,6 @@ pub enum ClientState {
     Idle,
 }
 
-impl Default for ClientState {
-    fn default() -> Self {
-        Self::Connected
-    }
-}
 
 /// Local request buffer for warmup mechanism.
 ///
@@ -809,7 +806,7 @@ impl RpcClient {
                     if fetched_seq == notified_seq {
                         // Set direct_slot_index to warmup count BEFORE clearing
                         // This syncs with server's next_expected_slot (which advanced by warmup_count)
-                        let warmup_count = state.last_notified_count.get() as usize;
+                        let warmup_count = state.last_notified_count.get();
                         state.direct_slot_index.set(warmup_count);
 
                         state.pending_notification.set(false);
@@ -1345,11 +1342,7 @@ impl RpcClient {
                 let last_acked = state.last_acked_seq.get();
                 let window = state.credit_window_size.get();
                 let in_flight = next_seq.wrapping_sub(last_acked);
-                let available = if window as u64 > in_flight {
-                    window as u64 - in_flight
-                } else {
-                    0
-                };
+                let available = (window as u64).saturating_sub(in_flight);
                 (in_flight, available, window)
             })
     }
@@ -1529,7 +1522,7 @@ impl RpcResponse {
     ///
     /// This returns the scheduler's context switch sequence (lower 32 bits).
     pub fn context_switch_seq(&self) -> Option<u64> {
-        self.context_switch_seq.map(|seq| (seq & 0xFFFFFFFF) as u64)
+        self.context_switch_seq.map(|seq| seq & 0xFFFFFFFF)
     }
 
     /// Get the fetched endpoint entry sequence (if context switch piggybacked).

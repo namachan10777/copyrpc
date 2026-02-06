@@ -199,6 +199,7 @@ impl RequestReliability {
     /// Trigger retransmission.
     ///
     /// Returns Ok(()) if retransmission is allowed, Err if max retries exceeded.
+    #[allow(clippy::result_unit_err)]
     pub fn trigger_retransmit(&mut self) -> Result<(), ()> {
         if self.retries >= self.max_retries {
             return Err(());
@@ -235,7 +236,7 @@ impl RequestReliability {
     /// Update RTO based on RTT measurement.
     pub fn update_rto(&mut self, rtt: u64) {
         // Simple RTO calculation: 2 * RTT + margin
-        self.rto = (rtt * 2).max(1000).min(100_000);
+        self.rto = (rtt * 2).clamp(1000, 100_000);
     }
 }
 

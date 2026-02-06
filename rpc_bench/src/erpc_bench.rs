@@ -26,8 +26,8 @@ struct ErpcConnectionInfo {
 const ERPC_INFO_SIZE: usize = std::mem::size_of::<ErpcConnectionInfo>();
 
 impl ErpcConnectionInfo {
-    fn to_bytes(&self) -> Vec<u8> {
-        let ptr = self as *const Self as *const u8;
+    fn to_bytes(self) -> Vec<u8> {
+        let ptr = &self as *const Self as *const u8;
         unsafe { std::slice::from_raw_parts(ptr, ERPC_INFO_SIZE).to_vec() }
     }
 
@@ -51,7 +51,7 @@ thread_local! {
 
 fn open_mlx5_device(device_index: usize, port: u8) -> (mlx5::device::Context, u8) {
     let device_list = DeviceList::list().expect("Failed to list devices");
-    let device = device_list.iter().nth(device_index).expect("Device not found");
+    let device = device_list.get(device_index).expect("Device not found");
     let ctx = device.open().expect("Failed to open device");
     (ctx, port)
 }
@@ -436,10 +436,10 @@ fn run_one_to_one_threaded(
     let remote_bytes = mpi_util::exchange_bytes(world, rank, 1 - rank, &local_bytes);
 
     // Distribute remote infos
-    for tid in 0..num_threads {
+    for (tid, remote_tx) in remote_txs.iter().enumerate() {
         let offset = tid * ERPC_INFO_SIZE;
         let remote_info = ErpcConnectionInfo::from_bytes(&remote_bytes[offset..offset + ERPC_INFO_SIZE]);
-        remote_txs[tid].send(remote_info).unwrap();
+        remote_tx.send(remote_info).unwrap();
     }
 
     // Wait for all handshakes

@@ -26,8 +26,8 @@ impl TestContext {
             if let Ok(ctx) = device.open() {
                 // Find an active port
                 for port in 1..=2u8 {
-                    if let Ok(port_attr) = ctx.query_port(port) {
-                        if port_attr.state == mlx5::types::PortState::Active {
+                    if let Ok(port_attr) = ctx.query_port(port)
+                        && port_attr.state == mlx5::types::PortState::Active {
                             let pd = ctx.alloc_pd().ok()?;
                             return Some(Self {
                                 ctx,
@@ -36,7 +36,6 @@ impl TestContext {
                                 port_attr,
                             });
                         }
-                    }
                 }
             }
         }

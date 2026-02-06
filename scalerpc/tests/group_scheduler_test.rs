@@ -308,7 +308,7 @@ fn test_two_groups_context_switch() {
         };
 
         // Add connections (each goes to a different group via round-robin)
-        for i in 0..num_groups {
+        for (i, server_info_tx) in server_info_txs.iter().enumerate() {
             let conn_id = match server.add_connection(&ctx.ctx, &ctx.pd, ctx.port) {
                 Ok(c) => c,
                 Err(e) => {
@@ -319,12 +319,12 @@ fn test_two_groups_context_switch() {
             assert_eq!(conn_id, i, "Connection ID mismatch");
 
             let server_endpoint = server.local_endpoint(conn_id).unwrap();
-            server_info_txs[i].send(server_endpoint.into()).unwrap();
+            server_info_tx.send(server_endpoint.into()).unwrap();
         }
 
         // Connect all
-        for i in 0..num_groups {
-            let client_info = client_info_rxs[i].recv().unwrap();
+        for (i, client_info_rx) in client_info_rxs.iter().enumerate() {
+            let client_info = client_info_rx.recv().unwrap();
             server.connect(i, client_info.into()).unwrap();
         }
 
@@ -358,12 +358,12 @@ fn test_two_groups_context_switch() {
     // Client threads (one per group)
     let mut client_handles = Vec::new();
 
-    for i in 0..num_groups {
+    for (i, completed_count) in completed_counts.iter().enumerate() {
         let server_info_rx = server_info_rxs.remove(0);
         let client_info_tx = client_info_txs.remove(0);
         let server_ready = server_ready.clone();
         let stop_flag = stop_flag.clone();
-        let completed_count = completed_counts[i].clone();
+        let completed_count = completed_count.clone();
 
         let handle = thread::spawn(move || {
             let ctx = match TestContext::new() {
@@ -537,7 +537,7 @@ fn test_three_groups_round_robin() {
         };
 
         // Add connections (round-robin group assignment)
-        for i in 0..num_groups {
+        for (i, server_info_tx) in server_info_txs.iter().enumerate() {
             let conn_id = match server.add_connection(&ctx.ctx, &ctx.pd, ctx.port) {
                 Ok(c) => c,
                 Err(e) => {
@@ -548,12 +548,12 @@ fn test_three_groups_round_robin() {
             assert_eq!(conn_id, i, "Connection ID mismatch");
 
             let server_endpoint = server.local_endpoint(conn_id).unwrap();
-            server_info_txs[i].send(server_endpoint.into()).unwrap();
+            server_info_tx.send(server_endpoint.into()).unwrap();
         }
 
         // Connect all
-        for i in 0..num_groups {
-            let client_info = client_info_rxs[i].recv().unwrap();
+        for (i, client_info_rx) in client_info_rxs.iter().enumerate() {
+            let client_info = client_info_rx.recv().unwrap();
             server.connect(i, client_info.into()).unwrap();
         }
 
@@ -590,12 +590,12 @@ fn test_three_groups_round_robin() {
     // Client threads
     let mut client_handles = Vec::new();
 
-    for i in 0..num_groups {
+    for (i, completed_count) in completed_counts.iter().enumerate() {
         let server_info_rx = server_info_rxs.remove(0);
         let client_info_tx = client_info_txs.remove(0);
         let server_ready = server_ready.clone();
         let stop_flag = stop_flag.clone();
-        let completed_count = completed_counts[i].clone();
+        let completed_count = completed_count.clone();
 
         let handle = thread::spawn(move || {
             let ctx = match TestContext::new() {

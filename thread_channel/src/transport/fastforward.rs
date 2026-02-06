@@ -330,7 +330,7 @@ impl<T: Serial> Receiver<T> {
         self.recv_count = self.recv_count.wrapping_add(1);
 
         // Check only every SLIP_CHECK_INTERVAL iterations (after initialization)
-        if self.slip_initialized && self.recv_count % SLIP_CHECK_INTERVAL != 0 {
+        if self.slip_initialized && !self.recv_count.is_multiple_of(SLIP_CHECK_INTERVAL) {
             return;
         }
 

@@ -97,6 +97,7 @@ impl Connection {
     /// * `recv_cq` - Shared receive completion queue
     /// * `sq_callback` - Callback for send completions
     /// * `rq_callback` - Callback for receive completions
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ctx: &Context,
         pd: &Pd,

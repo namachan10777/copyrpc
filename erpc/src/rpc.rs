@@ -272,7 +272,7 @@ impl<U: 'static> Rpc<U> {
     /// Check if a session is connected.
     pub fn is_session_connected(&self, handle: SessionHandle) -> bool {
         let sessions = self.sessions.borrow();
-        sessions.get(handle).map_or(false, |s| s.is_connected())
+        sessions.get(handle).is_some_and(|s| s.is_connected())
     }
 
     /// Get the number of requests that were stalled due to credit exhaustion.
@@ -357,11 +357,10 @@ impl<U: 'static> Rpc<U> {
         }
 
         let sessions = self.sessions.borrow();
-        if let Some(sess) = sessions.get(session) {
-            if sess.cc_state.is_some() {
+        if let Some(sess) = sessions.get(session)
+            && sess.cc_state.is_some() {
                 return current_time_us() >= sess.next_send_time_us.get();
             }
-        }
         true
     }
 
@@ -372,8 +371,8 @@ impl<U: 'static> Rpc<U> {
         }
 
         let sessions = self.sessions.borrow();
-        if let Some(sess) = sessions.get(session) {
-            if let Some(ref cc) = sess.cc_state {
+        if let Some(sess) = sessions.get(session)
+            && let Some(ref cc) = sess.cc_state {
                 let rate = cc.rate(); // packets per microsecond (Mpps)
                 if rate > 0.0 {
                     // rate is in Mpps (millions of packets per second)
@@ -385,7 +384,6 @@ impl<U: 'static> Rpc<U> {
                     }
                 }
             }
-        }
     }
 
     /// Send an asynchronous RPC request (copyrpc-style API).
@@ -768,9 +766,7 @@ impl<U: 'static> Rpc<U> {
             req_num,
         );
 
-        // Build inline packet: header + data
         let total_len = PKT_HDR_SIZE + data.len();
-        let max_inline = self.config.max_inline_data as usize;
 
         // Phase 3: Get address vector
         let av = {
@@ -782,30 +778,7 @@ impl<U: 'static> Rpc<U> {
         };
 
         // Phase 4: Send - use buffered send for all responses
-        // (inline with always signaled has higher CQ overhead than buffered)
-        if false && total_len <= max_inline {
-            // Build inline packet on stack
-            let mut inline_buf = [0u8; 256]; // Stack buffer for inline data
-            unsafe {
-                hdr.write_to(inline_buf.as_mut_ptr());
-                std::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    inline_buf.as_mut_ptr().add(PKT_HDR_SIZE),
-                    data.len(),
-                );
-            }
-
-            // Post inline send - uses signaled interval internally
-            // buf_idx = usize::MAX indicates no buffer to free
-            let entry = TransportEntry {
-                buf_idx: usize::MAX,
-                session_num,
-                context: 0,
-                buf_type: BufferType::Request, // Treated as no-op in completion (buf_idx check)
-            };
-            self.transport.post_send_inline(av, &inline_buf[..total_len], true, entry)?;
-        } else {
-            // Fall back to buffered send for large responses
+        {
             let buf_info = self.prepare_send_buffer(data, &hdr)?;
 
             let entry = TransportEntry {
@@ -1118,12 +1091,11 @@ impl<U: 'static> Rpc<U> {
         let mut sessions = self.sessions.borrow_mut();
         let handle = SessionHandle(client_session_num);
 
-        if let Some(session) = sessions.get_mut(handle) {
-            if session.state == SessionState::Connecting {
+        if let Some(session) = sessions.get_mut(handle)
+            && session.state == SessionState::Connecting {
                 // Set the correct remote session number from the server
                 session.connect(server_session_num);
             }
-        }
 
         Ok(())
     }
@@ -1242,11 +1214,10 @@ impl<U: 'static> Rpc<U> {
         }
 
         // Call callback
-        if let Some(p) = pending {
-            if let Some(ud) = p.user_data {
+        if let Some(p) = pending
+            && let Some(ud) = p.user_data {
                 (self.on_response)(ud, payload);
             }
-        }
 
         Ok(())
     }
@@ -1348,15 +1319,12 @@ impl<U: 'static> Rpc<U> {
         }
 
         // Call on_response callback outside of borrow
-        if is_complete {
-            if let Some(p) = pending {
-                if let Some(ud) = p.user_data {
-                    if let Some(resp_data) = data {
+        if is_complete
+            && let Some(p) = pending
+                && let Some(ud) = p.user_data
+                    && let Some(resp_data) = data {
                         (self.on_response)(ud, &resp_data);
                     }
-                }
-            }
-        }
 
         Ok(())
     }
@@ -1485,11 +1453,10 @@ impl<U: 'static> Rpc<U> {
         {
             let mut sessions = self.sessions.borrow_mut();
             let handle = SessionHandle(session_num);
-            if let Some(sess) = sessions.get_mut(handle) {
-                if let Some(sslot) = sess.sslot_mut(sslot_idx) {
+            if let Some(sess) = sessions.get_mut(handle)
+                && let Some(sslot) = sess.sslot_mut(sslot_idx) {
                     sslot.timer_wheel_slot = wheel_slot;
                 }
-            }
         }
 
         Ok(())
@@ -1539,11 +1506,10 @@ impl<U: 'static> Rpc<U> {
         {
             let mut sessions = self.sessions.borrow_mut();
             let handle = SessionHandle(session_num);
-            if let Some(sess) = sessions.get_mut(handle) {
-                if let Some(sslot) = sess.sslot_mut(sslot_idx) {
+            if let Some(sess) = sessions.get_mut(handle)
+                && let Some(sslot) = sess.sslot_mut(sslot_idx) {
                     sslot.timer_wheel_slot = wheel_slot;
                 }
-            }
         }
 
         Ok(())

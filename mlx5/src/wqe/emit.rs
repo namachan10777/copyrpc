@@ -977,7 +977,7 @@ macro_rules! emit_wqe {
         sge: { addr: $addr:expr, len: $len:expr, lkey: $lkey:expr $(,)? } $(,)?
     }) => {{
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
@@ -1025,7 +1025,7 @@ macro_rules! emit_wqe {
         signaled: $entry:expr $(,)?
     }) => {{
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
@@ -1189,7 +1189,7 @@ macro_rules! emit_wqe {
         sge: { addr: $addr:expr, len: $len:expr, lkey: $lkey:expr $(,)? } $(,)?
     }) => {{
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE + $crate::wqe::RDMA_SEG_SIZE + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
@@ -1240,7 +1240,7 @@ macro_rules! emit_wqe {
         signaled: $entry:expr $(,)?
     }) => {{
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE + $crate::wqe::RDMA_SEG_SIZE + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
@@ -1412,7 +1412,7 @@ macro_rules! emit_wqe {
         sge: { addr: $addr:expr, len: $len:expr, lkey: $lkey:expr $(,)? } $(,)?
     }) => {{
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE + $crate::wqe::RDMA_SEG_SIZE + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
@@ -1464,7 +1464,7 @@ macro_rules! emit_wqe {
         signaled: $entry:expr $(,)?
     }) => {{
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE + $crate::wqe::RDMA_SEG_SIZE + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
@@ -1637,7 +1637,7 @@ macro_rules! emit_wqe {
         sge: { addr: $addr:expr, len: $len:expr, lkey: $lkey:expr $(,)? } $(,)?
     }) => {{
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE + $crate::wqe::RDMA_SEG_SIZE + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
@@ -1688,7 +1688,7 @@ macro_rules! emit_wqe {
         signaled: $entry:expr $(,)?
     }) => {{
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE + $crate::wqe::RDMA_SEG_SIZE + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
@@ -1748,7 +1748,7 @@ macro_rules! emit_wqe {
         sge: { addr: $addr:expr, lkey: $lkey:expr $(,)? } $(,)?
     }) => {{
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE + $crate::wqe::RDMA_SEG_SIZE + $crate::wqe::ATOMIC_SEG_SIZE + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
@@ -1802,7 +1802,7 @@ macro_rules! emit_wqe {
         signaled: $entry:expr $(,)?
     }) => {{
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE + $crate::wqe::RDMA_SEG_SIZE + $crate::wqe::ATOMIC_SEG_SIZE + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
@@ -1862,7 +1862,7 @@ macro_rules! emit_wqe {
         sge: { addr: $addr:expr, lkey: $lkey:expr $(,)? } $(,)?
     }) => {{
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE + $crate::wqe::RDMA_SEG_SIZE + $crate::wqe::ATOMIC_SEG_SIZE + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
@@ -1915,7 +1915,7 @@ macro_rules! emit_wqe {
         signaled: $entry:expr $(,)?
     }) => {{
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE + $crate::wqe::RDMA_SEG_SIZE + $crate::wqe::ATOMIC_SEG_SIZE + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
@@ -2963,7 +2963,7 @@ macro_rules! emit_tm_wqe {
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE
             + $crate::wqe::TM_SEG_SIZE
             + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
@@ -3020,7 +3020,7 @@ macro_rules! emit_tm_wqe {
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE
             + $crate::wqe::TM_SEG_SIZE
             + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
@@ -3073,7 +3073,7 @@ macro_rules! emit_tm_wqe {
         index: $index:expr $(,)?
     }) => {{
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE + $crate::wqe::TM_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
@@ -3119,7 +3119,7 @@ macro_rules! emit_tm_wqe {
         signaled: $entry:expr $(,)?
     }) => {{
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE + $crate::wqe::TM_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
@@ -3218,7 +3218,7 @@ macro_rules! emit_dci_wqe {
             + $crate::wqe::ADDRESS_VECTOR_SIZE
             + $crate::wqe::RDMA_SEG_SIZE
             + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
@@ -3378,7 +3378,7 @@ macro_rules! emit_dci_wqe {
             + $crate::wqe::ADDRESS_VECTOR_SIZE
             + $crate::wqe::RDMA_SEG_SIZE
             + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
@@ -3452,7 +3452,7 @@ macro_rules! emit_dci_wqe {
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE
             + $crate::wqe::ADDRESS_VECTOR_SIZE
             + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
@@ -3755,7 +3755,7 @@ macro_rules! emit_ud_wqe {
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE
             + $crate::wqe::ADDRESS_VECTOR_SIZE
             + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
@@ -3829,7 +3829,7 @@ macro_rules! emit_ud_wqe {
         let wqe_size = $crate::wqe::CTRL_SEG_SIZE
             + $crate::wqe::ADDRESS_VECTOR_SIZE
             + inline_size;
-        let wqebb_cnt = ((wqe_size + 63) / 64) as u16;
+        let wqebb_cnt = wqe_size.div_ceil(64) as u16;
 
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
         let av = $av;
@@ -3896,7 +3896,7 @@ macro_rules! emit_ud_wqe {
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE
             + $crate::wqe::ADDRESS_VECTOR_SIZE
             + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
@@ -3965,7 +3965,7 @@ macro_rules! emit_ud_wqe {
         let wqe_size = $crate::wqe::CTRL_SEG_SIZE
             + $crate::wqe::ADDRESS_VECTOR_SIZE
             + inline_size;
-        let wqebb_cnt = ((wqe_size + 63) / 64) as u16;
+        let wqebb_cnt = wqe_size.div_ceil(64) as u16;
 
         let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
         let av = $av;
@@ -4101,7 +4101,7 @@ macro_rules! emit_wqe_bf {
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE
             + $crate::wqe::RDMA_SEG_SIZE
             + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let remaining = 256 - *ctx.offset;
@@ -4158,7 +4158,7 @@ macro_rules! emit_wqe_bf {
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE
             + $crate::wqe::RDMA_SEG_SIZE
             + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let remaining = 256 - *ctx.offset;
@@ -4328,7 +4328,7 @@ macro_rules! emit_wqe_bf {
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE
             + $crate::wqe::RDMA_SEG_SIZE
             + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let remaining = 256 - *ctx.offset;
@@ -4386,7 +4386,7 @@ macro_rules! emit_wqe_bf {
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE
             + $crate::wqe::RDMA_SEG_SIZE
             + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let remaining = 256 - *ctx.offset;
@@ -4440,7 +4440,7 @@ macro_rules! emit_wqe_bf {
         sge: { addr: $addr:expr, len: $len:expr, lkey: $lkey:expr $(,)? } $(,)?
     }) => {{
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let remaining = 256 - *ctx.offset;
@@ -4488,7 +4488,7 @@ macro_rules! emit_wqe_bf {
         signaled: $entry:expr $(,)?
     }) => {{
         const WQE_SIZE: usize = $crate::wqe::CTRL_SEG_SIZE + $crate::wqe::DATA_SEG_SIZE;
-        const WQEBB_CNT: u16 = ((WQE_SIZE + 63) / 64) as u16;
+        const WQEBB_CNT: u16 = WQE_SIZE.div_ceil(64) as u16;
 
         let ctx = $ctx;
         let remaining = 256 - *ctx.offset;

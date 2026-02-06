@@ -208,8 +208,8 @@ fn test_fan_in() {
                         }
                     }
 
-                    for i in 1..n {
-                        assert_eq!(counts[i], msgs_per_sender as u32);
+                    for count in &counts[1..n] {
+                        assert_eq!(*count, msgs_per_sender as u32);
                     }
                 } else {
                     // Sender
