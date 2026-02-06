@@ -363,6 +363,7 @@ pub struct PortAttr {
     /// Extended port capabilities flags.
     pub port_cap_flags2: u16,
     /// Extended active link speed (use this if non-zero, otherwise use active_speed).
+    #[cfg(has_extended_port_attr)]
     pub active_speed_ex: u32,
 }
 
@@ -534,12 +535,16 @@ pub struct Mlx5DeviceAttr {
     /// Crypto capabilities.
     pub crypto_caps: CryptoCaps,
     /// Maximum outstanding RDMA read/atomic per DC QP as requester.
+    #[cfg(has_extended_device_attr)]
     pub max_dc_rd_atom: u64,
     /// Maximum outstanding RDMA read/atomic per DC QP as responder.
+    #[cfg(has_extended_device_attr)]
     pub max_dc_init_rd_atom: u64,
     /// Value and mask to match local vport egress traffic in FDB.
+    #[cfg(has_extended_device_attr)]
     pub reg_c0: RegC0,
     /// Out-of-order receive WRs capabilities per QP type.
+    #[cfg(has_extended_device_attr)]
     pub ooo_recv_wrs_caps: OooRecvWrsCaps,
 }
 
