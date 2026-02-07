@@ -55,27 +55,18 @@ unsafe impl thread_channel::Serial for DelegatePayload {}
 /// User data attached to each Flux `call()`.
 /// Used by the `on_response` callback to route the response.
 #[derive(Clone, Debug)]
-pub enum DelegateUserData {
-    /// Originated from a shm_spsc client (complete_request when response arrives).
-    ClientRequest {
-        client_id: u32,
-        slot_index: u32,
-    },
-    /// Originated from copyrpc recv forwarding on Daemon #0.
-    CopyrpcRecv {
-        pending_id: u32,
-    },
+pub struct DelegateUserData {
+    pub client_id: u32,
+    pub slot_index: u32,
 }
 
 // === copyrpc layer: inter-node communication ===
 
 /// Routing info for copyrpc responses.
 #[derive(Clone, Debug)]
-pub enum CopyrpcOrigin {
-    /// Request came from Daemon #0's own shm_spsc client.
-    LocalClient { client_id: u32, slot_index: u32 },
-    /// Request was delegated from another daemon via Flux.
-    FluxDelegate { flux_from: u32, flux_token: u64 },
+pub struct CopyrpcOrigin {
+    pub client_id: u32,
+    pub slot_index: u32,
 }
 
 /// Serialized copyrpc request payload.
@@ -137,15 +128,7 @@ pub struct CopyrpcResponseEntry {
     pub response: Response,
 }
 
-/// Response from Flux for a copyrpc recv forwarding (on Daemon #0).
-#[derive(Debug)]
-pub struct CopyrpcRecvFluxResponse {
-    pub pending_id: u32,
-    pub response: Response,
-}
-
 thread_local! {
     pub static FLUX_RESPONSES: RefCell<Vec<FluxResponseEntry>> = const { RefCell::new(Vec::new()) };
     pub static COPYRPC_RESPONSES: RefCell<Vec<CopyrpcResponseEntry>> = const { RefCell::new(Vec::new()) };
-    pub static COPYRPC_RECV_FLUX_RESPONSES: RefCell<Vec<CopyrpcRecvFluxResponse>> = const { RefCell::new(Vec::new()) };
 }

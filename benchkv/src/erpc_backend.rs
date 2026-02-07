@@ -431,6 +431,15 @@ pub fn run_erpc(
                 avg_rps,
                 steady.len()
             );
+            let mut total_rps = 0.0f64;
+            world.all_reduce_into(
+                &avg_rps,
+                &mut total_rps,
+                mpi::collective::SystemOperation::sum(),
+            );
+            if rank == 0 {
+                eprintln!("  total run {}: {:.0} RPS", run + 1, total_rps);
+            }
         }
 
         all_rows.extend(rows);

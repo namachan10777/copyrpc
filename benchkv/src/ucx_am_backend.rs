@@ -274,6 +274,8 @@ pub fn run_ucx_am(
                     if let Some(ep) = client_endpoints.get(sender_id as usize) {
                         let _ = ep.am_send_nbx(1, remote_resp.as_bytes(), &[]);
                     }
+                    // Flush reply and receive new requests to reduce remote latency
+                    worker.progress();
                 }
             }
         }));
@@ -448,6 +450,15 @@ pub fn run_ucx_am(
                 avg_rps,
                 steady.len()
             );
+            let mut total_rps = 0.0f64;
+            world.all_reduce_into(
+                &avg_rps,
+                &mut total_rps,
+                mpi::collective::SystemOperation::sum(),
+            );
+            if rank == 0 {
+                eprintln!("  total run {}: {:.0} RPS", run + 1, total_rps);
+            }
         }
 
         all_rows.extend(rows);

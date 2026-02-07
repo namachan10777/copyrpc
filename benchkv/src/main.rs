@@ -19,7 +19,9 @@ use clap::Parser;
 use mpi::collective::CommunicatorCollectives;
 use mpi::topology::Communicator;
 
-use daemon::{on_delegate_response, CopyrpcSetup, DaemonFlux, EndpointConnectionInfo};
+use daemon::{
+    on_delegate_response, CopyrpcSetup, DaemonFlux, EndpointConnectionInfo, CONNECTION_INFO_SIZE,
+};
 use epoch::EpochCollector;
 use message::{DelegatePayload, DelegateUserData, Request, Response};
 
@@ -239,20 +241,34 @@ fn run_meta(
     // Barrier: all daemon threads + main thread
     let ready_barrier = Arc::new(Barrier::new(num_daemons + 1));
 
-    // copyrpc setup channels (for Daemon #0 if multi-node)
-    let (copyrpc_local_tx, copyrpc_local_rx, copyrpc_remote_tx, mut copyrpc_remote_rx) =
-        if size > 1 {
+    // copyrpc setup channels (per-daemon for multi-node)
+    let num_remote_ranks = (size - 1) as usize;
+    let (copyrpc_local_rxs, copyrpc_remote_txs, copyrpc_setups) = if size > 1 {
+        let mut local_rxs = Vec::with_capacity(num_daemons);
+        let mut remote_txs = Vec::with_capacity(num_daemons);
+        let mut setups = Vec::with_capacity(num_daemons);
+
+        for _ in 0..num_daemons {
             let (local_tx, local_rx) = std::sync::mpsc::channel();
             let (remote_tx, remote_rx) = std::sync::mpsc::channel();
-            (
-                Some(local_tx),
-                Some(local_rx),
-                Some(remote_tx),
-                Some(remote_rx),
-            )
-        } else {
-            (None, None, None, None)
-        };
+            local_rxs.push(local_rx);
+            remote_txs.push(remote_tx);
+            setups.push(Some(CopyrpcSetup {
+                local_info_tx: local_tx,
+                remote_info_rx: remote_rx,
+                device_index: cli.device_index,
+                port: cli.port,
+                ring_size: cli.ring_size,
+                num_remote_ranks,
+                num_daemons,
+            }));
+        }
+
+        (local_rxs, remote_txs, setups)
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
+    let mut copyrpc_setups = copyrpc_setups;
 
     // Spawn daemon threads
     let mut daemon_handles = Vec::with_capacity(num_daemons);
@@ -264,15 +280,8 @@ fn run_meta(
         let barrier = ready_barrier.clone();
         let key_range = cli.key_range;
 
-        let copyrpc_setup = if d == 0 && size > 1 {
-            Some(CopyrpcSetup {
-                local_info_tx: copyrpc_local_tx.as_ref().unwrap().clone(),
-                remote_info_rx: copyrpc_remote_rx.take().unwrap(),
-                device_index: cli.device_index,
-                port: cli.port,
-                ring_size: cli.ring_size,
-                num_remote_ranks: (size - 1) as usize,
-            })
+        let copyrpc_setup = if size > 1 {
+            copyrpc_setups[d].take()
         } else {
             None
         };
@@ -298,28 +307,63 @@ fn run_meta(
     }
 
     // Main thread: MPI exchange for copyrpc (if multi-node)
-    if let (Some(local_rx), Some(remote_tx)) = (copyrpc_local_rx, copyrpc_remote_tx) {
-        let local_infos = local_rx.recv().expect("Failed to receive local endpoint info");
+    if size > 1 {
+        // 1. Collect local endpoint infos from all daemons
+        //    Each daemon sends D * num_remote_ranks infos, ordered by
+        //    [rank_offset * D + target_daemon]
+        let daemon_local_infos: Vec<Vec<EndpointConnectionInfo>> = copyrpc_local_rxs
+            .iter()
+            .map(|rx| rx.recv().expect("Failed to receive daemon local info"))
+            .collect();
 
-        let mut all_remote_infos = Vec::new();
+        // 2. For each remote rank, build D×D matrix, exchange, distribute
+        //    Per-daemon accumulator for remote infos
+        let mut daemon_remote_infos: Vec<Vec<EndpointConnectionInfo>> =
+            (0..num_daemons).map(|_| Vec::with_capacity(num_daemons * num_remote_ranks)).collect();
+
         for peer_rank in 0..size {
             if peer_rank == rank {
                 continue;
             }
-            let ep_idx = if peer_rank < rank {
+            let rank_offset = if peer_rank < rank {
                 peer_rank as usize
             } else {
                 (peer_rank - 1) as usize
             };
-            let local_bytes = local_infos[ep_idx].to_bytes();
-            let remote_bytes =
-                mpi_util::exchange_bytes(world, rank as i32, peer_rank as i32, &local_bytes);
-            all_remote_infos.push(EndpointConnectionInfo::from_bytes(&remote_bytes));
+
+            // Build send matrix: D×D infos
+            // Layout: [d_local * D + d_remote]
+            let mut send_bytes =
+                Vec::with_capacity(num_daemons * num_daemons * CONNECTION_INFO_SIZE);
+            for local_infos in &daemon_local_infos {
+                for d_remote in 0..num_daemons {
+                    let idx = rank_offset * num_daemons + d_remote;
+                    send_bytes.extend(local_infos[idx].to_bytes());
+                }
+            }
+
+            // Exchange D×D infos with peer rank
+            let recv_bytes =
+                mpi_util::exchange_bytes(world, rank as i32, peer_rank as i32, &send_bytes);
+
+            // Parse receive matrix: [d_remote * D + d_local]
+            // For our daemon d, extract recv_matrix[j * D + d] for j in 0..D
+            for (d, remote_infos) in daemon_remote_infos.iter_mut().enumerate() {
+                for remote_d in 0..num_daemons {
+                    let matrix_idx = remote_d * num_daemons + d;
+                    let byte_offset = matrix_idx * CONNECTION_INFO_SIZE;
+                    remote_infos.push(EndpointConnectionInfo::from_bytes(
+                        &recv_bytes[byte_offset..],
+                    ));
+                }
+            }
         }
 
-        remote_tx
-            .send(all_remote_infos)
-            .expect("Failed to send remote endpoint info");
+        // 3. Send remote infos to each daemon
+        for (d, tx) in copyrpc_remote_txs.iter().enumerate() {
+            tx.send(std::mem::take(&mut daemon_remote_infos[d]))
+                .expect("Failed to send remote info to daemon");
+        }
     }
 
     // Wait for all daemons to be ready
@@ -393,6 +437,15 @@ fn run_meta(
                 avg_rps,
                 steady.len()
             );
+            let mut total_rps = 0.0f64;
+            world.all_reduce_into(
+                &avg_rps,
+                &mut total_rps,
+                mpi::collective::SystemOperation::sum(),
+            );
+            if rank == 0 {
+                eprintln!("  total run {}: {:.0} RPS", run + 1, total_rps);
+            }
         }
 
         all_rows.extend(rows);
