@@ -2,10 +2,13 @@ mod affinity;
 mod client;
 mod daemon;
 mod epoch;
+mod erpc_backend;
 mod message;
 mod mpi_util;
 mod parquet_out;
 mod storage;
+mod ucx_am;
+mod ucx_am_backend;
 mod workload;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -86,8 +89,19 @@ struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 enum SubCmd {
-    /// meta_put/meta_get benchmark
+    /// copyrpc meta_put/meta_get benchmark
     Meta,
+    /// eRPC meta_put/meta_get benchmark
+    Erpc {
+        /// Session credits
+        #[arg(long, default_value = "32")]
+        session_credits: usize,
+        /// Request window size
+        #[arg(long, default_value = "8")]
+        req_window: usize,
+    },
+    /// UCX Active Message meta_put/meta_get benchmark
+    UcxAm,
 }
 
 fn main() {
@@ -101,12 +115,52 @@ fn main() {
 
     let num_daemons = cli.server_threads;
     let num_clients = cli.client_threads;
-    let queue_depth = cli.queue_depth;
 
     eprintln!(
-        "rank {}: {} daemons, {} clients, QD={}, key_range={}, ranks={}",
-        rank, num_daemons, num_clients, queue_depth, cli.key_range, size
+        "rank {}: {} daemons, {} clients, QD={}, key_range={}, ranks={}, mode={:?}",
+        rank, num_daemons, num_clients, cli.queue_depth, cli.key_range, size, cli.subcommand
     );
+
+    let all_rows = match &cli.subcommand {
+        SubCmd::Meta => run_meta(&cli, &world, rank, size, num_daemons, num_clients),
+        SubCmd::Erpc {
+            session_credits,
+            req_window,
+        } => erpc_backend::run_erpc(
+            &cli,
+            &world,
+            rank,
+            size,
+            num_daemons,
+            num_clients,
+            *session_credits,
+            *req_window,
+        ),
+        SubCmd::UcxAm => {
+            ucx_am_backend::run_ucx_am(&cli, &world, rank, size, num_daemons, num_clients)
+        }
+    };
+
+    // Rank 0: write parquet
+    if rank == 0 {
+        if let Err(e) = parquet_out::write_parquet(&cli.output, &all_rows) {
+            eprintln!("Error writing parquet: {}", e);
+        } else if !all_rows.is_empty() {
+            eprintln!("Results written to {}", cli.output);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_meta(
+    cli: &Cli,
+    world: &mpi::topology::SimpleCommunicator,
+    rank: u32,
+    size: u32,
+    num_daemons: usize,
+    num_clients: usize,
+) -> Vec<parquet_out::BenchRow> {
+    let queue_depth = cli.queue_depth;
 
     // CPU affinity
     let available_cores = affinity::get_available_cores(cli.device_index);
@@ -133,14 +187,17 @@ fn main() {
         .map(|d| format!("/benchkv_{}_{}", rank, d))
         .collect();
 
-    let max_clients_per_daemon =
-        num_clients.div_ceil(num_daemons).max(1) as u32;
+    let max_clients_per_daemon = num_clients.div_ceil(num_daemons).max(1) as u32;
     let mut servers: Vec<Option<shm_spsc::Server<Request, Response>>> = shm_paths
         .iter()
         .map(|path| {
             Some(
                 unsafe {
-                    shm_spsc::Server::<Request, Response>::create(path, max_clients_per_daemon, queue_depth)
+                    shm_spsc::Server::<Request, Response>::create(
+                        path,
+                        max_clients_per_daemon,
+                        queue_depth,
+                    )
                 }
                 .expect("Failed to create shm_spsc server"),
             )
@@ -155,20 +212,17 @@ fn main() {
             num_daemons,
             flux_capacity,
             flux_inflight_max,
-            on_delegate_response
-                as fn(&mut DelegateUserData, DelegatePayload),
+            on_delegate_response as fn(&mut DelegateUserData, DelegatePayload),
         )
         .into_iter()
         .map(Some)
         .collect()
     } else {
-        // Single daemon: create one Flux node with no peers
         thread_channel::create_flux::<DelegatePayload, DelegateUserData, _>(
             1,
             flux_capacity,
             flux_inflight_max,
-            on_delegate_response
-                as fn(&mut DelegateUserData, DelegatePayload),
+            on_delegate_response as fn(&mut DelegateUserData, DelegatePayload),
         )
         .into_iter()
         .map(Some)
@@ -185,12 +239,16 @@ fn main() {
     let ready_barrier = Arc::new(Barrier::new(num_daemons + 1));
 
     // copyrpc setup channels (for Daemon #0 if multi-node)
-    // Split into separate Options so we can move remote_rx into the daemon thread
     let (copyrpc_local_tx, copyrpc_local_rx, copyrpc_remote_tx, mut copyrpc_remote_rx) =
         if size > 1 {
             let (local_tx, local_rx) = std::sync::mpsc::channel();
             let (remote_tx, remote_rx) = std::sync::mpsc::channel();
-            (Some(local_tx), Some(local_rx), Some(remote_tx), Some(remote_rx))
+            (
+                Some(local_tx),
+                Some(local_rx),
+                Some(remote_tx),
+                Some(remote_rx),
+            )
         } else {
             (None, None, None, None)
         };
@@ -240,16 +298,13 @@ fn main() {
 
     // Main thread: MPI exchange for copyrpc (if multi-node)
     if let (Some(local_rx), Some(remote_tx)) = (copyrpc_local_rx, copyrpc_remote_tx) {
-        // Receive local endpoint info from Daemon #0
         let local_infos = local_rx.recv().expect("Failed to receive local endpoint info");
 
-        // MPI exchange with each remote rank
         let mut all_remote_infos = Vec::new();
         for peer_rank in 0..size {
             if peer_rank == rank {
                 continue;
             }
-            // One endpoint per remote rank, ordered by rank (skipping self)
             let ep_idx = if peer_rank < rank {
                 peer_rank as usize
             } else {
@@ -257,11 +312,10 @@ fn main() {
             };
             let local_bytes = local_infos[ep_idx].to_bytes();
             let remote_bytes =
-                mpi_util::exchange_bytes(&world, rank as i32, peer_rank as i32, &local_bytes);
+                mpi_util::exchange_bytes(world, rank as i32, peer_rank as i32, &local_bytes);
             all_remote_infos.push(EndpointConnectionInfo::from_bytes(&remote_bytes));
         }
 
-        // Send remote endpoint info to Daemon #0
         remote_tx
             .send(all_remote_infos)
             .expect("Failed to send remote endpoint info");
@@ -298,7 +352,6 @@ fn main() {
     let interval = Duration::from_millis(cli.interval_ms);
 
     for run in 0..cli.runs {
-        // Reset
         for c in &completions {
             c.store(0, Ordering::Release);
         }
@@ -347,7 +400,6 @@ fn main() {
     // Stop
     stop_flag.store(true, Ordering::Release);
 
-    // Drop servers (happens when daemon threads exit) will signal clients
     for h in daemon_handles {
         h.join().expect("Daemon thread panicked");
     }
@@ -355,13 +407,5 @@ fn main() {
         h.join().expect("Client thread panicked");
     }
 
-    // Rank 0: write parquet
-    if rank == 0 {
-        // TODO: MPI gather from all ranks
-        if let Err(e) = parquet_out::write_parquet(&cli.output, &all_rows) {
-            eprintln!("Error writing parquet: {}", e);
-        } else if !all_rows.is_empty() {
-            eprintln!("Results written to {}", cli.output);
-        }
-    }
+    all_rows
 }

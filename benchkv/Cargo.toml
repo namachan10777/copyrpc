@@ -14,6 +14,8 @@ parquet.workspace = true
 arrow.workspace = true
 libc.workspace = true
 anyhow.workspace = true
+erpc = { path = "../erpc" }
+ucx_sys = { path = "../ucx_sys" }
 rand = "0.9"
 rand_distr = "0.5"
 
