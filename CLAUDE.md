@@ -50,7 +50,8 @@ cargo clippy
 - ベンチマークが30秒以上かかる場合はハングの可能性が高い。
 
 マルチノードでテストをしたい場合、fern03,fern04であれば/dev/omni.txtを使いMPI実行が出来る。
-1 node = 1 rank前提でslotは一つずつ。
+1 node = 1 rank前提でslotは一つずつ。SSH接続は`mnakano`ユーザで行うこと。
+`/work/`はノードローカルなので、MPIで実験する際は`/home/mnakano`のNFSを使うか、rsyncでコピーを行う。
 
 ```bash
 mpirun --hostfile ./dev/omni.txt -np 2 hostname
