@@ -73,20 +73,20 @@ fn detect_numa_node(device_index: usize) -> Option<usize> {
 }
 
 /// Assign cores to threads: daemon threads first, then client threads.
-/// `rank` and `num_ranks` are used to partition cores across co-located ranks.
+/// `ranks_on_node` and `rank_on_node` partition cores across co-located ranks.
 /// Returns (daemon_cores, client_cores).
 pub fn assign_cores(
     available: &[usize],
     num_daemons: usize,
     num_clients: usize,
-    rank: u32,
-    num_ranks: u32,
+    ranks_on_node: u32,
+    rank_on_node: u32,
 ) -> (Vec<usize>, Vec<usize>) {
     let total_needed = num_daemons + num_clients;
 
     // Partition available cores evenly across ranks on this node
-    let per_rank = available.len() / num_ranks as usize;
-    let offset = rank as usize * per_rank;
+    let per_rank = available.len() / ranks_on_node as usize;
+    let offset = rank_on_node as usize * per_rank;
     let my_cores = &available[offset..offset + per_rank];
 
     let daemon_cores: Vec<usize> = my_cores.iter().take(num_daemons).copied().collect();
@@ -99,10 +99,10 @@ pub fn assign_cores(
 
     if daemon_cores.len() + client_cores.len() < total_needed {
         eprintln!(
-            "Warning: rank {}: only {} cores available for {} threads",
-            rank,
+            "Warning: only {} cores available for {} threads (rank_on_node={})",
             my_cores.len(),
-            total_needed
+            total_needed,
+            rank_on_node
         );
     }
 

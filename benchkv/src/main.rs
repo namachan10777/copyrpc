@@ -164,8 +164,9 @@ fn run_meta(
 
     // CPU affinity
     let available_cores = affinity::get_available_cores(cli.device_index);
+    let (ranks_on_node, rank_on_node) = mpi_util::node_local_rank(world);
     let (daemon_cores, client_cores) =
-        affinity::assign_cores(&available_cores, num_daemons, num_clients, rank, size);
+        affinity::assign_cores(&available_cores, num_daemons, num_clients, ranks_on_node, rank_on_node);
 
     // Generate access patterns (one per client, before barrier)
     let pattern_len = 10000;
