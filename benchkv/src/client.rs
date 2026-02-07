@@ -41,9 +41,9 @@ pub fn run_client(
         }
     }
 
-    // Steady state: recv oldest → count completion → send next
+    // Steady state: recv any completed → count completion → send next
     while !stop_flag.load(Ordering::Relaxed) {
-        match client.recv() {
+        match client.recv_any() {
             Ok(_resp) => {
                 completions.fetch_add(1, Ordering::Relaxed);
                 let entry = &pattern[pattern_idx % pattern_len];

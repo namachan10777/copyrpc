@@ -54,7 +54,7 @@ unsafe impl thread_channel::Serial for DelegatePayload {}
 
 /// User data attached to each Flux `call()`.
 /// Used by the `on_response` callback to route the response.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct DelegateUserData {
     pub client_id: u32,
     pub slot_index: u32,
@@ -63,7 +63,7 @@ pub struct DelegateUserData {
 // === copyrpc layer: inter-node communication ===
 
 /// Routing info for copyrpc responses.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct CopyrpcOrigin {
     pub client_id: u32,
     pub slot_index: u32,

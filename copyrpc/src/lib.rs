@@ -176,9 +176,6 @@ impl CqeBuffer {
         self.entries.borrow_mut().push((cqe, entry));
     }
 
-    fn drain(&self) -> Vec<(Cqe, SrqEntry)> {
-        std::mem::take(&mut *self.entries.borrow_mut())
-    }
 }
 
 /// Type alias for the recv MonoCq callback.
@@ -426,14 +423,14 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
         }
         self.recv_cq.flush();
 
-        // 2. Process buffered CQEs
-        // Use cqe.qp_num to identify the endpoint, not entry.qpn
-        // (SRQ entries are returned in FIFO order, not per-endpoint)
-        let cqes = self.cqe_buffer.drain();
-        let num_cqes = cqes.len();
-
-        for (cqe, _entry) in cqes {
-            self.process_cqe(cqe, cqe.qp_num);
+        // 2. Process buffered CQEs in-place (preserves Vec capacity)
+        let num_cqes;
+        {
+            let mut entries = self.cqe_buffer.entries.borrow_mut();
+            num_cqes = entries.len();
+            for (cqe, _entry) in entries.drain(..) {
+                self.process_cqe(cqe, cqe.qp_num);
+            }
         }
 
         // 3. Repost recvs to SRQ when below 2/3 threshold
@@ -459,24 +456,25 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
         }
         self.send_cq.flush();
 
-        // 5. Process send CQEs (READ completions)
-        let send_cqes = self.send_cqe_buffer.drain();
+        // 5. Process send CQEs (READ completions) in-place
+        {
+            let mut entries = self.send_cqe_buffer.entries.borrow_mut();
+            for (_cqe, entry) in entries.drain(..) {
+                // Only process READ completions (is_read=true)
+                // WRITE+IMM completions (is_read=false) are just for SQ progress tracking
+                if !entry.is_read {
+                    continue;
+                }
 
-        for (_cqe, entry) in send_cqes {
-            // Only process READ completions (is_read=true)
-            // WRITE+IMM completions (is_read=false) are just for SQ progress tracking
-            if !entry.is_read {
-                continue;
-            }
-
-            // entry.qpn identifies which endpoint's READ completed
-            if let Some(ep) = self.endpoints.borrow().get(entry.qpn) {
-                let ep_ref = ep.borrow();
-                if ep_ref.read_inflight.get() {
-                    // Read the consumer value from read_buffer
-                    let consumer_value = u64::from_le_bytes(*ep_ref.read_buffer);
-                    ep_ref.remote_consumer.update(consumer_value);
-                    ep_ref.read_inflight.set(false);
+                // entry.qpn identifies which endpoint's READ completed
+                if let Some(ep) = self.endpoints.borrow().get(entry.qpn) {
+                    let ep_ref = ep.borrow();
+                    if ep_ref.read_inflight.get() {
+                        // Read the consumer value from read_buffer
+                        let consumer_value = u64::from_le_bytes(*ep_ref.read_buffer);
+                        ep_ref.remote_consumer.update(consumer_value);
+                        ep_ref.read_inflight.set(false);
+                    }
                 }
             }
         }
@@ -1101,13 +1099,11 @@ where
 }
 
 impl<U, F: Fn(U, &[u8])> RecvHandle<'_, U, F> {
-    /// Get the request data as a copy.
-    ///
-    /// Note: This returns a copy of the data because the underlying buffer
-    /// is managed by RefCell and cannot be borrowed across the RecvHandle lifetime.
-    pub fn data(&self) -> Vec<u8> {
+    /// Access request data zero-copy via callback.
+    pub fn with_data<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
         let inner = self.endpoint.borrow();
-        inner.recv_ring[self.data_offset..self.data_offset + self.data_len].to_vec()
+        let slice = &inner.recv_ring[self.data_offset..self.data_offset + self.data_len];
+        f(slice)
     }
 
     /// Get the QPN of the endpoint that received this request.

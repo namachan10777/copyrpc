@@ -84,14 +84,6 @@ fn on_copyrpc_response(origin: CopyrpcOrigin, data: &[u8]) {
 
 // === Helpers ===
 
-fn drain_flux_responses() -> Vec<FluxResponseEntry> {
-    FLUX_RESPONSES.with(|r| r.borrow_mut().drain(..).collect())
-}
-
-fn drain_copyrpc_responses() -> Vec<CopyrpcResponseEntry> {
-    COPYRPC_RESPONSES.with(|r| r.borrow_mut().drain(..).collect())
-}
-
 fn handle_local(store: &mut ShardedStore, req: &Request) -> Response {
     match *req {
         Request::MetaPut { key, value, .. } => {
@@ -323,17 +315,19 @@ pub fn run_daemon(
                 let remote_req = RemoteRequest { request: req };
                 let ep_idx = daemon_ep_index(target_rank, target_daemon);
                 loop {
-                    match copyrpc_endpoints[ep_idx].call(remote_req.as_bytes(), origin.clone()) {
+                    match copyrpc_endpoints[ep_idx].call(remote_req.as_bytes(), origin) {
                         Ok(_) => break,
                         Err(copyrpc::error::Error::RingFull) => {
                             ctx.poll();
-                            for entry in drain_copyrpc_responses() {
-                                server.complete_request(
-                                    ClientId(entry.origin.client_id),
-                                    entry.origin.slot_index,
-                                    entry.response,
-                                );
-                            }
+                            COPYRPC_RESPONSES.with(|r| {
+                                for entry in r.borrow_mut().drain(..) {
+                                    server.complete_request(
+                                        ClientId(entry.origin.client_id),
+                                        entry.origin.slot_index,
+                                        entry.response,
+                                    );
+                                }
+                            });
                             continue;
                         }
                         Err(_) => break,
@@ -346,9 +340,7 @@ pub fn run_daemon(
 
             // 4c. copyrpc recv (incoming requests from remote nodes)
             while let Some(recv_handle) = ctx.recv() {
-                let data = recv_handle.data();
-                let remote_req = RemoteRequest::from_bytes(&data);
-                let req = remote_req.request;
+                let req = recv_handle.with_data(|data| RemoteRequest::from_bytes(data).request);
 
                 debug_assert_eq!(
                     ShardedStore::owner_of(req.key(), num_daemons as u64) as usize,
@@ -370,18 +362,22 @@ pub fn run_daemon(
             }
 
             // 4d. Drain copyrpc on_response results
-            for entry in drain_copyrpc_responses() {
-                server.complete_request(
-                    ClientId(entry.origin.client_id),
-                    entry.origin.slot_index,
-                    entry.response,
-                );
-            }
+            COPYRPC_RESPONSES.with(|r| {
+                for entry in r.borrow_mut().drain(..) {
+                    server.complete_request(
+                        ClientId(entry.origin.client_id),
+                        entry.origin.slot_index,
+                        entry.response,
+                    );
+                }
+            });
         }
 
         // === Phase 5: Complete deferred shm_spsc responses from Flux ===
-        for entry in drain_flux_responses() {
-            server.complete_request(ClientId(entry.client_id), entry.slot_index, entry.response);
-        }
+        FLUX_RESPONSES.with(|r| {
+            for entry in r.borrow_mut().drain(..) {
+                server.complete_request(ClientId(entry.client_id), entry.slot_index, entry.response);
+            }
+        });
     }
 }

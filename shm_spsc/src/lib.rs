@@ -648,6 +648,55 @@ impl<Req: Serial, Resp: Serial> Client<Req, Resp> {
         Ok(resp)
     }
 
+    /// Receives any completed response without ordering constraint (non-blocking).
+    ///
+    /// Scans all in-flight slots and returns the first completed one.
+    /// Returns `Ok(None)` if no slot has completed yet.
+    ///
+    /// **Warning**: Do not mix with `recv()` — the pending_queue is not updated.
+    pub fn try_recv_any(&mut self) -> Result<Option<Resp>, CallError> {
+        let all_slots_mask = (1u32 << self.slots_per_client) - 1;
+        let in_flight = !self.free_bitmap & all_slots_mask;
+        if in_flight == 0 {
+            return Ok(None);
+        }
+
+        let mut bits = in_flight;
+        while bits != 0 {
+            let slot_idx = bits.trailing_zeros();
+            bits &= bits - 1;
+
+            let global = self.global_slot(slot_idx);
+            let expected_seq = unsafe { *self.client_seqs.get_unchecked(slot_idx as usize) };
+
+            if self.slot_server_seq(global).load(Ordering::Acquire) == expected_seq {
+                let resp = unsafe { std::ptr::read_volatile(self.slot_resp_ptr(global)) };
+                self.free_bitmap |= 1 << slot_idx;
+                return Ok(Some(resp));
+            }
+        }
+
+        if !self.is_server_alive() {
+            return Err(CallError::ServerDisconnected);
+        }
+        Ok(None)
+    }
+
+    /// Receives any completed response without ordering constraint (blocking).
+    ///
+    /// Spins until at least one in-flight slot completes, then returns its response.
+    ///
+    /// **Warning**: Do not mix with `recv()` — the pending_queue is not updated.
+    pub fn recv_any(&mut self) -> Result<Resp, CallError> {
+        loop {
+            match self.try_recv_any() {
+                Ok(Some(resp)) => return Ok(resp),
+                Ok(None) => std::hint::spin_loop(),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Synchronous blocking RPC call.
     ///
     /// Equivalent to `send(req)` followed by `recv()`.

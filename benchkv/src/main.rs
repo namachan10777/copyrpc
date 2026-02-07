@@ -428,24 +428,27 @@ fn run_meta(
             run,
         );
 
-        if !steady.is_empty() {
-            let avg_rps: f64 = rows.iter().map(|r| r.rps).sum::<f64>() / rows.len() as f64;
+        let avg_rps = if !steady.is_empty() {
+            let avg = rows.iter().map(|r| r.rps).sum::<f64>() / rows.len() as f64;
             eprintln!(
                 "  rank {} run {}: avg {:.0} RPS ({} steady epochs)",
                 rank,
                 run + 1,
-                avg_rps,
+                avg,
                 steady.len()
             );
-            let mut total_rps = 0.0f64;
-            world.all_reduce_into(
-                &avg_rps,
-                &mut total_rps,
-                mpi::collective::SystemOperation::sum(),
-            );
-            if rank == 0 {
-                eprintln!("  total run {}: {:.0} RPS", run + 1, total_rps);
-            }
+            avg
+        } else {
+            0.0
+        };
+        let mut total_rps = 0.0f64;
+        world.all_reduce_into(
+            &avg_rps,
+            &mut total_rps,
+            mpi::collective::SystemOperation::sum(),
+        );
+        if rank == 0 {
+            eprintln!("  total run {}: {:.0} RPS", run + 1, total_rps);
         }
 
         all_rows.extend(rows);
