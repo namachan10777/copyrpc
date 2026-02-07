@@ -1,0 +1,2 @@
+fern03 slots=1
+fern04 slots=1
