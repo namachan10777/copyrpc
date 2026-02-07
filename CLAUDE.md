@@ -49,6 +49,13 @@ cargo clippy
 - `#[allow]` は最後の手段。使う場合はユーザに確認を取る。
 - ベンチマークが30秒以上かかる場合はハングの可能性が高い。
 
+マルチノードでテストをしたい場合、fern03,fern04であれば/dev/omni.txtを使いMPI実行が出来る。
+1 node = 1 rank前提でslotは一つずつ。
+
+```bash
+mpirun --hostfile ./dev/omni.txt -np 2 hostname
+```
+
 ## 環境情報
 
 - マシン: fern04, Intel Xeon Gold 6530, 32コア
