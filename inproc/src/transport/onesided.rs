@@ -167,13 +167,13 @@ impl<T: Serial> Sender<T> {
         // Ensure data write completes before generation/head is advanced
         compiler_fence(Ordering::Release);
 
+        // Write generation for immediate consumer visibility at any QD.
+        // Generation and data are in the same Slot (same cache line), so the
+        // consumer can detect + read in a single cache line transfer.
+        unsafe {
+            ptr::write_volatile(slot.generation.get(), self.head);
+        }
         if self.sends_since_publish == 0 {
-            // First send after publish: write generation for immediate consumer visibility.
-            // Generation and data are in the same Slot (same cache line), so the
-            // consumer can detect + read in a single cache line transfer.
-            unsafe {
-                ptr::write_volatile(slot.generation.get(), self.head);
-            }
             cldemote(slot as *const Slot<T> as *const u8);
         }
 
