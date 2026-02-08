@@ -39,6 +39,23 @@
   file = {/Users/mnakano/Zotero/storage/T98H7UTL/Association for Computing Machinery - 2013 - Proceedings of the 2013 ACM SIGPLAN Conference on .pdf}
 }
 
+@inproceedings{bakerMeasurementsDistributedFile1991,
+  title = {Measurements of a Distributed File System},
+  booktitle = {Proceedings of the Thirteenth {{ACM}} Symposium on {{Operating}} Systems Principles},
+  author = {Baker, Mary G. and Hartman, John H. and Kupfer, Michael D. and Shirriff, Ken W. and Ousterhout, John K.},
+  date = {1991-09},
+  pages = {198--212},
+  publisher = {ACM},
+  location = {Pacific Grove California USA},
+  doi = {10.1145/121132.121164},
+  url = {https://dl.acm.org/doi/10.1145/121132.121164},
+  urldate = {2024-06-20},
+  abstract = {We analyzed the user-level file access patterns and caching behavior of the Sprite distributed file system. The first part of our analysis repeated a study done in 1985 of the: BSD UNIX file system. We found that file throughput has increased by a factor of 20 to an average of 8 Kbytes per second per active user over 10-minute intervals, and that the use of process migration for load sharing increased burst rates by another factor of six. Also, many more very large (multi-megabyte) files are in use today than in 1985. The second part of our analysis measured the behavior of Sprite's main-memory file caches. Client-level caches average about 7 Mbytes in size (about one-quarter to one-third of main memory) and filter out about 50\% of the traffic between clients and servers. 35\% of the remaining server traffic is caused by paging, even on workstations with large memories. We found that client cache consistency is needed to prevent stale data errors, but that it is not invoked often enough to degrade overall system performance.},
+  eventtitle = {{{SOSP91}}: 13th {{ACM Symposium}} on {{Operating Systems Principles}}},
+  isbn = {978-0-89791-447-5},
+  langid = {english}
+}
+
 @inproceedings{bakerMeasurementsDistributedFile1991a,
   title = {Measurements of a Distributed File System},
   booktitle = {Proceedings of the Thirteenth {{ACM}} Symposium on {{Operating}} Systems Principles},
@@ -158,6 +175,41 @@
   file = {/Users/mnakano/Zotero/storage/HGV7NA6S/Brooker et al. - 2023 - On-demand Container Loading in AWS Lambda.pdf}
 }
 
+@article{caiEfficientDistributedMemory2018,
+  title = {Efficient Distributed Memory Management with {{RDMA}} and Caching},
+  author = {Cai, Qingchao and Guo, Wentian and Zhang, Hao and Agrawal, Divyakant and Chen, Gang and Ooi, Beng Chin and Tan, Kian-Lee and Teo, Yong Meng and Wang, Sheng},
+  date = {2018-07},
+  journaltitle = {Proceedings of the VLDB Endowment},
+  shortjournal = {Proc. VLDB Endow.},
+  volume = {11},
+  number = {11},
+  pages = {1604--1617},
+  issn = {2150-8097},
+  doi = {10.14778/3236187.3236209},
+  url = {https://dl.acm.org/doi/10.14778/3236187.3236209},
+  urldate = {2024-12-06},
+  abstract = {Recent advancements in high-performance networking interconnect significantly narrow the performance gap between intra-node and inter-node communications, and open up opportunities for distributed memory platforms to enforce cache coherency among distributed nodes. To this end, we propose GAM, an efficient distributed in-memory platform that provides a directory-based cache coherence protocol over remote direct memory access (RDMA). GAM manages the free memory distributed among multiple nodes to provide a unified memory model, and supports a set of userfriendly APIs for memory operations. To remove writes from critical execution paths, GAM allows a write to be reordered with the following reads and writes, and hence enforces partial store order (PSO) memory consistency. A light-weight logging scheme is designed to provide fault tolerance in GAM. We further build a transaction engine and a distributed hash table (DHT) atop GAM to show the ease-of-use and applicability of the provided APIs. Finally, we conduct an extensive micro benchmark to evaluate the read/write/lock performance of GAM under various workloads, and a macro benchmark against the transaction engine and DHT. The results show the superior performance of GAM over existing distributed memory platforms.},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/TWUMNQTE/Cai et al. - 2018 - Efficient distributed memory management with RDMA .pdf}
+}
+
+@inproceedings{calciuMessagePassingShared2013,
+  title = {Message {{Passing}} or {{Shared Memory}}: {{Evaluating}} the {{Delegation Abstraction}} for {{Multicores}}},
+  shorttitle = {Message {{Passing}} or {{Shared Memory}}},
+  booktitle = {Principles of {{Distributed Systems}}},
+  author = {Calciu, Irina and Dice, Dave and Harris, Tim and Herlihy, Maurice and Kogan, Alex and Marathe, Virendra and Moir, Mark},
+  editor = {Baldoni, Roberto and Nisse, Nicolas and family=Steen, given=Maarten, prefix=van, useprefix=true},
+  date = {2013},
+  pages = {83--97},
+  publisher = {Springer International Publishing},
+  location = {Cham},
+  doi = {10.1007/978-3-319-03850-6_7},
+  abstract = {Even for small multi-core systems, it has become harder and harder to support a simple shared memory abstraction: processors access some memory regions more quickly than others, a phenomenon called non-uniform memory access (NUMA). These trends have prompted researchers to investigate alternative programming abstractions based on message passing rather than cache-coherent shared memory. To advance a pragmatic understanding of these models’ strengths and weaknesses, we have explored a range of different message passing and shared memory designs, for a variety of concurrent data structures, running on different multicore architectures. Our goal was to evaluate which combinations perform best, and where simple software or hardware optimizations might have the most impact. We observe that different approaches perform best in different circumstances, and that the communication overhead of message passing can often outweigh its benefits. Nonetheless, we discuss ways in which this balance may shift in the future. Overall, we conclude that, by emphasizing high-level shared data abstractions, software should be designed to be largely independent of the choice of low-level communication mechanism.},
+  isbn = {978-3-319-03850-6},
+  langid = {english},
+  keywords = {concurrent data structures,delegation,locks,message passing,NUMA,shared memory}
+}
+
 @article{caoPolarFSUltralowLatency2018,
   title = {{{PolarFS}}: An Ultra-Low Latency and Failure Resilient Distributed File System for Shared Storage Cloud Database},
   shorttitle = {{{PolarFS}}},
@@ -175,6 +227,27 @@
   file = {/Users/mnakano/Zotero/storage/Q4MK7SXJ/Cao et al. - 2018 - PolarFS an ultra-low latency and failure resilien.pdf}
 }
 
+@article{careagaIntrinsicImageDecomposition2024,
+  title = {Intrinsic {{Image Decomposition}} via {{Ordinal Shading}}},
+  author = {Careaga, Chris and Aksoy, Yağız},
+  date = {2024-02-29},
+  journaltitle = {ACM Transactions on Graphics},
+  shortjournal = {ACM Trans. Graph.},
+  volume = {43},
+  number = {1},
+  eprint = {2311.12792},
+  eprinttype = {arXiv},
+  eprintclass = {cs},
+  pages = {1--24},
+  issn = {0730-0301, 1557-7368},
+  doi = {10.1145/3630750},
+  url = {http://arxiv.org/abs/2311.12792},
+  urldate = {2024-07-08},
+  abstract = {Intrinsic decomposition is a fundamental mid-level vision problem that plays a crucial role in various inverse rendering and computational photography pipelines. Generating highly accurate intrinsic decompositions is an inherently under-constrained task that requires precisely estimating continuous-valued shading and albedo. In this work, we achieve high-resolution intrinsic decomposition by breaking the problem into two parts. First, we present a dense ordinal shading formulation using a shift- and scale-invariant loss in order to estimate ordinal shading cues without restricting the predictions to obey the intrinsic model. We then combine low- and high-resolution ordinal estimations using a second network to generate a shading estimate with both global coherency and local details. We encourage the model to learn an accurate decomposition by computing losses on the estimated shading as well as the albedo implied by the intrinsic model. We develop a straightforward method for generating dense pseudo ground truth using our model's predictions and multi-illumination data, enabling generalization to in-the-wild imagery. We present an exhaustive qualitative and quantitative analysis of our predicted intrinsic components against state-of-the-art methods. Finally, we demonstrate the real-world applicability of our estimations by performing otherwise difficult editing tasks such as recoloring and relighting.},
+  keywords = {Computer Science - Artificial Intelligence,Computer Science - Computer Vision and Pattern Recognition,Computer Science - Graphics},
+  file = {/Users/mnakano/Zotero/storage/ELQ7LCBM/Careaga and Aksoy - 2024 - Intrinsic Image Decomposition via Ordinal Shading.pdf;/Users/mnakano/Zotero/storage/Y8EPRJET/2311.html}
+}
+
 @inproceedings{carnsPVFSParallelFile2000,
   title = {{{PVFS}}: {{A Parallel File System}} for {{Linux Clusters}}},
   shorttitle = {\{{{PVFS}}\}},
@@ -185,6 +258,41 @@
   eventtitle = {4th {{Annual Linux Showcase}} \& {{Conference}} ({{ALS}} 2000)},
   langid = {english},
   file = {/Users/mnakano/Zotero/storage/RLZ4VYNP/Carns et al. - 2000 - PVFS A Parallel File System for Linux Clusters.pdf}
+}
+
+@article{carnsUnderstandingImprovingComputational2011,
+  title = {Understanding and {{Improving Computational Science Storage Access}} through {{Continuous Characterization}}},
+  author = {Carns, Philip and Harms, Kevin and Allcock, William and Bacon, Charles and Lang, Samuel and Latham, Robert and Ross, Robert},
+  date = {2011-10-01},
+  journaltitle = {ACM Trans. Storage},
+  volume = {7},
+  number = {3},
+  pages = {8:1--8:26},
+  issn = {1553-3077},
+  doi = {10.1145/2027066.2027068},
+  url = {https://dl.acm.org/doi/10.1145/2027066.2027068},
+  urldate = {2024-09-19},
+  abstract = {Computational science applications are driving a demand for increasingly powerful storage systems. While many techniques are available for capturing the I/O behavior of individual application trial runs and specific components of the storage system, continuous characterization of a production system remains a daunting challenge for systems with hundreds of thousands of compute cores and multiple petabytes of storage. As a result, these storage systems are often designed without a clear understanding of the diverse computational science workloads they will support.In this study, we outline a methodology for scalable, continuous, systemwide I/O characterization that combines storage device instrumentation, static file system analysis, and a new mechanism for capturing detailed application-level behavior. This methodology allows us to identify both system-wide trends and application-specific I/O strategies. We demonstrate the effectiveness of our methodology by performing a multilevel, two-month study of Intrepid, a 557-teraflop IBM Blue Gene/P system. During that time, we captured application-level I/O characterizations from 6,481 unique jobs spanning 38 science and engineering projects. We used the results of our study to tune example applications, highlight trends that impact the design of future storage systems, and identify opportunities for improvement in I/O characterization methodology.},
+  file = {/Users/mnakano/Zotero/storage/9EKKCQVI/Carns et al. - 2011 - Understanding and Improving Computational Science .pdf}
+}
+
+@article{chaikenLimitLESSDirectoriesScalable,
+  title = {{{LimitLESS Directories}}: {{A Scalable Cache Coherence Scheme}}},
+  author = {Chaiken, David and Kubiatowicz, John and Agarwal, Anant},
+  abstract = {Caches enhance the performance of multiprocessors by reducing network tra c and average memory access latency. However, cache-based systems must address the problem of cache coherence. We propose the LimitLESS directory protocol to solve this problem. The LimitLESS scheme uses a combination of hardware and software techniques to realize the performance of a full-map directory with the memory overhead of a limited directory. This protocol is supported by Alewife, a large-scale multiprocessor. We describe the architectural interfaces needed to implement the LimitLESS directory, and evaluate its performance through simulations of the Alewife machine.},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/CCKVPK9M/Chaiken et al. - LimitLESS Directories A Scalable Cache Coherence .pdf}
+}
+
+@inproceedings{CharacterizingBehaviorScientific,
+  title = {Characterizing the {{I}}/{{O}} Behavior of Scientific Applications on the {{Cray XT}} | {{Request PDF}}},
+  booktitle = {{{ResearchGate}}},
+  doi = {10.1145/1374596.1374609},
+  url = {https://www.researchgate.net/publication/220782476_Characterizing_the_IO_behavior_of_scientific_applications_on_the_Cray_XT},
+  urldate = {2026-01-03},
+  abstract = {Request PDF | Characterizing the I/O behavior of scientific applications on the Cray XT | Scientific applications use input/output (I/O) for obtaining initial conditions and execution parameters, as a persistent way of saving program... | Find, read and cite all the research you need on ResearchGate},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/CSX3P8C4/220782476_Characterizing_the_IO_behavior_of_scientific_applications_on_the_Cray_XT.html}
 }
 
 @article{cheng3DCrosspointPhasechange2019,
@@ -263,6 +371,13 @@
   file = {/Users/mnakano/Zotero/storage/9DDDMNLF/Cui et al. - 2025 - Decentralized, Epoch-based F2FS Journaling with Fine-grained Crash Recovery.pdf}
 }
 
+@online{DAOSFriendsProceedings,
+  title = {{{DAOS}} and Friends | {{Proceedings}} of the {{International Conference}} for {{High Performance Computing}}, {{Networking}}, {{Storage}} and {{Analysis}}},
+  url = {https://dl.acm.org/doi/10.5555/3014904.3014971},
+  urldate = {2025-01-26},
+  file = {/Users/mnakano/Zotero/storage/GFNJT73S/3014904.html}
+}
+
 @inproceedings{denmanAcreMethodSupporting,
   title = {Acre: A {{Method}} for {{Supporting Strong Consistency}} and {{Adaptivity}} in {{Replicated Data Storage}}},
   shorttitle = {Acre},
@@ -271,6 +386,41 @@
   urldate = {2025-03-05},
   abstract = {As most key-value stores partition and replicate data to support high availability with no strong consistency guarantee among replicas, users may suffer from data inconsistency. Although previous research has been done to support strong consistency among replicated data, most existing approaches suffer from potential hotspots and load imbalance. Neither do they consider dynamic data access patterns that may largely vary over time. In this paper, we propose a new approach, called ACRE (Adaptive Chain REplication), to support strong consistency among data replicas, hotspot avoidance and load balancing, and adaptivity to dynamic data access patterns.},
   file = {/Users/mnakano/Zotero/storage/VKWUM8H8/Denman and Kang - Acre a Method for Supporting Strong Consistency a.pdf}
+}
+
+@online{devlinBERTPretrainingDeep2019,
+  title = {{{BERT}}: {{Pre-training}} of {{Deep Bidirectional Transformers}} for {{Language Understanding}}},
+  shorttitle = {{{BERT}}},
+  author = {Devlin, Jacob and Chang, Ming-Wei and Lee, Kenton and Toutanova, Kristina},
+  date = {2019-05-24},
+  eprint = {1810.04805},
+  eprinttype = {arXiv},
+  eprintclass = {cs},
+  doi = {10.48550/arXiv.1810.04805},
+  url = {http://arxiv.org/abs/1810.04805},
+  urldate = {2025-11-25},
+  abstract = {We introduce a new language representation model called BERT, which stands for Bidirectional Encoder Representations from Transformers. Unlike recent language representation models, BERT is designed to pre-train deep bidirectional representations from unlabeled text by jointly conditioning on both left and right context in all layers. As a result, the pre-trained BERT model can be fine-tuned with just one additional output layer to create state-of-the-art models for a wide range of tasks, such as question answering and language inference, without substantial task-specific architecture modifications. BERT is conceptually simple and empirically powerful. It obtains new state-of-the-art results on eleven natural language processing tasks, including pushing the GLUE score to 80.5\% (7.7\% point absolute improvement), MultiNLI accuracy to 86.7\% (4.6\% absolute improvement), SQuAD v1.1 question answering Test F1 to 93.2 (1.5 point absolute improvement) and SQuAD v2.0 Test F1 to 83.1 (5.1 point absolute improvement).},
+  pubstate = {prepublished},
+  keywords = {Computer Science - Computation and Language},
+  file = {/Users/mnakano/Zotero/storage/244JVZZX/Devlin et al. - 2019 - BERT Pre-training of Deep Bidirectional Transformers for Language Understanding.pdf;/Users/mnakano/Zotero/storage/CL4KX2YZ/1810.html}
+}
+
+@online{Dex,
+  title = {Dex},
+  url = {https://dex.k8s.pfn.io/auth/ldap/login?back=&state=lydybieiwkqmvap2tdquj5jmg},
+  urldate = {2025-05-08},
+  file = {/Users/mnakano/Zotero/storage/ZXV795FW/login.html}
+}
+
+@online{Di10HuiOpenLDAPtoACL2008,
+  title = {第10回 OpenLDAPとACL},
+  date = {2008-03-31T11:16:50+09:00},
+  url = {https://gihyo.jp/admin/serial/01/ldap/0010},
+  urldate = {2025-03-29},
+  abstract = {今回はOpenLDAPにおけるアクセス管理についてお話ししたいと思います。コンピュータの世界でファイルやDBにアクセス権という概念が存在するように、LDAPにおいても同様の考え方が存在します。},
+  langid = {japanese},
+  organization = {gihyo.jp},
+  file = {/Users/mnakano/Zotero/storage/I5NNHF9A/0010.html}
 }
 
 @inproceedings{dragojevicFaRMFastRemote2014,
@@ -333,6 +483,23 @@
   file = {/Users/mnakano/Zotero/storage/NQKE998D/Gao et al. - 2025 - Stripeless Data Placement for Erasure-Coded In-Memory Storage.pdf}
 }
 
+@online{ghiasiMegISHighPerformanceEnergyEfficient2024,
+  title = {{{MegIS}}: {{High-Performance}}, {{Energy-Efficient}}, and {{Low-Cost Metagenomic Analysis}} with {{In-Storage Processing}}},
+  shorttitle = {{{MegIS}}},
+  author = {Ghiasi, Nika Mansouri and Sadrosadati, Mohammad and Mustafa, Harun and Gollwitzer, Arvid and Firtina, Can and Eudine, Julien and Mao, Haiyu and Lindegger, Joël and Cavlak, Meryem Banu and Alser, Mohammed and Park, Jisung and Mutlu, Onur},
+  date = {2024-06-27},
+  eprint = {2406.19113},
+  eprinttype = {arXiv},
+  eprintclass = {cs},
+  doi = {10.48550/arXiv.2406.19113},
+  url = {http://arxiv.org/abs/2406.19113},
+  urldate = {2025-12-19},
+  abstract = {Metagenomics has led to significant advances in many fields. Metagenomic analysis commonly involves the key tasks of determining the species present in a sample and their relative abundances. These tasks require searching large metagenomic databases. Metagenomic analysis suffers from significant data movement overhead due to moving large amounts of low-reuse data from the storage system. In-storage processing can be a fundamental solution for reducing this overhead. However, designing an in-storage processing system for metagenomics is challenging because existing approaches to metagenomic analysis cannot be directly implemented in storage effectively due to the hardware limitations of modern SSDs. We propose MegIS, the first in-storage processing system designed to significantly reduce the data movement overhead of the end-to-end metagenomic analysis pipeline. MegIS is enabled by our lightweight design that effectively leverages and orchestrates processing inside and outside the storage system. We address in-storage processing challenges for metagenomics via specialized and efficient 1) task partitioning, 2) data/computation flow coordination, 3) storage technology-aware algorithmic optimizations, 4) data mapping, and 5) lightweight in-storage accelerators. MegIS's design is flexible, capable of supporting different types of metagenomic input datasets, and can be integrated into various metagenomic analysis pipelines. Our evaluation shows that MegIS outperforms the state-of-the-art performance- and accuracy-optimized software metagenomic tools by 2.7\$\textbackslash times\$-37.2\$\textbackslash times\$ and 6.9\$\textbackslash times\$-100.2\$\textbackslash times\$, respectively, while matching the accuracy of the accuracy-optimized tool. MegIS achieves 1.5\$\textbackslash times\$-5.1\$\textbackslash times\$ speedup compared to the state-of-the-art metagenomic hardware-accelerated (using processing-in-memory) tool, while achieving significantly higher accuracy.},
+  pubstate = {prepublished},
+  keywords = {Computer Science - Distributed Parallel and Cluster Computing,Computer Science - Hardware Architecture,Quantitative Biology - Genomics},
+  file = {/Users/mnakano/Zotero/storage/NRJCTTM8/Ghiasi et al. - 2024 - MegIS High-Performance, Energy-Efficient, and Low-Cost Metagenomic Analysis with In-Storage Process.pdf;/Users/mnakano/Zotero/storage/C62VGVMZ/2406.html}
+}
+
 @article{gibsonCostEffectiveHighBandwidthStorage,
   title = {A {{Cost-Effective}}, {{High-Bandwidth Storage Architecture}}},
   author = {Gibson, Garth A and Nagle, David F and Amiri, Khalil and Butler, Jeff and Chang, Fay W and Gobioff, Howard and Hardin, Charles and Riedel, Erik and Rochberg, David and Zelenka, Jim},
@@ -382,6 +549,21 @@
   isbn = {978-1-939133-35-9},
   langid = {english},
   file = {/Users/mnakano/Zotero/storage/G42AJI7Q/Guo et al. - 2023 - SingularFS A Billion-Scale Distributed File S.pdf}
+}
+
+@inproceedings{hayashibaraSplPhiAccrual2004,
+  title = {The /Spl Phi/ Accrual Failure Detector},
+  booktitle = {Proceedings of the 23rd {{IEEE International Symposium}} on {{Reliable Distributed Systems}}, 2004.},
+  author = {Hayashibara, N. and Defago, X. and Yared, R. and Katayama, T.},
+  date = {2004},
+  pages = {66--78},
+  publisher = {IEEE},
+  location = {Florianpolis, Brazil},
+  doi = {10.1109/RELDIS.2004.1353004},
+  url = {http://ieeexplore.ieee.org/document/1353004/},
+  urldate = {2024-06-03},
+  eventtitle = {Proceedings of the 23rd {{IEEE International Symposium}} on {{Reliable Distributed Systems}}, 2004.},
+  isbn = {978-0-7695-2239-5}
 }
 
 @inproceedings{hayashibaraSplPhiAccrual2004a,
@@ -448,6 +630,31 @@
   file = {/Users/mnakano/Zotero/storage/XYD778XC/Hiraga and Tatebe - 2024 - PEANUTS A Persistent Memory-Based Network Unilate.pdf}
 }
 
+@online{HPCSAdminZuoYeYongkarenda,
+  title = {HPCS Admin作業用カレンダー},
+  url = {https://calendar.google.com/calendar/u/0/embed?height=300&wkst=1&bgcolor=%23ffffff&ctz=Asia/Tokyo&src=c2dsZDdtajdiN2lkYWplbmxzdThkbHJsamdAZ3JvdXAuY2FsZW5kYXIuZ29vZ2xlLmNvbQ&color=%23AD1457&showTitle=1&showNav=1&showDate=1&showPrint=1&showTabs=1&showCalendars=0&showTz=1&mode=AGENDA&storage_access_granted=true},
+  urldate = {2025-04-01},
+  langid = {japanese}
+}
+
+@online{HttpsDlacmorgDoi,
+  title = {{{https://dl.acm.org/doi/pdf/10.1145/320083.320092}}},
+  url = {https://dl.acm.org/doi/pdf/10.1145/320083.320092},
+  urldate = {2024-06-24}
+}
+
+@online{HttpsDropsdagstuhldeStorage,
+  title = {{{https://drops.dagstuhl.de/storage/00lipics/lipics-vol032-snapl2015/LIPIcs.SNAPL.2015.238/LIPIcs.SNAPL.2015.238.pdf}}},
+  url = {https://drops.dagstuhl.de/storage/00lipics/lipics-vol032-snapl2015/LIPIcs.SNAPL.2015.238/LIPIcs.SNAPL.2015.238.pdf},
+  urldate = {2024-07-07}
+}
+
+@online{HttpsDropsdagstuhldeStoragea,
+  title = {{{https://drops.dagstuhl.de/storage/00lipics/lipics-vol032-snapl2015/LIPIcs.SNAPL.2015.238/LIPIcs.SNAPL.2015.238.pdf}}},
+  url = {https://drops.dagstuhl.de/storage/00lipics/lipics-vol032-snapl2015/LIPIcs.SNAPL.2015.238/LIPIcs.SNAPL.2015.238.pdf},
+  urldate = {2024-07-07}
+}
+
 @inproceedings{jannenBetrFSRightOptimizedWriteOptimized2015,
   title = {{{BetrFS}}: {{A Right-Optimized Write-Optimized File System}}},
   shorttitle = {\{{{BetrFS}}\}},
@@ -506,6 +713,36 @@
   keywords = {Communication standards,Computer science,Concurrent computing,Contracts,High performance computing,Information science,Protocols,Scientific computing,Throughput,Writing}
 }
 
+@inproceedings{jonesBigDataChallenges2012,
+  title = {Big Data Challenges for Large Radio Arrays},
+  booktitle = {2012 {{IEEE Aerospace Conference}}},
+  author = {Jones, Dayton L. and Wagstaff, Kiri and Thompson, David R. and D'Addario, Larry and Navarro, Robert and Mattmann, Chris and Majid, Walid and Lazio, Joseph and Preston, Robert and Rebbapragada, Umaa},
+  date = {2012-03},
+  pages = {1--6},
+  issn = {1095-323X},
+  doi = {10.1109/AERO.2012.6187090},
+  url = {https://ieeexplore.ieee.org/document/6187090},
+  urldate = {2026-01-03},
+  abstract = {Future large radio astronomy arrays, particularly the Square Kilometre Array (SKA), will be able to generate data at rates far higher than can be analyzed or stored affordably with current practices. This is, by definition, a "big data" problem, and requires an end-to-end solution if future radio arrays are to reach their full scientific potential. Similar data processing, transport, storage, and management challenges face next-generation facilities in many other fields. The Jet Propulsion Laboratory is developing technologies to address big data issues, with an emphasis in three areas: 1) Lower-power digital processing architectures to make highvolume data generation operationally affordable, 2) Date-adaptive machine learning algorithms for real-time analysis (or "data triage") of large data volumes, and 3) Scalable data archive systems that allow efficient data mining and remote user code to run locally where the data are stored.1},
+  eventtitle = {2012 {{IEEE Aerospace Conference}}},
+  keywords = {Antennas,Arrays,Data handling,Data storage systems,Information management,Radio astronomy,Transient analysis},
+  file = {/Users/mnakano/Zotero/storage/NQT3NYF3/Jones et al. - 2012 - Big data challenges for large radio arrays.pdf;/Users/mnakano/Zotero/storage/RNS44AMD/6187090.html}
+}
+
+@inproceedings{joshiPassthruUpstreamingFlexible2024,
+  title = {\{{{I}}/{{O}}\} {{Passthru}}: {{Upstreaming}} a Flexible and Efficient \{{{I}}/{{O}}\} {{Path}} in {{Linux}}},
+  shorttitle = {\{{{I}}/{{O}}\} {{Passthru}}},
+  author = {Joshi, Kanchan and Gupta, Anuj and González, Javier and Kumar, Ankit and Reddy, Krishna Kanth and George, Arun and Lund, Simon and Axboe, Jens},
+  date = {2024},
+  pages = {107--121},
+  url = {https://www.usenix.org/conference/fast24/presentation/joshi},
+  urldate = {2024-10-10},
+  eventtitle = {22nd {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 24)},
+  isbn = {978-1-939133-38-0},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/4F6VAVUZ/Joshi et al. - 2024 - IO Passthru Upstreaming a flexible and efficie.pdf}
+}
+
 @inproceedings{joshiPassthruUpstreamingFlexible2024a,
   title = {I/{{O Passthru}}: {{Upstreaming}} a Flexible and Efficient {{I}}/{{O Path}} in {{Linux}}},
   shorttitle = {\{{{I}}/{{O}}\} {{Passthru}}},
@@ -532,6 +769,40 @@
   abstract = {Many popular database management systems implement a multiversion concurrency control algorithm called snapshot isolation rather than providing full serializability based on locking. There are well-known anomalies permitted by snapshot isolation that ...},
   langid = {english},
   file = {/Users/mnakano/Zotero/storage/WNIBIALL/1620585.html}
+}
+
+@article{jumperHighlyAccurateProtein2021,
+  title = {Highly Accurate Protein Structure Prediction with {{AlphaFold}}},
+  author = {Jumper, John and Evans, Richard and Pritzel, Alexander and Green, Tim and Figurnov, Michael and Ronneberger, Olaf and Tunyasuvunakool, Kathryn and Bates, Russ and Žídek, Augustin and Potapenko, Anna and Bridgland, Alex and Meyer, Clemens and Kohl, Simon A. A. and Ballard, Andrew J. and Cowie, Andrew and Romera-Paredes, Bernardino and Nikolov, Stanislav and Jain, Rishub and Adler, Jonas and Back, Trevor and Petersen, Stig and Reiman, David and Clancy, Ellen and Zielinski, Michal and Steinegger, Martin and Pacholska, Michalina and Berghammer, Tamas and Bodenstein, Sebastian and Silver, David and Vinyals, Oriol and Senior, Andrew W. and Kavukcuoglu, Koray and Kohli, Pushmeet and Hassabis, Demis},
+  date = {2021-08},
+  journaltitle = {Nature},
+  volume = {596},
+  number = {7873},
+  pages = {583--589},
+  publisher = {Nature Publishing Group},
+  issn = {1476-4687},
+  doi = {10.1038/s41586-021-03819-2},
+  url = {https://www.nature.com/articles/s41586-021-03819-2},
+  urldate = {2025-11-25},
+  abstract = {Proteins are essential to life, and understanding their structure can facilitate a mechanistic understanding of their function. Through an enormous experimental effort1–4, the structures of around 100,000 unique proteins have been determined5, but this represents a small fraction of the billions of known protein sequences6,7. Structural coverage is bottlenecked by the months to years of painstaking effort required to determine a single protein structure. Accurate computational approaches are needed to address this gap and to enable large-scale structural bioinformatics. Predicting the three-dimensional structure that a protein will adopt based solely on its amino acid sequence—the structure prediction component of the ‘protein folding problem’8—has been an important open research problem for more than 50~years9. Despite recent progress10–14, existing methods fall far~short of atomic accuracy, especially when no homologous structure is available. Here we provide the first computational method that can regularly predict protein structures with atomic accuracy even in cases in which no similar structure is known. We validated an entirely redesigned version of our neural network-based model, AlphaFold, in the challenging 14th Critical Assessment of protein Structure Prediction (CASP14)15, demonstrating accuracy competitive with experimental structures in a majority of cases and greatly outperforming other methods. Underpinning the latest version of AlphaFold is a novel machine learning approach that incorporates physical and biological knowledge about protein structure, leveraging multi-sequence alignments, into the design of the deep learning algorithm.},
+  langid = {english},
+  keywords = {Computational biophysics,Machine learning,Protein structure predictions,Structural biology},
+  file = {/Users/mnakano/Zotero/storage/BJ9QD25T/Jumper et al. - 2021 - Highly accurate protein structure prediction with AlphaFold.pdf}
+}
+
+@inproceedings{juniorUseLocalityInformation2013,
+  title = {The {{Use}} of {{Locality Information}} on {{Data Intensive Parallel File Systems}}},
+  booktitle = {2013 {{IEEE}} 16th {{International Conference}} on {{Computational Science}} and {{Engineering}}},
+  author = {Junior, Ricardo Ryoiti Sugawara and Sato, Liria Matsumoto},
+  date = {2013-02},
+  pages = {167--173},
+  doi = {10.1109/CSE.2013.35},
+  url = {https://ieeexplore.ieee.org/document/6755213},
+  urldate = {2024-09-11},
+  abstract = {Many recent data intensive parallel systems builds with cost effective hardware and combine compute and storage facilities. Since bandwidth-bisecting networks are the norm, distributing jobs near data provides significant performance improvements. However, the data locality information is not easily available to the programmer. It requires interaction with file system internals, or the adoption of a custom programming and run-time frameworks that provide locality-aware job scheduling, such as Mapreduce and Hadoop. In this paper, we present a parallel file system implementation combined with virtual files presented as text that can be queried for locality data or written to control the placement of new data blocks. This simplifies how software that do not adhere to Mapreduce's model can benefit from computing near the data. To evaluate the proposed approach, a number of tests were run on an initial implementation using fast disks, with locality-aware cases showing from 2 to 9 times faster reads and higher processor utilization.},
+  eventtitle = {2013 {{IEEE}} 16th {{International Conference}} on {{Computational Science}} and {{Engineering}}},
+  keywords = {Bandwidth,Data Intensive,Fuses,Hadoop,Instruction sets,Kernel,Locality,Parallel File System,Registers,Servers,Sockets,Virtual File System},
+  file = {/Users/mnakano/Zotero/storage/UPQVKEUM/6755213.html}
 }
 
 @inproceedings{junWeAintAfraid2024,
@@ -779,6 +1050,22 @@
   file = {/Users/mnakano/Zotero/storage/KXESSQYP/Li et al. - 2022 - ctFS Replacing File Indexing with Hardware Memo.pdf}
 }
 
+@online{liSurveyLargeLanguage2025,
+  title = {A {{Survey}} on {{Large Language Model Acceleration}} Based on {{KV Cache Management}}},
+  author = {Li, Haoyang and Li, Yiming and Tian, Anxin and Tang, Tianhao and Xu, Zhanchao and Chen, Xuejia and Hu, Nicole and Dong, Wei and Li, Qing and Chen, Lei},
+  date = {2025-07-30},
+  eprint = {2412.19442},
+  eprinttype = {arXiv},
+  eprintclass = {cs},
+  doi = {10.48550/arXiv.2412.19442},
+  url = {http://arxiv.org/abs/2412.19442},
+  urldate = {2026-01-03},
+  abstract = {Large Language Models (LLMs) have revolutionized a wide range of domains such as natural language processing, computer vision, and multi-modal tasks due to their ability to comprehend context and perform logical reasoning. However, the computational and memory demands of LLMs, particularly during inference, pose significant challenges when scaling them to real-world, long-context, and real-time applications. Key-Value (KV) cache management has emerged as a critical optimization technique for accelerating LLM inference by reducing redundant computations and improving memory utilization. This survey provides a comprehensive overview of KV cache management strategies for LLM acceleration, categorizing them into token-level, model-level, and system-level optimizations. Token-level strategies include KV cache selection, budget allocation, merging, quantization, and low-rank decomposition, while model-level optimizations focus on architectural innovations and attention mechanisms to enhance KV reuse. System-level approaches address memory management, scheduling, and hardware-aware designs to improve efficiency across diverse computing environments. Additionally, the survey provides an overview of both text and multimodal datasets and benchmarks used to evaluate these strategies. By presenting detailed taxonomies and comparative analyses, this work aims to offer useful insights for researchers and practitioners to support the development of efficient and scalable KV cache management techniques, contributing to the practical deployment of LLMs in real-world applications. The curated paper list for KV cache management is in: \textbackslash href\{https://github.com/TreeAI-Lab/Awesome-KV-Cache-Management\}\{https://github.com/TreeAI-Lab/Awesome-KV-Cache-Management\}.},
+  pubstate = {prepublished},
+  keywords = {Computer Science - Artificial Intelligence,Computer Science - Distributed Parallel and Cluster Computing},
+  file = {/Users/mnakano/Zotero/storage/ZP4XN3L4/Li et al. - 2025 - A Survey on Large Language Model Acceleration based on KV Cache Management.pdf;/Users/mnakano/Zotero/storage/8BT5X9BI/2412.html}
+}
+
 @inproceedings{liuFlacIOFlatCollective2025,
   title = {{{FlacIO}}: {{Flat}} and {{Collective I}}/{{O}} for {{Container Image Service}}},
   shorttitle = {\{{{FlacIO}}\}},
@@ -851,6 +1138,23 @@
   abstract = {The DOE Extreme-Scale Technology Acceleration Fast Forward Storage and IO Stack project is going to have significant impact on storage systems design within and beyond the HPC community. With phase two of the project starting, it is an excellent opportunity to explore the complete design and how it will address the needs of extreme scale platforms. This paper examines each layer of the proposed stack in some detail along with cross-cutting topics, such as transactions and metadata management.This paper not only provides a timely summary of important aspects of the design specifications but also captures the underlying reasoning that is not available elsewhere. We encourage the broader community to understand the design, intent, and future directions to foster discussion guiding phase two and the ultimate production storage stack based on this work. An initial performance evaluation of the early prototype implementation is also provided to validate the presented design.},
   isbn = {978-1-4673-8815-3},
   file = {/Users/mnakano/Zotero/storage/FFW65ZJS/Lofstead et al. - 2016 - DAOS and friends a proposal for an exascale stora.pdf}
+}
+
+@inproceedings{luettgauEnablingAgileAnalysis2023,
+  title = {Enabling {{Agile Analysis}} of {{I}}/{{O Performance Data}} with {{PyDarshan}}},
+  booktitle = {Proceedings of the {{SC}} '23 {{Workshops}} of {{The International Conference}} on {{High Performance Computing}}, {{Network}}, {{Storage}}, and {{Analysis}}},
+  author = {Luettgau, Jakob and Snyder, Shane and Reddy, Tyler and Awtrey, Nikolaus and Harms, Kevin and Bez, Jean Luca and Wang, Rui and Latham, Rob and Carns, Philip},
+  date = {2023-11-12},
+  series = {{{SC-W}} '23},
+  pages = {1380--1391},
+  publisher = {Association for Computing Machinery},
+  location = {New York, NY, USA},
+  doi = {10.1145/3624062.3624207},
+  url = {https://dl.acm.org/doi/10.1145/3624062.3624207},
+  urldate = {2024-09-19},
+  abstract = {Modern scientific applications utilize numerous software and hardware layers to efficiently access data. This approach poses a challenge for I/O optimization because of the need to instrument and correlate information across those layers. The Darshan characterization tool seeks to address this challenge by providing efficient, transparent, and compact runtime instrumentation of many common I/O interfaces. It also includes command-line tools to generate actionable insights and summary reports. However, the extreme diversity of today’s scientific applications means that not all applications are well served by one-size-fits-all analysis tools. In this work we present PyDarshan, a Python-based library that enables agile analysis of I/O performance data. PyDarshan caters to both novice and advanced users by offering ready-to-use HTML reports as well as a rich collection of APIs to facilitate custom analyses. We present the design of PyDarshan and demonstrate its effectiveness in four diverse real-world analysis use cases.},
+  isbn = {979-8-4007-0785-8},
+  file = {/Users/mnakano/Zotero/storage/LN82IMX5/Luettgau et al. - 2023 - Enabling Agile Analysis of IO Performance Data wi.pdf}
 }
 
 @article{luoLSMbasedStorageTechniques2020,
@@ -969,6 +1273,65 @@
   file = {/Users/mnakano/Zotero/storage/TE5AF3Q7/chen-haibo.html}
 }
 
+@inproceedings{mongaBirdsFeatherFlock2021,
+  title = {Birds of a {{Feather Flock Together}}: {{Scaling RDMA RPCs}} with {{Flock}}},
+  shorttitle = {Birds of a {{Feather Flock Together}}},
+  booktitle = {Proceedings of the {{ACM SIGOPS}} 28th {{Symposium}} on {{Operating Systems Principles}}},
+  author = {Monga, Sumit Kumar and Kashyap, Sanidhya and Min, Changwoo},
+  date = {2021-10-26},
+  series = {{{SOSP}} '21},
+  pages = {212--227},
+  publisher = {Association for Computing Machinery},
+  location = {New York, NY, USA},
+  doi = {10.1145/3477132.3483576},
+  url = {https://doi.org/10.1145/3477132.3483576},
+  urldate = {2025-12-18},
+  abstract = {RDMA-capable networks are gaining traction with datacenter deployments due to their high throughput, low latency, CPU efficiency, and advanced features, such as remote memory operations. However, efficiently utilizing RDMA capability in a common setting of high fan-in, fan-out asymmetric network topology is challenging. For instance, using RDMA programming features comes at the cost of connection scalability, which does not scale with increasing cluster size. To address that, several works forgo some RDMA features by only focusing on conventional RPC APIs.In this work, we strive to exploit the full capability of RDMA, while scaling the number of connections regardless of the cluster size. We present Flock, a communication framework for RDMA networks that uses hardware provided reliable connection. Using a partially shared model, Flock departs from the conventional RDMA design by enabling connection sharing among threads, which provides significant performance improvements contrary to the widely held belief that connection sharing deteriorates performance. At its core, Flock uses a connection handle abstraction for connection multiplexing; a new coalescing-based synchronization approach for efficient network utilization; and a load-control mechanism for connections with symbiotic send-recv scheduling, which reduces the synchronization overheads associated with connection sharing along with ensuring fair utilization of network connections. We demonstrate the benefits for a distributed transaction processing system and an in-memory index, where it outperforms other RPC systems by up to 88\% and 50\%, respectively, with significant reductions in median and tail latency.},
+  isbn = {978-1-4503-8709-5},
+  file = {/Users/mnakano/Zotero/storage/3KL677I4/Monga et al. - 2021 - Birds of a Feather Flock Together Scaling RDMA RPCs with Flock.pdf;/Users/mnakano/Zotero/storage/ZA3DDX2G/ja-flock-monga-sosp21.pdf}
+}
+
+@online{Netflix,
+  title = {Netflix},
+  url = {https://www.netflix.com/jp/login},
+  urldate = {2025-12-12},
+  abstract = {Netflix (ネットフリックス) で映画やドラマをオンラインでストリーム再生! スマートテレビ、ゲーム機、パソコン、Mac、モバイル機器、タブレットなどでお楽しみいただけます。},
+  langid = {japanese}
+}
+
+@book{nielsenUsabilityEngineering1993,
+  title = {Usability Engineering},
+  author = {Nielsen, Jakob},
+  date = {1993},
+  publisher = {Academic Press},
+  location = {Boston},
+  abstract = {"Avoid usability surprises by including cost-effective usability activities throughout your product development life cycle." "Better usability engineering methods can help you avoid the four most frequently listed reasons for delay in software projects: frequent requests for changes by users, overlooked tasks, users' lack of understanding of their own requirements, and insufficient user-analyst communication and understanding. By implementing the methods discussed, you will be able to improve your user interfaces for software (or other products) immediately." "Systematic usability engineering leads to better user interfaces that make your system easier to learn and your users more productive. This helps reduce the frequency and seriousness of user errors, and makes the users like the system better."--Jacket},
+  isbn = {978-0-12-518406-9},
+  langid = {english}
+}
+
+@inproceedings{nilssonScalableTreeProtocola1992,
+  title = {The {{Scalable Tree Protocol-a}} Cache Coherence Approach for Large-Scale Multiprocessors},
+  booktitle = {[1992] {{Proceedings}} of the {{Fourth IEEE Symposium}} on {{Parallel}} and {{Distributed Processing}}},
+  author = {Nilsson, H. and Stenstrom, P.},
+  date = {1992-02},
+  pages = {498--506},
+  doi = {10.1109/SPDP.1992.242703},
+  url = {https://ieeexplore.ieee.org/document/242703/?arnumber=242703},
+  urldate = {2024-12-06},
+  abstract = {The problem of cache coherence in large-scale shared-memory multiprocessors has been addressed using directory-schemes. Two problems arise when the number of processors increases: the network latency increases and the implementation cost must be kept acceptable. The authors present a tree-based cache coherence protocol called the scalable tree protocol (STP). They show that it can be implemented at a reasonable implementation cost and that the write latency is logarithmic to the size of the sharing set. How to maintain an optimal tree structure and how to handle replacements efficiently are critical issues the authors address for this type of protocol. They compare the performance of the STP with that of the scalable coherent interface (SCI) (IEEE standard P1596) by considering a classical matrix-oriented algorithm targeted for large-scale parallel processing. They show that the STP manages to reduce the execution time considerably by reducing the write latency.{$<>$}},
+  eventtitle = {[1992] {{Proceedings}} of the {{Fourth IEEE Symposium}} on {{Parallel}} and {{Distributed Processing}}},
+  keywords = {Costs,Delay,Energy management,Large-scale systems,Memory management,Parallel processing,Parallel programming,Power system modeling,Protocols,Tree data structures},
+  file = {/Users/mnakano/Zotero/storage/PMXFMMBN/Nilsson and Stenstrom - 1992 - The Scalable Tree Protocol-a cache coherence appro.pdf;/Users/mnakano/Zotero/storage/A7SANYC9/242703.html}
+}
+
+@online{OAuth2ExamplesKanidm,
+  title = {{{OAuth2 Examples}} - {{Kanidm Administration}}},
+  url = {https://kanidm.github.io/kanidm/master/integrations/oauth2/examples.html},
+  urldate = {2025-03-30},
+  file = {/Users/mnakano/Zotero/storage/6ZC3LJGP/examples.html}
+}
+
 @inproceedings{ongaroSearchUnderstandableConsensus2014,
   title = {In {{Search}} of an {{Understandable Consensus Algorithm}}},
   author = {Ongaro, Diego and Ousterhout, John},
@@ -980,6 +1343,39 @@
   isbn = {978-1-931971-10-2},
   langid = {english},
   file = {/Users/mnakano/Zotero/storage/ZGHW78RR/Ongaro and Ousterhout - 2014 - In Search of an Understandable Consensus Algorithm.pdf}
+}
+
+@online{openaiGPT4TechnicalReport2024,
+  title = {{{GPT-4 Technical Report}}},
+  author = {OpenAI and Achiam, Josh and Adler, Steven and Agarwal, Sandhini and Ahmad, Lama and Akkaya, Ilge and Aleman, Florencia Leoni and Almeida, Diogo and Altenschmidt, Janko and Altman, Sam and Anadkat, Shyamal and Avila, Red and Babuschkin, Igor and Balaji, Suchir and Balcom, Valerie and Baltescu, Paul and Bao, Haiming and Bavarian, Mohammad and Belgum, Jeff and Bello, Irwan and Berdine, Jake and Bernadett-Shapiro, Gabriel and Berner, Christopher and Bogdonoff, Lenny and Boiko, Oleg and Boyd, Madelaine and Brakman, Anna-Luisa and Brockman, Greg and Brooks, Tim and Brundage, Miles and Button, Kevin and Cai, Trevor and Campbell, Rosie and Cann, Andrew and Carey, Brittany and Carlson, Chelsea and Carmichael, Rory and Chan, Brooke and Chang, Che and Chantzis, Fotis and Chen, Derek and Chen, Sully and Chen, Ruby and Chen, Jason and Chen, Mark and Chess, Ben and Cho, Chester and Chu, Casey and Chung, Hyung Won and Cummings, Dave and Currier, Jeremiah and Dai, Yunxing and Decareaux, Cory and Degry, Thomas and Deutsch, Noah and Deville, Damien and Dhar, Arka and Dohan, David and Dowling, Steve and Dunning, Sheila and Ecoffet, Adrien and Eleti, Atty and Eloundou, Tyna and Farhi, David and Fedus, Liam and Felix, Niko and Fishman, Simón Posada and Forte, Juston and Fulford, Isabella and Gao, Leo and Georges, Elie and Gibson, Christian and Goel, Vik and Gogineni, Tarun and Goh, Gabriel and Gontijo-Lopes, Rapha and Gordon, Jonathan and Grafstein, Morgan and Gray, Scott and Greene, Ryan and Gross, Joshua and Gu, Shixiang Shane and Guo, Yufei and Hallacy, Chris and Han, Jesse and Harris, Jeff and He, Yuchen and Heaton, Mike and Heidecke, Johannes and Hesse, Chris and Hickey, Alan and Hickey, Wade and Hoeschele, Peter and Houghton, Brandon and Hsu, Kenny and Hu, Shengli and Hu, Xin and Huizinga, Joost and Jain, Shantanu and Jain, Shawn and Jang, Joanne and Jiang, Angela and Jiang, Roger and Jin, Haozhun and Jin, Denny and Jomoto, Shino and Jonn, Billie and Jun, Heewoo and Kaftan, Tomer and Kaiser, Łukasz and Kamali, Ali and Kanitscheider, Ingmar and Keskar, Nitish Shirish and Khan, Tabarak and Kilpatrick, Logan and Kim, Jong Wook and Kim, Christina and Kim, Yongjik and Kirchner, Jan Hendrik and Kiros, Jamie and Knight, Matt and Kokotajlo, Daniel and Kondraciuk, Łukasz and Kondrich, Andrew and Konstantinidis, Aris and Kosic, Kyle and Krueger, Gretchen and Kuo, Vishal and Lampe, Michael and Lan, Ikai and Lee, Teddy and Leike, Jan and Leung, Jade and Levy, Daniel and Li, Chak Ming and Lim, Rachel and Lin, Molly and Lin, Stephanie and Litwin, Mateusz and Lopez, Theresa and Lowe, Ryan and Lue, Patricia and Makanju, Anna and Malfacini, Kim and Manning, Sam and Markov, Todor and Markovski, Yaniv and Martin, Bianca and Mayer, Katie and Mayne, Andrew and McGrew, Bob and McKinney, Scott Mayer and McLeavey, Christine and McMillan, Paul and McNeil, Jake and Medina, David and Mehta, Aalok and Menick, Jacob and Metz, Luke and Mishchenko, Andrey and Mishkin, Pamela and Monaco, Vinnie and Morikawa, Evan and Mossing, Daniel and Mu, Tong and Murati, Mira and Murk, Oleg and Mély, David and Nair, Ashvin and Nakano, Reiichiro and Nayak, Rajeev and Neelakantan, Arvind and Ngo, Richard and Noh, Hyeonwoo and Ouyang, Long and O'Keefe, Cullen and Pachocki, Jakub and Paino, Alex and Palermo, Joe and Pantuliano, Ashley and Parascandolo, Giambattista and Parish, Joel and Parparita, Emy and Passos, Alex and Pavlov, Mikhail and Peng, Andrew and Perelman, Adam and Peres, Filipe de Avila Belbute and Petrov, Michael and Pinto, Henrique Ponde de Oliveira and Michael and Pokorny and Pokrass, Michelle and Pong, Vitchyr H. and Powell, Tolly and Power, Alethea and Power, Boris and Proehl, Elizabeth and Puri, Raul and Radford, Alec and Rae, Jack and Ramesh, Aditya and Raymond, Cameron and Real, Francis and Rimbach, Kendra and Ross, Carl and Rotsted, Bob and Roussez, Henri and Ryder, Nick and Saltarelli, Mario and Sanders, Ted and Santurkar, Shibani and Sastry, Girish and Schmidt, Heather and Schnurr, David and Schulman, John and Selsam, Daniel and Sheppard, Kyla and Sherbakov, Toki and Shieh, Jessica and Shoker, Sarah and Shyam, Pranav and Sidor, Szymon and Sigler, Eric and Simens, Maddie and Sitkin, Jordan and Slama, Katarina and Sohl, Ian and Sokolowsky, Benjamin and Song, Yang and Staudacher, Natalie and Such, Felipe Petroski and Summers, Natalie and Sutskever, Ilya and Tang, Jie and Tezak, Nikolas and Thompson, Madeleine B. and Tillet, Phil and Tootoonchian, Amin and Tseng, Elizabeth and Tuggle, Preston and Turley, Nick and Tworek, Jerry and Uribe, Juan Felipe Cerón and Vallone, Andrea and Vijayvergiya, Arun and Voss, Chelsea and Wainwright, Carroll and Wang, Justin Jay and Wang, Alvin and Wang, Ben and Ward, Jonathan and Wei, Jason and Weinmann, C. J. and Welihinda, Akila and Welinder, Peter and Weng, Jiayi and Weng, Lilian and Wiethoff, Matt and Willner, Dave and Winter, Clemens and Wolrich, Samuel and Wong, Hannah and Workman, Lauren and Wu, Sherwin and Wu, Jeff and Wu, Michael and Xiao, Kai and Xu, Tao and Yoo, Sarah and Yu, Kevin and Yuan, Qiming and Zaremba, Wojciech and Zellers, Rowan and Zhang, Chong and Zhang, Marvin and Zhao, Shengjia and Zheng, Tianhao and Zhuang, Juntang and Zhuk, William and Zoph, Barret},
+  date = {2024-03-04},
+  eprint = {2303.08774},
+  eprinttype = {arXiv},
+  eprintclass = {cs},
+  doi = {10.48550/arXiv.2303.08774},
+  url = {http://arxiv.org/abs/2303.08774},
+  urldate = {2025-11-25},
+  abstract = {We report the development of GPT-4, a large-scale, multimodal model which can accept image and text inputs and produce text outputs. While less capable than humans in many real-world scenarios, GPT-4 exhibits human-level performance on various professional and academic benchmarks, including passing a simulated bar exam with a score around the top 10\% of test takers. GPT-4 is a Transformer-based model pre-trained to predict the next token in a document. The post-training alignment process results in improved performance on measures of factuality and adherence to desired behavior. A core component of this project was developing infrastructure and optimization methods that behave predictably across a wide range of scales. This allowed us to accurately predict some aspects of GPT-4's performance based on models trained with no more than 1/1,000th the compute of GPT-4.},
+  pubstate = {prepublished},
+  keywords = {Computer Science - Artificial Intelligence,Computer Science - Computation and Language},
+  file = {/Users/mnakano/Zotero/storage/N2WMQHB7/OpenAI et al. - 2024 - GPT-4 Technical Report.pdf;/Users/mnakano/Zotero/storage/GLVYG63U/2303.html}
+}
+
+@online{ottFairseqFastExtensible2019,
+  title = {Fairseq: {{A Fast}}, {{Extensible Toolkit}} for {{Sequence Modeling}}},
+  shorttitle = {Fairseq},
+  author = {Ott, Myle and Edunov, Sergey and Baevski, Alexei and Fan, Angela and Gross, Sam and Ng, Nathan and Grangier, David and Auli, Michael},
+  date = {2019-04-01},
+  eprint = {1904.01038},
+  eprinttype = {arXiv},
+  eprintclass = {cs},
+  doi = {10.48550/arXiv.1904.01038},
+  url = {http://arxiv.org/abs/1904.01038},
+  urldate = {2026-01-03},
+  abstract = {fairseq is an open-source sequence modeling toolkit that allows researchers and developers to train custom models for translation, summarization, language modeling, and other text generation tasks. The toolkit is based on PyTorch and supports distributed training across multiple GPUs and machines. We also support fast mixed-precision training and inference on modern GPUs. A demo video can be found at https://www.youtube.com/watch?v=OtgDdWtHvto},
+  pubstate = {prepublished},
+  keywords = {Computer Science - Computation and Language},
+  file = {/Users/mnakano/Zotero/storage/DHMC3YCP/Ott et al. - 2019 - fairseq A Fast, Extensible Toolkit for Sequence Modeling.pdf;/Users/mnakano/Zotero/storage/V6PUSYDA/1904.html}
 }
 
 @inproceedings{panFacebooksTectonicFilesystem2021,
@@ -1082,6 +1478,19 @@
   file = {/Users/mnakano/Zotero/storage/2XJ38EY6/Pismenny et al. - 2025 - Disentangling the Dual Role of NIC Receive Rings.pdf}
 }
 
+@inproceedings{qianCombiningBufferedDirect2024,
+  title = {Combining {{Buffered}} \{{{I}}/{{O}}\} and {{Direct}} \{{{I}}/{{O}}\} in {{Distributed File Systems}}},
+  author = {Qian, Yingjin and Vef, Marc-André and Farrell, Patrick and Dilger, Andreas and Li, Xi and Ihara, Shuichi and Fu, Yinjin and Xue, Wei and Brinkmann, André},
+  date = {2024},
+  pages = {17--33},
+  url = {https://www.usenix.org/conference/fast24/presentation/qian},
+  urldate = {2024-09-11},
+  eventtitle = {22nd {{USENIX Conference}} on {{File}} and {{Storage Technologies}} ({{FAST}} 24)},
+  isbn = {978-1-939133-38-0},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/V9UBQCNV/Qian et al. - 2024 - Combining Buffered IO and Direct IO in Distr.pdf}
+}
+
 @inproceedings{qianCombiningBufferedDirect2024a,
   title = {Combining {{Buffered I}}/{{O}} and {{Direct I}}/{{O}} in {{Distributed File Systems}}},
   author = {Qian, Yingjin and Vef, Marc-André and Farrell, Patrick and Dilger, Andreas and Li, Xi and Ihara, Shuichi and Fu, Yinjin and Xue, Wei and Brinkmann, André},
@@ -1111,6 +1520,13 @@
   abstract = {Directory tree walks on parallel file systems are costly operations frequently required by many storage management tasks. Even listing the contents of a single directory can take minutes to hours for huge directories, as the tree walk performance of parallel file systems in Linux is severely throttled by sequentially accessing distributed metadata for each file through the syscall interface.We present eXtreme file attribute stat (Xfast), which scales the performance of directory tree walks by combining techniques that have been developed over a time frame of 10 years for the Lustre file system. Scalable statahead predicts file access patterns and prefetches required attributes, while the Size on MDT (SOM) mechanism reduces the number of RPC calls to collect file attributes. Xfast improves the performance of common directory operations, e.g. reduces the time to list one million files from 11 minutes to less than one minute for a single process.},
   isbn = {979-8-4007-0109-2},
   file = {/Users/mnakano/Zotero/storage/RXM3GQCB/Qian et al. - 2023 - Xfast Extreme File Attribute Stat Acceleration fo.pdf}
+}
+
+@online{RedirectingSlack,
+  title = {Redirecting... | {{Slack}}},
+  url = {https://tsukuba-hpcs.slack.com/ssb/signin_redirect?s=1&v=4.37.101&ssb_vid=.e2f374188884ac11d84a9d5b8b2ee91e&ssb_instance_id=d85d785a-4421-47bb-9b34-e3a3cc139a63&is_ssb_browser_signin=1},
+  urldate = {2024-07-08},
+  file = {/Users/mnakano/Zotero/storage/E2NSZJKT/signin_redirect.html}
 }
 
 @inproceedings{renIndexFSScalingFile2014,
@@ -1176,6 +1592,38 @@
   file = {/Users/mnakano/Zotero/storage/SQBDUI99/Rompf et al. - 2015 - Go Meta! A Case for Generative Programming and DSL.pdf}
 }
 
+@article{sanchez-gallegosHERCULESScalableElastic2025,
+  title = {{{HERCULES}}: {{A}} Scalable and Elastic Ad-Hoc File System for Large-Scale Computing Systems},
+  shorttitle = {{{HERCULES}}},
+  author = {Sánchez-Gallegos, Genaro and Petre, Cosmin and Garcia-Blas, Javier and Carretero, Jesus},
+  date = {2025-12-28},
+  journaltitle = {Future Generation Computer Systems},
+  shortjournal = {Future Generation Computer Systems},
+  pages = {108350},
+  issn = {0167-739X},
+  doi = {10.1016/j.future.2025.108350},
+  url = {https://www.sciencedirect.com/science/article/pii/S0167739X25006442},
+  urldate = {2026-01-02},
+  abstract = {The increasing demand for data processing by new, data-intensive applications is placing significant strain on the performance and capacity of HPC storage systems. Advancements in storage technologies, such as NVMe and persistent memory, have been introduced to address these demands. However, relying exclusively on ultra-fast storage devices is not cost-effective, necessitating multi-tier storage hierarchies to manage data based on its usage. In response, ad-hoc file systems have been proposed as a solution. These systems use the storage resources available in compute nodes, including memory and persistent storage, to create temporary file systems that adapt to application behavior in the HPC environment. This work presents the design, implementation, and evaluation of HERCULES, a distributed ad-hoc in-memory storage system, with a focus on its new metadata and elasticity model. HERCULES takes advantage of the Unified Communication X (UCX) framework, leveraging RDMA protocols such as Infiniband, Omnipath, shared-memory, and zero-copy transfers for data transfer. It includes elasticity features at runtime and fault-tolerant facilities. The elasticity features, together with flexible policies for data allocation, allow HERCULES to migrate data so that the available resources can be efficiently used. Our exhaustive evaluation results demonstrate a better performance than Lustre and BeeGFS, two parallel file systems heavily used in High-Performance Computing systems, and GekkoFS, an ad-hoc state-of-the-art solution.},
+  keywords = {Elasticity,file System,HPC,In-Memory,Metadata management,Resilience},
+  file = {/Users/mnakano/Zotero/storage/9RUCVIUW/Sánchez-Gallegos et al. - 2025 - HERCULES A scalable and elastic ad-hoc file system for large-scale computing systems.pdf;/Users/mnakano/Zotero/storage/EAGL9TV2/S0167739X25006442.html}
+}
+
+@inproceedings{sasanoSimpleApproachUnknown2013,
+  title = {A {{Simple Approach}} to {{Unknown Word Processing}} in {{Japanese Morphological Analysis}}},
+  booktitle = {Proceedings of the {{Sixth International Joint Conference}} on {{Natural Language Processing}}},
+  author = {Sasano, Ryohei and Kurohashi, Sadao and Okumura, Manabu},
+  editor = {Mitkov, Ruslan and Park, Jong C.},
+  date = {2013-10},
+  pages = {162--170},
+  publisher = {Asian Federation of Natural Language Processing},
+  location = {Nagoya, Japan},
+  url = {https://aclanthology.org/I13-1019},
+  urldate = {2024-10-14},
+  eventtitle = {{{IJCNLP}} 2013},
+  file = {/Users/mnakano/Zotero/storage/NKJM7N6G/Sasano et al. - 2013 - A Simple Approach to Unknown Word Processing in Ja.pdf}
+}
+
 @inproceedings{satijaCloudscapeStudyStorage2025,
   title = {Cloudscape: {{A Study}} of {{Storage Services}} in {{Modern Cloud Architectures}}},
   shorttitle = {Cloudscape},
@@ -1202,6 +1650,12 @@
   isbn = {978-1-939133-47-2},
   langid = {english},
   file = {/Users/mnakano/Zotero/storage/UV3JPUKC/Schuermann et al. - 2025 - Building Bridges Safe Interactions with Foreign Languages through Omniglot.pdf}
+}
+
+@online{SelectivePreprocessingOffloading,
+  title = {A {{Selective Preprocessing Offloading Framework}} for {{Reducing Data Traffic}} in {{DL Training}} | {{Proceedings}} of the 16th {{ACM Workshop}} on {{Hot Topics}} in {{Storage}} and {{File Systems}}},
+  url = {https://dl.acm.org/doi/10.1145/3655038.3665947},
+  urldate = {2025-01-31}
 }
 
 @inproceedings{SFSRandomWrite2012,
@@ -1289,6 +1743,21 @@
   file = {/Users/mnakano/Zotero/storage/LYW6B39E/Singh and Bawa - 2018 - Scalable Metadata Management Techniques for Ultra-.pdf}
 }
 
+@inproceedings{snyderModularHPCCharacterization2016,
+  title = {Modular {{HPC I}}/{{O Characterization}} with {{Darshan}}},
+  booktitle = {2016 5th {{Workshop}} on {{Extreme-Scale Programming Tools}} ({{ESPT}})},
+  author = {Snyder, Shane and Carns, Philip and Harms, Kevin and Ross, Robert and Lockwood, Glenn K. and Wright, Nicholas J.},
+  date = {2016-01-01},
+  pages = {9--17},
+  doi = {10.1109/ESPT.2016.006},
+  url = {https://ieeexplore.ieee.org/document/7830462},
+  urldate = {2024-09-19},
+  abstract = {Contemporary high-performance computing (HPC) applications encompass a broad range of distinct I/O strategies and are often executed on a number of different compute platforms in their lifetime. These large-scale HPC platforms employ increasingly complex I/O subsystems to provide a suitable level of I/O performance to applications. Tuning I/O workloads for such a system is nontrivial, and the results generally are not portable to other HPC systems. I/O profiling tools can help to address this challenge, but most existing tools only instrument specific components within the I/O subsystem that provide a limited perspective on I/O performance. The increasing diversity of scientific applications and computing platforms calls for greater flexibility and scope in I/O characterization.In this work, we consider how the I/O profiling tool Darshan can be improved to allow for more flexible, comprehensive instrumentation of current and future HPC I/O workloads. We evaluate the performance and scalability of our design to ensure that it is lightweight enough for full-time deployment on production HPC systems. We also present two case studies illustrating how a more comprehensive instrumentation of application I/O workloads can enable insights into I/O behavior that were not previously possible. Our results indicate that Darshan's modular instrumentation methods can provide valuable feedback to both users and system administrators, while imposing negligible overheads on user applications.},
+  eventtitle = {2016 5th {{Workshop}} on {{Extreme-Scale Programming Tools}} ({{ESPT}})},
+  keywords = {Buffer storage,Instruments,Libraries,Production systems,Registers,Runtime,Writing},
+  file = {/Users/mnakano/Zotero/storage/NB2WFDXQ/Snyder et al. - 2016 - Modular HPC IO Characterization with Darshan.pdf}
+}
+
 @unpublished{SongGangCongCiShiDaiJiSuanJiPanFuYueNEXTnoTuiJinnituite2024,
   title = {次世代計算基盤（富岳NEXT）の推進について},
   author = {松岡聡},
@@ -1296,6 +1765,32 @@
   url = {https://www.mext.go.jp/content/20240823-mxt-jyohoka01-000037488\_04.pdf},
   langid = {japanese},
   file = {/Users/mnakano/Zotero/storage/4R9IGV5Y/計算科学研究センター - 次世代計算基盤（富岳NEXT）の推進について.pdf}
+}
+
+@article{stenderStripingSacrificesMaintaining,
+  title = {Striping without {{Sacriﬁces}}: {{Maintaining POSIX Semantics}} in a {{Parallel File System}}},
+  author = {Stender, Jan and Kolbeck, Björn and Hupfeld, Felix and Cesario, Eugenio and Focht, Erich and Hess, Matthias and Malo, Jesús and Martí, Jonathan},
+  abstract = {Striping is a technique that distributes file content over multiple storage servers and thereby enables parallel access. In order to be able to provide a consistent view across file data and metadata operations, the file system has to track the layout of the file and know where the file ends and where it contains gaps. In this paper, we present a light-weight protocol for maintaining a consistent notion of a file’s layout that provides POSIX semantics without restricting concurrent access to the file. In an evaluation, we show that the protocol scales and elicit its corner cases.},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/BY8MIFAJ/Stender et al. - Striping without Sacriﬁces Maintaining POSIX Sema.pdf}
+}
+
+@article{subramaniamUsingInflightChains2013,
+  title = {Using In-Flight Chains to Build a Scalable Cache Coherence Protocol},
+  author = {Subramaniam, Samantika and Steely, Simon C. and Hasenplaugh, Will and Jaleel, Aamer and Beckmann, Carl and Fossum, Tryggve and Emer, Joel},
+  date = {2013-12},
+  journaltitle = {ACM Transactions on Architecture and Code Optimization},
+  shortjournal = {ACM Trans. Archit. Code Optim.},
+  volume = {10},
+  number = {4},
+  pages = {1--24},
+  issn = {1544-3566, 1544-3973},
+  doi = {10.1145/2541228.2541235},
+  url = {https://dl.acm.org/doi/10.1145/2541228.2541235},
+  urldate = {2024-12-06},
+  abstract = {As microprocessor designs integrate more cores, scalability of cache coherence protocols becomes a challenging problem. Most directory-based protocols avoid races by using blocking tag directories that can impact the performance of parallel applications. In this article, we first quantitatively demonstrate that state-of-the-art blocking protocols significantly constrain throughput at large core counts for several parallel applications. Nonblocking protocols address this throughput concern at the expense of scalability in the interconnection network or in the required resource overheads. To address this concern, we enhance nonblocking directory protocols by migrating the point of service of responses. Our approach uses in-flight chains of cores making parallel memory requests to incorporate scalability while maintaining high-throughput. The proposed cache coherence protocol called               chained cache coherence               , can outperform blocking protocols by up to 20\% on scientific and 12\% on commercial applications. It also has low resource overheads and simple address ordering requirements making it both a high-performance and scalable protocol. Furthermore, in-flight chains provide a scalable solution to building hierarchical and nonblocking tag directories as well as optimize communication latencies.},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/6WU8GQEM/Subramaniam et al. - 2013 - Using in-flight chains to build a scalable cache c.pdf}
 }
 
 @inproceedings{sugiharaDesignDirectRead2020,
@@ -1390,6 +1885,41 @@
   file = {/Users/mnakano/Zotero/storage/WPIQSYW3/Terrace and Freedman - Object Storage on CRAQ.pdf}
 }
 
+@inproceedings{tolmachevJumanMorphologicalAnalysis2018,
+  title = {Juman++: {{A Morphological Analysis Toolkit}} for {{Scriptio Continua}}},
+  shorttitle = {Juman++},
+  booktitle = {Proceedings of the 2018 {{Conference}} on {{Empirical Methods}} in {{Natural Language Processing}}: {{System Demonstrations}}},
+  author = {Tolmachev, Arseny and Kawahara, Daisuke and Kurohashi, Sadao},
+  editor = {Blanco, Eduardo and Lu, Wei},
+  date = {2018-01-01},
+  pages = {54--59},
+  publisher = {Association for Computational Linguistics},
+  location = {Brussels, Belgium},
+  doi = {10.18653/v1/D18-2010},
+  url = {https://aclanthology.org/D18-2010},
+  urldate = {2024-10-14},
+  abstract = {We present a three-part toolkit for developing morphological analyzers for languages without natural word boundaries. The first part is a C++11/14 lattice-based morphological analysis library that uses a combination of linear and recurrent neural net language models for analysis. The other parts are a tool for exposing problems in the trained model and a partial annotation tool. Our morphological analyzer of Japanese achieves new SOTA on Jumandic-based corpora while being 250 times faster than the previous one. We also perform a small experiment and quantitive analysis and experience of using development tools. All components of the toolkit is open source and available under a permissive Apache 2 License.},
+  file = {/Users/mnakano/Zotero/storage/6IUSH4EF/Tolmachev et al. - 2018 - Juman++ A Morphological Analysis Toolkit for Scri.pdf}
+}
+
+@online{TongYiRenZhengsisutemuUnifiedAuthentication,
+  title = {統一認証システム ({{Unified Authentication System}})},
+  url = {https://idp.account.tsukuba.ac.jp/idp/profile/SAML2/Redirect/SSO?execution=e1s2},
+  urldate = {2025-05-07},
+  file = {/Users/mnakano/Zotero/storage/A7BHFQAK/SSO.html}
+}
+
+@online{UsabilityEngineeringBook,
+  title = {Usability {{Engineering}} : {{Book}} by {{Jakob Nielsen}}},
+  shorttitle = {Usability {{Engineering}}},
+  url = {https://www.nngroup.com/books/usability-engineering/},
+  urldate = {2026-01-03},
+  abstract = {Jakob Nielsen's textbook on applying systematic methods throughout the development lifecycle to increase ease-of-use for software, websites, and other user interfaces. Emphasis on cheap  and fast methods.},
+  langid = {english},
+  organization = {Nielsen Norman Group},
+  file = {/Users/mnakano/Zotero/storage/SNV4WVYI/usability-engineering.html}
+}
+
 @online{UsingLightweightFormal,
   title = {Using {{Lightweight Formal Methods}} to {{Validate}} a {{Key-Value Storage Node}} in {{Amazon S3}} | {{Proceedings}} of the {{ACM SIGOPS}} 28th {{Symposium}} on {{Operating Systems Principles}}},
   doi = {10.1145/3477132.3483540},
@@ -1433,6 +1963,22 @@
   isbn = {978-1-931971-36-2},
   langid = {english},
   file = {/Users/mnakano/Zotero/storage/AU5UT48P/Vangoor et al. - 2017 - To FUSE or Not to FUSE Performance of User-S.pdf}
+}
+
+@online{vaswaniAttentionAllYou2023,
+  title = {Attention {{Is All You Need}}},
+  author = {Vaswani, Ashish and Shazeer, Noam and Parmar, Niki and Uszkoreit, Jakob and Jones, Llion and Gomez, Aidan N. and Kaiser, Lukasz and Polosukhin, Illia},
+  date = {2023-08-02},
+  eprint = {1706.03762},
+  eprinttype = {arXiv},
+  eprintclass = {cs},
+  doi = {10.48550/arXiv.1706.03762},
+  url = {http://arxiv.org/abs/1706.03762},
+  urldate = {2026-01-03},
+  abstract = {The dominant sequence transduction models are based on complex recurrent or convolutional neural networks in an encoder-decoder configuration. The best performing models also connect the encoder and decoder through an attention mechanism. We propose a new simple network architecture, the Transformer, based solely on attention mechanisms, dispensing with recurrence and convolutions entirely. Experiments on two machine translation tasks show these models to be superior in quality while being more parallelizable and requiring significantly less time to train. Our model achieves 28.4 BLEU on the WMT 2014 English-to-German translation task, improving over the existing best results, including ensembles by over 2 BLEU. On the WMT 2014 English-to-French translation task, our model establishes a new single-model state-of-the-art BLEU score of 41.8 after training for 3.5 days on eight GPUs, a small fraction of the training costs of the best models from the literature. We show that the Transformer generalizes well to other tasks by applying it successfully to English constituency parsing both with large and limited training data.},
+  pubstate = {prepublished},
+  keywords = {Computer Science - Computation and Language,Computer Science - Machine Learning},
+  file = {/Users/mnakano/Zotero/storage/JME82QZV/Vaswani et al. - 2023 - Attention Is All You Need.pdf;/Users/mnakano/Zotero/storage/I6A529Z8/1706.html}
 }
 
 @inproceedings{vefGekkoFSTemporaryDistributed2018,
@@ -1521,6 +2067,40 @@
   eventtitle = {{{SC}} '16: The {{International Conference}} for {{High Performance Computing}}, {{Networking}}, {{Storage}} and {{Analysis}}},
   keywords = {Bandwidth,Buffer storage,Distributed databases,File systems,Indexing,Metadata,Pipeline processing},
   file = {/Users/mnakano/Zotero/storage/DR6K9Q5D/7877147.html}
+}
+
+@online{wangLargeLanguageModels2025,
+  title = {Large {{Language Models}} in {{Bioinformatics}}: {{A Survey}}},
+  shorttitle = {Large {{Language Models}} in {{Bioinformatics}}},
+  author = {Wang, Zhenyu and Wang, Zikang and Jiang, Jiyue and Chen, Pengan and Shi, Xiangyu and Li, Yu},
+  date = {2025-05-31},
+  eprint = {2503.04490},
+  eprinttype = {arXiv},
+  eprintclass = {cs},
+  doi = {10.48550/arXiv.2503.04490},
+  url = {http://arxiv.org/abs/2503.04490},
+  urldate = {2025-11-25},
+  abstract = {Large Language Models (LLMs) are revolutionizing bioinformatics, enabling advanced analysis of DNA, RNA, proteins, and single-cell data. This survey provides a systematic review of recent advancements, focusing on genomic sequence modeling, RNA structure prediction, protein function inference, and single-cell transcriptomics. Meanwhile, we also discuss several key challenges, including data scarcity, computational complexity, and cross-omics integration, and explore future directions such as multimodal learning, hybrid AI models, and clinical applications. By offering a comprehensive perspective, this paper underscores the transformative potential of LLMs in driving innovations in bioinformatics and precision medicine.},
+  pubstate = {prepublished},
+  keywords = {Computer Science - Computation and Language,Quantitative Biology - Genomics},
+  file = {/Users/mnakano/Zotero/storage/TDLLH4J6/Wang et al. - 2025 - Large Language Models in Bioinformatics A Survey.pdf;/Users/mnakano/Zotero/storage/K3SMRMVF/2503.html}
+}
+
+@online{wangLargeLanguageModels2025a,
+  title = {Large {{Language Models}} in {{Bioinformatics}}: {{A Survey}}},
+  shorttitle = {Large {{Language Models}} in {{Bioinformatics}}},
+  author = {Wang, Zhenyu and Wang, Zikang and Jiang, Jiyue and Chen, Pengan and Shi, Xiangyu and Li, Yu},
+  date = {2025-05-31},
+  eprint = {2503.04490},
+  eprinttype = {arXiv},
+  eprintclass = {cs},
+  doi = {10.48550/arXiv.2503.04490},
+  url = {http://arxiv.org/abs/2503.04490},
+  urldate = {2025-11-25},
+  abstract = {Large Language Models (LLMs) are revolutionizing bioinformatics, enabling advanced analysis of DNA, RNA, proteins, and single-cell data. This survey provides a systematic review of recent advancements, focusing on genomic sequence modeling, RNA structure prediction, protein function inference, and single-cell transcriptomics. Meanwhile, we also discuss several key challenges, including data scarcity, computational complexity, and cross-omics integration, and explore future directions such as multimodal learning, hybrid AI models, and clinical applications. By offering a comprehensive perspective, this paper underscores the transformative potential of LLMs in driving innovations in bioinformatics and precision medicine.},
+  pubstate = {prepublished},
+  keywords = {Computer Science - Computation and Language,Quantitative Biology - Genomics},
+  file = {/Users/mnakano/Zotero/storage/WNP2D53I/Wang et al. - 2025 - Large Language Models in Bioinformatics A Survey.pdf;/Users/mnakano/Zotero/storage/47P52HK3/2503.html}
 }
 
 @inproceedings{wangSelectivePreprocessingOffloading2024,
@@ -1621,6 +2201,16 @@
   urldate = {2025-06-28}
 }
 
+@online{XianXingDanHuiGuiFenXinoShiZumiwowakariyasukuJieShuoAVILEN2024,
+  title = {線形単回帰分析の仕組みをわかりやすく解説 ｜AVILEN},
+  date = {2024-03-28},
+  url = {https://avilen.co.jp/personal/knowledge-article/simple_linear_reg/},
+  urldate = {2024-10-02},
+  abstract = {このページでは、回帰分析における基本である単回帰分析を用いて回帰分析の理解を深めましょう。},
+  langid = {japanese},
+  file = {/Users/mnakano/Zotero/storage/SGZTKVAV/simple_linear_reg.html}
+}
+
 @online{xuAsyncFSMetadataUpdates2024,
   title = {{{AsyncFS}}: {{Metadata Updates Made Asynchronous}} for {{Distributed Filesystems}} with {{In-Network Coordination}}},
   shorttitle = {{{AsyncFS}}},
@@ -1702,6 +2292,14 @@
   abstract = {Modern distributed key-value (KV) stores adopt replication for fault tolerance by distributing replicas of KV pairs across nodes. However, existing distributed KV stores often manage all replicas in the same index structure, thereby leading to significant I/O costs beyond the replication redundancy. We propose a notion called replica decoupling, which decouples the storage management of the primary and redundant copies of replicas, so as to not only mitigate the I/O costs in indexing, but also provide tunable performance. In particular, we design a novel two-layer log that enables tunable ordering for the redundant copies to achieve balanced read/write performance. We implement a distributed KV store prototype, DEPART, atop Cassandra. Experiments show that DEPART outperforms Cassandra in all performance aspects under various consistency levels and parameter settings. Specifically, under the eventual consistency setting, DEPART achieves up to 1.43×, 2.43×, 2.68×, and 1.44× throughput for writes, reads, scans, and updates, respectively.},
   langid = {english},
   file = {/Users/mnakano/Zotero/storage/7FSM2KUP/Zhang et al. - DEPART Replica Decoupling for Distributed Key-Val.pdf}
+}
+
+@article{zhangRelayCacheCoherenceProtocol,
+  title = {Relay: {{A Cache-Coherence Protocol}} for {{Distributed Transactional Memory}}},
+  author = {Zhang, Bo and Ravindran, Binoy},
+  abstract = {Transactional memory is an alternative programming model for managing contention in accessing shared in-memory data objects. Distributed transactional memory promises to alleviate difficulties with lock-based (distributed) synchronization and object performance bottlenecks in distributed systems. The design of the cache-coherence protocol is critical to the performance of distributed transactional memory systems. We evaluate the performance of a cache-coherence protocol by measuring its worst-case competitive ratio — i.e., the ratio of its makespan to the makespan of the optimal cache-coherence protocol. We establish the upper bound of the competitive ratio and show that it is determined by the worst-case number of abortions, maximum locating stretch, and maximum moving stretch of the protocol —the first such result. We present the Relay protocol, a novel cache-coherence protocol, which optimizes these values, and evaluate its performance. We show that Relay’s competitive ratio is significantly improved by a factor of O(Ni) for Ni transactions requesting the same object when compared against past distributed queuing protocols.},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/ATWV8WHP/Zhang and Ravindran - Relay A Cache-Coherence Protocol for Distributed .pdf}
 }
 
 @inproceedings{zhangRevisitingUnderlyingCauses2024,
