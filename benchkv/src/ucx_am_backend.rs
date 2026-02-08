@@ -1,6 +1,6 @@
 //! UCX Active Message backend for benchkv.
 //!
-//! Architecture: Client → UCX AM → Daemon (direct, no shm_spsc, no Flux)
+//! Architecture: Client → UCX AM → Daemon (direct, no ipc, no Flux)
 //! Each client thread has endpoints to all daemons (local + remote).
 //! Each daemon thread has endpoints to all clients (for replies).
 //!

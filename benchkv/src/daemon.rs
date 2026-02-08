@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use shm_spsc::RequestToken;
+use ipc::RequestToken;
 
 use crate::message::*;
 use crate::storage::ShardedStore;
@@ -8,7 +8,7 @@ use crate::storage::ShardedStore;
 // === Type aliases ===
 
 pub type DelegateOnResponse = fn(&mut RequestToken, DelegatePayload);
-pub type DaemonFlux = thread_channel::Flux<DelegatePayload, RequestToken, DelegateOnResponse>;
+pub type DaemonFlux = inproc::Flux<DelegatePayload, RequestToken, DelegateOnResponse>;
 
 type CopyrpcOnResponse = fn(RequestToken, &[u8]);
 type CopyrpcCtx = copyrpc::Context<RequestToken, CopyrpcOnResponse>;
@@ -101,7 +101,7 @@ fn reply_flux(flux: &mut DaemonFlux, to: usize, token: u64, payload: DelegatePay
     loop {
         match flux.reply(to, token, p) {
             Ok(()) => break,
-            Err(thread_channel::SendError::Full(v)) => {
+            Err(inproc::SendError::Full(v)) => {
                 p = v;
                 flux.poll();
             }
@@ -130,7 +130,7 @@ pub fn run_daemon(
     my_rank: u32,
     num_daemons: usize,
     key_range: u64,
-    mut server: shm_spsc::Server<Request, Response>,
+    mut server: ipc::Server<Request, Response>,
     mut flux: DaemonFlux,
     copyrpc_setup: Option<CopyrpcSetup>,
     stop_flag: &AtomicBool,
@@ -237,7 +237,7 @@ pub fn run_daemon(
     let mut remote_queue: Vec<(RequestToken, Request, u32, usize)> = Vec::new();
 
     while !stop_flag.load(Ordering::Relaxed) {
-        // === Phase 1: Process shm_spsc client requests ===
+        // === Phase 1: Process ipc client requests ===
         server.poll();
         while let Some((token, req)) = server.recv() {
             let target_rank = req.rank();
@@ -331,7 +331,7 @@ pub fn run_daemon(
             });
         }
 
-        // === Phase 5: Complete deferred shm_spsc responses from Flux ===
+        // === Phase 5: Complete deferred ipc responses from Flux ===
         FLUX_RESPONSES.with(|r| {
             for entry in r.borrow_mut().drain(..) {
                 server.reply(entry.token, entry.response);

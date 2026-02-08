@@ -5,8 +5,8 @@ edition = "2024"
 
 [dependencies]
 copyrpc = { path = "../copyrpc" }
-thread_channel = { path = "../thread_channel" }
-shm_spsc = { path = "../shm_spsc" }
+inproc = { path = "../inproc" }
+ipc = { path = "../ipc" }
 mlx5 = { path = "../mlx5" }
 mpi.workspace = true
 clap.workspace = true

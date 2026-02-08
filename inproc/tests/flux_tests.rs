@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use thread_channel::{create_flux, Flux, SendError};
+use inproc::{create_flux, Flux, SendError};
 
 #[test]
 fn test_two_node_communication() {

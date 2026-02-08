@@ -7,14 +7,14 @@ use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_mai
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use thread_channel::Serial;
-use thread_channel::{
+use inproc::Serial;
+use inproc::{
     FastForwardTransport, LamportTransport, OnesidedTransport, Transport, TransportEndpoint,
 };
 #[cfg(feature = "rtrb")]
-use thread_channel::RtrbTransport;
+use inproc::RtrbTransport;
 #[cfg(feature = "omango")]
-use thread_channel::OmangoTransport;
+use inproc::OmangoTransport;
 
 fn pin_to_core(core_id: usize) {
     core_affinity::set_for_current(core_affinity::CoreId { id: core_id });

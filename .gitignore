@@ -31,7 +31,7 @@ target
 *.pdf
 
 # Benchmark results
-thread_channel/bench_results/
+inproc/bench_results/
 *.parquet
 
 # Job logs

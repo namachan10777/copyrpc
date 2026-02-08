@@ -1,7 +1,7 @@
 //! Integration tests for Mesh (MPSC-based n-to-n).
 
 use std::thread;
-use thread_channel::{create_mesh, Mesh, ReceivedMessage, RecvError, SendError};
+use inproc::{create_mesh, Mesh, ReceivedMessage, RecvError, SendError};
 
 #[test]
 fn test_two_node_communication() {

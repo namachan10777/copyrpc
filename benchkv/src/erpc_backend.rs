@@ -1,6 +1,6 @@
 //! eRPC backend for benchkv.
 //!
-//! Architecture: Client → eRPC → Daemon (direct, no shm_spsc, no Flux)
+//! Architecture: Client → eRPC → Daemon (direct, no ipc, no Flux)
 //! Each client thread has sessions to all daemons (local + remote).
 //! Each daemon thread accepts sessions from all clients (local + remote).
 

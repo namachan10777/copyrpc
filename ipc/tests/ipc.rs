@@ -1,6 +1,6 @@
-//! Integration tests for shm_spsc RPC slot communication.
+//! Integration tests for ipc RPC slot communication.
 
-use shm_spsc::{CallError, Client, ConnectError, Server, SyncClient};
+use ipc::{CallError, Client, ConnectError, Server, SyncClient};
 use std::thread;
 use std::time::Duration;
 

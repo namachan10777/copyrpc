@@ -1,4 +1,4 @@
-//! Benchmark for shm_spsc RPC call latency.
+//! Benchmark for ipc RPC call latency.
 //!
 //! Compares two implementations:
 //! - slot: original toggle-bit slot protocol
@@ -24,7 +24,7 @@ fn bench_call_latency(c: &mut Criterion) {
     group.bench_function("slot_u64", |b| {
         let name = format!("/shm_bench_slot_{}", Uuid::now_v7());
         unsafe {
-            let mut server = shm_spsc::Server::<u64, u64>::create(&name, 4, 1).unwrap();
+            let mut server = ipc::Server::<u64, u64>::create(&name, 4, 1).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = stop.clone();
             let server_thread = thread::spawn(move || {
@@ -37,7 +37,7 @@ fn bench_call_latency(c: &mut Criterion) {
                 }
             });
             thread::sleep(std::time::Duration::from_millis(10));
-            let mut client = shm_spsc::SyncClient::<u64, u64>::connect_sync(&name).unwrap();
+            let mut client = ipc::SyncClient::<u64, u64>::connect_sync(&name).unwrap();
             for _ in 0..1000 {
                 client.call_blocking(0).unwrap();
             }
@@ -55,7 +55,7 @@ fn bench_call_latency(c: &mut Criterion) {
         let name = format!("/shm_bench_ffwd_{}", Uuid::now_v7());
         unsafe {
             let mut server =
-                shm_spsc::mpsc_ffwd::Server::<u64, u64>::create(&name, 4, RING_DEPTH).unwrap();
+                ipc::mpsc_ffwd::Server::<u64, u64>::create(&name, 4, RING_DEPTH).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = stop.clone();
             let server_thread = thread::spawn(move || {
@@ -69,7 +69,7 @@ fn bench_call_latency(c: &mut Criterion) {
             });
             thread::sleep(std::time::Duration::from_millis(10));
             let mut client =
-                shm_spsc::mpsc_ffwd::SyncClient::<u64, u64>::connect_sync(&name).unwrap();
+                ipc::mpsc_ffwd::SyncClient::<u64, u64>::connect_sync(&name).unwrap();
             for _ in 0..1000 {
                 client.call_blocking(0).unwrap();
             }

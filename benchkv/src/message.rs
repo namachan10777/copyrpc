@@ -1,6 +1,6 @@
 /// Message types for benchkv inter-layer communication.
 
-// === shm_spsc layer: Client ↔ Daemon ===
+// === ipc layer: Client ↔ Daemon ===
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -18,8 +18,8 @@ pub enum Response {
     MetaGetNotFound,
 }
 
-unsafe impl shm_spsc::Serial for Request {}
-unsafe impl shm_spsc::Serial for Response {}
+unsafe impl ipc::Serial for Request {}
+unsafe impl ipc::Serial for Response {}
 
 impl Request {
     #[inline]
@@ -50,7 +50,7 @@ pub enum DelegatePayload {
     Resp(Response),
 }
 
-unsafe impl thread_channel::Serial for DelegatePayload {}
+unsafe impl inproc::Serial for DelegatePayload {}
 
 // === copyrpc layer: inter-node communication ===
 
@@ -97,7 +97,7 @@ impl RemoteResponse {
 // === Thread-local response queues ===
 
 use std::cell::RefCell;
-use shm_spsc::RequestToken;
+use ipc::RequestToken;
 
 /// Response routed back from the Flux on_response callback.
 #[derive(Debug)]

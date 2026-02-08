@@ -14,21 +14,21 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use clap::{Parser, ValueEnum};
 use parquet::arrow::ArrowWriter;
-use thread_channel::Serial;
-use thread_channel::{
+use inproc::Serial;
+use inproc::{
     create_flux_with_transport, create_mesh_with, FastForwardTransport, Flux, LamportTransport,
     Mesh, OnesidedTransport, OnesidedImmediateTransport, OnesidedValidityTransport,
     ReceivedMessage, StdMpsc, Transport,
 };
 
 #[cfg(feature = "rtrb")]
-use thread_channel::RtrbTransport;
+use inproc::RtrbTransport;
 #[cfg(feature = "omango")]
-use thread_channel::OmangoTransport;
+use inproc::OmangoTransport;
 #[cfg(feature = "crossbeam")]
-use thread_channel::CrossbeamMpsc;
+use inproc::CrossbeamMpsc;
 
-use thread_channel::mpsc::MpscChannel;
+use inproc::mpsc::MpscChannel;
 
 /// 32-byte payload for benchmarking
 #[derive(Clone, Copy, Debug)]

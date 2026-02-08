@@ -13,8 +13,8 @@ RDMA (InfiniBand) を活用した高性能RPCフレームワーク。
 | ユーティリティ | `fastmap` | 高速マップ実装 |
 | RPC実装 | `copyrpc` | メインRPC実装 (Flux/Meshアーキテクチャ) |
 | RPC実装 | `erpc`, `scalerpc` | 比較用RPC実装 |
-| スレッド間通信 | `thread_channel` | Flux/Meshのスレッド間版 (rtrb/omango/crossbeam対応) |
-| 共有メモリ通信 | `shm_spsc` | 共有メモリベースSPSC |
+| スレッド間通信 | `inproc` | Flux/Meshのスレッド間版 (rtrb/omango/crossbeam対応) |
+| プロセス間通信 | `ipc` | 共有メモリベースRPC |
 | ベンチマーク | `rpc_bench` | 複数RPC実装の統一ベンチマーク |
 
 ### 主要な依存グラフ

@@ -10,8 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
-use thread_channel::Serial;
-use thread_channel::{
+use inproc::Serial;
+use inproc::{
     create_flux_with_transport, FastForwardTransport, Flux, LamportTransport, OnesidedTransport,
     Transport,
 };

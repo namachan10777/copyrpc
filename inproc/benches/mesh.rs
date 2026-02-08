@@ -4,26 +4,26 @@
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::thread;
-use thread_channel::{
+use inproc::{
     create_flux_with_transport, create_mesh_with, Flux, Mesh, ReceivedMessage, StdMpsc,
 };
 
 #[cfg(feature = "crossbeam")]
-use thread_channel::CrossbeamMpsc;
+use inproc::CrossbeamMpsc;
 
 fn pin_to_core(core_id: usize) {
     core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
 }
 
-use thread_channel::mpsc::MpscChannel;
-use thread_channel::Serial;
-use thread_channel::{
+use inproc::mpsc::MpscChannel;
+use inproc::Serial;
+use inproc::{
     FastForwardTransport, LamportTransport, OnesidedTransport, Transport,
 };
 #[cfg(feature = "rtrb")]
-use thread_channel::RtrbTransport;
+use inproc::RtrbTransport;
 #[cfg(feature = "omango")]
-use thread_channel::OmangoTransport;
+use inproc::OmangoTransport;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]

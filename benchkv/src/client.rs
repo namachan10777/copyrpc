@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use shm_spsc::Client;
+use ipc::Client;
 
 use crate::message::{Request, Response};
 use crate::workload::AccessEntry;

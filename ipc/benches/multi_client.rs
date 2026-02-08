@@ -1,4 +1,4 @@
-//! Benchmark for shm_spsc multi-client throughput.
+//! Benchmark for ipc multi-client throughput.
 //!
 //! 16 client threads issue RPC calls concurrently to 1 server thread.
 //! Compares two implementations:
@@ -34,7 +34,7 @@ fn run_bench_slot(b: &mut criterion::Bencher, depth: u32) {
 
     unsafe {
         let mut server =
-            shm_spsc::Server::<u64, u64>::create(&name, NUM_CLIENTS as u32, depth).unwrap();
+            ipc::Server::<u64, u64>::create(&name, NUM_CLIENTS as u32, depth).unwrap();
 
         let stop_server = stop.clone();
         let server_thread = thread::spawn(move || {
@@ -63,7 +63,7 @@ fn run_bench_slot(b: &mut criterion::Bencher, depth: u32) {
 
                 if depth <= 1 {
                     let mut client =
-                        shm_spsc::SyncClient::<u64, u64>::connect_sync(&name_clone).unwrap();
+                        ipc::SyncClient::<u64, u64>::connect_sync(&name_clone).unwrap();
                     for _ in 0..100 {
                         client.call_blocking(0).unwrap();
                     }
@@ -81,7 +81,7 @@ fn run_bench_slot(b: &mut criterion::Bencher, depth: u32) {
                 } else {
                     let count = std::cell::Cell::new(0u64);
                     let mut client =
-                        shm_spsc::Client::<u64, u64, (), _>::connect(&name_clone, |(), _resp| {
+                        ipc::Client::<u64, u64, (), _>::connect(&name_clone, |(), _resp| {
                             count.set(count.get() + 1);
                         })
                         .unwrap();
@@ -151,7 +151,7 @@ fn run_bench_ffwd(b: &mut criterion::Bencher, depth: u32) {
     let end_barrier = Arc::new(Barrier::new(NUM_CLIENTS + 1));
 
     unsafe {
-        let mut server = shm_spsc::mpsc_ffwd::Server::<u64, u64>::create(
+        let mut server = ipc::mpsc_ffwd::Server::<u64, u64>::create(
             &name,
             NUM_CLIENTS as u32,
             RING_DEPTH,
@@ -185,7 +185,7 @@ fn run_bench_ffwd(b: &mut criterion::Bencher, depth: u32) {
 
                 if depth <= 1 {
                     let mut client =
-                        shm_spsc::mpsc_ffwd::SyncClient::<u64, u64>::connect_sync(&name_clone)
+                        ipc::mpsc_ffwd::SyncClient::<u64, u64>::connect_sync(&name_clone)
                             .unwrap();
                     for _ in 0..100 {
                         client.call_blocking(0).unwrap();
@@ -204,7 +204,7 @@ fn run_bench_ffwd(b: &mut criterion::Bencher, depth: u32) {
                 } else {
                     let count = std::cell::Cell::new(0u64);
                     let mut client =
-                        shm_spsc::mpsc_ffwd::Client::<u64, u64, (), _>::connect(
+                        ipc::mpsc_ffwd::Client::<u64, u64, (), _>::connect(
                             &name_clone,
                             |(), _resp| {
                                 count.set(count.get() + 1);

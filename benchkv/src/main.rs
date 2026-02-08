@@ -24,11 +24,11 @@ use daemon::{
 };
 use epoch::EpochCollector;
 use message::{DelegatePayload, Request, Response};
-use shm_spsc::RequestToken;
+use ipc::RequestToken;
 
 #[derive(Parser, Debug)]
 #[command(name = "benchkv")]
-#[command(about = "Distributed KV benchmark over copyrpc + thread_channel + shm_spsc")]
+#[command(about = "Distributed KV benchmark over copyrpc + inproc + ipc")]
 struct Cli {
     /// Benchmark duration in seconds
     #[arg(short = 'd', long, default_value = "30")]
@@ -186,24 +186,24 @@ fn run_meta(
         })
         .collect();
 
-    // Create shm_spsc servers
+    // Create ipc servers
     let shm_paths: Vec<String> = (0..num_daemons)
         .map(|d| format!("/benchkv_{}_{}", rank, d))
         .collect();
 
     let max_clients_per_daemon = num_clients.div_ceil(num_daemons).max(1) as u32;
-    let mut servers: Vec<Option<shm_spsc::Server<Request, Response>>> = shm_paths
+    let mut servers: Vec<Option<ipc::Server<Request, Response>>> = shm_paths
         .iter()
         .map(|path| {
             Some(
                 unsafe {
-                    shm_spsc::Server::<Request, Response>::create(
+                    ipc::Server::<Request, Response>::create(
                         path,
                         max_clients_per_daemon,
                         queue_depth,
                     )
                 }
-                .expect("Failed to create shm_spsc server"),
+                .expect("Failed to create ipc server"),
             )
         })
         .collect();
@@ -212,7 +212,7 @@ fn run_meta(
     let flux_capacity = 1024;
     let flux_inflight_max = 256;
     let mut flux_nodes: Vec<Option<DaemonFlux>> = if num_daemons > 1 {
-        thread_channel::create_flux::<DelegatePayload, RequestToken, _>(
+        inproc::create_flux::<DelegatePayload, RequestToken, _>(
             num_daemons,
             flux_capacity,
             flux_inflight_max,
@@ -222,7 +222,7 @@ fn run_meta(
         .map(Some)
         .collect()
     } else {
-        thread_channel::create_flux::<DelegatePayload, RequestToken, _>(
+        inproc::create_flux::<DelegatePayload, RequestToken, _>(
             1,
             flux_capacity,
             flux_inflight_max,

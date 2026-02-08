@@ -356,14 +356,14 @@ dependencies = [
  "copyrpc",
  "erpc",
  "gethostname",
+ "inproc",
+ "ipc",
  "libc",
  "mlx5",
  "mpi",
  "parquet",
  "rand",
  "rand_distr",
- "shm_spsc",
- "thread_channel",
  "ucx_sys",
 ]
 
@@ -968,10 +968,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "inproc"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "clap",
+ "core_affinity",
+ "criterion",
+ "crossbeam-channel",
+ "omango",
+ "parquet",
+ "rtrb",
+ "slab",
+]
+
+[[package]]
 name = "integer-encoding"
 version = "3.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8bb03732005da905c88227371639bf1ad885cc712789c011c31c5fb3ab3ccf02"
+
+[[package]]
+name = "ipc"
+version = "0.1.0"
+dependencies = [
+ "core_affinity",
+ "criterion",
+ "libc",
+ "nix",
+ "uuid",
+]
 
 [[package]]
 name = "is-terminal"
@@ -1827,17 +1853,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
-name = "shm_spsc"
-version = "0.1.0"
-dependencies = [
- "core_affinity",
- "criterion",
- "libc",
- "nix",
- "uuid",
-]
-
-[[package]]
 name = "simd-adler32"
 version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1919,21 +1934,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
-]
-
-[[package]]
-name = "thread_channel"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "clap",
- "core_affinity",
- "criterion",
- "crossbeam-channel",
- "omango",
- "parquet",
- "rtrb",
- "slab",
 ]
 
 [[package]]
