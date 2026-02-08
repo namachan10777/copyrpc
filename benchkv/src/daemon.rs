@@ -1,17 +1,17 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use shm_spsc::ClientId;
+use shm_spsc::RequestToken;
 
 use crate::message::*;
 use crate::storage::ShardedStore;
 
 // === Type aliases ===
 
-pub type DelegateOnResponse = fn(&mut DelegateUserData, DelegatePayload);
-pub type DaemonFlux = thread_channel::Flux<DelegatePayload, DelegateUserData, DelegateOnResponse>;
+pub type DelegateOnResponse = fn(&mut RequestToken, DelegatePayload);
+pub type DaemonFlux = thread_channel::Flux<DelegatePayload, RequestToken, DelegateOnResponse>;
 
-type CopyrpcOnResponse = fn(CopyrpcOrigin, &[u8]);
-type CopyrpcCtx = copyrpc::Context<CopyrpcOrigin, CopyrpcOnResponse>;
+type CopyrpcOnResponse = fn(RequestToken, &[u8]);
+type CopyrpcCtx = copyrpc::Context<RequestToken, CopyrpcOnResponse>;
 
 // === Connection info for MPI exchange ===
 
@@ -60,23 +60,22 @@ impl EndpointConnectionInfo {
 
 // === Callbacks ===
 
-pub fn on_delegate_response(user_data: &mut DelegateUserData, data: DelegatePayload) {
+pub fn on_delegate_response(token: &mut RequestToken, data: DelegatePayload) {
     if let DelegatePayload::Resp(resp) = data {
         FLUX_RESPONSES.with(|r| {
             r.borrow_mut().push(FluxResponseEntry {
-                client_id: user_data.client_id,
-                slot_index: user_data.slot_index,
+                token: *token,
                 response: resp,
             });
         });
     }
 }
 
-fn on_copyrpc_response(origin: CopyrpcOrigin, data: &[u8]) {
+fn on_copyrpc_response(token: RequestToken, data: &[u8]) {
     let remote_resp = RemoteResponse::from_bytes(data);
     COPYRPC_RESPONSES.with(|r| {
         r.borrow_mut().push(CopyrpcResponseEntry {
-            origin,
+            token,
             response: remote_resp.response,
         });
     });
@@ -111,12 +110,6 @@ fn reply_flux(flux: &mut DaemonFlux, to: usize, token: u64, payload: DelegatePay
     }
 }
 
-struct PendingRequest {
-    client_id: u32,
-    slot_index: u32,
-    request: Request,
-}
-
 // === copyrpc setup ===
 
 pub struct CopyrpcSetup {
@@ -147,7 +140,7 @@ pub fn run_daemon(
 
     // Setup copyrpc (all daemons when multi-node)
     let copyrpc_ctx: Option<CopyrpcCtx>;
-    let mut copyrpc_endpoints: Vec<copyrpc::Endpoint<CopyrpcOrigin>> = Vec::new();
+    let mut copyrpc_endpoints: Vec<copyrpc::Endpoint<RequestToken>> = Vec::new();
 
     if let Some(setup) = copyrpc_setup {
         let ctx: CopyrpcCtx = copyrpc::ContextBuilder::new()
@@ -241,55 +234,28 @@ pub fn run_daemon(
         rank_offset * num_daemons + target_daemon
     };
 
-    let mut pending_shm: Vec<PendingRequest> = Vec::new();
-    let mut remote_queue: Vec<(CopyrpcOrigin, Request, u32, usize)> = Vec::new();
+    let mut remote_queue: Vec<(RequestToken, Request, u32, usize)> = Vec::new();
 
     while !stop_flag.load(Ordering::Relaxed) {
         // === Phase 1: Process shm_spsc client requests ===
-        pending_shm.clear();
-        server.process_batch_deferred(|client_id, slot_idx, req| {
+        server.poll();
+        while let Some((token, req)) = server.recv() {
             let target_rank = req.rank();
             let target_daemon = ShardedStore::owner_of(req.key(), num_daemons as u64) as usize;
 
             if target_rank == my_rank && target_daemon == daemon_id {
-                Some(handle_local(&mut store, &req))
-            } else {
-                pending_shm.push(PendingRequest {
-                    client_id: client_id.0,
-                    slot_index: slot_idx,
-                    request: req,
-                });
-                None
-            }
-        });
-
-        // Route non-local requests
-        for p in pending_shm.drain(..) {
-            let target_rank = p.request.rank();
-            let target_daemon =
-                ShardedStore::owner_of(p.request.key(), num_daemons as u64) as usize;
-
-            if target_rank == my_rank {
+                let resp = handle_local(&mut store, &req);
+                server.reply(token, resp);
+            } else if target_rank == my_rank {
                 // Same rank, different daemon shard → Flux
                 let _ = flux.call(
                     target_daemon,
-                    DelegatePayload::Req(p.request),
-                    DelegateUserData {
-                        client_id: p.client_id,
-                        slot_index: p.slot_index,
-                    },
+                    DelegatePayload::Req(req),
+                    token,
                 );
             } else {
-                // Remote rank → copyrpc (all daemons have their own endpoints)
-                remote_queue.push((
-                    CopyrpcOrigin {
-                        client_id: p.client_id,
-                        slot_index: p.slot_index,
-                    },
-                    p.request,
-                    target_rank,
-                    target_daemon,
-                ));
+                // Remote rank → copyrpc
+                remote_queue.push((token, req, target_rank, target_daemon));
             }
         }
 
@@ -297,12 +263,12 @@ pub fn run_daemon(
         flux.poll();
 
         // === Phase 3: Process Flux received requests (same-rank only) ===
-        while let Some((from, token, payload)) = flux.try_recv_raw() {
+        while let Some((from, flux_token, payload)) = flux.try_recv_raw() {
             match payload {
                 DelegatePayload::Req(req) => {
                     debug_assert_eq!(req.rank(), my_rank);
                     let resp = handle_local(&mut store, &req);
-                    reply_flux(&mut flux, from, token, DelegatePayload::Resp(resp));
+                    reply_flux(&mut flux, from, flux_token, DelegatePayload::Resp(resp));
                 }
                 DelegatePayload::Resp(_) => {}
             }
@@ -311,21 +277,17 @@ pub fn run_daemon(
         // === Phase 4: copyrpc (all daemons when multi-node) ===
         if let Some(ctx) = ctx_ref {
             // 4a. Send queued remote requests via copyrpc
-            for (origin, req, target_rank, target_daemon) in remote_queue.drain(..) {
+            for (token, req, target_rank, target_daemon) in remote_queue.drain(..) {
                 let remote_req = RemoteRequest { request: req };
                 let ep_idx = daemon_ep_index(target_rank, target_daemon);
                 loop {
-                    match copyrpc_endpoints[ep_idx].call(remote_req.as_bytes(), origin) {
+                    match copyrpc_endpoints[ep_idx].call(remote_req.as_bytes(), token) {
                         Ok(_) => break,
                         Err(copyrpc::error::Error::RingFull) => {
                             ctx.poll();
                             COPYRPC_RESPONSES.with(|r| {
                                 for entry in r.borrow_mut().drain(..) {
-                                    server.complete_request(
-                                        ClientId(entry.origin.client_id),
-                                        entry.origin.slot_index,
-                                        entry.response,
-                                    );
+                                    server.reply(entry.token, entry.response);
                                 }
                             });
                             continue;
@@ -364,11 +326,7 @@ pub fn run_daemon(
             // 4d. Drain copyrpc on_response results
             COPYRPC_RESPONSES.with(|r| {
                 for entry in r.borrow_mut().drain(..) {
-                    server.complete_request(
-                        ClientId(entry.origin.client_id),
-                        entry.origin.slot_index,
-                        entry.response,
-                    );
+                    server.reply(entry.token, entry.response);
                 }
             });
         }
@@ -376,7 +334,7 @@ pub fn run_daemon(
         // === Phase 5: Complete deferred shm_spsc responses from Flux ===
         FLUX_RESPONSES.with(|r| {
             for entry in r.borrow_mut().drain(..) {
-                server.complete_request(ClientId(entry.client_id), entry.slot_index, entry.response);
+                server.reply(entry.token, entry.response);
             }
         });
     }

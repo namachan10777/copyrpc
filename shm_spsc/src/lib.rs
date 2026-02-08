@@ -1,16 +1,22 @@
 //! RPC slot-based communication over shared memory.
 //!
-//! Each client gets a group of 2^n dedicated request/response slots.
-//! The server polls all slots and responds to each client via `process_batch()`.
-//!
 //! Uses a toggle-bit protocol (inspired by ffwd, SOSP 2017):
 //! - `client_seq` incremented by client when posting a request
 //! - `server_seq` incremented by server when posting a response
 //! - `client_seq != server_seq` → request pending
 //! - `client_seq == server_seq` → idle / response ready
 //!
-//! Clients can pipeline up to `slots_per_client` requests using `send()`/`recv()`.
-//! Free slots are tracked with a bitmap; `trailing_zeros()` finds the next free slot.
+//! ## Client API (copyrpc-style async)
+//!
+//! - `call(req, user_data)` — non-blocking send; polls internally if all slots busy
+//! - `poll()` — scans in-flight slots, fires `on_response(user_data, resp)` for completions
+//! - `call_blocking(req)` — synchronous RPC (on `connect_sync()` clients)
+//!
+//! ## Server API (pull-based)
+//!
+//! - `poll()` — scans all client slots for new requests, buffers internally
+//! - `recv()` — returns next buffered request with an opaque `RequestToken`
+//! - `reply(token, resp)` — writes response (immediate or deferred)
 
 pub mod shm;
 
@@ -48,7 +54,23 @@ unsafe impl<T: Copy, const N: usize> Serial for [T; N] {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClientId(pub u32);
 
-/// Error returned when `Client::call()` or `Client::send()`/`Client::recv()` fails.
+/// Opaque token identifying a pending request on the server.
+///
+/// Returned by [`Server::recv()`] and consumed by [`Server::reply()`].
+#[derive(Clone, Copy, Debug)]
+pub struct RequestToken {
+    client_id: ClientId,
+    slot_index: u32,
+}
+
+impl RequestToken {
+    /// Returns the client that sent this request.
+    pub fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+}
+
+/// Error returned when a client operation fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallError {
     ServerDisconnected,
@@ -141,7 +163,6 @@ fn calc_slot_layout<Req, Resp>() -> SlotLayout {
         .max(std::mem::align_of::<Resp>())
         .max(8);
 
-    // [client_seq: AtomicU8(1)] [server_seq: AtomicU8(1)] [alive: AtomicBool(1)] [padding to align] [req] [padding to align] [resp] [padding to cache line]
     let client_seq_offset = 0;
     let server_seq_offset = 1;
     let alive_offset = 2;
@@ -168,6 +189,10 @@ fn align_up(val: usize, align: usize) -> usize {
     (val + align - 1) & !(align - 1)
 }
 
+// =============================================================================
+// Server
+// =============================================================================
+
 /// Server side of the RPC slot channel.
 pub struct Server<Req: Serial, Resp: Serial> {
     _shm: SharedMemory,
@@ -176,7 +201,9 @@ pub struct Server<Req: Serial, Resp: Serial> {
     layout: SlotLayout,
     slots_per_client: u32,
     server_seqs: Vec<u8>,
-    deferred_bitmap: Vec<u32>,
+    in_progress: Vec<u32>,    // bits: recv'd but not yet replied
+    new_requests: Vec<u32>,   // bits: found by poll(), not yet recv'd
+    recv_scan_pos: u32,
     _marker: PhantomData<(Req, Resp)>,
 }
 
@@ -257,109 +284,59 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
             layout,
             slots_per_client,
             server_seqs: vec![0u8; total_slots as usize],
-            deferred_bitmap: vec![0u32; max_clients as usize],
+            in_progress: vec![0u32; max_clients as usize],
+            new_requests: vec![0u32; max_clients as usize],
+            recv_scan_pos: 0,
             _marker: PhantomData,
         })
     }
 
-    fn slot_base(&self, global_slot: u32) -> *mut u8 {
+    #[inline(always)]
+    fn slot_base(&self, flat_idx: u32) -> *mut u8 {
         unsafe {
             self.base
-                .add(HEADER_SIZE + self.layout.slot_size * global_slot as usize)
+                .add(HEADER_SIZE + self.layout.slot_size * flat_idx as usize)
         }
     }
 
-    fn slot_client_seq(&self, global_slot: u32) -> &AtomicU8 {
+    #[inline(always)]
+    fn slot_client_seq(&self, flat_idx: u32) -> &AtomicU8 {
         unsafe {
-            &*(self.slot_base(global_slot).add(self.layout.client_seq_offset) as *const AtomicU8)
+            &*(self.slot_base(flat_idx).add(self.layout.client_seq_offset) as *const AtomicU8)
         }
     }
 
-    fn slot_server_seq(&self, global_slot: u32) -> &AtomicU8 {
+    #[inline(always)]
+    fn slot_server_seq(&self, flat_idx: u32) -> &AtomicU8 {
         unsafe {
-            &*(self.slot_base(global_slot).add(self.layout.server_seq_offset) as *const AtomicU8)
+            &*(self.slot_base(flat_idx).add(self.layout.server_seq_offset) as *const AtomicU8)
         }
     }
 
-    fn slot_alive(&self, global_slot: u32) -> &AtomicBool {
+    #[inline(always)]
+    fn slot_alive(&self, flat_idx: u32) -> &AtomicBool {
         unsafe {
-            &*(self.slot_base(global_slot).add(self.layout.alive_offset) as *const AtomicBool)
+            &*(self.slot_base(flat_idx).add(self.layout.alive_offset) as *const AtomicBool)
         }
     }
 
-    fn slot_req_ptr(&self, global_slot: u32) -> *const Req {
-        unsafe { self.slot_base(global_slot).add(self.layout.req_offset) as *const Req }
+    #[inline(always)]
+    fn slot_req_ptr(&self, flat_idx: u32) -> *const Req {
+        unsafe { self.slot_base(flat_idx).add(self.layout.req_offset) as *const Req }
     }
 
-    fn slot_resp_ptr(&self, global_slot: u32) -> *mut Resp {
-        unsafe { self.slot_base(global_slot).add(self.layout.resp_offset) as *mut Resp }
+    #[inline(always)]
+    fn slot_resp_ptr(&self, flat_idx: u32) -> *mut Resp {
+        unsafe { self.slot_base(flat_idx).add(self.layout.resp_offset) as *mut Resp }
     }
 
-    /// Processes all pending requests in a single sweep.
+    /// Scans all client slots for new requests, marking them in an internal bitmap.
     ///
-    /// Scans all allocated client slots linearly, calls `f` for each pending request
-    /// to compute the response, and writes the response back immediately.
-    ///
-    /// # Design
-    ///
-    /// The toggle-bit protocol is inspired by **ffwd delegation** (Roghanchi et al.,
-    /// SOSP 2017): dedicated per-client slots with a single server thread scanning
-    /// all slots.
-    ///
-    /// Returns the number of requests processed.
-    pub fn process_batch(&mut self, mut f: impl FnMut(ClientId, Req) -> Resp) -> u32 {
-        let allocated = unsafe { (*self.header).next_client_id.load(Ordering::Relaxed) };
-        if allocated == 0 {
-            return 0;
-        }
-
-        let spc = self.slots_per_client;
-        let mut count = 0u32;
-
-        for client_idx in 0..allocated {
-            let base_slot = client_idx * spc;
-            // Check alive on first slot only
-            if !self.slot_alive(base_slot).load(Ordering::Acquire) {
-                continue;
-            }
-            for s in 0..spc {
-                let global = base_slot + s;
-                let seq_idx = global as usize;
-                let client_seq = self.slot_client_seq(global).load(Ordering::Acquire);
-                // SAFETY: seq_idx = client_idx * spc + s where client_idx < allocated <= max_clients
-                // and s < spc, so seq_idx < max_clients * spc = server_seqs.len()
-                let server_seq = unsafe { *self.server_seqs.get_unchecked(seq_idx) };
-                if client_seq != server_seq {
-                    let req = unsafe { std::ptr::read_volatile(self.slot_req_ptr(global)) };
-                    let resp = f(ClientId(client_idx), req);
-                    unsafe { std::ptr::write_volatile(self.slot_resp_ptr(global), resp) };
-                    let new_seq = server_seq.wrapping_add(1);
-                    unsafe { *self.server_seqs.get_unchecked_mut(seq_idx) = new_seq };
-                    self.slot_server_seq(global)
-                        .store(new_seq, Ordering::Release);
-                    count += 1;
-                }
-            }
-        }
-
-        count
-    }
-
-    /// Processes all pending requests, allowing deferred responses.
-    ///
-    /// Like [`process_batch`], but the callback returns `Option<Resp>`:
-    /// - `Some(resp)`: immediate response (same as `process_batch`)
-    /// - `None`: deferred — the slot is marked pending and must be completed
-    ///   later via [`complete_request`]
-    ///
-    /// The callback receives `(ClientId, u32, Req)` where the `u32` is the
-    /// slot index within the client's slot group (0..slots_per_client).
-    ///
-    /// Returns the number of requests processed (both immediate and deferred).
-    pub fn process_batch_deferred(
-        &mut self,
-        mut f: impl FnMut(ClientId, u32, Req) -> Option<Resp>,
-    ) -> u32 {
+    /// Use [`recv()`](Self::recv) to retrieve marked requests (reads directly from
+    /// shared memory — zero-copy). Slots that are already marked as new or
+    /// in-progress (recv'd but not replied) are skipped.
+    #[inline]
+    pub fn poll(&mut self) -> u32 {
         let allocated = unsafe { (*self.header).next_client_id.load(Ordering::Relaxed) };
         if allocated == 0 {
             return 0;
@@ -373,10 +350,12 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
             if !self.slot_alive(base_slot).load(Ordering::Acquire) {
                 continue;
             }
-            let bitmap = unsafe { *self.deferred_bitmap.get_unchecked(client_idx as usize) };
+            let ci = client_idx as usize;
+            let skip = unsafe {
+                *self.in_progress.get_unchecked(ci) | *self.new_requests.get_unchecked(ci)
+            };
             for s in 0..spc {
-                // Skip slots that are already deferred
-                if bitmap & (1 << s) != 0 {
+                if skip & (1 << s) != 0 {
                     continue;
                 }
                 let global = base_slot + s;
@@ -384,44 +363,56 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
                 let client_seq = self.slot_client_seq(global).load(Ordering::Acquire);
                 let server_seq = unsafe { *self.server_seqs.get_unchecked(seq_idx) };
                 if client_seq != server_seq {
-                    let req = unsafe { std::ptr::read_volatile(self.slot_req_ptr(global)) };
-                    match f(ClientId(client_idx), s, req) {
-                        Some(resp) => {
-                            unsafe { std::ptr::write_volatile(self.slot_resp_ptr(global), resp) };
-                            let new_seq = server_seq.wrapping_add(1);
-                            unsafe { *self.server_seqs.get_unchecked_mut(seq_idx) = new_seq };
-                            self.slot_server_seq(global)
-                                .store(new_seq, Ordering::Release);
-                        }
-                        None => {
-                            // Mark as deferred
-                            unsafe {
-                                *self.deferred_bitmap.get_unchecked_mut(client_idx as usize) |=
-                                    1 << s;
-                            }
-                        }
-                    }
+                    unsafe { *self.new_requests.get_unchecked_mut(ci) |= 1 << s };
                     count += 1;
                 }
             }
         }
 
+        self.recv_scan_pos = 0;
         count
     }
 
-    /// Completes a previously deferred request by writing the response.
+    /// Returns the next new request, reading directly from shared memory.
     ///
-    /// # Panics
-    /// Panics if the slot was not deferred.
-    pub fn complete_request(&mut self, client_id: ClientId, slot_index: u32, resp: Resp) {
-        let cid = client_id.0;
-        let global = cid * self.slots_per_client + slot_index;
-        let seq_idx = global as usize;
+    /// The returned [`RequestToken`] must be passed to [`reply()`](Self::reply)
+    /// to complete the request.
+    #[inline]
+    pub fn recv(&mut self) -> Option<(RequestToken, Req)> {
+        let allocated = unsafe { (*self.header).next_client_id.load(Ordering::Relaxed) };
+        let spc = self.slots_per_client;
 
-        debug_assert!(
-            unsafe { *self.deferred_bitmap.get_unchecked(cid as usize) } & (1 << slot_index) != 0,
-            "complete_request called on non-deferred slot"
-        );
+        while self.recv_scan_pos < allocated {
+            let ci = self.recv_scan_pos as usize;
+            let bits = unsafe { *self.new_requests.get_unchecked(ci) };
+            if bits != 0 {
+                let s = bits.trailing_zeros();
+                unsafe { *self.new_requests.get_unchecked_mut(ci) &= !(1 << s) };
+                unsafe { *self.in_progress.get_unchecked_mut(ci) |= 1 << s };
+                let global = self.recv_scan_pos * spc + s;
+                let req = unsafe { std::ptr::read_volatile(self.slot_req_ptr(global)) };
+                return Some((
+                    RequestToken {
+                        client_id: ClientId(self.recv_scan_pos),
+                        slot_index: s,
+                    },
+                    req,
+                ));
+            }
+            self.recv_scan_pos += 1;
+        }
+        None
+    }
+
+    /// Writes a response for a previously received request.
+    ///
+    /// Can be called immediately after `recv()` or deferred to a later point.
+    #[inline]
+    pub fn reply(&mut self, token: RequestToken, resp: Resp) {
+        let cid = token.client_id.0;
+        let s = token.slot_index;
+        let global = cid * self.slots_per_client + s;
+        let seq_idx = global as usize;
 
         unsafe { std::ptr::write_volatile(self.slot_resp_ptr(global), resp) };
         let server_seq = unsafe { *self.server_seqs.get_unchecked(seq_idx) };
@@ -430,10 +421,7 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
         self.slot_server_seq(global)
             .store(new_seq, Ordering::Release);
 
-        // Clear the deferred bit
-        unsafe {
-            *self.deferred_bitmap.get_unchecked_mut(cid as usize) &= !(1 << slot_index);
-        }
+        unsafe { *self.in_progress.get_unchecked_mut(cid as usize) &= !(1 << s) };
     }
 
     /// Returns true if a specific client is connected.
@@ -470,31 +458,49 @@ impl<Req: Serial, Resp: Serial> Drop for Server<Req, Resp> {
     }
 }
 
+// =============================================================================
+// Client
+// =============================================================================
+
 /// Client side of the RPC slot channel.
-pub struct Client<Req: Serial, Resp: Serial> {
+///
+/// Generic over user data `U` and response callback `F`.
+/// Use [`connect_sync()`](Self::connect_sync) for synchronous-only usage.
+pub struct Client<Req: Serial, Resp: Serial, U, F: FnMut(U, Resp)> {
     _shm: SharedMemory,
     header: *mut Header,
     base: *mut u8,
     layout: SlotLayout,
     client_id: u32,
     slots_per_client: u32,
+    base_slot: u32, // client_id * slots_per_client (precomputed)
     client_seqs: [u8; MAX_SLOTS_PER_CLIENT],
     free_bitmap: u32,
-    pending_queue: [u8; MAX_SLOTS_PER_CLIENT],
+    pending_queue: [u32; MAX_SLOTS_PER_CLIENT],
     pq_head: u32,
-    pq_tail: u32,
+    pq_count: u32,
+    user_data: [Option<U>; MAX_SLOTS_PER_CLIENT],
+    on_response: F,
     _marker: PhantomData<(Req, Resp)>,
 }
 
-unsafe impl<Req: Serial + Send, Resp: Serial + Send> Send for Client<Req, Resp> {}
+unsafe impl<Req: Serial + Send, Resp: Serial + Send, U: Send, F: FnMut(U, Resp) + Send> Send
+    for Client<Req, Resp, U, F>
+{
+}
 
-impl<Req: Serial, Resp: Serial> Client<Req, Resp> {
+impl<Req: Serial, Resp: Serial, U, F: FnMut(U, Resp)> Client<Req, Resp, U, F> {
     /// Connects to an existing shared memory region.
+    ///
+    /// `on_response` is called for each completed async request during [`poll()`](Self::poll).
     ///
     /// # Safety
     /// The caller must ensure that a server has created the shared memory
     /// with the same types `Req` and `Resp`.
-    pub unsafe fn connect<P: AsRef<Path>>(path: P) -> Result<Self, ConnectError> {
+    pub unsafe fn connect<P: AsRef<Path>>(
+        path: P,
+        on_response: F,
+    ) -> Result<Self, ConnectError> {
         // First open with just the header to validate
         let header_shm = unsafe { SharedMemory::open(&path, HEADER_SIZE)? };
         let header = header_shm.as_ptr() as *const Header;
@@ -544,7 +550,6 @@ impl<Req: Serial, Resp: Serial> Client<Req, Resp> {
             alive.store(true, Ordering::Release);
         }
 
-        // Initialize free bitmap: all slots free
         let free_bitmap = (1u32 << slots_per_client) - 1;
 
         Ok(Self {
@@ -554,173 +559,212 @@ impl<Req: Serial, Resp: Serial> Client<Req, Resp> {
             layout,
             client_id,
             slots_per_client,
+            base_slot: client_id * slots_per_client,
             client_seqs: [0u8; MAX_SLOTS_PER_CLIENT],
             free_bitmap,
-            pending_queue: [0u8; MAX_SLOTS_PER_CLIENT],
+            pending_queue: [0u32; MAX_SLOTS_PER_CLIENT],
             pq_head: 0,
-            pq_tail: 0,
+            pq_count: 0,
+            user_data: std::array::from_fn(|_| None),
+            on_response,
             _marker: PhantomData,
         })
     }
 
-    fn global_slot(&self, local_slot: u32) -> u32 {
-        self.client_id * self.slots_per_client + local_slot
-    }
-
-    fn slot_base(&self, global_slot: u32) -> *mut u8 {
+    #[inline(always)]
+    fn slot_base(&self, flat_idx: u32) -> *mut u8 {
         unsafe {
             self.base
-                .add(HEADER_SIZE + self.layout.slot_size * global_slot as usize)
+                .add(HEADER_SIZE + self.layout.slot_size * flat_idx as usize)
         }
     }
 
-    fn slot_client_seq(&self, global_slot: u32) -> &AtomicU8 {
+    #[inline(always)]
+    fn slot_client_seq(&self, flat_idx: u32) -> &AtomicU8 {
         unsafe {
-            &*(self.slot_base(global_slot).add(self.layout.client_seq_offset) as *const AtomicU8)
+            &*(self.slot_base(flat_idx).add(self.layout.client_seq_offset) as *const AtomicU8)
         }
     }
 
-    fn slot_server_seq(&self, global_slot: u32) -> &AtomicU8 {
+    #[inline(always)]
+    fn slot_server_seq(&self, flat_idx: u32) -> &AtomicU8 {
         unsafe {
-            &*(self.slot_base(global_slot).add(self.layout.server_seq_offset) as *const AtomicU8)
+            &*(self.slot_base(flat_idx).add(self.layout.server_seq_offset) as *const AtomicU8)
         }
     }
 
-    fn slot_req_ptr(&self, global_slot: u32) -> *mut Req {
-        unsafe { self.slot_base(global_slot).add(self.layout.req_offset) as *mut Req }
+    #[inline(always)]
+    fn slot_req_ptr(&self, flat_idx: u32) -> *mut Req {
+        unsafe { self.slot_base(flat_idx).add(self.layout.req_offset) as *mut Req }
     }
 
-    fn slot_resp_ptr(&self, global_slot: u32) -> *const Resp {
-        unsafe { self.slot_base(global_slot).add(self.layout.resp_offset) as *const Resp }
+    #[inline(always)]
+    fn slot_resp_ptr(&self, flat_idx: u32) -> *const Resp {
+        unsafe { self.slot_base(flat_idx).add(self.layout.resp_offset) as *const Resp }
     }
 
-    /// Sends a request without waiting for a response.
-    ///
-    /// If all slots are occupied, blocks until the oldest pending request completes,
-    /// discarding its response.
-    pub fn send(&mut self, req: Req) -> Result<(), CallError> {
-        if self.free_bitmap == 0 {
-            // All slots busy, drain the oldest
-            let _ = self.recv()?;
-        }
-        let slot_idx = self.free_bitmap.trailing_zeros();
-        self.free_bitmap &= !(1 << slot_idx);
-
-        let global = self.global_slot(slot_idx);
-        unsafe { std::ptr::write_volatile(self.slot_req_ptr(global), req) };
-        // SAFETY: slot_idx = trailing_zeros(free_bitmap) < slots_per_client <= 32 = client_seqs.len()
+    /// Writes a request to the given slot and updates the client sequence number.
+    #[inline(always)]
+    fn write_slot(&mut self, slot_idx: u32, req: Req) -> u8 {
+        let fi = self.base_slot + slot_idx;
+        unsafe { std::ptr::write_volatile(self.slot_req_ptr(fi), req) };
         let new_seq = unsafe {
             let seq = self.client_seqs.get_unchecked_mut(slot_idx as usize);
             *seq = seq.wrapping_add(1);
             *seq
         };
-        self.slot_client_seq(global).store(new_seq, Ordering::Release);
+        self.slot_client_seq(fi).store(new_seq, Ordering::Release);
+        new_seq
+    }
 
-        let mask = self.slots_per_client - 1;
-        // SAFETY: pq_tail is masked by (spc - 1) < 32 = pending_queue.len()
-        unsafe { *self.pending_queue.get_unchecked_mut(self.pq_tail as usize) = slot_idx as u8 };
-        self.pq_tail = (self.pq_tail + 1) & mask;
+    /// Allocates a slot, writes the request, stores user data, and pushes to FIFO.
+    #[inline(always)]
+    fn send_internal(&mut self, req: Req, user_data: U) -> u32 {
+        let slot_idx = self.free_bitmap.trailing_zeros();
+        self.free_bitmap &= !(1 << slot_idx);
+        self.write_slot(slot_idx, req);
+        self.user_data[slot_idx as usize] = Some(user_data);
+
+        // Push to FIFO pending queue
+        let tail = (self.pq_head + self.pq_count) % MAX_SLOTS_PER_CLIENT as u32;
+        self.pending_queue[tail as usize] = slot_idx;
+        self.pq_count += 1;
+
+        slot_idx
+    }
+
+    /// Sends a request asynchronously with associated user data.
+    ///
+    /// If all slots are occupied, internally calls [`poll()`](Self::poll) to drain
+    /// completions until a slot becomes available.
+    #[inline]
+    pub fn call(&mut self, req: Req, user_data: U) -> Result<(), CallError> {
+        while self.free_bitmap == 0 {
+            self.poll()?;
+            std::hint::spin_loop();
+        }
+        self.send_internal(req, user_data);
         Ok(())
     }
 
-    /// Receives the response for the oldest pending request (blocks until ready).
-    pub fn recv(&mut self) -> Result<Resp, CallError> {
-        let mask = self.slots_per_client - 1;
-        // SAFETY: pq_head is masked by (spc - 1) < 32 = pending_queue.len()
-        let slot_idx = unsafe { *self.pending_queue.get_unchecked(self.pq_head as usize) } as u32;
-        self.pq_head = (self.pq_head + 1) & mask;
-
-        let global = self.global_slot(slot_idx);
-        // SAFETY: slot_idx came from pending_queue which stores values < slots_per_client <= 32
-        let expected_seq = unsafe { *self.client_seqs.get_unchecked(slot_idx as usize) };
-        loop {
-            if self.slot_server_seq(global).load(Ordering::Acquire) == expected_seq {
-                break;
-            }
-            if !self.is_server_alive() {
-                return Err(CallError::ServerDisconnected);
-            }
-            std::hint::spin_loop();
+    /// Scans in-flight slots in FIFO order, invoking `on_response` for each completion.
+    ///
+    /// Checks the oldest pending slot first; stops at the first non-completed slot.
+    #[inline]
+    pub fn poll(&mut self) -> Result<u32, CallError> {
+        if self.pq_count == 0 {
+            return Ok(0);
         }
 
-        let resp = unsafe { std::ptr::read_volatile(self.slot_resp_ptr(global)) };
-        self.free_bitmap |= 1 << slot_idx;
-        Ok(resp)
-    }
+        let mut completed = 0u32;
 
-    /// Receives any completed response without ordering constraint (non-blocking).
-    ///
-    /// Scans all in-flight slots and returns the first completed one.
-    /// Returns `Ok(None)` if no slot has completed yet.
-    ///
-    /// **Warning**: Do not mix with `recv()` — the pending_queue is not updated.
-    pub fn try_recv_any(&mut self) -> Result<Option<Resp>, CallError> {
-        let all_slots_mask = (1u32 << self.slots_per_client) - 1;
-        let in_flight = !self.free_bitmap & all_slots_mask;
-        if in_flight == 0 {
-            return Ok(None);
-        }
-
-        let mut bits = in_flight;
-        while bits != 0 {
-            let slot_idx = bits.trailing_zeros();
-            bits &= bits - 1;
-
-            let global = self.global_slot(slot_idx);
+        while self.pq_count > 0 {
+            let slot_idx = self.pending_queue[self.pq_head as usize];
+            let fi = self.base_slot + slot_idx;
             let expected_seq = unsafe { *self.client_seqs.get_unchecked(slot_idx as usize) };
 
-            if self.slot_server_seq(global).load(Ordering::Acquire) == expected_seq {
-                let resp = unsafe { std::ptr::read_volatile(self.slot_resp_ptr(global)) };
-                self.free_bitmap |= 1 << slot_idx;
-                return Ok(Some(resp));
+            if self.slot_server_seq(fi).load(Ordering::Acquire) != expected_seq {
+                break;
             }
+
+            let resp = unsafe { std::ptr::read_volatile(self.slot_resp_ptr(fi)) };
+            let ud = self.user_data[slot_idx as usize]
+                .take()
+                .expect("user_data missing for completed slot");
+            self.free_bitmap |= 1 << slot_idx;
+            self.pq_head = (self.pq_head + 1) % MAX_SLOTS_PER_CLIENT as u32;
+            self.pq_count -= 1;
+            (self.on_response)(ud, resp);
+            completed += 1;
         }
 
-        if !self.is_server_alive() {
+        if completed == 0 && self.pq_count > 0 && !self.is_server_alive() {
             return Err(CallError::ServerDisconnected);
         }
-        Ok(None)
+        Ok(completed)
     }
 
-    /// Receives any completed response without ordering constraint (blocking).
-    ///
-    /// Spins until at least one in-flight slot completes, then returns its response.
-    ///
-    /// **Warning**: Do not mix with `recv()` — the pending_queue is not updated.
-    pub fn recv_any(&mut self) -> Result<Resp, CallError> {
-        loop {
-            match self.try_recv_any() {
-                Ok(Some(resp)) => return Ok(resp),
-                Ok(None) => std::hint::spin_loop(),
-                Err(e) => return Err(e),
-            }
-        }
+    /// Returns the number of in-flight async requests (excludes blocking calls).
+    #[inline]
+    pub fn pending_count(&self) -> u32 {
+        self.pq_count
     }
 
-    /// Synchronous blocking RPC call.
-    ///
-    /// Equivalent to `send(req)` followed by `recv()`.
-    pub fn call(&mut self, req: Req) -> Result<Resp, CallError> {
-        self.send(req)?;
-        self.recv()
+    /// Returns the number of slots available per client.
+    #[inline]
+    pub fn slots_per_client(&self) -> u32 {
+        self.slots_per_client
     }
 
     /// Returns the client's slot ID.
+    #[inline]
     pub fn id(&self) -> ClientId {
         ClientId(self.client_id)
     }
 
     /// Returns true if the server is still alive.
+    #[inline]
     pub fn is_server_alive(&self) -> bool {
         unsafe { (*self.header).server_alive.load(Ordering::Acquire) }
     }
 }
 
-impl<Req: Serial, Resp: Serial> Drop for Client<Req, Resp> {
+/// Type alias for synchronous-only clients (no async callback).
+pub type SyncClient<Req, Resp> = Client<Req, Resp, (), fn((), Resp)>;
+
+/// Synchronous convenience methods.
+impl<Req: Serial, Resp: Serial> SyncClient<Req, Resp> {
+    /// Connects with a no-op callback for synchronous-only usage.
+    ///
+    /// Use [`call_blocking()`](Self::call_blocking) for RPC calls.
+    ///
+    /// # Safety
+    /// Same requirements as [`connect()`](Client::connect).
+    pub unsafe fn connect_sync<P: AsRef<Path>>(path: P) -> Result<Self, ConnectError> {
+        fn noop<R>(_: (), _: R) {}
+        unsafe { Self::connect(path, noop::<Resp>) }
+    }
+
+    /// Synchronous blocking RPC call.
+    ///
+    /// Bypasses the FIFO pending queue entirely, spinning directly on the
+    /// assigned slot for minimal overhead. If async calls are in flight,
+    /// their callbacks are drained via `poll()` while waiting.
+    #[inline]
+    pub fn call_blocking(&mut self, req: Req) -> Result<Resp, CallError> {
+        while self.free_bitmap == 0 {
+            self.poll()?;
+            std::hint::spin_loop();
+        }
+        // Allocate slot directly (not via send_internal — no pending_queue push)
+        let slot_idx = self.free_bitmap.trailing_zeros();
+        self.free_bitmap &= !(1 << slot_idx);
+        let new_seq = self.write_slot(slot_idx, req);
+
+        let fi = self.base_slot + slot_idx;
+        let has_async = self.pq_count > 0;
+
+        loop {
+            if self.slot_server_seq(fi).load(Ordering::Acquire) == new_seq {
+                let resp = unsafe { std::ptr::read_volatile(self.slot_resp_ptr(fi)) };
+                self.free_bitmap |= 1 << slot_idx;
+                return Ok(resp);
+            }
+            if has_async {
+                self.poll()?;
+            } else if !self.is_server_alive() {
+                self.free_bitmap |= 1 << slot_idx;
+                return Err(CallError::ServerDisconnected);
+            }
+            std::hint::spin_loop();
+        }
+    }
+}
+
+impl<Req: Serial, Resp: Serial, U, F: FnMut(U, Resp)> Drop for Client<Req, Resp, U, F> {
     fn drop(&mut self) {
-        let first_global = self.global_slot(0);
         unsafe {
-            let alive = &*(self.slot_base(first_global).add(self.layout.alive_offset)
+            let alive = &*(self.slot_base(self.base_slot).add(self.layout.alive_offset)
                 as *const AtomicBool);
             alive.store(false, Ordering::Release);
         }
@@ -741,14 +785,15 @@ mod tests {
             let name_clone = name.clone();
             let client_thread = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(10));
-                let mut client = Client::<u64, u64>::connect(&name_clone).unwrap();
-                let resp = client.call(42).unwrap();
+                let mut client = SyncClient::<u64, u64>::connect_sync(&name_clone).unwrap();
+                let resp = client.call_blocking(42).unwrap();
                 assert_eq!(resp, 43);
             });
 
-            // Poll for request using process_batch
             loop {
-                if server.process_batch(|_cid, req| req + 1) > 0 {
+                server.poll();
+                if let Some((token, req)) = server.recv() {
+                    server.reply(token, req + 1);
                     break;
                 }
                 std::hint::spin_loop();
@@ -767,7 +812,7 @@ mod tests {
 
             let name_clone = name.clone();
             {
-                let client = Client::<u64, u64>::connect(&name_clone).unwrap();
+                let client = SyncClient::<u64, u64>::connect_sync(&name_clone).unwrap();
                 assert!(server.is_client_connected(client.id()));
                 let cid = client.id();
                 drop(client);
@@ -783,7 +828,7 @@ mod tests {
         unsafe {
             let server = Server::<u64, u64>::create(&name, 4, 1).unwrap();
             let name_clone = name.clone();
-            let client = Client::<u64, u64>::connect(&name_clone).unwrap();
+            let client = SyncClient::<u64, u64>::connect_sync(&name_clone).unwrap();
             assert!(client.is_server_alive());
             drop(server);
             assert!(!client.is_server_alive());
@@ -800,16 +845,20 @@ mod tests {
             let name_clone = name.clone();
             let client_thread = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(10));
-                let mut client = Client::<u64, u64>::connect(&name_clone).unwrap();
+                let mut client = SyncClient::<u64, u64>::connect_sync(&name_clone).unwrap();
                 for i in 0..100u64 {
-                    let resp = client.call(i).unwrap();
+                    let resp = client.call_blocking(i).unwrap();
                     assert_eq!(resp, i * 2);
                 }
             });
 
             let mut served = 0;
             while served < 100 {
-                served += server.process_batch(|_cid, req| req * 2);
+                server.poll();
+                while let Some((token, req)) = server.recv() {
+                    server.reply(token, req * 2);
+                    served += 1;
+                }
                 std::hint::spin_loop();
             }
 
@@ -827,13 +876,15 @@ mod tests {
             let name_clone = name.clone();
             let client_thread = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(10));
-                let mut client = Client::<u32, u64>::connect(&name_clone).unwrap();
-                let resp = client.call(10u32).unwrap();
+                let mut client = SyncClient::<u32, u64>::connect_sync(&name_clone).unwrap();
+                let resp = client.call_blocking(10u32).unwrap();
                 assert_eq!(resp, 100u64);
             });
 
             loop {
-                if server.process_batch(|_cid, req| req as u64 * 10) > 0 {
+                server.poll();
+                if let Some((token, req)) = server.recv() {
+                    server.reply(token, req as u64 * 10);
                     break;
                 }
                 std::hint::spin_loop();
@@ -853,48 +904,37 @@ mod tests {
             let name_clone = name.clone();
             let client_thread = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(10));
-                let mut client = Client::<u64, u64>::connect(&name_clone).unwrap();
+                let mut client = SyncClient::<u64, u64>::connect_sync(&name_clone).unwrap();
 
-                // Send 4 requests (fills pipeline)
-                for i in 0..4u64 {
-                    client.send(i).unwrap();
-                }
-
-                // Receive all 4 responses (server will complete deferred ones)
                 let mut results = Vec::new();
-                for _ in 0..4 {
-                    results.push(client.recv().unwrap());
+                for i in 0..4u64 {
+                    results.push(client.call_blocking(i).unwrap());
                 }
                 results
             });
 
-            // Collect deferred requests
-            let mut deferred: Vec<(ClientId, u32, u64)> = Vec::new();
+            let mut deferred: Vec<(RequestToken, u64)> = Vec::new();
             let mut served = 0u32;
 
             while served < 4 {
-                served += server.process_batch_deferred(|cid, slot_idx, req| {
+                server.poll();
+                while let Some((token, req)) = server.recv() {
+                    served += 1;
                     if req % 2 == 0 {
-                        // Defer even requests
-                        deferred.push((cid, slot_idx, req));
-                        None
+                        deferred.push((token, req));
                     } else {
-                        // Respond immediately to odd requests
-                        Some(req * 10)
+                        server.reply(token, req * 10);
                     }
-                });
+                }
+                for (token, req) in deferred.drain(..) {
+                    server.reply(token, req * 100);
+                }
                 std::hint::spin_loop();
-            }
-
-            // Complete deferred requests
-            for (cid, slot_idx, req) in &deferred {
-                server.complete_request(*cid, *slot_idx, req * 100);
             }
 
             let results = client_thread.join().unwrap();
             assert_eq!(results.len(), 4);
-            // Slots are received in FIFO order. req 0 (even→*100), req 1 (odd→*10),
-            // req 2 (even→*100), req 3 (odd→*10)
+            // call_blocking is serial: 0 (even→*100), 1 (odd→*10), 2 (even→*100), 3 (odd→*10)
             assert_eq!(results[0], 0);   // 0 * 100
             assert_eq!(results[1], 10);  // 1 * 10
             assert_eq!(results[2], 200); // 2 * 100
@@ -903,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn test_send_recv_pipeline() {
+    fn test_async_pipeline() {
         let name = format!("/shm_rpc_pipe_{}", std::process::id());
 
         unsafe {
@@ -912,28 +952,38 @@ mod tests {
             let name_clone = name.clone();
             let client_thread = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(10));
-                let mut client = Client::<u64, u64>::connect(&name_clone).unwrap();
 
-                // Fill pipeline with 4 requests
+                let count = std::cell::Cell::new(0u64);
+                let mut client =
+                    Client::<u64, u64, (), _>::connect(&name_clone, |(), _resp| {
+                        count.set(count.get() + 1);
+                    })
+                    .unwrap();
+
+                // Fill pipeline
                 for i in 0..4u64 {
-                    client.send(i).unwrap();
+                    client.call(i, ()).unwrap();
                 }
-                // Steady state: recv oldest, send new
+                // Steady state: call() will poll internally when full
                 for i in 4..100u64 {
-                    let resp = client.recv().unwrap();
-                    assert_eq!(resp, (i - 4) + 1);
-                    client.send(i).unwrap();
+                    client.call(i, ()).unwrap();
                 }
                 // Drain
-                for i in 96..100u64 {
-                    let resp = client.recv().unwrap();
-                    assert_eq!(resp, i + 1);
+                while client.pending_count() > 0 {
+                    client.poll().unwrap();
+                    std::hint::spin_loop();
                 }
+
+                assert_eq!(count.get(), 100);
             });
 
-            let mut served = 0;
+            let mut served = 0u32;
             while served < 100 {
-                served += server.process_batch(|_cid, req| req + 1);
+                server.poll();
+                while let Some((token, req)) = server.recv() {
+                    server.reply(token, req + 1);
+                    served += 1;
+                }
                 std::hint::spin_loop();
             }
 

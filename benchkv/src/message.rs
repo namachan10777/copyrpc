@@ -52,22 +52,7 @@ pub enum DelegatePayload {
 
 unsafe impl thread_channel::Serial for DelegatePayload {}
 
-/// User data attached to each Flux `call()`.
-/// Used by the `on_response` callback to route the response.
-#[derive(Clone, Copy, Debug)]
-pub struct DelegateUserData {
-    pub client_id: u32,
-    pub slot_index: u32,
-}
-
 // === copyrpc layer: inter-node communication ===
-
-/// Routing info for copyrpc responses.
-#[derive(Clone, Copy, Debug)]
-pub struct CopyrpcOrigin {
-    pub client_id: u32,
-    pub slot_index: u32,
-}
 
 /// Serialized copyrpc request payload.
 #[derive(Clone, Copy)]
@@ -112,19 +97,19 @@ impl RemoteResponse {
 // === Thread-local response queues ===
 
 use std::cell::RefCell;
+use shm_spsc::RequestToken;
 
 /// Response routed back from the Flux on_response callback.
 #[derive(Debug)]
 pub struct FluxResponseEntry {
-    pub client_id: u32,
-    pub slot_index: u32,
+    pub token: RequestToken,
     pub response: Response,
 }
 
 /// Response routed back from the copyrpc on_response callback.
 #[derive(Debug)]
 pub struct CopyrpcResponseEntry {
-    pub origin: CopyrpcOrigin,
+    pub token: RequestToken,
     pub response: Response,
 }
 

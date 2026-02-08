@@ -7,7 +7,7 @@
 //! IRQ-handling cores (0,1) and system noise.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use shm_spsc::{Client, Server};
+use shm_spsc::{Client, Server, SyncClient};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -36,7 +36,10 @@ fn run_bench(b: &mut criterion::Bencher, depth: u32) {
         let server_thread = thread::spawn(move || {
             pin_to_core(SERVER_CORE);
             while !stop_server.load(Ordering::Relaxed) {
-                server.process_batch(|_cid, req| req + 1);
+                server.poll();
+                while let Some((token, req)) = server.recv() {
+                    server.reply(token, req + 1);
+                }
             }
         });
 
@@ -53,43 +56,72 @@ fn run_bench(b: &mut criterion::Bencher, depth: u32) {
 
             client_handles.push(thread::spawn(move || {
                 pin_to_core(core_id);
-                let mut client = Client::<u64, u64>::connect(&name_clone).unwrap();
 
-                // Warmup
-                for _ in 0..100 {
-                    client.call(0).unwrap();
-                }
+                if depth <= 1 {
+                    let mut client =
+                        SyncClient::<u64, u64>::connect_sync(&name_clone).unwrap();
 
-                loop {
-                    start_b.wait();
-                    if stop_clone.load(Ordering::Relaxed) {
-                        return;
+                    // Warmup
+                    for _ in 0..100 {
+                        client.call_blocking(0).unwrap();
                     }
-                    let iters = iters_clone.load(Ordering::Relaxed);
 
-                    if depth <= 1 {
+                    loop {
+                        start_b.wait();
+                        if stop_clone.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let iters = iters_clone.load(Ordering::Relaxed);
                         for _ in 0..iters {
-                            client.call(42u64).unwrap();
+                            client.call_blocking(42u64).unwrap();
                         }
-                    } else {
-                        let d = depth as u64;
-                        let fill = d.min(iters);
-                        // Fill pipeline
-                        for _ in 0..fill {
-                            client.send(42u64).unwrap();
-                        }
-                        // Steady state
-                        for _ in fill..iters {
-                            client.recv().unwrap();
-                            client.send(42u64).unwrap();
-                        }
-                        // Drain
-                        for _ in 0..fill {
-                            client.recv().unwrap();
-                        }
+                        end_b.wait();
+                    }
+                } else {
+                    let count = std::cell::Cell::new(0u64);
+                    let mut client =
+                        Client::<u64, u64, (), _>::connect(&name_clone, |(), _resp| {
+                            count.set(count.get() + 1);
+                        })
+                        .unwrap();
+
+                    // Warmup
+                    for _ in 0..100 {
+                        client.call(42u64, ()).unwrap();
+                    }
+                    while client.pending_count() > 0 {
+                        client.poll().unwrap();
+                        std::hint::spin_loop();
                     }
 
-                    end_b.wait();
+                    loop {
+                        start_b.wait();
+                        if stop_clone.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let iters = iters_clone.load(Ordering::Relaxed);
+                        count.set(0);
+
+                        // Pipeline: fill, then poll+refill, then drain
+                        let fill = (depth as u64).min(iters);
+                        for _ in 0..fill {
+                            client.call(42u64, ()).unwrap();
+                        }
+                        let mut sent = fill;
+                        while count.get() < iters {
+                            let n = client.poll().unwrap();
+                            let to_send = (n as u64).min(iters - sent);
+                            for _ in 0..to_send {
+                                client.call(42u64, ()).unwrap();
+                            }
+                            sent += to_send;
+                            if n == 0 {
+                                std::hint::spin_loop();
+                            }
+                        }
+
+                        end_b.wait();
+                    }
                 }
             }));
         }

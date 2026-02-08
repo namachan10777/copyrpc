@@ -1,6 +1,6 @@
 //! Integration tests for shm_spsc RPC slot communication.
 
-use shm_spsc::{CallError, Client, ConnectError, Server};
+use shm_spsc::{CallError, Client, ConnectError, Server, SyncClient};
 use std::thread;
 use std::time::Duration;
 
@@ -15,17 +15,21 @@ fn test_basic_rpc() {
         let name_clone = name.clone();
         let client_thread = thread::spawn(move || {
             thread::sleep(Duration::from_millis(10));
-            let mut client = Client::<u64, u64>::connect(&name_clone).unwrap();
+            let mut client = SyncClient::<u64, u64>::connect_sync(&name_clone).unwrap();
 
             for i in 0..100u64 {
-                let resp = client.call(i).unwrap();
+                let resp = client.call_blocking(i).unwrap();
                 assert_eq!(resp, i + 1);
             }
         });
 
         let mut served = 0;
         while served < 100 {
-            served += server.process_batch(|_cid, req| req + 1);
+            server.poll();
+            while let Some((token, req)) = server.recv() {
+                server.reply(token, req + 1);
+                served += 1;
+            }
             std::hint::spin_loop();
         }
 
@@ -49,11 +53,11 @@ fn test_multi_client() {
             let name_clone = name.clone();
             handles.push(thread::spawn(move || {
                 thread::sleep(Duration::from_millis(10 + client_idx as u64 * 5));
-                let mut client = Client::<u64, u64>::connect(&name_clone).unwrap();
+                let mut client = SyncClient::<u64, u64>::connect_sync(&name_clone).unwrap();
 
                 for i in 0..calls_per_client {
                     let req = client_idx as u64 * 1000 + i;
-                    let resp = client.call(req).unwrap();
+                    let resp = client.call_blocking(req).unwrap();
                     assert_eq!(resp, req * 2);
                 }
             }));
@@ -62,7 +66,11 @@ fn test_multi_client() {
         let total = num_clients as u64 * calls_per_client;
         let mut served = 0u64;
         while served < total {
-            served += server.process_batch(|_cid, req| req * 2) as u64;
+            server.poll();
+            while let Some((token, req)) = server.recv() {
+                server.reply(token, req * 2);
+                served += 1;
+            }
             std::hint::spin_loop();
         }
 
@@ -81,7 +89,7 @@ fn test_server_disconnect() {
         let name_clone = name.clone();
         let client_thread = thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
-            let mut client = Client::<u64, u64>::connect(&name_clone).unwrap();
+            let mut client = SyncClient::<u64, u64>::connect_sync(&name_clone).unwrap();
 
             // Wait for server to die
             thread::sleep(Duration::from_millis(100));
@@ -89,7 +97,7 @@ fn test_server_disconnect() {
             assert!(!client.is_server_alive());
 
             // call should return ServerDisconnected
-            match client.call(42) {
+            match client.call_blocking(42) {
                 Err(CallError::ServerDisconnected) => {}
                 other => panic!("expected ServerDisconnected, got {:?}", other),
             }
@@ -116,9 +124,8 @@ fn test_client_disconnect() {
         let name_clone = name.clone();
         let client_thread = thread::spawn(move || {
             thread::sleep(Duration::from_millis(10));
-            let client = Client::<u64, u64>::connect(&name_clone).unwrap();
+            let client = SyncClient::<u64, u64>::connect_sync(&name_clone).unwrap();
             let cid = client.id();
-            // client drops immediately
             drop(client);
             cid
         });
@@ -141,13 +148,14 @@ fn test_array_type() {
         let name_clone = name.clone();
         let client_thread = thread::spawn(move || {
             thread::sleep(Duration::from_millis(10));
-            let mut client = Client::<[u8; 64], [u8; 128]>::connect(&name_clone).unwrap();
+            let mut client =
+                SyncClient::<[u8; 64], [u8; 128]>::connect_sync(&name_clone).unwrap();
 
             let mut req = [0u8; 64];
             req[0] = 0xAB;
             req[63] = 0xCD;
 
-            let resp = client.call(req).unwrap();
+            let resp = client.call_blocking(req).unwrap();
             assert_eq!(resp[0], 0xAB);
             assert_eq!(resp[63], 0xCD);
             assert_eq!(resp[64], 0xFF);
@@ -155,14 +163,13 @@ fn test_array_type() {
         });
 
         loop {
-            let processed = server.process_batch(|_cid, req| {
+            server.poll();
+            if let Some((token, req)) = server.recv() {
                 let mut resp = [0u8; 128];
                 resp[..64].copy_from_slice(&req);
                 resp[64] = 0xFF;
                 resp[127] = 0xEE;
-                resp
-            });
-            if processed > 0 {
+                server.reply(token, resp);
                 break;
             }
             std::hint::spin_loop();
@@ -180,11 +187,11 @@ fn test_server_full() {
     unsafe {
         let _server = Server::<u64, u64>::create(&name, 2, 1).unwrap();
 
-        let _c1 = Client::<u64, u64>::connect(&name).unwrap();
-        let _c2 = Client::<u64, u64>::connect(&name).unwrap();
+        let _c1 = SyncClient::<u64, u64>::connect_sync(&name).unwrap();
+        let _c2 = SyncClient::<u64, u64>::connect_sync(&name).unwrap();
 
         // Third client should fail
-        match Client::<u64, u64>::connect(&name) {
+        match SyncClient::<u64, u64>::connect_sync(&name) {
             Err(ConnectError::ServerFull) => {}
             Ok(_) => panic!("expected ServerFull, got Ok"),
             Err(e) => panic!("expected ServerFull, got {:?}", e),
@@ -199,14 +206,14 @@ fn test_channel_name_formats() {
     let name1 = format!("shm_rpc_name1_{}", std::process::id());
     unsafe {
         let _server = Server::<u64, u64>::create(&name1, 4, 1).unwrap();
-        let _client = Client::<u64, u64>::connect(&name1).unwrap();
+        let _client = SyncClient::<u64, u64>::connect_sync(&name1).unwrap();
     }
 
     // With leading slash
     let name2 = format!("/shm_rpc_name2_{}", std::process::id());
     unsafe {
         let _server = Server::<u64, u64>::create(&name2, 4, 1).unwrap();
-        let _client = Client::<u64, u64>::connect(&name2).unwrap();
+        let _client = SyncClient::<u64, u64>::connect_sync(&name2).unwrap();
     }
 }
 
@@ -219,10 +226,10 @@ fn test_connected_clients() {
         let server = Server::<u64, u64>::create(&name, 4, 1).unwrap();
         assert_eq!(server.connected_clients(), 0);
 
-        let c1 = Client::<u64, u64>::connect(&name).unwrap();
+        let c1 = SyncClient::<u64, u64>::connect_sync(&name).unwrap();
         assert_eq!(server.connected_clients(), 1);
 
-        let c2 = Client::<u64, u64>::connect(&name).unwrap();
+        let c2 = SyncClient::<u64, u64>::connect_sync(&name).unwrap();
         assert_eq!(server.connected_clients(), 2);
 
         drop(c1);
@@ -233,7 +240,7 @@ fn test_connected_clients() {
     }
 }
 
-/// Test send/recv pipelining with depth 2.
+/// Test async pipeline with depth 2.
 #[test]
 fn test_pipeline_depth2() {
     let name = format!("/shm_rpc_ipc_pipe2_{}", std::process::id());
@@ -244,31 +251,32 @@ fn test_pipeline_depth2() {
         let name_clone = name.clone();
         let client_thread = thread::spawn(move || {
             thread::sleep(Duration::from_millis(10));
-            let mut client = Client::<u64, u64>::connect(&name_clone).unwrap();
 
-            let depth = 2u64;
-            let total = 50u64;
+            let count = std::cell::Cell::new(0u64);
+            let mut client =
+                Client::<u64, u64, (), _>::connect(&name_clone, |(), _resp| {
+                    count.set(count.get() + 1);
+                })
+                .unwrap();
 
-            // Fill pipeline
-            for i in 0..depth {
-                client.send(i).unwrap();
+            for i in 0..50u64 {
+                client.call(i, ()).unwrap();
             }
-            // Steady state
-            for i in depth..total {
-                let resp = client.recv().unwrap();
-                assert_eq!(resp, (i - depth) + 1);
-                client.send(i).unwrap();
+            while client.pending_count() > 0 {
+                client.poll().unwrap();
+                std::hint::spin_loop();
             }
-            // Drain
-            for i in (total - depth)..total {
-                let resp = client.recv().unwrap();
-                assert_eq!(resp, i + 1);
-            }
+
+            assert_eq!(count.get(), 50);
         });
 
         let mut served = 0u32;
         while served < 50 {
-            served += server.process_batch(|_cid, req| req + 1);
+            server.poll();
+            while let Some((token, req)) = server.recv() {
+                server.reply(token, req + 1);
+                served += 1;
+            }
             std::hint::spin_loop();
         }
 
@@ -281,40 +289,45 @@ fn test_pipeline_depth2() {
 fn test_multi_client_pipeline() {
     let name = format!("/shm_rpc_ipc_mcpipe_{}", std::process::id());
     let num_clients = 4u32;
-    let depth = 4u64;
     let calls_per_client = 100u64;
 
     unsafe {
         let mut server =
-            Server::<u64, u64>::create(&name, num_clients, depth as u32).unwrap();
+            Server::<u64, u64>::create(&name, num_clients, 4).unwrap();
 
         let mut handles = Vec::new();
         for client_idx in 0..num_clients {
             let name_clone = name.clone();
             handles.push(thread::spawn(move || {
                 thread::sleep(Duration::from_millis(10 + client_idx as u64 * 5));
-                let mut client = Client::<u64, u64>::connect(&name_clone).unwrap();
 
-                // Fill
-                for i in 0..depth {
-                    client.send(client_idx as u64 * 1000 + i).unwrap();
+                let count = std::cell::Cell::new(0u64);
+                let mut client =
+                    Client::<u64, u64, (), _>::connect(&name_clone, |(), _resp| {
+                        count.set(count.get() + 1);
+                    })
+                    .unwrap();
+
+                for i in 0..calls_per_client {
+                    client.call(client_idx as u64 * 1000 + i, ()).unwrap();
                 }
-                // Steady state
-                for i in depth..calls_per_client {
-                    let _resp = client.recv().unwrap();
-                    client.send(client_idx as u64 * 1000 + i).unwrap();
+                while client.pending_count() > 0 {
+                    client.poll().unwrap();
+                    std::hint::spin_loop();
                 }
-                // Drain
-                for _ in 0..depth {
-                    let _resp = client.recv().unwrap();
-                }
+
+                assert_eq!(count.get(), calls_per_client);
             }));
         }
 
         let total = num_clients as u64 * calls_per_client;
         let mut served = 0u64;
         while served < total {
-            served += server.process_batch(|_cid, req| req * 2) as u64;
+            server.poll();
+            while let Some((token, req)) = server.recv() {
+                server.reply(token, req * 2);
+                served += 1;
+            }
             std::hint::spin_loop();
         }
 

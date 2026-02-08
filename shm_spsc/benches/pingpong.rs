@@ -1,7 +1,7 @@
 //! Benchmark for shm_spsc RPC call latency.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use shm_spsc::{Client, Server};
+use shm_spsc::{Server, SyncClient};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -29,23 +29,26 @@ fn bench_call_latency(c: &mut Criterion) {
             let server_thread = thread::spawn(move || {
                 pin_to_core(30);
                 while !stop_clone.load(Ordering::Relaxed) {
-                    server.process_batch(|_cid, req| req + 1);
+                    server.poll();
+                    while let Some((token, req)) = server.recv() {
+                        server.reply(token, req + 1);
+                    }
                 }
             });
 
             // Wait for server to be ready
             thread::sleep(std::time::Duration::from_millis(10));
 
-            let mut client = Client::<u64, u64>::connect(&name_clone).unwrap();
+            let mut client = SyncClient::<u64, u64>::connect_sync(&name_clone).unwrap();
 
             // Warmup
             for _ in 0..1000 {
-                client.call(0).unwrap();
+                client.call_blocking(0).unwrap();
             }
 
             b.iter(|| {
                 pin_to_core(31);
-                black_box(client.call(black_box(42u64)).unwrap());
+                black_box(client.call_blocking(black_box(42u64)).unwrap());
             });
 
             stop.store(true, Ordering::Relaxed);
@@ -68,24 +71,27 @@ fn bench_call_latency(c: &mut Criterion) {
             let server_thread = thread::spawn(move || {
                 pin_to_core(30);
                 while !stop_clone.load(Ordering::Relaxed) {
-                    server.process_batch(|_cid, req| req);
+                    server.poll();
+                    while let Some((token, req)) = server.recv() {
+                        server.reply(token, req);
+                    }
                 }
             });
 
             thread::sleep(std::time::Duration::from_millis(10));
 
             let mut client =
-                Client::<[u8; 64], [u8; 64]>::connect(&name_clone).unwrap();
+                SyncClient::<[u8; 64], [u8; 64]>::connect_sync(&name_clone).unwrap();
 
             // Warmup
             for _ in 0..1000 {
-                client.call([0u8; 64]).unwrap();
+                client.call_blocking([0u8; 64]).unwrap();
             }
 
             let data = [0xABu8; 64];
             b.iter(|| {
                 pin_to_core(31);
-                black_box(client.call(black_box(data)).unwrap());
+                black_box(client.call_blocking(black_box(data)).unwrap());
             });
 
             stop.store(true, Ordering::Relaxed);
@@ -108,24 +114,27 @@ fn bench_call_latency(c: &mut Criterion) {
             let server_thread = thread::spawn(move || {
                 pin_to_core(30);
                 while !stop_clone.load(Ordering::Relaxed) {
-                    server.process_batch(|_cid, req| req);
+                    server.poll();
+                    while let Some((token, req)) = server.recv() {
+                        server.reply(token, req);
+                    }
                 }
             });
 
             thread::sleep(std::time::Duration::from_millis(10));
 
             let mut client =
-                Client::<[u8; 256], [u8; 256]>::connect(&name_clone).unwrap();
+                SyncClient::<[u8; 256], [u8; 256]>::connect_sync(&name_clone).unwrap();
 
             // Warmup
             for _ in 0..1000 {
-                client.call([0u8; 256]).unwrap();
+                client.call_blocking([0u8; 256]).unwrap();
             }
 
             let data = [0xABu8; 256];
             b.iter(|| {
                 pin_to_core(31);
-                black_box(client.call(black_box(data)).unwrap());
+                black_box(client.call_blocking(black_box(data)).unwrap());
             });
 
             stop.store(true, Ordering::Relaxed);

@@ -23,7 +23,8 @@ use daemon::{
     on_delegate_response, CopyrpcSetup, DaemonFlux, EndpointConnectionInfo, CONNECTION_INFO_SIZE,
 };
 use epoch::EpochCollector;
-use message::{DelegatePayload, DelegateUserData, Request, Response};
+use message::{DelegatePayload, Request, Response};
+use shm_spsc::RequestToken;
 
 #[derive(Parser, Debug)]
 #[command(name = "benchkv")]
@@ -211,21 +212,21 @@ fn run_meta(
     let flux_capacity = 1024;
     let flux_inflight_max = 256;
     let mut flux_nodes: Vec<Option<DaemonFlux>> = if num_daemons > 1 {
-        thread_channel::create_flux::<DelegatePayload, DelegateUserData, _>(
+        thread_channel::create_flux::<DelegatePayload, RequestToken, _>(
             num_daemons,
             flux_capacity,
             flux_inflight_max,
-            on_delegate_response as fn(&mut DelegateUserData, DelegatePayload),
+            on_delegate_response as fn(&mut RequestToken, DelegatePayload),
         )
         .into_iter()
         .map(Some)
         .collect()
     } else {
-        thread_channel::create_flux::<DelegatePayload, DelegateUserData, _>(
+        thread_channel::create_flux::<DelegatePayload, RequestToken, _>(
             1,
             flux_capacity,
             flux_inflight_max,
-            on_delegate_response as fn(&mut DelegateUserData, DelegatePayload),
+            on_delegate_response as fn(&mut RequestToken, DelegatePayload),
         )
         .into_iter()
         .map(Some)

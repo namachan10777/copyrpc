@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use shm_spsc::Client;
+
 use crate::message::{Request, Response};
 use crate::workload::AccessEntry;
 
@@ -25,9 +27,12 @@ pub fn run_client(
     stop_flag: &AtomicBool,
     completions: &AtomicU64,
 ) {
-    let mut client =
-        unsafe { shm_spsc::Client::<Request, Response>::connect(shm_path) }
-            .expect("Client failed to connect");
+    let mut client = unsafe {
+        Client::<Request, Response, (), _>::connect(shm_path, |(), _resp| {
+            completions.fetch_add(1, Ordering::Relaxed);
+        })
+    }
+    .expect("Client failed to connect");
 
     let pattern_len = pattern.len();
     let mut pattern_idx = 0usize;
@@ -36,23 +41,27 @@ pub fn run_client(
     for _ in 0..queue_depth {
         let entry = &pattern[pattern_idx % pattern_len];
         pattern_idx += 1;
-        if client.send(make_request(entry)).is_err() {
+        if client.call(make_request(entry), ()).is_err() {
             return;
         }
     }
 
-    // Steady state: recv any completed → count completion → send next
+    // Steady state: poll for completions, send replacements
     while !stop_flag.load(Ordering::Relaxed) {
-        match client.recv_any() {
-            Ok(_resp) => {
-                completions.fetch_add(1, Ordering::Relaxed);
-                let entry = &pattern[pattern_idx % pattern_len];
-                pattern_idx += 1;
-                if client.send(make_request(entry)).is_err() {
-                    break;
+        match client.poll() {
+            Ok(n) => {
+                for _ in 0..n {
+                    let entry = &pattern[pattern_idx % pattern_len];
+                    pattern_idx += 1;
+                    if client.call(make_request(entry), ()).is_err() {
+                        return;
+                    }
+                }
+                if n == 0 {
+                    std::hint::spin_loop();
                 }
             }
-            Err(shm_spsc::CallError::ServerDisconnected) => break,
+            Err(_) => break,
         }
     }
 }
