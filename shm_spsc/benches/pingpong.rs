@@ -1,8 +1,7 @@
 //! Benchmark for shm_spsc RPC call latency.
 //!
-//! Compares three implementations:
+//! Compares two implementations:
 //! - slot: original toggle-bit slot protocol
-//! - shared: shared MPSC ring buffer with fetch_add
 //! - ffwd: per-client SPSC delegation (flat combining)
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
@@ -39,38 +38,6 @@ fn bench_call_latency(c: &mut Criterion) {
             });
             thread::sleep(std::time::Duration::from_millis(10));
             let mut client = shm_spsc::SyncClient::<u64, u64>::connect_sync(&name).unwrap();
-            for _ in 0..1000 {
-                client.call_blocking(0).unwrap();
-            }
-            b.iter(|| {
-                pin_to_core(31);
-                black_box(client.call_blocking(black_box(42u64)).unwrap());
-            });
-            stop.store(true, Ordering::Relaxed);
-            server_thread.join().unwrap();
-        }
-    });
-
-    // --- Shared MPSC ---
-    group.bench_function("shared_u64", |b| {
-        let name = format!("/shm_bench_shared_{}", Uuid::now_v7());
-        unsafe {
-            let mut server =
-                shm_spsc::mpsc_shared::Server::<u64, u64>::create(&name, 4, RING_DEPTH).unwrap();
-            let stop = Arc::new(AtomicBool::new(false));
-            let stop_clone = stop.clone();
-            let server_thread = thread::spawn(move || {
-                pin_to_core(30);
-                while !stop_clone.load(Ordering::Relaxed) {
-                    server.poll();
-                    while let Some((token, req)) = server.recv() {
-                        server.reply(token, req + 1);
-                    }
-                }
-            });
-            thread::sleep(std::time::Duration::from_millis(10));
-            let mut client =
-                shm_spsc::mpsc_shared::SyncClient::<u64, u64>::connect_sync(&name).unwrap();
             for _ in 0..1000 {
                 client.call_blocking(0).unwrap();
             }

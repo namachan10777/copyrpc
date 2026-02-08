@@ -19,7 +19,6 @@
 //! - `reply(token, resp)` — writes response (immediate or deferred)
 
 pub mod mpsc_ffwd;
-pub mod mpsc_shared;
 pub mod shm;
 
 use shm::SharedMemory;
