@@ -10,7 +10,7 @@ fn test_basic_rpc() {
     let name = format!("/shm_rpc_ipc_basic_{}", std::process::id());
 
     unsafe {
-        let mut server = Server::<u64, u64>::create(&name, 4, 1).unwrap();
+        let server = Server::<u64, u64>::create(&name, 4, 1).unwrap();
 
         let name_clone = name.clone();
         let client_thread = thread::spawn(move || {
@@ -26,8 +26,9 @@ fn test_basic_rpc() {
         let mut served = 0;
         while served < 100 {
             server.poll();
-            while let Some((token, req)) = server.recv() {
-                server.reply(token, req + 1);
+            while let Some(handle) = server.recv() {
+                let req = *handle.data();
+                handle.reply(req + 1);
                 served += 1;
             }
             std::hint::spin_loop();
@@ -45,7 +46,7 @@ fn test_multi_client() {
     let calls_per_client = 50u64;
 
     unsafe {
-        let mut server =
+        let server =
             Server::<u64, u64>::create(&name, num_clients, 1).unwrap();
 
         let mut handles = Vec::new();
@@ -67,8 +68,9 @@ fn test_multi_client() {
         let mut served = 0u64;
         while served < total {
             server.poll();
-            while let Some((token, req)) = server.recv() {
-                server.reply(token, req * 2);
+            while let Some(handle) = server.recv() {
+                let req = *handle.data();
+                handle.reply(req * 2);
                 served += 1;
             }
             std::hint::spin_loop();
@@ -143,7 +145,7 @@ fn test_array_type() {
     let name = format!("/shm_rpc_ipc_array_{}", std::process::id());
 
     unsafe {
-        let mut server = Server::<[u8; 64], [u8; 128]>::create(&name, 4, 1).unwrap();
+        let server = Server::<[u8; 64], [u8; 128]>::create(&name, 4, 1).unwrap();
 
         let name_clone = name.clone();
         let client_thread = thread::spawn(move || {
@@ -164,12 +166,13 @@ fn test_array_type() {
 
         loop {
             server.poll();
-            if let Some((token, req)) = server.recv() {
+            if let Some(handle) = server.recv() {
+                let req = *handle.data();
                 let mut resp = [0u8; 128];
                 resp[..64].copy_from_slice(&req);
                 resp[64] = 0xFF;
                 resp[127] = 0xEE;
-                server.reply(token, resp);
+                handle.reply(resp);
                 break;
             }
             std::hint::spin_loop();
@@ -246,7 +249,7 @@ fn test_pipeline_depth2() {
     let name = format!("/shm_rpc_ipc_pipe2_{}", std::process::id());
 
     unsafe {
-        let mut server = Server::<u64, u64>::create(&name, 4, 2).unwrap();
+        let server = Server::<u64, u64>::create(&name, 4, 2).unwrap();
 
         let name_clone = name.clone();
         let client_thread = thread::spawn(move || {
@@ -273,8 +276,9 @@ fn test_pipeline_depth2() {
         let mut served = 0u32;
         while served < 50 {
             server.poll();
-            while let Some((token, req)) = server.recv() {
-                server.reply(token, req + 1);
+            while let Some(handle) = server.recv() {
+                let req = *handle.data();
+                handle.reply(req + 1);
                 served += 1;
             }
             std::hint::spin_loop();
@@ -292,7 +296,7 @@ fn test_multi_client_pipeline() {
     let calls_per_client = 100u64;
 
     unsafe {
-        let mut server =
+        let server =
             Server::<u64, u64>::create(&name, num_clients, 4).unwrap();
 
         let mut handles = Vec::new();
@@ -324,8 +328,9 @@ fn test_multi_client_pipeline() {
         let mut served = 0u64;
         while served < total {
             server.poll();
-            while let Some((token, req)) = server.recv() {
-                server.reply(token, req * 2);
+            while let Some(handle) = server.recv() {
+                let req = *handle.data();
+                handle.reply(req * 2);
                 served += 1;
             }
             std::hint::spin_loop();

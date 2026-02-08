@@ -520,13 +520,17 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
     /// Call poll() first to populate the recv_stack.
     /// Returns `None` if no request is available.
     pub fn recv(&self) -> Option<RecvHandle<'_, U, F>> {
-        self.recv_stack.borrow_mut().pop().map(|msg| RecvHandle {
-            _lifetime: PhantomData,
-            endpoint: msg.endpoint,
-            qpn: msg.qpn,
-            call_id: msg.call_id,
-            data_offset: msg.data_offset,
-            data_len: msg.data_len,
+        self.recv_stack.borrow_mut().pop().map(|msg| {
+            let data_ptr = msg.endpoint.borrow().recv_ring.as_ptr();
+            let data_ptr = unsafe { data_ptr.add(msg.data_offset) };
+            RecvHandle {
+                _lifetime: PhantomData,
+                endpoint: msg.endpoint,
+                qpn: msg.qpn,
+                call_id: msg.call_id,
+                data_ptr,
+                data_len: msg.data_len,
+            }
         })
     }
 
@@ -1012,13 +1016,17 @@ impl<U> Endpoint<U> {
     ///
     /// When the response arrives, the Context's on_response callback will
     /// be invoked with the provided user_data.
-    pub fn call(&self, data: &[u8], user_data: U) -> Result<u32> {
+    pub fn call(
+        &self,
+        data: &[u8],
+        user_data: U,
+    ) -> std::result::Result<u32, error::CallError<U>> {
         let inner = self.inner.borrow();
 
         let remote_ring = inner
             .remote_recv_ring
             .get()
-            .ok_or(Error::RemoteConsumerUnknown)?;
+            .ok_or(error::CallError::Other(Error::RemoteConsumerUnknown))?;
 
         // Calculate message size
         let msg_size = padded_message_size(data.len() as u32);
@@ -1030,7 +1038,7 @@ impl<U> Endpoint<U> {
         // Check if write would wrap around the local send buffer
         if send_offset + msg_size as usize > inner.send_ring.len() {
             // First emit any pending WQEs before the wrap point
-            inner.emit_wqe()?;
+            inner.emit_wqe().map_err(error::CallError::Other)?;
 
             // Write padding marker at current offset
             let remaining = inner.send_ring.len() - send_offset;
@@ -1043,7 +1051,7 @@ impl<U> Endpoint<U> {
             inner.send_ring_producer.set(producer);
 
             // Emit the padding marker WQE (sends padding to remote)
-            inner.emit_wqe()?;
+            inner.emit_wqe().map_err(error::CallError::Other)?;
 
             // Recalculate offset (should now be 0)
             send_offset = 0;
@@ -1055,9 +1063,9 @@ impl<U> Endpoint<U> {
 
         if available < msg_size {
             // No space: flush and set force_read flag to trigger RDMA READ
-            inner.flush()?;
+            inner.flush().map_err(error::CallError::Other)?;
             inner.force_read.set(true);
-            return Err(Error::RingFull);
+            return Err(error::CallError::RingFull(user_data));
         }
 
         // Allocate call ID from slab (index is the call_id)
@@ -1094,16 +1102,15 @@ where
     endpoint: Rc<RefCell<EndpointInner<U>>>,
     qpn: u32,
     call_id: u32,
-    data_offset: usize,
+    data_ptr: *const u8,
     data_len: usize,
 }
 
 impl<U, F: Fn(U, &[u8])> RecvHandle<'_, U, F> {
-    /// Access request data zero-copy via callback.
-    pub fn with_data<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
-        let inner = self.endpoint.borrow();
-        let slice = &inner.recv_ring[self.data_offset..self.data_offset + self.data_len];
-        f(slice)
+    /// Zero-copy access to the request data in the receive ring buffer.
+    #[inline]
+    pub fn data(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.data_ptr, self.data_len) }
     }
 
     /// Get the QPN of the endpoint that received this request.

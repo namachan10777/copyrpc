@@ -216,7 +216,7 @@ fn run_meta(
             num_daemons,
             flux_capacity,
             flux_inflight_max,
-            on_delegate_response as fn(&mut RequestToken, DelegatePayload),
+            on_delegate_response as fn(RequestToken, DelegatePayload),
         )
         .into_iter()
         .map(Some)
@@ -226,7 +226,7 @@ fn run_meta(
             1,
             flux_capacity,
             flux_inflight_max,
-            on_delegate_response as fn(&mut RequestToken, DelegatePayload),
+            on_delegate_response as fn(RequestToken, DelegatePayload),
         )
         .into_iter()
         .map(Some)

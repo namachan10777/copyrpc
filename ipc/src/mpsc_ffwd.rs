@@ -10,6 +10,7 @@
 
 use crate::shm::SharedMemory;
 use crate::{align_up, CallError, ClientId, ConnectError, Serial, CACHE_LINE_SIZE};
+use std::cell::{Cell, UnsafeCell};
 use std::collections::VecDeque;
 use std::io;
 use std::marker::PhantomData;
@@ -64,6 +65,72 @@ pub struct RequestToken {
     client_id: ClientId,
 }
 
+/// Zero-copy receive handle for accessing request data in shared memory.
+pub struct RecvHandle<'a, Req: Serial, Resp: Serial> {
+    server: &'a Server<Req, Resp>,
+    client_idx: usize,
+    tail: u64,
+    _marker: PhantomData<(Req, Resp)>,
+}
+
+impl<Req: Serial, Resp: Serial> RecvHandle<'_, Req, Resp> {
+    /// Zero-copy access to the request data.
+    #[inline]
+    pub fn data(&self) -> &Req {
+        let slot_idx = (self.tail & self.server.ring_mask) as usize;
+        let slot_ptr = unsafe {
+            self.server.req_ring_bases[self.client_idx].add(slot_idx * self.server.req_slot_size)
+        };
+        unsafe { &*(slot_ptr.add(self.server.req_data_offset) as *const Req) }
+    }
+
+    /// Consumes the handle and replies immediately.
+    #[inline]
+    pub fn reply(self, resp: Resp) {
+        // Clear valid flag
+        let slot_idx = (self.tail & self.server.ring_mask) as usize;
+        let slot_ptr = unsafe {
+            self.server.req_ring_bases[self.client_idx].add(slot_idx * self.server.req_slot_size)
+        };
+        compiler_fence(Ordering::Release);
+        unsafe { write_volatile(slot_ptr, 0) };
+
+        let req_tails = unsafe { &mut *self.server.req_tails.get() };
+        req_tails[self.client_idx] = self.tail + 1;
+        let req_avail = unsafe { &mut *self.server.req_avail.get() };
+        req_avail[self.client_idx] -= 1;
+
+        self.server.reply_to_client(ClientId(self.client_idx as u32), resp);
+    }
+
+    /// Extracts a non-Copy token for deferred reply.
+    #[inline]
+    pub fn into_token(self) -> RequestToken {
+        // Clear valid flag
+        let slot_idx = (self.tail & self.server.ring_mask) as usize;
+        let slot_ptr = unsafe {
+            self.server.req_ring_bases[self.client_idx].add(slot_idx * self.server.req_slot_size)
+        };
+        compiler_fence(Ordering::Release);
+        unsafe { write_volatile(slot_ptr, 0) };
+
+        let req_tails = unsafe { &mut *self.server.req_tails.get() };
+        req_tails[self.client_idx] = self.tail + 1;
+        let req_avail = unsafe { &mut *self.server.req_avail.get() };
+        req_avail[self.client_idx] -= 1;
+
+        RequestToken {
+            client_id: ClientId(self.client_idx as u32),
+        }
+    }
+
+    /// Returns the client that sent this request.
+    #[inline]
+    pub fn client_id(&self) -> ClientId {
+        ClientId(self.client_idx as u32)
+    }
+}
+
 /// Server-side RPC handler
 pub struct Server<Req: Serial, Resp: Serial> {
     shm: SharedMemory,
@@ -79,16 +146,16 @@ pub struct Server<Req: Serial, Resp: Serial> {
     // Precomputed data offsets within slots
     req_data_offset: usize,
     resp_data_offset: usize,
-    // Per-client ring state
-    req_tails: Vec<u64>,
-    resp_heads: Vec<u64>,
-    scan_pos: u32,
+    // Per-client ring state (interior mutability)
+    req_tails: UnsafeCell<Vec<u64>>,
+    resp_heads: UnsafeCell<Vec<u64>>,
+    scan_pos: Cell<u32>,
     // Zero-copy recv: per-client available count + lane-drain state
-    req_avail: Vec<u32>,
-    recv_start: u32,
-    recv_scan_pos: u32,
+    req_avail: UnsafeCell<Vec<u32>>,
+    recv_start: Cell<u32>,
+    recv_scan_pos: Cell<u32>,
     // Deferred responses (Vec + swap_remove)
-    deferred_responses: Vec<(ClientId, Resp)>,
+    deferred_responses: UnsafeCell<Vec<(ClientId, Resp)>>,
     _phantom: PhantomData<(Req, Resp)>,
 }
 
@@ -164,24 +231,26 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
             control_ptrs,
             req_data_offset,
             resp_data_offset,
-            req_tails: vec![0; max_clients as usize],
-            resp_heads: vec![0; max_clients as usize],
-            scan_pos: 0,
-            req_avail: vec![0; max_clients as usize],
-            recv_start: 0,
-            recv_scan_pos: 0,
-            deferred_responses: Vec::new(),
+            req_tails: UnsafeCell::new(vec![0; max_clients as usize]),
+            resp_heads: UnsafeCell::new(vec![0; max_clients as usize]),
+            scan_pos: Cell::new(0),
+            req_avail: UnsafeCell::new(vec![0; max_clients as usize]),
+            recv_start: Cell::new(0),
+            recv_scan_pos: Cell::new(0),
+            deferred_responses: UnsafeCell::new(Vec::new()),
             _phantom: PhantomData,
         })
     }
 
     /// Try to flush deferred responses to their respective response rings.
-    fn flush_deferred(&mut self) {
+    fn flush_deferred(&self) {
+        let deferred = unsafe { &mut *self.deferred_responses.get() };
+        let resp_heads = unsafe { &mut *self.resp_heads.get() };
         let mut i = 0;
-        while i < self.deferred_responses.len() {
-            let (client_id, _) = &self.deferred_responses[i];
+        while i < deferred.len() {
+            let (client_id, _) = &deferred[i];
             let client_idx = client_id.0 as usize;
-            let head = self.resp_heads[client_idx];
+            let head = resp_heads[client_idx];
             let slot_idx = (head & self.ring_mask) as usize;
 
             let slot_ptr =
@@ -193,8 +262,7 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
                 continue;
             }
 
-            // O(1) swap_remove instead of O(n) VecDeque::remove
-            let (_, resp) = self.deferred_responses.swap_remove(i);
+            let (_, resp) = deferred.swap_remove(i);
 
             let resp_ptr = unsafe { slot_ptr.add(self.resp_data_offset) as *mut Resp };
             unsafe { write_volatile(resp_ptr, resp) };
@@ -202,38 +270,38 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
             compiler_fence(Ordering::Release);
             unsafe { write_volatile(slot_ptr, 1) };
 
-            self.resp_heads[client_idx] = head + 1;
-            // Don't increment i — swap_remove moved last element here
+            resp_heads[client_idx] = head + 1;
         }
     }
 
     /// Scan all client request rings and count available requests.
     /// Returns the total number of requests available for recv().
-    pub fn poll(&mut self) -> u32 {
-        // Flush deferred responses only if needed
-        if !self.deferred_responses.is_empty() {
+    pub fn poll(&self) -> u32 {
+        let deferred = unsafe { &*self.deferred_responses.get() };
+        if !deferred.is_empty() {
             self.flush_deferred();
         }
 
-        let recv_start = self.scan_pos;
+        let recv_start = self.scan_pos.get();
         let mut count = 0u32;
+        let mut scan = self.scan_pos.get();
+
+        let req_tails = unsafe { &*self.req_tails.get() };
+        let req_avail = unsafe { &mut *self.req_avail.get() };
 
         for _ in 0..self.max_clients {
-            let client_idx = self.scan_pos as usize;
-            self.scan_pos = (self.scan_pos + 1) % self.max_clients;
+            let client_idx = scan as usize;
+            scan = (scan + 1) % self.max_clients;
 
-            // Check if client is alive (using cached pointer)
             let alive = unsafe { &*self.control_ptrs[client_idx] };
             if !alive.load(Ordering::Relaxed) {
-                self.req_avail[client_idx] = 0;
+                req_avail[client_idx] = 0;
                 continue;
             }
 
-            // Count available requests (valid flags only, no data read)
-            // Limit to ring_depth to avoid infinite wraparound (valid isn't cleared until recv)
             let req_ring_base = self.req_ring_bases[client_idx];
             let ring_depth = (self.ring_mask + 1) as u32;
-            let mut tail = self.req_tails[client_idx];
+            let mut tail = req_tails[client_idx];
             let mut avail = 0u32;
             while avail < ring_depth {
                 let slot_idx = (tail & self.ring_mask) as usize;
@@ -245,58 +313,52 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
                 avail += 1;
                 tail += 1;
             }
-            self.req_avail[client_idx] = avail;
+            req_avail[client_idx] = avail;
             count += avail;
         }
 
-        self.recv_start = recv_start;
-        self.recv_scan_pos = 0;
+        self.scan_pos.set(scan);
+        self.recv_start.set(recv_start);
+        self.recv_scan_pos.set(0);
         count
     }
 
     /// Receive a request directly from SHM.
     /// Drains all requests from the same client before moving to the next.
-    pub fn recv(&mut self) -> Option<(RequestToken, Req)> {
-        while (self.recv_scan_pos as usize) < self.max_clients as usize {
+    pub fn recv(&self) -> Option<RecvHandle<'_, Req, Resp>> {
+        let req_avail = unsafe { &*self.req_avail.get() };
+        let req_tails = unsafe { &*self.req_tails.get() };
+
+        let mut scan = self.recv_scan_pos.get();
+        while (scan as usize) < self.max_clients as usize {
             let client_idx =
-                ((self.recv_start + self.recv_scan_pos) % self.max_clients) as usize;
+                ((self.recv_start.get() + scan) % self.max_clients) as usize;
 
-            if self.req_avail[client_idx] > 0 {
-                let tail = self.req_tails[client_idx];
-                let slot_idx = (tail & self.ring_mask) as usize;
-                let slot_ptr = unsafe {
-                    self.req_ring_bases[client_idx].add(slot_idx * self.req_slot_size)
-                };
+            if req_avail[client_idx] > 0 {
+                let tail = req_tails[client_idx];
 
-                compiler_fence(Ordering::Acquire);
-                let req = unsafe {
-                    read_volatile(slot_ptr.add(self.req_data_offset) as *const Req)
-                };
-                compiler_fence(Ordering::Release);
-                unsafe { write_volatile(slot_ptr, 0) };
+                // Read data in RecvHandle::data() instead
+                // Don't clear valid or advance tail here - do it in RecvHandle::reply/into_token
 
-                self.req_tails[client_idx] = tail + 1;
-                self.req_avail[client_idx] -= 1;
-
-                return Some((
-                    RequestToken {
-                        client_id: ClientId(client_idx as u32),
-                    },
-                    req,
-                ));
+                return Some(RecvHandle {
+                    server: self,
+                    client_idx,
+                    tail,
+                    _marker: PhantomData,
+                });
             }
 
-            self.recv_scan_pos += 1;
+            scan += 1;
+            self.recv_scan_pos.set(scan);
         }
         None
     }
 
-    /// Send a response to a client.
-    /// If the response ring is full, the response is buffered internally
-    /// and will be flushed on the next poll() call.
-    pub fn reply(&mut self, token: RequestToken, resp: Resp) {
-        let client_idx = token.client_id.0 as usize;
-        let head = self.resp_heads[client_idx];
+    /// Internal helper to write response to a client's response ring.
+    fn reply_to_client(&self, client_id: ClientId, resp: Resp) {
+        let client_idx = client_id.0 as usize;
+        let resp_heads = unsafe { &mut *self.resp_heads.get() };
+        let head = resp_heads[client_idx];
         let slot_idx = (head & self.ring_mask) as usize;
 
         let slot_ptr =
@@ -304,8 +366,8 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
 
         let valid = unsafe { read_volatile(slot_ptr as *const u8) };
         if valid != 0 {
-            // Response ring full — defer this response
-            self.deferred_responses.push((token.client_id, resp));
+            let deferred = unsafe { &mut *self.deferred_responses.get() };
+            deferred.push((client_id, resp));
             return;
         }
 
@@ -315,7 +377,12 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
         compiler_fence(Ordering::Release);
         unsafe { write_volatile(slot_ptr, 1) };
 
-        self.resp_heads[client_idx] = head + 1;
+        resp_heads[client_idx] = head + 1;
+    }
+
+    /// Send a response to a client.
+    pub fn reply(&self, token: RequestToken, resp: Resp) {
+        self.reply_to_client(token.client_id, resp);
     }
 
     /// Check if a client is connected.
@@ -663,7 +730,7 @@ mod tests {
         );
 
         unsafe {
-            let mut server = Server::<u64, u64>::create(&path, 4, 8).unwrap();
+            let server = Server::<u64, u64>::create(&path, 4, 8).unwrap();
             let mut client: SyncClient<u64, u64> = SyncClient::connect_sync(&path).unwrap();
 
             // Send request
@@ -671,9 +738,10 @@ mod tests {
 
             // Server processes
             assert_eq!(server.poll(), 1);
-            let (token, req) = server.recv().unwrap();
+            let handle = server.recv().unwrap();
+            let req = *handle.data();
             assert_eq!(req, 42);
-            server.reply(token, req * 2);
+            handle.reply(req * 2);
 
             // Client receives response
             while client.pending_count() > 0 {
@@ -711,14 +779,15 @@ mod tests {
         );
 
         unsafe {
-            let mut server = Server::<u64, u64>::create(&path, 4, 16).unwrap();
+            let server = Server::<u64, u64>::create(&path, 4, 16).unwrap();
             let mut client: SyncClient<u64, u64> = SyncClient::connect_sync(&path).unwrap();
 
             for i in 0..100 {
                 client.call(i, ()).unwrap();
                 server.poll();
-                if let Some((token, req)) = server.recv() {
-                    server.reply(token, req * 2);
+                if let Some(handle) = server.recv() {
+                    let req = *handle.data();
+                    handle.reply(req * 2);
                 }
 
                 while client.pending_count() > 0 {
@@ -740,7 +809,7 @@ mod tests {
         );
 
         unsafe {
-            let mut server = Server::<u64, u64>::create(&path, 4, 16).unwrap();
+            let server = Server::<u64, u64>::create(&path, 4, 16).unwrap();
 
             let responses = Rc::new(RefCell::new(Vec::new()));
             let responses_clone = responses.clone();
@@ -759,8 +828,9 @@ mod tests {
             // Process them
             while responses.borrow().len() < 10 {
                 server.poll();
-                while let Some((token, req)) = server.recv() {
-                    server.reply(token, req * 2);
+                while let Some(handle) = server.recv() {
+                    let req = *handle.data();
+                    handle.reply(req * 2);
                 }
                 client.poll().unwrap();
             }
@@ -783,7 +853,7 @@ mod tests {
         );
 
         unsafe {
-            let mut server = Server::<u64, u64>::create(&path, 4, 16).unwrap();
+            let server = Server::<u64, u64>::create(&path, 4, 16).unwrap();
 
             let mut clients: Vec<SyncClient<u64, u64>> = vec![
                 SyncClient::connect_sync(&path).unwrap(),
@@ -802,8 +872,9 @@ mod tests {
             let mut count = 0;
             while count < 3 {
                 count += server.poll();
-                while let Some((token, req)) = server.recv() {
-                    server.reply(token, req + 1);
+                while let Some(handle) = server.recv() {
+                    let req = *handle.data();
+                    handle.reply(req + 1);
                 }
             }
 

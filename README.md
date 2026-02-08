@@ -35,12 +35,16 @@ poll() → recv() → [処理] → reply()
 ```rust
 // copyrpc (RDMA)
 let handle: RecvHandle = ctx.recv()?;
-let req = handle.with_data(|bytes| parse(bytes));  // ゼロコピー読み取り
-handle.reply(response_bytes)?;                      // 所有権消費
+let req = handle.data();                             // ゼロコピー読み取り
+handle.reply(response_bytes)?;                       // 所有権消費
 
 // ipc (共有メモリ)
-let (token, req) = server.recv()?;                  // Copy 型の直接読み取り
-server.reply(token, response);                      // 所有権消費
+let handle = server.recv()?;                         // RecvHandle 取得
+let req = handle.data();                             // ゼロコピー読み取り
+handle.reply(response);                              // 所有権消費（即座 reply）
+// または遅延 reply:
+let token = handle.into_token();                     // 非Copy トークン抽出
+server.reply(token, response);                       // 後で reply
 ```
 
 ### クライアント側: call / poll + callback
@@ -69,8 +73,8 @@ client.poll()?;                                     // 完了検出 → on_respo
 |------|---------|-----|------|
 | トランスポート | RDMA RC + SRQ | POSIX 共有メモリ | RDMA UD |
 | リクエスト形式 | `&[u8]` バイト列 | `Copy` 型構造体 | `&[u8]` バイト列 |
-| サーバ受信 | `RecvHandle` (lifetime) | `RequestToken` (opaque) | `IncomingRequest` |
-| データアクセス | `with_data()` コールバック | `recv()` 戻り値 | `request.data()` |
+| サーバ受信 | `RecvHandle` (lifetime) | `RecvHandle` / `RequestToken` | `IncomingRequest` |
+| データアクセス | `data()` 直接参照 | `data()` ゼロコピー参照 | `request.data()` |
 | クライアント user_data | `Slab<U>` | `[Option<U>; 32]` | `Slab<U>` |
 | レスポンスコールバック | `Fn(U, &[u8])` | `FnMut(U, Resp)` | `Fn(U, &[u8])` |
 | overwrite 防止 | slab + CQ | bitmap + toggle bit | slab + slot window |

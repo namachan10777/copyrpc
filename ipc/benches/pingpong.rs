@@ -24,15 +24,16 @@ fn bench_call_latency(c: &mut Criterion) {
     group.bench_function("slot_u64", |b| {
         let name = format!("/shm_bench_slot_{}", Uuid::now_v7());
         unsafe {
-            let mut server = ipc::Server::<u64, u64>::create(&name, 4, 1).unwrap();
+            let server = ipc::Server::<u64, u64>::create(&name, 4, 1).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = stop.clone();
             let server_thread = thread::spawn(move || {
                 pin_to_core(30);
                 while !stop_clone.load(Ordering::Relaxed) {
                     server.poll();
-                    while let Some((token, req)) = server.recv() {
-                        server.reply(token, req + 1);
+                    while let Some(handle) = server.recv() {
+                        let req = *handle.data();
+                        handle.reply(req + 1);
                     }
                 }
             });
@@ -54,7 +55,7 @@ fn bench_call_latency(c: &mut Criterion) {
     group.bench_function("ffwd_u64", |b| {
         let name = format!("/shm_bench_ffwd_{}", Uuid::now_v7());
         unsafe {
-            let mut server =
+            let server =
                 ipc::mpsc_ffwd::Server::<u64, u64>::create(&name, 4, RING_DEPTH).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = stop.clone();
@@ -62,8 +63,9 @@ fn bench_call_latency(c: &mut Criterion) {
                 pin_to_core(30);
                 while !stop_clone.load(Ordering::Relaxed) {
                     server.poll();
-                    while let Some((token, req)) = server.recv() {
-                        server.reply(token, req + 1);
+                    while let Some(handle) = server.recv() {
+                        let req = *handle.data();
+                        handle.reply(req + 1);
                     }
                 }
             });

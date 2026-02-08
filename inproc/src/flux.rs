@@ -39,14 +39,14 @@ struct RecvRequest<T> {
 }
 
 /// Handle for a received request that allows replying.
-pub struct RecvHandle<'a, T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport = OnesidedTransport> {
+pub struct RecvHandle<'a, T: Serial + Send, U, F: FnMut(U, T), Tr: Transport = OnesidedTransport> {
     flux: &'a mut Flux<T, U, F, Tr>,
     from: usize,
     token: u64,
     data: T,
 }
 
-impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport> RecvHandle<'a, T, U, F, Tr> {
+impl<'a, T: Serial + Send, U, F: FnMut(U, T), Tr: Transport> RecvHandle<'a, T, U, F, Tr> {
     /// Returns the sender's node ID.
     #[inline]
     pub fn from(&self) -> usize {
@@ -126,7 +126,7 @@ impl<'a, T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport> RecvHandle<'a,
 /// A node in a Flux network with callback-based response handling.
 ///
 /// Generic over the transport implementation.
-pub struct Flux<T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport = OnesidedTransport> {
+pub struct Flux<T: Serial + Send, U, F: FnMut(U, T), Tr: Transport = OnesidedTransport> {
     id: usize,
     num_nodes: usize,
     channels: Vec<FluxChannel<T, Tr>>,
@@ -146,7 +146,7 @@ pub struct Flux<T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport = Onesid
     _marker: PhantomData<Tr>,
 }
 
-impl<T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport> Flux<T, U, F, Tr> {
+impl<T: Serial + Send, U, F: FnMut(U, T), Tr: Transport> Flux<T, U, F, Tr> {
     /// Returns this node's ID.
     #[inline]
     pub fn id(&self) -> usize {
@@ -235,8 +235,8 @@ impl<T: Serial + Send, U, F: FnMut(&mut U, T), Tr: Transport> Flux<T, U, F, Tr> 
 
                 // Get user_data and invoke callback
                 let slot = (token as usize) % self.channel_capacity;
-                if let Some(mut user_data) = self.pending_calls[idx][slot].take() {
-                    (self.on_response)(&mut user_data, data);
+                if let Some(user_data) = self.pending_calls[idx][slot].take() {
+                    (self.on_response)(user_data, data);
                 }
             }
         }
@@ -312,7 +312,7 @@ pub fn create_flux<T, U, F>(
 where
     T: Serial + Send,
     U: Send,
-    F: FnMut(&mut U, T) + Clone,
+    F: FnMut(U, T) + Clone,
 {
     create_flux_with_transport::<T, U, F, OnesidedTransport>(n, capacity, inflight_max, on_response)
 }
@@ -336,7 +336,7 @@ pub fn create_flux_with_transport<T, U, F, Tr>(
 where
     T: Serial + Send,
     U: Send,
-    F: FnMut(&mut U, T) + Clone,
+    F: FnMut(U, T) + Clone,
     Tr: Transport,
 {
     assert!(n > 0, "must have at least one node");
@@ -433,7 +433,7 @@ mod tests {
 
         let mut nodes: Vec<Flux<u32, u32, _, OnesidedTransport>> =
             create_flux(2, 16, 8, move |user_data, data| {
-                responses_clone.borrow_mut().push((*user_data, data));
+                responses_clone.borrow_mut().push((user_data, data));
             });
 
         // Node 0 calls node 1 with user_data=100
@@ -599,7 +599,7 @@ mod tests {
         let global_count_clone = Arc::clone(&global_response_count);
 
         let nodes: Vec<Flux<u64, (), _, OnesidedTransport>> =
-            create_flux(n, capacity, inflight_max, move |_: &mut (), _: u64| {
+            create_flux(n, capacity, inflight_max, move |_: (), _: u64| {
                 global_count_clone.fetch_add(1, Ordering::Relaxed);
             });
         let end_barrier = Arc::new(Barrier::new(n));
@@ -678,7 +678,7 @@ mod tests {
         let response_count_clone = Arc::clone(&response_count);
 
         let mut nodes: Vec<Flux<u64, (), _, OnesidedTransport>> =
-            create_flux(2, 8, 4, move |_: &mut (), _: u64| {
+            create_flux(2, 8, 4, move |_: (), _: u64| {
                 response_count_clone.fetch_add(1, Ordering::Relaxed);
             });
 
@@ -713,7 +713,7 @@ mod tests {
 
         let mut nodes: Vec<Flux<u32, u32, _, OnesidedTransport>> =
             create_flux(2, 16, 8, move |user_data, data| {
-                responses_clone.borrow_mut().push((*user_data, data));
+                responses_clone.borrow_mut().push((user_data, data));
             });
 
         // Node 0 calls node 1 with user_data=100
@@ -751,7 +751,7 @@ mod tests {
 
         let mut nodes: Vec<Flux<u32, u32, _, OnesidedTransport>> =
             create_flux(3, 16, 8, move |user_data, data| {
-                responses_clone.borrow_mut().push((*user_data, data));
+                responses_clone.borrow_mut().push((user_data, data));
             });
 
         // Node 1 and 2 both call node 0
@@ -790,7 +790,7 @@ mod tests {
 
         let mut nodes: Vec<Flux<u32, u32, _, FastForwardTransport>> =
             create_flux_with_transport(2, 16, 8, move |user_data, data| {
-                responses_clone.borrow_mut().push((*user_data, data));
+                responses_clone.borrow_mut().push((user_data, data));
             });
 
         nodes[0].call(1, 42, 100).unwrap();
@@ -820,7 +820,7 @@ mod tests {
 
         let mut nodes: Vec<Flux<u32, u32, _, LamportTransport>> =
             create_flux_with_transport(2, 16, 8, move |user_data, data| {
-                responses_clone.borrow_mut().push((*user_data, data));
+                responses_clone.borrow_mut().push((user_data, data));
             });
 
         nodes[0].call(1, 42, 100).unwrap();

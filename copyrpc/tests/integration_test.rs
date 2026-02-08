@@ -2104,7 +2104,7 @@ fn test_emit_wqe_boundary_split() {
                     total_sent += 1;
                     _batch_sent += 1;
                 }
-                Err(copyrpc::error::Error::RingFull) => {
+                Err(copyrpc::error::CallError::RingFull(_)) => {
                     ringfull_count += 1;
                     // Need to poll and drain before continuing
                     break;

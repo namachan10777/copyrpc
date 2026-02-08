@@ -19,6 +19,9 @@ use crate::{ReceivedMessage, RecvError, SendError as CrateSendError};
 /// Sender matrix: `all_senders[j][i]` holds node j's sender to node i's receive queue.
 type SenderMatrix<T, M> = Vec<Vec<Option<<M as MpscChannel>::Sender<TaggedMessage<T>>>>>;
 
+/// Default Mesh type with no-op callback for responses.
+pub type DefaultMesh<T> = Mesh<T, (), fn((), T), StdMpsc>;
+
 #[cfg(feature = "crossbeam")]
 pub use crate::mpsc::CrossbeamMpsc;
 
@@ -46,16 +49,19 @@ struct TaggedMessage<T> {
 /// The `M` type parameter selects the MPSC channel implementation.
 /// Use [`create_mesh`] for the default `StdMpsc` implementation, or
 /// [`create_mesh_with`] to select a different implementation.
-pub struct Mesh<T: Send, M: MpscChannel = StdMpsc> {
+pub struct Mesh<T: Send, U = (), F: FnMut(U, T) = fn((), T), M: MpscChannel = StdMpsc> {
     id: usize,
     num_nodes: usize,
     rx: M::Receiver<TaggedMessage<T>>,
     txs: Vec<Option<M::Sender<TaggedMessage<T>>>>,
     next_req_num: u64,
+    pending_calls: Vec<Option<U>>,
+    pending_capacity: usize,
+    on_response: F,
     _marker: PhantomData<M>,
 }
 
-impl<T: Serial + Send, M: MpscChannel> Mesh<T, M> {
+impl<T: Serial + Send, U, F: FnMut(U, T), M: MpscChannel> Mesh<T, U, F, M> {
     /// Returns this node's ID.
     pub fn id(&self) -> usize {
         self.id
@@ -88,7 +94,7 @@ impl<T: Serial + Send, M: MpscChannel> Mesh<T, M> {
     /// Sends a request to a specific peer.
     ///
     /// Returns the request number on success, which can be used to match the response.
-    pub fn call(&mut self, to: usize, value: T) -> Result<u64, CrateSendError<T>> {
+    pub fn call(&mut self, to: usize, value: T, user_data: U) -> Result<u64, CrateSendError<T>> {
         if to >= self.num_nodes || to == self.id {
             return Err(CrateSendError::InvalidPeer(value));
         }
@@ -103,6 +109,8 @@ impl<T: Serial + Send, M: MpscChannel> Mesh<T, M> {
             }) {
                 Ok(()) => {
                     self.next_req_num = self.next_req_num.wrapping_add(1);
+                    let slot = (req_num as usize) % self.pending_capacity;
+                    self.pending_calls[slot] = Some(user_data);
                     Ok(req_num)
                 }
                 Err(SendError(msg)) => Err(CrateSendError::Disconnected(msg.data)),
@@ -142,10 +150,16 @@ impl<T: Serial + Send, M: MpscChannel> Mesh<T, M> {
                         req_num: msg.req_num,
                         data: msg.data,
                     },
-                    MessageKind::Response => ReceivedMessage::Response {
-                        req_num: msg.req_num,
-                        data: msg.data,
-                    },
+                    MessageKind::Response => {
+                        let slot = (msg.req_num as usize) % self.pending_capacity;
+                        if let Some(user_data) = self.pending_calls[slot].take() {
+                            (self.on_response)(user_data, msg.data);
+                        }
+                        ReceivedMessage::Response {
+                            req_num: msg.req_num,
+                            data: msg.data,
+                        }
+                    }
                 };
                 Ok((msg.from, received))
             }
@@ -164,10 +178,16 @@ impl<T: Serial + Send, M: MpscChannel> Mesh<T, M> {
                         req_num: msg.req_num,
                         data: msg.data,
                     },
-                    MessageKind::Response => ReceivedMessage::Response {
-                        req_num: msg.req_num,
-                        data: msg.data,
-                    },
+                    MessageKind::Response => {
+                        let slot = (msg.req_num as usize) % self.pending_capacity;
+                        if let Some(user_data) = self.pending_calls[slot].take() {
+                            (self.on_response)(user_data, msg.data);
+                        }
+                        ReceivedMessage::Response {
+                            req_num: msg.req_num,
+                            data: msg.data,
+                        }
+                    }
                 };
                 Ok((msg.from, received))
             }
@@ -184,8 +204,9 @@ impl<T: Serial + Send, M: MpscChannel> Mesh<T, M> {
 ///
 /// # Panics
 /// Panics if `n` is 0.
-pub fn create_mesh<T: Serial + Send>(n: usize) -> Vec<Mesh<T, StdMpsc>> {
-    create_mesh_with::<T, StdMpsc>(n)
+#[allow(clippy::type_complexity)]
+pub fn create_mesh<T: Serial + Send>(n: usize) -> Vec<Mesh<T, (), fn((), T), StdMpsc>> {
+    create_mesh_with::<T, (), fn((), T), StdMpsc>(n, |(), _| {})
 }
 
 /// Creates a Mesh network with `n` nodes using a custom MPSC channel implementation.
@@ -195,7 +216,7 @@ pub fn create_mesh<T: Serial + Send>(n: usize) -> Vec<Mesh<T, StdMpsc>> {
 ///
 /// # Panics
 /// Panics if `n` is 0.
-pub fn create_mesh_with<T: Serial + Send, M: MpscChannel>(n: usize) -> Vec<Mesh<T, M>> {
+pub fn create_mesh_with<T: Serial + Send, U, F: FnMut(U, T) + Clone, M: MpscChannel>(n: usize, on_response: F) -> Vec<Mesh<T, U, F, M>> {
     assert!(n > 0, "must have at least one node");
 
     // Create receivers and collect senders
@@ -217,6 +238,7 @@ pub fn create_mesh_with<T: Serial + Send, M: MpscChannel>(n: usize) -> Vec<Mesh<
     }
 
     // Build nodes
+    let pending_capacity = 1024usize.next_power_of_two();
     receivers
         .into_iter()
         .enumerate()
@@ -227,6 +249,9 @@ pub fn create_mesh_with<T: Serial + Send, M: MpscChannel>(n: usize) -> Vec<Mesh<
             rx,
             txs,
             next_req_num: 0,
+            pending_calls: (0..pending_capacity).map(|_| None).collect(),
+            pending_capacity,
+            on_response: on_response.clone(),
             _marker: PhantomData,
         })
         .collect()
@@ -236,7 +261,7 @@ pub fn create_mesh_with<T: Serial + Send, M: MpscChannel>(n: usize) -> Vec<Mesh<
 // Backward compatibility: specialized implementation for StdMpsc
 // ============================================================================
 
-impl<T: Serial + Send> Mesh<T, StdMpsc> {
+impl<T: Serial + Send> Mesh<T, (), fn((), T), StdMpsc> {
     /// Creates a Mesh network with `n` nodes using the default channel.
     ///
     /// This is a convenience method equivalent to `create_mesh(n)`.
@@ -252,7 +277,7 @@ mod tests {
 
     #[test]
     fn test_create_mesh() {
-        let nodes: Vec<Mesh<u32>> = create_mesh(3);
+        let nodes = create_mesh::<u32>(3);
         assert_eq!(nodes.len(), 3);
         assert_eq!(nodes[0].num_peers(), 2);
         assert_eq!(nodes[1].num_peers(), 2);
@@ -261,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_notify_recv() {
-        let mut nodes: Vec<Mesh<u32>> = create_mesh(2);
+        let mut nodes = create_mesh::<u32>(2);
 
         nodes[0].notify(1, 42).unwrap();
         assert_eq!(
@@ -278,9 +303,9 @@ mod tests {
 
     #[test]
     fn test_call_reply() {
-        let mut nodes: Vec<Mesh<u32>> = create_mesh(2);
+        let mut nodes = create_mesh::<u32>(2);
 
-        let req_num = nodes[0].call(1, 42).unwrap();
+        let req_num = nodes[0].call(1, 42, ()).unwrap();
         assert_eq!(req_num, 0);
 
         let (from, msg) = nodes[1].recv().unwrap();
@@ -307,7 +332,7 @@ mod tests {
 
     #[test]
     fn test_recv_from_multiple() {
-        let mut nodes: Vec<Mesh<u32>> = create_mesh(3);
+        let mut nodes = create_mesh::<u32>(3);
 
         // Nodes 1 and 2 both send to node 0
         nodes[1].notify(0, 100).unwrap();
@@ -328,7 +353,7 @@ mod tests {
 
     #[test]
     fn test_invalid_peer() {
-        let nodes: Vec<Mesh<u32>> = create_mesh(2);
+        let nodes = create_mesh::<u32>(2);
 
         assert!(matches!(
             nodes[0].notify(5, 42),
@@ -344,7 +369,7 @@ mod tests {
     fn test_threaded() {
         use std::thread;
 
-        let nodes: Vec<Mesh<u64>> = create_mesh(4);
+        let nodes = create_mesh::<u64>(4);
         let mut handles = Vec::new();
 
         for mut node in nodes {
@@ -384,7 +409,7 @@ mod tests {
     #[cfg(feature = "crossbeam")]
     #[test]
     fn test_crossbeam_mesh() {
-        let mut nodes: Vec<Mesh<u32, CrossbeamMpsc>> = create_mesh_with(2);
+        let mut nodes = create_mesh_with::<u32, (), fn((), u32), CrossbeamMpsc>(2, |(), _| {});
 
         nodes[0].notify(1, 42).unwrap();
         assert_eq!(
@@ -404,7 +429,7 @@ mod tests {
     fn test_crossbeam_mesh_threaded() {
         use std::thread;
 
-        let nodes: Vec<Mesh<u64, CrossbeamMpsc>> = create_mesh_with(4);
+        let nodes = create_mesh_with::<u64, (), fn((), u64), CrossbeamMpsc>(4, |(), _| {});
         let mut handles = Vec::new();
 
         for mut node in nodes {
@@ -439,5 +464,49 @@ mod tests {
         for h in handles {
             assert_eq!(h.join().unwrap(), 300); // 3 peers * 100 messages
         }
+    }
+
+    #[test]
+    fn test_callback_on_response() {
+        use std::sync::{Arc, Mutex};
+
+        let callback_data = Arc::new(Mutex::new(Vec::new()));
+        let callback_data_clone = callback_data.clone();
+
+        let mut nodes = create_mesh_with::<u32, u32, _, StdMpsc>(2, move |user_data, response| {
+            callback_data_clone.lock().unwrap().push((user_data, response));
+        });
+
+        // Send request with user_data = 100
+        let req_num = nodes[0].call(1, 42, 100).unwrap();
+        assert_eq!(req_num, 0);
+
+        // Server receives and replies
+        let (from, msg) = nodes[1].recv().unwrap();
+        assert_eq!(from, 0);
+        match msg {
+            ReceivedMessage::Request { req_num: r, data } => {
+                assert_eq!(r, 0);
+                assert_eq!(data, 42);
+                nodes[1].reply(0, r, data + 1).unwrap();
+            }
+            _ => panic!("expected Request"),
+        }
+
+        // Client receives response - callback should be invoked
+        let (from, msg) = nodes[0].recv().unwrap();
+        assert_eq!(from, 1);
+        match msg {
+            ReceivedMessage::Response { req_num: r, data } => {
+                assert_eq!(r, 0);
+                assert_eq!(data, 43);
+            }
+            _ => panic!("expected Response"),
+        }
+
+        // Verify callback was invoked with correct data
+        let callback_results = callback_data.lock().unwrap();
+        assert_eq!(callback_results.len(), 1);
+        assert_eq!(callback_results[0], (100, 43));
     }
 }

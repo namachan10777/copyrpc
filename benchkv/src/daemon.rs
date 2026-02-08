@@ -7,7 +7,7 @@ use crate::storage::ShardedStore;
 
 // === Type aliases ===
 
-pub type DelegateOnResponse = fn(&mut RequestToken, DelegatePayload);
+pub type DelegateOnResponse = fn(RequestToken, DelegatePayload);
 pub type DaemonFlux = inproc::Flux<DelegatePayload, RequestToken, DelegateOnResponse>;
 
 type CopyrpcOnResponse = fn(RequestToken, &[u8]);
@@ -60,11 +60,11 @@ impl EndpointConnectionInfo {
 
 // === Callbacks ===
 
-pub fn on_delegate_response(token: &mut RequestToken, data: DelegatePayload) {
+pub fn on_delegate_response(token: RequestToken, data: DelegatePayload) {
     if let DelegatePayload::Resp(resp) = data {
         FLUX_RESPONSES.with(|r| {
             r.borrow_mut().push(FluxResponseEntry {
-                token: *token,
+                token,
                 response: resp,
             });
         });
@@ -130,7 +130,7 @@ pub fn run_daemon(
     my_rank: u32,
     num_daemons: usize,
     key_range: u64,
-    mut server: ipc::Server<Request, Response>,
+    server: ipc::Server<Request, Response>,
     mut flux: DaemonFlux,
     copyrpc_setup: Option<CopyrpcSetup>,
     stop_flag: &AtomicBool,
@@ -236,18 +236,23 @@ pub fn run_daemon(
 
     let mut remote_queue: Vec<(RequestToken, Request, u32, usize)> = Vec::new();
 
+    let num_daemons_u64 = num_daemons as u64;
+
     while !stop_flag.load(Ordering::Relaxed) {
         // === Phase 1: Process ipc client requests ===
         server.poll();
-        while let Some((token, req)) = server.recv() {
+
+        while let Some(handle) = server.recv() {
+            let req = *handle.data();
             let target_rank = req.rank();
-            let target_daemon = ShardedStore::owner_of(req.key(), num_daemons as u64) as usize;
+            let target_daemon = ShardedStore::owner_of(req.key(), num_daemons_u64) as usize;
 
             if target_rank == my_rank && target_daemon == daemon_id {
                 let resp = handle_local(&mut store, &req);
-                server.reply(token, resp);
+                handle.reply(resp);
             } else if target_rank == my_rank {
                 // Same rank, different daemon shard → Flux
+                let token = handle.into_token();
                 let _ = flux.call(
                     target_daemon,
                     DelegatePayload::Req(req),
@@ -255,6 +260,7 @@ pub fn run_daemon(
                 );
             } else {
                 // Remote rank → copyrpc
+                let token = handle.into_token();
                 remote_queue.push((token, req, target_rank, target_daemon));
             }
         }
@@ -280,10 +286,12 @@ pub fn run_daemon(
             for (token, req, target_rank, target_daemon) in remote_queue.drain(..) {
                 let remote_req = RemoteRequest { request: req };
                 let ep_idx = daemon_ep_index(target_rank, target_daemon);
+                let mut pending = token;
                 loop {
-                    match copyrpc_endpoints[ep_idx].call(remote_req.as_bytes(), token) {
+                    match copyrpc_endpoints[ep_idx].call(remote_req.as_bytes(), pending) {
                         Ok(_) => break,
-                        Err(copyrpc::error::Error::RingFull) => {
+                        Err(copyrpc::error::CallError::RingFull(returned)) => {
+                            pending = returned;
                             ctx.poll();
                             COPYRPC_RESPONSES.with(|r| {
                                 for entry in r.borrow_mut().drain(..) {
@@ -302,10 +310,10 @@ pub fn run_daemon(
 
             // 4c. copyrpc recv (incoming requests from remote nodes)
             while let Some(recv_handle) = ctx.recv() {
-                let req = recv_handle.with_data(|data| RemoteRequest::from_bytes(data).request);
+                let req = RemoteRequest::from_bytes(recv_handle.data()).request;
 
                 debug_assert_eq!(
-                    ShardedStore::owner_of(req.key(), num_daemons as u64) as usize,
+                    ShardedStore::owner_of(req.key(), num_daemons_u64) as usize,
                     daemon_id
                 );
 

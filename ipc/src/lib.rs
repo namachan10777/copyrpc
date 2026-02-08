@@ -22,6 +22,7 @@ pub mod mpsc_ffwd;
 pub mod shm;
 
 use shm::SharedMemory;
+use std::cell::{Cell, UnsafeCell};
 use std::io;
 use std::marker::PhantomData;
 use std::path::Path;
@@ -58,7 +59,7 @@ pub struct ClientId(pub u32);
 /// Opaque token identifying a pending request on the server.
 ///
 /// Returned by [`Server::recv()`] and consumed by [`Server::reply()`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct RequestToken {
     client_id: ClientId,
     slot_index: u32,
@@ -66,6 +67,48 @@ pub struct RequestToken {
 
 impl RequestToken {
     /// Returns the client that sent this request.
+    pub fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+}
+
+/// Zero-copy receive handle for accessing request data in shared memory.
+///
+/// Created by [`Server::recv()`]. Provides zero-copy access to request data
+/// and can be consumed to reply immediately or converted to a [`RequestToken`]
+/// for deferred reply.
+pub struct RecvHandle<'a, Req: Serial, Resp: Serial> {
+    server: &'a Server<Req, Resp>,
+    flat_idx: u32,
+    client_id: ClientId,
+    slot_index: u32,
+    _marker: PhantomData<(Req, Resp)>,
+}
+
+impl<Req: Serial, Resp: Serial> RecvHandle<'_, Req, Resp> {
+    /// Zero-copy access to the request data in shared memory.
+    #[inline]
+    pub fn data(&self) -> &Req {
+        unsafe { &*self.server.slot_req_ptr(self.flat_idx) }
+    }
+
+    /// Consumes the handle and replies immediately.
+    #[inline]
+    pub fn reply(self, resp: Resp) {
+        self.server.reply_internal(self.client_id, self.slot_index, resp);
+    }
+
+    /// Extracts a non-Copy token for deferred reply.
+    #[inline]
+    pub fn into_token(self) -> RequestToken {
+        RequestToken {
+            client_id: self.client_id,
+            slot_index: self.slot_index,
+        }
+    }
+
+    /// Returns the client that sent this request.
+    #[inline]
     pub fn client_id(&self) -> ClientId {
         self.client_id
     }
@@ -201,10 +244,10 @@ pub struct Server<Req: Serial, Resp: Serial> {
     base: *mut u8,
     layout: SlotLayout,
     slots_per_client: u32,
-    server_seqs: Vec<u8>,
-    in_progress: Vec<u32>,    // bits: recv'd but not yet replied
-    new_requests: Vec<u32>,   // bits: found by poll(), not yet recv'd
-    recv_scan_pos: u32,
+    server_seqs: UnsafeCell<Vec<u8>>,
+    in_progress: UnsafeCell<Vec<u32>>,
+    new_requests: UnsafeCell<Vec<u32>>,
+    recv_scan_pos: Cell<u32>,
     _marker: PhantomData<(Req, Resp)>,
 }
 
@@ -284,10 +327,10 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
             base,
             layout,
             slots_per_client,
-            server_seqs: vec![0u8; total_slots as usize],
-            in_progress: vec![0u32; max_clients as usize],
-            new_requests: vec![0u32; max_clients as usize],
-            recv_scan_pos: 0,
+            server_seqs: UnsafeCell::new(vec![0u8; total_slots as usize]),
+            in_progress: UnsafeCell::new(vec![0u32; max_clients as usize]),
+            new_requests: UnsafeCell::new(vec![0u32; max_clients as usize]),
+            recv_scan_pos: Cell::new(0),
             _marker: PhantomData,
         })
     }
@@ -337,7 +380,7 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
     /// shared memory — zero-copy). Slots that are already marked as new or
     /// in-progress (recv'd but not replied) are skipped.
     #[inline]
-    pub fn poll(&mut self) -> u32 {
+    pub fn poll(&self) -> u32 {
         let allocated = unsafe { (*self.header).next_client_id.load(Ordering::Relaxed) };
         if allocated == 0 {
             return 0;
@@ -346,6 +389,10 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
         let spc = self.slots_per_client;
         let mut count = 0u32;
 
+        let in_progress = unsafe { &*self.in_progress.get() };
+        let new_requests = unsafe { &mut *self.new_requests.get() };
+        let server_seqs = unsafe { &*self.server_seqs.get() };
+
         for client_idx in 0..allocated {
             let base_slot = client_idx * spc;
             if !self.slot_alive(base_slot).load(Ordering::Acquire) {
@@ -353,7 +400,7 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
             }
             let ci = client_idx as usize;
             let skip = unsafe {
-                *self.in_progress.get_unchecked(ci) | *self.new_requests.get_unchecked(ci)
+                *in_progress.get_unchecked(ci) | *new_requests.get_unchecked(ci)
             };
             for s in 0..spc {
                 if skip & (1 << s) != 0 {
@@ -362,67 +409,80 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
                 let global = base_slot + s;
                 let seq_idx = global as usize;
                 let client_seq = self.slot_client_seq(global).load(Ordering::Acquire);
-                let server_seq = unsafe { *self.server_seqs.get_unchecked(seq_idx) };
+                let server_seq = unsafe { *server_seqs.get_unchecked(seq_idx) };
                 if client_seq != server_seq {
-                    unsafe { *self.new_requests.get_unchecked_mut(ci) |= 1 << s };
+                    unsafe { *new_requests.get_unchecked_mut(ci) |= 1 << s };
                     count += 1;
                 }
             }
         }
 
-        self.recv_scan_pos = 0;
+        self.recv_scan_pos.set(0);
         count
     }
 
     /// Returns the next new request, reading directly from shared memory.
     ///
-    /// The returned [`RequestToken`] must be passed to [`reply()`](Self::reply)
-    /// to complete the request.
+    /// The returned [`RecvHandle`] must be consumed to reply (either immediately
+    /// via `handle.reply()` or deferred via `handle.into_token()` + `server.reply()`).
     #[inline]
-    pub fn recv(&mut self) -> Option<(RequestToken, Req)> {
+    pub fn recv(&self) -> Option<RecvHandle<'_, Req, Resp>> {
         let allocated = unsafe { (*self.header).next_client_id.load(Ordering::Relaxed) };
         let spc = self.slots_per_client;
 
-        while self.recv_scan_pos < allocated {
-            let ci = self.recv_scan_pos as usize;
-            let bits = unsafe { *self.new_requests.get_unchecked(ci) };
+        let new_requests = unsafe { &mut *self.new_requests.get() };
+        let in_progress = unsafe { &mut *self.in_progress.get() };
+
+        let mut scan_pos = self.recv_scan_pos.get();
+        while scan_pos < allocated {
+            let ci = scan_pos as usize;
+            let bits = unsafe { *new_requests.get_unchecked(ci) };
             if bits != 0 {
                 let s = bits.trailing_zeros();
-                unsafe { *self.new_requests.get_unchecked_mut(ci) &= !(1 << s) };
-                unsafe { *self.in_progress.get_unchecked_mut(ci) |= 1 << s };
-                let global = self.recv_scan_pos * spc + s;
-                let req = unsafe { std::ptr::read_volatile(self.slot_req_ptr(global)) };
-                return Some((
-                    RequestToken {
-                        client_id: ClientId(self.recv_scan_pos),
-                        slot_index: s,
-                    },
-                    req,
-                ));
+                unsafe { *new_requests.get_unchecked_mut(ci) &= !(1 << s) };
+                unsafe { *in_progress.get_unchecked_mut(ci) |= 1 << s };
+                let global = scan_pos * spc + s;
+                self.recv_scan_pos.set(scan_pos);
+                return Some(RecvHandle {
+                    server: self,
+                    flat_idx: global,
+                    client_id: ClientId(scan_pos),
+                    slot_index: s,
+                    _marker: PhantomData,
+                });
             }
-            self.recv_scan_pos += 1;
+            scan_pos += 1;
         }
+        self.recv_scan_pos.set(scan_pos);
         None
+    }
+
+    /// Internal reply implementation shared by RecvHandle::reply() and Server::reply().
+    #[inline]
+    fn reply_internal(&self, client_id: ClientId, slot_index: u32, resp: Resp) {
+        let cid = client_id.0;
+        let s = slot_index;
+        let global = cid * self.slots_per_client + s;
+        let seq_idx = global as usize;
+
+        unsafe { std::ptr::write_volatile(self.slot_resp_ptr(global), resp) };
+        let server_seqs = unsafe { &mut *self.server_seqs.get() };
+        let server_seq = unsafe { *server_seqs.get_unchecked(seq_idx) };
+        let new_seq = server_seq.wrapping_add(1);
+        unsafe { *server_seqs.get_unchecked_mut(seq_idx) = new_seq };
+        self.slot_server_seq(global)
+            .store(new_seq, Ordering::Release);
+
+        let in_progress = unsafe { &mut *self.in_progress.get() };
+        unsafe { *in_progress.get_unchecked_mut(cid as usize) &= !(1 << s) };
     }
 
     /// Writes a response for a previously received request.
     ///
     /// Can be called immediately after `recv()` or deferred to a later point.
     #[inline]
-    pub fn reply(&mut self, token: RequestToken, resp: Resp) {
-        let cid = token.client_id.0;
-        let s = token.slot_index;
-        let global = cid * self.slots_per_client + s;
-        let seq_idx = global as usize;
-
-        unsafe { std::ptr::write_volatile(self.slot_resp_ptr(global), resp) };
-        let server_seq = unsafe { *self.server_seqs.get_unchecked(seq_idx) };
-        let new_seq = server_seq.wrapping_add(1);
-        unsafe { *self.server_seqs.get_unchecked_mut(seq_idx) = new_seq };
-        self.slot_server_seq(global)
-            .store(new_seq, Ordering::Release);
-
-        unsafe { *self.in_progress.get_unchecked_mut(cid as usize) &= !(1 << s) };
+    pub fn reply(&self, token: RequestToken, resp: Resp) {
+        self.reply_internal(token.client_id, token.slot_index, resp);
     }
 
     /// Returns true if a specific client is connected.
@@ -781,7 +841,7 @@ mod tests {
         let name = format!("/shm_rpc_basic_{}", std::process::id());
 
         unsafe {
-            let mut server = Server::<u64, u64>::create(&name, 4, 1).unwrap();
+            let server = Server::<u64, u64>::create(&name, 4, 1).unwrap();
 
             let name_clone = name.clone();
             let client_thread = std::thread::spawn(move || {
@@ -793,8 +853,9 @@ mod tests {
 
             loop {
                 server.poll();
-                if let Some((token, req)) = server.recv() {
-                    server.reply(token, req + 1);
+                if let Some(handle) = server.recv() {
+                    let req = *handle.data();
+                    handle.reply(req + 1);
                     break;
                 }
                 std::hint::spin_loop();
@@ -841,7 +902,7 @@ mod tests {
         let name = format!("/shm_rpc_multi_{}", std::process::id());
 
         unsafe {
-            let mut server = Server::<u64, u64>::create(&name, 4, 1).unwrap();
+            let server = Server::<u64, u64>::create(&name, 4, 1).unwrap();
 
             let name_clone = name.clone();
             let client_thread = std::thread::spawn(move || {
@@ -856,8 +917,9 @@ mod tests {
             let mut served = 0;
             while served < 100 {
                 server.poll();
-                while let Some((token, req)) = server.recv() {
-                    server.reply(token, req * 2);
+                while let Some(handle) = server.recv() {
+                    let req = *handle.data();
+                    handle.reply(req * 2);
                     served += 1;
                 }
                 std::hint::spin_loop();
@@ -872,7 +934,7 @@ mod tests {
         let name = format!("/shm_rpc_types_{}", std::process::id());
 
         unsafe {
-            let mut server = Server::<u32, u64>::create(&name, 4, 1).unwrap();
+            let server = Server::<u32, u64>::create(&name, 4, 1).unwrap();
 
             let name_clone = name.clone();
             let client_thread = std::thread::spawn(move || {
@@ -884,8 +946,9 @@ mod tests {
 
             loop {
                 server.poll();
-                if let Some((token, req)) = server.recv() {
-                    server.reply(token, req as u64 * 10);
+                if let Some(handle) = server.recv() {
+                    let req = *handle.data();
+                    handle.reply(req as u64 * 10);
                     break;
                 }
                 std::hint::spin_loop();
@@ -900,7 +963,7 @@ mod tests {
         let name = format!("/shm_rpc_defer_{}", std::process::id());
 
         unsafe {
-            let mut server = Server::<u64, u64>::create(&name, 4, 4).unwrap();
+            let server = Server::<u64, u64>::create(&name, 4, 4).unwrap();
 
             let name_clone = name.clone();
             let client_thread = std::thread::spawn(move || {
@@ -919,12 +982,14 @@ mod tests {
 
             while served < 4 {
                 server.poll();
-                while let Some((token, req)) = server.recv() {
+                while let Some(handle) = server.recv() {
                     served += 1;
+                    let req = *handle.data();
                     if req % 2 == 0 {
+                        let token = handle.into_token();
                         deferred.push((token, req));
                     } else {
-                        server.reply(token, req * 10);
+                        handle.reply(req * 10);
                     }
                 }
                 for (token, req) in deferred.drain(..) {
@@ -948,7 +1013,7 @@ mod tests {
         let name = format!("/shm_rpc_pipe_{}", std::process::id());
 
         unsafe {
-            let mut server = Server::<u64, u64>::create(&name, 4, 4).unwrap();
+            let server = Server::<u64, u64>::create(&name, 4, 4).unwrap();
 
             let name_clone = name.clone();
             let client_thread = std::thread::spawn(move || {
@@ -981,8 +1046,9 @@ mod tests {
             let mut served = 0u32;
             while served < 100 {
                 server.poll();
-                while let Some((token, req)) = server.recv() {
-                    server.reply(token, req + 1);
+                while let Some(handle) = server.recv() {
+                    let req = *handle.data();
+                    handle.reply(req + 1);
                     served += 1;
                 }
                 std::hint::spin_loop();

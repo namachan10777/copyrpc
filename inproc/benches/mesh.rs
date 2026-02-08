@@ -5,7 +5,7 @@
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::thread;
 use inproc::{
-    create_flux_with_transport, create_mesh_with, Flux, Mesh, ReceivedMessage, StdMpsc,
+    create_flux_with_transport, create_mesh_with, Flux, ReceivedMessage, StdMpsc,
 };
 
 #[cfg(feature = "crossbeam")]
@@ -64,7 +64,7 @@ fn run_mesh_notify_bench<M: MpscChannel>(
     msgs_per_node: usize,
 ) {
     b.iter(|| {
-        let nodes: Vec<Mesh<Payload, M>> = create_mesh_with(num_nodes);
+        let nodes = create_mesh_with::<Payload, (), fn((), Payload), M>(num_nodes, |(), _| {});
         let mut handles = Vec::new();
 
         for (node_index, mut node) in nodes.into_iter().enumerate() {
@@ -134,7 +134,7 @@ fn run_mesh_call_reply_bench<M: MpscChannel>(
     calls_per_node: usize,
 ) {
     b.iter(|| {
-        let nodes: Vec<Mesh<Payload, M>> = create_mesh_with(num_nodes);
+        let nodes = create_mesh_with::<Payload, (), fn((), Payload), M>(num_nodes, |(), _| {});
         let mut handles = Vec::new();
 
         for (node_index, mut node) in nodes.into_iter().enumerate() {
@@ -150,7 +150,7 @@ fn run_mesh_call_reply_bench<M: MpscChannel>(
                 for peer in 0..n {
                     if peer != id {
                         for _ in 0..calls {
-                            node.call(peer, black_box(payload)).unwrap();
+                            node.call(peer, black_box(payload), ()).unwrap();
                             calls_sent += 1;
                         }
                     }
@@ -244,7 +244,7 @@ fn run_flux_call_reply_bench<Tr: Transport>(
 
         let nodes: Vec<Flux<Payload, (), _, Tr>> = {
             let counter = Arc::clone(&global_response_count);
-            create_flux_with_transport(num_nodes, capacity, inflight_max, move |_: &mut (), _: Payload| {
+            create_flux_with_transport(num_nodes, capacity, inflight_max, move |_: (), _: Payload| {
                 counter.fetch_add(1, Ordering::Relaxed);
             })
         };

@@ -33,7 +33,7 @@ fn run_bench_slot(b: &mut criterion::Bencher, depth: u32) {
     let end_barrier = Arc::new(Barrier::new(NUM_CLIENTS + 1));
 
     unsafe {
-        let mut server =
+        let server =
             ipc::Server::<u64, u64>::create(&name, NUM_CLIENTS as u32, depth).unwrap();
 
         let stop_server = stop.clone();
@@ -41,8 +41,9 @@ fn run_bench_slot(b: &mut criterion::Bencher, depth: u32) {
             pin_to_core(SERVER_CORE);
             while !stop_server.load(Ordering::Relaxed) {
                 server.poll();
-                while let Some((token, req)) = server.recv() {
-                    server.reply(token, req + 1);
+                while let Some(handle) = server.recv() {
+                    let req = *handle.data();
+                    handle.reply(req + 1);
                 }
             }
         });
@@ -151,7 +152,7 @@ fn run_bench_ffwd(b: &mut criterion::Bencher, depth: u32) {
     let end_barrier = Arc::new(Barrier::new(NUM_CLIENTS + 1));
 
     unsafe {
-        let mut server = ipc::mpsc_ffwd::Server::<u64, u64>::create(
+        let server = ipc::mpsc_ffwd::Server::<u64, u64>::create(
             &name,
             NUM_CLIENTS as u32,
             RING_DEPTH,
@@ -163,8 +164,9 @@ fn run_bench_ffwd(b: &mut criterion::Bencher, depth: u32) {
             pin_to_core(SERVER_CORE);
             while !stop_server.load(Ordering::Relaxed) {
                 server.poll();
-                while let Some((token, req)) = server.recv() {
-                    server.reply(token, req + 1);
+                while let Some(handle) = server.recv() {
+                    let req = *handle.data();
+                    handle.reply(req + 1);
                 }
             }
         });
