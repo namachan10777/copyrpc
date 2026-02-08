@@ -64,7 +64,7 @@ fn run_bench<Tr: Transport>(duration_secs: u64, inflight_max: usize, start_core:
     let completed_clone = Arc::clone(&completed);
 
     let nodes: Vec<Flux<Payload, (), _, Tr>> =
-        create_flux_with_transport(2, capacity, inflight_max, move |_: &mut (), _: Payload| {
+        create_flux_with_transport(2, capacity, inflight_max, move |_: (), _: Payload| {
             completed_clone.fetch_add(1, Ordering::Relaxed);
         });
 

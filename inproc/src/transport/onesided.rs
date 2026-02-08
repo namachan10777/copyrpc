@@ -3,28 +3,28 @@
 //! This transport uses a producer-only write SPSC channel for both request
 //! and response channels, achieving producer-only write semantics for all operations.
 //!
-//! Unlike Lamport, the consumer never writes back to the channel. Instead of
-//! shared_tail (consumer → producer), inflight management ensures the producer
-//! never overtakes the consumer. The producer publishes `shared_head` via sync()
-//! so the consumer knows how far it can read.
+//! Unlike Lamport, the consumer never writes back to the channel. Inflight
+//! management ensures the producer never overtakes the consumer. Per-slot
+//! generation counters provide immediate visibility without any shared atomic
+//! variables — the consumer checks `generation == tail` to detect new data.
 //!
 //! Token: uses monotonically increasing head counter masked to slot index.
 //!
 //! Store/Load characteristics:
-//! - call(): producer writes data to buffer (local), advances local head
-//! - sync(): producer publishes shared_head (single atomic store)
-//! - recv(): consumer reads shared_head (atomic load), reads data from buffer
-//! - reply(): producer writes data to buffer (local), advances local head
+//! - call(): producer writes data + generation to slot (same cache line)
+//! - sync(): no-op (generation provides immediate visibility)
+//! - recv(): consumer reads generation (volatile), reads data from same cache line
+//! - reply(): producer writes data + generation to slot (same cache line)
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::ptr;
-use std::sync::atomic::{compiler_fence, AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::serial::Serial;
 
-use super::common::{CachePadded, DisconnectState};
+use super::common::DisconnectState;
 use super::{cldemote, Response, Transport, TransportEndpoint, TransportError};
 
 // ============================================================================
@@ -67,8 +67,6 @@ impl<T> Slot<T> {
 /// Inner channel state.
 struct Inner<T> {
     shared: DisconnectState,
-    /// Producer head published via sync() (only producer writes)
-    shared_head: CachePadded<AtomicUsize>,
     /// Ring buffer with embedded generation counters
     slots: Box<[Slot<T>]>,
 }
@@ -78,14 +76,15 @@ unsafe impl<T: Send> Sync for Inner<T> {}
 
 /// The sending half of a producer-only write SPSC channel.
 ///
-/// Data is written locally; `publish()` makes it visible to the receiver.
+/// Each send writes data + generation to the same cache line, providing
+/// immediate visibility to the receiver without any shared atomic variable.
 pub struct Sender<T> {
     inner: Arc<Inner<T>>,
     /// Local head index (monotonically increasing, wraps via mask)
     head: usize,
     /// Bitmask for fast modulo
     mask: usize,
-    /// Number of sends since last publish (0 = next send writes generation)
+    /// Counter for CLDEMOTE gating (reset by publish/sync)
     sends_since_publish: usize,
 }
 
@@ -98,8 +97,6 @@ pub struct Receiver<T> {
     inner: Arc<Inner<T>>,
     /// Local tail index (monotonically increasing, wraps via mask)
     tail: usize,
-    /// Cached head from producer (reduces atomic reads)
-    cached_head: usize,
     /// Bitmask for fast modulo
     mask: usize,
 }
@@ -125,7 +122,6 @@ pub fn channel<T: Serial>(capacity: usize) -> (Sender<T>, Receiver<T>) {
             tx_alive: AtomicBool::new(true),
             rx_alive: AtomicBool::new(true),
         },
-        shared_head: CachePadded::new(AtomicUsize::new(0)),
         slots,
     });
 
@@ -139,7 +135,6 @@ pub fn channel<T: Serial>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     let receiver = Receiver {
         inner,
         tail: 0,
-        cached_head: 0,
         mask,
     };
 
@@ -164,15 +159,19 @@ impl<T: Serial> Sender<T> {
             ptr::write((*slot.data.get()).as_mut_ptr(), value);
         }
 
-        // Ensure data write completes before generation/head is advanced
+        // Ensure data write completes before generation is visible
         compiler_fence(Ordering::Release);
 
-        // Write generation for immediate consumer visibility at any QD.
+        // Write generation for immediate consumer visibility.
         // Generation and data are in the same Slot (same cache line), so the
         // consumer can detect + read in a single cache line transfer.
         unsafe {
             ptr::write_volatile(slot.generation.get(), self.head);
         }
+
+        // CLDEMOTE on first send after sync: hints CPU to push the cache line
+        // toward shared cache for faster cross-core detection. Only on first
+        // send to avoid overhead in tight loops.
         if self.sends_since_publish == 0 {
             cldemote(slot as *const Slot<T> as *const u8);
         }
@@ -190,15 +189,11 @@ impl<T: Serial> Sender<T> {
         Ok(())
     }
 
-    /// Publishes the current head, making all sent data visible to the receiver.
+    /// Resets CLDEMOTE gate. No shared state is published — generation
+    /// provides immediate per-send visibility.
     #[inline]
     pub fn publish(&mut self) {
-        if self.sends_since_publish > 0 {
-            self.inner
-                .shared_head
-                .store(self.head, Ordering::Release);
-            self.sends_since_publish = 0;
-        }
+        self.sends_since_publish = 0;
     }
 
     /// Returns true if the receiver has disconnected.
@@ -237,37 +232,17 @@ impl<T: Serial> Receiver<T> {
         self.recv_inner()
     }
 
-    /// Internal receive implementation (3-stage adaptive).
-    ///
-    /// 1. Fast path: tail < cached_head → data read only (high QD steady state)
-    /// 2. Immediate path: generation check → distributed per-slot access (low QD)
-    /// 3. Batch path: shared_head atomic load → batch discovery (high QD transition)
+    /// Check generation counter for data availability.
+    /// Generation and data are in the same Slot (same cache line), so detection
+    /// and read happen in a single cache line transfer.
     #[inline]
     fn recv_inner(&mut self) -> Option<T> {
-        // Fast path: cached_head tells us data is available
-        if self.tail < self.cached_head {
-            let slot_idx = self.tail & self.mask;
-            let value = unsafe { ptr::read((*self.inner.slots[slot_idx].data.get()).as_ptr()) };
-            self.tail = self.tail.wrapping_add(1);
-            return Some(value);
-        }
-
         let slot_idx = self.tail & self.mask;
         let slot = &self.inner.slots[slot_idx];
 
-        // Immediate path: check generation counter (no shared_head bouncing).
-        // Generation and data are in the same Slot → single cache line transfer.
         let generation = unsafe { ptr::read_volatile(slot.generation.get()) };
         if generation == self.tail {
             compiler_fence(Ordering::Acquire);
-            let value = unsafe { ptr::read((*slot.data.get()).as_ptr()) };
-            self.tail = self.tail.wrapping_add(1);
-            return Some(value);
-        }
-
-        // Batch path: load shared_head
-        self.cached_head = self.inner.shared_head.load(Ordering::Acquire);
-        if self.tail < self.cached_head {
             let value = unsafe { ptr::read((*slot.data.get()).as_ptr()) };
             self.tail = self.tail.wrapping_add(1);
             return Some(value);
