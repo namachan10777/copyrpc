@@ -15,6 +15,64 @@
 //! - sync(): no-op (generation provides immediate visibility)
 //! - recv(): consumer reads generation (volatile), reads data from same cache line
 //! - reply(): producer writes data + generation to slot (same cache line)
+//!
+//! # Design rationale: Onesided vs FastForward
+//!
+//! ## Generation counter vs validity flag
+//!
+//! Onesided uses a monotonically increasing generation counter (`head`) instead of
+//! FastForward's boolean validity flag. This eliminates the need for a next-slot
+//! sentinel write — FastForward must write `valid=false` to the next slot before
+//! writing data to prevent stale reads on ring wrap. Generation naturally
+//! disambiguates rounds via `generation == tail`.
+//!
+//! Per-send writes: Onesided = 2 (data + generation), FastForward = 3
+//! (next_valid=false + data + valid=true). Fewer writes per send, and all writes
+//! are within a single cache line.
+//!
+//! ## Cache coherency: RFO asymmetry (Intel MESIF/SnpInv)
+//!
+//! Despite fewer writes, Onesided has higher RFO (Read For Ownership) counts in
+//! throughput benchmarks. This is due to a fundamental difference in cache line
+//! state transitions between the two designs.
+//!
+//! **FastForward** — consumer writes `valid=false` after reading, producer reads
+//! `valid` before writing (read-before-write pattern):
+//!
+//! ```text
+//! Consumer: write valid=false → line in M (consumer)
+//! Producer: read valid        → CHA sends SnpInv (SPSC, sole sharer)
+//!                              → consumer M→I, producer gets E
+//! Producer: write data+valid  → E→M silent transition, no RFO
+//! ```
+//!
+//! **Onesided** — consumer is read-only, producer writes directly (write-only pattern):
+//!
+//! ```text
+//! Producer: write data+gen    → line in M (producer)
+//! Consumer: read gen+data     → snoop forward, line shared
+//! Producer: write data+gen    → S/I→M requires RFO (invalidate + ACK)
+//! ```
+//!
+//! On Intel Sapphire Rapids (non-inclusive LLC with snoop filter), the CHA issues
+//! SnpInv for demand reads when only one sharer exists (always true for SPSC).
+//! This gives the requester E state instead of S, enabling silent E→M writes.
+//! This is Intel-specific — standard MESI would give S to both cores on a read
+//! of M, and AMD MOESI has different behavior.
+//!
+//! Measured impact (perf stat, Flux 2-node throughput):
+//! - Onesided: 2.3 RFO/op, SB stalls 33% of cycles
+//! - FastForward: 0.9 RFO/op, SB stalls 25% of cycles
+//!
+//! ## Pingpong latency advantage
+//!
+//! Despite the throughput disadvantage, Onesided achieves ~11% lower pingpong
+//! latency than FastForward (~631ns vs ~710ns). This is because:
+//!
+//! 1. Fewer writes per send (2 vs 3) reduces per-operation overhead
+//! 2. CLDEMOTE on first send after sync() hints the CPU to push the cache line
+//!    toward shared cache, reducing cross-core detection latency
+//! 3. No consumer write means one fewer cache line transition per round-trip
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
