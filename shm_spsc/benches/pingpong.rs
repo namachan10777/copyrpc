@@ -1,7 +1,11 @@
 //! Benchmark for shm_spsc RPC call latency.
+//!
+//! Compares three implementations:
+//! - slot: original toggle-bit slot protocol
+//! - shared: shared MPSC ring buffer with fetch_add
+//! - ffwd: per-client SPSC delegation (flat combining)
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use shm_spsc::{Server, SyncClient};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -11,21 +15,19 @@ fn pin_to_core(core_id: usize) {
     core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
 }
 
+const RING_DEPTH: u32 = 8;
+
 fn bench_call_latency(c: &mut Criterion) {
     let mut group = c.benchmark_group("shm_rpc_call");
     group.throughput(Throughput::Elements(1));
 
-    // u64 request/response
-    group.bench_function("u64", |b| {
-        let name = format!("/shm_rpc_bench_{}", Uuid::now_v7());
-
+    // --- Slot (original) ---
+    group.bench_function("slot_u64", |b| {
+        let name = format!("/shm_bench_slot_{}", Uuid::now_v7());
         unsafe {
-            let mut server = Server::<u64, u64>::create(&name, 4, 1).unwrap();
-
-            let name_clone = name.clone();
+            let mut server = shm_spsc::Server::<u64, u64>::create(&name, 4, 1).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = stop.clone();
-
             let server_thread = thread::spawn(move || {
                 pin_to_core(30);
                 while !stop_clone.load(Ordering::Relaxed) {
@@ -35,108 +37,79 @@ fn bench_call_latency(c: &mut Criterion) {
                     }
                 }
             });
-
-            // Wait for server to be ready
             thread::sleep(std::time::Duration::from_millis(10));
-
-            let mut client = SyncClient::<u64, u64>::connect_sync(&name_clone).unwrap();
-
-            // Warmup
+            let mut client = shm_spsc::SyncClient::<u64, u64>::connect_sync(&name).unwrap();
             for _ in 0..1000 {
                 client.call_blocking(0).unwrap();
             }
-
             b.iter(|| {
                 pin_to_core(31);
                 black_box(client.call_blocking(black_box(42u64)).unwrap());
             });
-
             stop.store(true, Ordering::Relaxed);
             server_thread.join().unwrap();
         }
     });
 
-    // [u8; 64] request/response
-    group.bench_function("64_bytes", |b| {
-        let name = format!("/shm_rpc_bench64_{}", Uuid::now_v7());
-
+    // --- Shared MPSC ---
+    group.bench_function("shared_u64", |b| {
+        let name = format!("/shm_bench_shared_{}", Uuid::now_v7());
         unsafe {
             let mut server =
-                Server::<[u8; 64], [u8; 64]>::create(&name, 4, 1).unwrap();
-
-            let name_clone = name.clone();
+                shm_spsc::mpsc_shared::Server::<u64, u64>::create(&name, 4, RING_DEPTH).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = stop.clone();
-
             let server_thread = thread::spawn(move || {
                 pin_to_core(30);
                 while !stop_clone.load(Ordering::Relaxed) {
                     server.poll();
                     while let Some((token, req)) = server.recv() {
-                        server.reply(token, req);
+                        server.reply(token, req + 1);
                     }
                 }
             });
-
             thread::sleep(std::time::Duration::from_millis(10));
-
             let mut client =
-                SyncClient::<[u8; 64], [u8; 64]>::connect_sync(&name_clone).unwrap();
-
-            // Warmup
+                shm_spsc::mpsc_shared::SyncClient::<u64, u64>::connect_sync(&name).unwrap();
             for _ in 0..1000 {
-                client.call_blocking([0u8; 64]).unwrap();
+                client.call_blocking(0).unwrap();
             }
-
-            let data = [0xABu8; 64];
             b.iter(|| {
                 pin_to_core(31);
-                black_box(client.call_blocking(black_box(data)).unwrap());
+                black_box(client.call_blocking(black_box(42u64)).unwrap());
             });
-
             stop.store(true, Ordering::Relaxed);
             server_thread.join().unwrap();
         }
     });
 
-    // [u8; 256] request/response
-    group.bench_function("256_bytes", |b| {
-        let name = format!("/shm_rpc_bench256_{}", Uuid::now_v7());
-
+    // --- ffwd delegation ---
+    group.bench_function("ffwd_u64", |b| {
+        let name = format!("/shm_bench_ffwd_{}", Uuid::now_v7());
         unsafe {
             let mut server =
-                Server::<[u8; 256], [u8; 256]>::create(&name, 4, 1).unwrap();
-
-            let name_clone = name.clone();
+                shm_spsc::mpsc_ffwd::Server::<u64, u64>::create(&name, 4, RING_DEPTH).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = stop.clone();
-
             let server_thread = thread::spawn(move || {
                 pin_to_core(30);
                 while !stop_clone.load(Ordering::Relaxed) {
                     server.poll();
                     while let Some((token, req)) = server.recv() {
-                        server.reply(token, req);
+                        server.reply(token, req + 1);
                     }
                 }
             });
-
             thread::sleep(std::time::Duration::from_millis(10));
-
             let mut client =
-                SyncClient::<[u8; 256], [u8; 256]>::connect_sync(&name_clone).unwrap();
-
-            // Warmup
+                shm_spsc::mpsc_ffwd::SyncClient::<u64, u64>::connect_sync(&name).unwrap();
             for _ in 0..1000 {
-                client.call_blocking([0u8; 256]).unwrap();
+                client.call_blocking(0).unwrap();
             }
-
-            let data = [0xABu8; 256];
             b.iter(|| {
                 pin_to_core(31);
-                black_box(client.call_blocking(black_box(data)).unwrap());
+                black_box(client.call_blocking(black_box(42u64)).unwrap());
             });
-
             stop.store(true, Ordering::Relaxed);
             server_thread.join().unwrap();
         }

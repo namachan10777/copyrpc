@@ -18,6 +18,8 @@
 //! - `recv()` — returns next buffered request with an opaque `RequestToken`
 //! - `reply(token, resp)` — writes response (immediate or deferred)
 
+pub mod mpsc_ffwd;
+pub mod mpsc_shared;
 pub mod shm;
 
 use shm::SharedMemory;
@@ -124,7 +126,7 @@ impl From<io::Error> for ConnectError {
 const MAGIC: u64 = 0x5250_4353_4C4F_5421; // "RPCSLOT!"
 const VERSION: u32 = 5;
 const HEADER_SIZE: usize = 64;
-const CACHE_LINE_SIZE: usize = 64;
+pub(crate) const CACHE_LINE_SIZE: usize = 64;
 const MAX_SLOTS_PER_CLIENT: usize = 32;
 
 /// Header stored at the beginning of shared memory.
@@ -185,7 +187,7 @@ fn calc_shm_size<Req, Resp>(max_clients: u32, slots_per_client: u32) -> usize {
     HEADER_SIZE + layout.slot_size * (max_clients as usize * slots_per_client as usize)
 }
 
-fn align_up(val: usize, align: usize) -> usize {
+pub(crate) fn align_up(val: usize, align: usize) -> usize {
     (val + align - 1) & !(align - 1)
 }
 
