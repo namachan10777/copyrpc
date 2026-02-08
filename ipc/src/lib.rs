@@ -1,38 +1,38 @@
-//! RPC slot-based communication over shared memory.
+//! RPC over shared memory using ffwd delegation pattern.
 //!
-//! Uses a toggle-bit protocol (inspired by ffwd, SOSP 2017):
-//! - `client_seq` incremented by client when posting a request
-//! - `server_seq` incremented by server when posting a response
-//! - `client_seq != server_seq` → request pending
-//! - `client_seq == server_seq` → idle / response ready
+//! Each client gets a dedicated SPSC request ring. The server scans all client
+//! request rings (flat combining) and replies via per-client SPSC response rings.
+//! Supports out-of-order responses via slab-keyed user data on the client side.
 //!
-//! ## Client API (copyrpc-style async)
+//! ## Client API
 //!
-//! - `call(req, user_data)` — non-blocking send; polls internally if all slots busy
-//! - `poll()` — scans in-flight slots, fires `on_response(user_data, resp)` for completions
-//! - `call_blocking(req)` — synchronous RPC (on `connect_sync()` clients)
+//! - `call(req, user_data)` — non-blocking send; polls internally if ring full
+//! - `poll()` — scans response ring, fires `on_response(user_data, resp)`
+//! - `call_blocking(req)` — synchronous RPC (`SyncClient` only)
 //!
-//! ## Server API (pull-based)
+//! ## Server API
 //!
-//! - `poll()` — scans all client slots for new requests, buffers internally
-//! - `recv()` — returns next buffered request with an opaque `RequestToken`
+//! - `poll()` — scans all client request rings for new requests
+//! - `recv()` — returns next request via zero-copy `RecvHandle`
 //! - `reply(token, resp)` — writes response (immediate or deferred)
 
-pub mod mpsc_ffwd;
 pub mod shm;
 
 use shm::SharedMemory;
-use std::cell::{Cell, UnsafeCell};
+use std::cell::Cell;
+use std::cell::UnsafeCell;
 use std::io;
 use std::marker::PhantomData;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::ptr::{read_volatile, write_volatile};
+use std::sync::atomic::{compiler_fence, AtomicBool, AtomicU32, Ordering};
 
-/// Marker trait for types that can be safely transmitted through the channel.
+// === Serial trait ===
+
+/// Marker trait for types safely transmittable through the channel.
 ///
 /// # Safety
-/// Types implementing this trait must be `Copy` and have a stable memory layout
-/// suitable for inter-process communication.
+/// Types must be `Copy` with a stable memory layout suitable for IPC.
 pub unsafe trait Serial: Copy {}
 
 unsafe impl Serial for u8 {}
@@ -52,69 +52,24 @@ unsafe impl Serial for f64 {}
 unsafe impl Serial for bool {}
 unsafe impl<T: Copy, const N: usize> Serial for [T; N] {}
 
-/// Identifies a client slot.
+// === Public types ===
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClientId(pub u32);
 
-/// Opaque token identifying a pending request on the server.
-///
-/// Returned by [`Server::recv()`] and consumed by [`Server::reply()`].
+/// Opaque token for a pending request. Move-only to prevent double-reply.
 #[derive(Debug)]
 pub struct RequestToken {
     client_id: ClientId,
-    slot_index: u32,
+    slab_key: u32,
 }
 
 impl RequestToken {
-    /// Returns the client that sent this request.
     pub fn client_id(&self) -> ClientId {
         self.client_id
     }
 }
 
-/// Zero-copy receive handle for accessing request data in shared memory.
-///
-/// Created by [`Server::recv()`]. Provides zero-copy access to request data
-/// and can be consumed to reply immediately or converted to a [`RequestToken`]
-/// for deferred reply.
-pub struct RecvHandle<'a, Req: Serial, Resp: Serial> {
-    server: &'a Server<Req, Resp>,
-    flat_idx: u32,
-    client_id: ClientId,
-    slot_index: u32,
-    _marker: PhantomData<(Req, Resp)>,
-}
-
-impl<Req: Serial, Resp: Serial> RecvHandle<'_, Req, Resp> {
-    /// Zero-copy access to the request data in shared memory.
-    #[inline]
-    pub fn data(&self) -> &Req {
-        unsafe { &*self.server.slot_req_ptr(self.flat_idx) }
-    }
-
-    /// Consumes the handle and replies immediately.
-    #[inline]
-    pub fn reply(self, resp: Resp) {
-        self.server.reply_internal(self.client_id, self.slot_index, resp);
-    }
-
-    /// Extracts a non-Copy token for deferred reply.
-    #[inline]
-    pub fn into_token(self) -> RequestToken {
-        RequestToken {
-            client_id: self.client_id,
-            slot_index: self.slot_index,
-        }
-    }
-
-    /// Returns the client that sent this request.
-    #[inline]
-    pub fn client_id(&self) -> ClientId {
-        self.client_id
-    }
-}
-
-/// Error returned when a client operation fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallError {
     ServerDisconnected,
@@ -130,7 +85,6 @@ impl std::fmt::Display for CallError {
 
 impl std::error::Error for CallError {}
 
-/// Error returned when `Client::connect()` fails.
 #[derive(Debug)]
 pub enum ConnectError {
     ServerNotAlive,
@@ -165,124 +119,204 @@ impl From<io::Error> for ConnectError {
     }
 }
 
-const MAGIC: u64 = 0x5250_4353_4C4F_5421; // "RPCSLOT!"
-const VERSION: u32 = 5;
-const HEADER_SIZE: usize = 64;
-pub(crate) const CACHE_LINE_SIZE: usize = 64;
-const MAX_SLOTS_PER_CLIENT: usize = 32;
+// === Constants ===
 
-/// Header stored at the beginning of shared memory.
-/// Fixed 64 bytes.
+const MAGIC: u64 = 0x5250_4353_4646_5721; // "RPCSFFWD"
+const VERSION: u32 = 2;
+const HEADER_SIZE: usize = 64;
+const CACHE_LINE_SIZE: usize = 64;
+const SLAB_KEY_OFFSET: usize = 4;
+
+fn align_up(val: usize, align: usize) -> usize {
+    (val + align - 1) & !(align - 1)
+}
+
+// === Header ===
+
 #[repr(C)]
 struct Header {
-    magic: u64,                    // 8
-    version: u32,                  // 4
-    max_clients: u32,              // 4
-    req_size: u32,                 // 4
-    resp_size: u32,                // 4
-    req_align: u32,                // 4
-    resp_align: u32,               // 4
-    server_alive: AtomicBool,      // 1
-    _pad: [u8; 3],                 // 3
-    next_client_id: AtomicU32,     // 4
-    slots_per_client: u32,         // 4
-    _reserved: [u8; 20],           // 20
-    // total = 64
+    magic: u64,                // 8
+    version: u32,              // 4
+    max_clients: u32,          // 4
+    ring_depth: u32,           // 4
+    req_size: u32,             // 4
+    resp_size: u32,            // 4
+    req_align: u32,            // 4
+    resp_align: u32,           // 4
+    extra_buffer_size: u32,    // 4
+    server_alive: AtomicBool,  // 1
+    _pad: [u8; 3],            // 3
+    next_client_id: AtomicU32, // 4
+    _reserved: [u8; 16],      // 16 → total = 64
 }
 
 const _: () = assert!(std::mem::size_of::<Header>() == HEADER_SIZE);
 
-/// Layout of a single slot in shared memory.
-struct SlotLayout {
-    slot_size: usize,
-    client_seq_offset: usize,  // 0
-    server_seq_offset: usize,  // 1
-    alive_offset: usize,       // 2
-    req_offset: usize,
-    resp_offset: usize,
+// === Slot layout ===
+//
+// Each slot: [valid: u8][pad: 3B][slab_key: u32][data at offset 8+]
+// Slot size is cache-line aligned.
+
+fn calc_req_slot_size<Req: Serial>() -> usize {
+    let data_offset = align_up(8, std::mem::align_of::<Req>().max(8));
+    align_up(data_offset + std::mem::size_of::<Req>(), CACHE_LINE_SIZE)
 }
 
-fn calc_slot_layout<Req, Resp>() -> SlotLayout {
-    let align = std::mem::align_of::<Req>()
-        .max(std::mem::align_of::<Resp>())
-        .max(8);
+fn calc_resp_slot_size<Resp: Serial>() -> usize {
+    let data_offset = align_up(8, std::mem::align_of::<Resp>().max(8));
+    align_up(data_offset + std::mem::size_of::<Resp>(), CACHE_LINE_SIZE)
+}
 
-    let client_seq_offset = 0;
-    let server_seq_offset = 1;
-    let alive_offset = 2;
-    let req_offset = align_up(3, align);
-    let resp_offset = align_up(req_offset + std::mem::size_of::<Req>(), align);
-    let slot_size = align_up(resp_offset + std::mem::size_of::<Resp>(), CACHE_LINE_SIZE);
+fn per_client_block_size<Req: Serial, Resp: Serial>(
+    ring_depth: u32,
+    extra_buffer_size: u32,
+) -> usize {
+    let control_size = CACHE_LINE_SIZE;
+    let req_ring_size = calc_req_slot_size::<Req>() * ring_depth as usize;
+    let resp_ring_size = calc_resp_slot_size::<Resp>() * ring_depth as usize;
+    align_up(
+        control_size + req_ring_size + resp_ring_size + extra_buffer_size as usize,
+        CACHE_LINE_SIZE,
+    )
+}
 
-    SlotLayout {
-        slot_size,
-        client_seq_offset,
-        server_seq_offset,
-        alive_offset,
-        req_offset,
-        resp_offset,
+fn total_shm_size<Req: Serial, Resp: Serial>(
+    max_clients: u32,
+    ring_depth: u32,
+    extra_buffer_size: u32,
+) -> usize {
+    HEADER_SIZE
+        + per_client_block_size::<Req, Resp>(ring_depth, extra_buffer_size) * max_clients as usize
+}
+
+// === RecvHandle ===
+
+/// Zero-copy receive handle for accessing request data in shared memory.
+pub struct RecvHandle<'a, Req: Serial, Resp: Serial> {
+    server: &'a Server<Req, Resp>,
+    client_idx: usize,
+    tail: u64,
+    slab_key: u32,
+    _marker: PhantomData<(Req, Resp)>,
+}
+
+impl<Req: Serial, Resp: Serial> RecvHandle<'_, Req, Resp> {
+    /// Zero-copy access to the request data.
+    #[inline]
+    pub fn data(&self) -> &Req {
+        let slot_idx = (self.tail & self.server.ring_mask) as usize;
+        let slot_ptr = unsafe {
+            self.server.req_ring_bases[self.client_idx]
+                .add(slot_idx * self.server.req_slot_size)
+        };
+        unsafe { &*(slot_ptr.add(self.server.req_data_offset) as *const Req) }
     }
-}
 
-fn calc_shm_size<Req, Resp>(max_clients: u32, slots_per_client: u32) -> usize {
-    let layout = calc_slot_layout::<Req, Resp>();
-    HEADER_SIZE + layout.slot_size * (max_clients as usize * slots_per_client as usize)
-}
+    /// Consumes the handle and replies immediately.
+    #[inline]
+    pub fn reply(self, resp: Resp) {
+        let slot_idx = (self.tail & self.server.ring_mask) as usize;
+        let slot_ptr = unsafe {
+            self.server.req_ring_bases[self.client_idx]
+                .add(slot_idx * self.server.req_slot_size)
+        };
+        compiler_fence(Ordering::Release);
+        unsafe { write_volatile(slot_ptr, 0) };
 
-pub(crate) fn align_up(val: usize, align: usize) -> usize {
-    (val + align - 1) & !(align - 1)
+        let req_tails = unsafe { &mut *self.server.req_tails.get() };
+        req_tails[self.client_idx] = self.tail + 1;
+        let req_avail = unsafe { &mut *self.server.req_avail.get() };
+        req_avail[self.client_idx] -= 1;
+
+        self.server
+            .reply_to_client(ClientId(self.client_idx as u32), self.slab_key, resp);
+    }
+
+    /// Extracts a move-only token for deferred reply.
+    #[inline]
+    pub fn into_token(self) -> RequestToken {
+        let slot_idx = (self.tail & self.server.ring_mask) as usize;
+        let slot_ptr = unsafe {
+            self.server.req_ring_bases[self.client_idx]
+                .add(slot_idx * self.server.req_slot_size)
+        };
+        compiler_fence(Ordering::Release);
+        unsafe { write_volatile(slot_ptr, 0) };
+
+        let req_tails = unsafe { &mut *self.server.req_tails.get() };
+        req_tails[self.client_idx] = self.tail + 1;
+        let req_avail = unsafe { &mut *self.server.req_avail.get() };
+        req_avail[self.client_idx] -= 1;
+
+        RequestToken {
+            client_id: ClientId(self.client_idx as u32),
+            slab_key: self.slab_key,
+        }
+    }
+
+    #[inline]
+    pub fn client_id(&self) -> ClientId {
+        ClientId(self.client_idx as u32)
+    }
 }
 
 // =============================================================================
 // Server
 // =============================================================================
 
-/// Server side of the RPC slot channel.
 pub struct Server<Req: Serial, Resp: Serial> {
     _shm: SharedMemory,
     header: *mut Header,
-    base: *mut u8,
-    layout: SlotLayout,
-    slots_per_client: u32,
-    server_seqs: UnsafeCell<Vec<u8>>,
-    in_progress: UnsafeCell<Vec<u32>>,
-    new_requests: UnsafeCell<Vec<u32>>,
+    max_clients: u32,
+    ring_mask: u64,
+    req_slot_size: usize,
+    resp_slot_size: usize,
+    // Cached per-client SHM pointers
+    req_ring_bases: Vec<*mut u8>,
+    resp_ring_bases: Vec<*mut u8>,
+    control_ptrs: Vec<*const AtomicBool>,
+    extra_ptrs: Vec<*mut u8>,
+    // Precomputed data offsets
+    req_data_offset: usize,
+    resp_data_offset: usize,
+    extra_buffer_size: u32,
+    // Per-client ring state (interior mutability)
+    req_tails: UnsafeCell<Vec<u64>>,
+    resp_heads: UnsafeCell<Vec<u64>>,
+    scan_pos: Cell<u32>,
+    // Zero-copy recv: per-client available count + lane-drain state
+    req_avail: UnsafeCell<Vec<u32>>,
+    recv_start: Cell<u32>,
     recv_scan_pos: Cell<u32>,
-    _marker: PhantomData<(Req, Resp)>,
+    // Deferred responses: (client_id, slab_key, resp)
+    deferred_responses: UnsafeCell<Vec<(ClientId, u32, Resp)>>,
+    _phantom: PhantomData<(Req, Resp)>,
 }
 
 unsafe impl<Req: Serial + Send, Resp: Serial + Send> Send for Server<Req, Resp> {}
 
 impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
-    /// Creates a new server and shared memory region.
-    ///
-    /// `slots_per_client` must be a power of 2 (1, 2, 4, 8, ...).
+    /// Creates a new shared memory RPC server.
     ///
     /// # Safety
-    /// The caller must ensure that `path` is a valid shared memory path
-    /// and that no other process is using the same path.
+    /// - `ring_depth` must be a power of 2
+    /// - Caller must ensure no other process is using this path
     pub unsafe fn create<P: AsRef<Path>>(
         path: P,
         max_clients: u32,
-        slots_per_client: u32,
+        ring_depth: u32,
+        extra_buffer_size: u32,
     ) -> io::Result<Self> {
+        assert!(
+            ring_depth.is_power_of_two(),
+            "ring_depth must be power of 2"
+        );
         assert!(max_clients > 0, "max_clients must be > 0");
-        assert!(max_clients <= 64, "max_clients must be <= 64");
-        assert!(
-            slots_per_client > 0 && slots_per_client.is_power_of_two(),
-            "slots_per_client must be a power of 2"
-        );
-        assert!(
-            (slots_per_client as usize) <= MAX_SLOTS_PER_CLIENT,
-            "slots_per_client must be <= {}",
-            MAX_SLOTS_PER_CLIENT
-        );
 
-        let size = calc_shm_size::<Req, Resp>(max_clients, slots_per_client);
+        let size = total_shm_size::<Req, Resp>(max_clients, ring_depth, extra_buffer_size);
         let shm = unsafe { SharedMemory::create(path, size)? };
-        let base = shm.as_ptr();
 
-        let header = base as *mut Header;
+        let header = shm.as_ptr() as *mut Header;
         unsafe {
             std::ptr::write(
                 header,
@@ -290,224 +324,241 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
                     magic: MAGIC,
                     version: VERSION,
                     max_clients,
+                    ring_depth,
                     req_size: std::mem::size_of::<Req>() as u32,
                     resp_size: std::mem::size_of::<Resp>() as u32,
                     req_align: std::mem::align_of::<Req>() as u32,
                     resp_align: std::mem::align_of::<Resp>() as u32,
+                    extra_buffer_size,
                     server_alive: AtomicBool::new(true),
                     _pad: [0; 3],
                     next_client_id: AtomicU32::new(0),
-                    slots_per_client,
-                    _reserved: [0; 20],
+                    _reserved: [0; 16],
                 },
             );
         }
 
-        let layout = calc_slot_layout::<Req, Resp>();
-        let total_slots = max_clients * slots_per_client;
+        let req_slot_size = calc_req_slot_size::<Req>();
+        let resp_slot_size = calc_resp_slot_size::<Resp>();
+        let block_size = per_client_block_size::<Req, Resp>(ring_depth, extra_buffer_size);
+        let extra_offset = CACHE_LINE_SIZE
+            + req_slot_size * ring_depth as usize
+            + resp_slot_size * ring_depth as usize;
 
-        // Initialize all slots
-        for i in 0..total_slots {
-            let slot_base = unsafe { base.add(HEADER_SIZE + layout.slot_size * i as usize) };
-            unsafe {
-                let client_seq =
-                    &*(slot_base.add(layout.client_seq_offset) as *const AtomicU8);
-                client_seq.store(0, Ordering::Relaxed);
-                let server_seq =
-                    &*(slot_base.add(layout.server_seq_offset) as *const AtomicU8);
-                server_seq.store(0, Ordering::Relaxed);
-                let alive = &*(slot_base.add(layout.alive_offset) as *const AtomicBool);
-                alive.store(false, Ordering::Relaxed);
-            }
+        let mut req_ring_bases = Vec::with_capacity(max_clients as usize);
+        let mut resp_ring_bases = Vec::with_capacity(max_clients as usize);
+        let mut control_ptrs = Vec::with_capacity(max_clients as usize);
+        let mut extra_ptrs = Vec::with_capacity(max_clients as usize);
+
+        for i in 0..max_clients as usize {
+            let block_base = unsafe { shm.as_ptr().add(HEADER_SIZE + i * block_size) };
+            let alive = unsafe { &mut *(block_base as *mut AtomicBool) };
+            *alive = AtomicBool::new(false);
+
+            control_ptrs.push(block_base as *const AtomicBool);
+            req_ring_bases.push(unsafe { block_base.add(CACHE_LINE_SIZE) });
+            resp_ring_bases.push(unsafe {
+                block_base.add(CACHE_LINE_SIZE + ring_depth as usize * req_slot_size)
+            });
+            extra_ptrs.push(unsafe { block_base.add(extra_offset) });
         }
+
+        let req_data_offset = align_up(8, std::mem::align_of::<Req>().max(8));
+        let resp_data_offset = align_up(8, std::mem::align_of::<Resp>().max(8));
 
         Ok(Self {
             _shm: shm,
             header,
-            base,
-            layout,
-            slots_per_client,
-            server_seqs: UnsafeCell::new(vec![0u8; total_slots as usize]),
-            in_progress: UnsafeCell::new(vec![0u32; max_clients as usize]),
-            new_requests: UnsafeCell::new(vec![0u32; max_clients as usize]),
+            max_clients,
+            ring_mask: (ring_depth - 1) as u64,
+            req_slot_size,
+            resp_slot_size,
+            req_ring_bases,
+            resp_ring_bases,
+            control_ptrs,
+            extra_ptrs,
+            req_data_offset,
+            resp_data_offset,
+            extra_buffer_size,
+            req_tails: UnsafeCell::new(vec![0; max_clients as usize]),
+            resp_heads: UnsafeCell::new(vec![0; max_clients as usize]),
+            scan_pos: Cell::new(0),
+            req_avail: UnsafeCell::new(vec![0; max_clients as usize]),
+            recv_start: Cell::new(0),
             recv_scan_pos: Cell::new(0),
-            _marker: PhantomData,
+            deferred_responses: UnsafeCell::new(Vec::new()),
+            _phantom: PhantomData,
         })
     }
 
-    #[inline(always)]
-    fn slot_base(&self, flat_idx: u32) -> *mut u8 {
-        unsafe {
-            self.base
-                .add(HEADER_SIZE + self.layout.slot_size * flat_idx as usize)
-        }
-    }
-
-    #[inline(always)]
-    fn slot_client_seq(&self, flat_idx: u32) -> &AtomicU8 {
-        unsafe {
-            &*(self.slot_base(flat_idx).add(self.layout.client_seq_offset) as *const AtomicU8)
-        }
-    }
-
-    #[inline(always)]
-    fn slot_server_seq(&self, flat_idx: u32) -> &AtomicU8 {
-        unsafe {
-            &*(self.slot_base(flat_idx).add(self.layout.server_seq_offset) as *const AtomicU8)
-        }
-    }
-
-    #[inline(always)]
-    fn slot_alive(&self, flat_idx: u32) -> &AtomicBool {
-        unsafe {
-            &*(self.slot_base(flat_idx).add(self.layout.alive_offset) as *const AtomicBool)
-        }
-    }
-
-    #[inline(always)]
-    fn slot_req_ptr(&self, flat_idx: u32) -> *const Req {
-        unsafe { self.slot_base(flat_idx).add(self.layout.req_offset) as *const Req }
-    }
-
-    #[inline(always)]
-    fn slot_resp_ptr(&self, flat_idx: u32) -> *mut Resp {
-        unsafe { self.slot_base(flat_idx).add(self.layout.resp_offset) as *mut Resp }
-    }
-
-    /// Scans all client slots for new requests, marking them in an internal bitmap.
-    ///
-    /// Use [`recv()`](Self::recv) to retrieve marked requests (reads directly from
-    /// shared memory — zero-copy). Slots that are already marked as new or
-    /// in-progress (recv'd but not replied) are skipped.
-    #[inline]
-    pub fn poll(&self) -> u32 {
-        let allocated = unsafe { (*self.header).next_client_id.load(Ordering::Relaxed) };
-        if allocated == 0 {
-            return 0;
-        }
-
-        let spc = self.slots_per_client;
-        let mut count = 0u32;
-
-        let in_progress = unsafe { &*self.in_progress.get() };
-        let new_requests = unsafe { &mut *self.new_requests.get() };
-        let server_seqs = unsafe { &*self.server_seqs.get() };
-
-        for client_idx in 0..allocated {
-            let base_slot = client_idx * spc;
-            if !self.slot_alive(base_slot).load(Ordering::Acquire) {
+    fn flush_deferred(&self) {
+        let deferred = unsafe { &mut *self.deferred_responses.get() };
+        let resp_heads = unsafe { &mut *self.resp_heads.get() };
+        let mut i = 0;
+        while i < deferred.len() {
+            let (client_id, _, _) = &deferred[i];
+            let client_idx = client_id.0 as usize;
+            let head = resp_heads[client_idx];
+            let slot_idx = (head & self.ring_mask) as usize;
+            let slot_ptr = unsafe {
+                self.resp_ring_bases[client_idx].add(slot_idx * self.resp_slot_size)
+            };
+            let valid = unsafe { read_volatile(slot_ptr as *const u8) };
+            if valid != 0 {
+                i += 1;
                 continue;
             }
-            let ci = client_idx as usize;
-            let skip = unsafe {
-                *in_progress.get_unchecked(ci) | *new_requests.get_unchecked(ci)
-            };
-            for s in 0..spc {
-                if skip & (1 << s) != 0 {
-                    continue;
-                }
-                let global = base_slot + s;
-                let seq_idx = global as usize;
-                let client_seq = self.slot_client_seq(global).load(Ordering::Acquire);
-                let server_seq = unsafe { *server_seqs.get_unchecked(seq_idx) };
-                if client_seq != server_seq {
-                    unsafe { *new_requests.get_unchecked_mut(ci) |= 1 << s };
-                    count += 1;
-                }
-            }
+
+            let (_, slab_key, resp) = deferred.swap_remove(i);
+
+            unsafe { write_volatile(slot_ptr.add(SLAB_KEY_OFFSET) as *mut u32, slab_key) };
+            let resp_ptr = unsafe { slot_ptr.add(self.resp_data_offset) as *mut Resp };
+            unsafe { write_volatile(resp_ptr, resp) };
+            compiler_fence(Ordering::Release);
+            unsafe { write_volatile(slot_ptr, 1) };
+
+            resp_heads[client_idx] = head + 1;
+        }
+    }
+
+    /// Scan all client request rings. Returns total available request count.
+    pub fn poll(&self) -> u32 {
+        let deferred = unsafe { &*self.deferred_responses.get() };
+        if !deferred.is_empty() {
+            self.flush_deferred();
         }
 
+        let recv_start = self.scan_pos.get();
+        let mut count = 0u32;
+        let mut scan = self.scan_pos.get();
+
+        let req_tails = unsafe { &*self.req_tails.get() };
+        let req_avail = unsafe { &mut *self.req_avail.get() };
+
+        for _ in 0..self.max_clients {
+            let client_idx = scan as usize;
+            scan = (scan + 1) % self.max_clients;
+
+            let alive = unsafe { &*self.control_ptrs[client_idx] };
+            if !alive.load(Ordering::Relaxed) {
+                req_avail[client_idx] = 0;
+                continue;
+            }
+
+            let req_ring_base = self.req_ring_bases[client_idx];
+            let ring_depth = (self.ring_mask + 1) as u32;
+            let mut tail = req_tails[client_idx];
+            let mut avail = 0u32;
+            while avail < ring_depth {
+                let slot_idx = (tail & self.ring_mask) as usize;
+                let slot_ptr = unsafe { req_ring_base.add(slot_idx * self.req_slot_size) };
+                let valid = unsafe { read_volatile(slot_ptr as *const u8) };
+                if valid == 0 {
+                    break;
+                }
+                avail += 1;
+                tail += 1;
+            }
+            req_avail[client_idx] = avail;
+            count += avail;
+        }
+
+        self.scan_pos.set(scan);
+        self.recv_start.set(recv_start);
         self.recv_scan_pos.set(0);
         count
     }
 
-    /// Returns the next new request, reading directly from shared memory.
-    ///
-    /// The returned [`RecvHandle`] must be consumed to reply (either immediately
-    /// via `handle.reply()` or deferred via `handle.into_token()` + `server.reply()`).
-    #[inline]
+    /// Receive a request directly from SHM. Lane-drains per client.
     pub fn recv(&self) -> Option<RecvHandle<'_, Req, Resp>> {
-        let allocated = unsafe { (*self.header).next_client_id.load(Ordering::Relaxed) };
-        let spc = self.slots_per_client;
+        let req_avail = unsafe { &*self.req_avail.get() };
+        let req_tails = unsafe { &*self.req_tails.get() };
 
-        let new_requests = unsafe { &mut *self.new_requests.get() };
-        let in_progress = unsafe { &mut *self.in_progress.get() };
+        let mut scan = self.recv_scan_pos.get();
+        while (scan as usize) < self.max_clients as usize {
+            let client_idx =
+                ((self.recv_start.get() + scan) % self.max_clients) as usize;
 
-        let mut scan_pos = self.recv_scan_pos.get();
-        while scan_pos < allocated {
-            let ci = scan_pos as usize;
-            let bits = unsafe { *new_requests.get_unchecked(ci) };
-            if bits != 0 {
-                let s = bits.trailing_zeros();
-                unsafe { *new_requests.get_unchecked_mut(ci) &= !(1 << s) };
-                unsafe { *in_progress.get_unchecked_mut(ci) |= 1 << s };
-                let global = scan_pos * spc + s;
-                self.recv_scan_pos.set(scan_pos);
+            if req_avail[client_idx] > 0 {
+                let tail = req_tails[client_idx];
+                let slot_idx = (tail & self.ring_mask) as usize;
+                let slot_ptr = unsafe {
+                    self.req_ring_bases[client_idx].add(slot_idx * self.req_slot_size)
+                };
+                let slab_key =
+                    unsafe { read_volatile(slot_ptr.add(SLAB_KEY_OFFSET) as *const u32) };
+
                 return Some(RecvHandle {
                     server: self,
-                    flat_idx: global,
-                    client_id: ClientId(scan_pos),
-                    slot_index: s,
+                    client_idx,
+                    tail,
+                    slab_key,
                     _marker: PhantomData,
                 });
             }
-            scan_pos += 1;
+
+            scan += 1;
+            self.recv_scan_pos.set(scan);
         }
-        self.recv_scan_pos.set(scan_pos);
         None
     }
 
-    /// Internal reply implementation shared by RecvHandle::reply() and Server::reply().
-    #[inline]
-    fn reply_internal(&self, client_id: ClientId, slot_index: u32, resp: Resp) {
-        let cid = client_id.0;
-        let s = slot_index;
-        let global = cid * self.slots_per_client + s;
-        let seq_idx = global as usize;
+    fn reply_to_client(&self, client_id: ClientId, slab_key: u32, resp: Resp) {
+        let client_idx = client_id.0 as usize;
+        let resp_heads = unsafe { &mut *self.resp_heads.get() };
+        let head = resp_heads[client_idx];
+        let slot_idx = (head & self.ring_mask) as usize;
+        let slot_ptr =
+            unsafe { self.resp_ring_bases[client_idx].add(slot_idx * self.resp_slot_size) };
 
-        unsafe { std::ptr::write_volatile(self.slot_resp_ptr(global), resp) };
-        let server_seqs = unsafe { &mut *self.server_seqs.get() };
-        let server_seq = unsafe { *server_seqs.get_unchecked(seq_idx) };
-        let new_seq = server_seq.wrapping_add(1);
-        unsafe { *server_seqs.get_unchecked_mut(seq_idx) = new_seq };
-        self.slot_server_seq(global)
-            .store(new_seq, Ordering::Release);
+        let valid = unsafe { read_volatile(slot_ptr as *const u8) };
+        if valid != 0 {
+            let deferred = unsafe { &mut *self.deferred_responses.get() };
+            deferred.push((client_id, slab_key, resp));
+            return;
+        }
 
-        let in_progress = unsafe { &mut *self.in_progress.get() };
-        unsafe { *in_progress.get_unchecked_mut(cid as usize) &= !(1 << s) };
+        unsafe { write_volatile(slot_ptr.add(SLAB_KEY_OFFSET) as *mut u32, slab_key) };
+        let resp_ptr = unsafe { slot_ptr.add(self.resp_data_offset) as *mut Resp };
+        unsafe { write_volatile(resp_ptr, resp) };
+        compiler_fence(Ordering::Release);
+        unsafe { write_volatile(slot_ptr, 1) };
+
+        resp_heads[client_idx] = head + 1;
     }
 
-    /// Writes a response for a previously received request.
-    ///
-    /// Can be called immediately after `recv()` or deferred to a later point.
-    #[inline]
+    /// Reply to a previously received request using its token.
     pub fn reply(&self, token: RequestToken, resp: Resp) {
-        self.reply_internal(token.client_id, token.slot_index, resp);
+        self.reply_to_client(token.client_id, token.slab_key, resp);
     }
 
-    /// Returns true if a specific client is connected.
     pub fn is_client_connected(&self, client_id: ClientId) -> bool {
-        let id = client_id.0;
-        let allocated = unsafe { (*self.header).next_client_id.load(Ordering::Relaxed) };
-        if id >= allocated {
+        let client_idx = client_id.0 as usize;
+        if client_idx >= self.max_clients as usize {
             return false;
         }
-        let base_slot = id * self.slots_per_client;
-        self.slot_alive(base_slot).load(Ordering::Acquire)
+        let alive = unsafe { &*self.control_ptrs[client_idx] };
+        alive.load(Ordering::Relaxed)
     }
 
-    /// Returns the number of currently connected clients.
     pub fn connected_clients(&self) -> u32 {
-        let allocated = unsafe { (*self.header).next_client_id.load(Ordering::Relaxed) };
-        let spc = self.slots_per_client;
-        let mut count = 0;
-        for i in 0..allocated {
-            let base_slot = i * spc;
-            if self.slot_alive(base_slot).load(Ordering::Acquire) {
-                count += 1;
-            }
+        (0..self.max_clients)
+            .filter(|&i| self.is_client_connected(ClientId(i)))
+            .count() as u32
+    }
+
+    /// Returns a pointer to the client's extra buffer region, or `None` if
+    /// extra_buffer_size is 0 or the client_id is invalid.
+    pub fn client_extra_buffer(&self, client_id: ClientId) -> Option<*mut u8> {
+        let idx = client_id.0 as usize;
+        if self.extra_buffer_size == 0 || idx >= self.max_clients as usize {
+            return None;
         }
-        count
+        Some(self.extra_ptrs[idx])
+    }
+
+    pub fn extra_buffer_size(&self) -> u32 {
+        self.extra_buffer_size
     }
 }
 
@@ -523,26 +574,29 @@ impl<Req: Serial, Resp: Serial> Drop for Server<Req, Resp> {
 // Client
 // =============================================================================
 
-/// Client side of the RPC slot channel.
-///
-/// Generic over user data `U` and response callback `F`.
-/// Use [`connect_sync()`](Self::connect_sync) for synchronous-only usage.
 pub struct Client<Req: Serial, Resp: Serial, U, F: FnMut(U, Resp)> {
     _shm: SharedMemory,
-    header: *mut Header,
-    base: *mut u8,
-    layout: SlotLayout,
-    client_id: u32,
-    slots_per_client: u32,
-    base_slot: u32, // client_id * slots_per_client (precomputed)
-    client_seqs: [u8; MAX_SLOTS_PER_CLIENT],
-    free_bitmap: u32,
-    pending_queue: [u32; MAX_SLOTS_PER_CLIENT],
-    pq_head: u32,
-    pq_count: u32,
-    user_data: [Option<U>; MAX_SLOTS_PER_CLIENT],
+    header: *const Header,
+    client_id: ClientId,
+    ring_depth: u32,
+    ring_mask: u64,
+    req_slot_size: usize,
+    resp_slot_size: usize,
+    // Cached pointers
+    req_ring_base: *mut u8,
+    resp_ring_base: *mut u8,
+    control_ptr: *const AtomicBool,
+    extra_ptr: *mut u8,
+    extra_buffer_size: u32,
+    req_data_offset: usize,
+    resp_data_offset: usize,
+    // Ring state
+    req_head: u64,
+    resp_tail: u64,
+    in_flight: u32,
     on_response: F,
-    _marker: PhantomData<(Req, Resp)>,
+    user_data_slab: slab::Slab<U>,
+    _phantom: PhantomData<(Req, Resp)>,
 }
 
 unsafe impl<Req: Serial + Send, Resp: Serial + Send, U: Send, F: FnMut(U, Resp) + Send> Send
@@ -551,270 +605,273 @@ unsafe impl<Req: Serial + Send, Resp: Serial + Send, U: Send, F: FnMut(U, Resp) 
 }
 
 impl<Req: Serial, Resp: Serial, U, F: FnMut(U, Resp)> Client<Req, Resp, U, F> {
-    /// Connects to an existing shared memory region.
-    ///
-    /// `on_response` is called for each completed async request during [`poll()`](Self::poll).
+    /// Connect to an existing shared memory RPC server.
     ///
     /// # Safety
-    /// The caller must ensure that a server has created the shared memory
-    /// with the same types `Req` and `Resp`.
+    /// Server must have been created with matching `Req`/`Resp` types.
     pub unsafe fn connect<P: AsRef<Path>>(
         path: P,
         on_response: F,
     ) -> Result<Self, ConnectError> {
-        // First open with just the header to validate
-        let header_shm = unsafe { SharedMemory::open(&path, HEADER_SIZE)? };
-        let header = header_shm.as_ptr() as *const Header;
+        let header_shm =
+            unsafe { SharedMemory::open(&path, HEADER_SIZE).map_err(ConnectError::Io)? };
+        let header_ptr = header_shm.as_ptr() as *const Header;
 
-        let (max_clients, slots_per_client, shm_size) = unsafe {
-            if (*header).magic != MAGIC {
+        let (max_clients, ring_depth, extra_buf_size) = unsafe {
+            if (*header_ptr).magic != MAGIC {
                 return Err(ConnectError::LayoutMismatch);
             }
-            if (*header).version != VERSION {
+            if (*header_ptr).version != VERSION {
                 return Err(ConnectError::LayoutMismatch);
             }
-            if (*header).req_size != std::mem::size_of::<Req>() as u32
-                || (*header).resp_size != std::mem::size_of::<Resp>() as u32
-                || (*header).req_align != std::mem::align_of::<Req>() as u32
-                || (*header).resp_align != std::mem::align_of::<Resp>() as u32
+            if !(*header_ptr).server_alive.load(Ordering::Acquire) {
+                return Err(ConnectError::ServerNotAlive);
+            }
+            if (*header_ptr).req_size != std::mem::size_of::<Req>() as u32
+                || (*header_ptr).resp_size != std::mem::size_of::<Resp>() as u32
+                || (*header_ptr).req_align != std::mem::align_of::<Req>() as u32
+                || (*header_ptr).resp_align != std::mem::align_of::<Resp>() as u32
             {
                 return Err(ConnectError::LayoutMismatch);
             }
-            if !(*header).server_alive.load(Ordering::Acquire) {
-                return Err(ConnectError::ServerNotAlive);
-            }
-            let mc = (*header).max_clients;
-            let spc = (*header).slots_per_client;
-            (mc, spc, calc_shm_size::<Req, Resp>(mc, spc))
+            (
+                (*header_ptr).max_clients,
+                (*header_ptr).ring_depth,
+                (*header_ptr).extra_buffer_size,
+            )
         };
 
         drop(header_shm);
 
-        // Re-open with full size
-        let shm = unsafe { SharedMemory::open(path, shm_size)? };
-        let base = shm.as_ptr();
-        let header = base as *mut Header;
+        let size = total_shm_size::<Req, Resp>(max_clients, ring_depth, extra_buf_size);
+        let shm = unsafe { SharedMemory::open(path, size).map_err(ConnectError::Io)? };
+        let header = shm.as_ptr() as *const Header;
 
-        // Allocate a client slot group
-        let client_id = unsafe { (*header).next_client_id.fetch_add(1, Ordering::Relaxed) };
-        if client_id >= max_clients {
-            return Err(ConnectError::ServerFull);
-        }
-
-        let layout = calc_slot_layout::<Req, Resp>();
-
-        // Mark first slot as alive (used for liveness detection)
-        let first_slot = client_id * slots_per_client;
         unsafe {
-            let slot_ptr = base.add(HEADER_SIZE + layout.slot_size * first_slot as usize);
-            let alive = &*(slot_ptr.add(layout.alive_offset) as *const AtomicBool);
-            alive.store(true, Ordering::Release);
+            let client_idx = (*header).next_client_id.fetch_add(1, Ordering::Relaxed);
+            if client_idx >= max_clients {
+                return Err(ConnectError::ServerFull);
+            }
+
+            let req_slot_size = calc_req_slot_size::<Req>();
+            let resp_slot_size = calc_resp_slot_size::<Resp>();
+            let block_size = per_client_block_size::<Req, Resp>(ring_depth, extra_buf_size);
+            let block_base = shm.as_ptr().add(HEADER_SIZE + client_idx as usize * block_size);
+            let control_ptr = block_base as *const AtomicBool;
+            (&*control_ptr).store(true, Ordering::Release);
+
+            let req_ring_base = block_base.add(CACHE_LINE_SIZE);
+            let resp_ring_base =
+                block_base.add(CACHE_LINE_SIZE + ring_depth as usize * req_slot_size);
+            let extra_offset = CACHE_LINE_SIZE
+                + req_slot_size * ring_depth as usize
+                + resp_slot_size * ring_depth as usize;
+            let extra_ptr = block_base.add(extra_offset);
+
+            let req_data_offset = align_up(8, std::mem::align_of::<Req>().max(8));
+            let resp_data_offset = align_up(8, std::mem::align_of::<Resp>().max(8));
+
+            Ok(Self {
+                _shm: shm,
+                header,
+                client_id: ClientId(client_idx),
+                ring_depth,
+                ring_mask: (ring_depth - 1) as u64,
+                req_slot_size,
+                resp_slot_size,
+                req_ring_base,
+                resp_ring_base,
+                control_ptr,
+                extra_ptr,
+                extra_buffer_size: extra_buf_size,
+                req_data_offset,
+                resp_data_offset,
+                req_head: 0,
+                resp_tail: 0,
+                in_flight: 0,
+                on_response,
+                user_data_slab: slab::Slab::with_capacity(ring_depth as usize),
+                _phantom: PhantomData,
+            })
         }
-
-        let free_bitmap = (1u32 << slots_per_client) - 1;
-
-        Ok(Self {
-            _shm: shm,
-            header,
-            base,
-            layout,
-            client_id,
-            slots_per_client,
-            base_slot: client_id * slots_per_client,
-            client_seqs: [0u8; MAX_SLOTS_PER_CLIENT],
-            free_bitmap,
-            pending_queue: [0u32; MAX_SLOTS_PER_CLIENT],
-            pq_head: 0,
-            pq_count: 0,
-            user_data: std::array::from_fn(|_| None),
-            on_response,
-            _marker: PhantomData,
-        })
     }
 
-    #[inline(always)]
-    fn slot_base(&self, flat_idx: u32) -> *mut u8 {
-        unsafe {
-            self.base
-                .add(HEADER_SIZE + self.layout.slot_size * flat_idx as usize)
-        }
-    }
-
-    #[inline(always)]
-    fn slot_client_seq(&self, flat_idx: u32) -> &AtomicU8 {
-        unsafe {
-            &*(self.slot_base(flat_idx).add(self.layout.client_seq_offset) as *const AtomicU8)
-        }
-    }
-
-    #[inline(always)]
-    fn slot_server_seq(&self, flat_idx: u32) -> &AtomicU8 {
-        unsafe {
-            &*(self.slot_base(flat_idx).add(self.layout.server_seq_offset) as *const AtomicU8)
-        }
-    }
-
-    #[inline(always)]
-    fn slot_req_ptr(&self, flat_idx: u32) -> *mut Req {
-        unsafe { self.slot_base(flat_idx).add(self.layout.req_offset) as *mut Req }
-    }
-
-    #[inline(always)]
-    fn slot_resp_ptr(&self, flat_idx: u32) -> *const Resp {
-        unsafe { self.slot_base(flat_idx).add(self.layout.resp_offset) as *const Resp }
-    }
-
-    /// Writes a request to the given slot and updates the client sequence number.
-    #[inline(always)]
-    fn write_slot(&mut self, slot_idx: u32, req: Req) -> u8 {
-        let fi = self.base_slot + slot_idx;
-        unsafe { std::ptr::write_volatile(self.slot_req_ptr(fi), req) };
-        let new_seq = unsafe {
-            let seq = self.client_seqs.get_unchecked_mut(slot_idx as usize);
-            *seq = seq.wrapping_add(1);
-            *seq
-        };
-        self.slot_client_seq(fi).store(new_seq, Ordering::Release);
-        new_seq
-    }
-
-    /// Allocates a slot, writes the request, stores user data, and pushes to FIFO.
-    #[inline(always)]
-    fn send_internal(&mut self, req: Req, user_data: U) -> u32 {
-        let slot_idx = self.free_bitmap.trailing_zeros();
-        self.free_bitmap &= !(1 << slot_idx);
-        self.write_slot(slot_idx, req);
-        self.user_data[slot_idx as usize] = Some(user_data);
-
-        // Push to FIFO pending queue
-        let tail = (self.pq_head + self.pq_count) % MAX_SLOTS_PER_CLIENT as u32;
-        self.pending_queue[tail as usize] = slot_idx;
-        self.pq_count += 1;
-
-        slot_idx
-    }
-
-    /// Sends a request asynchronously with associated user data.
-    ///
-    /// If all slots are occupied, internally calls [`poll()`](Self::poll) to drain
-    /// completions until a slot becomes available.
-    #[inline]
+    /// Send a request with associated user data.
     pub fn call(&mut self, req: Req, user_data: U) -> Result<(), CallError> {
-        while self.free_bitmap == 0 {
-            self.poll()?;
+        if !self.is_server_alive() {
+            return Err(CallError::ServerDisconnected);
+        }
+
+        while self.in_flight >= self.ring_depth {
+            if self.poll()? == 0 {
+                std::hint::spin_loop();
+            }
+        }
+
+        let slot_idx = (self.req_head & self.ring_mask) as usize;
+        let slot_ptr = unsafe { self.req_ring_base.add(slot_idx * self.req_slot_size) };
+
+        loop {
+            let valid = unsafe { read_volatile(slot_ptr as *const u8) };
+            if valid == 0 {
+                break;
+            }
             std::hint::spin_loop();
         }
-        self.send_internal(req, user_data);
+
+        let key = self.user_data_slab.insert(user_data);
+        unsafe { write_volatile(slot_ptr.add(SLAB_KEY_OFFSET) as *mut u32, key as u32) };
+
+        let req_ptr = unsafe { slot_ptr.add(self.req_data_offset) as *mut Req };
+        unsafe { write_volatile(req_ptr, req) };
+
+        compiler_fence(Ordering::Release);
+        unsafe { write_volatile(slot_ptr, 1) };
+
+        self.req_head += 1;
+        self.in_flight += 1;
+
         Ok(())
     }
 
-    /// Scans in-flight slots in FIFO order, invoking `on_response` for each completion.
-    ///
-    /// Checks the oldest pending slot first; stops at the first non-completed slot.
-    #[inline]
+    /// Poll for responses and invoke callbacks. Returns count processed.
     pub fn poll(&mut self) -> Result<u32, CallError> {
-        if self.pq_count == 0 {
-            return Ok(0);
-        }
+        let mut count = 0;
 
-        let mut completed = 0u32;
+        while self.in_flight > 0 {
+            let slot_idx = (self.resp_tail & self.ring_mask) as usize;
+            let slot_ptr = unsafe { self.resp_ring_base.add(slot_idx * self.resp_slot_size) };
 
-        while self.pq_count > 0 {
-            let slot_idx = self.pending_queue[self.pq_head as usize];
-            let fi = self.base_slot + slot_idx;
-            let expected_seq = unsafe { *self.client_seqs.get_unchecked(slot_idx as usize) };
-
-            if self.slot_server_seq(fi).load(Ordering::Acquire) != expected_seq {
+            let valid = unsafe { read_volatile(slot_ptr as *const u8) };
+            if valid == 0 {
                 break;
             }
 
-            let resp = unsafe { std::ptr::read_volatile(self.slot_resp_ptr(fi)) };
-            let ud = self.user_data[slot_idx as usize]
-                .take()
-                .expect("user_data missing for completed slot");
-            self.free_bitmap |= 1 << slot_idx;
-            self.pq_head = (self.pq_head + 1) % MAX_SLOTS_PER_CLIENT as u32;
-            self.pq_count -= 1;
-            (self.on_response)(ud, resp);
-            completed += 1;
+            compiler_fence(Ordering::Acquire);
+
+            let slab_key =
+                unsafe { read_volatile(slot_ptr.add(SLAB_KEY_OFFSET) as *const u32) };
+            let resp_ptr = unsafe { slot_ptr.add(self.resp_data_offset) as *const Resp };
+            let resp = unsafe { read_volatile(resp_ptr) };
+
+            compiler_fence(Ordering::Release);
+            unsafe { write_volatile(slot_ptr, 0) };
+
+            self.resp_tail += 1;
+            self.in_flight -= 1;
+
+            let user_data = self.user_data_slab.remove(slab_key as usize);
+            (self.on_response)(user_data, resp);
+
+            count += 1;
         }
 
-        if completed == 0 && self.pq_count > 0 && !self.is_server_alive() {
+        if count == 0 && self.in_flight > 0 && !self.is_server_alive() {
             return Err(CallError::ServerDisconnected);
         }
-        Ok(completed)
+
+        Ok(count)
     }
 
-    /// Returns the number of in-flight async requests (excludes blocking calls).
-    #[inline]
     pub fn pending_count(&self) -> u32 {
-        self.pq_count
+        self.in_flight
     }
 
-    /// Returns the number of slots available per client.
-    #[inline]
-    pub fn slots_per_client(&self) -> u32 {
-        self.slots_per_client
-    }
-
-    /// Returns the client's slot ID.
-    #[inline]
     pub fn id(&self) -> ClientId {
-        ClientId(self.client_id)
+        self.client_id
     }
 
-    /// Returns true if the server is still alive.
-    #[inline]
     pub fn is_server_alive(&self) -> bool {
         unsafe { (*self.header).server_alive.load(Ordering::Acquire) }
     }
-}
 
-/// Type alias for synchronous-only clients (no async callback).
-pub type SyncClient<Req, Resp> = Client<Req, Resp, (), fn((), Resp)>;
-
-/// Synchronous convenience methods.
-impl<Req: Serial, Resp: Serial> SyncClient<Req, Resp> {
-    /// Connects with a no-op callback for synchronous-only usage.
-    ///
-    /// Use [`call_blocking()`](Self::call_blocking) for RPC calls.
-    ///
-    /// # Safety
-    /// Same requirements as [`connect()`](Client::connect).
-    pub unsafe fn connect_sync<P: AsRef<Path>>(path: P) -> Result<Self, ConnectError> {
-        fn noop<R>(_: (), _: R) {}
-        unsafe { Self::connect(path, noop::<Resp>) }
+    pub fn extra_buffer(&self) -> *mut u8 {
+        self.extra_ptr
     }
 
-    /// Synchronous blocking RPC call.
-    ///
-    /// Bypasses the FIFO pending queue entirely, spinning directly on the
-    /// assigned slot for minimal overhead. If async calls are in flight,
-    /// their callbacks are drained via `poll()` while waiting.
-    #[inline]
-    pub fn call_blocking(&mut self, req: Req) -> Result<Resp, CallError> {
-        while self.free_bitmap == 0 {
-            self.poll()?;
-            std::hint::spin_loop();
-        }
-        // Allocate slot directly (not via send_internal — no pending_queue push)
-        let slot_idx = self.free_bitmap.trailing_zeros();
-        self.free_bitmap &= !(1 << slot_idx);
-        let new_seq = self.write_slot(slot_idx, req);
+    pub fn extra_buffer_size(&self) -> u32 {
+        self.extra_buffer_size
+    }
+}
 
-        let fi = self.base_slot + slot_idx;
-        let has_async = self.pq_count > 0;
+impl<Req: Serial, Resp: Serial, U, F: FnMut(U, Resp)> Drop for Client<Req, Resp, U, F> {
+    fn drop(&mut self) {
+        let alive = unsafe { &*self.control_ptr };
+        alive.store(false, Ordering::Release);
+    }
+}
+
+// === SyncClient ===
+
+pub type SyncClient<Req, Resp> = Client<Req, Resp, (), fn((), Resp)>;
+
+impl<Req: Serial, Resp: Serial> SyncClient<Req, Resp> {
+    /// Connect for synchronous-only usage.
+    ///
+    /// # Safety
+    /// Same as [`Client::connect`].
+    pub unsafe fn connect_sync<P: AsRef<Path>>(path: P) -> Result<Self, ConnectError> {
+        unsafe { Self::connect(path, |_, _| {}) }
+    }
+
+    /// Blocking RPC call. Must not be mixed with async `call()` on the same client.
+    pub fn call_blocking(&mut self, req: Req) -> Result<Resp, CallError> {
+        if !self.is_server_alive() {
+            return Err(CallError::ServerDisconnected);
+        }
+
+        while self.in_flight >= self.ring_depth {
+            if self.poll()? == 0 {
+                std::hint::spin_loop();
+            }
+        }
+
+        let slot_idx = (self.req_head & self.ring_mask) as usize;
+        let slot_ptr = unsafe { self.req_ring_base.add(slot_idx * self.req_slot_size) };
 
         loop {
-            if self.slot_server_seq(fi).load(Ordering::Acquire) == new_seq {
-                let resp = unsafe { std::ptr::read_volatile(self.slot_resp_ptr(fi)) };
-                self.free_bitmap |= 1 << slot_idx;
+            let valid = unsafe { read_volatile(slot_ptr as *const u8) };
+            if valid == 0 {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+
+        // slab_key = 0 for blocking calls (not tracked in slab)
+        unsafe { write_volatile(slot_ptr.add(SLAB_KEY_OFFSET) as *mut u32, 0) };
+
+        let req_ptr = unsafe { slot_ptr.add(self.req_data_offset) as *mut Req };
+        unsafe { write_volatile(req_ptr, req) };
+
+        compiler_fence(Ordering::Release);
+        unsafe { write_volatile(slot_ptr, 1) };
+
+        self.req_head += 1;
+        self.in_flight += 1;
+
+        loop {
+            let resp_slot_idx = (self.resp_tail & self.ring_mask) as usize;
+            let resp_slot_ptr =
+                unsafe { self.resp_ring_base.add(resp_slot_idx * self.resp_slot_size) };
+
+            let valid = unsafe { read_volatile(resp_slot_ptr as *const u8) };
+            if valid != 0 {
+                compiler_fence(Ordering::Acquire);
+
+                let resp_ptr =
+                    unsafe { resp_slot_ptr.add(self.resp_data_offset) as *const Resp };
+                let resp = unsafe { read_volatile(resp_ptr) };
+
+                compiler_fence(Ordering::Release);
+                unsafe { write_volatile(resp_slot_ptr, 0) };
+
+                self.resp_tail += 1;
+                self.in_flight -= 1;
+
                 return Ok(resp);
             }
-            if has_async {
-                self.poll()?;
-            } else if !self.is_server_alive() {
-                self.free_bitmap |= 1 << slot_idx;
+
+            if !self.is_server_alive() {
                 return Err(CallError::ServerDisconnected);
             }
             std::hint::spin_loop();
@@ -822,31 +879,53 @@ impl<Req: Serial, Resp: Serial> SyncClient<Req, Resp> {
     }
 }
 
-impl<Req: Serial, Resp: Serial, U, F: FnMut(U, Resp)> Drop for Client<Req, Resp, U, F> {
-    fn drop(&mut self) {
-        unsafe {
-            let alive = &*(self.slot_base(self.base_slot).add(self.layout.alive_offset)
-                as *const AtomicBool);
-            alive.store(false, Ordering::Release);
-        }
-    }
-}
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn test_path() -> String {
+        format!(
+            "/shm_ipc_test_{}_{}",
+            std::process::id(),
+            TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
 
     #[test]
     fn test_basic_rpc() {
-        let name = format!("/shm_rpc_basic_{}", std::process::id());
-
+        let path = test_path();
         unsafe {
-            let server = Server::<u64, u64>::create(&name, 4, 1).unwrap();
+            let server = Server::<u64, u64>::create(&path, 4, 8, 0).unwrap();
+            let mut client = SyncClient::<u64, u64>::connect_sync(&path).unwrap();
 
-            let name_clone = name.clone();
-            let client_thread = std::thread::spawn(move || {
+            client.call(42, ()).unwrap();
+            assert_eq!(server.poll(), 1);
+            let handle = server.recv().unwrap();
+            assert_eq!(*handle.data(), 42);
+            handle.reply(84);
+
+            while client.pending_count() > 0 {
+                client.poll().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_blocking_rpc() {
+        let path = test_path();
+        unsafe {
+            let server = Server::<u64, u64>::create(&path, 4, 8, 0).unwrap();
+            let path2 = path.clone();
+            let t = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(10));
-                let mut client = SyncClient::<u64, u64>::connect_sync(&name_clone).unwrap();
+                let mut client = SyncClient::<u64, u64>::connect_sync(&path2).unwrap();
                 let resp = client.call_blocking(42).unwrap();
                 assert_eq!(resp, 43);
             });
@@ -860,37 +939,33 @@ mod tests {
                 }
                 std::hint::spin_loop();
             }
-
-            client_thread.join().unwrap();
+            t.join().unwrap();
         }
     }
 
     #[test]
     fn test_disconnect_detection() {
-        let name = format!("/shm_rpc_disc_{}", std::process::id());
-
+        let path = test_path();
         unsafe {
-            let server = Server::<u64, u64>::create(&name, 4, 1).unwrap();
+            let server = Server::<u64, u64>::create(&path, 4, 8, 0).unwrap();
+            let client = SyncClient::<u64, u64>::connect_sync(&path).unwrap();
 
-            let name_clone = name.clone();
-            {
-                let client = SyncClient::<u64, u64>::connect_sync(&name_clone).unwrap();
-                assert!(server.is_client_connected(client.id()));
-                let cid = client.id();
-                drop(client);
-                assert!(!server.is_client_connected(cid));
-            }
+            assert!(client.is_server_alive());
+            assert_eq!(server.connected_clients(), 1);
+
+            let cid = client.id();
+            assert!(server.is_client_connected(cid));
+            drop(client);
+            assert!(!server.is_client_connected(cid));
         }
     }
 
     #[test]
     fn test_server_disconnect() {
-        let name = format!("/shm_rpc_sdisc_{}", std::process::id());
-
+        let path = test_path();
         unsafe {
-            let server = Server::<u64, u64>::create(&name, 4, 1).unwrap();
-            let name_clone = name.clone();
-            let client = SyncClient::<u64, u64>::connect_sync(&name_clone).unwrap();
+            let server = Server::<u64, u64>::create(&path, 4, 8, 0).unwrap();
+            let client = SyncClient::<u64, u64>::connect_sync(&path).unwrap();
             assert!(client.is_server_alive());
             drop(server);
             assert!(!client.is_server_alive());
@@ -899,77 +974,34 @@ mod tests {
 
     #[test]
     fn test_multiple_calls() {
-        let name = format!("/shm_rpc_multi_{}", std::process::id());
-
+        let path = test_path();
         unsafe {
-            let server = Server::<u64, u64>::create(&name, 4, 1).unwrap();
+            let server = Server::<u64, u64>::create(&path, 4, 16, 0).unwrap();
+            let mut client = SyncClient::<u64, u64>::connect_sync(&path).unwrap();
 
-            let name_clone = name.clone();
-            let client_thread = std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                let mut client = SyncClient::<u64, u64>::connect_sync(&name_clone).unwrap();
-                for i in 0..100u64 {
-                    let resp = client.call_blocking(i).unwrap();
-                    assert_eq!(resp, i * 2);
-                }
-            });
-
-            let mut served = 0;
-            while served < 100 {
-                server.poll();
-                while let Some(handle) = server.recv() {
-                    let req = *handle.data();
-                    handle.reply(req * 2);
-                    served += 1;
-                }
-                std::hint::spin_loop();
-            }
-
-            client_thread.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn test_different_req_resp_types() {
-        let name = format!("/shm_rpc_types_{}", std::process::id());
-
-        unsafe {
-            let server = Server::<u32, u64>::create(&name, 4, 1).unwrap();
-
-            let name_clone = name.clone();
-            let client_thread = std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                let mut client = SyncClient::<u32, u64>::connect_sync(&name_clone).unwrap();
-                let resp = client.call_blocking(10u32).unwrap();
-                assert_eq!(resp, 100u64);
-            });
-
-            loop {
+            for i in 0..100 {
+                client.call(i, ()).unwrap();
                 server.poll();
                 if let Some(handle) = server.recv() {
                     let req = *handle.data();
-                    handle.reply(req as u64 * 10);
-                    break;
+                    handle.reply(req * 2);
                 }
-                std::hint::spin_loop();
+                while client.pending_count() > 0 {
+                    client.poll().unwrap();
+                }
             }
-
-            client_thread.join().unwrap();
         }
     }
 
     #[test]
     fn test_deferred_response() {
-        let name = format!("/shm_rpc_defer_{}", std::process::id());
-
+        let path = test_path();
         unsafe {
-            let server = Server::<u64, u64>::create(&name, 4, 4).unwrap();
-
-            let name_clone = name.clone();
-            let client_thread = std::thread::spawn(move || {
+            let server = Server::<u64, u64>::create(&path, 4, 8, 0).unwrap();
+            let path2 = path.clone();
+            let t = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(10));
-                let mut client = SyncClient::<u64, u64>::connect_sync(&name_clone).unwrap();
-
+                let mut client = SyncClient::<u64, u64>::connect_sync(&path2).unwrap();
                 let mut results = Vec::new();
                 for i in 0..4u64 {
                     results.push(client.call_blocking(i).unwrap());
@@ -998,63 +1030,173 @@ mod tests {
                 std::hint::spin_loop();
             }
 
-            let results = client_thread.join().unwrap();
-            assert_eq!(results.len(), 4);
-            // call_blocking is serial: 0 (even→*100), 1 (odd→*10), 2 (even→*100), 3 (odd→*10)
-            assert_eq!(results[0], 0);   // 0 * 100
-            assert_eq!(results[1], 10);  // 1 * 10
-            assert_eq!(results[2], 200); // 2 * 100
-            assert_eq!(results[3], 30);  // 3 * 10
+            let results = t.join().unwrap();
+            assert_eq!(results, vec![0, 10, 200, 30]);
         }
     }
 
     #[test]
     fn test_async_pipeline() {
-        let name = format!("/shm_rpc_pipe_{}", std::process::id());
+        use std::cell::RefCell;
+        use std::rc::Rc;
 
+        let path = test_path();
         unsafe {
-            let server = Server::<u64, u64>::create(&name, 4, 4).unwrap();
+            let server = Server::<u64, u64>::create(&path, 4, 16, 0).unwrap();
 
-            let name_clone = name.clone();
-            let client_thread = std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(10));
+            let responses = Rc::new(RefCell::new(Vec::new()));
+            let responses_clone = responses.clone();
 
-                let count = std::cell::Cell::new(0u64);
-                let mut client =
-                    Client::<u64, u64, (), _>::connect(&name_clone, |(), _resp| {
-                        count.set(count.get() + 1);
-                    })
-                    .unwrap();
+            let mut client: Client<u64, u64, u64, _> =
+                Client::connect(&path, move |id: u64, resp| {
+                    responses_clone.borrow_mut().push((id, resp));
+                })
+                .unwrap();
 
-                // Fill pipeline
-                for i in 0..4u64 {
-                    client.call(i, ()).unwrap();
-                }
-                // Steady state: call() will poll internally when full
-                for i in 4..100u64 {
-                    client.call(i, ()).unwrap();
-                }
-                // Drain
-                while client.pending_count() > 0 {
-                    client.poll().unwrap();
-                    std::hint::spin_loop();
-                }
+            for i in 0..10 {
+                client.call(i, i).unwrap();
+            }
 
-                assert_eq!(count.get(), 100);
-            });
-
-            let mut served = 0u32;
-            while served < 100 {
+            while responses.borrow().len() < 10 {
                 server.poll();
                 while let Some(handle) = server.recv() {
                     let req = *handle.data();
-                    handle.reply(req + 1);
-                    served += 1;
+                    handle.reply(req * 2);
                 }
-                std::hint::spin_loop();
+                client.poll().unwrap();
             }
 
-            client_thread.join().unwrap();
+            let mut r = responses.borrow().clone();
+            r.sort_by_key(|(id, _)| *id);
+            for (i, (id, resp)) in r.iter().enumerate() {
+                assert_eq!(*id, i as u64);
+                assert_eq!(*resp, (i as u64) * 2);
+            }
+        }
+    }
+
+    #[test]
+    fn test_slab_ooo_response() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let path = test_path();
+        unsafe {
+            let server = Server::<u64, u64>::create(&path, 4, 8, 0).unwrap();
+
+            let responses = Rc::new(RefCell::new(Vec::new()));
+            let responses_clone = responses.clone();
+
+            let mut client: Client<u64, u64, u64, _> =
+                Client::connect(&path, move |ud: u64, resp| {
+                    responses_clone.borrow_mut().push((ud, resp));
+                })
+                .unwrap();
+
+            // Send 4 requests with user_data 100, 200, 300, 400
+            client.call(10, 100).unwrap();
+            client.call(20, 200).unwrap();
+            client.call(30, 300).unwrap();
+            client.call(40, 400).unwrap();
+
+            // Server receives all 4 and defers them
+            server.poll();
+            let mut tokens = Vec::new();
+            let mut reqs = Vec::new();
+            while let Some(handle) = server.recv() {
+                let req = *handle.data();
+                reqs.push(req);
+                tokens.push(handle.into_token());
+            }
+            assert_eq!(reqs, vec![10, 20, 30, 40]);
+
+            // Reply in REVERSE order
+            for (token, req) in tokens.into_iter().zip(reqs.iter()).rev() {
+                server.reply(token, *req * 2);
+            }
+
+            while client.pending_count() > 0 {
+                client.poll().unwrap();
+            }
+
+            let r = responses.borrow();
+            assert_eq!(r.len(), 4);
+            // Verify correct user_data ↔ response pairing
+            for &(ud, resp) in r.iter() {
+                match ud {
+                    100 => assert_eq!(resp, 20),
+                    200 => assert_eq!(resp, 40),
+                    300 => assert_eq!(resp, 60),
+                    400 => assert_eq!(resp, 80),
+                    _ => panic!("unexpected user_data {}", ud),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_multi_client() {
+        let path = test_path();
+        unsafe {
+            let server = Server::<u64, u64>::create(&path, 4, 16, 0).unwrap();
+
+            let mut clients: Vec<SyncClient<u64, u64>> = vec![
+                SyncClient::connect_sync(&path).unwrap(),
+                SyncClient::connect_sync(&path).unwrap(),
+                SyncClient::connect_sync(&path).unwrap(),
+            ];
+
+            assert_eq!(server.connected_clients(), 3);
+
+            for (i, client) in clients.iter_mut().enumerate() {
+                client.call(i as u64 * 100, ()).unwrap();
+            }
+
+            let mut count = 0;
+            while count < 3 {
+                count += server.poll();
+                while let Some(handle) = server.recv() {
+                    let req = *handle.data();
+                    handle.reply(req + 1);
+                }
+            }
+
+            for client in clients.iter_mut() {
+                while client.pending_count() > 0 {
+                    client.poll().unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_extra_buffer() {
+        let path = test_path();
+        unsafe {
+            let server = Server::<u64, u64>::create(&path, 4, 8, 128).unwrap();
+            assert_eq!(server.extra_buffer_size(), 128);
+
+            let client = SyncClient::<u64, u64>::connect_sync(&path).unwrap();
+            assert_eq!(client.extra_buffer_size(), 128);
+
+            // Client writes to extra buffer
+            let client_buf = client.extra_buffer();
+            write_volatile(client_buf as *mut u64, 0xDEAD_BEEF);
+
+            // Server reads same region
+            let server_buf = server.client_extra_buffer(client.id()).unwrap();
+            let val = read_volatile(server_buf as *const u64);
+            assert_eq!(val, 0xDEAD_BEEF);
+        }
+    }
+
+    #[test]
+    fn test_no_extra_buffer() {
+        let path = test_path();
+        unsafe {
+            let server = Server::<u64, u64>::create(&path, 4, 8, 0).unwrap();
+            assert_eq!(server.extra_buffer_size(), 0);
+            assert!(server.client_extra_buffer(ClientId(0)).is_none());
         }
     }
 }

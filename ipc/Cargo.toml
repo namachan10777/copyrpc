@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 nix.workspace = true
 libc.workspace = true
+slab.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

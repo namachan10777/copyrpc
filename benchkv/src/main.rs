@@ -201,6 +201,7 @@ fn run_meta(
                         path,
                         max_clients_per_daemon,
                         queue_depth,
+                        0,
                     )
                 }
                 .expect("Failed to create ipc server"),
