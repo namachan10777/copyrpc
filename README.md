@@ -78,3 +78,36 @@ client.poll()?;                                     // 完了検出 → on_respo
 | クライアント user_data | `Slab<U>` | `[Option<U>; 32]` | `Slab<U>` |
 | レスポンスコールバック | `Fn(U, &[u8])` | `FnMut(U, Resp)` | `Fn(U, &[u8])` |
 | overwrite 防止 | slab + CQ | bitmap + toggle bit | slab + slot window |
+
+## inproc: MPSC/SPSC 研究カバレッジ（学術文献のみ）
+
+inproc クレートに含まれる MPSC/SPSC 実装と、対応する代表的な研究・論文の対応表。
+SPSC は call/response を双方向 SPSC 2 本で構成する前提の参照先も含む。
+※本節は学術文献に紐づくもののみ記載（学術出典が確認できない実装は除外）。
+
+### 実装済み（学術由来）
+
+| カテゴリ | 実装 | 参考 |
+|---|---|---|
+| SPSC | `FastForwardTransport` | [FastForward for efficient pipeline parallelism: a cache-optimized concurrent lock-free queue (PPoPP 2008)](https://dblp.org/rec/conf/ppopp/GiacomoniMV08) |
+| SPSC | `LamportTransport` | [Specifying Concurrent Program Modules (ACM TOPLAS 1983)](https://www.microsoft.com/en-us/research/publication/specifying-concurrent-program-modules/) |
+
+### 未実装（研究候補; call/response に有用）
+
+**MPSC**
+- [Jiffy: A Fast, Memory Efficient, Wait-Free Multi-Producers Single-Consumer Queue (DISC 2020)](https://drops.dagstuhl.de/opus/volltexte/2020/13128)
+- [A Scalable, Portable, and Memory-Efficient Lock-Free FIFO Queue (DISC 2019)](https://drops.dagstuhl.de/entities/document/10.4230/LIPIcs.DISC.2019.28) ※MPMC だが単一 consumer に限定すれば MPSC として利用可能（推論）
+
+**SPSC**
+- [Single-Producer/Single-Consumer Queues on Shared Cache Multi-Core Systems (2010)](https://arxiv.org/abs/1012.1824) ※uSPSC など
+- [Liberty Queues for EPIC Architectures (EPIC 2010)](https://liberty.cs.princeton.edu/Projects/AutoPar/)
+- [B-Queue: Efficient and Practical Queuing for Fast Core-to-Core Communication (Int. J. Parallel Program. 2013)](https://dblp.org/rec/journals/ijpp/WangZTH13)
+- [A lock-free, cache-efficient multi-core synchronization mechanism for line-rate network traffic monitoring (IPDPS 2010)](https://dblp.org/rec/conf/ipps/LeeBC10)
+- [A lock-free, cache-efficient shared ring buffer for multi-core architectures (ANCS 2009)](https://dblp.org/rec/conf/ancs/LeeBC09)
+
+### Intel TBB での実装可能性（比較）
+
+- `oneapi::tbb::concurrent_queue` は複数スレッドが同時に push/pop できる unbounded FIFO。`try_pop` による非ブロッキング取得が基本。 [oneTBB Concurrent Queue Classes](https://uxlfoundation.github.io/oneTBB/main/tbb_userguide/Concurrent_Queue_Classes.html)
+- `oneapi::tbb::concurrent_bounded_queue` は bounded FIFO で、capacity 設定と `push`/`pop` のブロッキング、`try_push` を提供。 [oneTBB Concurrent Queue Classes](https://uxlfoundation.github.io/oneTBB/main/tbb_userguide/Concurrent_Queue_Classes.html)
+- 両者とも MPMC 設計なので、スレッド数を制限すれば MPSC/SPSC としても利用可能（推論）。
+- call/response では「request 用 queue と response 用 queue をペアで持つ」構成が自然。MPSC サーバなら request は共有、response はクライアント別に分離する構成が可能（設計メモ）。
