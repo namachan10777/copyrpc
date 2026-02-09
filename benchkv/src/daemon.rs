@@ -29,6 +29,7 @@ pub struct EndpointConnectionInfo {
     pub consumer_addr: u64,
     pub consumer_rkey: u32,
     _padding3: u32,
+    pub initial_credit: u64,
 }
 
 pub const CONNECTION_INFO_SIZE: usize = std::mem::size_of::<EndpointConnectionInfo>();
@@ -96,18 +97,8 @@ fn handle_local(store: &mut ShardedStore, req: &Request) -> Response {
     }
 }
 
-fn reply_flux(flux: &mut DaemonFlux, to: usize, token: u64, payload: DelegatePayload) {
-    let mut p = payload;
-    loop {
-        match flux.reply(to, token, p) {
-            Ok(()) => break,
-            Err(inproc::SendError::Full(v)) => {
-                p = v;
-                flux.poll();
-            }
-            Err(_) => break,
-        }
-    }
+fn reply_flux(flux: &mut DaemonFlux, token: inproc::ReplyToken, payload: DelegatePayload) {
+    flux.reply(token, payload);
 }
 
 // === copyrpc setup ===
@@ -130,7 +121,7 @@ pub fn run_daemon(
     my_rank: u32,
     num_daemons: usize,
     key_range: u64,
-    server: ipc::Server<Request, Response>,
+    mut server: ipc::Server<Request, Response>,
     mut flux: DaemonFlux,
     copyrpc_setup: Option<CopyrpcSetup>,
     stop_flag: &AtomicBool,
@@ -181,6 +172,7 @@ pub fn run_daemon(
                 consumer_addr: info.consumer_addr,
                 consumer_rkey: info.consumer_rkey,
                 _padding3: 0,
+                initial_credit: info.initial_credit,
             });
             copyrpc_endpoints.push(ep);
         }
@@ -207,6 +199,7 @@ pub fn run_daemon(
                     recv_ring_size: r.recv_ring_size,
                     consumer_addr: r.consumer_addr,
                     consumer_rkey: r.consumer_rkey,
+                    initial_credit: r.initial_credit,
                 },
                 0,
                 ctx.port(),
@@ -269,12 +262,12 @@ pub fn run_daemon(
         flux.poll();
 
         // === Phase 3: Process Flux received requests (same-rank only) ===
-        while let Some((from, flux_token, payload)) = flux.try_recv_raw() {
+        while let Some((_from, flux_token, payload)) = flux.try_recv_raw() {
             match payload {
                 DelegatePayload::Req(req) => {
                     debug_assert_eq!(req.rank(), my_rank);
                     let resp = handle_local(&mut store, &req);
-                    reply_flux(&mut flux, from, flux_token, DelegatePayload::Resp(resp));
+                    reply_flux(&mut flux, flux_token, DelegatePayload::Resp(resp));
                 }
                 DelegatePayload::Resp(_) => {}
             }
@@ -288,7 +281,7 @@ pub fn run_daemon(
                 let ep_idx = daemon_ep_index(target_rank, target_daemon);
                 let mut pending = token;
                 loop {
-                    match copyrpc_endpoints[ep_idx].call(remote_req.as_bytes(), pending) {
+                    match copyrpc_endpoints[ep_idx].call(remote_req.as_bytes(), pending, 0u64) {
                         Ok(_) => break,
                         Err(copyrpc::error::CallError::RingFull(returned)) => {
                             pending = returned;

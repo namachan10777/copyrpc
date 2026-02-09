@@ -1641,6 +1641,7 @@ dependencies = [
  "mlx5_sys",
  "mpi",
  "parquet",
+ "ucx_sys",
 ]
 
 [[package]]

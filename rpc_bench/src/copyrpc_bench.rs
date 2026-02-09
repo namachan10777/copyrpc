@@ -29,6 +29,7 @@ struct EndpointConnectionInfo {
     consumer_addr: u64,
     consumer_rkey: u32,
     _padding3: u32,
+    initial_credit: u64,
 }
 
 const CONNECTION_INFO_SIZE: usize = std::mem::size_of::<EndpointConnectionInfo>();
@@ -178,6 +179,7 @@ fn run_one_to_one(
             consumer_addr: info.consumer_addr,
             consumer_rkey: info.consumer_rkey,
             _padding3: 0,
+            initial_credit: info.initial_credit,
         });
 
         endpoints.push(ep);
@@ -205,6 +207,7 @@ fn run_one_to_one(
             recv_ring_size: remote_ep.recv_ring_size,
             consumer_addr: remote_ep.consumer_addr,
             consumer_rkey: remote_ep.consumer_rkey,
+            initial_credit: remote_ep.initial_credit,
         };
         ep.connect(&remote, 0, ctx.port())
             .expect("Failed to connect endpoint");
@@ -341,6 +344,7 @@ fn run_one_to_one_threaded(
                     consumer_addr: info.consumer_addr,
                     consumer_rkey: info.consumer_rkey,
                     _padding3: 0,
+                    initial_credit: info.initial_credit,
                 });
                 endpoints.push(ep);
             }
@@ -363,6 +367,7 @@ fn run_one_to_one_threaded(
                     recv_ring_size: remote_ep.recv_ring_size,
                     consumer_addr: remote_ep.consumer_addr,
                     consumer_rkey: remote_ep.consumer_rkey,
+                    initial_credit: remote_ep.initial_credit,
                 };
                 ep.connect(&remote, 0, ctx.port())
                     .expect("Failed to connect endpoint");
@@ -545,7 +550,7 @@ fn run_client_duration_atomic<F: Fn((), &[u8])>(
     // Initial fill
     for ep in endpoints.iter() {
         for _ in 0..inflight_per_ep {
-            if ep.call(&request_data, ()).is_ok() {
+            if ep.call(&request_data, (), 0u64).is_ok() {
                 inflight += 1;
             }
         }
@@ -567,7 +572,7 @@ fn run_client_duration_atomic<F: Fn((), &[u8])>(
         while inflight < max_inflight {
             let ep = &endpoints[ep_idx % endpoints.len()];
             ep_idx += 1;
-            if ep.call(&request_data, ()).is_ok() {
+            if ep.call(&request_data, (), 0u64).is_ok() {
                 inflight += 1;
             } else {
                 ctx.poll();
@@ -655,7 +660,7 @@ fn run_client_duration<F: Fn((), &[u8])>(
     // Initial fill
     for ep in endpoints.iter() {
         for _ in 0..inflight_per_ep {
-            if ep.call(&request_data, ()).is_ok() {
+            if ep.call(&request_data, (), 0u64).is_ok() {
                 inflight += 1;
             }
         }
@@ -678,7 +683,7 @@ fn run_client_duration<F: Fn((), &[u8])>(
         while inflight < max_inflight {
             let ep = &endpoints[ep_idx % endpoints.len()];
             ep_idx += 1;
-            if ep.call(&request_data, ()).is_ok() {
+            if ep.call(&request_data, (), 0u64).is_ok() {
                 inflight += 1;
             } else {
                 ctx.poll();
@@ -806,6 +811,7 @@ fn run_multi_client(
                 consumer_addr: info.consumer_addr,
                 consumer_rkey: info.consumer_rkey,
                 _padding3: 0,
+                initial_credit: info.initial_credit,
             });
             endpoints.push(ep);
         }
@@ -826,6 +832,7 @@ fn run_multi_client(
                 recv_ring_size: remote_ep.recv_ring_size,
                 consumer_addr: remote_ep.consumer_addr,
                 consumer_rkey: remote_ep.consumer_rkey,
+                initial_credit: remote_ep.initial_credit,
             };
             endpoints[i]
                 .connect(&remote, 0, ctx.port())
@@ -891,6 +898,7 @@ fn run_multi_client(
             consumer_addr: info.consumer_addr,
             consumer_rkey: info.consumer_rkey,
             _padding3: 0,
+            initial_credit: info.initial_credit,
         };
 
         let local_bytes = local_info.to_bytes();
@@ -905,6 +913,7 @@ fn run_multi_client(
             recv_ring_size: remote_ep.recv_ring_size,
             consumer_addr: remote_ep.consumer_addr,
             consumer_rkey: remote_ep.consumer_rkey,
+            initial_credit: remote_ep.initial_credit,
         };
 
         let mut ep = ep;

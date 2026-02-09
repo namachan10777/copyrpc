@@ -2,7 +2,7 @@ mod affinity;
 mod copyrpc_bench;
 mod epoch;
 mod erpc_bench;
-mod mercury_bench;
+
 mod mpi_util;
 mod parquet_out;
 mod rc_send_recv_bench;
@@ -104,15 +104,6 @@ enum SystemCmd {
         #[command(subcommand)]
         mode: ModeCmd,
     },
-    /// Mercury RPC benchmark
-    Mercury {
-        /// Transport string (e.g. "ucx+all")
-        #[arg(long, default_value = "ucx+all")]
-        transport: String,
-
-        #[command(subcommand)]
-        mode: ModeCmd,
-    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -182,9 +173,6 @@ fn main() {
         SystemCmd::UcxAm { mode } => ucx_am_bench::run(&common, &world, &mode),
         SystemCmd::RcSend { num_slots, mode } => {
             rc_send_recv_bench::run(&common, &world, num_slots, &mode)
-        }
-        SystemCmd::Mercury { transport, mode } => {
-            mercury_bench::run(&common, &world, &transport, &mode)
         }
     };
 
