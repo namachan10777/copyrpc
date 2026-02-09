@@ -197,6 +197,18 @@
   file = {/Users/mnakano/Zotero/storage/RLZ4VYNP/Carns et al. - 2000 - PVFS A Parallel File System for Linux Clusters.pdf}
 }
 
+@inproceedings{chen2023RemoteProcedureCall,
+  title = {Remote {{Procedure Call}} as a {{Managed System Service}}},
+  booktitle = {20th {{USENIX Symposium}} on {{Networked Systems Design}} and {{Implementation}} ({{NSDI}} 23)},
+  author = {Chen, Jingrong and Wu, Yongji and Lin, Shihan and Xu, Yechen and Kong, Xinhao and Anderson, Thomas and Lentz, Matthew and Yang, Xiaowei and Zhuo, Danyang},
+  year = 2023,
+  pages = {141--159},
+  urldate = {2026-02-09},
+  isbn = {978-1-939133-33-5},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/JK8572LK/Chen et al. - 2023 - Remote Procedure Call as a Managed System Service.pdf}
+}
+
 @article{cheng3DCrosspointPhasechange2019,
   title = {{{3D}} Cross-Point Phase-Change Memory for Storage-Class Memory},
   author = {Cheng, Huai-Yu and Carta, Fabio and Chien, Wei-Chih and Lung, Hsiang-Lan and BrightSky, Matthew J},
@@ -231,6 +243,14 @@
   abstract = {Emerging high-performance computing (HPC) applications with diverse workload characteristics impose greater demands on parallel file systems (PFSs). PFSs also require more efficient software designs to fully utilize the performance of modern hardware, such as multi-core CPUs, Remote Direct Memory Access (RDMA), and NVMe SSDs. However, existing PFSs expose great limitations under these requirements due to limited multi-core scalability, unaware of HPC workloads, and disjointed network-storage optimizations. In this article, we present PeakFS, an ultra-high performance parallel file system via computing-network-storage co-optimization for HPC applications. PeakFS designs a shared-nothing scheduling system based on link-reduced task dispatching with lock-free queues to reduce concurrency overhead. Besides, PeakFS improves I/O performance with flexible distribution strategies, memory-efficient indexing, and metadata caching according to HPC I/O characteristics. Finally, PeakFS shortens the critical path of request processing through network-storage co-optimizations. Experimental results show that the metadata and data performance of PeakFS reaches more than 90\% of the hardware limits. For metadata throughput, PeakFS achieves a 3.5--19\texttimes{} improvement over GekkoFS and outperforms BeeGFS by three orders of magnitude.},
   keywords = {File systems,Hardware,high-performance computing,Message systems,Metadata,Optimization,Parallel file system,performance optimization,Program processors,Protocols,remote direct memory access,Scalability,Semantics,Servers},
   file = {/Users/mnakano/Zotero/storage/VHTMTWMX/Chen et al. - 2024 - PeakFS An Ultra-High Performance Parallel File Sy.pdf;/Users/mnakano/Zotero/storage/7QCS65RY/metrics.html}
+}
+
+@article{chenRemoteProcedureCall,
+  title = {Remote {{Procedure Call}} as a {{Managed System Service}}},
+  author = {Chen, Jingrong and Wu, Yongji and Lin, Shihan},
+  abstract = {Remote Procedure Call (RPC) is a widely used abstraction for cloud computing. The programmer specifies type information for each remote procedure, and a compiler generates stub code linked into each application to marshal and unmarshal arguments into message buffers. Increasingly, however, application and service operations teams need a high degree of visibility and control over the flow of RPCs between services, leading many installations to use sidecars or service mesh proxies for manageability and policy flexibility. These sidecars typically involve inspection and modification of RPC data that the stub compiler had just carefully assembled, adding needless overhead. Further, upgrading diverse application RPC stubs to use advanced hardware capabilities such as RDMA or DPDK is a long and involved process, and often incompatible with sidecar policy control.},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/S4JPFYR8/Chen et al. - Remote Procedure Call as a Managed System Service.pdf}
 }
 
 @inproceedings{chenScalableRDMARPC2019,
@@ -311,6 +331,21 @@
   abstract = {Extendible hashing is a new access technique, in which the user is guaranteed no more than two page faults to locate the data associated with a given unique identifier, or key. Unlike conventional hashing, extendible hashing has a dynamic structure that grows and shrinks gracefully as the database grows and shrinks. This approach simultaneously solves the problem of making hash tables that are extendible and of making radix search trees that are balanced. We study, by analysis and simulation, the performance of extendible hashing. The results indicate that extendible hashing provides an attractive alternative to other access methods, such as balanced trees.},
   langid = {english},
   file = {/Users/mnakano/Zotero/storage/RBWQF5AB/Fagin et al. - 1979 - Extendible hashing—a fast access method for dynami.pdf}
+}
+
+@inproceedings{fent2020LowLatencyCommunicationFast,
+  title = {Low-{{Latency Communication}} for {{Fast DBMS Using RDMA}} and {{Shared Memory}}},
+  booktitle = {2020 {{IEEE}} 36th {{International Conference}} on {{Data Engineering}} ({{ICDE}})},
+  author = {Fent, Philipp and van Renen, Alexander and Kipf, Andreas and Leis, Viktor and Neumann, Thomas and Kemper, Alfons},
+  year = 2020,
+  month = apr,
+  pages = {1477--1488},
+  issn = {2375-026X},
+  doi = {10.1109/ICDE48307.2020.00131},
+  urldate = {2026-02-09},
+  abstract = {While hardware and software improvements greatly accelerated modern database systems' internal operations, the decades-old stream-based Socket API for external communication is still unchanged. We show experimentally, that for modern high-performance systems networking has become a performance bottleneck. Therefore, we argue that the communication stack needs to be redesigned to fully exploit modern hardware - as has already happened to most other database system components.We propose L5, a high-performance communication layer for database systems. L5 rethinks the flow of data in and out of the database system and is based on direct memory access techniques for intra-datacenter (RDMA) and intra-machine communication (Shared Memory). With L5, we provide a building block to accelerate ODBC-like interfaces with a unified and message-based communication framework. Our results show that using interconnects like RDMA (InfiniBand), RoCE (Ethernet), and Shared Memory (IPC), L5 can largely eliminate the network bottleneck for database systems.},
+  keywords = {Database systems,Hardware,Message systems,Servers,Sockets,Throughput},
+  file = {/Users/mnakano/Zotero/storage/5ASQN7FN/Fent et al. - 2020 - Low-Latency Communication for Fast DBMS Using RDMA and Shared Memory.pdf;/Users/mnakano/Zotero/storage/KU4F7KHB/9101845.html}
 }
 
 @inproceedings{gaoShiftLockMitigateOnesided2025,
@@ -547,6 +582,23 @@
   file = {/Users/mnakano/Zotero/storage/F6GDAB9A/Jun et al. - 2024 - We Ain't Afraid of No File Fragmentation Causes a.pdf}
 }
 
+@inproceedings{kalia2014UsingRDMAEfficiently,
+  title = {Using {{RDMA}} Efficiently for Key-Value Services},
+  booktitle = {Proceedings of the 2014 {{ACM}} Conference on {{SIGCOMM}}},
+  author = {Kalia, Anuj and Kaminsky, Michael and Andersen, David G.},
+  year = 2014,
+  month = aug,
+  pages = {295--306},
+  publisher = {ACM},
+  address = {Chicago Illinois USA},
+  doi = {10.1145/2619239.2626299},
+  urldate = {2026-02-09},
+  abstract = {This paper describes the design and implementation of HERD, a key-value system designed to make the best use of an RDMA network. Unlike prior RDMA-based key-value systems, HERD focuses its design on reducing network round trips while using efficient RDMA primitives; the result is substantially lower latency, and throughput that saturates modern, commodity RDMA hardware.},
+  isbn = {978-1-4503-2836-4},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/A6FPHWI9/Kalia et al. - 2014 - Using RDMA efficiently for key-value services.pdf}
+}
+
 @inproceedings{kalia2016DesignGuidelinesHigh,
   title = {Design Guidelines for High Performance {{RDMA}} Systems},
   booktitle = {Proceedings of the 2016 {{USENIX Conference}} on {{Usenix Annual Technical Conference}}},
@@ -560,6 +612,29 @@
   urldate = {2026-02-09},
   abstract = {Modern RDMA hardware offers the potential for exceptional performance, but design choices including which RDMA operations to use and how to use them significantly affect observed performance. This paper lays out guidelines that can be used by system designers to navigate the RDMA design space. Our guidelines emphasize paying attention to low-level details such as individual PCIe transactions and NIC architecture. We empirically demonstrate how these guidelines can be used to improve the performance of RDMA-based systems: we design a networked sequencer that outperforms an existing design by 50x, and improve the CPU efficiency of a prior high-performance key-value store by 83\%. We also present and evaluate several new RDMA optimizations and pitfalls, and discuss how they affect the design of RDMA systems.},
   isbn = {978-1-931971-30-0}
+}
+
+@inproceedings{kalia2019DatacenterRPCsCan,
+  title = {Datacenter {{RPCs}} Can Be General and Fast},
+  booktitle = {Proceedings of the 16th {{USENIX Conference}} on {{Networked Systems Design}} and {{Implementation}}},
+  author = {Kalia, Anuj and Kaminsky, Michael and Andersen, David G.},
+  year = 2019,
+  month = feb,
+  series = {{{NSDI}}'19},
+  pages = {1--16},
+  publisher = {USENIX Association},
+  address = {USA},
+  urldate = {2026-02-09},
+  abstract = {It is commonly believed that datacenter networking software must sacrifice generality to attain high performance. The popularity of specialized distributed systems designed specifically for niche technologies such as RDMA, lossless networks, FPGAs, and programmable switches testifies to this belief. In this paper, we show that such specialization is not necessary. eRPC is a new general-purpose remote procedure call (RPC) library that offers performance comparable to specialized systems, while running on commodity CPUs in traditional datacenter networks based on either lossy Ethernet or lossless fabrics. eRPC performs well in three key metrics: message rate for small messages; bandwidth for large messages; and scalability to a large number of nodes and CPU cores. It handles packet loss, congestion, and background request execution. In microbenchmarks, one CPU core can handle up to 10 million small RPCs per second, or send large messages at 75 Gbps. We port a production-grade implementation of Raft state machine replication to eRPC without modifying the core Raft source code. We achieve 5.5 \textmu s of replication latency on lossy Ethernet, which is faster than or comparable to specialized replication systems that use programmable switches, FPGAs, or RDMA.},
+  isbn = {978-1-931971-49-2}
+}
+
+@article{kaliaDatacenterRPCsCan,
+  title = {Datacenter {{RPCs}} Can Be {{General}} and {{Fast}}},
+  author = {Kalia, Anuj and Andersen, David},
+  abstract = {It is commonly believed that datacenter networking software must sacrifice generality to attain high performance. The popularity of specialized distributed systems designed specifically for niche technologies such as RDMA, lossless networks, FPGAs, and programmable switches testifies to this belief. In this paper, we show that such specialization is not necessary. eRPC is a new general-purpose remote procedure call (RPC) library that offers performance comparable to specialized systems, while running on commodity CPUs in traditional datacenter networks based on either lossy Ethernet or lossless fabrics. eRPC performs well in three key metrics: message rate for small messages; bandwidth for large messages; and scalability to a large number of nodes and CPU cores. It handles packet loss, congestion, and background request execution. In microbenchmarks, one CPU core can handle up to 10 million small RPCs per second, or send large messages at 75 Gbps. We port a production-grade implementation of Raft state machine replication to eRPC without modifying the core Raft source code. We achieve 5.5 \textmu s of replication latency on lossy Ethernet, which is faster than or comparable to specialized replication systems that use programmable switches, FPGAs, or RDMA.},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/TYI5LIHJ/Kalia と Andersen - Datacenter RPCs can be General and Fast.pdf}
 }
 
 @inproceedings{kaliaDatacenterRPCsCan2019,
@@ -585,40 +660,6 @@
   isbn = {978-1-931971-33-1},
   langid = {english},
   file = {/Users/mnakano/Zotero/storage/T7VUSL92/Kalia et al. - 2016 - FaSST Fast, Scalable and Simple Distributed Transactions with Two-Sided ( RDMA ) Datagr.pdf}
-}
-
-@inproceedings{kaliaUsingRDMAEfficiently2014,
-  title = {Using {{RDMA}} Efficiently for Key-Value Services},
-  booktitle = {Proceedings of the 2014 {{ACM}} Conference on {{SIGCOMM}}},
-  author = {Kalia, Anuj and Kaminsky, Michael and Andersen, David G.},
-  year = 2014,
-  month = aug,
-  series = {{{SIGCOMM}} '14},
-  pages = {295--306},
-  publisher = {Association for Computing Machinery},
-  address = {New York, NY, USA},
-  doi = {10.1145/2619239.2626299},
-  urldate = {2025-06-30},
-  abstract = {This paper describes the design and implementation of HERD, a key-value system designed to make the best use of an RDMA network. Unlike prior RDMA-based key-value systems, HERD focuses its design on reducing network round trips while using efficient RDMA primitives; the result is substantially lower latency, and throughput that saturates modern, commodity RDMA hardware.HERD has two unconventional decisions: First, it does not use RDMA reads, despite the allure of operations that bypass the remote CPU entirely. Second, it uses a mix of RDMA and messaging verbs, despite the conventional wisdom that the messaging primitives are slow. A HERD client writes its request into the server's memory; the server computes the reply. This design uses a single round trip for all requests and supports up to 26 million key-value operations per second with 5{$\mu$}s average latency. Notably, for small key-value items, our full system throughput is similar to native RDMA read throughput and is over 2X higher than recent RDMA-based key-value systems. We believe that HERD further serves as an effective template for the construction of RDMA-based datacenter services.},
-  isbn = {978-1-4503-2836-4},
-  file = {/Users/mnakano/Zotero/storage/9RXTTRSF/Kalia et al. - 2014 - Using RDMA efficiently for key-value services.pdf}
-}
-
-@inproceedings{kaliaUsingRDMAEfficiently2014a,
-  title = {Using {{RDMA}} Efficiently for Key-Value Services},
-  booktitle = {Proceedings of the 2014 {{ACM}} Conference on {{SIGCOMM}}},
-  author = {Kalia, Anuj and Kaminsky, Michael and Andersen, David G.},
-  year = 2014,
-  month = aug,
-  series = {{{SIGCOMM}} '14},
-  pages = {295--306},
-  publisher = {Association for Computing Machinery},
-  address = {New York, NY, USA},
-  doi = {10.1145/2619239.2626299},
-  urldate = {2025-06-29},
-  abstract = {This paper describes the design and implementation of HERD, a key-value system designed to make the best use of an RDMA network. Unlike prior RDMA-based key-value systems, HERD focuses its design on reducing network round trips while using efficient RDMA primitives; the result is substantially lower latency, and throughput that saturates modern, commodity RDMA hardware.HERD has two unconventional decisions: First, it does not use RDMA reads, despite the allure of operations that bypass the remote CPU entirely. Second, it uses a mix of RDMA and messaging verbs, despite the conventional wisdom that the messaging primitives are slow. A HERD client writes its request into the server's memory; the server computes the reply. This design uses a single round trip for all requests and supports up to 26 million key-value operations per second with 5{$\mu$}s average latency. Notably, for small key-value items, our full system throughput is similar to native RDMA read throughput and is over 2X higher than recent RDMA-based key-value systems. We believe that HERD further serves as an effective template for the construction of RDMA-based datacenter services.},
-  isbn = {978-1-4503-2836-4},
-  file = {/Users/mnakano/Zotero/storage/NHG2TVE5/Kalia et al. - 2014 - Using RDMA efficiently for key-value services.pdf}
 }
 
 @article{kargerConsistentHashingRandom,
@@ -771,6 +812,24 @@
   file = {/Users/mnakano/Zotero/storage/C5I369FN/Lewis et al. - 2025 - IO in Machine Learning Applications on HPC System.pdf}
 }
 
+@inproceedings{li2021HatRPCHintacceleratedThrift,
+  title = {{{HatRPC}}: Hint-Accelerated Thrift {{RPC}} over {{RDMA}}},
+  shorttitle = {{{HatRPC}}},
+  booktitle = {Proceedings of the {{International Conference}} for {{High Performance Computing}}, {{Networking}}, {{Storage}} and {{Analysis}}},
+  author = {Li, Tianxi and Shi, Haiyang and Lu, Xiaoyi},
+  year = 2021,
+  month = nov,
+  series = {{{SC}} '21},
+  pages = {1--14},
+  publisher = {Association for Computing Machinery},
+  address = {New York, NY, USA},
+  doi = {10.1145/3458817.3476191},
+  urldate = {2026-02-09},
+  abstract = {In this paper, we propose a novel hint-accelerated Remote Procedure Call (RPC) framework based on Apache Thrift over Remote Direct Memory Access (RDMA) protocols, called HatRPC. HatRPC proposes a hierarchical hint scheme towards optimizing heterogeneous RPC services and functions. The proposed hint design is composed of service-granularity and function-granularity hints for achieving varied optimization goals and reducing design space for further optimizing the underneath RDMA communication engine. We co-design a key-value store called HatKV with HatRPC and LMDB. The effectiveness and efficiency of HatRPC are validated and evaluated with our proposed Apache Thrift Benchmarks (ATB), YCSB, and TPC-H workloads. Performance evaluations show that the proposed HatRPC approach can deliver up to 55\% performance improvement for ATB benchmarks and up to 1.51X speedup for TPC-H queries compared with vanilla Thrift over IPoIB. In addition, the co-designed HatKV can achieve up to 85.5\% improvement for YCSB workloads.},
+  isbn = {978-1-4503-8442-1},
+  file = {/Users/mnakano/Zotero/storage/H9P3KA2X/Li et al. - 2021 - HatRPC hint-accelerated thrift RPC over RDMA.pdf}
+}
+
 @inproceedings{liangDAOSScaleOutHigh2020,
   title = {{{DAOS}}: {{A Scale-Out High Performance Storage Stack}} for {{Storage Class Memory}}},
   shorttitle = {{{DAOS}}},
@@ -912,6 +971,22 @@
   isbn = {978-1-939133-26-7},
   langid = {english},
   file = {/Users/mnakano/Zotero/storage/QCYAAGUF/Lv et al. - 2022 - InfiniFS An Efficient Metadata Service for Lar.pdf}
+}
+
+@article{ma2025RdmaxScalableRDMA,
+  title = {Rdmax: {{Scalable RDMA RPC}} on {{Reliable Connection Through QP Multiplexing}} and {{In-Network Dispatching}}},
+  shorttitle = {Rdmax},
+  author = {Ma, Zhihuang and Xu, Zichen and Li, Tingyu and Yang, Zijiang and Chen, Xiaoliang and Zhu, Zuqing},
+  year = 2025,
+  month = nov,
+  journal = {IEEE Transactions on Networking},
+  number = {01},
+  pages = {1--15},
+  publisher = {IEEE Computer Society},
+  doi = {10.1109/TON.2025.3628909},
+  urldate = {2026-02-09},
+  abstract = {In remote direct memory access (RDMA)-based remote procedure call (RPC) systems, using reliable connection (RC) transport mode with one-sided verbs might face challenges from excessive queue pairs (QPs) and per-client request regions when there is high client concurrency. This can cause cache thrashing on the RDMA network interface card (RNIC) and CPU and restrict server-side scalability. To address this issue, this paper proposes Rdmax, a highly-scalable RC-based RPC system incorporating two innovations. First, it leverages QP multiplexity to serve multiple independent clients simultaneously with one RC QP, breaking the one-to-one connection constraint of RC. This also allows to post responses for different clients in one batch. Second, it uses in-network request dispatching to consolidate per-client request regions into a shared one, while still ensuring conflict-free client writes. Rdmax realizes these innovations with a programmable network, which manages the states of RC QPs and the request region and modifies relevant fields in RDMA packets accordingly. In a dummy RPC benchmark, Rdmax achieves up to - higher throughput. For online transaction processing, Rdmax outperforms two state-of-the-arts based on client grouping and unreliable datagram schemes, improving throughput by up to 44.3\% and 45.7\%, while reducing 99\% tail latency by up to 66.8\% and 40.0\%, respectively.},
+  langid = {english}
 }
 
 @inproceedings{maDRustLanguageGuidedDistributed2024,
@@ -1310,6 +1385,24 @@
   file = {/Users/mnakano/Zotero/storage/LYW6B39E/Singh and Bawa - 2018 - Scalable Metadata Management Techniques for Ultra-.pdf}
 }
 
+@inproceedings{singhvi20201RMAReenvisioningRemote,
+  title = {{{1RMA}}: {{Re-envisioning Remote Memory Access}} for {{Multi-tenant Datacenters}}},
+  shorttitle = {{{1RMA}}},
+  booktitle = {Proceedings of the {{Annual}} Conference of the {{ACM Special Interest Group}} on {{Data Communication}} on the Applications, Technologies, Architectures, and Protocols for Computer Communication},
+  author = {Singhvi, Arjun and Akella, Aditya and Gibson, Dan and Wenisch, Thomas F. and {Wong-Chan}, Monica and Clark, Sean and Martin, Milo M. K. and McLaren, Moray and Chandra, Prashant and Cauble, Rob and Wassel, Hassan M. G. and Montazeri, Behnam and Sabato, Simon L. and Scherpelz, Joel and Vahdat, Amin},
+  year = 2020,
+  month = jul,
+  series = {{{SIGCOMM}} '20},
+  pages = {708--721},
+  publisher = {Association for Computing Machinery},
+  address = {New York, NY, USA},
+  doi = {10.1145/3387514.3405897},
+  urldate = {2026-02-09},
+  abstract = {Remote Direct Memory Access (RDMA) plays a key role in supporting performance-hungry datacenter applications. However, existing RDMA technologies are ill-suited to multi-tenant datacenters, where applications run at massive scales, tenants require isolation and security, and the workload mix changes over time. Our experiences seeking to operationalize RDMA at scale indicate that these ills are rooted in standard RDMA's basic design attributes: connectionorientedness and complex policies baked into hardware.We describe a new approach to remote memory access -- One-Shot RMA (1RMA) -- suited to the constraints imposed by our multi-tenant datacenter settings. The 1RMA NIC is connection-free and fixed-function; it treats each RMA operation independently, assisting software by offering fine-grained delay measurements and fast failure notifications. 1RMA software provides operation pacing, congestion control, failure recovery, and inter-operation ordering, when needed. The NIC, deployed in our production datacenters, supports encryption at line rate (100Gbps and 100M ops/sec) with minimal performance/availability disruption for encryption key rotation.},
+  isbn = {978-1-4503-7955-7},
+  file = {/Users/mnakano/Zotero/storage/WNCC3P5C/Singhvi et al. - 2020 - 1RMA Re-envisioning Remote Memory Access for Multi-tenant Datacenters.pdf}
+}
+
 @misc{SongGangCongCiShiDaiJiSuanJiPanFuYueNEXTnoTuiJinnituite2024,
   title = {{次世代計算基盤（富岳NEXT）の推進について}},
   author = {松岡聡},
@@ -1408,16 +1501,6 @@
   file = {/Users/mnakano/Zotero/storage/WPIQSYW3/Terrace and Freedman - Object Storage on CRAQ.pdf}
 }
 
-@misc{UsingLightweightFormal,
-  title = {Using {{Lightweight Formal Methods}} to {{Validate}} a {{Key-Value Storage Node}} in {{Amazon S3}} \textbar{} {{Proceedings}} of the {{ACM SIGOPS}} 28th {{Symposium}} on {{Operating Systems Principles}}},
-  journal = {ACM Conferences},
-  doi = {10.1145/3477132.3483540},
-  urldate = {2024-05-31},
-  howpublished = {https://dl.acm.org/doi/10.1145/3477132.3483540},
-  langid = {english},
-  file = {/Users/mnakano/Zotero/storage/CGFDWDS6/Using Lightweight Formal Methods to Validate a Key.pdf;/Users/mnakano/Zotero/storage/QAF8NNGJ/3477132.html}
-}
-
 @article{usmanDataLocalityHigh2023,
   title = {Data {{Locality}} in {{High Performance Computing}}, {{Big Data}}, and {{Converged Systems}}: {{An Analysis}} of the {{Cutting Edge}} and a {{Future System Architecture}}},
   shorttitle = {Data {{Locality}} in {{High Performance Computing}}, {{Big Data}}, and {{Converged Systems}}},
@@ -1477,6 +1560,35 @@
   isbn = {978-1-931971-20-1},
   langid = {english},
   file = {/Users/mnakano/Zotero/storage/MMPHUGSG/Waldspurger et al. - 2015 - Efficient MRC Construction with SHARDS .pdf}
+}
+
+@inproceedings{wang2021StaRBreakingScalability,
+  title = {{{StaR}}: {{Breaking}} the {{Scalability Limit}} for {{RDMA}}},
+  shorttitle = {{{StaR}}},
+  booktitle = {2021 {{IEEE}} 29th {{International Conference}} on {{Network Protocols}} ({{ICNP}})},
+  author = {Wang, Xizheng and Chen, Guo and Yin, Xijin and Dai, Huichen and Li, Bojie and Fu, Binzhang and Tan, Kun},
+  year = 2021,
+  month = jan,
+  pages = {1--11},
+  issn = {2643-3303},
+  doi = {10.1109/ICNP52444.2021.9651935},
+  urldate = {2026-02-09},
+  abstract = {Due to its superior performance, Remote Direct Memory Access (RDMA) has been widely deployed in data center networks. It provides applications with ultra-high throughput, ultra-low latency, and far lower CPU utilization than TCP/IP software network stack. However, the connection states that must be stored on the RDMA NIC (RNIC) and the small NIC memory result in poor scalability. The performance drops significantly when the RNIC needs to maintain a large number of concurrent connections.We propose StaR (Stateless RDMA), which solves the scalability problem of RDMA by transferring states to the other communication end. Leveraging the asymmetric communication pattern in data center applications, StaR lets the communication end with low concurrency save states for the other end with high concurrency, thus making the RNIC on the bottleneck side to be stateless. We have implemented StaR on an FPGA board with 10Gbps network port and evaluated its performance on a testbed with 9 machines all equipped with StaR NICs. The experimental results show that in high concurrency scenarios, the throughput of StaR can reach up to 4.13x and 1.35x of the original RNIC and the latest software-based solution, respectively.},
+  keywords = {Concurrent computing,Data centers,Ports (computers),Protocols,Scalability,TCPIP,Throughput},
+  file = {/Users/mnakano/Zotero/storage/778NITTD/9651935.html}
+}
+
+@inproceedings{wang2023SRNICScalableArchitecture,
+  title = {{{SRNIC}}: {{A Scalable Architecture}} for {{RDMA NICs}}},
+  shorttitle = {{{SRNIC}}},
+  booktitle = {20th {{USENIX Symposium}} on {{Networked Systems Design}} and {{Implementation}} ({{NSDI}} 23)},
+  author = {Wang, Zilong and Luo, Layong and Ning, Qingsong and Zeng, Chaoliang and Li, Wenxue and Wan, Xinchen and Xie, Peng and Feng, Tao and Cheng, Ke and Geng, Xiongfei and Wang, Tianhao and Ling, Weicheng and Huo, Kejia and An, Pingbo and Ji, Kui and Zhang, Shideng and Xu, Bin and Feng, Ruiqing and Ding, Tao and Chen, Kai and Guo, Chuanxiong},
+  year = 2023,
+  pages = {1--14},
+  urldate = {2026-02-09},
+  isbn = {978-1-939133-33-5},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/I4RVFHX9/Wang et al. - 2023 - SRNIC A Scalable Architecture for RDMA NICs.pdf}
 }
 
 @inproceedings{wangBurstFSDistributedBurst2016,
@@ -1552,6 +1664,19 @@
   abstract = {Deep learning (DL) training is data-intensive and often bottlenecked by fetching data from remote storage. Recognizing that many samples' sizes diminish during data preprocessing, we explore selectively offloading preprocessing to remote storage to mitigate data traffic. We conduct a case study to uncover the potential benefits and challenges of this approach. We then propose SOPHON, a framework that selectively offloads preprocessing tasks at a fine granularity in order to reduce data traffic, utilizing online profiling and adaptive algorithms to optimize for every sample in every training scenario. Our results show that SOPHON can reduce data traffic and training time by 1.2-2.2x over existing solutions.},
   isbn = {979-8-4007-0630-1},
   file = {/Users/mnakano/Zotero/storage/PQVPT49M/Wang et al. - 2024 - A Selective Preprocessing Offloading Framework for.pdf}
+}
+
+@inproceedings{wei2018DeconstructingRDMAenabledDistributed,
+  title = {Deconstructing {{RDMA-enabled Distributed Transactions}}: {{Hybrid}} Is {{Better}}!},
+  shorttitle = {Deconstructing {{RDMA-enabled Distributed Transactions}}},
+  booktitle = {13th {{USENIX Symposium}} on {{Operating Systems Design}} and {{Implementation}} ({{OSDI}} 18)},
+  author = {Wei, Xingda and Dong, Zhiyuan and Chen, Rong and Chen, Haibo},
+  year = 2018,
+  pages = {233--251},
+  urldate = {2026-02-09},
+  isbn = {978-1-939133-08-3},
+  langid = {english},
+  file = {/Users/mnakano/Zotero/storage/RHLPTVAN/Wei et al. - 2018 - Deconstructing RDMA-enabled Distributed Transactions Hybrid is Better!.pdf}
 }
 
 @inproceedings{weihangjiangHighPerformanceMPI22004,
@@ -1725,6 +1850,24 @@
   abstract = {Remote direct memory access (RDMA) networks are widely deployed in clouds and data centers for low latency and high throughput. Emerging applications like artificial intelligence training and serverless computing demand RDMA networks with high connection scalability. However, increasing connections can reduce throughput, as many academic research states. Conversely, some industry reports indicate the scalability issues are situation-specific. Despite this, existing work lacks a comprehensive analysis of RDMA scalability issue triggers and causes. In this paper, we revisit triggering conditions and underlying causes of RDMA scalability issues. First, we comprehensively analyze RDMA data flows and potential resource contentions, particularly with direct cache access. Second, we conduct extensive tests across varied measurement settings and RDMA NICs (RNICs). We identify triggering conditions including frequent switching of queue pair connections, rapid request posting, intensive memory access demands and inappropriate program configurations. We also systematically uncover causes of scalability issues, mainly due to RNIC cache misses, RNIC processing unit backpressure, host last-level cache misses, and software inefficiency. Finally, we provide guidelines to mitigate the RDMA scalability issues.},
   isbn = {979-8-3315-0971-2},
   langid = {english}
+}
+
+@inproceedings{zhao2025SRCScalableReliable,
+  title = {{{SRC}}: {{A Scalable Reliable Connection}} for {{RDMA}} with {{Decoupled QPs}} and {{Connections}}},
+  shorttitle = {{{SRC}}},
+  booktitle = {Proceedings of the 9th {{Asia-Pacific Workshop}} on {{Networking}}},
+  author = {Zhao, Yiren and Shu, Ran and Xiong, Yongqiang},
+  year = 2025,
+  month = aug,
+  series = {{{APNET}} '25},
+  pages = {44--50},
+  publisher = {Association for Computing Machinery},
+  address = {New York, NY, USA},
+  doi = {10.1145/3735358.3735366},
+  urldate = {2026-02-09},
+  abstract = {Using Remote Direct Memory Access (RDMA) is the trend in data centers for achieving high throughput and low latency due to the benefits of hardware offloaded stacks. However, RDMA cannot provide consistently high performance at scale due to the limited RDMA NIC (RNIC) hardware state capacity. We observe that the scalability issue is due to the coupled design of host-RNIC communication channels (queue pairs), and the network connections. In this paper, we propose a novel RDMA transport concept, SRC, which decouples the network connections from queue pairs. SRC introduces a lightweight mapping scheme for efficient forwarding between QPs and connections on the RNIC. Besides, SRC lets software manage the mapping between QPs and connections, which enables inter-application connection sharing, and compatibility with existing RC-based applications. Our results show that SRC can reduce RDMA state size from 146.198 MB to 0.190 MB in a 512-server cluster running RDMA applications.},
+  isbn = {979-8-4007-1401-6},
+  file = {/Users/mnakano/Zotero/storage/FG5RHHTD/Zhao et al. - 2025 - SRC A Scalable Reliable Connection for RDMA with Decoupled QPs and Connections.pdf}
 }
 
 @inproceedings{zhengBatchFSScalingFile2014,

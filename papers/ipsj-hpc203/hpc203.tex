@@ -75,34 +75,94 @@ LocustaRPCは、ノードごとに配置されたサービスデーモンがリ�
 
 \section{関連研究}
 
-\subsection{RDMA RPCシステム}
+\subsection{WRITE系RDMA RPCとデータ配置・到着通知}
+
+RDMA WRITEを用いたRPCは、送信側がone-sided WRITEで受信側メモリへ要求・応答を直接配置し、
+受信側CPUが到着を検知して処理する系統であり、
+データ配置と到着通知の設計が性能を左右する。
+
+メモリポーリング型の代表であるFaRM\cite{dragojevicFaRMFastRemote2014}は、
+受信側のcircular bufferにRDMA WRITEでメッセージを書き込み、
+受信側がHead位置をポーリングして非ゼロ値により到着を検知する。
+しかしチャネル数増加に伴いポーリング対象が線形に増加する問題があり、
+FaRM自身が大規模化時にはWRITE with Immediate Data（WRITE+IMM）とShared Receive Queue（SRQ）による
+ポーリングコストの一定化が望ましいことを示唆している。
+
+HERD\cite{kalia2014UsingRDMAEfficiently}はRDMA WRITEで要求を書き込み、
+サーバCPUがメモリをポーリングして検知するが、
+outbound WRITEが接続数でスケールしない問題を回避するため応答はUD SENDで返すハイブリッド設計を採る。
+
+研究史的にはCQポーリングはibverbs経由のspin lockやコピーのオーバーヘッドにより高コストとして敬遠されてきた。
+Fentら\cite{fent2020LowLatencyCommunicationFast}も
+WRITE+IMMとメモリポーリングを比較検討し、
+CQポーリングが無条件に有利でないことを可視化している。
+
+本研究は、ibverbsをバイパスしたCQハードウェアバッファへの直接アクセスと
+複数QPのCQイベント集約により、CQポーリングの再評価を行う。
+これはFaRMが示唆した「WRITE+IMM+SRQによるポーリングコスト一定化」を具体的に実装・体系化したものと位置づけられる。
+
+\subsection{RDMA RPCのフロー制御とプロトコル設計}
 
 eRPC\cite{kaliaDatacenterRPCsCan2019}は汎用的かつ高速なRPCフレームワークであり、
-1コアあたり10M RPCの処理性能を達成している。
-しかし、個々のクライアントがNICを直接操作する設計であり、Fat node環境での接続爆発には対応していない。
+session creditsによるend-to-endフロー制御でスイッチキューイングを抑制する。
+本研究のcredit\_grant/resp\_reservation設計は同じcredit系譜にあるが、
+eRPCはcommodity UDP上の設計であり、NIC直接操作によるFat node向け最適化は行っていない。
 
-FaSST\cite{kaliaFaSSTFastScalable2016}はtwo-sided datagram RPCを採用し、
-doorbell batchingにより高いスループットを達成したが、
-大規模接続時のスケーラビリティに課題が残る。
+FaSST\cite{kaliaFaSSTFastScalable2016}はtwo-sided UD datagram RPCを採用し、
+各コアが1つのdatagram QPで多対多通信を行うことでQP状態爆発を回避する。
+本研究はRC + WRITE+IMMで対極に位置するが、
+デーモン中継による接続集約でRCの接続数問題に対処する。
 
-HERD\cite{kaliaUsingRDMAEfficiently2014}はRDMA Writeとメッセージングverbsの組み合わせにより
-キーバリューサービスで26M ops/secを達成した。
-HERDが採用したmemory polling（受信バッファ上のフラグをポーリング）は後続研究で広く参照されているが、
-これはibverbsのCQポーリングAPIにおけるspin lockオーバーヘッドが大きかったことが背景にある。
-本研究ではibverbsをバイパスすることでCQポーリングの再評価を行う。
+RFP\cite{wuRFRPCRemoteFetching2019}は、
+サーバのoutbound RDMA発行コストが高くinbound/outboundに非対称性があること、
+server-bypassが複数回の追加RDMAを要しがちであることを分析し、
+応答をクライアントがREADで取りに行くパラダイムを提案した。
+本研究は応答もWRITEで返す設計だが、
+バッチングによるWQE・doorbell節約、piggybackによる追加往復抑制、
+予約不変条件による応答詰まり抑制が、outbound非対称性をどの程度相殺できるかが評価上の論点となる。
 
-ScaleRPC\cite{chenScalableRDMARPC2019}は接続グルーピングによりNICキャッシュの飽和とスラッシングを
-バランスさせ、メタデータアクセスで90--160\%の改善を報告した。
-しかし、CPU側のメモリアクセスパターン最適化は扱っていない。
+HatRPC\cite{li2021HatRPCHintacceleratedThrift}は、
+payloadサイズ・並行度・性能目標に基づき、
+Direct-WriteIMM、RFP、Send/Recv等の複数RDMAプロトコルを切り替える設計空間を提示し、
+WRITE+IMMが常に最適ではないことを示した。
+本研究はWRITE+IMM中心に設計を収束させているため、
+勝つ条件領域（小〜中メッセージ、低レイテンシ重視、lossless前提）を明確に評価する。
 
-Flock\cite{monga2021BirdsFeatherFlock}はスレッド間での接続共有とcoalescing同期により
-RDMA RPCのスケーラビリティを改善した。
-本研究はこれと異なり、デーモン中継による接続集約という
-アーキテクチャレベルでの解決を図る。
+Weiら\cite{wei2018DeconstructingRDMAenabledDistributed}は
+分散トランザクション文脈で、one-sided/two-sidedのどちらか一方が全フェーズに勝つわけではないことを
+phase-by-phaseで示し、ハイブリッドが最適と結論した。
 
-これらの既存研究はネットワーク層およびNIC層の最適化が中心であるのに対し、
-本研究ではNICが十分高速であるという前提の下、CPU側のメモリアクセスを主要なボトルネックとして捉え、
-全スタックに渡るメモリアクセス最適化を行う。
+\subsection{接続スケーラビリティ}
+
+RC QPの状態爆発（RNIC SRAM不足によるPCIe read増加と性能低下）は、
+2020年代のRDMA研究で最も重要な争点の一つである\cite{kong2023UnderstandingRDMAMicroarchitecture}。
+
+ScaleRPC\cite{chenScalableRDMARPC2019}はconnection groupingで同時アクティブ接続数を抑え
+NICキャッシュスラッシングを緩和し、virtualized mappingでメッセージプール共有によりCPUキャッシュ競合を抑制する。
+ただし、グルーピングに起因するレイテンシ分布の二峰性というトレードオフがある。
+
+Flock\cite{monga2021BirdsFeatherFlock}はconnection handle abstractionで
+スレッドとQPを多対多に多重化し、coalescingベースの同期とcredit renewalでスケーラビリティを改善した。
+
+RDMAX\cite{ma2025RdmaxScalableRDMA}はRC QP multiplexingで
+1つのRC QPに複数クライアントを束ね、
+in-network request dispatchingで衝突のない書込み位置決定をネットワーク側へオフロードする。
+
+SRC\cite{zhao2025SRCScalableReliable}はQPと``接続''の結合自体を問題視し、
+QPとconnectionsをdecoupleすることで状態量を桁違いに削減する。
+512ノード規模で、RCの146\,MB/nodeに対しSRCは0.19\,MB/nodeを報告している。
+
+SRNIC\cite{wang2023SRNICScalableArchitecture}はRNICのon-chip状態をモデルに基づき分解し、
+プロトコル・アーキテクチャ共同設計で10K接続規模を性能劣化なしに達成した。
+StaR\cite{wang2021StaRBreakingScalability}は高並行側のRNICをstateless化により軽量化し、
+1RMA\cite{singhvi20201RMAReenvisioningRemote}はマルチテナントDC制約を踏まえ
+one-sided primitives中心で send/recvはソフトウェアで代替する再設計思想を示した。
+
+本研究のCQ集約とSRQ共有は「受信側資源管理の定数化」としてSRC等の共有化潮流と整合するが、
+RC QPを接続ごとに保持する限りQP状態量問題は残る。
+本研究ではデーモン中継による接続集約で
+QP数そのものを物理的に削減するアーキテクチャ的回答を採用しており、
+ソフトウェアQP共有（Flock）やグルーピング（ScaleRPC）とは異なる比較軸を提供する。
 
 \subsection{RDMA設計指針とNICマイクロアーキテクチャ}
 
@@ -112,7 +172,7 @@ Kaliaらは高性能RDMAシステムの設計指針として、doorbell batching
 Kongら\cite{kong2023UnderstandingRDMAMicroarchitecture}はRDMA NICのマイクロアーキテクチャリソース（QPコンテキストキャッシュ等）を定量的に分析し、
 QP数増加時の性能低下メカニズムを明らかにした。
 本研究では、Connect-X7においてはQP数1000程度まで実用的な性能が維持されることを踏まえ、
-アーキテクチャレベルでの接続集約により QP数を管理可能な範囲に抑える設計を採用する。
+アーキテクチャレベルでの接続集約によりQP数を管理可能な範囲に抑える設計を採用する。
 
 \subsection{ノード内通信とデリゲーション}
 
@@ -121,6 +181,12 @@ Calciuら\cite{calciuMessagePassingShared2013}はマルチコア環境におけ�
 デリゲーションの有効性と限界を示した。
 本研究はこの知見を踏まえ、SPSCベースのデリゲーション機構を採用しつつ、
 キャッシュコヒーレンシプロトコルの影響を最小化するメモリアクセス設計を行う。
+
+mRPC\cite{chen2023RemoteProcedureCall}はRPCのmarshallingとポリシーを
+システムサービスとして統合し、サイドカー比で大幅な高速化を報告した。
+本研究は通信基盤の極限最適化に重心を置くが、
+mRPCが示す``RPCのサービス化''の方向性は、
+デーモン中継アーキテクチャと相補的な位置づけにある。
 
 \section{設計}
 
