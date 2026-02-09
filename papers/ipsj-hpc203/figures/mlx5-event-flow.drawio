@@ -1,0 +1,552 @@
+<mxGraphModel>
+  <root>
+    <mxCell id="0"/>
+    <mxCell id="1" parent="0"/>
+
+    <!-- ===== BACKGROUND COLUMNS ===== -->
+    <!-- Sender Column Background -->
+    <mxCell id="bg-sender" value="" style="rounded=0;fillColor=#f8f8f8;strokeColor=#000000;strokeWidth=1;dashed=1;" vertex="1" parent="1">
+      <mxGeometry x="10" y="10" width="480" height="880" as="geometry"/>
+    </mxCell>
+    <mxCell id="bg-sender-label" value="Sender Node" style="text;fontSize=11;fontStyle=1;fontFamily=Helvetica;align=center;" vertex="1" parent="1">
+      <mxGeometry x="200" y="12" width="100" height="16" as="geometry"/>
+    </mxCell>
+
+    <!-- NIC / InfiniBand Column -->
+    <mxCell id="bg-nic" value="" style="rounded=0;fillColor=#e8e8e8;strokeColor=#000000;strokeWidth=1;dashed=1;" vertex="1" parent="1">
+      <mxGeometry x="500" y="10" width="200" height="880" as="geometry"/>
+    </mxCell>
+    <mxCell id="bg-nic-label" value="NIC (ConnectX-7) / InfiniBand" style="text;fontSize=10;fontStyle=1;fontFamily=Helvetica;align=center;" vertex="1" parent="1">
+      <mxGeometry x="510" y="12" width="180" height="16" as="geometry"/>
+    </mxCell>
+
+    <!-- Receiver Column Background -->
+    <mxCell id="bg-recv" value="" style="rounded=0;fillColor=#f8f8f8;strokeColor=#000000;strokeWidth=1;dashed=1;" vertex="1" parent="1">
+      <mxGeometry x="710" y="10" width="480" height="880" as="geometry"/>
+    </mxCell>
+    <mxCell id="bg-recv-label" value="Receiver Node" style="text;fontSize=11;fontStyle=1;fontFamily=Helvetica;align=center;" vertex="1" parent="1">
+      <mxGeometry x="900" y="12" width="100" height="16" as="geometry"/>
+    </mxCell>
+
+    <!-- ===== SENDER: Layer 1 - Application / RPC Layer ===== -->
+    <mxCell id="s-l1-box" value="" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;" vertex="1" parent="1">
+      <mxGeometry x="20" y="32" width="460" height="100" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l1-title" value="Application / RPC Layer (copyrpc)" style="text;fontSize=10;fontStyle=1;fontFamily=Helvetica;align=left;" vertex="1" parent="1">
+      <mxGeometry x="24" y="34" width="250" height="14" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l1-call" value="call(data) / reply(data)&#xa;  → pending_calls Slab (call_id割当)&#xa;  → credit check: peer_credit ≥ msg_size + 32&#xa;  → ring space: available − 2R ≥ msg_size" style="text;fontSize=8;fontFamily=Courier New;align=left;verticalAlign=top;spacingLeft=4;" vertex="1" parent="1">
+      <mxGeometry x="24" y="50" width="280" height="52" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l1-const" value="DEFAULT_RING_SIZE = 1MB&#xa;MAX_RESP_RESERVATION = 256KB&#xa;SIGNAL_INTERVAL = 64" style="text;fontSize=8;fontFamily=Courier New;align=left;verticalAlign=top;fillColor=#f0f0f0;strokeColor=#000000;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="320" y="50" width="155" height="38" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l1-inv" value="不変条件: r + s + R ≤ C&#xa;credit_grant: FlowMetaにpiggyback" style="text;fontSize=8;fontFamily=Courier New;align=left;verticalAlign=top;spacingLeft=4;" vertex="1" parent="1">
+      <mxGeometry x="320" y="92" width="155" height="24" as="geometry"/>
+    </mxCell>
+
+    <!-- ===== SENDER: Layer 2 - Send Ring Buffer ===== -->
+    <mxCell id="s-l2-box" value="" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;" vertex="1" parent="1">
+      <mxGeometry x="20" y="138" width="460" height="195" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l2-title" value="Send Ring Buffer (circular, power-of-2)" style="text;fontSize=10;fontStyle=1;fontFamily=Helvetica;align=left;" vertex="1" parent="1">
+      <mxGeometry x="24" y="140" width="280" height="14" as="geometry"/>
+    </mxCell>
+
+    <!-- Ring diagram -->
+    <mxCell id="s-l2-ring" value="" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;" vertex="1" parent="1">
+      <mxGeometry x="24" y="158" width="310" height="40" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l2-r-fm" value="FlowMeta&#xa;32B" style="rounded=0;fillColor=#e0e0e0;strokeColor=#000000;strokeWidth=1;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="24" y="158" width="60" height="40" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l2-r-m0" value="Msg 0&#xa;hdr+payload" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="84" y="158" width="80" height="40" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l2-r-m1" value="Msg 1&#xa;hdr+payload" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="164" y="158" width="80" height="40" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l2-r-free" value="(空き)" style="rounded=0;fillColor=#f8f8f8;strokeColor=#000000;strokeWidth=1;fontSize=7;fontFamily=Courier New;fontColor=#888888;" vertex="1" parent="1">
+      <mxGeometry x="244" y="158" width="90" height="40" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l2-r-prod" value="producer→" style="text;fontSize=7;fontFamily=Courier New;align=left;" vertex="1" parent="1">
+      <mxGeometry x="24" y="200" width="60" height="12" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l2-r-cons" value="←consumer" style="text;fontSize=7;fontFamily=Courier New;align=right;" vertex="1" parent="1">
+      <mxGeometry x="270" y="200" width="64" height="12" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l2-r-wrap" value="wrap marker: msg_count=0xFFFFFFFF" style="text;fontSize=7;fontFamily=Courier New;align=center;fontColor=#666666;" vertex="1" parent="1">
+      <mxGeometry x="90" y="200" width="180" height="12" as="geometry"/>
+    </mxCell>
+
+    <!-- FlowMeta format -->
+    <mxCell id="s-l2-fm-title" value="FlowMeta (32B):" style="text;fontSize=8;fontStyle=1;fontFamily=Courier New;align=left;" vertex="1" parent="1">
+      <mxGeometry x="24" y="216" width="100" height="12" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l2-fm" value="" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;" vertex="1" parent="1">
+      <mxGeometry x="24" y="228" width="310" height="24" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l2-fm0" value="consumer_pos&#xa;8B (u64 LE)" style="rounded=0;fillColor=#e8e8e8;strokeColor=#000000;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="24" y="228" width="80" height="24" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l2-fm1" value="credit_grant&#xa;8B (u64 LE)" style="rounded=0;fillColor=#e8e8e8;strokeColor=#000000;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="104" y="228" width="80" height="24" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l2-fm2" value="msg_count&#xa;4B (u32 LE)" style="rounded=0;fillColor=#e8e8e8;strokeColor=#000000;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="184" y="228" width="76" height="24" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l2-fm3" value="padding&#xa;12B" style="rounded=0;fillColor=#f0f0f0;strokeColor=#000000;fontSize=7;fontFamily=Courier New;fontColor=#888888;" vertex="1" parent="1">
+      <mxGeometry x="260" y="228" width="74" height="24" as="geometry"/>
+    </mxCell>
+
+    <!-- Message Header format -->
+    <mxCell id="s-l2-mh-title" value="Message Header (12B) + Payload + Pad (→32B align):" style="text;fontSize=8;fontStyle=1;fontFamily=Courier New;align=left;" vertex="1" parent="1">
+      <mxGeometry x="24" y="256" width="310" height="12" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l2-mh" value="" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;" vertex="1" parent="1">
+      <mxGeometry x="24" y="268" width="310" height="24" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l2-mh0" value="call_id 4B&#xa;MSB=resp" style="rounded=0;fillColor=#e8e8e8;strokeColor=#000000;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="24" y="268" width="62" height="24" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l2-mh1" value="piggyback&#xa;4B" style="rounded=0;fillColor=#e8e8e8;strokeColor=#000000;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="86" y="268" width="52" height="24" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l2-mh2" value="len&#xa;4B" style="rounded=0;fillColor=#e8e8e8;strokeColor=#000000;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="138" y="268" width="40" height="24" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l2-mh3" value="payload&#xa;len bytes" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="178" y="268" width="100" height="24" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l2-mh4" value="pad&#xa;→32B" style="rounded=0;fillColor=#f0f0f0;strokeColor=#000000;fontSize=7;fontFamily=Courier New;fontColor=#888888;" vertex="1" parent="1">
+      <mxGeometry x="278" y="268" width="56" height="24" as="geometry"/>
+    </mxCell>
+
+    <!-- Position arithmetic -->
+    <mxCell id="s-l2-pos" value="pos → offset: pos &amp; (size − 1)&#xa;available: size − (producer − consumer)" style="text;fontSize=7;fontFamily=Courier New;align=left;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="24" y="296" width="200" height="20" as="geometry"/>
+    </mxCell>
+
+    <!-- Encoding info -->
+    <mxCell id="s-l2-enc" value="IMM encode: delta/32 (u32)&#xa;ALIGNMENT = 32B&#xa;HEADER_SIZE = 12B&#xa;FLOW_META = 32B&#xa;RESP_FLAG = 0x80000000" style="text;fontSize=7;fontFamily=Courier New;align=left;fillColor=#f0f0f0;strokeColor=#000000;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="350" y="158" width="125" height="60" as="geometry"/>
+    </mxCell>
+
+    <!-- ===== SENDER: Layer 3 - SQ / WQE ===== -->
+    <mxCell id="s-l3-box" value="" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;" vertex="1" parent="1">
+      <mxGeometry x="20" y="340" width="460" height="240" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l3-title" value="SQ (Send Queue) / WQE Construction" style="text;fontSize=10;fontStyle=1;fontFamily=Helvetica;align=left;" vertex="1" parent="1">
+      <mxGeometry x="24" y="342" width="250" height="14" as="geometry"/>
+    </mxCell>
+
+    <!-- Mode A -->
+    <mxCell id="s-l3-modeA-title" value="Mode A: Fully Inline (batch ≤ 220B)" style="text;fontSize=8;fontStyle=1;fontFamily=Courier New;align=left;" vertex="1" parent="1">
+      <mxGeometry x="24" y="358" width="250" height="12" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l3-modeA" value="" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;" vertex="1" parent="1">
+      <mxGeometry x="24" y="372" width="440" height="30" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l3-a-ctrl" value="Ctrl Seg&#xa;16B" style="rounded=0;fillColor=#d0d0d0;strokeColor=#000000;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="24" y="372" width="60" height="30" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l3-a-rdma" value="RDMA Seg&#xa;16B" style="rounded=0;fillColor=#d0d0d0;strokeColor=#000000;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="84" y="372" width="60" height="30" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l3-a-inline" value="Inline Data ≤ 220B (0x8000_0000|len + data)" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="144" y="372" width="320" height="30" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l3-a-bf" value="→ BlueFlame (256B copy)" style="text;fontSize=7;fontFamily=Courier New;align=left;fontColor=#444444;" vertex="1" parent="1">
+      <mxGeometry x="24" y="404" width="160" height="12" as="geometry"/>
+    </mxCell>
+
+    <!-- Mode B -->
+    <mxCell id="s-l3-modeB-title" value="Mode B: Hybrid (batch &gt; 220B)" style="text;fontSize=8;fontStyle=1;fontFamily=Courier New;align=left;" vertex="1" parent="1">
+      <mxGeometry x="24" y="418" width="250" height="12" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l3-modeB" value="" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;" vertex="1" parent="1">
+      <mxGeometry x="24" y="432" width="440" height="30" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l3-b-ctrl" value="Ctrl Seg&#xa;16B" style="rounded=0;fillColor=#d0d0d0;strokeColor=#000000;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="24" y="432" width="60" height="30" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l3-b-rdma" value="RDMA Seg&#xa;16B" style="rounded=0;fillColor=#d0d0d0;strokeColor=#000000;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="84" y="432" width="60" height="30" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l3-b-inline" value="Inline ≤ 204B" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="144" y="432" width="200" height="30" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l3-b-sge" value="SGE 16B&#xa;→Send Ring" style="rounded=0;fillColor=#d0d0d0;strokeColor=#000000;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="344" y="432" width="120" height="30" as="geometry"/>
+    </mxCell>
+
+    <!-- Ctrl Seg detail -->
+    <mxCell id="s-l3-ctrl-title" value="Ctrl Seg (16B):" style="text;fontSize=8;fontStyle=1;fontFamily=Courier New;align=left;" vertex="1" parent="1">
+      <mxGeometry x="24" y="468" width="100" height="12" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l3-ctrl-detail" value="opmod:8|idx:16|opc:8 (0x09=RDMA_WRITE_IMM)&#xa;qpn:24|ds_cnt:8&#xa;pcie:8|stream:16|fm_ce_se:8&#xa;imm (4B, BE) = encode(delta/32)" style="text;fontSize=7;fontFamily=Courier New;align=left;fillColor=#f0f0f0;strokeColor=#000000;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="24" y="482" width="260" height="44" as="geometry"/>
+    </mxCell>
+
+    <!-- RDMA Seg detail -->
+    <mxCell id="s-l3-rdma-title" value="RDMA Seg (16B):" style="text;fontSize=8;fontStyle=1;fontFamily=Courier New;align=left;" vertex="1" parent="1">
+      <mxGeometry x="300" y="468" width="100" height="12" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l3-rdma-detail" value="remote_addr (8B, BE)&#xa;rkey (4B, BE)&#xa;reserved (4B)" style="text;fontSize=7;fontFamily=Courier New;align=left;fillColor=#f0f0f0;strokeColor=#000000;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="300" y="482" width="160" height="34" as="geometry"/>
+    </mxCell>
+
+    <!-- SGE detail -->
+    <mxCell id="s-l3-sge-title" value="Data Seg / SGE (16B):" style="text;fontSize=8;fontStyle=1;fontFamily=Courier New;align=left;" vertex="1" parent="1">
+      <mxGeometry x="300" y="520" width="160" height="12" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l3-sge-detail" value="byte_count:4B lkey:4B addr:8B" style="text;fontSize=7;fontFamily=Courier New;align=left;fillColor=#f0f0f0;strokeColor=#000000;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="300" y="534" width="160" height="14" as="geometry"/>
+    </mxCell>
+
+    <!-- Signal info -->
+    <mxCell id="s-l3-signal" value="Signal: 64 WQE毎 (fm_ce_se |= 0x08)&#xa;WQEBB = 64B, BF_BUF = 256B" style="text;fontSize=7;fontFamily=Courier New;align=left;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="24" y="530" width="240" height="20" as="geometry"/>
+    </mxCell>
+
+    <!-- ===== SENDER: Layer 4 - Doorbell ===== -->
+    <mxCell id="s-l4-box" value="" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;" vertex="1" parent="1">
+      <mxGeometry x="20" y="586" width="460" height="100" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l4-title" value="Doorbell (2-phase)" style="text;fontSize=10;fontStyle=1;fontFamily=Helvetica;align=left;" vertex="1" parent="1">
+      <mxGeometry x="24" y="588" width="200" height="14" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l4-p1" value="Phase 1: DBREC write&#xa;  sfence&#xa;  volatile_write(dbrec[1], PI.to_be())&#xa;  udma_to_device_barrier" style="text;fontSize=7;fontFamily=Courier New;align=left;fillColor=#f0f0f0;strokeColor=#000000;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="24" y="606" width="220" height="46" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l4-p2" value="Phase 2: BlueFlame MMIO write&#xa;  bf[offset] ← first 8B of Ctrl (min DB)&#xa;  or: bf_copy(WQE, 256B) (full BF)&#xa;  sfence&#xa;  offset ^= bf_size (toggle 0↔256)" style="text;fontSize=7;fontFamily=Courier New;align=left;fillColor=#f0f0f0;strokeColor=#000000;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="254" y="606" width="220" height="56" as="geometry"/>
+    </mxCell>
+
+    <!-- ===== SENDER: Layer 5 - Send CQ ===== -->
+    <mxCell id="s-l5-box" value="" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;" vertex="1" parent="1">
+      <mxGeometry x="20" y="692" width="460" height="50" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l5-title" value="Send CQ (SQ Completion)" style="text;fontSize=10;fontStyle=1;fontFamily=Helvetica;align=left;" vertex="1" parent="1">
+      <mxGeometry x="24" y="694" width="200" height="14" as="geometry"/>
+    </mxCell>
+    <mxCell id="s-l5-detail" value="64 WQE毎にsignal → CQE生成 → SQ CI更新、slot回収" style="text;fontSize=8;fontFamily=Courier New;align=left;spacingLeft=4;" vertex="1" parent="1">
+      <mxGeometry x="24" y="712" width="400" height="14" as="geometry"/>
+    </mxCell>
+
+    <!-- ===== NIC COLUMN ===== -->
+    <!-- Sender NIC -->
+    <mxCell id="nic-sender" value="" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;" vertex="1" parent="1">
+      <mxGeometry x="510" y="32" width="180" height="120" as="geometry"/>
+    </mxCell>
+    <mxCell id="nic-sender-title" value="Sender NIC" style="text;fontSize=9;fontStyle=1;fontFamily=Helvetica;align=center;" vertex="1" parent="1">
+      <mxGeometry x="510" y="34" width="180" height="14" as="geometry"/>
+    </mxCell>
+    <mxCell id="nic-sender-detail" value="① PCIe DMA: SQバッファから&#xa;   WQE fetch&#xa;② PCIe DMA: SGEアドレスから&#xa;   データ fetch (Hybrid時)&#xa;③ RDMA WRITE+IMM&#xa;   パケット組立・送信" style="text;fontSize=7;fontFamily=Courier New;align=left;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="514" y="50" width="170" height="72" as="geometry"/>
+    </mxCell>
+
+    <!-- InfiniBand link -->
+    <mxCell id="nic-ib" value="" style="rounded=0;fillColor=#d0d0d0;strokeColor=#000000;strokeWidth=2;" vertex="1" parent="1">
+      <mxGeometry x="580" y="160" width="40" height="560" as="geometry"/>
+    </mxCell>
+    <mxCell id="nic-ib-label" value="I&#xa;n&#xa;f&#xa;i&#xa;n&#xa;i&#xa;B&#xa;a&#xa;n&#xa;d&#xa;&#xa;R&#xa;C" style="text;fontSize=8;fontStyle=1;fontFamily=Helvetica;align=center;verticalAlign=middle;" vertex="1" parent="1">
+      <mxGeometry x="584" y="250" width="32" height="200" as="geometry"/>
+    </mxCell>
+
+    <!-- Arrow: Sender→IB (RDMA WRITE) -->
+    <mxCell id="arrow-s-ib" value="" style="endArrow=classic;strokeColor=#000000;strokeWidth=2;exitX=1;exitY=0.5;entryX=0;entryY=0.3;" edge="1" parent="1" source="s-l4-box" target="nic-ib">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="arrow-s-ib-label" value="③ Doorbell" style="text;fontSize=7;fontStyle=1;fontFamily=Helvetica;align=center;" vertex="1" parent="1">
+      <mxGeometry x="490" y="610" width="60" height="12" as="geometry"/>
+    </mxCell>
+
+    <!-- Receiver NIC -->
+    <mxCell id="nic-recv" value="" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;" vertex="1" parent="1">
+      <mxGeometry x="510" y="740" width="180" height="140" as="geometry"/>
+    </mxCell>
+    <mxCell id="nic-recv-title" value="Receiver NIC" style="text;fontSize=9;fontStyle=1;fontFamily=Helvetica;align=center;" vertex="1" parent="1">
+      <mxGeometry x="510" y="742" width="180" height="14" as="geometry"/>
+    </mxCell>
+    <mxCell id="nic-recv-detail" value="④ RDMA WRITE: Recv Ring上の&#xa;   指定アドレスにデータ書込&#xa;⑤ IMM → CQE生成&#xa;   DDIO経由でL3キャッシュ配置&#xa;⑥ SRQからRecv WQE消費&#xa;   (WRITE+IMMはRQ WQE消費)" style="text;fontSize=7;fontFamily=Courier New;align=left;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="514" y="758" width="170" height="72" as="geometry"/>
+    </mxCell>
+
+    <!-- Arrow: IB→Receiver NIC -->
+    <mxCell id="arrow-ib-rnic" value="" style="endArrow=classic;strokeColor=#000000;strokeWidth=2;" edge="1" parent="1">
+      <mxGeometry relative="1" as="geometry">
+        <mxPoint x="600" y="720" as="sourcePoint"/>
+        <mxPoint x="600" y="740" as="targetPoint"/>
+      </mxGeometry>
+    </mxCell>
+
+    <!-- ===== RECEIVER: Layer 1 - Recv CQ (MonoCq) ===== -->
+    <mxCell id="r-l1-box" value="" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;" vertex="1" parent="1">
+      <mxGeometry x="720" y="32" width="460" height="210" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l1-title" value="Recv CQ (MonoCq) — 全QPのCQE集約" style="text;fontSize=10;fontStyle=1;fontFamily=Helvetica;align=left;" vertex="1" parent="1">
+      <mxGeometry x="724" y="34" width="280" height="14" as="geometry"/>
+    </mxCell>
+
+    <!-- CQ Buffer diagram -->
+    <mxCell id="r-l1-cqbuf" value="" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;" vertex="1" parent="1">
+      <mxGeometry x="724" y="52" width="240" height="28" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l1-cq0" value="CQE 0" style="rounded=0;fillColor=#e0e0e0;strokeColor=#000000;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="724" y="52" width="60" height="28" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l1-cq1" value="CQE 1" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="784" y="52" width="60" height="28" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l1-cq2" value="CQE 2" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="844" y="52" width="60" height="28" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l1-cq3" value="..." style="rounded=0;fillColor=#f8f8f8;strokeColor=#000000;fontSize=7;fontFamily=Courier New;fontColor=#888888;" vertex="1" parent="1">
+      <mxGeometry x="904" y="52" width="60" height="28" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l1-ci" value="CI→" style="text;fontSize=7;fontFamily=Courier New;fontStyle=1;" vertex="1" parent="1">
+      <mxGeometry x="724" y="82" width="30" height="12" as="geometry"/>
+    </mxCell>
+
+    <!-- CQE format -->
+    <mxCell id="r-l1-cqe-title" value="CQE (64B):" style="text;fontSize=8;fontStyle=1;fontFamily=Courier New;align=left;" vertex="1" parent="1">
+      <mxGeometry x="724" y="96" width="80" height="12" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l1-cqe-fmt" value="[0-31]  scatter data (scatter-to-CQE時)&#xa;[36]    imm_inval_pkey (4B, BE) ← IMM値&#xa;[44]    byte_cnt (4B, BE)&#xa;[56]    qp_num (3B, bits[23:0], BE) ← QPN&#xa;[60]    wqe_counter (2B, BE)&#xa;[63]    op_own: opc[7:4]|scat[3:2]|own[0]" style="text;fontSize=7;fontFamily=Courier New;align=left;fillColor=#f0f0f0;strokeColor=#000000;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="724" y="110" width="260" height="68" as="geometry"/>
+    </mxCell>
+
+    <!-- Polling logic -->
+    <mxCell id="r-l1-poll-title" value="Polling:" style="text;fontSize=8;fontStyle=1;fontFamily=Courier New;align=left;" vertex="1" parent="1">
+      <mxGeometry x="724" y="182" width="60" height="12" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l1-poll" value="sw_own = (CI &gt;&gt; log2(cqe_cnt)) &amp; 1&#xa;hw_own = op_own &amp; 1&#xa;sw ≠ hw → no CQE&#xa;sw = hw → barrier → read → CI++ → dbrec" style="text;fontSize=7;fontFamily=Courier New;align=left;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="724" y="196" width="250" height="40" as="geometry"/>
+    </mxCell>
+
+    <!-- CQ aggregation -->
+    <mxCell id="r-l1-agg" value="QP0 ─┐&#xa;QP1 ─┤→ 単一CQ&#xa;QP2 ─┘  (MonoCq)" style="text;fontSize=8;fontFamily=Courier New;align=left;fillColor=#f0f0f0;strokeColor=#000000;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="1000" y="52" width="100" height="40" as="geometry"/>
+    </mxCell>
+
+    <!-- Compressed CQE info -->
+    <mxCell id="r-l1-comp" value="Compressed CQE:&#xa;[62] mini_cqe_cnt&#xa;  fmt[7:6]|cnt-1[5:2]&#xa;Mini CQE (8B):&#xa;  byte_cnt:4B + meta" style="text;fontSize=7;fontFamily=Courier New;align=left;fillColor=#f0f0f0;strokeColor=#000000;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="1000" y="110" width="120" height="56" as="geometry"/>
+    </mxCell>
+
+    <!-- ===== RECEIVER: Layer 2 - SRQ ===== -->
+    <mxCell id="r-l2-box" value="" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;" vertex="1" parent="1">
+      <mxGeometry x="720" y="248" width="460" height="80" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l2-title" value="SRQ (Shared Receive Queue)" style="text;fontSize=10;fontStyle=1;fontFamily=Helvetica;align=left;" vertex="1" parent="1">
+      <mxGeometry x="724" y="250" width="250" height="14" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l2-detail" value="全QPで共有、CI-based FIFO&#xa;WRITE+IMMではwqe_counter不正確 → CI順でentry追跡&#xa;WQE(32B): Next Seg(16B, zeroed) + Data Seg(16B SGE)" style="text;fontSize=7;fontFamily=Courier New;align=left;spacingLeft=4;" vertex="1" parent="1">
+      <mxGeometry x="724" y="268" width="320" height="34" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l2-replenish" value="Replenish:&#xa;posted &lt; 2/3 threshold&#xa;  → repost to max" style="text;fontSize=7;fontFamily=Courier New;align=left;fillColor=#f0f0f0;strokeColor=#000000;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="1060" y="258" width="110" height="34" as="geometry"/>
+    </mxCell>
+
+    <!-- ===== RECEIVER: Layer 3 - QPN Dispatch ===== -->
+    <mxCell id="r-l3-box" value="" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;" vertex="1" parent="1">
+      <mxGeometry x="720" y="334" width="460" height="50" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l3-title" value="QPN → Endpoint Dispatch" style="text;fontSize=10;fontStyle=1;fontFamily=Helvetica;align=left;" vertex="1" parent="1">
+      <mxGeometry x="724" y="336" width="250" height="14" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l3-detail" value="CQE.qp_num → FastMap&lt;QPN, Endpoint&gt; → O(1) lookup (last_queue_cache付き)" style="text;fontSize=8;fontFamily=Courier New;align=left;spacingLeft=4;" vertex="1" parent="1">
+      <mxGeometry x="724" y="354" width="440" height="14" as="geometry"/>
+    </mxCell>
+
+    <!-- ===== RECEIVER: Layer 4 - Recv Ring + process_cqe ===== -->
+    <mxCell id="r-l4-box" value="" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;" vertex="1" parent="1">
+      <mxGeometry x="720" y="390" width="460" height="220" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l4-title" value="Recv Ring解析 + process_cqe()" style="text;fontSize=10;fontStyle=1;fontFamily=Helvetica;align=left;" vertex="1" parent="1">
+      <mxGeometry x="724" y="392" width="280" height="14" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="r-l4-step1" value="① IMM値デコード:&#xa;   delta = imm * 32&#xa;   → recv_ring_producer += delta" style="text;fontSize=7;fontFamily=Courier New;align=left;fillColor=#f0f0f0;strokeColor=#000000;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="724" y="410" width="210" height="34" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="r-l4-step2" value="② FlowMeta読み取り (32B):&#xa;   consumer_pos → remote consumer更新&#xa;   credit_grant → peer_credit加算&#xa;   msg_count → 後続メッセージ数" style="text;fontSize=7;fontFamily=Courier New;align=left;fillColor=#f0f0f0;strokeColor=#000000;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="724" y="448" width="220" height="46" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="r-l4-step3" value="③ メッセージループ (i = 0..msg_count):&#xa;   call_id &amp; 0x80000000 ?&#xa;     Response → Slab[call_id &amp; 0x7FFFFFFF]&#xa;              → callback&#xa;     Request  → handler(data) → reply()へ" style="text;fontSize=7;fontFamily=Courier New;align=left;fillColor=#f0f0f0;strokeColor=#000000;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="724" y="498" width="250" height="56" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="r-l4-step4" value="④ msg_count == 0xFFFFFFFF&#xa;   → wrap marker&#xa;   → skip to ring head" style="text;fontSize=7;fontFamily=Courier New;align=left;fillColor=#f0f0f0;strokeColor=#000000;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="724" y="558" width="180" height="34" as="geometry"/>
+    </mxCell>
+
+    <!-- Recv Ring layout -->
+    <mxCell id="r-l4-ring" value="" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;" vertex="1" parent="1">
+      <mxGeometry x="980" y="410" width="190" height="34" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l4-r-fm" value="FlowMeta&#xa;32B" style="rounded=0;fillColor=#e0e0e0;strokeColor=#000000;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="980" y="410" width="50" height="34" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l4-r-m0" value="Msg 0" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="1030" y="410" width="50" height="34" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l4-r-m1" value="Msg 1" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;fontSize=7;fontFamily=Courier New;" vertex="1" parent="1">
+      <mxGeometry x="1080" y="410" width="50" height="34" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l4-r-free" value="..." style="rounded=0;fillColor=#f8f8f8;strokeColor=#000000;fontSize=7;fontFamily=Courier New;fontColor=#888888;" vertex="1" parent="1">
+      <mxGeometry x="1130" y="410" width="40" height="34" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l4-ring-label" value="Recv Ring (remote RDMA write先)" style="text;fontSize=7;fontFamily=Courier New;align=center;" vertex="1" parent="1">
+      <mxGeometry x="980" y="446" width="190" height="12" as="geometry"/>
+    </mxCell>
+
+    <!-- ===== RECEIVER: Layer 5 - Flow Control ===== -->
+    <mxCell id="r-l5-box" value="" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;" vertex="1" parent="1">
+      <mxGeometry x="720" y="616" width="460" height="120" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l5-title" value="フロー制御状態" style="text;fontSize=10;fontStyle=1;fontFamily=Helvetica;align=left;" vertex="1" parent="1">
+      <mxGeometry x="724" y="618" width="200" height="14" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l5-invariant" value="不変条件: r + s + R ≤ C&#xa;  r: 未消費リクエストブロック数&#xa;  s: 未消費レスポンスブロック数&#xa;  R: レスポンス予約総量 (max 256KB)" style="text;fontSize=7;fontFamily=Courier New;align=left;fillColor=#f0f0f0;strokeColor=#000000;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="724" y="636" width="240" height="46" as="geometry"/>
+    </mxCell>
+    <mxCell id="r-l5-credit" value="credit_grant: FlowMetaにpiggyback&#xa;  (専用ACK不要)&#xa;&#xa;空き ≥ R ≥ Ri ≥ si&#xa;  → レスポンス書込は常に成功&#xa;&#xa;RDMA READ fallback:&#xa;  available &lt; 25% → consumer_pos取得" style="text;fontSize=7;fontFamily=Courier New;align=left;fillColor=#f0f0f0;strokeColor=#000000;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="980" y="636" width="195" height="90" as="geometry"/>
+    </mxCell>
+
+    <!-- ===== EVENT FLOW ARROWS ===== -->
+
+    <!-- ① call()/reply() → Send Ring -->
+    <mxCell id="arrow-1" value="" style="endArrow=classic;strokeColor=#000000;strokeWidth=2;exitX=0.5;exitY=1;entryX=0.3;entryY=0;" edge="1" parent="1" source="s-l1-box" target="s-l2-box">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="arrow-1-label" value="①" style="text;fontSize=9;fontStyle=1;fontFamily=Helvetica;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="142" y="130" width="16" height="14" as="geometry"/>
+    </mxCell>
+
+    <!-- ② flush() → SQ -->
+    <mxCell id="arrow-2" value="" style="endArrow=classic;strokeColor=#000000;strokeWidth=2;exitX=0.3;exitY=1;entryX=0.3;entryY=0;" edge="1" parent="1" source="s-l2-box" target="s-l3-box">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="arrow-2-label" value="②" style="text;fontSize=9;fontStyle=1;fontFamily=Helvetica;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="142" y="328" width="16" height="14" as="geometry"/>
+    </mxCell>
+
+    <!-- ② flush → SQ (additional label) -->
+    <mxCell id="arrow-2b" value="" style="endArrow=classic;strokeColor=#000000;strokeWidth=2;exitX=0.3;exitY=1;entryX=0.3;entryY=0;" edge="1" parent="1" source="s-l3-box" target="s-l4-box">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <!-- ④ NIC DMA fetch -->
+    <mxCell id="arrow-4" value="" style="endArrow=classic;strokeColor=#000000;strokeWidth=1;dashed=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="nic-sender" target="nic-ib">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="arrow-4-label" value="④ NIC DMA" style="text;fontSize=7;fontStyle=1;fontFamily=Helvetica;" vertex="1" parent="1">
+      <mxGeometry x="620" y="148" width="60" height="12" as="geometry"/>
+    </mxCell>
+
+    <!-- ⑤ RDMA WRITE → Recv Ring -->
+    <mxCell id="arrow-5" value="" style="endArrow=classic;strokeColor=#000000;strokeWidth=2;" edge="1" parent="1">
+      <mxGeometry relative="1" as="geometry">
+        <mxPoint x="620" y="440" as="sourcePoint"/>
+        <mxPoint x="710" y="440" as="targetPoint"/>
+      </mxGeometry>
+    </mxCell>
+    <mxCell id="arrow-5-label" value="⑤ RDMA&#xa;WRITE" style="text;fontSize=7;fontStyle=1;fontFamily=Helvetica;align=center;" vertex="1" parent="1">
+      <mxGeometry x="630" y="425" width="50" height="22" as="geometry"/>
+    </mxCell>
+
+    <!-- ⑥ IMM → Recv CQ -->
+    <mxCell id="arrow-6" value="" style="endArrow=classic;strokeColor=#000000;strokeWidth=2;" edge="1" parent="1">
+      <mxGeometry relative="1" as="geometry">
+        <mxPoint x="700" y="100" as="sourcePoint"/>
+        <mxPoint x="720" y="100" as="targetPoint"/>
+      </mxGeometry>
+    </mxCell>
+    <mxCell id="arrow-6-label" value="⑥ IMM→CQE" style="text;fontSize=7;fontStyle=1;fontFamily=Helvetica;" vertex="1" parent="1">
+      <mxGeometry x="630" y="84" width="70" height="12" as="geometry"/>
+    </mxCell>
+
+    <!-- ⑦ MonoCq.poll() → QPN dispatch -->
+    <mxCell id="arrow-7" value="" style="endArrow=classic;strokeColor=#000000;strokeWidth=2;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="r-l1-box" target="r-l2-box">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="arrow-7-label" value="⑦" style="text;fontSize=9;fontStyle=1;fontFamily=Helvetica;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="942" y="238" width="16" height="14" as="geometry"/>
+    </mxCell>
+
+    <!-- ⑦→⑧ chained -->
+    <mxCell id="arrow-7b" value="" style="endArrow=classic;strokeColor=#000000;strokeWidth=2;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="r-l2-box" target="r-l3-box">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <mxCell id="arrow-8" value="" style="endArrow=classic;strokeColor=#000000;strokeWidth=2;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="r-l3-box" target="r-l4-box">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="arrow-8-label" value="⑧" style="text;fontSize=9;fontStyle=1;fontFamily=Helvetica;fontColor=#000000;" vertex="1" parent="1">
+      <mxGeometry x="942" y="376" width="16" height="14" as="geometry"/>
+    </mxCell>
+
+    <!-- ⑧→flow control -->
+    <mxCell id="arrow-8b" value="" style="endArrow=classic;strokeColor=#000000;strokeWidth=2;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="r-l4-box" target="r-l5-box">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <!-- ⑨ credit_grant piggyback (dashed, right→left) -->
+    <mxCell id="arrow-9" value="" style="endArrow=classic;strokeColor=#000000;strokeWidth=1;dashed=1;" edge="1" parent="1">
+      <mxGeometry relative="1" as="geometry">
+        <mxPoint x="720" y="660" as="sourcePoint"/>
+        <mxPoint x="480" y="120" as="targetPoint"/>
+        <Array as="points">
+          <mxPoint x="700" y="660"/>
+          <mxPoint x="700" y="850"/>
+          <mxPoint x="500" y="850"/>
+          <mxPoint x="500" y="120"/>
+        </Array>
+      </mxGeometry>
+    </mxCell>
+    <mxCell id="arrow-9-label" value="⑨ credit_grant piggyback&#xa;⑩ consumer_pos piggyback&#xa;(FlowMetaに載せて返送)" style="text;fontSize=7;fontFamily=Helvetica;align=left;fontStyle=2;" vertex="1" parent="1">
+      <mxGeometry x="14" y="756" width="160" height="34" as="geometry"/>
+    </mxCell>
+
+    <!-- ⑪ RDMA READ fallback -->
+    <mxCell id="arrow-11" value="" style="endArrow=classic;startArrow=classic;strokeColor=#000000;strokeWidth=1;dashed=1;dashPattern=3 3;" edge="1" parent="1">
+      <mxGeometry relative="1" as="geometry">
+        <mxPoint x="480" y="86" as="sourcePoint"/>
+        <mxPoint x="510" y="86" as="targetPoint"/>
+      </mxGeometry>
+    </mxCell>
+    <mxCell id="arrow-11-label" value="⑪ RDMA READ&#xa;(available&lt;25%)" style="text;fontSize=6;fontFamily=Helvetica;align=center;fontStyle=2;" vertex="1" parent="1">
+      <mxGeometry x="410" y="80" width="80" height="20" as="geometry"/>
+    </mxCell>
+
+    <!-- ===== DATA PATH LEGEND ===== -->
+    <mxCell id="legend-box" value="" style="rounded=0;fillColor=#ffffff;strokeColor=#000000;strokeWidth=1;" vertex="1" parent="1">
+      <mxGeometry x="720" y="742" width="460" height="145" as="geometry"/>
+    </mxCell>
+    <mxCell id="legend-title" value="Event Flow" style="text;fontSize=10;fontStyle=1;fontFamily=Helvetica;align=left;" vertex="1" parent="1">
+      <mxGeometry x="724" y="744" width="100" height="14" as="geometry"/>
+    </mxCell>
+
+    <!-- Data path legend items -->
+    <mxCell id="legend-data" value="── Data Path (太線):" style="text;fontSize=7;fontStyle=1;fontFamily=Helvetica;align=left;" vertex="1" parent="1">
+      <mxGeometry x="724" y="760" width="140" height="12" as="geometry"/>
+    </mxCell>
+    <mxCell id="legend-d1" value="① call()/reply() → Send Ring (msg書込)&#xa;② flush() → SQ (WQE構築, inline/hybrid)&#xa;③ Doorbell → NIC (DBREC + BlueFlame)&#xa;④ NIC DMA → WQE fetch + data fetch&#xa;⑤ RDMA WRITE → Recv Ring (対向メモリ)&#xa;⑥ IMM → Recv CQ (CQE生成, DDIO→L3)&#xa;⑦ MonoCq.poll() → QPN dispatch&#xa;⑧ process_cqe() → App (FlowMeta + msg)" style="text;fontSize=7;fontFamily=Courier New;align=left;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="724" y="774" width="260" height="90" as="geometry"/>
+    </mxCell>
+
+    <!-- Control path legend items -->
+    <mxCell id="legend-ctrl" value="-- Control Path (破線):" style="text;fontSize=7;fontStyle=1;fontFamily=Helvetica;align=left;" vertex="1" parent="1">
+      <mxGeometry x="1000" y="760" width="140" height="12" as="geometry"/>
+    </mxCell>
+    <mxCell id="legend-c1" value="⑨ credit_grant piggyback&#xa;   (FlowMetaに載せて返送)&#xa;⑩ consumer_pos piggyback&#xa;   (FlowMetaに載せて返送)&#xa;⑪ RDMA READ fallback&#xa;   (available&lt;25%時)" style="text;fontSize=7;fontFamily=Courier New;align=left;spacingLeft=2;" vertex="1" parent="1">
+      <mxGeometry x="1000" y="774" width="170" height="68" as="geometry"/>
+    </mxCell>
+
+  </root>
+</mxGraphModel>

@@ -51,26 +51,22 @@ LocustaRPCは，RDMAを活用した低遅延通信と，
 
 こうした環境において、HPCミドルウェア、特にad-hocファイルシステムやキーバリューストアの
 RPC基盤にはスケーラビリティの課題が生じる。
-従来のRPC設計では個々のクライアントがNICを直接利用するため、
+まず第一に、従来のRPC設計では個々のクライアントがNICを直接利用するため、
 プロセス数の増大に伴い接続数が爆発的に増加し、NICリソースの枯渇やメモリ消費の増大を招く。
-
-既存のRDMA RPCシステム\cite{kaliaDatacenterRPCsCan2019,kaliaFaSSTFastScalable2016,chenScalableRDMARPC2019,monga2021BirdsFeatherFlock}は
-主にネットワーク層の最適化やNICキャッシュの効率化に注力してきた。
-しかし、現代のRDMA NICは十分に高速であり、
-少数コアでNICを操作する設計においては、真のボトルネックはCPUがどれだけ効率的にメモリ操作を行えるかにある。
+また、通信層が十分な性能を発揮しただけでは、全プロセスのリクエストが集中するシナリオでの負荷問題が残るため、
+ハードウェアでの解決では固有の負荷軽減策を差し込むことが難しい。
 
 そこで本研究では、ノード内IPC、プロセス内デリゲーション、ノード間RDMA通信の全ての通信層を
-メモリアクセス最適化問題として統一的に扱うRPC基盤、LocustaRPCを提案する。
+メモリアクセス最適化問題として統一的に扱うHPCの第一階層ストレージを主眼としたRPC基盤、LocustaRPCを提案する。
 LocustaRPCは、ノードごとに配置されたサービスデーモンがリクエストを集約し、
-接続数を削減しつつQueue depthを活用する設計により、Fat node環境でのスケーラビリティを実現する。
+接続数を削減しつつ少数通信経路への集約を行うことで、従来課題であった大規模ワークロードでの通信の安定性とスケーラビリティを改善し、
+また、Queue depthに着目した最適化により性能低下を抑えることが可能であることを示す。
 
 本稿の貢献は以下の通りである。
 \begin{enumerate}
-    \item メモリアクセス最適化を軸とした、デーモン中継型RPCアーキテクチャの設計
-    \item ibverbsをバイパスした直接デバイスアクセスによるCQポーリング効率化と、
-          memory pollingとの比較における従来評価の再検討
-    \item キャッシュ制御（CLDEMOTE、HITM回避）を意識したノード内通信の設計と最適化
-    \item Connect-X7上でのEnd-to-End性能評価
+    \item ノード内通信中継でのコネクション削減による大規模環境への適応
+    \item end-to-end flow controlによる、リクエスト消失の防止を行うRPCの提案
+    \item ノード内通信/RPCの協調最適化
 \end{enumerate}
 
 \section{関連研究}
@@ -103,34 +99,31 @@ CQポーリングが無条件に有利でないことを可視化している。
 
 \subsection{RDMA RPCのフロー制御とプロトコル設計}
 
-eRPC\cite{kaliaDatacenterRPCsCan2019}は汎用的かつ高速なRPCフレームワークであり、
+FaSST\cite{kaliaFaSSTFastScalable2016}、eRPC\cite{kaliaDatacenterRPCsCan2019}は汎用的かつ高速なRPCフレームワークであり、
 session creditsによるend-to-endフロー制御でスイッチキューイングを抑制する。
 本研究のcredit\_grant/resp\_reservation設計は同じcredit系譜にあるが、
-eRPCはcommodity UDP上の設計であり、NIC直接操作によるFat node向け最適化は行っていない。
-
-FaSST\cite{kaliaFaSSTFastScalable2016}はtwo-sided UD datagram RPCを採用し、
-各コアが1つのdatagram QPで多対多通信を行うことでQP状態爆発を回避する。
-本研究はRC + WRITE+IMMで対極に位置するが、
-デーモン中継による接続集約でRCの接続数問題に対処する。
+eRPCはUD上の設計であり、本研究ではRCの信頼性をHWにオフロードし、Flowのみをコントロールする設計に比べて
+負荷が大きい。また、ファイルシステムのような大容量通信を行う場合はやはりRC接続ないしDC接続が必要であり、
+eRPC経路に加えて他の経路が必要になってくるという問題がある。
 
 RFP\cite{wuRFRPCRemoteFetching2019}は、
 サーバのoutbound RDMA発行コストが高くinbound/outboundに非対称性があること、
 server-bypassが複数回の追加RDMAを要しがちであることを分析し、
 応答をクライアントがREADで取りに行くパラダイムを提案した。
-本研究は応答もWRITEで返す設計だが、
-バッチングによるWQE・doorbell節約、piggybackによる追加往復抑制、
-予約不変条件による応答詰まり抑制が、outbound非対称性をどの程度相殺できるかが評価上の論点となる。
+本研究は応答もWRITEで返す設計ではあるものの、
+HPCの第一階層ストレージにおいては、計算プロセス自体のCPU資源は余るものの
+ストレージデーモンは相互通信を行い、かつREADは同時受入可能数の制限があることから大規模環境ではスケーラビリティの課題がある。
 
-HatRPC\cite{li2021HatRPCHintacceleratedThrift}は、
-payloadサイズ・並行度・性能目標に基づき、
-Direct-WriteIMM、RFP、Send/Recv等の複数RDMAプロトコルを切り替える設計空間を提示し、
-WRITE+IMMが常に最適ではないことを示した。
-本研究はWRITE+IMM中心に設計を収束させているため、
-勝つ条件領域（小〜中メッセージ、低レイテンシ重視、lossless前提）を明確に評価する。
+%HatRPC\cite{li2021HatRPCHintacceleratedThrift}は、
+%payloadサイズ・並行度・性能目標に基づき、
+%Direct-WriteIMM、RFP、Send/Recv等の複数RDMAプロトコルを切り替える設計空間を提示し、
+%WRITE+IMMが常に最適ではないことを示した。
+%本研究はWRITE+IMM中心に設計を収束させているため、
+%勝つ条件領域（小〜中メッセージ、低レイテンシ重視、lossless前提）を明確に評価する。
 
-Weiら\cite{wei2018DeconstructingRDMAenabledDistributed}は
-分散トランザクション文脈で、one-sided/two-sidedのどちらか一方が全フェーズに勝つわけではないことを
-phase-by-phaseで示し、ハイブリッドが最適と結論した。
+%Weiら\cite{wei2018DeconstructingRDMAenabledDistributed}は
+%分散トランザクション文脈で、one-sided/two-sidedのどちらか一方が全フェーズに勝つわけではないことを
+%phase-by-phaseで示し、ハイブリッドが最適と結論した。
 
 \subsection{接続スケーラビリティ}
 
@@ -140,17 +133,22 @@ RC QPの状態爆発（RNIC SRAM不足によるPCIe read増加と性能低下）
 ScaleRPC\cite{chenScalableRDMARPC2019}はconnection groupingで同時アクティブ接続数を抑え
 NICキャッシュスラッシングを緩和し、virtualized mappingでメッセージプール共有によりCPUキャッシュ競合を抑制する。
 ただし、グルーピングに起因するレイテンシ分布の二峰性というトレードオフがある。
+また、確実なグループ切り替えのため、完全なパイプライン化が難しくスループットが伸びづらく、実装も複雑である。
+
 
 Flock\cite{monga2021BirdsFeatherFlock}はconnection handle abstractionで
 スレッドとQPを多対多に多重化し、coalescingベースの同期とcredit renewalでスケーラビリティを改善した。
+本研究ではデーモンが通信集約を行う点でFlockと類似しているが、本研究では異なるプロセスからの通信の中継を可能としている。
 
 RDMAX\cite{ma2025RdmaxScalableRDMA}はRC QP multiplexingで
 1つのRC QPに複数クライアントを束ね、
 in-network request dispatchingで衝突のない書込み位置決定をネットワーク側へオフロードする。
+この研究ではスケーラビリティの高い改善が見られるが、プログラマブルスイッチが必要となることから既存のHPCシステムへの適用は難しい。
 
 SRC\cite{zhao2025SRCScalableReliable}はQPと``接続''の結合自体を問題視し、
 QPとconnectionsをdecoupleすることで状態量を桁違いに削減する。
 512ノード規模で、RCの146\,MB/nodeに対しSRCは0.19\,MB/nodeを報告している。
+将来的なスケーラビリティ改善が期待されるものの、ハードウェア改良であるため既存のHPCシステムへの適用は難しい。
 
 SRNIC\cite{wang2023SRNICScalableArchitecture}はRNICのon-chip状態をモデルに基づき分解し、
 プロトコル・アーキテクチャ共同設計で10K接続規模を性能劣化なしに達成した。
@@ -196,18 +194,7 @@ mRPCが示す``RPCのサービス化''の方向性は、
 通信ライブラリにおいては未だ個別のクライアントがNICを直接利用する設計が多く、ここにギャップが存在する。
 % RDMAXとかのHWによるスケーラビリティと比較して検討する
 
-そこで、本研究においては、計算ノード上でのミドルウェア展開という枠組みを踏まえ、以下を目的としたミドルウェア設計の提案を行う。
-
-% sfence集約は具体的すぎる
-
-\begin{enumerate}
-    \item Daemonへのリクエスト集約
-    \item Daemonへのリクエスト移譲による接続数節約と、それによるメモリ使用量・スループットの改善
-    \item 通信のメモリアクセスパイプライン最適化と、sfence集約によるIPC向上
-\end{enumerate}
-
-
-以降、これら3つの目標を達成するために、メモリアクセス最適化を軸とした提案手法を述べる。
+以降、これら3つの目標を達成するために、メモリアクセス最適化とQueue depthを軸とした提案手法を述べる。
 
 \section{提案手法}
 
@@ -241,7 +228,7 @@ Store bufferが詰まらない限りにおいて64Bまではコピーでも十�
 
 本節では、ノード間RPC層の設計を述べる。
 設計上の主要な目標は、(1)~RQ/SQをリソース上のボトルネックから外してRNR retryを防ぐこと、
-(2)~レイテンシを最小化しつつスループットを向上させること、
+(2)~レイテンシを可能な限り最小化しつつスループットを向上させること、
 (3)~3000ノード級での受信ポーリングのスケーラビリティを確保することの3点である。
 
 デーモン中継によりノード内リクエストが集約されるため、
@@ -256,19 +243,16 @@ WRITE+IMMは、送信側がRDMA WRITEでデータを受信側リングに直接�
 32ビットのImmediate値により受信側CQにCompletion Queue Entry（CQE）を生成する。
 これにより、データ配置と到着通知が単一の操作で完結する。
 
-この選択には2つの利点がある。
-第一に、複数QPのCQEを単一のCQに集約できるため、
-受信イベントの直列化をCPUではなくNIC側にオフロードできる。
+既存研究においてはCQポーリングは負荷が大きいとする認識があったが、
+mlx5ドライバのメモリを直接扱うことにより、CQポーリングもバッファ上のフラグポーリングと同等のコストまで低下させることが可能である。
+本質的にはバッファ上のフラグのポーリングであっても、CPUで直列化する必要があるが、CQポーリングによりNICのCQ出力にこの直列化コストをオフロードする
+ことが可能となる。
+
 メモリポーリング型の設計\cite{dragojevicFaRMFastRemote2014,kalia2014UsingRDMAEfficiently}では
-QPごとに受信バッファをポーリングする必要があり、ポーリングコストがQP数に対して線形に増加する。
-一方、CQ集約ではCQバッファ先頭のowner bitを監視するだけで全QPの受信を検出でき、
-ポーリングコストはQP数に依存しない。
 FaRM\cite{dragojevicFaRMFastRemote2014}自身もWRITE+IMMとSRQによるポーリングコスト一定化を示唆しており、
 本設計はこれを具体的に実装・体系化したものである。
 
-第二に、Immediate値でエンドポイントを直接識別できるため、
-CQE処理からバッチ解析までを最小限の間接参照で接続できる。
-
+また、CQはWRITE完了時点で発生するため、validフラグのクリアが完全に不要となるのも利点である。
 従来の研究ではibverbs経由のCQポーリングが高コストとして敬遠されてきた\cite{fent2020LowLatencyCommunicationFast}。
 しかしこれはibverbs実装のspin lock・コピー・間接呼び出しに起因するオーバーヘッドであり、
 \ref{sec:ibverbs-bypass}節で述べるibverbsバイパスにより排除できる。
@@ -276,6 +260,8 @@ CQE処理からバッチ解析までを最小限の間接参照で接続でき�
 \subsubsection{ワイヤフォーマットとバッチレイアウト}
 
 1回のRDMA WRITE+IMMにより、対向の受信リング上に以下のバッチが書き込まれる。
+リクエスト発行では、この送信リングへとリクエストを書き込み、任意のタイミングでバッチをまとめて送信することでQueue depthを活用する。
+これにより、高負荷時にはリクエストあたりのWQE発行数を減らすことができ、これは受信側のWQEを減らしWQE枯渇を防止する。
 
 バッチ先頭の32バイトはフローメタデータであり、
 送信側の受信リング消費位置\texttt{consumer\_pos}（8バイト）、
@@ -286,8 +272,7 @@ CQE処理からバッチ解析までを最小限の間接参照で接続でき�
 全バッチに常にpiggybackされるため、専用のACKメッセージを必要としない。
 
 フローメタデータに続いて、個々のメッセージが連結される。
-各メッセージは12バイトのヘッダ（\texttt{call\_id} 4バイト、
-\texttt{piggyback} 4バイト、\texttt{len} 4バイト）とペイロードから成り、
+各メッセージは12バイトのヘッダ（\texttt{call\_id} 4バイト、\texttt{len} 4バイト）とペイロードから成り、
 32バイト境界にパディングされる。
 \texttt{call\_id}の最上位ビット（RESPONSE\_FLAG）でリクエストとレスポンスを識別する。
 リクエスト時の\texttt{piggyback}フィールドにはレスポンス許容量を32バイトブロック単位で格納する。
@@ -405,14 +390,21 @@ call時にクレジットが予約済みであり、
 \subsection{Client-Daemon通信}
 
 Client-Daemon通信はx86\_64のTSOを活用し、SPSCでOut-of-Order返答が可能なリングを用いる。
-クライアントごとにLaneを分離し、サーバ側が全てをPollingすることでクライアント調停コストを最小化する。
+クライアントごとにLaneを分離し、サーバ側が全てをPollingすることでコア間の調停コストを最小化する。
 また、Laneに対して連続的に多重化されたリクエストをDrainすることで性能を稼ぐ。
-
-\subsection{メモリアクセス最適化戦略}
-
-前節までの設計を横断する共通の最適化原理として、本節ではメモリアクセスの観点からの最適化戦略を述べる。
-
-\subsubsection{キャッシュコヒーレンシ最適化}
+producer側はstore onlyとし、consumer側はload onlyとする。
+メッセージのstore時にgenerationカウンタを付与し、consumerはgenerationカウンタをチェックすることで、どこまでが公開されたメッセージかを判別する。
+このアルゴリズムではstore側のoverwriteの危険があるが、通信をcall/responseに限定し、
+response到着によって送信可能クレジットを回復することで送信側のみで上書きを行わないフロー制御が可能である。
+これは、req/responseの処理順序をAPIレベルでin-orderを強制することで安全性が保障される。
+また、x86\_64のメモリモデルはTSOであり、
+あるコアでのStore順序は他のコアでも同じ順序で観測される。このアルゴリズムでは基本的に片側は一方的なStoreで、片側は連続的なLoadなので
+TSOではAtomicやFenceなしに順序保証がなされる。TSOで許容されるStoreからLoadへのreorderingが発生した場合でも、
+観測ずみのReqに対する返信よりも、未観測のReqに対するLoadが先行するのみである。
+Responseの発行がOut-of-Orderになることはアルゴリズム上許容されており、
+あくまでReq/Resの処理順序はLoad/Loadによって達成されるため一貫性は破壊されない。
+Storeが遅れることは単純に処理リクエストの通知が遅れるのみであり、
+高負荷時においてスループット低下の可能性が存在するのみとなる。
 
 コア間通信において、キャッシュコヒーレンシプロトコル（MESIFのForward遷移等）によるL1-L1転送は
 最も直接的なデータ共有手段である。
@@ -421,76 +413,52 @@ Client-Daemon通信はx86\_64のTSOを活用し、SPSCでOut-of-Order返答が�
 これは、Forward遷移に伴うスヌープのオーバーヘッドが、
 L3の共有キャッシュとしてのアクセスレイテンシを上回るためと考えられる。
 
+これらの最適化により、Queue depth = 1の場合の同期的通信では他のSOTA SPSCベース実装を超えるスループットが達成可能であり、
+またQueue depthが増加した場合でも性能低下を抑えることが可能である。
+特に、クライアントは典型的なPOSIXインターフェースを用いることが多いことから、
+Queue depth = 1に対する最適化は重要である。
+
 本設計では、SPSC通信においてプロデューサ側でCLDEMOTEを活用し、
 コンシューマがL3から効率的に読み出せるようにする。
 また、キャッシュライン境界での64Bアラインメントと、Lane分離によるfalse sharingの回避、
 SPSC設計によるHITM（Hardware Interrupt To Modify）イベントの削減を行う。
 
-\subsubsection{Store Buffer最適化}
+ノード内通信においては固定長スロットを採用しているが、これはノード間ではレイテンシが数μsとなり通信回数自体が性能低下を招くのに対して、
+ノード内ではキャッシュライン争奪が主要な性能低下要因であり通信回数自体は性能低下要因ではないことから、
+先に可変長部分をメモリに書いた上でポインタのみを転送することでキャッシュライン争奪を避けることが可能であるためである。
 
-x86\_64のTSO（Total Store Ordering）メモリモデルでは、
-ストアはStore bufferを経由して順序保証される。
-これを活用し、SPSCリングバッファにおいてlock-freeなプロデューサ-コンシューマ通信を実現する。
+\subsection{Daemon-Daemon delegation}
 
-さらに、poll()駆動の送信モデルにおいて、複数のリクエストを蓄積してから一括送信することで、
-sfence（Store Fence）の発行回数を集約し、Store bufferの圧力を低減する。
-リングバッファへの逐次書き込みにおいては、Write combiningが期待できる連続アドレスへの書き込みパターンを維持する。
+同一プロセス内のDaemonスレッド通信では、複数クライアントからの複数リクエストが集約されるため
+Client-Daemonに対してより高いQueue depthが想定される。
+極めて高いQueue depthにおいては、lamport styleのアルゴリズムを改良し、head/tail両方キャッシュして定期的な同期とすることで、
+head/tailでの同期でstallさせてそれ以降の読み書きを高速化する手法で高いスケーラビリティが達成される。
+一方で、lamport-styleではインデックスでのキャッシュラインをコヒーレンシプロトコルで奪い合った上でデータの読み書きを行うため、
+Queue depthが低くなると極度に性能が悪化する。
+Fast-Forwardingでは、validフラグによって進行を管理してconsumerがinvalidを書き戻すことでproducerとconsumerの間のキャッシュライン争奪を明示的に行い、
+consumerが先んじてキャッシュラインを奪っておくことでスループットを最大化可能だが、
+提案手法でのone-sided SPSCに対して大きな優位性はなく、
+Queue depth = 1の低負荷時のオーバーヘッドが大きいことからこちらでもone-sidedでのSPSCを束ねてMPSCとする手法を採用した。
 
-\subsubsection{ibverbsバイパス}
-\label{sec:ibverbs-bypass}
+\subsection{アーキテクチャ}
 
-libibverbsは汎用的なRDMAアクセスを提供するが、
-thread safety保証のためのspin lockや、APIレイヤでの余分なメモリコピーが
-性能上の大きなオーバーヘッドとなる。
-特にCQポーリングにおけるspin lockは、memory pollingがCQポーリングより高速であるという
-従来の評価結果に大きく影響していると考えられる。
+提案手法では、これらのコンポーネントを用いた上で、
+クライアントとDaemonはn-to-nでの全接続を行う。
+クライアントはDaemonから事前に提供された手段を用いて適切な中継Daemonを選択しそこにリクエストを送る。
+ローカルDaemonで処理不可能な場合は所有するコネクションを用いて他ノードへとリクエストを転送する。
+転送されたリモートのDaemonは、自身で処理するか自身の処理範囲ではない場合はSPSCでのDelegationにより担当スレッドへとリクエストを転送する。
+返送は逆順で行う。中継数の増加はレイテンシを増加させスループットの低下を招くのでクライアント側で事前にローカルの適切なDaemonへ転送することで
+ローカルDaemon内の通信を削減する。
 
-本実装ではmlx5デバイスのメモリマップドレジスタに直接アクセスし、
-WQE（Work Queue Element）の構築とCQE（Completion Queue Entry）の読み取りを
-ibverbsを介さずに行う。
-これにより、spin lockの排除とコピー削減を実現し、
-CQポーリングがmemory pollingと同等以上の性能を発揮できることを示す。
-
-\subsubsection{NIC-CPU協調最適化}
-
-3000ノード級の環境では、ノードあたり数千のQPが存在し得る。
-個別のQPごとにポーリングを行うとCPUコストが線形に増加するため、
-複数QPのCompletion Eventを単一のCQに集約し、NIC HW側で通知の集約を行わせる。
-これにより、ポーリング対象を1箇所に絞りつつ、各QPの受信完了をImmediate値で識別する。
-
-また、NICのDDIO（Data Direct I/O）によりCQEはL3キャッシュに直接書き込まれるため、
-ポーリングループではL3からの読み出しのみで完結する。
-送信側ではdoorbell batchingにより、複数WQEに対して1回のMMIO書き込みで通知を行い、
-PCIeトランザクション数を削減する。
+メタデータやコントロール用の小メッセージに対して、バッファ通信ではコピーコストが大きくなることからzero-copyでの通信が重要となる。
+そこで、client-daemonやdaemon-daemon delegationではコントロールメッセージのみの通信とし、バッファについてはメモリ情報のみを伝達してNICに通信をオフロードする。
+NICはPCIe経由接続であり、コアローカリティの影響を受けない。クライアントはデーモンとの共有メモリ領域を持ち、
+クライアント側で管理する空き領域の情報をデーモンへ伝達する。デーモンは共有メモリ領域を事前にNICにMemory region登録し、そこへの書き込みをNICに依頼することで
+DMAを用いてSPSCによるDelegationチェーンを外れた転送が可能である。
 
 \section{実装}
 
-LocustaRPCはRust言語で実装されている。
-主要なコンポーネントは以下のクレートで構成される。
 
-\subsection{システム構成}
-
-mlx5クレートはConnect-X系NICへの直接アクセスを提供し、ibverbsに依存しない。
-copyrpcクレートはmlx5上にRPC通信を実装し、
-ipcクレートは共有メモリベースのClient-Daemon通信を、
-inprocクレートはデーモン内のスレッド間デリゲーションを提供する。
-
-\subsection{直接デバイスアクセス}
-
-mlx5クレートでは、NICのデバイスファイルを直接mmapし、
-WQEの構築、doorbellの発行、CQEの読み取りをユーザ空間から直接行う。
-これにより、ibverbsのspin lockおよびAPI層でのメモリコピーを完全に排除する。
-QPの生成やMemory Region登録等の制御パス操作についてはibverbs経由で行い、
-データパスのみを直接アクセスとすることで、実装の複雑性を抑えている。
-
-\subsection{メモリ管理}
-
-IPC通信では、クライアントとデーモンが/dev/shmを介してメモリ領域を共有する。
-デーモンはこの共有領域をNICにMemory Regionとして登録することで、
-大規模バッファ転送においてクライアント-デーモン間のメモリコピーを不要にする。
-リングバッファはキャッシュライン（64B）アラインで確保し、false sharingを防止する。
-
-% TODO: perf c2cによるHITM計測、Store buffer監視の具体的手法を記述
 
 \section{評価}
 
