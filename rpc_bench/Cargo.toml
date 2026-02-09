@@ -8,6 +8,8 @@ copyrpc = { path = "../copyrpc" }
 erpc = { path = "../erpc" }
 mlx5 = { path = "../mlx5" }
 mlx5_sys = { path = "../mlx5_sys" }
+ucx_sys = { path = "../ucx_sys" }
+mercury_sys = { path = "../mercury_sys" }
 mpi.workspace = true
 clap.workspace = true
 parquet.workspace = true

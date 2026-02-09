@@ -1207,6 +1207,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 
 [[package]]
+name = "mercury_sys"
+version = "0.1.0"
+dependencies = [
+ "bindgen 0.72.1",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1700,10 +1707,12 @@ dependencies = [
  "copyrpc",
  "erpc",
  "libc",
+ "mercury_sys",
  "mlx5",
  "mlx5_sys",
  "mpi",
  "parquet",
+ "ucx_sys",
 ]
 
 [[package]]

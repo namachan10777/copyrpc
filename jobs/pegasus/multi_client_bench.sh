@@ -14,6 +14,9 @@ mkdir -p "$LOGDIR"
 
 cd "$WORKDIR"
 
+# Mercury shared libs (spack)
+export LD_LIBRARY_PATH="$WORKDIR/spack/.spack-env/view/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
 # Build
 cargo build --release --bin rpc_bench
 
@@ -56,6 +59,13 @@ for NC in 1 2 3 4 6 8 12 16 24 32 48 64 96 128; do
     erpc multi-client -i $QD \
     -o "$OUTDIR/erpc_mc_nc${NC}.parquet" \
     || echo "FAILED: erpc NC=$NC"
+
+  echo "=== ucx-am NC=$NC ==="
+  timeout 120 mpirun -np $NP --rankfile "$RANKFILE" "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
+    --affinity-mode multinode --affinity-start 47 \
+    ucx-am multi-client -i $QD \
+    -o "$OUTDIR/ucx_am_mc_nc${NC}.parquet" \
+    || echo "FAILED: ucx-am NC=$NC"
 done
 
 echo "=== All multi-client benchmarks completed ==="

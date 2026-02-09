@@ -14,6 +14,9 @@ mkdir -p "$LOGDIR"
 
 cd "$WORKDIR"
 
+# Mercury shared libs (spack)
+export LD_LIBRARY_PATH="$WORKDIR/spack/.spack-env/view/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
 # Build
 cargo build --release --bin rpc_bench
 
@@ -62,6 +65,26 @@ for QD in 1 32 256; do
       -o "$OUTDIR/rc_send_qd${QD}_t${T}.parquet" \
       || echo "FAILED: rc-send QD=$QD T=$T"
   done
+done
+
+# ucx-am: QD (single-thread only)
+for QD in 1 32 256; do
+  echo "=== ucx-am QD=$QD ==="
+  timeout 120 mpirun -np 2 "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
+    --affinity-mode multinode --affinity-start 47 \
+    ucx-am one-to-one -i $QD \
+    -o "$OUTDIR/ucx_am_qd${QD}.parquet" \
+    || echo "FAILED: ucx-am QD=$QD"
+done
+
+# mercury: QD (single-thread only)
+for QD in 1 32 256; do
+  echo "=== mercury QD=$QD ==="
+  timeout 120 mpirun -np 2 "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
+    --affinity-mode multinode --affinity-start 47 \
+    mercury one-to-one -i $QD \
+    -o "$OUTDIR/mercury_qd${QD}.parquet" \
+    || echo "FAILED: mercury QD=$QD"
 done
 
 echo "=== All one-to-one benchmarks completed ==="
