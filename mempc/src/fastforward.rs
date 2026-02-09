@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering, compiler_fence};
 // SPSC Core
 // ============================================================================
 
-#[repr(C)]
+#[repr(C, align(64))]
 struct Slot<T> {
     valid: UnsafeCell<bool>,
     _pad: [u8; 7],
