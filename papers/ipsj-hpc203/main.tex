@@ -50,13 +50,14 @@ LocustaRPCは，RDMAを活用した低遅延通信と，
 
 そこで、本研究においては、計算ノード上でのミドルウェア展開という枠組みを踏まえ、以下を目的としたミドルウェア設計の提案を行う。
 
+% sfence集約は具体的すぎる
+
 \begin{enumerate}
     \item Daemonへのリクエスト集約
     \item Daemonへのリクエスト移譲による接続数節約と、それによるメモリ使用量・スループットの改善
     \item 通信のメモリアクセスパイプライン最適化と、sfence集約によるIPC向上
 \end{enumerate}
 
-\section{関連研究}
 
 \section{提案手法}
 
@@ -126,7 +127,7 @@ NIC負荷を下げてQueue depthを活用する設計としている。
 
 \subsection{Client-Daemon通信}
 
-Client-Daemon通信はx86_64のTSOを活用し、SPSCでOut-of-Order返答が可能なリングを用いる。
+Client-Daemon通信はx86\_64のTSOを活用し、SPSCでOut-of-Order返答が可能なリングを用いる。
 クライアントごとにLaneを分離し、サーバ側が全てをPollingすることでクライアント調停コストを最小化する。
 また、Laneに対して連続的に多重化されたリクエストをDrainすることで性能を稼ぐ。
 
