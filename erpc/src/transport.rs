@@ -289,9 +289,6 @@ impl UdTransport {
             .rq_mono_cq(&recv_cq)
             .build()?;
 
-        // Register QP with recv MonoCq
-        recv_cq.register(&qp);
-
         // Transition QP to RTR/RTS
         {
             let mut qp_ref = qp.borrow_mut();

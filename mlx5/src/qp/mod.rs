@@ -9,7 +9,7 @@ use std::{io, mem::MaybeUninit, ptr::NonNull};
 
 use crate::BuildResult;
 use crate::CompletionTarget;
-use crate::builder_common::{register_with_cqs, register_with_send_cq};
+use crate::builder_common::{register_with_cqs, register_with_send_cq, MaybeMonoCqRegister};
 use crate::cq::{Cq, Cqe};
 use crate::device::Context;
 use crate::pd::Pd;
@@ -1416,7 +1416,7 @@ pub struct CqSet;
 /// - `RqCqState`: RQ CQ configuration state (`NoCq` or `CqSet`)
 /// - `OnSq`: SQ completion callback type
 /// - `OnRq`: RQ completion callback type
-pub struct RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, RqCqState, OnSq, OnRq> {
+pub struct RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, RqCqState, OnSq, OnRq, SqMono = (), RqMono = ()> {
     ctx: &'a Context,
     pd: &'a Pd,
     config: RcQpConfig,
@@ -1432,6 +1432,10 @@ pub struct RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, RqCqState, OnSq, 
     // Callbacks (set via sq_cq/rq_cq, () for MonoCq)
     sq_callback: OnSq,
     rq_callback: OnRq,
+
+    // MonoCq references for auto-registration at build() time
+    sq_mono_cq_ref: SqMono,
+    rq_mono_cq_ref: RqMono,
 
     // SRQ (set via with_srq())
     srq: Option<Rc<Srq<RqEntry>>>,
@@ -1480,7 +1484,7 @@ impl Context {
         &'a self,
         pd: &'a Pd,
         config: &RcQpConfig,
-    ) -> RcQpBuilder<'a, SqEntry, RqEntry, InfiniBand, OwnedRq<RqEntry>, NoCq, NoCq, (), ()> {
+    ) -> RcQpBuilder<'a, SqEntry, RqEntry, InfiniBand, OwnedRq<RqEntry>, NoCq, NoCq, (), (), (), ()> {
         RcQpBuilder {
             ctx: self,
             pd,
@@ -1491,6 +1495,8 @@ impl Context {
             recv_cq_weak: None,
             sq_callback: (),
             rq_callback: (),
+            sq_mono_cq_ref: (),
+            rq_mono_cq_ref: (),
             srq: None,
             _marker: std::marker::PhantomData,
         }
@@ -1501,15 +1507,15 @@ impl Context {
 // SQ CQ Configuration Methods
 // =============================================================================
 
-impl<'a, SqEntry, RqEntry, T, Rq, RqCqState, OnRq>
-    RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, NoCq, RqCqState, (), OnRq>
+impl<'a, SqEntry, RqEntry, T, Rq, RqCqState, OnRq, RqMono>
+    RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, NoCq, RqCqState, (), OnRq, (), RqMono>
 {
     /// Set normal CQ for SQ with callback.
     pub fn sq_cq<OnSq>(
         self,
         cq: Rc<Cq>,
         callback: OnSq,
-    ) -> RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, CqSet, RqCqState, OnSq, OnRq>
+    ) -> RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, CqSet, RqCqState, OnSq, OnRq, (), RqMono>
     where
         OnSq: Fn(Cqe, SqEntry) + 'static,
     {
@@ -1523,6 +1529,8 @@ impl<'a, SqEntry, RqEntry, T, Rq, RqCqState, OnRq>
             recv_cq_weak: self.recv_cq_weak,
             sq_callback: callback,
             rq_callback: self.rq_callback,
+            sq_mono_cq_ref: (),
+            rq_mono_cq_ref: self.rq_mono_cq_ref,
             srq: self.srq,
             _marker: std::marker::PhantomData,
         }
@@ -1532,7 +1540,7 @@ impl<'a, SqEntry, RqEntry, T, Rq, RqCqState, OnRq>
     pub fn sq_mono_cq<Q, F>(
         self,
         mono_cq: &Rc<crate::mono_cq::MonoCq<Q, F>>,
-    ) -> RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, CqSet, RqCqState, (), OnRq>
+    ) -> RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, CqSet, RqCqState, (), OnRq, Rc<crate::mono_cq::MonoCq<Q, F>>, RqMono>
     where
         Q: crate::mono_cq::CompletionSource,
         F: Fn(Cqe, Q::Entry) + 'static,
@@ -1547,6 +1555,8 @@ impl<'a, SqEntry, RqEntry, T, Rq, RqCqState, OnRq>
             recv_cq_weak: self.recv_cq_weak,
             sq_callback: (),
             rq_callback: self.rq_callback,
+            sq_mono_cq_ref: Rc::clone(mono_cq),
+            rq_mono_cq_ref: self.rq_mono_cq_ref,
             srq: self.srq,
             _marker: std::marker::PhantomData,
         }
@@ -1557,15 +1567,15 @@ impl<'a, SqEntry, RqEntry, T, Rq, RqCqState, OnRq>
 // RQ CQ Configuration Methods
 // =============================================================================
 
-impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, OnSq>
-    RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, NoCq, OnSq, ()>
+impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, OnSq, SqMono>
+    RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, NoCq, OnSq, (), SqMono, ()>
 {
     /// Set normal CQ for RQ with callback.
     pub fn rq_cq<OnRq>(
         self,
         cq: Rc<Cq>,
         callback: OnRq,
-    ) -> RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, CqSet, OnSq, OnRq>
+    ) -> RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, CqSet, OnSq, OnRq, SqMono, ()>
     where
         OnRq: Fn(Cqe, RqEntry) + 'static,
     {
@@ -1579,6 +1589,8 @@ impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, OnSq>
             recv_cq_weak: Some(Rc::downgrade(&cq)),
             sq_callback: self.sq_callback,
             rq_callback: callback,
+            sq_mono_cq_ref: self.sq_mono_cq_ref,
+            rq_mono_cq_ref: (),
             srq: self.srq,
             _marker: std::marker::PhantomData,
         }
@@ -1588,7 +1600,7 @@ impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, OnSq>
     pub fn rq_mono_cq<Q, F>(
         self,
         mono_cq: &Rc<crate::mono_cq::MonoCq<Q, F>>,
-    ) -> RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, CqSet, OnSq, ()>
+    ) -> RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, CqSet, OnSq, (), SqMono, Rc<crate::mono_cq::MonoCq<Q, F>>>
     where
         Q: crate::mono_cq::CompletionSource,
         F: Fn(Cqe, Q::Entry) + 'static,
@@ -1603,6 +1615,8 @@ impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, OnSq>
             recv_cq_weak: None, // MonoCq doesn't need CQ registration
             sq_callback: self.sq_callback,
             rq_callback: (),
+            sq_mono_cq_ref: self.sq_mono_cq_ref,
+            rq_mono_cq_ref: Rc::clone(mono_cq),
             srq: self.srq,
             _marker: std::marker::PhantomData,
         }
@@ -1613,15 +1627,15 @@ impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, OnSq>
 // Transport / RQ Type Transition Methods
 // =============================================================================
 
-impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, RqCqState, OnSq, OnRq>
-    RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, RqCqState, OnSq, OnRq>
+impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, RqCqState, OnSq, OnRq, SqMono, RqMono>
+    RcQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, RqCqState, OnSq, OnRq, SqMono, RqMono>
 {
     /// Switch to RoCE transport.
     ///
     /// # NOTE: RoCE support is untested (IB-only hardware environment)
     pub fn for_roce(
         self,
-    ) -> RcQpBuilder<'a, SqEntry, RqEntry, RoCE, Rq, SqCqState, RqCqState, OnSq, OnRq> {
+    ) -> RcQpBuilder<'a, SqEntry, RqEntry, RoCE, Rq, SqCqState, RqCqState, OnSq, OnRq, SqMono, RqMono> {
         RcQpBuilder {
             ctx: self.ctx,
             pd: self.pd,
@@ -1632,14 +1646,16 @@ impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, RqCqState, OnSq, OnRq>
             recv_cq_weak: self.recv_cq_weak,
             sq_callback: self.sq_callback,
             rq_callback: self.rq_callback,
+            sq_mono_cq_ref: self.sq_mono_cq_ref,
+            rq_mono_cq_ref: self.rq_mono_cq_ref,
             srq: self.srq,
             _marker: std::marker::PhantomData,
         }
     }
 }
 
-impl<'a, SqEntry, RqEntry, T, SqCqState, RqCqState, OnSq, OnRq>
-    RcQpBuilder<'a, SqEntry, RqEntry, T, OwnedRq<RqEntry>, SqCqState, RqCqState, OnSq, OnRq>
+impl<'a, SqEntry, RqEntry, T, SqCqState, RqCqState, OnSq, OnRq, SqMono, RqMono>
+    RcQpBuilder<'a, SqEntry, RqEntry, T, OwnedRq<RqEntry>, SqCqState, RqCqState, OnSq, OnRq, SqMono, RqMono>
 {
     /// Use Shared Receive Queue (SRQ) instead of owned RQ.
     ///
@@ -1648,7 +1664,7 @@ impl<'a, SqEntry, RqEntry, T, SqCqState, RqCqState, OnSq, OnRq>
     pub fn with_srq(
         self,
         srq: Rc<Srq<RqEntry>>,
-    ) -> RcQpBuilder<'a, SqEntry, RqEntry, T, SharedRq<RqEntry>, SqCqState, RqCqState, OnSq, OnRq>
+    ) -> RcQpBuilder<'a, SqEntry, RqEntry, T, SharedRq<RqEntry>, SqCqState, RqCqState, OnSq, OnRq, SqMono, RqMono>
     {
         RcQpBuilder {
             ctx: self.ctx,
@@ -1660,6 +1676,8 @@ impl<'a, SqEntry, RqEntry, T, SqCqState, RqCqState, OnSq, OnRq>
             recv_cq_weak: self.recv_cq_weak,
             sq_callback: self.sq_callback,
             rq_callback: self.rq_callback,
+            sq_mono_cq_ref: self.sq_mono_cq_ref,
+            rq_mono_cq_ref: self.rq_mono_cq_ref,
             srq: Some(srq),
             _marker: std::marker::PhantomData,
         }
@@ -1671,7 +1689,7 @@ impl<'a, SqEntry, RqEntry, T, SqCqState, RqCqState, OnSq, OnRq>
 // =============================================================================
 
 impl<'a, SqEntry, RqEntry, OnSq, OnRq>
-    RcQpBuilder<'a, SqEntry, RqEntry, InfiniBand, OwnedRq<RqEntry>, CqSet, CqSet, OnSq, OnRq>
+    RcQpBuilder<'a, SqEntry, RqEntry, InfiniBand, OwnedRq<RqEntry>, CqSet, CqSet, OnSq, OnRq, (), ()>
 where
     SqEntry: 'static,
     RqEntry: 'static,
@@ -1742,7 +1760,7 @@ where
 // =============================================================================
 
 impl<'a, SqEntry, RqEntry, OnSq, OnRq>
-    RcQpBuilder<'a, SqEntry, RqEntry, InfiniBand, SharedRq<RqEntry>, CqSet, CqSet, OnSq, OnRq>
+    RcQpBuilder<'a, SqEntry, RqEntry, InfiniBand, SharedRq<RqEntry>, CqSet, CqSet, OnSq, OnRq, (), ()>
 where
     SqEntry: 'static,
     RqEntry: 'static,
@@ -1820,11 +1838,12 @@ where
 // Build Methods - InfiniBand + SharedRq (SRQ) with MonoCq for RQ
 // =============================================================================
 
-impl<'a, Entry, OnSq>
-    RcQpBuilder<'a, Entry, Entry, InfiniBand, SharedRq<Entry>, CqSet, CqSet, OnSq, ()>
+impl<'a, Entry, OnSq, RqMono>
+    RcQpBuilder<'a, Entry, Entry, InfiniBand, SharedRq<Entry>, CqSet, CqSet, OnSq, (), (), RqMono>
 where
     Entry: Clone + 'static,
     OnSq: Fn(Cqe, Entry) + 'static,
+    RqMono: MaybeMonoCqRegister<RcQpForMonoCqWithSrqAndSqCb<Entry, OnSq>>,
 {
     /// Build the RC QP with SRQ using MonoCq for recv.
     ///
@@ -1889,8 +1908,10 @@ where
             let qpn = qp_rc.borrow().qpn();
 
             // Register with send CQ for SQ completion processing
-            // recv_cq (MonoCq) registration is done separately by caller via MonoCq::register()
             register_with_send_cq(qpn, &send_cq_for_register, &qp_rc);
+
+            // Auto-register with recv MonoCq
+            self.rq_mono_cq_ref.maybe_register(&qp_rc);
 
             Ok(qp_rc)
         }
@@ -1902,7 +1923,7 @@ where
 // =============================================================================
 
 impl<'a, SqEntry, RqEntry, OnSq, OnRq>
-    RcQpBuilder<'a, SqEntry, RqEntry, RoCE, OwnedRq<RqEntry>, CqSet, CqSet, OnSq, OnRq>
+    RcQpBuilder<'a, SqEntry, RqEntry, RoCE, OwnedRq<RqEntry>, CqSet, CqSet, OnSq, OnRq, (), ()>
 where
     SqEntry: 'static,
     RqEntry: 'static,
@@ -1976,7 +1997,7 @@ where
 // =============================================================================
 
 impl<'a, SqEntry, RqEntry, OnSq, OnRq>
-    RcQpBuilder<'a, SqEntry, RqEntry, RoCE, SharedRq<RqEntry>, CqSet, CqSet, OnSq, OnRq>
+    RcQpBuilder<'a, SqEntry, RqEntry, RoCE, SharedRq<RqEntry>, CqSet, CqSet, OnSq, OnRq, (), ()>
 where
     SqEntry: 'static,
     RqEntry: 'static,
@@ -2054,10 +2075,12 @@ where
 // Build Methods - MonoCq (OnSq = (), OnRq = ()) - InfiniBand + OwnedRq
 // =============================================================================
 
-impl<'a, Entry>
-    RcQpBuilder<'a, Entry, Entry, InfiniBand, OwnedRq<Entry>, CqSet, CqSet, (), ()>
+impl<'a, Entry, SqMono, RqMono>
+    RcQpBuilder<'a, Entry, Entry, InfiniBand, OwnedRq<Entry>, CqSet, CqSet, (), (), SqMono, RqMono>
 where
     Entry: 'static,
+    SqMono: MaybeMonoCqRegister<RcQpForMonoCq<Entry>>,
+    RqMono: MaybeMonoCqRegister<RcQpForMonoCq<Entry>>,
 {
     /// Build the RC QP for use with MonoCq.
     ///
@@ -2104,7 +2127,13 @@ where
 
             RcQpIb::<Entry, Entry, (), ()>::init_direct_access_internal(&mut result)?;
 
-            Ok(Rc::new(RefCell::new(result)))
+            let qp_rc = Rc::new(RefCell::new(result));
+
+            // Auto-register with MonoCqs
+            self.sq_mono_cq_ref.maybe_register(&qp_rc);
+            self.rq_mono_cq_ref.maybe_register(&qp_rc);
+
+            Ok(qp_rc)
         }
     }
 }

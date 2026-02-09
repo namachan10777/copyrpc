@@ -7,7 +7,42 @@ use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
 use crate::CompletionTarget;
-use crate::cq::Cq;
+use crate::cq::{Cq, Cqe};
+use crate::mono_cq::{CompletionSource, MonoCq};
+
+// =============================================================================
+// MaybeMonoCqRegister trait
+// =============================================================================
+
+/// Trait for optional MonoCq auto-registration in QP builders.
+///
+/// When a builder uses MonoCq, the builder stores the `Rc<MonoCq<Q, F>>`
+/// via this trait's implementor. At `build()` time, `maybe_register()` is
+/// called to register the newly-created QP with the MonoCq.
+///
+/// - `()` implements this as a no-op (used when the CQ is a normal `Cq`).
+/// - `Rc<MonoCq<Q, F>>` implements the actual registration.
+///
+/// This is fully monomorphized — no dynamic dispatch, no heap allocation.
+pub trait MaybeMonoCqRegister<Q> {
+    fn maybe_register(&self, qp: &Rc<RefCell<Q>>);
+}
+
+impl<Q> MaybeMonoCqRegister<Q> for () {
+    #[inline(always)]
+    fn maybe_register(&self, _qp: &Rc<RefCell<Q>>) {}
+}
+
+impl<Q, F> MaybeMonoCqRegister<Q> for Rc<MonoCq<Q, F>>
+where
+    Q: CompletionSource + 'static,
+    F: Fn(Cqe, Q::Entry) + 'static,
+{
+    #[inline(always)]
+    fn maybe_register(&self, qp: &Rc<RefCell<Q>>) {
+        MonoCq::register(self, qp);
+    }
+}
 
 /// Register a queue with its send and recv CQs.
 ///

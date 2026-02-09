@@ -323,9 +323,6 @@ fn setup_send_recv_benchmark() -> Option<SendRecvBenchmarkSetup<impl Fn(Cqe, u64
         .build()
         .ok()?;
 
-    send_cq.register(&qp);
-    recv_cq.register(&qp);
-
     let send_buf = AlignedBuffer::new(SEND_RECV_BUFFER_SIZE);
     let recv_buf = AlignedBuffer::new(SEND_RECV_BUFFER_SIZE);
 
@@ -443,9 +440,6 @@ fn setup_write_imm_benchmark() -> Option<WriteImmBenchmarkSetup<impl Fn(Cqe, u64
         .rq_mono_cq(&recv_cq)
         .build()
         .ok()?;
-
-    send_cq.register(&qp);
-    recv_cq.register(&qp);
 
     let send_buf = AlignedBuffer::new(SEND_RECV_BUFFER_SIZE);
     let recv_buf = AlignedBuffer::new(SEND_RECV_BUFFER_SIZE);
@@ -568,11 +562,6 @@ fn setup_rdma_loopback_benchmark(relaxed: bool) -> Option<RdmaLoopbackSetup<impl
         .rq_mono_cq(&recv_cq)
         .build()
         .ok()?;
-
-    send_cq.register(&qp1);
-    recv_cq.register(&qp1);
-    send_cq.register(&qp2);
-    recv_cq.register(&qp2);
 
     let local_buf = AlignedBuffer::new(RDMA_BUFFER_SIZE);
     let remote_buf = AlignedBuffer::new(RDMA_BUFFER_SIZE);
@@ -702,9 +691,6 @@ fn server_thread_main(
         Ok(q) => q,
         Err(_) => return,
     };
-
-    send_cq.register(&qp);
-    recv_cq.register(&qp);
 
     let send_buf = AlignedBuffer::new(SEND_RECV_BUFFER_SIZE);
     let recv_buf = AlignedBuffer::new(SEND_RECV_BUFFER_SIZE);
@@ -882,9 +868,6 @@ fn write_imm_server_thread_main(
         Ok(q) => q,
         Err(_) => return,
     };
-
-    send_cq.register(&qp);
-    recv_cq.register(&qp);
 
     let send_buf = AlignedBuffer::new(SEND_RECV_BUFFER_SIZE);
     let recv_buf = AlignedBuffer::new(SEND_RECV_BUFFER_SIZE);

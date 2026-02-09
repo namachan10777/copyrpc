@@ -10,7 +10,7 @@ use std::{io, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
 use crate::BuildResult;
 use crate::CompletionTarget;
-use crate::builder_common::register_with_send_cq;
+use crate::builder_common::{register_with_send_cq, MaybeMonoCqRegister};
 use crate::cq::{Cq, Cqe};
 use crate::mono_cq::CompletionSource;
 use crate::device::Context;
@@ -117,13 +117,14 @@ pub struct NoCq;
 pub struct CqSet;
 
 /// DCI Builder with type-state pattern for CQ configuration.
-pub struct DciBuilder<'a, Entry, T, CqState, OnComplete> {
+pub struct DciBuilder<'a, Entry, T, CqState, OnComplete, SqMono = ()> {
     ctx: &'a Context,
     pd: &'a Pd,
     config: DciConfig,
     send_cq_ptr: *mut mlx5_sys::ibv_cq,
     send_cq_weak: Option<Weak<Cq>>,
     callback: OnComplete,
+    sq_mono_cq_ref: SqMono,
     _marker: PhantomData<(Entry, T, CqState)>,
 }
 
@@ -140,7 +141,7 @@ impl Context {
         &'a self,
         pd: &'a Pd,
         config: &DciConfig,
-    ) -> DciBuilder<'a, Entry, InfiniBand, NoCq, ()> {
+    ) -> DciBuilder<'a, Entry, InfiniBand, NoCq, (), ()> {
         DciBuilder {
             ctx: self,
             pd,
@@ -148,18 +149,19 @@ impl Context {
             send_cq_ptr: std::ptr::null_mut(),
             send_cq_weak: None,
             callback: (),
+            sq_mono_cq_ref: (),
             _marker: PhantomData,
         }
     }
 }
 
-impl<'a, Entry, T> DciBuilder<'a, Entry, T, NoCq, ()> {
+impl<'a, Entry, T> DciBuilder<'a, Entry, T, NoCq, (), ()> {
     /// Set normal CQ with callback.
     pub fn sq_cq<OnComplete>(
         self,
         cq: Rc<Cq>,
         callback: OnComplete,
-    ) -> DciBuilder<'a, Entry, T, CqSet, OnComplete>
+    ) -> DciBuilder<'a, Entry, T, CqSet, OnComplete, ()>
     where
         OnComplete: Fn(Cqe, Entry) + 'static,
     {
@@ -170,6 +172,7 @@ impl<'a, Entry, T> DciBuilder<'a, Entry, T, NoCq, ()> {
             send_cq_ptr: cq.as_ptr(),
             send_cq_weak: Some(Rc::downgrade(&cq)),
             callback,
+            sq_mono_cq_ref: (),
             _marker: PhantomData,
         }
     }
@@ -178,7 +181,7 @@ impl<'a, Entry, T> DciBuilder<'a, Entry, T, NoCq, ()> {
     pub fn sq_mono_cq<Q, F>(
         self,
         mono_cq: &Rc<MonoCq<Q, F>>,
-    ) -> DciBuilder<'a, Entry, T, CqSet, ()>
+    ) -> DciBuilder<'a, Entry, T, CqSet, (), Rc<MonoCq<Q, F>>>
     where
         F: Fn(Cqe, Q::Entry) + 'static,
         Q: crate::mono_cq::CompletionSource,
@@ -190,14 +193,15 @@ impl<'a, Entry, T> DciBuilder<'a, Entry, T, NoCq, ()> {
             send_cq_ptr: mono_cq.as_ptr(),
             send_cq_weak: None, // MonoCq doesn't need CQ registration
             callback: (),
+            sq_mono_cq_ref: Rc::clone(mono_cq),
             _marker: PhantomData,
         }
     }
 }
 
-impl<'a, Entry, T> DciBuilder<'a, Entry, T, NoCq, ()> {
+impl<'a, Entry, T> DciBuilder<'a, Entry, T, NoCq, (), ()> {
     /// Switch to RoCE transport.
-    pub fn for_roce(self) -> DciBuilder<'a, Entry, RoCE, NoCq, ()> {
+    pub fn for_roce(self) -> DciBuilder<'a, Entry, RoCE, NoCq, (), ()> {
         DciBuilder {
             ctx: self.ctx,
             pd: self.pd,
@@ -205,12 +209,13 @@ impl<'a, Entry, T> DciBuilder<'a, Entry, T, NoCq, ()> {
             send_cq_ptr: self.send_cq_ptr,
             send_cq_weak: self.send_cq_weak,
             callback: self.callback,
+            sq_mono_cq_ref: self.sq_mono_cq_ref,
             _marker: PhantomData,
         }
     }
 }
 
-impl<'a, Entry, OnComplete> DciBuilder<'a, Entry, InfiniBand, CqSet, OnComplete>
+impl<'a, Entry, OnComplete> DciBuilder<'a, Entry, InfiniBand, CqSet, OnComplete, ()>
 where
     Entry: 'static,
     OnComplete: Fn(Cqe, Entry) + 'static,
@@ -274,9 +279,10 @@ where
 /// Type alias for DCI with MonoCq (no callback stored).
 pub type DciForMonoCq<Entry> = Dci<Entry, InfiniBand, OrderedWqeTable<Entry>, ()>;
 
-impl<'a, Entry> DciBuilder<'a, Entry, InfiniBand, CqSet, ()>
+impl<'a, Entry, SqMono> DciBuilder<'a, Entry, InfiniBand, CqSet, (), SqMono>
 where
     Entry: 'static,
+    SqMono: MaybeMonoCqRegister<DciForMonoCq<Entry>>,
 {
     /// Build the DCI for MonoCq.
     pub fn build(self) -> BuildResult<DciForMonoCq<Entry>> {
@@ -323,7 +329,9 @@ where
 
             DciForMonoCq::<Entry>::init_direct_access_internal(&mut result)?;
 
-            Ok(Rc::new(RefCell::new(result)))
+            let qp_rc = Rc::new(RefCell::new(result));
+            self.sq_mono_cq_ref.maybe_register(&qp_rc);
+            Ok(qp_rc)
         }
     }
 }

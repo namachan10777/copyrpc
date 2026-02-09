@@ -264,8 +264,6 @@ fn rc_server_thread_main(
             Ok(q) => q,
             Err(_) => return,
         };
-        send_cq.register(&qp);
-        recv_cq.register(&qp);
         server_infos.push(ConnectionInfo {
             qpn: qp.borrow().qpn(),
             lid: port_attr.lid,
@@ -409,8 +407,6 @@ fn setup_rc_multi_qp_benchmark() -> Option<RcMultiQpSetup<impl Fn(Cqe, u64), imp
             .rq_mono_cq(&recv_cq)
             .build()
             .ok()?;
-        send_cq.register(&qp);
-        recv_cq.register(&qp);
         qps.push(qp);
     }
 
@@ -685,9 +681,6 @@ fn ud_server_thread_main(
         Err(_) => return,
     };
 
-    send_cq.register(&qp);
-    recv_cq.register(&qp);
-
     if qp.borrow_mut().activate(port, 0).is_err() {
         return;
     }
@@ -821,9 +814,6 @@ fn setup_ud_multi_qp_benchmark() -> Option<UdMultiQpSetup> {
         .rq_mono_cq(&recv_cq)
         .build()
         .ok()?;
-
-    send_cq.register(&qp);
-    recv_cq.register(&qp);
 
     qp.borrow_mut().activate(port, 0).ok()?;
 
@@ -1117,8 +1107,6 @@ fn dc_server_thread_main(
         Err(_) => return,
     };
 
-    send_cq.register(&dci);
-
     if dci.borrow_mut().activate(port, 0, 4).is_err() {
         return;
     }
@@ -1254,8 +1242,6 @@ fn setup_dc_multi_qp_benchmark() -> Option<DcMultiQpSetup> {
         .sq_mono_cq(&send_cq)
         .build()
         .ok()?;
-
-    send_cq.register(&dci);
 
     dci.borrow_mut().activate(port, 0, 4).ok()?;
 

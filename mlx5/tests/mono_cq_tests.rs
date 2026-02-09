@@ -88,9 +88,7 @@ fn test_mono_cq_with_rc_qp() {
         .build()
         .expect("Failed to create QP2");
 
-    // Register QPs with the CQ
-    cq.register(&qp1);
-    cq.register(&qp2);
+    // QPs are automatically registered with the CQ during build()
 
     // Connect QPs
     let remote1 = IbRemoteQpInfo {
@@ -251,8 +249,7 @@ fn test_mono_cq_multiple_completions() {
         .build()
         .expect("Failed to create QP2");
 
-    cq.register(&qp1);
-    cq.register(&qp2);
+    // QPs are automatically registered with the CQ during build()
 
     let remote1 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
@@ -388,8 +385,7 @@ fn test_mono_cq_high_load() {
         .build()
         .expect("Failed to create QP2");
 
-    cq.register(&qp1);
-    cq.register(&qp2);
+    // QPs are automatically registered with the CQ during build()
 
     let remote1 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
@@ -542,8 +538,7 @@ fn test_mono_cq_recv_rdma_write_imm() {
         .build()
         .expect("Failed to create QP2");
 
-    cq1.register(&qp1);
-    cq2.register(&qp2);
+    // QPs are automatically registered with their respective CQs during build()
 
     let remote1 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
@@ -703,8 +698,7 @@ fn test_mono_cq_bidirectional_pingpong() {
         .build()
         .expect("QP2");
 
-    qp1_cq.register(&qp1);
-    qp2_cq.register(&qp2);
+    // QPs are automatically registered with their respective CQs during build()
 
     let remote1 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
@@ -889,8 +883,7 @@ fn test_mono_cq_wraparound() {
         .build()
         .expect("Failed to create QP2");
 
-    cq.register(&qp1);
-    cq.register(&qp2);
+    // QPs are automatically registered with the CQ during build()
 
     let remote1 = IbRemoteQpInfo {
         qp_number: qp1.borrow().qpn(),
@@ -1028,8 +1021,7 @@ fn test_mono_cq_with_srq() {
     let qpn1 = qp1.borrow().qpn();
     eprintln!("QP1 QPN: {}", qpn1);
 
-    // Register QP1 with recv MonoCq
-    recv_cq.register(&qp1);
+    // QP1 is automatically registered with recv MonoCq during build()
 
     // Create QP2 (sender) - normal QP without SRQ
     let qp2 = ctx.ctx
@@ -1194,9 +1186,7 @@ fn test_mono_cq_with_ud_qp() {
         .build()
         .expect("Failed to create receiver QP");
 
-    // Register QPs with MonoCq
-    cq.register(&sender);
-    cq.register(&receiver);
+    // QPs are automatically registered with MonoCq during build()
 
     // Activate QPs
     sender.borrow_mut().activate(ctx.port, 0).expect("activate sender");

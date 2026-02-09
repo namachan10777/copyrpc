@@ -738,9 +738,6 @@ impl<U> EndpointInner<U> {
             .rq_mono_cq(recv_cq)
             .build()?;
 
-        // Register QP with MonoCq for completion dispatch
-        recv_cq.register(&qp);
-
         let inner = Rc::new(RefCell::new(Self {
             qp,
             send_ring,

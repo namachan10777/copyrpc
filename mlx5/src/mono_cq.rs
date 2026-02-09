@@ -18,11 +18,11 @@
 //!     println!("Completed: {:?}", entry);
 //! })?;
 //!
-//! // Create QP without callback (callback is on CQ)
-//! let qp = ctx.create_rc_qp_for_mono_cq(&pd, &mono_cq, &recv_cq, &config)?;
-//!
-//! // Register the QP
-//! mono_cq.register(&qp);
+//! // Create QP using builder with MonoCq — registration is automatic
+//! let qp = ctx.rc_qp_builder::<Entry, Entry>(&pd, &config)
+//!     .sq_mono_cq(&mono_cq)
+//!     .rq_mono_cq(&mono_cq)
+//!     .build()?;
 //!
 //! // Poll with inlined dispatch
 //! mono_cq.poll();
@@ -337,8 +337,9 @@ where
 
     /// Register a queue for completion dispatch.
     ///
+    /// Called automatically by the QP builder during `build()`.
     /// The queue must implement `CompletionSource` with same entry type.
-    pub fn register(&self, qp: &Rc<RefCell<Q>>) {
+    pub(crate) fn register(&self, qp: &Rc<RefCell<Q>>) {
         let qpn = qp.borrow().qpn();
         self.queues.borrow_mut().insert(qpn, Rc::downgrade(qp));
     }
