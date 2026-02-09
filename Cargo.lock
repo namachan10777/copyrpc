@@ -1204,6 +1204,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mempc_bench"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "clap",
+ "core_affinity",
+ "inproc",
+ "mempc",
+ "parquet",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

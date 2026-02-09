@@ -1,0 +1,18 @@
+[package]
+name = "mempc_bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+inproc = { path = "../inproc" }
+mempc = { path = "../mempc" }
+clap.workspace = true
+parquet.workspace = true
+arrow.workspace = true
+core_affinity.workspace = true
+
+[[bin]]
+name = "all_to_all"
+
+[[bin]]
+name = "server_client"
