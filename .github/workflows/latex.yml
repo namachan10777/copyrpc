@@ -3,10 +3,10 @@ name: Build LaTeX
 on:
   push:
     paths:
-      - 'papers/ipsj-hpc203/**'
+      - "papers/ipsj-hpc203/**"
   pull_request:
     paths:
-      - 'papers/ipsj-hpc203/**'
+      - "papers/ipsj-hpc203/**"
 
 jobs:
   build:
@@ -18,10 +18,10 @@ jobs:
         run: docker build -t ipsj-latex papers/ipsj-hpc203
 
       - name: Build PDF
-        run: docker run --rm -v ${{ github.workspace }}/papers/ipsj-hpc203:/workdir ipsj-latex latexmk main.tex
+        run: docker run --rm -v ${{ github.workspace }}/papers/ipsj-hpc203:/workdir ipsj-latex latexmk hpc203.tex
 
       - name: Upload PDF
         uses: actions/upload-artifact@v4
         with:
           name: ipsj-hpc203
-          path: papers/ipsj-hpc203/main.pdf
+          path: papers/ipsj-hpc203/hpc203.pdf
