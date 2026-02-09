@@ -9,7 +9,10 @@
 pub mod common;
 pub mod fastforward;
 pub mod fetch_add;
+pub mod hazard;
 pub mod lamport;
+pub mod lcrq;
+pub mod lprq;
 pub mod onesided;
 pub mod serial;
 pub mod user_data;
@@ -116,4 +119,6 @@ pub trait MpscChannel: 'static + Send + Sync {
 pub use fastforward::FastForwardMpsc;
 pub use fetch_add::FetchAddMpsc;
 pub use lamport::LamportMpsc;
+pub use lcrq::LcrqMpsc;
+pub use lprq::LprqMpsc;
 pub use onesided::OnesidedMpsc;
