@@ -1,9 +1,7 @@
 //! Flux All-to-All Benchmark Binary for mempc
 //!
-//! Benchmarks 3 SPSC-based mempc::MpscChannel implementations (onesided, fastforward, lamport)
+//! Benchmarks 4 mempc::MpscChannel implementations (onesided, fastforward, lamport, fetchadd)
 //! using inproc::Flux with N-thread all-to-all communication pattern.
-//! FetchAdd is excluded because Flux creates O(N^2) independent MPSC channels,
-//! which is incompatible with FetchAdd's shared request ring design.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Barrier};
@@ -32,6 +30,7 @@ enum TransportType {
     Onesided,
     FastForward,
     Lamport,
+    FetchAdd,
     All,
 }
 
@@ -143,24 +142,20 @@ fn run_flux_benchmark<M: MpscChannel>(
 
                 'outer: loop {
                     for _ in 0..1024 {
-                        let mut any_sent = false;
                         if can_send {
                             for &peer in &peers {
                                 if node.call(peer, payload, ()).is_ok() {
                                     total_sent += 1;
-                                    any_sent = true;
                                 }
                             }
                         }
 
-                        if !any_sent || (total_sent & 0x1F) == 0 {
-                            node.poll();
-                            while let Some(handle) = node.try_recv() {
-                                let data = handle.data();
-                                handle.reply(data);
-                            }
-                            can_send = node.pending_count() < max_inflight;
+                        node.poll();
+                        while let Some(handle) = node.try_recv() {
+                            let data = handle.data();
+                            handle.reply(data);
                         }
+                        can_send = node.pending_count() < max_inflight;
                     }
 
                     let pending = node.pending_count() as u64;
@@ -422,6 +417,21 @@ fn main() {
             args.runs,
             args.start_core,
             run_flux_benchmark::<mempc::LamportMpsc>,
+        ));
+    }
+
+    if matches!(args.transport, TransportType::FetchAdd | TransportType::All) {
+        results.push(run_transport_benchmark(
+            "flux",
+            "fetchadd",
+            args.threads,
+            args.capacity,
+            args.duration,
+            args.inflight,
+            args.warmup,
+            args.runs,
+            args.start_core,
+            run_flux_benchmark::<mempc::FetchAddMpsc>,
         ));
     }
 
