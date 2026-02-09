@@ -298,19 +298,20 @@ impl<Req: Serial + Send, Resp: Serial + Send> MpscServer<Req, Resp> for LamportS
     }
 
     fn try_recv(&mut self) -> Option<Self::RecvRef<'_>> {
-        // Round-robin drain: start from current_lane
-        let start = self.current_lane;
         let n = self.lanes.len();
 
-        for i in 0..n {
-            let idx = (start + i) % n;
+        for _ in 0..n {
+            let idx = self.current_lane;
+            self.current_lane += 1;
+            if self.current_lane >= n {
+                self.current_lane = 0;
+            }
             if self.lanes[idx].available > 0 {
                 let lane = &mut self.lanes[idx];
                 if let Some(req) = lane.call_rx.recv() {
                     lane.available -= 1;
                     let token = lane.recv_count;
                     lane.recv_count = lane.recv_count.wrapping_add(1);
-                    self.current_lane = (idx + 1) % n;
 
                     return Some(LamportRecvRef {
                         server: self,

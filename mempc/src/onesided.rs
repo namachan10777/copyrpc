@@ -474,8 +474,11 @@ impl<Req: Serial + Send, Resp: Serial + Send> MpscServer<Req, Resp> for Onesided
         let n = self.callers.len();
 
         for _ in 0..n {
-            let caller_id = self.scan_pos % n;
+            let caller_id = self.scan_pos;
             self.scan_pos += 1;
+            if self.scan_pos >= n {
+                self.scan_pos = 0;
+            }
 
             let state = &mut self.callers[caller_id];
             if let Some((slot_idx, data)) = state.call_rx.try_recv() {

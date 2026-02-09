@@ -218,7 +218,10 @@ impl<Req: Serial + Send, Resp: Serial + Send> MpscServer<Req, Resp>
         let n = self.callers.len();
         for _ in 0..n {
             let caller_id = self.scan_idx;
-            self.scan_idx = (self.scan_idx + 1) % n;
+            self.scan_idx += 1;
+            if self.scan_idx >= n {
+                self.scan_idx = 0;
+            }
 
             let slot_idx = (self.callers[caller_id].recv_count as usize)
                 % self.callers[caller_id].call_rx.ring.len();
