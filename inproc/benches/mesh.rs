@@ -5,7 +5,7 @@
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::thread;
 use inproc::{
-    create_flux_with_transport, create_mesh_with, Flux, ReceivedMessage, StdMpsc,
+    create_flux_with_transport, create_mesh_with, FetchAddMpsc, Flux, ReceivedMessage, StdMpsc,
 };
 
 #[cfg(feature = "crossbeam")]
@@ -53,6 +53,10 @@ fn bench_mesh_notify(c: &mut Criterion) {
     #[cfg(feature = "crossbeam")]
     group.bench_function("crossbeam", |b| {
         run_mesh_notify_bench::<CrossbeamMpsc>(b, NUM_NODES, MSGS_PER_NODE);
+    });
+
+    group.bench_function("fetch_add", |b| {
+        run_mesh_notify_bench::<FetchAddMpsc>(b, NUM_NODES, MSGS_PER_NODE);
     });
 
     group.finish();
@@ -123,6 +127,10 @@ fn bench_mesh_call_reply(c: &mut Criterion) {
     #[cfg(feature = "crossbeam")]
     group.bench_function("crossbeam", |b| {
         run_mesh_call_reply_bench::<CrossbeamMpsc>(b, NUM_NODES, CALLS_PER_NODE);
+    });
+
+    group.bench_function("fetch_add", |b| {
+        run_mesh_call_reply_bench::<FetchAddMpsc>(b, NUM_NODES, CALLS_PER_NODE);
     });
 
     group.finish();

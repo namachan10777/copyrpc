@@ -11,12 +11,14 @@ pub mod serial;
 pub mod transport;
 
 pub mod mpsc;
+pub mod mpsc_fetchadd;
 
 pub use flux::{create_flux, create_flux_with_transport, Flux, RecvHandle};
 pub use mesh::{create_mesh, create_mesh_with, Mesh};
 #[cfg(feature = "crossbeam")]
 pub use mesh::CrossbeamMpsc;
 pub use mpsc::StdMpsc;
+pub use mpsc_fetchadd::FetchAddMpsc;
 pub use serial::Serial;
 pub use transport::{
     FastForwardTransport, LamportTransport, OnesidedTransport, OnesidedImmediateTransport,
