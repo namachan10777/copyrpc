@@ -60,7 +60,7 @@ struct Args {
     transport: TransportType,
 
     /// Number of benchmark runs per configuration
-    #[arg(short, long, default_value = "3")]
+    #[arg(short, long, default_value = "7")]
     runs: usize,
 
     /// Number of warmup runs
@@ -87,15 +87,13 @@ struct BenchResult {
     duration_ns_min: u64,
     duration_ns_max: u64,
     duration_ns_stddev: f64,
-    throughput_mops_mean: f64,
-    latency_ns_mean: f64,
+    throughput_mops_median: f64,
+    latency_ns_median: f64,
 }
 
 struct RunResult {
     duration: Duration,
     total_completed: u64,
-    min_rps: u64,
-    max_rps: u64,
 }
 
 fn pin_to_core(core_id: usize) {
@@ -200,7 +198,7 @@ fn run_flux_benchmark<M: MpscChannel>(
 // ============================================================================
 
 fn monitor_and_collect(
-    per_thread_completed: Vec<Arc<AtomicU64>>,
+    _per_thread_completed: Vec<Arc<AtomicU64>>,
     stop_flag: Arc<AtomicBool>,
     barrier: Arc<Barrier>,
     handles: Vec<thread::JoinHandle<u64>>,
@@ -210,21 +208,8 @@ fn monitor_and_collect(
     let start = Instant::now();
     let run_duration = Duration::from_secs(duration_secs);
 
-    let mut samples = Vec::new();
-    let mut prev_total = 0u64;
-    let interval_ms = 500u64;
-
     while start.elapsed() < run_duration {
-        thread::sleep(Duration::from_millis(interval_ms));
-
-        let current_total: u64 = per_thread_completed.iter().map(|c| c.load(Relaxed)).sum();
-        let delta = current_total.saturating_sub(prev_total);
-        let rps = (delta as f64 * 1000.0 / interval_ms as f64) as u64;
-
-        if delta > 0 {
-            samples.push(rps);
-        }
-        prev_total = current_total;
+        thread::sleep(Duration::from_millis(500));
     }
 
     stop_flag.store(true, Relaxed);
@@ -233,18 +218,9 @@ fn monitor_and_collect(
     let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     let total_completed: u64 = results.iter().sum();
 
-    let (min_rps, max_rps) = if samples.is_empty() {
-        (0, 0)
-    } else {
-        samples.sort();
-        (*samples.first().unwrap(), *samples.last().unwrap())
-    };
-
     RunResult {
         duration,
         total_completed,
-        min_rps,
-        max_rps,
     }
 }
 
@@ -283,8 +259,6 @@ fn run_transport_benchmark(
     }
 
     // Benchmark runs
-    let mut all_mins = Vec::new();
-    let mut all_maxes = Vec::new();
     let mut durations = Vec::new();
     let mut total_ops = Vec::new();
 
@@ -293,24 +267,31 @@ fn run_transport_benchmark(
         let result = run_fn(n, capacity, duration_secs, inflight, start_core);
         durations.push(result.duration);
         total_ops.push(result.total_completed);
-        all_mins.push(result.min_rps);
-        all_maxes.push(result.max_rps);
+        let run_mops = result.total_completed as f64 / result.duration.as_secs_f64() / 1_000_000.0;
         println!(
-            "    Duration: {:?}, Completed: {}, Min RPS: {:.2} Mops/s, Max RPS: {:.2} Mops/s",
-            result.duration,
-            result.total_completed,
-            result.min_rps as f64 / 1_000_000.0,
-            result.max_rps as f64 / 1_000_000.0
+            "    Duration: {:?}, Completed: {}, Throughput: {:.2} Mops/s",
+            result.duration, result.total_completed, run_mops,
         );
     }
 
-    let avg_min_mops = all_mins.iter().sum::<u64>() as f64 / all_mins.len() as f64 / 1_000_000.0;
-    let max_mops = *all_maxes.iter().max().unwrap() as f64 / 1_000_000.0;
+    // Compute per-run throughput and take median
+    let mut throughputs: Vec<f64> = durations
+        .iter()
+        .zip(total_ops.iter())
+        .map(|(d, &ops)| ops as f64 / d.as_secs_f64())
+        .collect();
+    throughputs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median_rps = throughputs[throughputs.len() / 2];
+    let median_mops = median_rps / 1_000_000.0;
     let total_calls: u64 = total_ops.iter().sum();
 
     println!(
-        "  Summary: Avg Min={:.2} Mops/s, Best Max={:.2} Mops/s",
-        avg_min_mops, max_mops
+        "  Summary: Median={:.2} Mops/s (runs: {:?} Mops/s)",
+        median_mops,
+        throughputs
+            .iter()
+            .map(|t| format!("{:.2}", t / 1_000_000.0))
+            .collect::<Vec<_>>()
     );
 
     let (mean_ns, min_ns, max_ns, stddev_ns) = compute_stats(&durations);
@@ -325,8 +306,8 @@ fn run_transport_benchmark(
         duration_ns_min: min_ns,
         duration_ns_max: max_ns,
         duration_ns_stddev: stddev_ns,
-        throughput_mops_mean: avg_min_mops,
-        latency_ns_mean: 1_000_000_000.0 / (avg_min_mops * 1_000_000.0),
+        throughput_mops_median: median_mops,
+        latency_ns_median: 1_000_000_000.0 / (median_mops * 1_000_000.0),
     }
 }
 
@@ -342,8 +323,8 @@ fn write_parquet(path: &str, results: &[BenchResult]) -> Result<(), Box<dyn std:
         Field::new("duration_ns_min", DataType::UInt64, false),
         Field::new("duration_ns_max", DataType::UInt64, false),
         Field::new("duration_ns_stddev", DataType::Float64, false),
-        Field::new("throughput_mops_mean", DataType::Float64, false),
-        Field::new("latency_ns_mean", DataType::Float64, false),
+        Field::new("throughput_mops_median", DataType::Float64, false),
+        Field::new("latency_ns_median", DataType::Float64, false),
     ]);
 
     let threads: Vec<u32> = results.iter().map(|r| r.threads).collect();
@@ -356,8 +337,9 @@ fn write_parquet(path: &str, results: &[BenchResult]) -> Result<(), Box<dyn std:
     let duration_ns_min: Vec<u64> = results.iter().map(|r| r.duration_ns_min).collect();
     let duration_ns_max: Vec<u64> = results.iter().map(|r| r.duration_ns_max).collect();
     let duration_ns_stddev: Vec<f64> = results.iter().map(|r| r.duration_ns_stddev).collect();
-    let throughput_mops_mean: Vec<f64> = results.iter().map(|r| r.throughput_mops_mean).collect();
-    let latency_ns_mean: Vec<f64> = results.iter().map(|r| r.latency_ns_mean).collect();
+    let throughput_mops_median: Vec<f64> =
+        results.iter().map(|r| r.throughput_mops_median).collect();
+    let latency_ns_median: Vec<f64> = results.iter().map(|r| r.latency_ns_median).collect();
 
     let batch = RecordBatch::try_new(
         Arc::new(schema),
@@ -372,8 +354,8 @@ fn write_parquet(path: &str, results: &[BenchResult]) -> Result<(), Box<dyn std:
             Arc::new(UInt64Array::from(duration_ns_min)),
             Arc::new(UInt64Array::from(duration_ns_max)),
             Arc::new(Float64Array::from(duration_ns_stddev)),
-            Arc::new(Float64Array::from(throughput_mops_mean)),
-            Arc::new(Float64Array::from(latency_ns_mean)),
+            Arc::new(Float64Array::from(throughput_mops_median)),
+            Arc::new(Float64Array::from(latency_ns_median)),
         ],
     )?;
 
