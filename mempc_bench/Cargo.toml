@@ -10,6 +10,7 @@ clap.workspace = true
 parquet.workspace = true
 arrow.workspace = true
 core_affinity.workspace = true
+fastant.workspace = true
 
 [[bin]]
 name = "all_to_all"

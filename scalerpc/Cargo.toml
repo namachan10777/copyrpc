@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 mlx5 = { version = "0.1.0", path = "../mlx5" }
 libc.workspace = true
-minstant.workspace = true
+fastant.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

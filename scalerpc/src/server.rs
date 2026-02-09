@@ -28,7 +28,7 @@
 use std::cell::{Cell, UnsafeCell};
 use std::rc::Rc;
 
-use minstant::Instant;
+use fastant::Instant;
 
 use mlx5::cq::{Cq, Cqe};
 use mlx5::device::Context;

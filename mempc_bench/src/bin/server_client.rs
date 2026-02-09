@@ -3,10 +3,10 @@
 //! Benchmarks raw mempc::MpscChannel API with 1 server + N clients pattern.
 //! Tests OnesidedMpsc, FastForwardMpsc, LamportMpsc, and FetchAddMpsc.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use arrow::array::{Float64Array, StringArray, UInt32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -113,27 +113,21 @@ fn run_server_client<M: MpscChannel>(
     start_core: usize,
 ) -> RunResult {
     let num_clients = n - 1;
-    // n total threads: 1 server + (n-1) clients
-    // Only clients' completed counts are tracked
-    let per_thread_completed: Vec<Arc<AtomicU64>> = (0..num_clients)
-        .map(|_| Arc::new(AtomicU64::new(0)))
-        .collect();
     let stop_flag = Arc::new(AtomicBool::new(false));
 
     let (callers, server) = M::create::<Payload, Payload>(num_clients, capacity, max_inflight);
 
-    // barrier: num_clients + 1 server + 1 monitor = n + 1
+    // barrier: num_clients + 1 server + 1 main thread = n + 1
     let barrier = Arc::new(Barrier::new(n + 1));
     let payload = Payload::default();
-
-    let mut handles: Vec<thread::JoinHandle<u64>> = Vec::with_capacity(n);
+    let run_duration = Duration::from_secs(duration_secs);
 
     // Server thread
-    {
+    let server_handle = {
         let barrier = Arc::clone(&barrier);
         let stop_flag = Arc::clone(&stop_flag);
         let core = start_core;
-        handles.push(thread::spawn(move || {
+        thread::spawn(move || {
             pin_to_core(core);
             let mut server = server;
             barrier.wait();
@@ -166,20 +160,21 @@ fn run_server_client<M: MpscChannel>(
 
             // Server returns 0 since we only count client-side completions
             0
-        }));
-    }
+        })
+    };
 
     // Client threads
+    let mut client_handles: Vec<thread::JoinHandle<u64>> = Vec::with_capacity(num_clients);
     for (client_idx, mut caller) in callers.into_iter().enumerate() {
         let barrier = Arc::clone(&barrier);
-        let stop_flag = Arc::clone(&stop_flag);
-        let my_completed = Arc::clone(&per_thread_completed[client_idx]);
         let core = start_core - 1 - client_idx;
-        handles.push(thread::spawn(move || {
+        client_handles.push(thread::spawn(move || {
             pin_to_core(core);
             barrier.wait();
 
+            let deadline = fastant::Instant::now() + run_duration;
             let mut total_completed = 0u64;
+            let mut iter_count = 0u32;
 
             loop {
                 // Send requests
@@ -197,9 +192,8 @@ fn run_server_client<M: MpscChannel>(
                     total_completed += 1;
                 }
 
-                my_completed.store(total_completed, Relaxed);
-
-                if stop_flag.load(Relaxed) {
+                iter_count = iter_count.wrapping_add(1);
+                if iter_count & 0x3F == 0 && fastant::Instant::now() >= deadline {
                     break;
                 }
             }
@@ -208,39 +202,17 @@ fn run_server_client<M: MpscChannel>(
         }));
     }
 
-    monitor_and_collect(
-        per_thread_completed,
-        stop_flag,
-        barrier,
-        handles,
-        duration_secs,
-    )
-}
-
-// ============================================================================
-// Shared monitoring infrastructure
-// ============================================================================
-
-fn monitor_and_collect(
-    _per_thread_completed: Vec<Arc<AtomicU64>>,
-    stop_flag: Arc<AtomicBool>,
-    barrier: Arc<Barrier>,
-    handles: Vec<thread::JoinHandle<u64>>,
-    duration_secs: u64,
-) -> RunResult {
+    // Main thread: wait for all clients to complete, then stop server
     barrier.wait();
-    let start = Instant::now();
-    let run_duration = Duration::from_secs(duration_secs);
-
-    while start.elapsed() < run_duration {
-        thread::sleep(Duration::from_millis(500));
-    }
-
-    stop_flag.store(true, Relaxed);
+    let start = fastant::Instant::now();
+    let client_results: Vec<u64> = client_handles
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .collect();
+    let total_completed: u64 = client_results.iter().sum();
     let duration = start.elapsed();
-
-    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    let total_completed: u64 = results.iter().sum();
+    stop_flag.store(true, Relaxed);
+    server_handle.join().unwrap();
 
     RunResult {
         duration,

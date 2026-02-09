@@ -3,10 +3,9 @@
 //! Benchmarks 4 mempc::MpscChannel implementations (onesided, fastforward, lamport, fetchadd)
 //! using inproc::Flux with N-thread all-to-all communication pattern.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use arrow::array::{Float64Array, StringArray, UInt32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -111,23 +110,18 @@ fn run_flux_benchmark<M: MpscChannel>(
     max_inflight: usize,
     start_core: usize,
 ) -> RunResult {
-    let per_thread_completed: Vec<Arc<AtomicU64>> =
-        (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
-    let stop_flag = Arc::new(AtomicBool::new(false));
-
     let nodes: Vec<Flux<Payload, (), _, M>> =
         create_flux_with(n, capacity, max_inflight, |_: (), _: Payload| {});
 
     let barrier = Arc::new(Barrier::new(n + 1));
     let payload = Payload::default();
+    let run_duration = Duration::from_secs(duration_secs);
 
     let handles: Vec<_> = nodes
         .into_iter()
         .enumerate()
         .map(|(thread_idx, mut node)| {
             let barrier = Arc::clone(&barrier);
-            let stop_flag = Arc::clone(&stop_flag);
-            let my_completed = Arc::clone(&per_thread_completed[thread_idx]);
             let core = start_core - thread_idx;
             thread::spawn(move || {
                 pin_to_core(core);
@@ -135,10 +129,11 @@ fn run_flux_benchmark<M: MpscChannel>(
                 let peers: Vec<usize> = (0..n).filter(|&p| p != id).collect();
 
                 barrier.wait();
+                let deadline = fastant::Instant::now() + run_duration;
 
                 let mut total_sent = 0u64;
-                let mut total_completed = 0u64;
                 let mut can_send = true;
+                let mut iter_count = 0u32;
 
                 'outer: loop {
                     for _ in 0..1024 {
@@ -158,60 +153,24 @@ fn run_flux_benchmark<M: MpscChannel>(
                         can_send = node.pending_count() < max_inflight;
                     }
 
-                    let pending = node.pending_count() as u64;
-                    let new_completed = total_sent.saturating_sub(pending);
-                    if new_completed > total_completed {
-                        total_completed = new_completed;
-                        my_completed.store(total_completed, Relaxed);
-                    }
-
-                    if stop_flag.load(Relaxed) {
+                    iter_count = iter_count.wrapping_add(1);
+                    if iter_count & 0x3 == 0 && fastant::Instant::now() >= deadline {
                         break 'outer;
                     }
                 }
 
                 let pending = node.pending_count() as u64;
-                total_completed = total_sent.saturating_sub(pending);
-                my_completed.store(total_completed, Relaxed);
-
-                total_completed
+                total_sent.saturating_sub(pending)
             })
         })
         .collect();
 
-    monitor_and_collect(
-        per_thread_completed,
-        stop_flag,
-        barrier,
-        handles,
-        duration_secs,
-    )
-}
-
-// ============================================================================
-// Shared monitoring infrastructure
-// ============================================================================
-
-fn monitor_and_collect(
-    _per_thread_completed: Vec<Arc<AtomicU64>>,
-    stop_flag: Arc<AtomicBool>,
-    barrier: Arc<Barrier>,
-    handles: Vec<thread::JoinHandle<u64>>,
-    duration_secs: u64,
-) -> RunResult {
     barrier.wait();
-    let start = Instant::now();
-    let run_duration = Duration::from_secs(duration_secs);
+    let start = fastant::Instant::now();
 
-    while start.elapsed() < run_duration {
-        thread::sleep(Duration::from_millis(500));
-    }
-
-    stop_flag.store(true, Relaxed);
-    let duration = start.elapsed();
-
-    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let results: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     let total_completed: u64 = results.iter().sum();
+    let duration = start.elapsed();
 
     RunResult {
         duration,

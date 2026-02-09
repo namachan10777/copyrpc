@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use minstant::Instant;
+use fastant::Instant;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
