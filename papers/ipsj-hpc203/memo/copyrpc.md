@@ -503,3 +503,114 @@ CQ pollingの本質は、**受信イベントの直列化をCPUではなくNIC�
 10. **BlueFlame最適化**: 3モード（最小8B/フルWQE/バッチ）。AVX-512非テンポラルストアでキャッシュ汚染なしの64B MMIO書き込み。ダブルバッファリングでPCIe WC合併を防止
 11. **Inline最適化**: ペイロードをWQE内に埋め込みDMA削減。BF+Inlineの併用でWQE+ペイロードが単一MMIO書き込みで完結
 12. **CQポーリングの本質**: 受信イベントの直列化をCPUからNICにオフロード。ibverbsのspin lock/コピー/間接呼び出しが従来のCQ polling vs memory polling比較を歪めていた。MonoCqの直接アクセスにより真の性能を回復
+
+## 先行研究との比較（サーベイPDFに基づく）
+
+### 比較の5軸
+
+| 軸 | 内容 |
+|----|------|
+| データ配置 (placement) | 受信側のどこに、どの粒度で書くか（固定スロット/連続リング/共有プール） |
+| 到着通知 (notification) | メモリポーリング vs CQポーリング vs 割込み vs 補助フラグ |
+| フロー制御 (flow control) | slotクリア/head共有/credit/予約不変条件 |
+| バッチング・PCIe/NIC効率 | Doorbell batching, unsignaled WQE, inline等 |
+| 接続スケーラビリティ | QP数・RNIC SRAMキャッシュスラッシングへの対処 |
+
+### WRITE系RDMA RPCの系譜
+
+#### メモリポーリング型
+
+**FaRM** (NSDI'14, Dragojević et al.)
+- circular bufferにRDMA WRITEでメッセージ書き込み、受信側はHead位置をポーリングして非ゼロ値で検知
+- 処理後にゼロクリア+Head更新、送信側はHeadコピーを見て上書き回避
+- チャネル数増加でポーリング対象が線形に増加（"polling overhead increases linearly"）
+- FaRM自身が「大規模化時にはWRITE+IMM + SRQでポーリングコスト一定化が望ましい」と示唆
+- **copyrpcとの関係**: FaRMの示唆を具体的に実装・体系化した形
+
+**HERD** (SIGCOMM'14, Kalia et al.)
+- クライアントがRDMA WRITEで要求書き込み、サーバCPUがメモリポーリングで検知
+- 応答はUD SENDで返すハイブリッド（outbound WRITEが接続数でスケールしないため）
+- **copyrpcとの対比**: copyrpcは双方向ともWRITE+IMMで統一。CQ集約によりHERDが回避したCQポーリングのコストを解決
+
+#### WRITE+IMM（CQE通知）型
+
+研究史的にはCQポーリングは高コストとして敬遠されてきた。背景にはibverbs経由のCQ処理オーバーヘッド（spin lock、コピー、間接呼び出し）がある。ICDE'20の検討でも「2回WRITEしてフラグを立て、メモリ側をポーリングする方が望ましい場面がある」と示唆。
+
+copyrpcは「CQポーリングの重さ」に対して:
+1. 複数QPのCQEを1つのCQに集約
+2. CQハードウェアバッファへの直接アクセス（ibverbsバイパス）
+3. owner bitチェック + prefetchで処理系を極限まで薄くする
+
+### WRITE系以外を含むSOTAとの比較
+
+**FaSST** (OSDI'16, Kalia et al.)
+- two-sided UD datagram RPC。各コアが1つのdatagram QPで多対多通信、QP状態爆発を回避
+- Doorbell batchingがバッチ内宛先数に依存せず効く
+- **copyrpcとの対比**: RC + WRITE+IMMで対極。copyrpcがSOTA水準で優位性を示すには、RCでも接続数増加時に失速しないこと（デーモン中継）、UDに比べた汎用性（信頼性、MTU、memory verbs併用）を明確に示す必要
+
+**RFP** (EuroSys'17, Su et al.)
+- 「サーバがRDMAを発行(outbound)するコストが高く、inbound/outboundに非対称性がある」
+- 「server-bypassは1回で済む理想に反して複数回の追加RDMAが必要」
+- 応答はサーバが送らず、クライアントがREADで取りに行くパラダイム
+- **copyrpcとの対比**: 応答もWRITEで返す設計。バッチング（WQE・Doorbell節約）、piggyback（追加往復抑制）、予約不変条件（応答詰まり抑制）が非対称性をどの程度相殺できるかが評価軸
+
+**HatRPC** (SC'21)
+- payload・並行度・性能目標に基づき、Direct-WriteIMM/RFP/Send-Recv/Rendezvous等の複数RDMAプロトコルを切替え
+- 「WRITE+IMMは強いが、負荷・メッセージサイズ・資源制約次第でRFP/他方式が勝つ」ことを前提
+- **copyrpcとの対比**: copyrpcは「WRITE+IMM中心」に収束。比較時は"copyrpcが勝つ条件領域"（小〜中メッセージ、低レイテンシ重視、lossless前提、CPU/PCIeが支配、接続数をデーモンで抑制可能）を明確に区切ることが重要
+
+**DrTM+H** (OSDI'18)
+- one-sided/two-sidedのどちらか一方が全フェーズに勝つわけではないことをphase-by-phaseで証明、ハイブリッドが最適
+- copyrpcが特定条件領域で勝つ設計であることの領域定義の精度が説得力を左右
+
+**eRPC** (NSDI'19, Kalia et al.)
+- 汎用RPCでcommodity UDP上でSOTAに近い性能。session creditsによるend-to-endフロー制御
+- **copyrpcとの対比**: credit_grant/resp_reservation設計は同じcredit系譜。「RDMA+WRITE+IMMでeRPCの汎用性をどの程度犠牲にせず上回れるか」が問い
+
+### 接続スケーラビリティSOTA
+
+**ScaleRPC** (EuroSys'19, Chen et al.)
+- connection groupingで同時アクティブ接続数を抑えRNICキャッシュスラッシング緩和
+- virtualized mappingでメッセージプール共有、CPUキャッシュ競合抑制
+- トレードオフ: グルーピングによるレイテンシ分布の二峰性
+
+**Flock** (SOSP'21, Monga et al.)
+- connection handle abstractionでスレッドとQPを多対多に多重化
+- coalescingベース同期、symbiotic send-recv scheduling、credit renewal
+
+**RDMAX** (IEEE/ACM ToN 2025/26)
+- RC QP multiplexingで1 RC QPに複数クライアントを束ねる
+- in-network request dispatchingで衝突のない書込み位置決定をネットワーク側へオフロード
+- 制約: iCRC再計算のためiCRC無効化が必要等
+
+**SRC** (APNet'25, Microsoft)
+- QPと"接続"の結合を問題視し、QPとconnectionsをdecoupleして状態量を桁違いに削減
+- 512ノードでRC: 146MB/node → SRC: 0.19MB/node
+
+**SRNIC** (NSDI'23, Wang et al.)
+- RNICのon-chip状態を概念モデルで分解、プロトコル・アーキテクチャ共同設計
+- 10K接続規模を性能劣化なしに達成
+
+**StaR** (ICNP'21)
+- 状態を非対称側へ寄せる（stateless化）で高並行側のRNICを軽量化
+
+**1RMA** (SIGCOMM'20)
+- マルチテナントDC制約を踏まえ、one-sided primitives中心で"send/recvはソフトで良い"
+
+**copyrpcの位置づけ**:
+- **強み**: CQ集約 + SRQ共有は「受信側資源管理の集約・定数化」方向で、SRC等の"共有化で制御点を減らす"潮流と整合
+- **限界**: RC QPを接続ごとに保持する限り、QP状態量問題からは逃げにくい。ScaleRPC/Flock/RDMAX/SRC/SRNICがまさにここを主戦場にしている
+- **回答**: デーモン中継+接続集約は「QP数そのものを物理的に減らす」アーキテクチャ的回答。ソフトウェアQP共有（Flock）やグルーピング（ScaleRPC）とは異なる比較軸
+
+### 研究ギャップと論文比較の勝ち筋
+
+copyrpcの新規性は「WRITE+IMM中心」という一点ではなく、以下の組合せ:
+1. **フロー制御**: 予約不変条件 `in_flight + 2R <= C` によるデッドロック自由性
+2. **制御メッセージ排除**: flow metadata piggybackで専用ACK不要
+3. **CQポーリング再評価**: イベント集約 + ibverbsバイパスによる低オーバーヘッド実装
+4. **接続数問題へのアーキテクチャ回答**: デーモン中継 + 接続集約
+
+**比較の設計**:
+- **WRITE系比較**: memory polling型（FaRM, HERD）に対する「CQ通知+集約」の優位性、ACK/制御メッセージ削減とデッドロック自由性の明快さが主戦場。FaRM自身の示唆をcopyrpcが具体化した構図
+- **SOTA比較**: HatRPC/DrTM+Hの「条件領域で最適が変わる」事実を踏まえ、copyrpcが勝つ領域（小〜中メッセージ、低レイテンシ重視、lossless前提、CPU/PCIeが支配、接続数をデーモンで抑制可能）を定義
+- **接続スケーラビリティSOTA**: "copyrpc単体のトランスポート最適化"と"接続集約アーキテクチャ"を分けて比較するのが公正。SOTAはQP状態量削減が主目的、copyrpcは受信検知・フロー制御・CQ処理の極限最適化が主目的
