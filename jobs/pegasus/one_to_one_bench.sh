@@ -14,7 +14,7 @@ mkdir -p "$LOGDIR"
 
 cd "$WORKDIR"
 
-# Mercury shared libs (spack)
+# Spack shared libs
 export LD_LIBRARY_PATH="$WORKDIR/spack/.spack-env/view/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # Build
@@ -35,9 +35,9 @@ for QD in 1 32 256; do
       [[ $E -lt $T || $((E % T)) -ne 0 ]] && continue
       echo "=== copyrpc QD=$QD T=$T E=$E ==="
       timeout 120 mpirun -np 2 "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
+        -o "$OUTDIR/copyrpc_qd${QD}_t${T}_e${E}.parquet" \
         --affinity-mode multinode --affinity-start 47 \
         copyrpc one-to-one -e $E -i $QD -t $T \
-        -o "$OUTDIR/copyrpc_qd${QD}_t${T}_e${E}.parquet" \
         || echo "FAILED: copyrpc QD=$QD T=$T E=$E"
     done
   done
@@ -48,9 +48,9 @@ for QD in 1 32 256; do
   for T in 1 2 4 8 16; do
     echo "=== erpc QD=$QD T=$T ==="
     timeout 120 mpirun -np 2 "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
+      -o "$OUTDIR/erpc_qd${QD}_t${T}.parquet" \
       --affinity-mode multinode --affinity-start 47 \
       erpc one-to-one -i $QD -t $T \
-      -o "$OUTDIR/erpc_qd${QD}_t${T}.parquet" \
       || echo "FAILED: erpc QD=$QD T=$T"
   done
 done
@@ -60,9 +60,9 @@ for QD in 1 32 256; do
   for T in 1 2 4 8 16; do
     echo "=== rc-send QD=$QD T=$T ==="
     timeout 120 mpirun -np 2 "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
+      -o "$OUTDIR/rc_send_qd${QD}_t${T}.parquet" \
       --affinity-mode multinode --affinity-start 47 \
       rc-send one-to-one -i $QD -t $T \
-      -o "$OUTDIR/rc_send_qd${QD}_t${T}.parquet" \
       || echo "FAILED: rc-send QD=$QD T=$T"
   done
 done
@@ -71,20 +71,10 @@ done
 for QD in 1 32 256; do
   echo "=== ucx-am QD=$QD ==="
   timeout 120 mpirun -np 2 "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
+    -o "$OUTDIR/ucx_am_qd${QD}.parquet" \
     --affinity-mode multinode --affinity-start 47 \
     ucx-am one-to-one -i $QD \
-    -o "$OUTDIR/ucx_am_qd${QD}.parquet" \
     || echo "FAILED: ucx-am QD=$QD"
-done
-
-# mercury: QD (single-thread only)
-for QD in 1 32 256; do
-  echo "=== mercury QD=$QD ==="
-  timeout 120 mpirun -np 2 "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
-    --affinity-mode multinode --affinity-start 47 \
-    mercury one-to-one -i $QD \
-    -o "$OUTDIR/mercury_qd${QD}.parquet" \
-    || echo "FAILED: mercury QD=$QD"
 done
 
 echo "=== All one-to-one benchmarks completed ==="
