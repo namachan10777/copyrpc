@@ -4,17 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+mempc = { path = "../mempc" }
 slab.workspace = true
 clap = { workspace = true, optional = true }
 parquet = { workspace = true, optional = true }
 arrow = { workspace = true, optional = true }
 core_affinity = { workspace = true, optional = true }
-rtrb = { version = "0.3", optional = true }
-omango = { version = "0.2", optional = true }
 [features]
 bench-bin = ["clap", "parquet", "arrow", "core_affinity"]
-rtrb = ["dep:rtrb"]
-omango = ["dep:omango"]
 
 [dev-dependencies]
 criterion.workspace = true

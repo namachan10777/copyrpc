@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::mpsc::{MpscChannel, MpscChannelReceiver, MpscChannelSender, SendError, TryRecvError};
-use crate::transport::common::CachePadded;
+use mempc::common::CachePadded;
 
 // ============================================================================
 // Slot

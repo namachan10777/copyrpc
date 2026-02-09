@@ -12,7 +12,7 @@ use crate::mpsc::{
     MpscChannel, MpscChannelReceiver, MpscChannelSender, SendError, TryRecvError,
 };
 use crate::mpsc_fetchadd::FetchAddMpsc;
-use crate::serial::Serial;
+use mempc::Serial;
 use crate::{ReceivedMessage, RecvError, SendError as CrateSendError};
 
 /// Sender matrix: `all_senders[j][i]` holds node j's sender to node i's receive queue.

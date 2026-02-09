@@ -1,8 +1,8 @@
-//! RPC over shared memory using ffwd delegation pattern.
+//! RPC over shared memory using generation counter SPSC protocol.
 //!
 //! Each client gets a dedicated SPSC request ring. The server scans all client
 //! request rings (flat combining) and replies via per-client SPSC response rings.
-//! Supports out-of-order responses via slab-keyed user data on the client side.
+//! Supports out-of-order responses via slot_idx matching on the client side.
 //!
 //! ## Client API
 //!
@@ -13,44 +13,20 @@
 //! ## Server API
 //!
 //! - `poll()` — scans all client request rings for new requests
-//! - `recv()` — returns next request via zero-copy `RecvHandle`
+//! - `recv()` — returns next request via `RecvHandle` (data is copied)
 //! - `reply(token, resp)` — writes response (immediate or deferred)
 
 pub mod shm;
 
+use mempc::common::Response;
+use mempc::onesided::{RawReceiver, RawSender, Slot};
+pub use mempc::Serial;
+
 use shm::SharedMemory;
-use std::cell::Cell;
-use std::cell::UnsafeCell;
 use std::io;
 use std::marker::PhantomData;
 use std::path::Path;
-use std::ptr::{read_volatile, write_volatile};
-use std::sync::atomic::{compiler_fence, AtomicBool, AtomicU32, Ordering};
-
-// === Serial trait ===
-
-/// Marker trait for types safely transmittable through the channel.
-///
-/// # Safety
-/// Types must be `Copy` with a stable memory layout suitable for IPC.
-pub unsafe trait Serial: Copy {}
-
-unsafe impl Serial for u8 {}
-unsafe impl Serial for u16 {}
-unsafe impl Serial for u32 {}
-unsafe impl Serial for u64 {}
-unsafe impl Serial for u128 {}
-unsafe impl Serial for usize {}
-unsafe impl Serial for i8 {}
-unsafe impl Serial for i16 {}
-unsafe impl Serial for i32 {}
-unsafe impl Serial for i64 {}
-unsafe impl Serial for i128 {}
-unsafe impl Serial for isize {}
-unsafe impl Serial for f32 {}
-unsafe impl Serial for f64 {}
-unsafe impl Serial for bool {}
-unsafe impl<T: Copy, const N: usize> Serial for [T; N] {}
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 // === Public types ===
 
@@ -61,7 +37,7 @@ pub struct ClientId(pub u32);
 #[derive(Debug)]
 pub struct RequestToken {
     client_id: ClientId,
-    slab_key: u32,
+    slot_idx: u64,
 }
 
 impl RequestToken {
@@ -122,10 +98,9 @@ impl From<io::Error> for ConnectError {
 // === Constants ===
 
 const MAGIC: u64 = 0x5250_4353_4646_5721; // "RPCSFFWD"
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const HEADER_SIZE: usize = 64;
 const CACHE_LINE_SIZE: usize = 64;
-const SLAB_KEY_OFFSET: usize = 4;
 
 fn align_up(val: usize, align: usize) -> usize {
     (val + align - 1) & !(align - 1)
@@ -139,118 +114,80 @@ struct Header {
     version: u32,              // 4
     max_clients: u32,          // 4
     ring_depth: u32,           // 4
-    req_size: u32,             // 4
-    resp_size: u32,            // 4
-    req_align: u32,            // 4
-    resp_align: u32,           // 4
+    req_slot_size: u32,        // 4
+    resp_slot_size: u32,       // 4
     extra_buffer_size: u32,    // 4
     server_alive: AtomicBool,  // 1
     _pad: [u8; 3],            // 3
     next_client_id: AtomicU32, // 4
-    _reserved: [u8; 16],      // 16 → total = 64
+    _reserved: [u8; 20],      // 20 → total = 64
 }
 
 const _: () = assert!(std::mem::size_of::<Header>() == HEADER_SIZE);
 
-// === Slot layout ===
-//
-// Each slot: [valid: u8][pad: 3B][slab_key: u32][data at offset 8+]
-// Slot size is cache-line aligned.
+// === Layout functions ===
 
-fn calc_req_slot_size<Req: Serial>() -> usize {
-    let data_offset = align_up(8, std::mem::align_of::<Req>().max(8));
-    align_up(data_offset + std::mem::size_of::<Req>(), CACHE_LINE_SIZE)
-}
-
-fn calc_resp_slot_size<Resp: Serial>() -> usize {
-    let data_offset = align_up(8, std::mem::align_of::<Resp>().max(8));
-    align_up(data_offset + std::mem::size_of::<Resp>(), CACHE_LINE_SIZE)
-}
-
-fn per_client_block_size<Req: Serial, Resp: Serial>(
+fn per_client_block_size(
+    req_slot_size: usize,
+    resp_slot_size: usize,
     ring_depth: u32,
     extra_buffer_size: u32,
 ) -> usize {
     let control_size = CACHE_LINE_SIZE;
-    let req_ring_size = calc_req_slot_size::<Req>() * ring_depth as usize;
-    let resp_ring_size = calc_resp_slot_size::<Resp>() * ring_depth as usize;
+    let req_ring_size = req_slot_size * ring_depth as usize;
+    let resp_ring_size = resp_slot_size * ring_depth as usize;
     align_up(
         control_size + req_ring_size + resp_ring_size + extra_buffer_size as usize,
         CACHE_LINE_SIZE,
     )
 }
 
-fn total_shm_size<Req: Serial, Resp: Serial>(
+fn total_shm_size(
+    req_slot_size: usize,
+    resp_slot_size: usize,
     max_clients: u32,
     ring_depth: u32,
     extra_buffer_size: u32,
 ) -> usize {
     HEADER_SIZE
-        + per_client_block_size::<Req, Resp>(ring_depth, extra_buffer_size) * max_clients as usize
+        + per_client_block_size(req_slot_size, resp_slot_size, ring_depth, extra_buffer_size)
+            * max_clients as usize
 }
 
 // === RecvHandle ===
 
-/// Zero-copy receive handle for accessing request data in shared memory.
+/// Receive handle for accessing request data (copied from SHM).
 pub struct RecvHandle<'a, Req: Serial, Resp: Serial> {
-    server: &'a Server<Req, Resp>,
+    server: &'a mut Server<Req, Resp>,
     client_idx: usize,
-    tail: u64,
-    slab_key: u32,
-    _marker: PhantomData<(Req, Resp)>,
+    slot_idx: usize,
+    data: Req,
 }
 
 impl<Req: Serial, Resp: Serial> RecvHandle<'_, Req, Resp> {
-    /// Zero-copy access to the request data.
+    /// Access to the request data.
     #[inline]
     pub fn data(&self) -> &Req {
-        let slot_idx = (self.tail & self.server.ring_mask) as usize;
-        let slot_ptr = unsafe {
-            self.server.req_ring_bases[self.client_idx]
-                .add(slot_idx * self.server.req_slot_size)
-        };
-        unsafe { &*(slot_ptr.add(self.server.req_data_offset) as *const Req) }
+        &self.data
     }
 
     /// Consumes the handle and replies immediately.
     #[inline]
     pub fn reply(self, resp: Resp) {
-        let slot_idx = (self.tail & self.server.ring_mask) as usize;
-        let slot_ptr = unsafe {
-            self.server.req_ring_bases[self.client_idx]
-                .add(slot_idx * self.server.req_slot_size)
+        let response = Response {
+            token: self.slot_idx as u64,
+            data: resp,
         };
-        compiler_fence(Ordering::Release);
-        unsafe { write_volatile(slot_ptr, 0) };
-
-        let req_tails = unsafe { &mut *self.server.req_tails.get() };
-        req_tails[self.client_idx] = self.tail + 1;
-        let req_avail = unsafe { &mut *self.server.req_avail.get() };
-        req_avail[self.client_idx] -= 1;
-
-        self.server
-            .reply_to_client(ClientId(self.client_idx as u32), self.slab_key, resp);
+        self.server.resp_txs[self.client_idx].try_send(response);
+        self.server.resp_txs[self.client_idx].publish();
     }
 
     /// Extracts a move-only token for deferred reply.
     #[inline]
     pub fn into_token(self) -> RequestToken {
-        let slot_idx = (self.tail & self.server.ring_mask) as usize;
-        let slot_ptr = unsafe {
-            self.server.req_ring_bases[self.client_idx]
-                .add(slot_idx * self.server.req_slot_size)
-        };
-        compiler_fence(Ordering::Release);
-        unsafe { write_volatile(slot_ptr, 0) };
-
-        let req_tails = unsafe { &mut *self.server.req_tails.get() };
-        req_tails[self.client_idx] = self.tail + 1;
-        let req_avail = unsafe { &mut *self.server.req_avail.get() };
-        req_avail[self.client_idx] -= 1;
-
         RequestToken {
             client_id: ClientId(self.client_idx as u32),
-            slab_key: self.slab_key,
+            slot_idx: self.slot_idx as u64,
         }
     }
 
@@ -268,28 +205,18 @@ pub struct Server<Req: Serial, Resp: Serial> {
     _shm: SharedMemory,
     header: *mut Header,
     max_clients: u32,
-    ring_mask: u64,
-    req_slot_size: usize,
-    resp_slot_size: usize,
-    // Cached per-client SHM pointers
-    req_ring_bases: Vec<*mut u8>,
-    resp_ring_bases: Vec<*mut u8>,
+    ring_depth: u32,
+    // Per-client raw SPSC handles
+    req_rxs: Vec<RawReceiver<Req>>,
+    resp_txs: Vec<RawSender<Response<Resp>>>,
     control_ptrs: Vec<*const AtomicBool>,
     extra_ptrs: Vec<*mut u8>,
-    // Precomputed data offsets
-    req_data_offset: usize,
-    resp_data_offset: usize,
     extra_buffer_size: u32,
-    // Per-client ring state (interior mutability)
-    req_tails: UnsafeCell<Vec<u64>>,
-    resp_heads: UnsafeCell<Vec<u64>>,
-    scan_pos: Cell<u32>,
-    // Zero-copy recv: per-client available count + lane-drain state
-    req_avail: UnsafeCell<Vec<u32>>,
-    recv_start: Cell<u32>,
-    recv_scan_pos: Cell<u32>,
-    // Deferred responses: (client_id, slab_key, resp)
-    deferred_responses: UnsafeCell<Vec<(ClientId, u32, Resp)>>,
+    // Scan state
+    scan_pos: u32,
+    recv_scan_pos: u32,
+    req_avail: Vec<u32>,
+    recv_start: u32,
     _phantom: PhantomData<(Req, Resp)>,
 }
 
@@ -313,7 +240,16 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
         );
         assert!(max_clients > 0, "max_clients must be > 0");
 
-        let size = total_shm_size::<Req, Resp>(max_clients, ring_depth, extra_buffer_size);
+        let req_slot_size = std::mem::size_of::<Slot<Req>>();
+        let resp_slot_size = std::mem::size_of::<Slot<Response<Resp>>>();
+
+        let size = total_shm_size(
+            req_slot_size,
+            resp_slot_size,
+            max_clients,
+            ring_depth,
+            extra_buffer_size,
+        );
         let shm = unsafe { SharedMemory::create(path, size)? };
 
         let header = shm.as_ptr() as *mut Header;
@@ -325,28 +261,29 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
                     version: VERSION,
                     max_clients,
                     ring_depth,
-                    req_size: std::mem::size_of::<Req>() as u32,
-                    resp_size: std::mem::size_of::<Resp>() as u32,
-                    req_align: std::mem::align_of::<Req>() as u32,
-                    resp_align: std::mem::align_of::<Resp>() as u32,
+                    req_slot_size: req_slot_size as u32,
+                    resp_slot_size: resp_slot_size as u32,
                     extra_buffer_size,
                     server_alive: AtomicBool::new(true),
                     _pad: [0; 3],
                     next_client_id: AtomicU32::new(0),
-                    _reserved: [0; 16],
+                    _reserved: [0; 20],
                 },
             );
         }
 
-        let req_slot_size = calc_req_slot_size::<Req>();
-        let resp_slot_size = calc_resp_slot_size::<Resp>();
-        let block_size = per_client_block_size::<Req, Resp>(ring_depth, extra_buffer_size);
+        let block_size = per_client_block_size(
+            req_slot_size,
+            resp_slot_size,
+            ring_depth,
+            extra_buffer_size,
+        );
         let extra_offset = CACHE_LINE_SIZE
             + req_slot_size * ring_depth as usize
             + resp_slot_size * ring_depth as usize;
 
-        let mut req_ring_bases = Vec::with_capacity(max_clients as usize);
-        let mut resp_ring_bases = Vec::with_capacity(max_clients as usize);
+        let mut req_rxs = Vec::with_capacity(max_clients as usize);
+        let mut resp_txs = Vec::with_capacity(max_clients as usize);
         let mut control_ptrs = Vec::with_capacity(max_clients as usize);
         let mut extra_ptrs = Vec::with_capacity(max_clients as usize);
 
@@ -356,180 +293,121 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
             *alive = AtomicBool::new(false);
 
             control_ptrs.push(block_base as *const AtomicBool);
-            req_ring_bases.push(unsafe { block_base.add(CACHE_LINE_SIZE) });
-            resp_ring_bases.push(unsafe {
-                block_base.add(CACHE_LINE_SIZE + ring_depth as usize * req_slot_size)
-            });
-            extra_ptrs.push(unsafe { block_base.add(extra_offset) });
-        }
 
-        let req_data_offset = align_up(8, std::mem::align_of::<Req>().max(8));
-        let resp_data_offset = align_up(8, std::mem::align_of::<Resp>().max(8));
+            let req_ring_base = unsafe { block_base.add(CACHE_LINE_SIZE) };
+            let resp_ring_base = unsafe {
+                block_base.add(CACHE_LINE_SIZE + ring_depth as usize * req_slot_size)
+            };
+            extra_ptrs.push(unsafe { block_base.add(extra_offset) });
+
+            // Initialize all request ring slots
+            for slot_idx in 0..ring_depth as usize {
+                let slot_ptr = unsafe {
+                    req_ring_base.add(slot_idx * req_slot_size) as *mut Slot<Req>
+                };
+                unsafe { Slot::<Req>::init(slot_ptr) };
+            }
+
+            // Initialize all response ring slots
+            for slot_idx in 0..ring_depth as usize {
+                let slot_ptr = unsafe {
+                    resp_ring_base.add(slot_idx * resp_slot_size)
+                        as *mut Slot<Response<Resp>>
+                };
+                unsafe { Slot::<Response<Resp>>::init(slot_ptr) };
+            }
+
+            // Construct RawReceiver and RawSender
+            let req_rx = unsafe {
+                RawReceiver::<Req>::new(req_ring_base as *const Slot<Req>, ring_depth as usize)
+            };
+            let resp_tx = unsafe {
+                RawSender::<Response<Resp>>::new(
+                    resp_ring_base as *mut Slot<Response<Resp>>,
+                    ring_depth as usize,
+                )
+            };
+
+            req_rxs.push(req_rx);
+            resp_txs.push(resp_tx);
+        }
 
         Ok(Self {
             _shm: shm,
             header,
             max_clients,
-            ring_mask: (ring_depth - 1) as u64,
-            req_slot_size,
-            resp_slot_size,
-            req_ring_bases,
-            resp_ring_bases,
+            ring_depth,
+            req_rxs,
+            resp_txs,
             control_ptrs,
             extra_ptrs,
-            req_data_offset,
-            resp_data_offset,
             extra_buffer_size,
-            req_tails: UnsafeCell::new(vec![0; max_clients as usize]),
-            resp_heads: UnsafeCell::new(vec![0; max_clients as usize]),
-            scan_pos: Cell::new(0),
-            req_avail: UnsafeCell::new(vec![0; max_clients as usize]),
-            recv_start: Cell::new(0),
-            recv_scan_pos: Cell::new(0),
-            deferred_responses: UnsafeCell::new(Vec::new()),
+            scan_pos: 0,
+            recv_scan_pos: 0,
+            req_avail: vec![0; max_clients as usize],
+            recv_start: 0,
             _phantom: PhantomData,
         })
     }
 
-    fn flush_deferred(&self) {
-        let deferred = unsafe { &mut *self.deferred_responses.get() };
-        let resp_heads = unsafe { &mut *self.resp_heads.get() };
-        let mut i = 0;
-        while i < deferred.len() {
-            let (client_id, _, _) = &deferred[i];
-            let client_idx = client_id.0 as usize;
-            let head = resp_heads[client_idx];
-            let slot_idx = (head & self.ring_mask) as usize;
-            let slot_ptr = unsafe {
-                self.resp_ring_bases[client_idx].add(slot_idx * self.resp_slot_size)
-            };
-            let valid = unsafe { read_volatile(slot_ptr as *const u8) };
-            if valid != 0 {
-                i += 1;
-                continue;
-            }
-
-            let (_, slab_key, resp) = deferred.swap_remove(i);
-
-            unsafe { write_volatile(slot_ptr.add(SLAB_KEY_OFFSET) as *mut u32, slab_key) };
-            let resp_ptr = unsafe { slot_ptr.add(self.resp_data_offset) as *mut Resp };
-            unsafe { write_volatile(resp_ptr, resp) };
-            compiler_fence(Ordering::Release);
-            unsafe { write_volatile(slot_ptr, 1) };
-
-            resp_heads[client_idx] = head + 1;
-        }
-    }
-
     /// Scan all client request rings. Returns total available request count.
-    pub fn poll(&self) -> u32 {
-        let deferred = unsafe { &*self.deferred_responses.get() };
-        if !deferred.is_empty() {
-            self.flush_deferred();
-        }
-
-        let recv_start = self.scan_pos.get();
+    pub fn poll(&mut self) -> u32 {
         let mut count = 0u32;
-        let mut scan = self.scan_pos.get();
-
-        let req_tails = unsafe { &*self.req_tails.get() };
-        let req_avail = unsafe { &mut *self.req_avail.get() };
+        let mut scan = self.scan_pos;
 
         for _ in 0..self.max_clients {
-            let client_idx = scan as usize;
+            let idx = scan as usize;
             scan = (scan + 1) % self.max_clients;
 
-            let alive = unsafe { &*self.control_ptrs[client_idx] };
+            let alive = unsafe { &*self.control_ptrs[idx] };
             if !alive.load(Ordering::Relaxed) {
-                req_avail[client_idx] = 0;
+                self.req_avail[idx] = 0;
                 continue;
             }
 
-            let req_ring_base = self.req_ring_bases[client_idx];
-            let ring_depth = (self.ring_mask + 1) as u32;
-            let mut tail = req_tails[client_idx];
-            let mut avail = 0u32;
-            while avail < ring_depth {
-                let slot_idx = (tail & self.ring_mask) as usize;
-                let slot_ptr = unsafe { req_ring_base.add(slot_idx * self.req_slot_size) };
-                let valid = unsafe { read_volatile(slot_ptr as *const u8) };
-                if valid == 0 {
-                    break;
-                }
-                avail += 1;
-                tail += 1;
-            }
-            req_avail[client_idx] = avail;
+            // Multi-drain: count consecutive available slots
+            let avail = self.req_rxs[idx].count_available(self.ring_depth);
+            self.req_avail[idx] = avail;
             count += avail;
         }
 
-        self.scan_pos.set(scan);
-        self.recv_start.set(recv_start);
-        self.recv_scan_pos.set(0);
+        self.scan_pos = scan;
+        self.recv_start = self.scan_pos;
+        self.recv_scan_pos = 0;
         count
     }
 
-    /// Receive a request directly from SHM. Lane-drains per client.
-    pub fn recv(&self) -> Option<RecvHandle<'_, Req, Resp>> {
-        let req_avail = unsafe { &*self.req_avail.get() };
-        let req_tails = unsafe { &*self.req_tails.get() };
+    /// Receive a request. Lane-drains per client.
+    pub fn recv(&mut self) -> Option<RecvHandle<'_, Req, Resp>> {
+        while (self.recv_scan_pos as usize) < self.max_clients as usize {
+            let client_idx = ((self.recv_start + self.recv_scan_pos) % self.max_clients) as usize;
 
-        let mut scan = self.recv_scan_pos.get();
-        while (scan as usize) < self.max_clients as usize {
-            let client_idx =
-                ((self.recv_start.get() + scan) % self.max_clients) as usize;
-
-            if req_avail[client_idx] > 0 {
-                let tail = req_tails[client_idx];
-                let slot_idx = (tail & self.ring_mask) as usize;
-                let slot_ptr = unsafe {
-                    self.req_ring_bases[client_idx].add(slot_idx * self.req_slot_size)
-                };
-                let slab_key =
-                    unsafe { read_volatile(slot_ptr.add(SLAB_KEY_OFFSET) as *const u32) };
-
+            if self.req_avail[client_idx] > 0
+                && let Some((slot_idx, data)) = self.req_rxs[client_idx].try_recv()
+            {
+                self.req_avail[client_idx] -= 1;
                 return Some(RecvHandle {
                     server: self,
                     client_idx,
-                    tail,
-                    slab_key,
-                    _marker: PhantomData,
+                    slot_idx,
+                    data,
                 });
             }
 
-            scan += 1;
-            self.recv_scan_pos.set(scan);
+            self.recv_scan_pos += 1;
         }
         None
     }
 
-    fn reply_to_client(&self, client_id: ClientId, slab_key: u32, resp: Resp) {
-        let client_idx = client_id.0 as usize;
-        let resp_heads = unsafe { &mut *self.resp_heads.get() };
-        let head = resp_heads[client_idx];
-        let slot_idx = (head & self.ring_mask) as usize;
-        let slot_ptr =
-            unsafe { self.resp_ring_bases[client_idx].add(slot_idx * self.resp_slot_size) };
-
-        let valid = unsafe { read_volatile(slot_ptr as *const u8) };
-        if valid != 0 {
-            let deferred = unsafe { &mut *self.deferred_responses.get() };
-            deferred.push((client_id, slab_key, resp));
-            return;
-        }
-
-        unsafe { write_volatile(slot_ptr.add(SLAB_KEY_OFFSET) as *mut u32, slab_key) };
-        let resp_ptr = unsafe { slot_ptr.add(self.resp_data_offset) as *mut Resp };
-        unsafe { write_volatile(resp_ptr, resp) };
-        compiler_fence(Ordering::Release);
-        unsafe { write_volatile(slot_ptr, 1) };
-
-        resp_heads[client_idx] = head + 1;
-    }
-
     /// Reply to a previously received request using its token.
-    pub fn reply(&self, token: RequestToken, resp: Resp) {
-        self.reply_to_client(token.client_id, token.slab_key, resp);
+    pub fn reply(&mut self, token: RequestToken, resp: Resp) {
+        let idx = token.client_id.0 as usize;
+        let response = Response {
+            token: token.slot_idx,
+            data: resp,
+        };
+        self.resp_txs[idx].try_send(response);
+        self.resp_txs[idx].publish();
     }
 
     pub fn is_client_connected(&self, client_id: ClientId) -> bool {
@@ -579,23 +457,16 @@ pub struct Client<Req: Serial, Resp: Serial, U, F: FnMut(U, Resp)> {
     header: *const Header,
     client_id: ClientId,
     ring_depth: u32,
-    ring_mask: u64,
-    req_slot_size: usize,
-    resp_slot_size: usize,
-    // Cached pointers
-    req_ring_base: *mut u8,
-    resp_ring_base: *mut u8,
+    // Raw SPSC handles
+    req_tx: RawSender<Req>,
+    resp_rx: RawReceiver<Response<Resp>>,
     control_ptr: *const AtomicBool,
     extra_ptr: *mut u8,
     extra_buffer_size: u32,
-    req_data_offset: usize,
-    resp_data_offset: usize,
     // Ring state
-    req_head: u64,
-    resp_tail: u64,
     in_flight: u32,
     on_response: F,
-    user_data_slab: slab::Slab<U>,
+    user_data: Vec<Option<U>>,
     _phantom: PhantomData<(Req, Resp)>,
 }
 
@@ -617,7 +488,7 @@ impl<Req: Serial, Resp: Serial, U, F: FnMut(U, Resp)> Client<Req, Resp, U, F> {
             unsafe { SharedMemory::open(&path, HEADER_SIZE).map_err(ConnectError::Io)? };
         let header_ptr = header_shm.as_ptr() as *const Header;
 
-        let (max_clients, ring_depth, extra_buf_size) = unsafe {
+        let (max_clients, ring_depth, extra_buf_size, req_slot_size, resp_slot_size) = unsafe {
             if (*header_ptr).magic != MAGIC {
                 return Err(ConnectError::LayoutMismatch);
             }
@@ -627,10 +498,9 @@ impl<Req: Serial, Resp: Serial, U, F: FnMut(U, Resp)> Client<Req, Resp, U, F> {
             if !(*header_ptr).server_alive.load(Ordering::Acquire) {
                 return Err(ConnectError::ServerNotAlive);
             }
-            if (*header_ptr).req_size != std::mem::size_of::<Req>() as u32
-                || (*header_ptr).resp_size != std::mem::size_of::<Resp>() as u32
-                || (*header_ptr).req_align != std::mem::align_of::<Req>() as u32
-                || (*header_ptr).resp_align != std::mem::align_of::<Resp>() as u32
+            if (*header_ptr).req_slot_size != std::mem::size_of::<Slot<Req>>() as u32
+                || (*header_ptr).resp_slot_size
+                    != std::mem::size_of::<Slot<Response<Resp>>>() as u32
             {
                 return Err(ConnectError::LayoutMismatch);
             }
@@ -638,12 +508,20 @@ impl<Req: Serial, Resp: Serial, U, F: FnMut(U, Resp)> Client<Req, Resp, U, F> {
                 (*header_ptr).max_clients,
                 (*header_ptr).ring_depth,
                 (*header_ptr).extra_buffer_size,
+                (*header_ptr).req_slot_size as usize,
+                (*header_ptr).resp_slot_size as usize,
             )
         };
 
         drop(header_shm);
 
-        let size = total_shm_size::<Req, Resp>(max_clients, ring_depth, extra_buf_size);
+        let size = total_shm_size(
+            req_slot_size,
+            resp_slot_size,
+            max_clients,
+            ring_depth,
+            extra_buf_size,
+        );
         let shm = unsafe { SharedMemory::open(path, size).map_err(ConnectError::Io)? };
         let header = shm.as_ptr() as *const Header;
 
@@ -653,9 +531,12 @@ impl<Req: Serial, Resp: Serial, U, F: FnMut(U, Resp)> Client<Req, Resp, U, F> {
                 return Err(ConnectError::ServerFull);
             }
 
-            let req_slot_size = calc_req_slot_size::<Req>();
-            let resp_slot_size = calc_resp_slot_size::<Resp>();
-            let block_size = per_client_block_size::<Req, Resp>(ring_depth, extra_buf_size);
+            let block_size = per_client_block_size(
+                req_slot_size,
+                resp_slot_size,
+                ring_depth,
+                extra_buf_size,
+            );
             let block_base = shm.as_ptr().add(HEADER_SIZE + client_idx as usize * block_size);
             let control_ptr = block_base as *const AtomicBool;
             (&*control_ptr).store(true, Ordering::Release);
@@ -668,29 +549,30 @@ impl<Req: Serial, Resp: Serial, U, F: FnMut(U, Resp)> Client<Req, Resp, U, F> {
                 + resp_slot_size * ring_depth as usize;
             let extra_ptr = block_base.add(extra_offset);
 
-            let req_data_offset = align_up(8, std::mem::align_of::<Req>().max(8));
-            let resp_data_offset = align_up(8, std::mem::align_of::<Resp>().max(8));
+            // Construct RawSender and RawReceiver
+            // Note: server has already initialized all slots at creation time
+            let req_tx = RawSender::<Req>::new(
+                req_ring_base as *mut Slot<Req>,
+                ring_depth as usize,
+            );
+            let resp_rx = RawReceiver::<Response<Resp>>::new(
+                resp_ring_base as *const Slot<Response<Resp>>,
+                ring_depth as usize,
+            );
 
             Ok(Self {
                 _shm: shm,
                 header,
                 client_id: ClientId(client_idx),
                 ring_depth,
-                ring_mask: (ring_depth - 1) as u64,
-                req_slot_size,
-                resp_slot_size,
-                req_ring_base,
-                resp_ring_base,
+                req_tx,
+                resp_rx,
                 control_ptr,
                 extra_ptr,
                 extra_buffer_size: extra_buf_size,
-                req_data_offset,
-                resp_data_offset,
-                req_head: 0,
-                resp_tail: 0,
                 in_flight: 0,
                 on_response,
-                user_data_slab: slab::Slab::with_capacity(ring_depth as usize),
+                user_data: (0..ring_depth as usize).map(|_| None).collect(),
                 _phantom: PhantomData,
             })
         }
@@ -708,27 +590,12 @@ impl<Req: Serial, Resp: Serial, U, F: FnMut(U, Resp)> Client<Req, Resp, U, F> {
             }
         }
 
-        let slot_idx = (self.req_head & self.ring_mask) as usize;
-        let slot_ptr = unsafe { self.req_ring_base.add(slot_idx * self.req_slot_size) };
-
-        loop {
-            let valid = unsafe { read_volatile(slot_ptr as *const u8) };
-            if valid == 0 {
-                break;
-            }
-            std::hint::spin_loop();
-        }
-
-        let key = self.user_data_slab.insert(user_data);
-        unsafe { write_volatile(slot_ptr.add(SLAB_KEY_OFFSET) as *mut u32, key as u32) };
-
-        let req_ptr = unsafe { slot_ptr.add(self.req_data_offset) as *mut Req };
-        unsafe { write_volatile(req_ptr, req) };
-
-        compiler_fence(Ordering::Release);
-        unsafe { write_volatile(slot_ptr, 1) };
-
-        self.req_head += 1;
+        let slot_idx = self
+            .req_tx
+            .try_send(req)
+            .expect("inflight management prevents full");
+        self.req_tx.publish();
+        self.user_data[slot_idx] = Some(user_data);
         self.in_flight += 1;
 
         Ok(())
@@ -739,31 +606,18 @@ impl<Req: Serial, Resp: Serial, U, F: FnMut(U, Resp)> Client<Req, Resp, U, F> {
         let mut count = 0;
 
         while self.in_flight > 0 {
-            let slot_idx = (self.resp_tail & self.ring_mask) as usize;
-            let slot_ptr = unsafe { self.resp_ring_base.add(slot_idx * self.resp_slot_size) };
-
-            let valid = unsafe { read_volatile(slot_ptr as *const u8) };
-            if valid == 0 {
-                break;
+            match self.resp_rx.try_recv() {
+                Some((_, response)) => {
+                    self.in_flight -= 1;
+                    let ud_idx = response.token as usize;
+                    let user_data = self.user_data[ud_idx]
+                        .take()
+                        .expect("user_data must exist");
+                    (self.on_response)(user_data, response.data);
+                    count += 1;
+                }
+                None => break,
             }
-
-            compiler_fence(Ordering::Acquire);
-
-            let slab_key =
-                unsafe { read_volatile(slot_ptr.add(SLAB_KEY_OFFSET) as *const u32) };
-            let resp_ptr = unsafe { slot_ptr.add(self.resp_data_offset) as *const Resp };
-            let resp = unsafe { read_volatile(resp_ptr) };
-
-            compiler_fence(Ordering::Release);
-            unsafe { write_volatile(slot_ptr, 0) };
-
-            self.resp_tail += 1;
-            self.in_flight -= 1;
-
-            let user_data = self.user_data_slab.remove(slab_key as usize);
-            (self.on_response)(user_data, resp);
-
-            count += 1;
         }
 
         if count == 0 && self.in_flight > 0 && !self.is_server_alive() {
@@ -826,51 +680,17 @@ impl<Req: Serial, Resp: Serial> SyncClient<Req, Resp> {
             }
         }
 
-        let slot_idx = (self.req_head & self.ring_mask) as usize;
-        let slot_ptr = unsafe { self.req_ring_base.add(slot_idx * self.req_slot_size) };
-
-        loop {
-            let valid = unsafe { read_volatile(slot_ptr as *const u8) };
-            if valid == 0 {
-                break;
-            }
-            std::hint::spin_loop();
-        }
-
-        // slab_key = 0 for blocking calls (not tracked in slab)
-        unsafe { write_volatile(slot_ptr.add(SLAB_KEY_OFFSET) as *mut u32, 0) };
-
-        let req_ptr = unsafe { slot_ptr.add(self.req_data_offset) as *mut Req };
-        unsafe { write_volatile(req_ptr, req) };
-
-        compiler_fence(Ordering::Release);
-        unsafe { write_volatile(slot_ptr, 1) };
-
-        self.req_head += 1;
+        self.req_tx
+            .try_send(req)
+            .expect("inflight management prevents full");
+        self.req_tx.publish();
         self.in_flight += 1;
 
         loop {
-            let resp_slot_idx = (self.resp_tail & self.ring_mask) as usize;
-            let resp_slot_ptr =
-                unsafe { self.resp_ring_base.add(resp_slot_idx * self.resp_slot_size) };
-
-            let valid = unsafe { read_volatile(resp_slot_ptr as *const u8) };
-            if valid != 0 {
-                compiler_fence(Ordering::Acquire);
-
-                let resp_ptr =
-                    unsafe { resp_slot_ptr.add(self.resp_data_offset) as *const Resp };
-                let resp = unsafe { read_volatile(resp_ptr) };
-
-                compiler_fence(Ordering::Release);
-                unsafe { write_volatile(resp_slot_ptr, 0) };
-
-                self.resp_tail += 1;
+            if let Some((_, response)) = self.resp_rx.try_recv() {
                 self.in_flight -= 1;
-
-                return Ok(resp);
+                return Ok(response.data);
             }
-
             if !self.is_server_alive() {
                 return Err(CallError::ServerDisconnected);
             }
@@ -886,6 +706,7 @@ impl<Req: Serial, Resp: Serial> SyncClient<Req, Resp> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ptr::{read_volatile, write_volatile};
     use std::sync::atomic::AtomicU64;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -902,7 +723,7 @@ mod tests {
     fn test_basic_rpc() {
         let path = test_path();
         unsafe {
-            let server = Server::<u64, u64>::create(&path, 4, 8, 0).unwrap();
+            let mut server = Server::<u64, u64>::create(&path, 4, 8, 0).unwrap();
             let mut client = SyncClient::<u64, u64>::connect_sync(&path).unwrap();
 
             client.call(42, ()).unwrap();
@@ -921,7 +742,7 @@ mod tests {
     fn test_blocking_rpc() {
         let path = test_path();
         unsafe {
-            let server = Server::<u64, u64>::create(&path, 4, 8, 0).unwrap();
+            let mut server = Server::<u64, u64>::create(&path, 4, 8, 0).unwrap();
             let path2 = path.clone();
             let t = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -976,7 +797,7 @@ mod tests {
     fn test_multiple_calls() {
         let path = test_path();
         unsafe {
-            let server = Server::<u64, u64>::create(&path, 4, 16, 0).unwrap();
+            let mut server = Server::<u64, u64>::create(&path, 4, 16, 0).unwrap();
             let mut client = SyncClient::<u64, u64>::connect_sync(&path).unwrap();
 
             for i in 0..100 {
@@ -997,7 +818,7 @@ mod tests {
     fn test_deferred_response() {
         let path = test_path();
         unsafe {
-            let server = Server::<u64, u64>::create(&path, 4, 8, 0).unwrap();
+            let mut server = Server::<u64, u64>::create(&path, 4, 8, 0).unwrap();
             let path2 = path.clone();
             let t = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1042,7 +863,7 @@ mod tests {
 
         let path = test_path();
         unsafe {
-            let server = Server::<u64, u64>::create(&path, 4, 16, 0).unwrap();
+            let mut server = Server::<u64, u64>::create(&path, 4, 16, 0).unwrap();
 
             let responses = Rc::new(RefCell::new(Vec::new()));
             let responses_clone = responses.clone();
@@ -1082,7 +903,7 @@ mod tests {
 
         let path = test_path();
         unsafe {
-            let server = Server::<u64, u64>::create(&path, 4, 8, 0).unwrap();
+            let mut server = Server::<u64, u64>::create(&path, 4, 8, 0).unwrap();
 
             let responses = Rc::new(RefCell::new(Vec::new()));
             let responses_clone = responses.clone();
@@ -1138,7 +959,7 @@ mod tests {
     fn test_multi_client() {
         let path = test_path();
         unsafe {
-            let server = Server::<u64, u64>::create(&path, 4, 16, 0).unwrap();
+            let mut server = Server::<u64, u64>::create(&path, 4, 16, 0).unwrap();
 
             let mut clients: Vec<SyncClient<u64, u64>> = vec![
                 SyncClient::connect_sync(&path).unwrap(),

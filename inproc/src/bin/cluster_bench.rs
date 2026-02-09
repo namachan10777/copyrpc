@@ -1,6 +1,6 @@
 //! Cluster All-to-All Benchmark Binary
 //!
-//! Benchmarks Transport (Flux) and MPSC (Mesh) implementations with N-thread
+//! Benchmarks MpscChannel (Flux) and MPSC (Mesh) implementations with N-thread
 //! all-to-all communication pattern. Uses a management thread for monitoring
 //! and statistics collection.
 
@@ -16,17 +16,10 @@ use clap::{Parser, ValueEnum};
 use parquet::arrow::ArrowWriter;
 use inproc::Serial;
 use inproc::{
-    create_flux_with_transport, create_mesh_with, FastForwardTransport, Flux, LamportTransport,
-    Mesh, OnesidedTransport, OnesidedImmediateTransport, OnesidedValidityTransport,
-    ReceivedMessage, FetchAddMpsc, Transport,
+    create_flux_with, create_mesh_with, Flux, ReceivedMessage, FetchAddMpsc,
 };
-
-#[cfg(feature = "rtrb")]
-use inproc::RtrbTransport;
-#[cfg(feature = "omango")]
-use inproc::OmangoTransport;
-
 use inproc::mpsc::MpscChannel;
+use mempc::MpscChannel as MempcMpscChannel;
 
 /// 32-byte payload for benchmarking
 #[derive(Clone, Copy, Debug)]
@@ -46,20 +39,14 @@ impl Default for Payload {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum TransportType {
     Onesided,
-    OnesidedImmediate,
-    OnesidedValidity,
     FastForward,
     Lamport,
-    #[cfg(feature = "rtrb")]
-    Rtrb,
-    #[cfg(feature = "omango")]
-    Omango,
     All,
 }
 
 #[derive(Parser)]
 #[command(name = "cluster_bench")]
-#[command(about = "N-thread all-to-all benchmark: Flux (Transport) vs Mesh (MPSC)")]
+#[command(about = "N-thread all-to-all benchmark: Flux (MpscChannel) vs Mesh (MPSC)")]
 struct Args {
     /// Number of worker threads
     #[arg(short = 'n', long, default_value = "16")]
@@ -125,11 +112,11 @@ fn pin_to_core(core_id: usize) {
 }
 
 // ============================================================================
-// Flux benchmark (SPSC Transport based)
+// Flux benchmark (SPSC MpscChannel based)
 // ============================================================================
 
-/// Run Flux benchmark for a specific transport implementation
-fn run_flux_benchmark<Tr: Transport>(
+/// Run Flux benchmark for a specific MpscChannel implementation
+fn run_flux_benchmark<M: MempcMpscChannel>(
     n: usize,
     capacity: usize,
     duration_secs: u64,
@@ -140,8 +127,8 @@ fn run_flux_benchmark<Tr: Transport>(
         (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
     let stop_flag = Arc::new(AtomicBool::new(false));
 
-    let nodes: Vec<Flux<Payload, (), _, Tr>> =
-        create_flux_with_transport(n, capacity, max_inflight, |_: &mut (), _: Payload| {});
+    let nodes: Vec<Flux<Payload, (), _, M>> =
+        create_flux_with(n, capacity, max_inflight, |_: (), _: Payload| {});
 
     let barrier = Arc::new(Barrier::new(n + 1));
     let payload = Payload::default();
@@ -181,9 +168,7 @@ fn run_flux_benchmark<Tr: Transport>(
                             node.poll();
                             while let Some(handle) = node.try_recv() {
                                 let data = handle.data();
-                                if !handle.reply_or_requeue(data) {
-                                    break;
-                                }
+                                handle.reply(data);
                             }
                             can_send = node.pending_count() < max_inflight;
                         }
@@ -229,7 +214,7 @@ fn run_mesh_benchmark<M: MpscChannel>(
         (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
     let stop_flag = Arc::new(AtomicBool::new(false));
 
-    let nodes: Vec<Mesh<Payload, M>> = create_mesh_with(n);
+    let nodes = create_mesh_with::<Payload, (), fn((), Payload), M>(n, |(), _| {});
 
     let barrier = Arc::new(Barrier::new(n + 1));
     let payload = Payload::default();
@@ -260,7 +245,7 @@ fn run_mesh_benchmark<M: MpscChannel>(
                                 if inflight >= max_inflight {
                                     break;
                                 }
-                                if node.call(peer, payload).is_ok() {
+                                if node.call(peer, payload, ()).is_ok() {
                                     inflight += 1;
                                 }
                             }
@@ -455,7 +440,7 @@ fn main() {
 
     let mut results = Vec::new();
 
-    // --- Flux benchmarks (SPSC Transport) ---
+    // --- Flux benchmarks (SPSC MpscChannel) ---
 
     // Onesided
     if matches!(args.transport, TransportType::Onesided | TransportType::All) {
@@ -469,39 +454,7 @@ fn main() {
             args.warmup,
             args.runs,
             args.start_core,
-            run_flux_benchmark::<OnesidedTransport>,
-        ));
-    }
-
-    // Onesided Immediate (index-based, per-send publish)
-    if matches!(args.transport, TransportType::OnesidedImmediate | TransportType::All) {
-        results.push(run_transport_benchmark(
-            "flux",
-            "onesided-immediate",
-            args.threads,
-            args.capacity,
-            args.duration,
-            args.inflight,
-            args.warmup,
-            args.runs,
-            args.start_core,
-            run_flux_benchmark::<OnesidedImmediateTransport>,
-        ));
-    }
-
-    // Onesided Validity (validity flag, per-send publish)
-    if matches!(args.transport, TransportType::OnesidedValidity | TransportType::All) {
-        results.push(run_transport_benchmark(
-            "flux",
-            "onesided-validity",
-            args.threads,
-            args.capacity,
-            args.duration,
-            args.inflight,
-            args.warmup,
-            args.runs,
-            args.start_core,
-            run_flux_benchmark::<OnesidedValidityTransport>,
+            run_flux_benchmark::<mempc::OnesidedMpsc>,
         ));
     }
 
@@ -517,7 +470,7 @@ fn main() {
             args.warmup,
             args.runs,
             args.start_core,
-            run_flux_benchmark::<FastForwardTransport>,
+            run_flux_benchmark::<mempc::FastForwardMpsc>,
         ));
     }
 
@@ -533,41 +486,7 @@ fn main() {
             args.warmup,
             args.runs,
             args.start_core,
-            run_flux_benchmark::<LamportTransport>,
-        ));
-    }
-
-    // Rtrb
-    #[cfg(feature = "rtrb")]
-    if matches!(args.transport, TransportType::Rtrb | TransportType::All) {
-        results.push(run_transport_benchmark(
-            "flux",
-            "rtrb",
-            args.threads,
-            args.capacity,
-            args.duration,
-            args.inflight,
-            args.warmup,
-            args.runs,
-            args.start_core,
-            run_flux_benchmark::<RtrbTransport>,
-        ));
-    }
-
-    // Omango
-    #[cfg(feature = "omango")]
-    if matches!(args.transport, TransportType::Omango | TransportType::All) {
-        results.push(run_transport_benchmark(
-            "flux",
-            "omango",
-            args.threads,
-            args.capacity,
-            args.duration,
-            args.inflight,
-            args.warmup,
-            args.runs,
-            args.start_core,
-            run_flux_benchmark::<OmangoTransport>,
+            run_flux_benchmark::<mempc::LamportMpsc>,
         ));
     }
 

@@ -1,52 +1,34 @@
 //! SPSC-based n-to-n communication with callback-based response handling.
 //!
-//! Each node pair has dedicated SPSC channels, providing zero-contention
+//! Each node has one MPSC server and N-1 callers, providing zero-contention
 //! communication at the cost of O(N^2) memory usage.
 //!
-//! This module is generic over the transport implementation:
-//! - `OnesidedTransport` (default): Producer-only write pattern
-//! - `FastForwardTransport`: FastForward algorithm with validity flags
-//! - `LamportTransport`: Batched index synchronization
+//! This module is generic over the MPSC channel implementation:
+//! - `OnesidedMpsc` (default): Producer-only write pattern
+//! - `FastForwardMpsc`: FastForward algorithm with validity flags
+//! - `LamportMpsc`: Batched index synchronization
 //!
 //! API:
 //! - `call(to, payload, user_data)` sends a request
 //! - `poll()` processes messages (responses invoke callback)
 //! - `try_recv()` returns received requests via `RecvHandle`
 
-use std::collections::VecDeque;
 use std::marker::PhantomData;
 
-use crate::serial::Serial;
-use crate::transport::{OnesidedTransport, Transport, TransportEndpoint, TransportError};
+use mempc::{MpscChannel, MpscRecvRef, MpscServer, OnesidedMpsc, ReplyToken, Serial};
+use mempc::CallerWithUserData;
+
 use crate::SendError;
 
-/// A bidirectional channel to a single peer.
-///
-/// Uses a single TransportEndpoint for all RPC communication.
-struct FluxChannel<T: Serial + Send, Tr: Transport> {
-    peer_id: usize,
-    /// Bidirectional endpoint for this peer
-    endpoint: Tr::Endpoint<T, T>,
-    /// Current inflight count for this channel
-    inflight_count: usize,
-}
-
-/// A received request, stored in the internal queue.
-struct RecvRequest<T> {
-    from: usize,
-    token: u64,
-    data: T,
-}
-
 /// Handle for a received request that allows replying.
-pub struct RecvHandle<'a, T: Serial + Send, U, F: FnMut(U, T), Tr: Transport = OnesidedTransport> {
-    flux: &'a mut Flux<T, U, F, Tr>,
+pub struct RecvHandle<'a, T: Serial + Send, U, F: FnMut(U, T), M: MpscChannel = OnesidedMpsc> {
+    flux: &'a mut Flux<T, U, F, M>,
     from: usize,
-    token: u64,
+    token: ReplyToken,
     data: T,
 }
 
-impl<'a, T: Serial + Send, U, F: FnMut(U, T), Tr: Transport> RecvHandle<'a, T, U, F, Tr> {
+impl<'a, T: Serial + Send, U, F: FnMut(U, T), M: MpscChannel> RecvHandle<'a, T, U, F, M> {
     /// Returns the sender's node ID.
     #[inline]
     pub fn from(&self) -> usize {
@@ -59,94 +41,27 @@ impl<'a, T: Serial + Send, U, F: FnMut(U, T), Tr: Transport> RecvHandle<'a, T, U
         self.data
     }
 
-    /// Sends a reply to the request, consuming the handle on success.
+    /// Sends a reply to the request, consuming the handle.
     #[inline]
-    pub fn reply(self, value: T) -> Result<(), (Self, SendError<T>)> {
-        let channel_idx = match self.flux.peer_to_channel_index(self.from) {
-            Some(idx) => idx,
-            None => return Err((self, SendError::InvalidPeer(value))),
-        };
-
-        match self.flux.channels[channel_idx].endpoint.reply(self.token, value) {
-            Ok(()) => Ok(()),
-            Err(TransportError::Full(v)) | Err(TransportError::InflightExceeded(v)) => Err((
-                Self {
-                    flux: self.flux,
-                    from: self.from,
-                    token: self.token,
-                    data: self.data,
-                },
-                SendError::Full(v),
-            )),
-            Err(TransportError::Disconnected(v)) => Err((
-                Self {
-                    flux: self.flux,
-                    from: self.from,
-                    token: self.token,
-                    data: self.data,
-                },
-                SendError::Disconnected(v),
-            )),
-        }
-    }
-
-    /// Tries to send a reply. On failure, requeues the request for later retry.
-    #[inline]
-    pub fn reply_or_requeue(self, value: T) -> bool {
-        let channel_idx = match self.flux.peer_to_channel_index(self.from) {
-            Some(idx) => idx,
-            None => {
-                self.flux.recv_queue.push_front(RecvRequest {
-                    from: self.from,
-                    token: self.token,
-                    data: self.data,
-                });
-                return false;
-            }
-        };
-
-        match self.flux.channels[channel_idx].endpoint.reply(self.token, value) {
-            Ok(()) => true,
-            Err(
-                TransportError::Full(_)
-                | TransportError::Disconnected(_)
-                | TransportError::InflightExceeded(_),
-            ) => {
-                self.flux.recv_queue.push_front(RecvRequest {
-                    from: self.from,
-                    token: self.token,
-                    data: self.data,
-                });
-                false
-            }
-        }
+    pub fn reply(self, value: T) {
+        self.flux.server.reply(self.token, value);
     }
 }
 
 /// A node in a Flux network with callback-based response handling.
 ///
-/// Generic over the transport implementation.
-pub struct Flux<T: Serial + Send, U, F: FnMut(U, T), Tr: Transport = OnesidedTransport> {
+/// Generic over the MPSC channel implementation.
+pub struct Flux<T: Serial + Send, U, F: FnMut(U, T), M: MpscChannel = OnesidedMpsc> {
     id: usize,
     num_nodes: usize,
-    channels: Vec<FluxChannel<T, Tr>>,
-    /// Round-robin index for poll
-    recv_index: usize,
-    /// Pending calls: maps token % capacity to user_data (fixed-size array per channel)
-    /// Outer vec is per-channel, inner vec is per-slot
-    pending_calls: Vec<Vec<Option<U>>>,
-    /// Response callback
-    on_response: F,
-    /// Queue of received requests
-    recv_queue: VecDeque<RecvRequest<T>>,
-    /// Maximum inflight requests per channel
-    inflight_max: usize,
-    /// Capacity per channel (for token % capacity mapping)
-    channel_capacity: usize,
-    _marker: PhantomData<Tr>,
+    server: M::Server<T, T>,
+    callers: Vec<CallerWithUserData<M::Caller<T, T>, T, T, U, F>>,
+    /// peer_ids[i] = peer node ID for callers[i]
+    peer_ids: Vec<usize>,
+    _marker: PhantomData<M>,
 }
 
-impl<T: Serial + Send, U, F: FnMut(U, T), Tr: Transport> Flux<T, U, F, Tr> {
+impl<T: Serial + Send, U, F: FnMut(U, T), M: MpscChannel> Flux<T, U, F, M> {
     /// Returns this node's ID.
     #[inline]
     pub fn id(&self) -> usize {
@@ -156,12 +71,12 @@ impl<T: Serial + Send, U, F: FnMut(U, T), Tr: Transport> Flux<T, U, F, Tr> {
     /// Returns the number of peers (excluding self).
     #[inline]
     pub fn num_peers(&self) -> usize {
-        self.channels.len()
+        self.callers.len()
     }
 
-    /// Converts peer ID to channel index in O(1).
+    /// Converts peer ID to caller index in O(1).
     #[inline]
-    fn peer_to_channel_index(&self, peer: usize) -> Option<usize> {
+    fn peer_to_caller_index(&self, peer: usize) -> Option<usize> {
         if peer >= self.num_nodes || peer == self.id {
             return None;
         }
@@ -171,93 +86,61 @@ impl<T: Serial + Send, U, F: FnMut(U, T), Tr: Transport> Flux<T, U, F, Tr> {
     /// Sends a call to the specified peer.
     #[inline]
     pub fn call(&mut self, to: usize, value: T, user_data: U) -> Result<(), SendError<T>> {
-        let channel_idx = match self.peer_to_channel_index(to) {
+        let caller_idx = match self.peer_to_caller_index(to) {
             Some(idx) => idx,
             None => return Err(SendError::InvalidPeer(value)),
         };
 
-        let channel = &mut self.channels[channel_idx];
-
-        // Check inflight limit
-        if channel.inflight_count >= self.inflight_max {
-            return Err(SendError::Full(value));
-        }
-
-        match channel.endpoint.call(value) {
-            Ok(token) => {
-                channel.inflight_count += 1;
-                // Store user_data for this token (using token % capacity for indexing)
-                let slot = (token as usize) % self.channel_capacity;
-                self.pending_calls[channel_idx][slot] = Some(user_data);
-                Ok(())
-            }
-            Err(TransportError::Full(v) | TransportError::InflightExceeded(v)) => {
-                Err(SendError::Full(v))
-            }
-            Err(TransportError::Disconnected(v)) => Err(SendError::Disconnected(v)),
-        }
+        self.callers[caller_idx]
+            .call(value, user_data)
+            .map_err(|e| match e {
+                mempc::CallError::Full(v) | mempc::CallError::InflightExceeded(v) => {
+                    SendError::Full(v)
+                }
+                mempc::CallError::Disconnected(v) => SendError::Disconnected(v),
+            })
     }
 
     /// Polls for messages from peers.
     ///
-    /// - Requests: queued for retrieval via `try_recv()`
-    /// - Responses: invokes callback
+    /// - Requests: available for retrieval via `try_recv()`
+    /// - Responses: invokes callback (handled by CallerWithUserData)
     #[inline]
     pub fn poll(&mut self) {
-        let n = self.channels.len();
-        if n == 0 {
-            return;
-        }
+        // Poll server for incoming requests
+        self.server.poll();
 
-        for _ in 0..n {
-            let idx = self.recv_index;
-            self.recv_index = (self.recv_index + 1) % n;
-
-            let channel = &mut self.channels[idx];
-            let peer_id = channel.peer_id;
-
-            // Sync once per channel (for Lamport, this does 4 atomic ops)
-            channel.endpoint.sync();
-
-            // Receive requests (from peer's calls)
-            while let Some((token, data)) = channel.endpoint.recv() {
-                self.recv_queue.push_back(RecvRequest {
-                    from: peer_id,
-                    token,
-                    data,
-                });
-            }
-
-            // Receive responses (to our calls) - no sync needed, already done above
-            while let Some((token, data)) = channel.endpoint.try_recv_response() {
-                // Decrement inflight count
-                channel.inflight_count -= 1;
-
-                // Get user_data and invoke callback
-                let slot = (token as usize) % self.channel_capacity;
-                if let Some(user_data) = self.pending_calls[idx][slot].take() {
-                    (self.on_response)(user_data, data);
-                }
-            }
+        // Poll all callers for responses (invokes callback)
+        for caller in self.callers.iter_mut() {
+            caller.poll();
         }
     }
 
-    /// Tries to receive the next request from the queue.
+    /// Tries to receive the next request from the server.
     #[inline]
-    pub fn try_recv(&mut self) -> Option<RecvHandle<'_, T, U, F, Tr>> {
-        let req = self.recv_queue.pop_front()?;
+    pub fn try_recv(&mut self) -> Option<RecvHandle<'_, T, U, F, M>> {
+        let recv_ref = self.server.try_recv()?;
+
+        // Copy data (T: Serial = Copy) and extract token
+        let caller_id = recv_ref.caller_id();
+        let data = recv_ref.data();
+        let token = recv_ref.into_token();
+
+        // Map caller_id to peer_id
+        let from = self.peer_ids[caller_id];
+
         Some(RecvHandle {
             flux: self,
-            from: req.from,
-            token: req.token,
-            data: req.data,
+            from,
+            token,
+            data,
         })
     }
 
     /// Returns the number of pending calls awaiting responses.
     #[inline]
     pub fn pending_count(&self) -> usize {
-        self.channels.iter().map(|c| c.inflight_count).sum()
+        self.callers.iter().map(|c| c.pending_count()).sum()
     }
 
     /// Pops the next received request without holding a borrow on Flux.
@@ -266,34 +149,29 @@ impl<T: Serial + Send, U, F: FnMut(U, T), Tr: Transport> Flux<T, U, F, Tr> {
     /// Unlike [`try_recv`], this does not create a `RecvHandle`, so the caller
     /// can hold multiple pending requests and reply asynchronously.
     #[inline]
-    pub fn try_recv_raw(&mut self) -> Option<(usize, u64, T)> {
-        let req = self.recv_queue.pop_front()?;
-        Some((req.from, req.token, req.data))
+    pub fn try_recv_raw(&mut self) -> Option<(usize, ReplyToken, T)> {
+        let recv_ref = self.server.try_recv()?;
+
+        let caller_id = recv_ref.caller_id();
+        let data = recv_ref.data();
+        let token = recv_ref.into_token();
+
+        let from = self.peer_ids[caller_id];
+
+        Some((from, token, data))
     }
 
-    /// Replies to a previously received request identified by peer ID and token.
+    /// Replies to a previously received request identified by token.
     ///
     /// This is the deferred counterpart to [`RecvHandle::reply`].
+    /// The `token` parameter contains the caller information, so no `to` parameter is needed.
     #[inline]
-    pub fn reply(&mut self, to: usize, token: u64, value: T) -> Result<(), SendError<T>> {
-        let channel_idx = match self.peer_to_channel_index(to) {
-            Some(idx) => idx,
-            None => return Err(SendError::InvalidPeer(value)),
-        };
-
-        self.channels[channel_idx]
-            .endpoint
-            .reply(token, value)
-            .map_err(|e| match e {
-                TransportError::Full(v) | TransportError::InflightExceeded(v) => {
-                    SendError::Full(v)
-                }
-                TransportError::Disconnected(v) => SendError::Disconnected(v),
-            })
+    pub fn reply(&mut self, token: ReplyToken, value: T) {
+        self.server.reply(token, value);
     }
 }
 
-/// Creates a Flux network with `n` nodes using the default transport (OnesidedTransport).
+/// Creates a Flux network with `n` nodes using the default MPSC channel (OnesidedMpsc).
 ///
 /// # Arguments
 /// * `n` - Number of nodes
@@ -308,16 +186,16 @@ pub fn create_flux<T, U, F>(
     capacity: usize,
     inflight_max: usize,
     on_response: F,
-) -> Vec<Flux<T, U, F, OnesidedTransport>>
+) -> Vec<Flux<T, U, F, OnesidedMpsc>>
 where
     T: Serial + Send,
     U: Send,
     F: FnMut(U, T) + Clone,
 {
-    create_flux_with_transport::<T, U, F, OnesidedTransport>(n, capacity, inflight_max, on_response)
+    create_flux_with::<T, U, F, OnesidedMpsc>(n, capacity, inflight_max, on_response)
 }
 
-/// Creates a Flux network with `n` nodes using the specified transport.
+/// Creates a Flux network with `n` nodes using the specified MPSC channel.
 ///
 /// # Arguments
 /// * `n` - Number of nodes
@@ -327,17 +205,17 @@ where
 ///
 /// # Panics
 /// Panics if `n` is 0, `capacity` is 0, or `inflight_max >= capacity`.
-pub fn create_flux_with_transport<T, U, F, Tr>(
+pub fn create_flux_with<T, U, F, M>(
     n: usize,
     capacity: usize,
     inflight_max: usize,
     on_response: F,
-) -> Vec<Flux<T, U, F, Tr>>
+) -> Vec<Flux<T, U, F, M>>
 where
     T: Serial + Send,
     U: Send,
     F: FnMut(U, T) + Clone,
-    Tr: Transport,
+    M: MpscChannel,
 {
     assert!(n > 0, "must have at least one node");
     assert!(capacity > 0, "capacity must be greater than 0");
@@ -349,59 +227,52 @@ where
         "inflight_max must be less than capacity"
     );
 
-    // Store endpoints separately for each (i, j) directed pair
-    // channel_endpoints[i][j] = Some(endpoint) means:
-    //   - endpoint: node i uses this to communicate with node j
-    let mut channel_endpoints: Vec<Vec<Option<Tr::Endpoint<T, T>>>> =
-        (0..n).map(|_| (0..n).map(|_| None).collect()).collect();
-
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..n {
-        for j in (i + 1)..n {
-            // Create bidirectional channel between i and j
-            let (endpoint_i, endpoint_j) = Tr::channel(capacity, inflight_max);
-
-            // Node i's endpoint for peer j
-            channel_endpoints[i][j] = Some(endpoint_i);
-            // Node j's endpoint for peer i
-            channel_endpoints[j][i] = Some(endpoint_j);
-        }
-    }
+    // Create N MPSC channel groups (each group has n-1 callers and 1 server)
+    let mut groups: Vec<(Vec<Option<M::Caller<T, T>>>, Option<M::Server<T, T>>)> =
+        (0..n).map(|_| {
+            let (callers, server) = M::create::<T, T>(n - 1, capacity, inflight_max);
+            let callers_opt: Vec<Option<M::Caller<T, T>>> = callers.into_iter().map(Some).collect();
+            (callers_opt, Some(server))
+        }).collect();
 
     // Build nodes
     let mut nodes = Vec::with_capacity(n);
 
     #[allow(clippy::needless_range_loop)]
     for i in 0..n {
-        let mut channels = Vec::with_capacity(n - 1);
-        let mut pending_calls = Vec::with_capacity(n - 1);
+        // Take server for node i
+        let server = groups[i].1.take().unwrap();
+
+        // Collect callers from other nodes' groups
+        let mut callers_raw = Vec::with_capacity(n - 1);
+        let mut peer_ids = Vec::with_capacity(n - 1);
 
         for j in 0..n {
-            if i == j {
+            if j == i {
                 continue;
             }
 
-            let endpoint = channel_endpoints[i][j].take().unwrap();
+            // Node i gets a caller from node j's group
+            // The caller index in node j's group is the relative position of i among j's peers
+            let caller_idx = if i < j { i } else { i - 1 };
+            let caller = groups[j].0[caller_idx].take().unwrap();
 
-            channels.push(FluxChannel {
-                peer_id: j,
-                endpoint,
-                inflight_count: 0,
-            });
-            // Fixed-size array for pending calls per channel
-            pending_calls.push((0..actual_capacity).map(|_| None).collect());
+            callers_raw.push(caller);
+            peer_ids.push(j);
         }
+
+        // Wrap each caller with CallerWithUserData
+        let callers: Vec<CallerWithUserData<M::Caller<T, T>, T, T, U, F>> = callers_raw
+            .into_iter()
+            .map(|caller| CallerWithUserData::new(caller, actual_capacity, on_response.clone()))
+            .collect();
 
         nodes.push(Flux {
             id: i,
             num_nodes: n,
-            channels,
-            recv_index: 0,
-            pending_calls,
-            on_response: on_response.clone(),
-            recv_queue: VecDeque::with_capacity(capacity),
-            inflight_max,
-            channel_capacity: actual_capacity,
+            server,
+            callers,
+            peer_ids,
             _marker: PhantomData,
         });
     }
@@ -412,11 +283,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::{FastForwardTransport, LamportTransport};
+    use mempc::{FastForwardMpsc, LamportMpsc};
 
     #[test]
     fn test_create_flux() {
-        let nodes: Vec<Flux<u32, (), _, OnesidedTransport>> = create_flux(3, 16, 8, |_, _| {});
+        let nodes: Vec<Flux<u32, (), _, OnesidedMpsc>> = create_flux(3, 16, 8, |_, _| {});
         assert_eq!(nodes.len(), 3);
         assert_eq!(nodes[0].num_peers(), 2);
         assert_eq!(nodes[1].num_peers(), 2);
@@ -431,7 +302,7 @@ mod tests {
         let responses: Rc<RefCell<Vec<(u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
         let responses_clone = Rc::clone(&responses);
 
-        let mut nodes: Vec<Flux<u32, u32, _, OnesidedTransport>> =
+        let mut nodes: Vec<Flux<u32, u32, _, OnesidedMpsc>> =
             create_flux(2, 16, 8, move |user_data, data| {
                 responses_clone.borrow_mut().push((user_data, data));
             });
@@ -445,7 +316,7 @@ mod tests {
         let handle = nodes[1].try_recv().unwrap();
         assert_eq!(handle.from(), 0);
         assert_eq!(handle.data(), 42);
-        assert!(handle.reply(43).is_ok());
+        handle.reply(43);
         nodes[1].poll();
 
         // Node 0 receives response (callback is invoked)
@@ -458,7 +329,7 @@ mod tests {
 
     #[test]
     fn test_poll_round_robin() {
-        let mut nodes: Vec<Flux<u32, (), _, OnesidedTransport>> = create_flux(3, 16, 8, |_, _| {});
+        let mut nodes: Vec<Flux<u32, (), _, OnesidedMpsc>> = create_flux(3, 16, 8, |_, _| {});
 
         // Node 1 and 2 both send to node 0
         nodes[1].call(0, 100, ()).unwrap();
@@ -471,6 +342,7 @@ mod tests {
         let mut received = Vec::new();
         while let Some(handle) = nodes[0].try_recv() {
             received.push((handle.from(), handle.data()));
+            handle.reply(0);
         }
 
         assert_eq!(received.len(), 2);
@@ -480,7 +352,7 @@ mod tests {
 
     #[test]
     fn test_invalid_peer() {
-        let mut nodes: Vec<Flux<u32, (), _, OnesidedTransport>> = create_flux(2, 16, 8, |_, _| {});
+        let mut nodes: Vec<Flux<u32, (), _, OnesidedMpsc>> = create_flux(2, 16, 8, |_, _| {});
 
         assert!(matches!(
             nodes[0].call(5, 42, ()),
@@ -490,7 +362,7 @@ mod tests {
 
     #[test]
     fn test_inflight_limit() {
-        let mut nodes: Vec<Flux<u32, (), _, OnesidedTransport>> = create_flux(2, 16, 4, |_, _| {});
+        let mut nodes: Vec<Flux<u32, (), _, OnesidedMpsc>> = create_flux(2, 16, 4, |_, _| {});
 
         // Send up to inflight_max
         for i in 0..4 {
@@ -510,7 +382,7 @@ mod tests {
         nodes[1].poll();
         while let Some(handle) = nodes[1].try_recv() {
             let data = handle.data();
-            assert!(handle.reply(data).is_ok());
+            handle.reply(data);
         }
         // Publish replies
         nodes[1].poll();
@@ -530,7 +402,7 @@ mod tests {
 
         let completed_count = Arc::new(AtomicU64::new(0));
 
-        let nodes: Vec<Flux<u64, Arc<AtomicU64>, _, OnesidedTransport>> = {
+        let nodes: Vec<Flux<u64, Arc<AtomicU64>, _, OnesidedMpsc>> = {
             let completed = Arc::clone(&completed_count);
             create_flux(4, 1024, 256, move |_, _| {
                 completed.fetch_add(1, Ordering::Relaxed);
@@ -571,7 +443,7 @@ mod tests {
                     node.poll();
                     while let Some(handle) = node.try_recv() {
                         let data = handle.data();
-                        handle.reply(data).ok();
+                        handle.reply(data);
                         request_count += 1;
                     }
                 }
@@ -598,7 +470,7 @@ mod tests {
         let global_response_count = Arc::new(AtomicU64::new(0));
         let global_count_clone = Arc::clone(&global_response_count);
 
-        let nodes: Vec<Flux<u64, (), _, OnesidedTransport>> =
+        let nodes: Vec<Flux<u64, (), _, OnesidedMpsc>> =
             create_flux(n, capacity, inflight_max, move |_: (), _: u64| {
                 global_count_clone.fetch_add(1, Ordering::Relaxed);
             });
@@ -609,7 +481,7 @@ mod tests {
         std::thread::scope(|s| {
             let handles: Vec<_> = nodes
                 .into_iter()
-                
+
                 .map(|mut node| {
                     let end_barrier = Arc::clone(&end_barrier);
                     let global_count = Arc::clone(&global_response_count_clone);
@@ -637,9 +509,8 @@ mod tests {
 
                             while let Some(handle) = node.try_recv() {
                                 let data = handle.data();
-                                if handle.reply(data).is_ok() {
-                                    sent_replies += 1;
-                                }
+                                handle.reply(data);
+                                sent_replies += 1;
                             }
                         }
 
@@ -648,7 +519,7 @@ mod tests {
                             node.poll();
                             while let Some(handle) = node.try_recv() {
                                 let data = handle.data();
-                                handle.reply(data).ok();
+                                handle.reply(data);
                             }
                             std::hint::spin_loop();
                         }
@@ -677,7 +548,7 @@ mod tests {
         let response_count = Arc::new(AtomicU64::new(0));
         let response_count_clone = Arc::clone(&response_count);
 
-        let mut nodes: Vec<Flux<u64, (), _, OnesidedTransport>> =
+        let mut nodes: Vec<Flux<u64, (), _, OnesidedMpsc>> =
             create_flux(2, 8, 4, move |_: (), _: u64| {
                 response_count_clone.fetch_add(1, Ordering::Relaxed);
             });
@@ -693,7 +564,7 @@ mod tests {
             nodes[1].poll();
             while let Some(handle) = nodes[1].try_recv() {
                 let data = handle.data();
-                assert!(handle.reply(data + 1000).is_ok());
+                handle.reply(data + 1000);
             }
 
             // Node 0 receives all responses
@@ -711,7 +582,7 @@ mod tests {
         let responses: Rc<RefCell<Vec<(u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
         let responses_clone = Rc::clone(&responses);
 
-        let mut nodes: Vec<Flux<u32, u32, _, OnesidedTransport>> =
+        let mut nodes: Vec<Flux<u32, u32, _, OnesidedMpsc>> =
             create_flux(2, 16, 8, move |user_data, data| {
                 responses_clone.borrow_mut().push((user_data, data));
             });
@@ -729,8 +600,8 @@ mod tests {
         // Can do other work between recv_raw and reply
         assert!(nodes[1].try_recv_raw().is_none());
 
-        // Reply using the stored token
-        nodes[1].reply(from, token, 43).unwrap();
+        // Reply using the stored token (no 'to' parameter needed)
+        nodes[1].reply(token, 43);
         nodes[1].poll();
 
         // Node 0 receives response
@@ -749,7 +620,7 @@ mod tests {
         let responses: Rc<RefCell<Vec<(u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
         let responses_clone = Rc::clone(&responses);
 
-        let mut nodes: Vec<Flux<u32, u32, _, OnesidedTransport>> =
+        let mut nodes: Vec<Flux<u32, u32, _, OnesidedMpsc>> =
             create_flux(3, 16, 8, move |user_data, data| {
                 responses_clone.borrow_mut().push((user_data, data));
             });
@@ -765,9 +636,9 @@ mod tests {
         let req1 = nodes[0].try_recv_raw().unwrap();
         let req2 = nodes[0].try_recv_raw().unwrap();
 
-        // Reply in reverse order
-        nodes[0].reply(req2.0, req2.1, req2.2 + 1).unwrap();
-        nodes[0].reply(req1.0, req1.1, req1.2 + 1).unwrap();
+        // Reply in reverse order (no 'to' parameter needed)
+        nodes[0].reply(req2.1, req2.2 + 1);
+        nodes[0].reply(req1.1, req1.2 + 1);
         nodes[0].poll();
 
         // Both callers receive responses
@@ -778,18 +649,18 @@ mod tests {
         assert_eq!(responses.len(), 2);
     }
 
-    // Tests for different transport implementations
+    // Tests for different MPSC channel implementations
 
     #[test]
-    fn test_fastforward_transport() {
+    fn test_fastforward_mpsc() {
         use std::cell::RefCell;
         use std::rc::Rc;
 
         let responses: Rc<RefCell<Vec<(u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
         let responses_clone = Rc::clone(&responses);
 
-        let mut nodes: Vec<Flux<u32, u32, _, FastForwardTransport>> =
-            create_flux_with_transport(2, 16, 8, move |user_data, data| {
+        let mut nodes: Vec<Flux<u32, u32, _, FastForwardMpsc>> =
+            create_flux_with(2, 16, 8, move |user_data, data| {
                 responses_clone.borrow_mut().push((user_data, data));
             });
 
@@ -800,7 +671,7 @@ mod tests {
         let handle = nodes[1].try_recv().unwrap();
         assert_eq!(handle.from(), 0);
         assert_eq!(handle.data(), 42);
-        assert!(handle.reply(43).is_ok());
+        handle.reply(43);
         nodes[1].poll();
 
         nodes[0].poll();
@@ -811,15 +682,15 @@ mod tests {
     }
 
     #[test]
-    fn test_lamport_transport() {
+    fn test_lamport_mpsc() {
         use std::cell::RefCell;
         use std::rc::Rc;
 
         let responses: Rc<RefCell<Vec<(u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
         let responses_clone = Rc::clone(&responses);
 
-        let mut nodes: Vec<Flux<u32, u32, _, LamportTransport>> =
-            create_flux_with_transport(2, 16, 8, move |user_data, data| {
+        let mut nodes: Vec<Flux<u32, u32, _, LamportMpsc>> =
+            create_flux_with(2, 16, 8, move |user_data, data| {
                 responses_clone.borrow_mut().push((user_data, data));
             });
 
@@ -830,7 +701,7 @@ mod tests {
         let handle = nodes[1].try_recv().unwrap();
         assert_eq!(handle.from(), 0);
         assert_eq!(handle.data(), 42);
-        assert!(handle.reply(43).is_ok());
+        handle.reply(43);
         nodes[1].poll();
 
         nodes[0].poll();

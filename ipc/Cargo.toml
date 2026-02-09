@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 nix.workspace = true
 libc.workspace = true
-slab.workspace = true
+mempc = { path = "../mempc" }
 
 [dev-dependencies]
 criterion.workspace = true

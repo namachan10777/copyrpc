@@ -1,30 +1,21 @@
 //! Thread-safe channel implementations for inter-thread communication.
 //!
 //! This crate provides:
-//! - `flux`: SPSC-based n-to-n communication (separate queue per peer)
+//! - `flux`: SPSC-based n-to-n communication via `mempc::MpscChannel`
 //! - `mesh`: MPSC-based n-to-n communication (single shared receive queue)
-//! - `transport`: Transport trait abstraction for SPSC implementations
 
 pub mod flux;
 pub mod mesh;
-pub mod serial;
-pub mod transport;
 
 pub mod mpsc;
 pub mod mpsc_fetchadd;
 
-pub use flux::{create_flux, create_flux_with_transport, Flux, RecvHandle};
+pub use flux::{create_flux, create_flux_with, Flux, RecvHandle};
 pub use mesh::{create_mesh, create_mesh_with, Mesh};
 pub use mpsc_fetchadd::FetchAddMpsc;
-pub use serial::Serial;
-pub use transport::{
-    FastForwardTransport, LamportTransport, OnesidedTransport, OnesidedImmediateTransport,
-    OnesidedValidityTransport, Transport, TransportEndpoint, TransportError,
-};
-#[cfg(feature = "omango")]
-pub use transport::OmangoTransport;
-#[cfg(feature = "rtrb")]
-pub use transport::RtrbTransport;
+pub use mempc::Serial;
+pub use mempc::{OnesidedMpsc, FastForwardMpsc, LamportMpsc, FetchAddMpsc as MempcFetchAddMpsc};
+pub use mempc::ReplyToken;
 
 /// A received message, distinguishing between notifications, requests, and responses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

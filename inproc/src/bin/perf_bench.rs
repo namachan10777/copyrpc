@@ -11,10 +11,8 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use inproc::Serial;
-use inproc::{
-    create_flux_with_transport, FastForwardTransport, Flux, LamportTransport, OnesidedTransport,
-    Transport,
-};
+use inproc::{create_flux_with, Flux};
+use mempc::MpscChannel;
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -58,13 +56,13 @@ fn pin_to_core(core_id: usize) {
     core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
 }
 
-fn run_bench<Tr: Transport>(duration_secs: u64, inflight_max: usize, start_core: usize) {
+fn run_bench<M: MpscChannel>(duration_secs: u64, inflight_max: usize, start_core: usize) {
     let capacity = 1024;
     let completed = Arc::new(AtomicU64::new(0));
     let completed_clone = Arc::clone(&completed);
 
-    let nodes: Vec<Flux<Payload, (), _, Tr>> =
-        create_flux_with_transport(2, capacity, inflight_max, move |_: (), _: Payload| {
+    let nodes: Vec<Flux<Payload, (), _, M>> =
+        create_flux_with(2, capacity, inflight_max, move |_: (), _: Payload| {
             completed_clone.fetch_add(1, Ordering::Relaxed);
         });
 
@@ -87,7 +85,7 @@ fn run_bench<Tr: Transport>(duration_secs: u64, inflight_max: usize, start_core:
             node1.poll();
             while let Some(h) = node1.try_recv() {
                 let data = h.data();
-                h.reply(data).ok();
+                h.reply(data);
             }
         }
     });
@@ -138,10 +136,14 @@ fn main() {
     );
 
     match args.transport {
-        TransportType::Onesided => run_bench::<OnesidedTransport>(args.duration, args.inflight, args.start_core),
-        TransportType::FastForward => {
-            run_bench::<FastForwardTransport>(args.duration, args.inflight, args.start_core)
+        TransportType::Onesided => {
+            run_bench::<mempc::OnesidedMpsc>(args.duration, args.inflight, args.start_core)
         }
-        TransportType::Lamport => run_bench::<LamportTransport>(args.duration, args.inflight, args.start_core),
+        TransportType::FastForward => {
+            run_bench::<mempc::FastForwardMpsc>(args.duration, args.inflight, args.start_core)
+        }
+        TransportType::Lamport => {
+            run_bench::<mempc::LamportMpsc>(args.duration, args.inflight, args.start_core)
+        }
     }
 }

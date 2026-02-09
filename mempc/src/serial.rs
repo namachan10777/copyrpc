@@ -1,13 +1,10 @@
-//! Serial trait for types that can be safely transmitted through channels.
-
-/// Marker trait for types that can be safely transmitted through the channel.
+/// Marker trait for types that can be safely transmitted through channels.
 ///
 /// # Safety
 /// Types implementing this trait must be `Copy` to ensure they can be safely
 /// transmitted without ownership issues.
 pub unsafe trait Serial: Copy {}
 
-// Implement Serial for common types
 unsafe impl Serial for u8 {}
 unsafe impl Serial for u16 {}
 unsafe impl Serial for u32 {}

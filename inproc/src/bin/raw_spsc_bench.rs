@@ -1,6 +1,6 @@
-//! Raw Transport benchmark without Flux overhead.
+//! Raw SPSC benchmark without Flux overhead.
 //!
-//! Tests Transport's call/reply pattern directly.
+//! Tests MpscChannel's call/reply pattern directly.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
@@ -9,9 +9,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use inproc::Serial;
-use inproc::{
-    FastForwardTransport, LamportTransport, OnesidedTransport, Transport, TransportEndpoint,
-};
+use mempc::{MpscCaller, MpscChannel, MpscRecvRef, MpscServer};
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -52,10 +50,11 @@ fn pin_to_core(core_id: usize) {
     core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
 }
 
-fn run_bench<Tr: Transport>(duration_secs: u64, start_core: usize) {
+fn run_bench<M: MpscChannel>(duration_secs: u64, start_core: usize) {
     let capacity = 1024;
     let inflight_max = 256;
-    let (mut endpoint_a, mut endpoint_b) = Tr::channel::<Payload, Payload>(capacity, inflight_max);
+    let (mut callers, mut server) = M::create::<Payload, Payload>(1, capacity, inflight_max);
+    let mut caller = callers.pop().unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);
@@ -70,18 +69,14 @@ fn run_bench<Tr: Transport>(duration_secs: u64, start_core: usize) {
         barrier2.wait();
         let mut count = 0u64;
         while !stop2.load(Ordering::Relaxed) {
-            // sync() makes peer's calls visible, makes our replies visible
-            endpoint_b.sync();
-            // Receive requests and reply
-            while let Some((token, data)) = endpoint_b.recv() {
-                // Send response with same token
-                loop {
-                    if endpoint_b.reply(token, data).is_ok() {
-                        count += 1;
-                        break;
-                    }
-                    std::hint::spin_loop();
-                }
+            server.poll();
+            loop {
+                let (data, token) = match server.try_recv() {
+                    Some(r) => (r.data(), r.into_token()),
+                    None => break,
+                };
+                server.reply(token, data);
+                count += 1;
             }
         }
         count
@@ -97,9 +92,9 @@ fn run_bench<Tr: Transport>(duration_secs: u64, start_core: usize) {
     let mut received = 0u64;
 
     while start.elapsed() < run_duration {
-        // Send requests (Transport limits inflight via InflightExceeded error)
+        // Send requests
         while sent - received < inflight_max as u64 {
-            if endpoint_a.call(payload).is_ok() {
+            if caller.call(payload).is_ok() {
                 sent += 1;
             } else {
                 break;
@@ -107,16 +102,16 @@ fn run_bench<Tr: Transport>(duration_secs: u64, start_core: usize) {
         }
 
         // Receive responses
-        endpoint_a.sync();
-        while let Some(_) = endpoint_a.try_recv_response() {
+        caller.sync();
+        while caller.try_recv_response().is_some() {
             received += 1;
         }
     }
 
     // Drain remaining
     while received < sent {
-        endpoint_a.sync();
-        while let Some(_) = endpoint_a.try_recv_response() {
+        caller.sync();
+        while caller.try_recv_response().is_some() {
             received += 1;
         }
         std::hint::spin_loop();
@@ -136,11 +131,20 @@ fn run_bench<Tr: Transport>(duration_secs: u64, start_core: usize) {
 fn main() {
     let args = Args::parse();
 
-    println!("Running {:?} transport for {}s", args.transport, args.duration);
+    println!(
+        "Running {:?} transport for {}s",
+        args.transport, args.duration
+    );
 
     match args.transport {
-        TransportType::Onesided => run_bench::<OnesidedTransport>(args.duration, args.start_core),
-        TransportType::FastForward => run_bench::<FastForwardTransport>(args.duration, args.start_core),
-        TransportType::Lamport => run_bench::<LamportTransport>(args.duration, args.start_core),
+        TransportType::Onesided => {
+            run_bench::<mempc::OnesidedMpsc>(args.duration, args.start_core)
+        }
+        TransportType::FastForward => {
+            run_bench::<mempc::FastForwardMpsc>(args.duration, args.start_core)
+        }
+        TransportType::Lamport => {
+            run_bench::<mempc::LamportMpsc>(args.duration, args.start_core)
+        }
     }
 }
