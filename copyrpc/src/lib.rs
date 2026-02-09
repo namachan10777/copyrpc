@@ -685,6 +685,16 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
 /// This prevents SQ exhaustion by allowing completion processing.
 const SIGNAL_INTERVAL: u32 = 64;
 
+/// Maximum bytes that can be inlined in a write_imm WQE (inline-only, no SGE).
+/// BlueFlame(256) - Ctrl(16) - RDMA(16) = 224 bytes for inline padded.
+/// inline_padded_size(220) = (4 + 220 + 15) & !15 = 224. Total WQE = 256B.
+const MAX_INLINE_ONLY: usize = 220;
+
+/// Maximum bytes that can be inlined in a hybrid write_imm WQE (inline + SGE).
+/// BlueFlame(256) - Ctrl(16) - RDMA(16) - SGE(16) = 208 bytes for inline padded.
+/// inline_padded_size(204) = (4 + 204 + 15) & !15 = 208. Total WQE = 256B.
+const MAX_INLINE_HYBRID: usize = 204;
+
 /// Internal endpoint state.
 struct EndpointInner<U> {
     /// RC Queue Pair (wrapped in Rc<RefCell>).
@@ -897,24 +907,70 @@ impl<U> EndpointInner<U> {
         {
             let qp = self.qp.borrow();
             let ctx = qp.emit_ctx().map_err(Error::Io)?;
+            let delta_usize = delta as usize;
+
+            if delta_usize <= MAX_INLINE_ONLY {
+                // Fully inline: entire batch fits in BlueFlame WQE
+                let inline_data = &self.send_ring[start_offset..start_offset + delta_usize];
+                if should_signal {
+                    emit_wqe!(
+                        &ctx,
+                        write_imm {
+                            flags: WqeFlags::empty(),
+                            remote_addr: remote_addr,
+                            rkey: remote_ring.rkey,
+                            imm: imm,
+                            inline: inline_data,
+                            signaled: SrqEntry {
+                                qpn,
+                                is_read: false
+                            },
+                        }
+                    )
+                    .map_err(|e| Error::Io(e.into()))?;
+                } else {
+                    emit_wqe!(
+                        &ctx,
+                        write_imm {
+                            flags: WqeFlags::empty(),
+                            remote_addr: remote_addr,
+                            rkey: remote_ring.rkey,
+                            imm: imm,
+                            inline: inline_data,
+                        }
+                    )
+                    .map_err(|e| Error::Io(e.into()))?;
+                }
+            } else {
+                // Hybrid: inline first MAX_INLINE_HYBRID bytes, SGE for the rest
+                let inline_data = &self.send_ring[start_offset..start_offset + MAX_INLINE_HYBRID];
+                let sge_offset = start_offset + MAX_INLINE_HYBRID;
+                let sge_len = delta_usize - MAX_INLINE_HYBRID;
+                if should_signal {
+                    emit_wqe!(&ctx, write_imm {
+                        flags: WqeFlags::empty(),
+                        remote_addr: remote_addr,
+                        rkey: remote_ring.rkey,
+                        imm: imm,
+                        inline: inline_data,
+                        sge: { addr: self.send_ring_mr.addr() as u64 + sge_offset as u64, len: sge_len as u32, lkey: self.send_ring_mr.lkey() },
+                        signaled: SrqEntry { qpn, is_read: false },
+                    }).map_err(|e| Error::Io(e.into()))?;
+                } else {
+                    emit_wqe!(&ctx, write_imm {
+                        flags: WqeFlags::empty(),
+                        remote_addr: remote_addr,
+                        rkey: remote_ring.rkey,
+                        imm: imm,
+                        inline: inline_data,
+                        sge: { addr: self.send_ring_mr.addr() as u64 + sge_offset as u64, len: sge_len as u32, lkey: self.send_ring_mr.lkey() },
+                    }).map_err(|e| Error::Io(e.into()))?;
+                }
+            }
+
             if should_signal {
-                emit_wqe!(&ctx, write_imm {
-                    flags: WqeFlags::empty(),
-                    remote_addr: remote_addr,
-                    rkey: remote_ring.rkey,
-                    imm: imm,
-                    sge: { addr: self.send_ring_mr.addr() as u64 + start_offset as u64, len: delta as u32, lkey: self.send_ring_mr.lkey() },
-                    signaled: SrqEntry { qpn, is_read: false },
-                }).map_err(|e| Error::Io(e.into()))?;
                 self.unsignaled_count.set(0);
             } else {
-                emit_wqe!(&ctx, write_imm {
-                    flags: WqeFlags::empty(),
-                    remote_addr: remote_addr,
-                    rkey: remote_ring.rkey,
-                    imm: imm,
-                    sge: { addr: self.send_ring_mr.addr() as u64 + start_offset as u64, len: delta as u32, lkey: self.send_ring_mr.lkey() },
-                }).map_err(|e| Error::Io(e.into()))?;
                 self.unsignaled_count.set(count + 1);
             }
         }

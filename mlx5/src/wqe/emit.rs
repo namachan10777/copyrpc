@@ -892,10 +892,10 @@ pub fn emit_write_wrap<Q: SqState>(
     opcode: WqeOpcode,
 ) -> Result<EmitResult, SubmissionError> {
     // Calculate WQE size
-    let data_size = if let Some(data) = inline_data {
-        ((4 + data.len()) + 15) & !15
-    } else {
-        DATA_SEG_SIZE
+    let data_size = match (inline_data, sge.len > 0) {
+        (Some(data), true) => inline_padded_size(data.len()) + DATA_SEG_SIZE,
+        (Some(data), false) => inline_padded_size(data.len()),
+        (None, _) => DATA_SEG_SIZE,
     };
     let wqe_size = CTRL_SEG_SIZE + RDMA_SEG_SIZE + data_size;
     let wqebb_cnt = calc_wqebb_cnt(wqe_size);
@@ -943,6 +943,15 @@ pub fn emit_write_wrap<Q: SqState>(
             let ptr = wqe_ptr.add(data_offset);
             write_inline_header(ptr, data.len() as u32);
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(4), data.len());
+            if sge.len > 0 {
+                let inline_padded = inline_padded_size(data.len());
+                write_data_seg(
+                    wqe_ptr.add(data_offset + inline_padded),
+                    sge.len,
+                    sge.lkey,
+                    sge.addr,
+                );
+            }
         } else {
             write_data_seg(wqe_ptr.add(data_offset), sge.len, sge.lkey, sge.addr);
         }
@@ -2195,6 +2204,185 @@ macro_rules! emit_wqe {
                         wqe_ptr.add($crate::wqe::CTRL_SEG_SIZE + $crate::wqe::RDMA_SEG_SIZE);
                     $crate::wqe::write_inline_header(data_ptr, data.len() as u32);
                     $crate::wqe::copy_inline_data(data_ptr.add(4), data.as_ptr(), data.len());
+                }
+
+                ctx.pi().set(wqe_idx.wrapping_add(wqebb_cnt));
+                ctx.last_wqe().set(Some((wqe_ptr, wqe_size)));
+                ctx.table().store(wqe_idx, $entry, ctx.pi().get());
+
+                Ok($crate::wqe::emit::EmitResult {
+                    wqe_ptr,
+                    wqe_idx,
+                    wqe_size,
+                    wqebb_cnt,
+                })
+            }
+        }
+    }};
+
+    // WRITE_IMM with inline + SGE
+    ($ctx:expr, write_imm {
+        flags: $flags:expr,
+        remote_addr: $raddr:expr,
+        rkey: $rkey:expr,
+        imm: $imm:expr,
+        inline: $data:expr,
+        sge: { addr: $addr:expr, len: $len:expr, lkey: $lkey:expr $(,)? } $(,)?
+    }) => {{
+        let ctx = $ctx;
+        let data: &[u8] = $data;
+        let inline_size = $crate::wqe::inline_padded_size(data.len());
+        let wqe_size = $crate::wqe::CTRL_SEG_SIZE
+            + $crate::wqe::RDMA_SEG_SIZE
+            + inline_size
+            + $crate::wqe::DATA_SEG_SIZE;
+        let wqebb_cnt = ((wqe_size + 63) / 64) as u16;
+        let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
+
+        if $crate::wqe::unlikely(available < wqebb_cnt) {
+            Err($crate::wqe::SubmissionError::SqFull)
+        } else {
+            let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
+            if $crate::wqe::unlikely(wqebb_cnt > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
+                $crate::wqe::emit::emit_write_wrap(
+                    ctx,
+                    $flags,
+                    $crate::wqe::emit::RdmaParams {
+                        remote_addr: $raddr,
+                        rkey: $rkey,
+                    },
+                    $crate::wqe::emit::SgeParams {
+                        addr: $addr,
+                        len: $len,
+                        lkey: $lkey,
+                    },
+                    false,
+                    Some(data),
+                    $imm,
+                    $crate::wqe::WqeOpcode::RdmaWriteImm,
+                )
+            } else {
+                let wqe_idx = ctx.pi().get();
+                let wqe_ptr = unsafe {
+                    ctx.sq_buf()
+                        .add(((wqe_idx & (ctx.wqe_cnt() - 1)) as usize) * 64)
+                };
+
+                unsafe {
+                    $crate::wqe::write_ctrl_seg(
+                        wqe_ptr,
+                        &$crate::wqe::CtrlSegParams {
+                            opmod: 0,
+                            opcode: $crate::wqe::WqeOpcode::RdmaWriteImm as u8,
+                            wqe_idx,
+                            qpn: ctx.sqn(),
+                            ds_cnt: (wqe_size / 16) as u8,
+                            flags: $flags,
+                            imm: $imm,
+                        },
+                    );
+                    $crate::wqe::write_rdma_seg(
+                        wqe_ptr.add($crate::wqe::CTRL_SEG_SIZE),
+                        $raddr,
+                        $rkey,
+                    );
+                    let data_ptr =
+                        wqe_ptr.add($crate::wqe::CTRL_SEG_SIZE + $crate::wqe::RDMA_SEG_SIZE);
+                    $crate::wqe::write_inline_header(data_ptr, data.len() as u32);
+                    $crate::wqe::copy_inline_data(data_ptr.add(4), data.as_ptr(), data.len());
+                    $crate::wqe::write_data_seg(data_ptr.add(inline_size), $len, $lkey, $addr);
+                }
+
+                ctx.pi().set(wqe_idx.wrapping_add(wqebb_cnt));
+                ctx.last_wqe().set(Some((wqe_ptr, wqe_size)));
+
+                Ok($crate::wqe::emit::EmitResult {
+                    wqe_ptr,
+                    wqe_idx,
+                    wqe_size,
+                    wqebb_cnt,
+                })
+            }
+        }
+    }};
+
+    // WRITE_IMM with inline + SGE (signaled)
+    ($ctx:expr, write_imm {
+        flags: $flags:expr,
+        remote_addr: $raddr:expr,
+        rkey: $rkey:expr,
+        imm: $imm:expr,
+        inline: $data:expr,
+        sge: { addr: $addr:expr, len: $len:expr, lkey: $lkey:expr $(,)? },
+        signaled: $entry:expr $(,)?
+    }) => {{
+        let ctx = $ctx;
+        let data: &[u8] = $data;
+        let inline_size = $crate::wqe::inline_padded_size(data.len());
+        let wqe_size = $crate::wqe::CTRL_SEG_SIZE
+            + $crate::wqe::RDMA_SEG_SIZE
+            + inline_size
+            + $crate::wqe::DATA_SEG_SIZE;
+        let wqebb_cnt = ((wqe_size + 63) / 64) as u16;
+        let available = ctx.wqe_cnt() - ctx.pi().get().wrapping_sub(ctx.ci().get());
+
+        if $crate::wqe::unlikely(available < wqebb_cnt) {
+            Err($crate::wqe::SubmissionError::SqFull)
+        } else {
+            let slots_to_end = ctx.wqe_cnt() - (ctx.pi().get() & (ctx.wqe_cnt() - 1));
+            if $crate::wqe::unlikely(wqebb_cnt > slots_to_end && slots_to_end < ctx.wqe_cnt()) {
+                let result = $crate::wqe::emit::emit_write_wrap(
+                    ctx,
+                    $flags | $crate::wqe::WqeFlags::COMPLETION,
+                    $crate::wqe::emit::RdmaParams {
+                        remote_addr: $raddr,
+                        rkey: $rkey,
+                    },
+                    $crate::wqe::emit::SgeParams {
+                        addr: $addr,
+                        len: $len,
+                        lkey: $lkey,
+                    },
+                    true,
+                    Some(data),
+                    $imm,
+                    $crate::wqe::WqeOpcode::RdmaWriteImm,
+                );
+                if let Ok(ref res) = result {
+                    ctx.table().store(res.wqe_idx, $entry, ctx.pi().get());
+                }
+                result
+            } else {
+                let wqe_idx = ctx.pi().get();
+                let wqe_ptr = unsafe {
+                    ctx.sq_buf()
+                        .add(((wqe_idx & (ctx.wqe_cnt() - 1)) as usize) * 64)
+                };
+                let flags = $flags | $crate::wqe::WqeFlags::COMPLETION;
+
+                unsafe {
+                    $crate::wqe::write_ctrl_seg(
+                        wqe_ptr,
+                        &$crate::wqe::CtrlSegParams {
+                            opmod: 0,
+                            opcode: $crate::wqe::WqeOpcode::RdmaWriteImm as u8,
+                            wqe_idx,
+                            qpn: ctx.sqn(),
+                            ds_cnt: (wqe_size / 16) as u8,
+                            flags,
+                            imm: $imm,
+                        },
+                    );
+                    $crate::wqe::write_rdma_seg(
+                        wqe_ptr.add($crate::wqe::CTRL_SEG_SIZE),
+                        $raddr,
+                        $rkey,
+                    );
+                    let data_ptr =
+                        wqe_ptr.add($crate::wqe::CTRL_SEG_SIZE + $crate::wqe::RDMA_SEG_SIZE);
+                    $crate::wqe::write_inline_header(data_ptr, data.len() as u32);
+                    $crate::wqe::copy_inline_data(data_ptr.add(4), data.as_ptr(), data.len());
+                    $crate::wqe::write_data_seg(data_ptr.add(inline_size), $len, $lkey, $addr);
                 }
 
                 ctx.pi().set(wqe_idx.wrapping_add(wqebb_cnt));
