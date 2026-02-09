@@ -188,7 +188,8 @@ fn run_server_client<M: MpscChannel>(
                 caller.sync();
 
                 // Receive responses
-                while let Some((_token, _resp)) = caller.try_recv_response() {
+                while let Some((_token, resp)) = caller.try_recv_response() {
+                    std::hint::black_box(resp);
                     total_completed += 1;
                 }
 
