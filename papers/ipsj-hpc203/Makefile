@@ -11,11 +11,11 @@ docker-build:
 
 # Build PDF using Docker (pLaTeX + dvipdfmx)
 build: docker-build
-	$(DOCKER_RUN) latexmk main.tex
+	$(DOCKER_RUN) latexmk hpc203.tex
 
 # Watch for changes and rebuild
 watch: docker-build
-	$(DOCKER_RUN) latexmk -pvc main.tex
+	$(DOCKER_RUN) latexmk -pvc hpc203.tex
 
 # Clean auxiliary files
 clean:
