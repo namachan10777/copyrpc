@@ -46,7 +46,10 @@ use crate::cq::{Cq, Cqe, CqeOpcode};
 use crate::device::Context;
 use crate::pd::Pd;
 use crate::srq::SrqInfo;
-use crate::wqe::{OrderedWqeTable, UnorderedWqeTable, emit::{SendQueueState, TmCmdEmitContext}};
+use crate::wqe::{
+    OrderedWqeTable, UnorderedWqeTable,
+    emit::{SendQueueState, TmCmdEmitContext},
+};
 
 // =============================================================================
 // TM-SRQ Completion Types
@@ -514,7 +517,13 @@ impl<CmdEntry, RecvEntry, OnComplete> TmSrq<CmdEntry, RecvEntry, OnComplete> {
     /// * `len` - Length of the receive buffer
     /// * `lkey` - Local key for the memory region
     /// * `entry` - User entry to associate with this receive operation
-    pub fn post_unordered_recv(&self, addr: u64, len: u32, lkey: u32, entry: RecvEntry) -> io::Result<()> {
+    pub fn post_unordered_recv(
+        &self,
+        addr: u64,
+        len: u32,
+        lkey: u32,
+        entry: RecvEntry,
+    ) -> io::Result<()> {
         use crate::wqe::write_data_seg;
 
         let srq_state = self.srq_state();
@@ -544,7 +553,9 @@ impl<CmdEntry, RecvEntry, OnComplete> TmSrq<CmdEntry, RecvEntry, OnComplete> {
         if srq_state.pending_start_ptr.get().is_none() {
             srq_state.pending_start_ptr.set(Some(wqe_ptr));
         }
-        srq_state.pending_wqe_count.set(srq_state.pending_wqe_count.get() + 1);
+        srq_state
+            .pending_wqe_count
+            .set(srq_state.pending_wqe_count.get() + 1);
 
         Ok(())
     }
@@ -684,4 +695,3 @@ where
         }
     }
 }
-

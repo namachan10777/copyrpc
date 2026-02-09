@@ -12,8 +12,8 @@ use crate::common::{DisconnectState, Response, cldemote};
 use crate::{CallError, MpscCaller, MpscChannel, MpscServer, ReplyToken, Serial};
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ============================================================================
 // Slot (public for SHM usage)
@@ -279,13 +279,19 @@ impl<T: Serial> Receiver<T> {
 
 impl<T: Serial> Drop for Sender<T> {
     fn drop(&mut self) {
-        self.inner.disconnect.tx_alive.store(false, Ordering::Release);
+        self.inner
+            .disconnect
+            .tx_alive
+            .store(false, Ordering::Release);
     }
 }
 
 impl<T: Serial> Drop for Receiver<T> {
     fn drop(&mut self) {
-        self.inner.disconnect.rx_alive.store(false, Ordering::Release);
+        self.inner
+            .disconnect
+            .rx_alive
+            .store(false, Ordering::Release);
     }
 }
 
@@ -309,18 +315,8 @@ fn create_spsc<T: Serial>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     });
 
     // Safety: buffer lives as long as Arc<Inner>, capacity matches buffer length
-    let raw_sender = unsafe {
-        RawSender::new(
-            inner.buffer.as_ptr() as *mut Slot<T>,
-            capacity,
-        )
-    };
-    let raw_receiver = unsafe {
-        RawReceiver::new(
-            inner.buffer.as_ptr(),
-            capacity,
-        )
-    };
+    let raw_sender = unsafe { RawSender::new(inner.buffer.as_ptr() as *mut Slot<T>, capacity) };
+    let raw_receiver = unsafe { RawReceiver::new(inner.buffer.as_ptr(), capacity) };
 
     let sender = Sender {
         inner: Arc::clone(&inner),
@@ -459,7 +455,10 @@ impl<Req: Serial, Resp: Serial> crate::MpscRecvRef<Req> for OnesidedRecvRef<'_, 
 }
 
 impl<Req: Serial + Send, Resp: Serial + Send> MpscServer<Req, Resp> for OnesidedServer<Req, Resp> {
-    type RecvRef<'a> = OnesidedRecvRef<'a, Req, Resp> where Self: 'a;
+    type RecvRef<'a>
+        = OnesidedRecvRef<'a, Req, Resp>
+    where
+        Self: 'a;
 
     #[inline]
     fn poll(&mut self) -> u32 {
@@ -515,7 +514,10 @@ impl MpscChannel for OnesidedMpsc {
         ring_depth: usize,
         max_inflight: usize,
     ) -> (Vec<Self::Caller<Req, Resp>>, Self::Server<Req, Resp>) {
-        assert!(ring_depth.is_power_of_two(), "ring_depth must be power of 2");
+        assert!(
+            ring_depth.is_power_of_two(),
+            "ring_depth must be power of 2"
+        );
 
         let mut callers = Vec::with_capacity(max_callers);
         let mut server_states = Vec::with_capacity(max_callers);
@@ -575,7 +577,9 @@ mod tests {
         assert_eq!(rx.try_recv(), None);
 
         // Clean up
-        unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(ptr, 4))); }
+        unsafe {
+            drop(Box::from_raw(std::slice::from_raw_parts_mut(ptr, 4)));
+        }
     }
 
     #[test]
@@ -606,7 +610,9 @@ mod tests {
             assert_eq!(rx.try_recv(), None);
         }
 
-        unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(ptr, 4))); }
+        unsafe {
+            drop(Box::from_raw(std::slice::from_raw_parts_mut(ptr, 4)));
+        }
     }
 
     #[test]
@@ -632,7 +638,9 @@ mod tests {
         assert_eq!(rx.count_available(8), 3);
         assert_eq!(rx.count_available(2), 2); // capped at max
 
-        unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(ptr, 8))); }
+        unsafe {
+            drop(Box::from_raw(std::slice::from_raw_parts_mut(ptr, 8)));
+        }
     }
 
     #[test]
@@ -642,13 +650,17 @@ mod tests {
         let ptr = unsafe { std::alloc::alloc(layout) as *mut Slot<u64> };
         assert!(!ptr.is_null());
 
-        unsafe { Slot::<u64>::init(ptr); }
+        unsafe {
+            Slot::<u64>::init(ptr);
+        }
 
         // Verify generation is usize::MAX
         let generation = unsafe { std::ptr::read_volatile((*ptr).generation.get()) };
         assert_eq!(generation, usize::MAX);
 
-        unsafe { std::alloc::dealloc(ptr as *mut u8, layout); }
+        unsafe {
+            std::alloc::dealloc(ptr as *mut u8, layout);
+        }
     }
 
     // --- Arc-backed SPSC tests ---
@@ -882,8 +894,12 @@ mod tests {
         let (mut callers, mut server) = OnesidedMpsc::create::<u64, u64>(3, 8, 8);
 
         // Caller 0 sends 4, caller 1 sends 2, caller 2 sends 1
-        for _ in 0..4 { callers[0].call(0).unwrap(); }
-        for _ in 0..2 { callers[1].call(1).unwrap(); }
+        for _ in 0..4 {
+            callers[0].call(0).unwrap();
+        }
+        for _ in 0..2 {
+            callers[1].call(1).unwrap();
+        }
         callers[2].call(2).unwrap();
 
         for c in &mut callers {

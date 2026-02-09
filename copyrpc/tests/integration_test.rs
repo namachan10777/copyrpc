@@ -1,8 +1,8 @@
 //! Integration tests for copyrpc.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -55,7 +55,11 @@ fn test_context_creation() {
         .on_response(on_response)
         .build();
 
-    assert!(result.is_ok(), "Failed to create context: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to create context: {:?}",
+        result.err()
+    );
 }
 
 // =============================================================================
@@ -112,7 +116,9 @@ fn test_simple_pingpong() {
         .expect("Failed to create client context");
 
     let ep_config = EndpointConfig::default();
-    let mut ep = ctx.create_endpoint(&ep_config).expect("Failed to create endpoint");
+    let mut ep = ctx
+        .create_endpoint(&ep_config)
+        .expect("Failed to create endpoint");
 
     let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
 
@@ -143,11 +149,20 @@ fn test_simple_pingpong() {
     let server_stop = stop_flag.clone();
 
     let handle: JoinHandle<()> = thread::spawn(move || {
-        server_thread(server_info_tx, client_info_rx, server_ready_clone, server_stop);
+        server_thread(
+            server_info_tx,
+            client_info_rx,
+            server_ready_clone,
+            server_stop,
+        );
     });
 
-    client_info_tx.send(client_info).expect("Failed to send client info");
-    let server_info = server_info_rx.recv().expect("Failed to receive server info");
+    client_info_tx
+        .send(client_info)
+        .expect("Failed to send client info");
+    let server_info = server_info_rx
+        .recv()
+        .expect("Failed to receive server info");
 
     while server_ready.load(Ordering::Acquire) == 0 {
         std::hint::spin_loop();
@@ -166,14 +181,16 @@ fn test_simple_pingpong() {
         initial_credit: server_info.initial_credit,
     };
 
-    ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
+    ep.connect(&remote, 0, ctx.port())
+        .expect("Failed to connect");
 
     // Send a request
     let request_data = vec![0u8; 32];
     let user_data = CallUserData { call_id: 1 };
 
     eprintln!("Sending request...");
-    ep.call(&request_data, user_data, 64).expect("Failed to send request");
+    ep.call(&request_data, user_data, 64)
+        .expect("Failed to send request");
 
     // Poll for response with timeout
     let start = std::time::Instant::now();
@@ -201,7 +218,11 @@ fn test_simple_pingpong() {
     handle.join().expect("Server thread panicked");
 
     let response_count = completed.load(Ordering::SeqCst);
-    assert!(response_count > 0, "Did not receive response within timeout (completed={})", response_count);
+    assert!(
+        response_count > 0,
+        "Did not receive response within timeout (completed={})",
+        response_count
+    );
 }
 
 fn server_thread(
@@ -340,7 +361,9 @@ fn test_multi_endpoint_pingpong() {
 
     for i in 0..NUM_ENDPOINTS {
         eprintln!("Client: Creating endpoint {}...", i);
-        let ep = ctx.create_endpoint(&ep_config).expect("Failed to create endpoint");
+        let ep = ctx
+            .create_endpoint(&ep_config)
+            .expect("Failed to create endpoint");
         let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
         eprintln!("Client: Endpoint {} created, qpn={}", i, info.qp_number);
 
@@ -353,7 +376,7 @@ fn test_multi_endpoint_pingpong() {
             recv_ring_size: info.recv_ring_size,
             consumer_addr: info.consumer_addr,
             consumer_rkey: info.consumer_rkey,
-        initial_credit: info.initial_credit,
+            initial_credit: info.initial_credit,
         });
 
         endpoints.push(ep);
@@ -374,13 +397,22 @@ fn test_multi_endpoint_pingpong() {
     let server_stop = stop_flag.clone();
 
     let handle: JoinHandle<()> = thread::spawn(move || {
-        multi_endpoint_server_thread(server_info_tx, client_info_rx, server_ready_clone, server_stop);
+        multi_endpoint_server_thread(
+            server_info_tx,
+            client_info_rx,
+            server_ready_clone,
+            server_stop,
+        );
     });
 
-    client_info_tx.send(MultiEndpointConnectionInfo {
-        endpoints: client_infos,
-    }).expect("Failed to send client info");
-    let server_info = server_info_rx.recv().expect("Failed to receive server info");
+    client_info_tx
+        .send(MultiEndpointConnectionInfo {
+            endpoints: client_infos,
+        })
+        .expect("Failed to send client info");
+    let server_info = server_info_rx
+        .recv()
+        .expect("Failed to receive server info");
 
     while server_ready.load(Ordering::Acquire) == 0 {
         std::hint::spin_loop();
@@ -402,7 +434,8 @@ fn test_multi_endpoint_pingpong() {
             initial_credit: server_ep.initial_credit,
         };
 
-        ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
+        ep.connect(&remote, 0, ctx.port())
+            .expect("Failed to connect");
         eprintln!("Client: Endpoint {} connected", i);
     }
 
@@ -412,8 +445,11 @@ fn test_multi_endpoint_pingpong() {
 
     for (ep_id, ep) in endpoints.iter().enumerate() {
         for slot_id in 0..REQUESTS_PER_EP {
-            let user_data = CallUserData { call_id: (ep_id * REQUESTS_PER_EP + slot_id) as u32 };
-            ep.call(&request_data, user_data, 64).expect("Failed to send request");
+            let user_data = CallUserData {
+                call_id: (ep_id * REQUESTS_PER_EP + slot_id) as u32,
+            };
+            ep.call(&request_data, user_data, 64)
+                .expect("Failed to send request");
             total_sent += 1;
         }
     }
@@ -441,14 +477,19 @@ fn test_multi_endpoint_pingpong() {
     }
 
     let final_completed = completed.load(Ordering::SeqCst);
-    eprintln!("Client: Final completed count: {}/{}", final_completed, total_sent);
+    eprintln!(
+        "Client: Final completed count: {}/{}",
+        final_completed, total_sent
+    );
 
     stop_flag.store(true, Ordering::SeqCst);
     handle.join().expect("Server thread panicked");
 
-    assert_eq!(final_completed as usize, total_sent,
+    assert_eq!(
+        final_completed as usize, total_sent,
         "Did not receive all responses within timeout (completed={}, expected={})",
-        final_completed, total_sent);
+        final_completed, total_sent
+    );
 }
 
 // =============================================================================
@@ -484,7 +525,9 @@ fn test_srq_exhaustion_pingpong() {
         .expect("Failed to create client context");
 
     let ep_config = EndpointConfig::default();
-    let mut ep = ctx.create_endpoint(&ep_config).expect("Failed to create endpoint");
+    let mut ep = ctx
+        .create_endpoint(&ep_config)
+        .expect("Failed to create endpoint");
 
     let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
 
@@ -515,11 +558,20 @@ fn test_srq_exhaustion_pingpong() {
     let server_stop = stop_flag.clone();
 
     let handle: JoinHandle<()> = thread::spawn(move || {
-        srq_exhaustion_server_thread(server_info_tx, client_info_rx, server_ready_clone, server_stop);
+        srq_exhaustion_server_thread(
+            server_info_tx,
+            client_info_rx,
+            server_ready_clone,
+            server_stop,
+        );
     });
 
-    client_info_tx.send(client_info).expect("Failed to send client info");
-    let server_info = server_info_rx.recv().expect("Failed to receive server info");
+    client_info_tx
+        .send(client_info)
+        .expect("Failed to send client info");
+    let server_info = server_info_rx
+        .recv()
+        .expect("Failed to receive server info");
 
     while server_ready.load(Ordering::Acquire) == 0 {
         std::hint::spin_loop();
@@ -538,7 +590,8 @@ fn test_srq_exhaustion_pingpong() {
         initial_credit: server_info.initial_credit,
     };
 
-    ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
+    ep.connect(&remote, 0, ctx.port())
+        .expect("Failed to connect");
 
     // Run multiple pingpong iterations
     let request_data = vec![0u8; 32];
@@ -549,7 +602,8 @@ fn test_srq_exhaustion_pingpong() {
 
         // Send request
         let user_data = CallUserData { call_id: i as u32 };
-        ep.call(&request_data, user_data, 64).expect("Failed to send request");
+        ep.call(&request_data, user_data, 64)
+            .expect("Failed to send request");
 
         // Poll until response received
         let iter_start = std::time::Instant::now();
@@ -557,8 +611,12 @@ fn test_srq_exhaustion_pingpong() {
             if iter_start.elapsed() > timeout {
                 stop_flag.store(true, Ordering::SeqCst);
                 let _ = handle.join();
-                panic!("Timeout at iteration {} (completed={}, expected={})",
-                    i, completed.load(Ordering::SeqCst), before + 1);
+                panic!(
+                    "Timeout at iteration {} (completed={}, expected={})",
+                    i,
+                    completed.load(Ordering::SeqCst),
+                    before + 1
+                );
             }
             ctx.poll();
         }
@@ -570,9 +628,11 @@ fn test_srq_exhaustion_pingpong() {
     handle.join().expect("Server thread panicked");
 
     let final_completed = completed.load(Ordering::SeqCst);
-    assert_eq!(final_completed as usize, ITERATIONS,
+    assert_eq!(
+        final_completed as usize, ITERATIONS,
         "Did not complete all iterations (completed={}, expected={})",
-        final_completed, ITERATIONS);
+        final_completed, ITERATIONS
+    );
 }
 
 fn srq_exhaustion_server_thread(
@@ -703,7 +763,9 @@ fn test_benchmark_style_pingpong() {
         .expect("Failed to create client context");
 
     let ep_config = EndpointConfig::default();
-    let mut ep = ctx.create_endpoint(&ep_config).expect("Failed to create endpoint");
+    let mut ep = ctx
+        .create_endpoint(&ep_config)
+        .expect("Failed to create endpoint");
 
     let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
 
@@ -734,11 +796,20 @@ fn test_benchmark_style_pingpong() {
     let server_stop = stop_flag.clone();
 
     let handle: JoinHandle<()> = thread::spawn(move || {
-        benchmark_style_server_thread(server_info_tx, client_info_rx, server_ready_clone, server_stop);
+        benchmark_style_server_thread(
+            server_info_tx,
+            client_info_rx,
+            server_ready_clone,
+            server_stop,
+        );
     });
 
-    client_info_tx.send(client_info).expect("Failed to send client info");
-    let server_info = server_info_rx.recv().expect("Failed to receive server info");
+    client_info_tx
+        .send(client_info)
+        .expect("Failed to send client info");
+    let server_info = server_info_rx
+        .recv()
+        .expect("Failed to receive server info");
 
     while server_ready.load(Ordering::Acquire) == 0 {
         std::hint::spin_loop();
@@ -757,7 +828,8 @@ fn test_benchmark_style_pingpong() {
         initial_credit: server_info.initial_credit,
     };
 
-    ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
+    ep.connect(&remote, 0, ctx.port())
+        .expect("Failed to connect");
 
     // Benchmark-style pipelined pingpong
     let request_data = vec![0u8; 32];
@@ -768,7 +840,8 @@ fn test_benchmark_style_pingpong() {
     // Initial fill: send initial requests
     for i in 0..MAX_INFLIGHT {
         let user_data = CallUserData { call_id: i as u32 };
-        ep.call(&request_data, user_data, 64).expect("Failed to send initial request");
+        ep.call(&request_data, user_data, 64)
+            .expect("Failed to send initial request");
         inflight += 1;
     }
 
@@ -783,8 +856,10 @@ fn test_benchmark_style_pingpong() {
         if start.elapsed() > timeout {
             stop_flag.store(true, Ordering::SeqCst);
             let _ = handle.join();
-            panic!("Timeout (completed={}, inflight={}, target={})",
-                completed_count, inflight, total_iterations);
+            panic!(
+                "Timeout (completed={}, inflight={}, target={})",
+                completed_count, inflight, total_iterations
+            );
         }
 
         // Poll for completions
@@ -798,12 +873,12 @@ fn test_benchmark_style_pingpong() {
 
         // Send new requests to maintain queue depth
         let remaining = total_iterations.saturating_sub(completed_count);
-        let can_send = MAX_INFLIGHT
-            .saturating_sub(inflight)
-            .min(remaining);
+        let can_send = MAX_INFLIGHT.saturating_sub(inflight).min(remaining);
 
         for _ in 0..can_send {
-            let user_data = CallUserData { call_id: completed_count as u32 };
+            let user_data = CallUserData {
+                call_id: completed_count as u32,
+            };
             if ep.call(&request_data, user_data, 64).is_ok() {
                 inflight += 1;
             }
@@ -825,9 +900,11 @@ fn test_benchmark_style_pingpong() {
     stop_flag.store(true, Ordering::SeqCst);
     handle.join().expect("Server thread panicked");
 
-    assert_eq!(completed_count, total_iterations,
+    assert_eq!(
+        completed_count, total_iterations,
         "Did not complete all iterations (completed={}, expected={})",
-        completed_count, total_iterations);
+        completed_count, total_iterations
+    );
 }
 
 fn benchmark_style_server_thread(
@@ -977,15 +1054,18 @@ fn multi_endpoint_server_thread(
             recv_ring_size: info.recv_ring_size,
             consumer_addr: info.consumer_addr,
             consumer_rkey: info.consumer_rkey,
-        initial_credit: info.initial_credit,
+            initial_credit: info.initial_credit,
         });
 
         endpoints.push(ep);
     }
 
-    if info_tx.send(MultiEndpointConnectionInfo {
-        endpoints: server_infos,
-    }).is_err() {
+    if info_tx
+        .send(MultiEndpointConnectionInfo {
+            endpoints: server_infos,
+        })
+        .is_err()
+    {
         eprintln!("Server: Failed to send server info");
         return;
     }
@@ -1080,7 +1160,9 @@ fn test_ring_wraparound() {
         recv_ring_size: SMALL_RING_SIZE,
         ..Default::default()
     };
-    let mut ep = ctx.create_endpoint(&ep_config).expect("Failed to create endpoint");
+    let mut ep = ctx
+        .create_endpoint(&ep_config)
+        .expect("Failed to create endpoint");
 
     let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
 
@@ -1110,11 +1192,21 @@ fn test_ring_wraparound() {
     let server_stop = stop_flag.clone();
 
     let handle: JoinHandle<()> = thread::spawn(move || {
-        wraparound_server_thread(server_info_tx, client_info_rx, server_ready_clone, server_stop, SMALL_RING_SIZE);
+        wraparound_server_thread(
+            server_info_tx,
+            client_info_rx,
+            server_ready_clone,
+            server_stop,
+            SMALL_RING_SIZE,
+        );
     });
 
-    client_info_tx.send(client_info).expect("Failed to send client info");
-    let server_info = server_info_rx.recv().expect("Failed to receive server info");
+    client_info_tx
+        .send(client_info)
+        .expect("Failed to send client info");
+    let server_info = server_info_rx
+        .recv()
+        .expect("Failed to receive server info");
 
     while server_ready.load(Ordering::Acquire) == 0 {
         std::hint::spin_loop();
@@ -1132,7 +1224,8 @@ fn test_ring_wraparound() {
         initial_credit: server_info.initial_credit,
     };
 
-    ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
+    ep.connect(&remote, 0, ctx.port())
+        .expect("Failed to connect");
 
     // Run sequential pingpongs to test wrap-around
     let request_data = vec![0u8; 32];
@@ -1154,21 +1247,31 @@ fn test_ring_wraparound() {
             if iter_start.elapsed() > timeout {
                 stop_flag.store(true, Ordering::SeqCst);
                 let _ = handle.join();
-                panic!("Timeout at wrap-around iteration {} (completed={})", i, completed.load(Ordering::SeqCst));
+                panic!(
+                    "Timeout at wrap-around iteration {} (completed={})",
+                    i,
+                    completed.load(Ordering::SeqCst)
+                );
             }
             ctx.poll();
         }
     }
 
-    eprintln!("Client: Wrap-around test completed {} iterations", ITERATIONS);
+    eprintln!(
+        "Client: Wrap-around test completed {} iterations",
+        ITERATIONS
+    );
 
     stop_flag.store(true, Ordering::SeqCst);
     handle.join().expect("Server thread panicked");
 
     let final_completed = completed.load(Ordering::SeqCst);
-    assert!(final_completed as usize >= ITERATIONS - 10,
+    assert!(
+        final_completed as usize >= ITERATIONS - 10,
         "Did not complete enough iterations (completed={}, expected>={})",
-        final_completed, ITERATIONS - 10);
+        final_completed,
+        ITERATIONS - 10
+    );
 }
 
 fn wraparound_server_thread(
@@ -1268,7 +1371,10 @@ fn wraparound_server_thread(
         }
     }
 
-    eprintln!("Server: Wrap-around server exiting... (sent {} replies)", replies_sent);
+    eprintln!(
+        "Server: Wrap-around server exiting... (sent {} replies)",
+        replies_sent
+    );
 }
 
 // =============================================================================
@@ -1302,7 +1408,9 @@ fn test_high_throughput_sustained() {
         .expect("Failed to create client context");
 
     let ep_config = EndpointConfig::default();
-    let mut ep = ctx.create_endpoint(&ep_config).expect("Failed to create endpoint");
+    let mut ep = ctx
+        .create_endpoint(&ep_config)
+        .expect("Failed to create endpoint");
 
     let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
 
@@ -1332,11 +1440,20 @@ fn test_high_throughput_sustained() {
     let server_stop = stop_flag.clone();
 
     let handle: JoinHandle<()> = thread::spawn(move || {
-        high_throughput_server_thread(server_info_tx, client_info_rx, server_ready_clone, server_stop);
+        high_throughput_server_thread(
+            server_info_tx,
+            client_info_rx,
+            server_ready_clone,
+            server_stop,
+        );
     });
 
-    client_info_tx.send(client_info).expect("Failed to send client info");
-    let server_info = server_info_rx.recv().expect("Failed to receive server info");
+    client_info_tx
+        .send(client_info)
+        .expect("Failed to send client info");
+    let server_info = server_info_rx
+        .recv()
+        .expect("Failed to receive server info");
 
     while server_ready.load(Ordering::Acquire) == 0 {
         std::hint::spin_loop();
@@ -1354,7 +1471,8 @@ fn test_high_throughput_sustained() {
         initial_credit: server_info.initial_credit,
     };
 
-    ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
+    ep.connect(&remote, 0, ctx.port())
+        .expect("Failed to connect");
 
     let request_data = vec![0u8; 32];
     let mut completed_count = 0usize;
@@ -1364,7 +1482,9 @@ fn test_high_throughput_sustained() {
 
     // Initial fill
     while inflight < MAX_INFLIGHT && sent < ITERATIONS {
-        let user_data = CallUserData { call_id: sent as u32 };
+        let user_data = CallUserData {
+            call_id: sent as u32,
+        };
         if ep.call(&request_data, user_data, 64).is_ok() {
             inflight += 1;
             sent += 1;
@@ -1378,8 +1498,10 @@ fn test_high_throughput_sustained() {
         if start.elapsed() > timeout {
             stop_flag.store(true, Ordering::SeqCst);
             let _ = handle.join();
-            panic!("Timeout (completed={}, inflight={}, sent={}, target={})",
-                completed_count, inflight, sent, ITERATIONS);
+            panic!(
+                "Timeout (completed={}, inflight={}, sent={}, target={})",
+                completed_count, inflight, sent, ITERATIONS
+            );
         }
 
         ctx.poll();
@@ -1391,7 +1513,9 @@ fn test_high_throughput_sustained() {
 
         // Send more requests to maintain queue depth
         while inflight < MAX_INFLIGHT && sent < ITERATIONS {
-            let user_data = CallUserData { call_id: sent as u32 };
+            let user_data = CallUserData {
+                call_id: sent as u32,
+            };
             match ep.call(&request_data, user_data, 64) {
                 Ok(_) => {
                     inflight += 1;
@@ -1412,14 +1536,20 @@ fn test_high_throughput_sustained() {
         inflight = inflight.saturating_sub(new_completions);
     }
 
-    eprintln!("Client: High throughput test completed {} iterations in {:?}", completed_count, start.elapsed());
+    eprintln!(
+        "Client: High throughput test completed {} iterations in {:?}",
+        completed_count,
+        start.elapsed()
+    );
 
     stop_flag.store(true, Ordering::SeqCst);
     handle.join().expect("Server thread panicked");
 
-    assert_eq!(completed_count, ITERATIONS,
+    assert_eq!(
+        completed_count, ITERATIONS,
         "Did not complete all iterations (completed={}, expected={})",
-        completed_count, ITERATIONS);
+        completed_count, ITERATIONS
+    );
 }
 
 fn high_throughput_server_thread(
@@ -1512,7 +1642,10 @@ fn high_throughput_server_thread(
         }
     }
 
-    eprintln!("Server: High throughput server exiting... (sent {} replies)", replies_sent);
+    eprintln!(
+        "Server: High throughput server exiting... (sent {} replies)",
+        replies_sent
+    );
 }
 
 // =============================================================================
@@ -1546,7 +1679,9 @@ fn test_debug_small_iterations() {
         .expect("Failed to create client context");
 
     let ep_config = EndpointConfig::default();
-    let mut ep = ctx.create_endpoint(&ep_config).expect("Failed to create endpoint");
+    let mut ep = ctx
+        .create_endpoint(&ep_config)
+        .expect("Failed to create endpoint");
 
     let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
 
@@ -1576,11 +1711,20 @@ fn test_debug_small_iterations() {
     let server_stop = stop_flag.clone();
 
     let handle: JoinHandle<()> = thread::spawn(move || {
-        debug_server_thread(server_info_tx, client_info_rx, server_ready_clone, server_stop);
+        debug_server_thread(
+            server_info_tx,
+            client_info_rx,
+            server_ready_clone,
+            server_stop,
+        );
     });
 
-    client_info_tx.send(client_info).expect("Failed to send client info");
-    let server_info = server_info_rx.recv().expect("Failed to receive server info");
+    client_info_tx
+        .send(client_info)
+        .expect("Failed to send client info");
+    let server_info = server_info_rx
+        .recv()
+        .expect("Failed to receive server info");
 
     while server_ready.load(Ordering::Acquire) == 0 {
         std::hint::spin_loop();
@@ -1598,7 +1742,8 @@ fn test_debug_small_iterations() {
         initial_credit: server_info.initial_credit,
     };
 
-    ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
+    ep.connect(&remote, 0, ctx.port())
+        .expect("Failed to connect");
 
     let request_data = vec![0u8; 32];
     let mut completed_count = 0usize;
@@ -1608,7 +1753,9 @@ fn test_debug_small_iterations() {
 
     // Initial fill
     while inflight < MAX_INFLIGHT && sent < ITERATIONS {
-        let user_data = CallUserData { call_id: sent as u32 };
+        let user_data = CallUserData {
+            call_id: sent as u32,
+        };
         eprintln!("CLIENT: Sending request #{}", sent);
         if ep.call(&request_data, user_data, 64).is_ok() {
             inflight += 1;
@@ -1627,8 +1774,10 @@ fn test_debug_small_iterations() {
         if start.elapsed() > timeout {
             stop_flag.store(true, Ordering::SeqCst);
             let _ = handle.join();
-            panic!("Timeout (completed={}, inflight={}, sent={}, target={})",
-                completed_count, inflight, sent, ITERATIONS);
+            panic!(
+                "Timeout (completed={}, inflight={}, sent={}, target={})",
+                completed_count, inflight, sent, ITERATIONS
+            );
         }
 
         ctx.poll();
@@ -1636,14 +1785,19 @@ fn test_debug_small_iterations() {
         let prev_completed = completed.load(Ordering::SeqCst) as usize;
         let new_completions = prev_completed.saturating_sub(completed_count);
         if new_completions > 0 {
-            eprintln!("CLIENT: {} new completions, total={}", new_completions, prev_completed);
+            eprintln!(
+                "CLIENT: {} new completions, total={}",
+                new_completions, prev_completed
+            );
         }
         completed_count = prev_completed;
         inflight = inflight.saturating_sub(new_completions);
 
         // Send more requests
         while inflight < MAX_INFLIGHT && sent < ITERATIONS {
-            let user_data = CallUserData { call_id: sent as u32 };
+            let user_data = CallUserData {
+                call_id: sent as u32,
+            };
             match ep.call(&request_data, user_data, 64) {
                 Ok(_) => {
                     eprintln!("CLIENT: Sending request #{}", sent);
@@ -1658,14 +1812,19 @@ fn test_debug_small_iterations() {
         }
     }
 
-    eprintln!("CLIENT: Test completed. completed={}, sent={}", completed_count, sent);
+    eprintln!(
+        "CLIENT: Test completed. completed={}, sent={}",
+        completed_count, sent
+    );
 
     stop_flag.store(true, Ordering::SeqCst);
     handle.join().expect("Server thread panicked");
 
-    assert_eq!(completed_count, ITERATIONS,
+    assert_eq!(
+        completed_count, ITERATIONS,
         "Did not complete all iterations (completed={}, expected={})",
-        completed_count, ITERATIONS);
+        completed_count, ITERATIONS
+    );
 }
 
 fn debug_server_thread(
@@ -1766,7 +1925,10 @@ fn debug_server_thread(
         }
     }
 
-    eprintln!("SERVER: Exiting... (sent {} replies, poll_count={})", replies_sent, poll_count);
+    eprintln!(
+        "SERVER: Exiting... (sent {} replies, poll_count={})",
+        replies_sent, poll_count
+    );
 }
 
 // =============================================================================
@@ -1801,7 +1963,9 @@ fn test_benchmark_pattern() {
         .expect("Failed to create client context");
 
     let ep_config = EndpointConfig::default();
-    let mut ep = ctx.create_endpoint(&ep_config).expect("Failed to create endpoint");
+    let mut ep = ctx
+        .create_endpoint(&ep_config)
+        .expect("Failed to create endpoint");
 
     let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
 
@@ -1831,11 +1995,21 @@ fn test_benchmark_pattern() {
     let server_stop = stop_flag.clone();
 
     let handle: JoinHandle<()> = thread::spawn(move || {
-        benchmark_pattern_server(server_info_tx, client_info_rx, server_ready_clone, server_stop, server_replies_for_thread);
+        benchmark_pattern_server(
+            server_info_tx,
+            client_info_rx,
+            server_ready_clone,
+            server_stop,
+            server_replies_for_thread,
+        );
     });
 
-    client_info_tx.send(client_info).expect("Failed to send client info");
-    let server_info = server_info_rx.recv().expect("Failed to receive server info");
+    client_info_tx
+        .send(client_info)
+        .expect("Failed to send client info");
+    let server_info = server_info_rx
+        .recv()
+        .expect("Failed to receive server info");
 
     while server_ready.load(Ordering::Acquire) == 0 {
         std::hint::spin_loop();
@@ -1853,7 +2027,8 @@ fn test_benchmark_pattern() {
         initial_credit: server_info.initial_credit,
     };
 
-    ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
+    ep.connect(&remote, 0, ctx.port())
+        .expect("Failed to connect");
 
     let request_data = vec![0u8; 32];
     let mut total_completed = 0usize;
@@ -1865,7 +2040,9 @@ fn test_benchmark_pattern() {
         let mut inflight = 0usize;
 
         // Send initial request (1 concurrent)
-        let user_data = CallUserData { call_id: total_sent as u32 };
+        let user_data = CallUserData {
+            call_id: total_sent as u32,
+        };
         if ep.call(&request_data, user_data, 64).is_ok() {
             inflight += 1;
             total_sent += 1;
@@ -1889,14 +2066,17 @@ fn test_benchmark_pattern() {
             ctx.poll();
 
             let current_completed = completed.load(Ordering::SeqCst) as usize;
-            let new_completions = current_completed.saturating_sub(round_start_completed + round_completed);
+            let new_completions =
+                current_completed.saturating_sub(round_start_completed + round_completed);
             round_completed += new_completions;
             inflight = inflight.saturating_sub(new_completions);
 
             // Send next request (keep 1 concurrent)
             let remaining = iters.saturating_sub(round_completed);
             if inflight == 0 && remaining > 0 {
-                let user_data = CallUserData { call_id: total_sent as u32 };
+                let user_data = CallUserData {
+                    call_id: total_sent as u32,
+                };
                 if ep.call(&request_data, user_data, 64).is_ok() {
                     inflight += 1;
                     total_sent += 1;
@@ -1905,19 +2085,31 @@ fn test_benchmark_pattern() {
         }
 
         total_completed += round_completed;
-        eprintln!("Round iters={} completed (total_completed={}, total_sent={})", iters, total_completed, total_sent);
+        eprintln!(
+            "Round iters={} completed (total_completed={}, total_sent={})",
+            iters, total_completed, total_sent
+        );
     }
 
     stop_flag.store(true, Ordering::SeqCst);
     handle.join().expect("Server thread panicked");
 
     let server_sent = server_replies.load(Ordering::SeqCst);
-    eprintln!("Final: total_completed={}, total_sent={}, server_replies={}", total_completed, total_sent, server_sent);
+    eprintln!(
+        "Final: total_completed={}, total_sent={}, server_replies={}",
+        total_completed, total_sent, server_sent
+    );
 
-    assert_eq!(total_completed, total_sent,
-        "Mismatch: completed={}, sent={}", total_completed, total_sent);
-    assert_eq!(server_sent as usize, total_sent,
-        "Server sent more replies than expected: server={}, expected={}", server_sent, total_sent);
+    assert_eq!(
+        total_completed, total_sent,
+        "Mismatch: completed={}, sent={}",
+        total_completed, total_sent
+    );
+    assert_eq!(
+        server_sent as usize, total_sent,
+        "Server sent more replies than expected: server={}, expected={}",
+        server_sent, total_sent
+    );
 }
 
 fn benchmark_pattern_server(
@@ -2010,7 +2202,10 @@ fn benchmark_pattern_server(
         }
     }
 
-    eprintln!("Server: Benchmark pattern server exiting... (sent {} replies)", replies_sent.load(Ordering::SeqCst));
+    eprintln!(
+        "Server: Benchmark pattern server exiting... (sent {} replies)",
+        replies_sent.load(Ordering::SeqCst)
+    );
 }
 
 // =============================================================================
@@ -2061,7 +2256,9 @@ fn test_emit_wqe_boundary_split() {
         recv_ring_size: TINY_RING_SIZE,
         ..Default::default()
     };
-    let mut ep = ctx.create_endpoint(&ep_config).expect("Failed to create endpoint");
+    let mut ep = ctx
+        .create_endpoint(&ep_config)
+        .expect("Failed to create endpoint");
 
     let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
 
@@ -2091,11 +2288,21 @@ fn test_emit_wqe_boundary_split() {
     let server_stop = stop_flag.clone();
 
     let handle: JoinHandle<()> = thread::spawn(move || {
-        emit_wqe_boundary_server_thread(server_info_tx, client_info_rx, server_ready_clone, server_stop, TINY_RING_SIZE);
+        emit_wqe_boundary_server_thread(
+            server_info_tx,
+            client_info_rx,
+            server_ready_clone,
+            server_stop,
+            TINY_RING_SIZE,
+        );
     });
 
-    client_info_tx.send(client_info).expect("Failed to send client info");
-    let server_info = server_info_rx.recv().expect("Failed to receive server info");
+    client_info_tx
+        .send(client_info)
+        .expect("Failed to send client info");
+    let server_info = server_info_rx
+        .recv()
+        .expect("Failed to receive server info");
 
     while server_ready.load(Ordering::Acquire) == 0 {
         std::hint::spin_loop();
@@ -2113,7 +2320,8 @@ fn test_emit_wqe_boundary_split() {
         initial_credit: server_info.initial_credit,
     };
 
-    ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
+    ep.connect(&remote, 0, ctx.port())
+        .expect("Failed to connect");
 
     // Give server time to set up
     std::thread::sleep(Duration::from_millis(10));
@@ -2133,13 +2341,18 @@ fn test_emit_wqe_boundary_split() {
         // Batch multiple calls without poll - this accumulates data in send buffer
         let mut _batch_sent = 0;
         for i in 0..BATCH_SIZE {
-            let user_data = CallUserData { call_id: (batch * BATCH_SIZE + i) as u32 };
+            let user_data = CallUserData {
+                call_id: (batch * BATCH_SIZE + i) as u32,
+            };
             match ep.call(&request_data, user_data, 64) {
                 Ok(_) => {
                     total_sent += 1;
                     _batch_sent += 1;
                 }
-                Err(copyrpc::error::CallError::RingFull(_) | copyrpc::error::CallError::InsufficientCredit(_)) => {
+                Err(
+                    copyrpc::error::CallError::RingFull(_)
+                    | copyrpc::error::CallError::InsufficientCredit(_),
+                ) => {
                     ringfull_count += 1;
                     // Need to poll and drain before continuing
                     break;
@@ -2158,8 +2371,12 @@ fn test_emit_wqe_boundary_split() {
         let wait_start = std::time::Instant::now();
         while completed.load(Ordering::SeqCst) < total_sent as u32 {
             if wait_start.elapsed() > Duration::from_secs(5) {
-                eprintln!("Timeout waiting for responses at batch {} (sent={}, completed={})",
-                    batch, total_sent, completed.load(Ordering::SeqCst));
+                eprintln!(
+                    "Timeout waiting for responses at batch {} (sent={}, completed={})",
+                    batch,
+                    total_sent,
+                    completed.load(Ordering::SeqCst)
+                );
                 break;
             }
             ctx.poll();
@@ -2168,21 +2385,29 @@ fn test_emit_wqe_boundary_split() {
 
     // Drain any remaining
     let drain_start = std::time::Instant::now();
-    while completed.load(Ordering::SeqCst) < total_sent as u32 && drain_start.elapsed() < Duration::from_secs(5) {
+    while completed.load(Ordering::SeqCst) < total_sent as u32
+        && drain_start.elapsed() < Duration::from_secs(5)
+    {
         ctx.poll();
     }
 
     let final_completed = completed.load(Ordering::SeqCst);
-    eprintln!("emit_wqe boundary test: sent={}, completed={}, ringfull={}",
-        total_sent, final_completed, ringfull_count);
+    eprintln!(
+        "emit_wqe boundary test: sent={}, completed={}, ringfull={}",
+        total_sent, final_completed, ringfull_count
+    );
 
     stop_flag.store(true, Ordering::SeqCst);
     handle.join().expect("Server thread panicked");
 
     // Verify we completed most of the sends
     // Some might fail due to RingFull, but we should complete the majority
-    assert!(final_completed as usize >= total_sent.saturating_sub(BATCH_SIZE),
-        "Too many messages lost (sent={}, completed={})", total_sent, final_completed);
+    assert!(
+        final_completed as usize >= total_sent.saturating_sub(BATCH_SIZE),
+        "Too many messages lost (sent={}, completed={})",
+        total_sent,
+        final_completed
+    );
 }
 
 fn emit_wqe_boundary_server_thread(
@@ -2291,7 +2516,10 @@ fn emit_wqe_boundary_server_thread(
         }
     }
 
-    eprintln!("Server: emit_wqe boundary test server exiting (sent {} replies)", replies_sent);
+    eprintln!(
+        "Server: emit_wqe boundary test server exiting (sent {} replies)",
+        replies_sent
+    );
 }
 
 // =============================================================================
@@ -2445,7 +2673,9 @@ fn test_credit_small_ring_large_response() {
         recv_ring_size: RING_SIZE,
         ..Default::default()
     };
-    let mut ep = ctx.create_endpoint(&ep_config).expect("Failed to create endpoint");
+    let mut ep = ctx
+        .create_endpoint(&ep_config)
+        .expect("Failed to create endpoint");
 
     let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
 
@@ -2475,11 +2705,21 @@ fn test_credit_small_ring_large_response() {
     let server_stop = stop_flag.clone();
 
     let handle: JoinHandle<()> = thread::spawn(move || {
-        generic_server_thread(server_info_tx, client_info_rx, server_ready_clone, server_stop, RING_SIZE);
+        generic_server_thread(
+            server_info_tx,
+            client_info_rx,
+            server_ready_clone,
+            server_stop,
+            RING_SIZE,
+        );
     });
 
-    client_info_tx.send(client_info).expect("Failed to send client info");
-    let server_info = server_info_rx.recv().expect("Failed to receive server info");
+    client_info_tx
+        .send(client_info)
+        .expect("Failed to send client info");
+    let server_info = server_info_rx
+        .recv()
+        .expect("Failed to receive server info");
 
     while server_ready.load(Ordering::Acquire) == 0 {
         std::hint::spin_loop();
@@ -2497,7 +2737,8 @@ fn test_credit_small_ring_large_response() {
         initial_credit: server_info.initial_credit,
     };
 
-    ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
+    ep.connect(&remote, 0, ctx.port())
+        .expect("Failed to connect");
 
     // Sequential pingpong with large response allowance
     let request_data = vec![0u8; 32];
@@ -2507,14 +2748,19 @@ fn test_credit_small_ring_large_response() {
         let before = completed.load(Ordering::SeqCst);
         let user_data = CallUserData { call_id: i as u32 };
 
-        ep.call(&request_data, user_data, RESPONSE_ALLOWANCE).expect("Failed to send request");
+        ep.call(&request_data, user_data, RESPONSE_ALLOWANCE)
+            .expect("Failed to send request");
 
         let iter_start = std::time::Instant::now();
         while completed.load(Ordering::SeqCst) <= before {
             if iter_start.elapsed() > timeout {
                 stop_flag.store(true, Ordering::SeqCst);
                 let _ = handle.join();
-                panic!("Timeout at iteration {} (completed={})", i, completed.load(Ordering::SeqCst));
+                panic!(
+                    "Timeout at iteration {} (completed={})",
+                    i,
+                    completed.load(Ordering::SeqCst)
+                );
             }
             ctx.poll();
         }
@@ -2524,9 +2770,11 @@ fn test_credit_small_ring_large_response() {
     handle.join().expect("Server thread panicked");
 
     let final_completed = completed.load(Ordering::SeqCst);
-    assert_eq!(final_completed as usize, ITERATIONS,
+    assert_eq!(
+        final_completed as usize, ITERATIONS,
         "Did not complete all iterations (completed={}, expected={})",
-        final_completed, ITERATIONS);
+        final_completed, ITERATIONS
+    );
 }
 
 // =============================================================================
@@ -2565,7 +2813,9 @@ fn test_credit_mixed_sizes() {
         recv_ring_size: RING_SIZE,
         ..Default::default()
     };
-    let mut ep = ctx.create_endpoint(&ep_config).expect("Failed to create endpoint");
+    let mut ep = ctx
+        .create_endpoint(&ep_config)
+        .expect("Failed to create endpoint");
 
     let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
 
@@ -2595,11 +2845,21 @@ fn test_credit_mixed_sizes() {
     let server_stop = stop_flag.clone();
 
     let handle: JoinHandle<()> = thread::spawn(move || {
-        generic_server_thread(server_info_tx, client_info_rx, server_ready_clone, server_stop, RING_SIZE);
+        generic_server_thread(
+            server_info_tx,
+            client_info_rx,
+            server_ready_clone,
+            server_stop,
+            RING_SIZE,
+        );
     });
 
-    client_info_tx.send(client_info).expect("Failed to send client info");
-    let server_info = server_info_rx.recv().expect("Failed to receive server info");
+    client_info_tx
+        .send(client_info)
+        .expect("Failed to send client info");
+    let server_info = server_info_rx
+        .recv()
+        .expect("Failed to receive server info");
 
     while server_ready.load(Ordering::Acquire) == 0 {
         std::hint::spin_loop();
@@ -2617,7 +2877,8 @@ fn test_credit_mixed_sizes() {
         initial_credit: server_info.initial_credit,
     };
 
-    ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
+    ep.connect(&remote, 0, ctx.port())
+        .expect("Failed to connect");
 
     // Sequential pingpong with cycling response allowances
     let request_data = vec![0u8; 32];
@@ -2628,14 +2889,19 @@ fn test_credit_mixed_sizes() {
         let user_data = CallUserData { call_id: i as u32 };
         let allowance = ALLOWANCES[i % ALLOWANCES.len()];
 
-        ep.call(&request_data, user_data, allowance).expect("Failed to send request");
+        ep.call(&request_data, user_data, allowance)
+            .expect("Failed to send request");
 
         let iter_start = std::time::Instant::now();
         while completed.load(Ordering::SeqCst) <= before {
             if iter_start.elapsed() > timeout {
                 stop_flag.store(true, Ordering::SeqCst);
                 let _ = handle.join();
-                panic!("Timeout at iteration {} (completed={})", i, completed.load(Ordering::SeqCst));
+                panic!(
+                    "Timeout at iteration {} (completed={})",
+                    i,
+                    completed.load(Ordering::SeqCst)
+                );
             }
             ctx.poll();
         }
@@ -2645,9 +2911,11 @@ fn test_credit_mixed_sizes() {
     handle.join().expect("Server thread panicked");
 
     let final_completed = completed.load(Ordering::SeqCst);
-    assert_eq!(final_completed as usize, ITERATIONS,
+    assert_eq!(
+        final_completed as usize, ITERATIONS,
         "Did not complete all iterations (completed={}, expected={})",
-        final_completed, ITERATIONS);
+        final_completed, ITERATIONS
+    );
 }
 
 // =============================================================================
@@ -2687,7 +2955,9 @@ fn test_credit_bidirectional_stress() {
         recv_ring_size: RING_SIZE,
         ..Default::default()
     };
-    let mut ep = ctx.create_endpoint(&ep_config).expect("Failed to create endpoint");
+    let mut ep = ctx
+        .create_endpoint(&ep_config)
+        .expect("Failed to create endpoint");
 
     let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
 
@@ -2825,13 +3095,18 @@ fn test_credit_bidirectional_stress() {
             let mut inflight = sent.saturating_sub(completed);
 
             while inflight < QUEUE_DEPTH && sent < CALLS_PER_SIDE {
-                let user_data = CallUserData { call_id: sent as u32 };
+                let user_data = CallUserData {
+                    call_id: sent as u32,
+                };
                 match ep.call(&request_data, user_data, RESPONSE_ALLOWANCE) {
                     Ok(_) => {
                         sent += 1;
                         inflight += 1;
                     }
-                    Err(copyrpc::error::CallError::RingFull(_) | copyrpc::error::CallError::InsufficientCredit(_)) => {
+                    Err(
+                        copyrpc::error::CallError::RingFull(_)
+                        | copyrpc::error::CallError::InsufficientCredit(_),
+                    ) => {
                         break;
                     }
                     Err(_) => break,
@@ -2839,11 +3114,19 @@ fn test_credit_bidirectional_stress() {
             }
         }
 
-        eprintln!("Server: Exiting (sent {} calls, completed {})", sent, server_completed_clone.load(Ordering::SeqCst));
+        eprintln!(
+            "Server: Exiting (sent {} calls, completed {})",
+            sent,
+            server_completed_clone.load(Ordering::SeqCst)
+        );
     });
 
-    client_info_tx.send(client_info).expect("Failed to send client info");
-    let server_info = server_info_rx.recv().expect("Failed to receive server info");
+    client_info_tx
+        .send(client_info)
+        .expect("Failed to send client info");
+    let server_info = server_info_rx
+        .recv()
+        .expect("Failed to receive server info");
 
     while server_ready.load(Ordering::Acquire) == 0 {
         std::hint::spin_loop();
@@ -2861,7 +3144,8 @@ fn test_credit_bidirectional_stress() {
         initial_credit: server_info.initial_credit,
     };
 
-    ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
+    ep.connect(&remote, 0, ctx.port())
+        .expect("Failed to connect");
 
     // Client sends calls and replies to incoming requests
     let request_data = vec![0u8; 32];
@@ -2875,8 +3159,12 @@ fn test_credit_bidirectional_stress() {
         if start.elapsed() > timeout {
             stop_flag.store(true, Ordering::SeqCst);
             let _ = handle.join();
-            panic!("Timeout (sent={}, inflight={}, completed={})",
-                sent, inflight, client_completed.load(Ordering::SeqCst));
+            panic!(
+                "Timeout (sent={}, inflight={}, completed={})",
+                sent,
+                inflight,
+                client_completed.load(Ordering::SeqCst)
+            );
         }
 
         ctx.poll();
@@ -2901,13 +3189,18 @@ fn test_credit_bidirectional_stress() {
 
         // Send more calls
         while inflight < QUEUE_DEPTH && sent < CALLS_PER_SIDE {
-            let user_data = CallUserData { call_id: sent as u32 };
+            let user_data = CallUserData {
+                call_id: sent as u32,
+            };
             match ep.call(&request_data, user_data, RESPONSE_ALLOWANCE) {
                 Ok(_) => {
                     sent += 1;
                     inflight += 1;
                 }
-                Err(copyrpc::error::CallError::RingFull(_) | copyrpc::error::CallError::InsufficientCredit(_)) => {
+                Err(
+                    copyrpc::error::CallError::RingFull(_)
+                    | copyrpc::error::CallError::InsufficientCredit(_),
+                ) => {
                     break;
                 }
                 Err(_) => break,
@@ -2915,16 +3208,25 @@ fn test_credit_bidirectional_stress() {
         }
     }
 
-    eprintln!("Client: Completed all calls (sent={}, completed={})",
-        sent, client_completed.load(Ordering::SeqCst));
+    eprintln!(
+        "Client: Completed all calls (sent={}, completed={})",
+        sent,
+        client_completed.load(Ordering::SeqCst)
+    );
 
     stop_flag.store(true, Ordering::SeqCst);
     handle.join().expect("Server thread panicked");
 
-    assert_eq!(client_completed.load(Ordering::SeqCst) as usize, CALLS_PER_SIDE,
-        "Client did not receive all responses");
-    assert_eq!(server_completed.load(Ordering::SeqCst) as usize, CALLS_PER_SIDE,
-        "Server did not receive all responses");
+    assert_eq!(
+        client_completed.load(Ordering::SeqCst) as usize,
+        CALLS_PER_SIDE,
+        "Client did not receive all responses"
+    );
+    assert_eq!(
+        server_completed.load(Ordering::SeqCst) as usize,
+        CALLS_PER_SIDE,
+        "Server did not receive all responses"
+    );
 }
 
 // =============================================================================
@@ -2964,7 +3266,9 @@ fn test_credit_deep_queue_tiny_ring() {
         recv_ring_size: RING_SIZE,
         ..Default::default()
     };
-    let mut ep = ctx.create_endpoint(&ep_config).expect("Failed to create endpoint");
+    let mut ep = ctx
+        .create_endpoint(&ep_config)
+        .expect("Failed to create endpoint");
 
     let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
 
@@ -2994,11 +3298,21 @@ fn test_credit_deep_queue_tiny_ring() {
     let server_stop = stop_flag.clone();
 
     let handle: JoinHandle<()> = thread::spawn(move || {
-        generic_server_thread(server_info_tx, client_info_rx, server_ready_clone, server_stop, RING_SIZE);
+        generic_server_thread(
+            server_info_tx,
+            client_info_rx,
+            server_ready_clone,
+            server_stop,
+            RING_SIZE,
+        );
     });
 
-    client_info_tx.send(client_info).expect("Failed to send client info");
-    let server_info = server_info_rx.recv().expect("Failed to receive server info");
+    client_info_tx
+        .send(client_info)
+        .expect("Failed to send client info");
+    let server_info = server_info_rx
+        .recv()
+        .expect("Failed to receive server info");
 
     while server_ready.load(Ordering::Acquire) == 0 {
         std::hint::spin_loop();
@@ -3016,7 +3330,8 @@ fn test_credit_deep_queue_tiny_ring() {
         initial_credit: server_info.initial_credit,
     };
 
-    ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
+    ep.connect(&remote, 0, ctx.port())
+        .expect("Failed to connect");
 
     // Pipelined sends with retry on RingFull/InsufficientCredit
     let request_data = vec![0u8; 32];
@@ -3029,8 +3344,12 @@ fn test_credit_deep_queue_tiny_ring() {
         if start.elapsed() > timeout {
             stop_flag.store(true, Ordering::SeqCst);
             let _ = handle.join();
-            panic!("Timeout (sent={}, inflight={}, completed={})",
-                sent, inflight, completed.load(Ordering::SeqCst));
+            panic!(
+                "Timeout (sent={}, inflight={}, completed={})",
+                sent,
+                inflight,
+                completed.load(Ordering::SeqCst)
+            );
         }
 
         ctx.poll();
@@ -3040,13 +3359,18 @@ fn test_credit_deep_queue_tiny_ring() {
 
         // Send more requests to maintain queue depth
         while inflight < QUEUE_DEPTH && sent < ITERATIONS {
-            let user_data = CallUserData { call_id: sent as u32 };
+            let user_data = CallUserData {
+                call_id: sent as u32,
+            };
             match ep.call(&request_data, user_data, RESPONSE_ALLOWANCE) {
                 Ok(_) => {
                     sent += 1;
                     inflight += 1;
                 }
-                Err(copyrpc::error::CallError::RingFull(_) | copyrpc::error::CallError::InsufficientCredit(_)) => {
+                Err(
+                    copyrpc::error::CallError::RingFull(_)
+                    | copyrpc::error::CallError::InsufficientCredit(_),
+                ) => {
                     // Poll and retry
                     break;
                 }
@@ -3061,9 +3385,11 @@ fn test_credit_deep_queue_tiny_ring() {
     handle.join().expect("Server thread panicked");
 
     let final_completed = completed.load(Ordering::SeqCst);
-    assert_eq!(final_completed as usize, ITERATIONS,
+    assert_eq!(
+        final_completed as usize, ITERATIONS,
         "Did not complete all iterations (completed={}, expected={})",
-        final_completed, ITERATIONS);
+        final_completed, ITERATIONS
+    );
 }
 
 // =============================================================================
@@ -3102,7 +3428,9 @@ fn test_credit_exhaustion_recovery() {
         recv_ring_size: RING_SIZE,
         ..Default::default()
     };
-    let mut ep = ctx.create_endpoint(&ep_config).expect("Failed to create endpoint");
+    let mut ep = ctx
+        .create_endpoint(&ep_config)
+        .expect("Failed to create endpoint");
 
     let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
 
@@ -3132,11 +3460,21 @@ fn test_credit_exhaustion_recovery() {
     let server_stop = stop_flag.clone();
 
     let handle: JoinHandle<()> = thread::spawn(move || {
-        generic_server_thread(server_info_tx, client_info_rx, server_ready_clone, server_stop, RING_SIZE);
+        generic_server_thread(
+            server_info_tx,
+            client_info_rx,
+            server_ready_clone,
+            server_stop,
+            RING_SIZE,
+        );
     });
 
-    client_info_tx.send(client_info).expect("Failed to send client info");
-    let server_info = server_info_rx.recv().expect("Failed to receive server info");
+    client_info_tx
+        .send(client_info)
+        .expect("Failed to send client info");
+    let server_info = server_info_rx
+        .recv()
+        .expect("Failed to receive server info");
 
     while server_ready.load(Ordering::Acquire) == 0 {
         std::hint::spin_loop();
@@ -3154,7 +3492,8 @@ fn test_credit_exhaustion_recovery() {
         initial_credit: server_info.initial_credit,
     };
 
-    ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
+    ep.connect(&remote, 0, ctx.port())
+        .expect("Failed to connect");
 
     let request_data = vec![0u8; 32];
     let mut sent = 0;
@@ -3163,7 +3502,9 @@ fn test_credit_exhaustion_recovery() {
     // Phase 1: Send until InsufficientCredit
     eprintln!("Phase 1: Sending until credit exhaustion...");
     loop {
-        let user_data = CallUserData { call_id: sent as u32 };
+        let user_data = CallUserData {
+            call_id: sent as u32,
+        };
         match ep.call(&request_data, user_data, RESPONSE_ALLOWANCE) {
             Ok(_) => {
                 sent += 1;
@@ -3183,7 +3524,10 @@ fn test_credit_exhaustion_recovery() {
         }
     }
 
-    assert!(insufficient_credit_count > 0, "Did not observe InsufficientCredit");
+    assert!(
+        insufficient_credit_count > 0,
+        "Did not observe InsufficientCredit"
+    );
 
     // Phase 2: Poll to regain credit
     eprintln!("Phase 2: Polling to regain credit...");
@@ -3194,8 +3538,11 @@ fn test_credit_exhaustion_recovery() {
         if start.elapsed() > timeout {
             stop_flag.store(true, Ordering::SeqCst);
             let _ = handle.join();
-            panic!("Timeout waiting for responses (sent={}, completed={})",
-                sent, completed.load(Ordering::SeqCst));
+            panic!(
+                "Timeout waiting for responses (sent={}, completed={})",
+                sent,
+                completed.load(Ordering::SeqCst)
+            );
         }
         ctx.poll();
     }
@@ -3205,14 +3552,19 @@ fn test_credit_exhaustion_recovery() {
 
     // Phase 3: Send more calls after recovery
     for i in 0..MIN_COMPLETED {
-        let user_data = CallUserData { call_id: (recovery_start + i) as u32 };
+        let user_data = CallUserData {
+            call_id: (recovery_start + i) as u32,
+        };
         loop {
             match ep.call(&request_data, user_data, RESPONSE_ALLOWANCE) {
                 Ok(_) => {
                     sent += 1;
                     break;
                 }
-                Err(copyrpc::error::CallError::RingFull(_) | copyrpc::error::CallError::InsufficientCredit(_)) => {
+                Err(
+                    copyrpc::error::CallError::RingFull(_)
+                    | copyrpc::error::CallError::InsufficientCredit(_),
+                ) => {
                     ctx.poll();
                     continue;
                 }
@@ -3229,8 +3581,11 @@ fn test_credit_exhaustion_recovery() {
         if start.elapsed() > timeout {
             stop_flag.store(true, Ordering::SeqCst);
             let _ = handle.join();
-            panic!("Timeout in final drain (sent={}, completed={})",
-                sent, completed.load(Ordering::SeqCst));
+            panic!(
+                "Timeout in final drain (sent={}, completed={})",
+                sent,
+                completed.load(Ordering::SeqCst)
+            );
         }
         ctx.poll();
     }
@@ -3239,10 +3594,15 @@ fn test_credit_exhaustion_recovery() {
     handle.join().expect("Server thread panicked");
 
     let final_completed = completed.load(Ordering::SeqCst) as usize;
-    eprintln!("Test completed: sent={}, completed={}, insufficient_credit_count={}",
-        sent, final_completed, insufficient_credit_count);
+    eprintln!(
+        "Test completed: sent={}, completed={}, insufficient_credit_count={}",
+        sent, final_completed, insufficient_credit_count
+    );
 
-    assert!(final_completed >= MIN_COMPLETED,
+    assert!(
+        final_completed >= MIN_COMPLETED,
         "Did not complete enough iterations after recovery (completed={}, expected>={})",
-        final_completed, MIN_COMPLETED);
+        final_completed,
+        MIN_COMPLETED
+    );
 }

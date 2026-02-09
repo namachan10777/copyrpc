@@ -18,9 +18,9 @@
 
 pub mod shm;
 
+pub use mempc::Serial;
 use mempc::common::Response;
 use mempc::onesided::{RawReceiver, RawSender, Slot};
-pub use mempc::Serial;
 
 use shm::SharedMemory;
 use std::io;
@@ -118,9 +118,9 @@ struct Header {
     resp_slot_size: u32,       // 4
     extra_buffer_size: u32,    // 4
     server_alive: AtomicBool,  // 1
-    _pad: [u8; 3],            // 3
+    _pad: [u8; 3],             // 3
     next_client_id: AtomicU32, // 4
-    _reserved: [u8; 20],      // 20 → total = 64
+    _reserved: [u8; 20],       // 20 → total = 64
 }
 
 const _: () = assert!(std::mem::size_of::<Header>() == HEADER_SIZE);
@@ -272,12 +272,8 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
             );
         }
 
-        let block_size = per_client_block_size(
-            req_slot_size,
-            resp_slot_size,
-            ring_depth,
-            extra_buffer_size,
-        );
+        let block_size =
+            per_client_block_size(req_slot_size, resp_slot_size, ring_depth, extra_buffer_size);
         let extra_offset = CACHE_LINE_SIZE
             + req_slot_size * ring_depth as usize
             + resp_slot_size * ring_depth as usize;
@@ -295,24 +291,21 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
             control_ptrs.push(block_base as *const AtomicBool);
 
             let req_ring_base = unsafe { block_base.add(CACHE_LINE_SIZE) };
-            let resp_ring_base = unsafe {
-                block_base.add(CACHE_LINE_SIZE + ring_depth as usize * req_slot_size)
-            };
+            let resp_ring_base =
+                unsafe { block_base.add(CACHE_LINE_SIZE + ring_depth as usize * req_slot_size) };
             extra_ptrs.push(unsafe { block_base.add(extra_offset) });
 
             // Initialize all request ring slots
             for slot_idx in 0..ring_depth as usize {
-                let slot_ptr = unsafe {
-                    req_ring_base.add(slot_idx * req_slot_size) as *mut Slot<Req>
-                };
+                let slot_ptr =
+                    unsafe { req_ring_base.add(slot_idx * req_slot_size) as *mut Slot<Req> };
                 unsafe { Slot::<Req>::init(slot_ptr) };
             }
 
             // Initialize all response ring slots
             for slot_idx in 0..ring_depth as usize {
                 let slot_ptr = unsafe {
-                    resp_ring_base.add(slot_idx * resp_slot_size)
-                        as *mut Slot<Response<Resp>>
+                    resp_ring_base.add(slot_idx * resp_slot_size) as *mut Slot<Response<Resp>>
                 };
                 unsafe { Slot::<Response<Resp>>::init(slot_ptr) };
             }
@@ -480,10 +473,7 @@ impl<Req: Serial, Resp: Serial, U, F: FnMut(U, Resp)> Client<Req, Resp, U, F> {
     ///
     /// # Safety
     /// Server must have been created with matching `Req`/`Resp` types.
-    pub unsafe fn connect<P: AsRef<Path>>(
-        path: P,
-        on_response: F,
-    ) -> Result<Self, ConnectError> {
+    pub unsafe fn connect<P: AsRef<Path>>(path: P, on_response: F) -> Result<Self, ConnectError> {
         let header_shm =
             unsafe { SharedMemory::open(&path, HEADER_SIZE).map_err(ConnectError::Io)? };
         let header_ptr = header_shm.as_ptr() as *const Header;
@@ -531,13 +521,11 @@ impl<Req: Serial, Resp: Serial, U, F: FnMut(U, Resp)> Client<Req, Resp, U, F> {
                 return Err(ConnectError::ServerFull);
             }
 
-            let block_size = per_client_block_size(
-                req_slot_size,
-                resp_slot_size,
-                ring_depth,
-                extra_buf_size,
-            );
-            let block_base = shm.as_ptr().add(HEADER_SIZE + client_idx as usize * block_size);
+            let block_size =
+                per_client_block_size(req_slot_size, resp_slot_size, ring_depth, extra_buf_size);
+            let block_base = shm
+                .as_ptr()
+                .add(HEADER_SIZE + client_idx as usize * block_size);
             let control_ptr = block_base as *const AtomicBool;
             (&*control_ptr).store(true, Ordering::Release);
 
@@ -551,10 +539,8 @@ impl<Req: Serial, Resp: Serial, U, F: FnMut(U, Resp)> Client<Req, Resp, U, F> {
 
             // Construct RawSender and RawReceiver
             // Note: server has already initialized all slots at creation time
-            let req_tx = RawSender::<Req>::new(
-                req_ring_base as *mut Slot<Req>,
-                ring_depth as usize,
-            );
+            let req_tx =
+                RawSender::<Req>::new(req_ring_base as *mut Slot<Req>, ring_depth as usize);
             let resp_rx = RawReceiver::<Response<Resp>>::new(
                 resp_ring_base as *const Slot<Response<Resp>>,
                 ring_depth as usize,
@@ -610,9 +596,7 @@ impl<Req: Serial, Resp: Serial, U, F: FnMut(U, Resp)> Client<Req, Resp, U, F> {
                 Some((_, response)) => {
                     self.in_flight -= 1;
                     let ud_idx = response.token as usize;
-                    let user_data = self.user_data[ud_idx]
-                        .take()
-                        .expect("user_data must exist");
+                    let user_data = self.user_data[ud_idx].take().expect("user_data must exist");
                     (self.on_response)(user_data, response.data);
                     count += 1;
                 }

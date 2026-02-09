@@ -1,6 +1,6 @@
-mod flush;
 mod devdax;
 mod file;
+mod flush;
 
 #[allow(clippy::len_without_is_empty)]
 pub trait PmemRegion {
@@ -30,6 +30,6 @@ impl PmemRegion for file::FileRegion {
     }
 }
 
-pub use flush::{flush, drain, persist, FlushMethod, detect_flush_method};
 pub use devdax::DevDaxRegion;
 pub use file::FileRegion;
+pub use flush::{FlushMethod, detect_flush_method, drain, flush, persist};

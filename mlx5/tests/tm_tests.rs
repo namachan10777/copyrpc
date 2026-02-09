@@ -42,7 +42,11 @@ fn test_tm_srq_creation() {
 
     require_tm_srq!(&ctx);
 
-    let cq = Rc::new(ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ"));
+    let cq = Rc::new(
+        ctx.ctx
+            .create_cq(256, &CqConfig::default())
+            .expect("Failed to create CQ"),
+    );
 
     let config = TmSrqConfig {
         max_wr: 256,
@@ -76,7 +80,10 @@ fn test_tm_srq_direct_access() {
 
     require_tm_srq!(&ctx);
 
-    let cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ");
+    let cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create CQ");
     let cq = Rc::new(cq);
 
     let config = TmSrqConfig {
@@ -115,7 +122,11 @@ fn test_tm_tag_add_remove() {
 
     require_tm_srq!(&ctx);
 
-    let cq = Rc::new(ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ"));
+    let cq = Rc::new(
+        ctx.ctx
+            .create_cq(256, &CqConfig::default())
+            .expect("Failed to create CQ"),
+    );
 
     let config = TmSrqConfig {
         max_wr: 256,
@@ -165,7 +176,8 @@ fn test_tm_tag_add_remove() {
         tag: tag,
         sge: { addr: recv_buf.addr(), len: 256, lkey: mr.lkey() },
         signaled: 1u64,
-    }).expect("emit_tm_wqe failed");
+    })
+    .expect("emit_tm_wqe failed");
     tm_ref.ring_cmd_doorbell();
     drop(tm_ref);
 
@@ -208,10 +220,14 @@ fn test_tm_tag_add_remove() {
     // Remove the tag
     let tm_ref = tm_srq.borrow();
     let ctx = tm_ref.cmd_emit_ctx().expect("cmd_emit_ctx failed");
-    emit_tm_wqe!(&ctx, tag_del {
-        index: tag_index,
-        signaled: 2u64,
-    }).expect("emit_tm_wqe failed");
+    emit_tm_wqe!(
+        &ctx,
+        tag_del {
+            index: tag_index,
+            signaled: 2u64,
+        }
+    )
+    .expect("emit_tm_wqe failed");
     tm_ref.ring_cmd_doorbell();
     drop(tm_ref);
 
@@ -263,11 +279,17 @@ fn test_tm_tag_matching_with_dc() {
     require_tm_srq!(&ctx);
 
     // Create CQ for DCI
-    let dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
+    let dci_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create DCI CQ");
     let dci_cq = Rc::new(dci_cq);
 
     // Create CQ for TM-SRQ
-    let tm_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create TM CQ");
+    let tm_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create TM CQ");
     let tm_cq = Rc::new(tm_cq);
 
     // Create TM-SRQ
@@ -321,7 +343,11 @@ fn test_tm_multiple_tags() {
 
     require_tm_srq!(&ctx);
 
-    let cq = Rc::new(ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ"));
+    let cq = Rc::new(
+        ctx.ctx
+            .create_cq(256, &CqConfig::default())
+            .expect("Failed to create CQ"),
+    );
 
     let config = TmSrqConfig {
         max_wr: 256,
@@ -373,7 +399,8 @@ fn test_tm_multiple_tags() {
                 tag: tag,
                 sge: { addr: recv_bufs[i as usize].addr(), len: 256, lkey: mrs[i as usize].lkey() },
                 signaled: (i + 1) as u64,
-            }).expect("emit_tm_wqe failed");
+            })
+            .expect("emit_tm_wqe failed");
             tm_ref.ring_cmd_doorbell();
         }
 
@@ -406,10 +433,14 @@ fn test_tm_multiple_tags() {
         {
             let tm_ref = tm_srq.borrow();
             let ctx = tm_ref.cmd_emit_ctx().expect("cmd_emit_ctx failed");
-            emit_tm_wqe!(&ctx, tag_del {
-                index: i,
-                signaled: (i + 100) as u64,
-            }).expect("emit_tm_wqe failed");
+            emit_tm_wqe!(
+                &ctx,
+                tag_del {
+                    index: i,
+                    signaled: (i + 100) as u64,
+                }
+            )
+            .expect("emit_tm_wqe failed");
             tm_ref.ring_cmd_doorbell();
         }
 
@@ -453,7 +484,10 @@ fn test_tm_unordered_recv() {
 
     require_tm_srq!(&ctx);
 
-    let cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ");
+    let cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create CQ");
     let cq = Rc::new(cq);
 
     let config = TmSrqConfig {
@@ -510,7 +544,10 @@ fn test_tm_tag_via_verbs_api() {
 
     require_tm_srq!(&ctx);
 
-    let cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ");
+    let cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create CQ");
     let cq = Rc::new(cq);
 
     let config = TmSrqConfig {

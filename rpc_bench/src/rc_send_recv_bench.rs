@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use mpi::collective::CommunicatorCollectives;
@@ -9,11 +9,11 @@ use mpi::topology::Communicator;
 
 use mlx5::cq::CqConfig;
 use mlx5::device::DeviceList;
+use mlx5::emit_wqe;
 use mlx5::pd::AccessFlags;
 use mlx5::qp::RcQpConfig;
 use mlx5::transport::IbRemoteQpInfo;
 use mlx5::wqe::WqeFlags;
-use mlx5::emit_wqe;
 
 use crate::epoch::EpochCollector;
 use crate::mpi_util;
@@ -88,9 +88,7 @@ pub fn run(
 
 fn open_mlx5_device(device_index: usize) -> mlx5::device::Context {
     let device_list = DeviceList::list().expect("Failed to list devices");
-    let device = device_list
-        .get(device_index)
-        .expect("Device not found");
+    let device = device_list.get(device_index).expect("Device not found");
     device.open().expect("Failed to open device")
 }
 
@@ -104,7 +102,13 @@ fn run_one_to_one(
 ) -> Vec<BenchRow> {
     let rank = world.rank();
     let is_client = rank == 0;
-    crate::affinity::pin_thread_if_configured(common.affinity_mode, common.affinity_start, rank, 1, 0);
+    crate::affinity::pin_thread_if_configured(
+        common.affinity_mode,
+        common.affinity_start,
+        rank,
+        1,
+        0,
+    );
 
     let ctx = open_mlx5_device(common.device_index);
     let pd = ctx.alloc_pd().expect("Failed to alloc PD");
@@ -918,7 +922,8 @@ fn run_one_to_one_threaded(
 
     for (tid, remote_tx) in remote_txs.iter().enumerate() {
         let offset = tid * RC_INFO_SIZE;
-        let remote_info = RcConnectionInfo::from_bytes(&remote_bytes[offset..offset + RC_INFO_SIZE]);
+        let remote_info =
+            RcConnectionInfo::from_bytes(&remote_bytes[offset..offset + RC_INFO_SIZE]);
         remote_tx.send(remote_info).unwrap();
     }
 
@@ -1009,4 +1014,3 @@ fn run_one_to_one_threaded(
 
     all_rows
 }
-

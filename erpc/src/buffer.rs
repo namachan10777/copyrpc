@@ -79,13 +79,8 @@ impl MsgBuffer {
             return Ok(());
         }
 
-        let mr = unsafe {
-            pd.register(
-                self.ptr.as_ptr(),
-                self.capacity,
-                AccessFlags::LOCAL_WRITE,
-            )?
-        };
+        let mr =
+            unsafe { pd.register(self.ptr.as_ptr(), self.capacity, AccessFlags::LOCAL_WRITE)? };
         self.mr = Some(mr);
         Ok(())
     }
@@ -412,7 +407,6 @@ impl FreeListRing {
     fn len(&self) -> usize {
         self.tail.wrapping_sub(self.head) as usize
     }
-
 }
 
 /// A zero-copy buffer pool with single MR registration.
@@ -470,9 +464,7 @@ impl ZeroCopyPool {
         };
 
         // Register single MR for entire buffer
-        let mr = unsafe {
-            pd.register(buffer, total_size, AccessFlags::LOCAL_WRITE)?
-        };
+        let mr = unsafe { pd.register(buffer, total_size, AccessFlags::LOCAL_WRITE)? };
 
         // Initialize free list ring buffer with all slots
         let mut free_list = FreeListRing::new(num_slots);

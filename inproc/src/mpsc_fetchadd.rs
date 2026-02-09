@@ -6,8 +6,8 @@
 
 use std::cell::{Cell, UnsafeCell};
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::mpsc::{MpscChannel, MpscChannelReceiver, MpscChannelSender, SendError, TryRecvError};
 use mempc::common::CachePadded;
@@ -353,5 +353,4 @@ mod tests {
 
         assert_eq!(received.len(), (num_senders * msgs_per_sender) as usize);
     }
-
 }

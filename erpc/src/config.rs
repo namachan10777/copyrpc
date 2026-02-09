@@ -127,8 +127,7 @@ impl RpcConfig {
 }
 
 /// Session-specific configuration.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionConfig {
     /// Request window size for this session.
     /// If None, uses the RpcConfig default.
@@ -137,4 +136,3 @@ pub struct SessionConfig {
     /// If None, uses the RpcConfig default.
     pub session_credits: Option<usize>,
 }
-

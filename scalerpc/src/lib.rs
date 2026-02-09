@@ -29,23 +29,25 @@
 //! let response = slot.wait_response()?;
 //! ```
 
+pub mod client;
 pub mod config;
+pub mod connection;
 pub mod error;
 pub mod mapping;
 pub mod pool;
 pub mod protocol;
-pub mod connection;
-pub mod client;
 pub mod server;
 
+pub use client::{ClientState, PendingRpc, RpcClient, RpcResponse};
 pub use config::{ClientConfig, GroupConfig, PoolConfig, ServerConfig};
+pub use connection::{Connection, ConnectionId, RemoteEndpoint};
 pub use error::{Error, Result, SlotState};
 pub use mapping::VirtualMapping;
 pub use pool::{MessagePool, MessageSlot, SlotHandle};
 pub use protocol::{
-    ContextSwitchEvent, MessageTrailer, RequestHeader, ResponseHeader,
-    MESSAGE_BLOCK_SIZE, MESSAGE_MAX_DATA_SIZE, MESSAGE_TRAILER_SIZE,
+    ContextSwitchEvent, MessageTrailer, RequestHeader, ResponseHeader, MESSAGE_BLOCK_SIZE,
+    MESSAGE_MAX_DATA_SIZE, MESSAGE_TRAILER_SIZE,
 };
-pub use connection::{Connection, RemoteEndpoint, ConnectionId};
-pub use client::{ClientState, PendingRpc, RpcClient, RpcResponse};
-pub use server::{GroupScheduler, IncomingRequest, NoHandler, RequestHandler, RpcServer, SchedulerState};
+pub use server::{
+    GroupScheduler, IncomingRequest, NoHandler, RequestHandler, RpcServer, SchedulerState,
+};

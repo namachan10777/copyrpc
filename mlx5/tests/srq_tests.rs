@@ -132,10 +132,16 @@ fn test_srq_with_dct_send() {
     require_dct!(&ctx);
 
     // Create CQs
-    let dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
+    let dci_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create DCI CQ");
     let dci_cq = Rc::new(dci_cq);
 
-    let dct_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCT CQ");
+    let dct_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create DCT CQ");
     let dct_cq = Rc::new(dct_cq);
 
     // Create SRQ
@@ -165,8 +171,8 @@ fn test_srq_with_dct_send() {
     let dci = ctx
         .ctx
         .dci_builder::<u64>(&ctx.pd, &dci_config)
-            .sq_cq(dci_cq.clone(), |_cqe, _entry| {})
-            .build()
+        .sq_cq(dci_cq.clone(), |_cqe, _entry| {})
+        .build()
         .expect("Failed to create DCI");
     dci.borrow_mut()
         .activate(ctx.port, 0, 4)
@@ -178,8 +184,8 @@ fn test_srq_with_dct_send() {
     let mut dct = ctx
         .ctx
         .dct_builder(&ctx.pd, &srq, &dct_config)
-            .recv_cq(&dct_cq)
-            .build()
+        .recv_cq(&dct_cq)
+        .build()
         .expect("Failed to create DCT");
     let access = full_access().bits();
     dct.activate(ctx.port, access, 4)
@@ -207,7 +213,8 @@ fn test_srq_with_dct_send() {
         flags: WqeFlags::empty(),
         sge: { addr: send_buf.addr(), len: test_data.len() as u32, lkey: send_mr.lkey() },
         signaled: 1u64,
-    }).expect("emit_dci_wqe failed");
+    })
+    .expect("emit_dci_wqe failed");
     dci_ref.ring_sq_doorbell();
     drop(dci_ref);
 
@@ -256,10 +263,16 @@ fn test_srq_shared_by_multiple_dcts() {
     require_dct!(&ctx);
 
     // Create CQs
-    let dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
+    let dci_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create DCI CQ");
     let dci_cq = Rc::new(dci_cq);
 
-    let dct_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCT CQ");
+    let dct_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create DCT CQ");
     let dct_cq = Rc::new(dct_cq);
 
     // Create shared SRQ
@@ -294,8 +307,8 @@ fn test_srq_shared_by_multiple_dcts() {
     let dci = ctx
         .ctx
         .dci_builder::<u64>(&ctx.pd, &dci_config)
-            .sq_cq(dci_cq.clone(), |_cqe, _entry| {})
-            .build()
+        .sq_cq(dci_cq.clone(), |_cqe, _entry| {})
+        .build()
         .expect("Failed to create DCI");
     dci.borrow_mut()
         .activate(ctx.port, 0, 4)
@@ -342,13 +355,14 @@ fn test_srq_shared_by_multiple_dcts() {
             flags: WqeFlags::empty(),
             sge: { addr: send_buf.addr(), len: test_data.len() as u32, lkey: send_mr.lkey() },
             signaled: (i + 1) as u64,
-        }).expect("emit_dci_wqe failed");
+        })
+        .expect("emit_dci_wqe failed");
         dci_ref.ring_sq_doorbell();
         drop(dci_ref);
 
         // Poll send completion
-        let send_cqe =
-            poll_cq_timeout(&dci_cq, 5000).unwrap_or_else(|| panic!("Send CQE timeout for DCT {}", i));
+        let send_cqe = poll_cq_timeout(&dci_cq, 5000)
+            .unwrap_or_else(|| panic!("Send CQE timeout for DCT {}", i));
         assert_eq!(
             send_cqe.syndrome, 0,
             "Send CQE error for DCT {}: syndrome={}",
@@ -356,8 +370,8 @@ fn test_srq_shared_by_multiple_dcts() {
         );
 
         // Poll receive completion
-        let recv_cqe =
-            poll_cq_timeout(&dct_cq, 5000).unwrap_or_else(|| panic!("Recv CQE timeout for DCT {}", i));
+        let recv_cqe = poll_cq_timeout(&dct_cq, 5000)
+            .unwrap_or_else(|| panic!("Recv CQE timeout for DCT {}", i));
         assert_eq!(
             recv_cqe.syndrome, 0,
             "Recv CQE error for DCT {}: syndrome={}",

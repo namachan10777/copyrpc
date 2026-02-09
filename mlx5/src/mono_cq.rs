@@ -33,7 +33,9 @@ use std::ptr::NonNull;
 use std::rc::{Rc, Weak};
 use std::{io, mem::MaybeUninit};
 
-use crate::cq::{CqConfig, CqModeration, CqeCompressionFormat, CqeOpcode, CqeSize, Cqe, MiniCqeIterator};
+use crate::cq::{
+    CqConfig, CqModeration, Cqe, CqeCompressionFormat, CqeOpcode, CqeSize, MiniCqeIterator,
+};
 use crate::device::Context;
 use fastmap::FastMap;
 

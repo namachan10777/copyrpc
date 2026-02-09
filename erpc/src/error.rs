@@ -57,7 +57,10 @@ impl fmt::Display for Error {
             Error::NoCredits => write!(f, "Credits exhausted"),
             Error::RequestQueued => write!(f, "Request queued due to credit exhaustion"),
             Error::MaxRetriesExceeded => write!(f, "Maximum retries exceeded"),
-            Error::BufferTooSmall { required, available } => {
+            Error::BufferTooSmall {
+                required,
+                available,
+            } => {
                 write!(
                     f,
                     "Buffer too small: required {} bytes, available {} bytes",

@@ -6,18 +6,18 @@
 //! - `lamport`: Batched index synchronization
 //! - `fetch_add`: Native lock-free MPSC via fetch_add
 
-pub mod serial;
 pub mod common;
-pub mod onesided;
 pub mod fastforward;
-pub mod lamport;
 pub mod fetch_add;
+pub mod lamport;
+pub mod onesided;
+pub mod serial;
 pub mod user_data;
 
+pub use common::Response;
+pub use onesided::{RawReceiver, RawSender, Slot};
 pub use serial::Serial;
 pub use user_data::CallerWithUserData;
-pub use common::Response;
-pub use onesided::{Slot, RawSender, RawReceiver};
 
 /// Error returned when a call fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,7 +86,9 @@ pub trait MpscRecvRef<Req: Serial> {
 /// Server that handles N callers with zero-copy recv via GAT.
 pub trait MpscServer<Req: Serial, Resp: Serial> {
     /// Zero-copy receive handle type.
-    type RecvRef<'a>: MpscRecvRef<Req> where Self: 'a;
+    type RecvRef<'a>: MpscRecvRef<Req>
+    where
+        Self: 'a;
 
     /// Scan all caller rings. Returns number of available requests.
     fn poll(&mut self) -> u32;
@@ -111,7 +113,7 @@ pub trait MpscChannel: 'static + Send + Sync {
     ) -> (Vec<Self::Caller<Req, Resp>>, Self::Server<Req, Resp>);
 }
 
-pub use onesided::OnesidedMpsc;
 pub use fastforward::FastForwardMpsc;
-pub use lamport::LamportMpsc;
 pub use fetch_add::FetchAddMpsc;
+pub use lamport::LamportMpsc;
+pub use onesided::OnesidedMpsc;

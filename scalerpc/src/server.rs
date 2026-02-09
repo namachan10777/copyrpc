@@ -584,10 +584,7 @@ impl RpcServer<NoHandler> {
         let response_pool = MessagePool::new(pd, &config.pool)?;
         let mapping = VirtualMapping::new();
 
-        let scheduler = GroupScheduler::new(
-            config.group.num_groups,
-            config.group.time_slice_us,
-        );
+        let scheduler = GroupScheduler::new(config.group.num_groups, config.group.time_slice_us);
 
         // Create endpoint entry pool for warmup notification
         let endpoint_entries = EndpointEntryPool::new(pd, max_connections)?;
@@ -779,7 +776,9 @@ impl<H: RequestHandler> RpcServer<H> {
                 std::slice::from_raw_parts_mut(buf_ptr, buf_len)
             };
 
-            let (status, response_len) = self.handler.handle(request.rpc_type, request.payload(), response_buf);
+            let (status, response_len) =
+                self.handler
+                    .handle(request.rpc_type, request.payload(), response_buf);
 
             if let Err(e) = self.send_response_zero_copy(&request, status, response_len) {
                 eprintln!("Failed to send response: {}", e);
@@ -827,7 +826,12 @@ impl<H: RequestHandler> RpcServer<H> {
     ///
     /// Instead of sending separate RDMA WRITEs, the context switch event will be
     /// piggybacked on the next response to each client. This reduces network overhead.
-    pub fn queue_context_switch_for_piggyback(&self, conn_ids: &[ConnectionId], sequence: u64, fetched_seq: u32) {
+    pub fn queue_context_switch_for_piggyback(
+        &self,
+        conn_ids: &[ConnectionId],
+        sequence: u64,
+        fetched_seq: u32,
+    ) {
         // SAFETY: Single-threaded access, no aliasing
         let pending = unsafe { &mut *self.pending_context_switch.get() };
         for &conn_id in conn_ids {
@@ -857,7 +861,12 @@ impl<H: RequestHandler> RpcServer<H> {
     /// This method sends separate RDMA WRITEs for backward compatibility.
     /// For better efficiency, use queue_context_switch_for_piggyback() to piggyback
     /// events on responses.
-    pub fn notify_context_switch(&self, conn_ids: &[ConnectionId], sequence: u64, fetched_seq: u32) -> Result<()> {
+    pub fn notify_context_switch(
+        &self,
+        conn_ids: &[ConnectionId],
+        sequence: u64,
+        fetched_seq: u32,
+    ) -> Result<()> {
         // Queue for piggybacking on responses (primary method)
         self.queue_context_switch_for_piggyback(conn_ids, sequence, fetched_seq);
 
@@ -912,13 +921,11 @@ impl<H: RequestHandler> RpcServer<H> {
         // SAFETY: Single-threaded access, no aliasing
         let next_slots = unsafe { &mut *self.next_expected_slot.get() };
         for &conn_id in conn_ids {
-            if self.mapping.get_connection(conn_id).is_some()
-                && conn_id < next_slots.len() {
-                    next_slots[conn_id] = 0; // Reset to first position
-                }
+            if self.mapping.get_connection(conn_id).is_some() && conn_id < next_slots.len() {
+                next_slots[conn_id] = 0; // Reset to first position
+            }
         }
     }
-
 
     /// Add a new connection to the server.
     ///
@@ -954,7 +961,16 @@ impl<H: RequestHandler> RpcServer<H> {
 
         let send_cq = self.shared_send_cq.as_ref().unwrap().clone();
         let recv_cq = self.shared_recv_cq.as_ref().unwrap().clone();
-        let conn = Connection::new(ctx, pd, conn_id, port, send_cq, recv_cq, sq_callback, rq_callback)?;
+        let conn = Connection::new(
+            ctx,
+            pd,
+            conn_id,
+            port,
+            send_cq,
+            recv_cq,
+            sq_callback,
+            rq_callback,
+        )?;
 
         self.mapping.register_connection(conn_id);
 
@@ -1256,7 +1272,9 @@ impl<H: RequestHandler> RpcServer<H> {
         };
 
         // Check for pending context switch event to piggyback
-        let response_header = if let Some((seq, fetched_seq)) = self.take_pending_context_switch(request.conn_id) {
+        let response_header = if let Some((seq, fetched_seq)) =
+            self.take_pending_context_switch(request.conn_id)
+        {
             if fetched_seq > 0 {
                 // Warmup fetch complete → include processing pool info for Process mode transition
                 ResponseHeader::with_processing_pool_info_and_credit_ack(
@@ -1384,7 +1402,9 @@ impl<H: RequestHandler> RpcServer<H> {
         };
 
         // Check for pending context switch event to piggyback
-        let response_header = if let Some((seq, fetched_seq)) = self.take_pending_context_switch(request.conn_id) {
+        let response_header = if let Some((seq, fetched_seq)) =
+            self.take_pending_context_switch(request.conn_id)
+        {
             if fetched_seq > 0 {
                 // Warmup fetch complete → include processing pool info for Process mode transition
                 ResponseHeader::with_processing_pool_info_and_credit_ack(
@@ -1470,7 +1490,9 @@ impl<H: RequestHandler> RpcServer<H> {
 
             // Call handler with request payload (zero-copy from processing_pool)
             // Uses static dispatch via RequestHandler trait for inlining
-            let (status, response_len) = self.handler.handle(request.rpc_type, request.payload(), response_buf);
+            let (status, response_len) =
+                self.handler
+                    .handle(request.rpc_type, request.payload(), response_buf);
 
             // Send response (header only, payload already in response_pool slot)
             if let Err(e) = self.send_response_zero_copy(&request, status, response_len) {
@@ -1565,7 +1587,12 @@ impl<H: RequestHandler> RpcServer<H> {
     /// Reply to a request (zero-copy version).
     ///
     /// The response payload is assumed to already be written in the slot.
-    pub fn reply_zero_copy(&self, request: &IncomingRequest, status: u32, payload_len: usize) -> Result<()> {
+    pub fn reply_zero_copy(
+        &self,
+        request: &IncomingRequest,
+        status: u32,
+        payload_len: usize,
+    ) -> Result<()> {
         self.send_response_zero_copy(request, status, payload_len)
     }
 
@@ -1642,7 +1669,9 @@ impl<H: RequestHandler> RpcServer<H> {
             };
 
             // Uses static dispatch via RequestHandler trait for inlining
-            let (status, response_len) = self.handler.handle(request.rpc_type, request.payload(), response_buf);
+            let (status, response_len) =
+                self.handler
+                    .handle(request.rpc_type, request.payload(), response_buf);
             if self.reply_zero_copy(&request, status, response_len).is_ok() {
                 requests_processed += 1;
             }
@@ -1698,13 +1727,20 @@ impl<H: RequestHandler> RpcServer<H> {
             // SAFETY: Single-threaded access
             let conn_id = unsafe { (&*self.conn_buf.get())[i] };
             // Check if this connection has a new batch via endpoint entry
-            let entry_opt = self.endpoint_entries.as_mut().and_then(|e| e.has_new_batch(conn_id));
+            let entry_opt = self
+                .endpoint_entries
+                .as_mut()
+                .and_then(|e| e.has_new_batch(conn_id));
             let entry = match entry_opt {
                 Some(e) => e,
                 None => continue,
             };
 
-            let warmup_info = match self.warmup_buffer_infos.get(conn_id).and_then(|w| w.as_ref()) {
+            let warmup_info = match self
+                .warmup_buffer_infos
+                .get(conn_id)
+                .and_then(|w| w.as_ref())
+            {
                 Some(info) => *info,
                 None => continue,
             };
@@ -1801,13 +1837,13 @@ impl<H: RequestHandler> RpcServer<H> {
                 conn_id, slot_idx
             )))?;
 
-        let slot_data_addr = self
-            .warmup_pool
-            .slot_data_addr(server_slot_idx)
-            .ok_or(Error::Protocol(format!(
-                "Warmup pool slot {} addr not found",
-                server_slot_idx
-            )))?;
+        let slot_data_addr =
+            self.warmup_pool
+                .slot_data_addr(server_slot_idx)
+                .ok_or(Error::Protocol(format!(
+                    "Warmup pool slot {} addr not found",
+                    server_slot_idx
+                )))?;
 
         // Calculate source address (client's warmup buffer + slot offset)
         let src_addr = warmup_info.addr + (slot_idx as u64 * MESSAGE_BLOCK_SIZE as u64);
@@ -1929,5 +1965,4 @@ impl<H: RequestHandler> RpcServer<H> {
             slot_seq,
         })
     }
-
 }

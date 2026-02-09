@@ -157,17 +157,17 @@ impl Connection {
             qpn: self.qpn(),
             psn: 0,
             lid: self.lid(),
-            slot_addr: 0,              // To be filled by caller
-            slot_rkey: 0,              // To be filled by caller
-            event_buffer_addr: 0,      // To be filled by caller (client only)
-            event_buffer_rkey: 0,      // To be filled by caller (client only)
-            warmup_buffer_addr: 0,     // To be filled by caller (client only)
-            warmup_buffer_rkey: 0,     // To be filled by caller (client only)
-            warmup_buffer_slots: 0,    // To be filled by caller (client only)
-            endpoint_entry_addr: 0,    // To be filled by caller (server only)
-            endpoint_entry_rkey: 0,    // To be filled by caller (server only)
+            slot_addr: 0,                        // To be filled by caller
+            slot_rkey: 0,                        // To be filled by caller
+            event_buffer_addr: 0,                // To be filled by caller (client only)
+            event_buffer_rkey: 0,                // To be filled by caller (client only)
+            warmup_buffer_addr: 0,               // To be filled by caller (client only)
+            warmup_buffer_rkey: 0,               // To be filled by caller (client only)
+            warmup_buffer_slots: 0,              // To be filled by caller (client only)
+            endpoint_entry_addr: 0,              // To be filled by caller (server only)
+            endpoint_entry_rkey: 0,              // To be filled by caller (server only)
             server_conn_id: self.conn_id as u32, // Filled by connection
-            pool_num_slots: 0,         // To be filled by caller (server only)
+            pool_num_slots: 0,                   // To be filled by caller (server only)
         }
     }
 

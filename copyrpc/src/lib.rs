@@ -43,19 +43,18 @@ use slab::Slab;
 
 use mlx5::cq::{CqConfig, Cqe};
 use mlx5::device::Context as Mlx5Context;
+use mlx5::emit_wqe;
 use mlx5::mono_cq::MonoCq;
 use mlx5::pd::{AccessFlags, MemoryRegion, Pd};
 use mlx5::qp::{RcQpConfig, RcQpForMonoCqWithSrqAndSqCb};
 use mlx5::srq::{Srq, SrqConfig};
 use mlx5::transport::IbRemoteQpInfo;
-use mlx5::emit_wqe;
 use mlx5::wqe::WqeFlags;
 
 use encoding::{
-    ALIGNMENT, FLOW_METADATA_SIZE, HEADER_SIZE, WRAP_MESSAGE_COUNT,
-    decode_flow_metadata, decode_header, decode_imm, encode_flow_metadata,
-    encode_header, encode_imm, from_response_id, is_response, padded_message_size,
-    to_response_id,
+    ALIGNMENT, FLOW_METADATA_SIZE, HEADER_SIZE, WRAP_MESSAGE_COUNT, decode_flow_metadata,
+    decode_header, decode_imm, encode_flow_metadata, encode_header, encode_imm, from_response_id,
+    is_response, padded_message_size, to_response_id,
 };
 use error::{Error, Result};
 use ring::RemoteConsumer;
@@ -182,7 +181,6 @@ impl CqeBuffer {
     fn push(&self, cqe: Cqe, entry: SrqEntry) {
         self.entries.borrow_mut().push((cqe, entry));
     }
-
 }
 
 /// Type alias for the recv MonoCq callback.
@@ -330,7 +328,15 @@ impl<U, F: Fn(U, &[u8])> ContextBuilder<U, F> {
 
         // Pre-post recv buffers to SRQ
         for _ in 0..srq_max_wr {
-            let _ = srq.post_recv(SrqEntry { qpn: 0, is_read: false }, 0, 0, 0);
+            let _ = srq.post_recv(
+                SrqEntry {
+                    qpn: 0,
+                    is_read: false,
+                },
+                0,
+                0,
+                0,
+            );
         }
         srq.ring_doorbell();
 
@@ -346,13 +352,19 @@ impl<U, F: Fn(U, &[u8])> ContextBuilder<U, F> {
         // Create MonoCq for recv with callback that pushes to buffer
         let recv_callback: RecvCqCallback = Box::new(move |cqe, entry| {
             // Log error CQEs
-            if cqe.opcode == mlx5::cq::CqeOpcode::ReqErr || cqe.opcode == mlx5::cq::CqeOpcode::RespErr {
-                eprintln!("[recv_cq ERROR] qpn={}, opcode={:?}, syndrome={}", entry.qpn, cqe.opcode, cqe.syndrome);
+            if cqe.opcode == mlx5::cq::CqeOpcode::ReqErr
+                || cqe.opcode == mlx5::cq::CqeOpcode::RespErr
+            {
+                eprintln!(
+                    "[recv_cq ERROR] qpn={}, opcode={:?}, syndrome={}",
+                    entry.qpn, cqe.opcode, cqe.syndrome
+                );
                 return;
             }
             cqe_buffer_for_callback.push(cqe, entry);
         });
-        let recv_cq = Rc::new(mlx5_ctx.create_mono_cq(self.cq_size, recv_callback, &CqConfig::default())?);
+        let recv_cq =
+            Rc::new(mlx5_ctx.create_mono_cq(self.cq_size, recv_callback, &CqConfig::default())?);
 
         Ok(Context {
             mlx5_ctx,
@@ -450,7 +462,15 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
         if posted < threshold {
             let to_post = self.srq_max_wr - posted;
             for _ in 0..to_post {
-                let _ = self.srq.post_recv(SrqEntry { qpn: 0, is_read: false }, 0, 0, 0);
+                let _ = self.srq.post_recv(
+                    SrqEntry {
+                        qpn: 0,
+                        is_read: false,
+                    },
+                    0,
+                    0,
+                    0,
+                );
             }
             self.srq.ring_doorbell();
             self.srq_posted.set(self.srq_max_wr);
@@ -589,7 +609,8 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
 
             // Update flow control from metadata
             ep.remote_consumer.update(consumer_pos);
-            ep.peer_credit_balance.set(ep.peer_credit_balance.get() + credit_grant);
+            ep.peer_credit_balance
+                .set(ep.peer_credit_balance.get() + credit_grant);
 
             // Advance past metadata
             ep.last_recv_pos.set(pos + FLOW_METADATA_SIZE as u64);
@@ -615,9 +636,8 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
             let recv_ring_mask = ep.recv_ring.len() as u64 - 1;
             let header_offset = (pos & recv_ring_mask) as usize;
 
-            let (call_id, piggyback, payload_len) = unsafe {
-                decode_header(ep.recv_ring[header_offset..].as_ptr())
-            };
+            let (call_id, piggyback, payload_len) =
+                unsafe { decode_header(ep.recv_ring[header_offset..].as_ptr()) };
 
             let msg_size = padded_message_size(payload_len);
             let new_pos = pos + msg_size;
@@ -626,7 +646,10 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
             if is_response(call_id) {
                 // Response - invoke callback
                 let original_call_id = from_response_id(call_id);
-                let user_data = ep.pending_calls.borrow_mut().try_remove(original_call_id as usize);
+                let user_data = ep
+                    .pending_calls
+                    .borrow_mut()
+                    .try_remove(original_call_id as usize);
 
                 if let Some(user_data) = user_data {
                     let data_offset = header_offset + HEADER_SIZE;
@@ -735,12 +758,10 @@ impl<U> EndpointInner<U> {
 
         // Register memory regions
         let access_flags = AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE;
-        let send_ring_mr = unsafe {
-            pd.register(send_ring.as_mut_ptr(), send_ring.len(), access_flags)?
-        };
-        let recv_ring_mr = unsafe {
-            pd.register(recv_ring.as_mut_ptr(), recv_ring.len(), access_flags)?
-        };
+        let send_ring_mr =
+            unsafe { pd.register(send_ring.as_mut_ptr(), send_ring.len(), access_flags)? };
+        let recv_ring_mr =
+            unsafe { pd.register(recv_ring.as_mut_ptr(), recv_ring.len(), access_flags)? };
 
         // Consumer position MR (for RDMA READ by remote)
         let consumer_position = Box::new(AtomicU64::new(0));
@@ -754,20 +775,20 @@ impl<U> EndpointInner<U> {
 
         // Read buffer for RDMA READ results
         let mut read_buffer = Box::new([0u8; 8]);
-        let read_buffer_mr = unsafe {
-            pd.register(
-                read_buffer.as_mut_ptr(),
-                8,
-                AccessFlags::LOCAL_WRITE,
-            )?
-        };
+        let read_buffer_mr =
+            unsafe { pd.register(read_buffer.as_mut_ptr(), 8, AccessFlags::LOCAL_WRITE)? };
 
         // Create QP with SRQ using MonoCq for recv
         let send_cqe_buffer_clone = send_cqe_buffer.clone();
         let sq_callback: SqCqCallback = Box::new(move |cqe, entry| {
             // Log error CQEs
-            if cqe.opcode == mlx5::cq::CqeOpcode::ReqErr || cqe.opcode == mlx5::cq::CqeOpcode::RespErr {
-                eprintln!("[send_cq ERROR] qpn={}, opcode={:?}, syndrome={}", entry.qpn, cqe.opcode, cqe.syndrome);
+            if cqe.opcode == mlx5::cq::CqeOpcode::ReqErr
+                || cqe.opcode == mlx5::cq::CqeOpcode::RespErr
+            {
+                eprintln!(
+                    "[send_cq ERROR] qpn={}, opcode={:?}, syndrome={}",
+                    entry.qpn, cqe.opcode, cqe.syndrome
+                );
                 return;
             }
             send_cqe_buffer_clone.push(cqe, entry);
@@ -779,8 +800,9 @@ impl<U> EndpointInner<U> {
             .rq_mono_cq(recv_cq)
             .build()?;
 
-        let max_resp_reservation = config.max_resp_reservation.min(config.send_ring_size as u64 / 4);
-
+        let max_resp_reservation = config
+            .max_resp_reservation
+            .min(config.send_ring_size as u64 / 4);
 
         let inner = Rc::new(RefCell::new(Self {
             qp,
@@ -828,7 +850,9 @@ impl<U> EndpointInner<U> {
             recv_ring_size: self.recv_ring.len() as u64,
             consumer_addr: self.consumer_position_mr.addr() as u64,
             consumer_rkey: self.consumer_position_mr.rkey(),
-            initial_credit: self.max_resp_reservation.min(self.send_ring.len() as u64 / 4),
+            initial_credit: self
+                .max_resp_reservation
+                .min(self.send_ring.len() as u64 / 4),
         }
     }
 
@@ -943,7 +967,8 @@ impl<U> EndpointInner<U> {
 
         self.meta_pos.set(Some(producer));
         self.batch_message_count.set(0);
-        self.send_ring_producer.set(producer + FLOW_METADATA_SIZE as u64);
+        self.send_ring_producer
+            .set(producer + FLOW_METADATA_SIZE as u64);
     }
 
     /// Fill the current batch's flow_metadata with final values.
@@ -962,7 +987,8 @@ impl<U> EndpointInner<U> {
         let message_count = self.batch_message_count.get();
 
         // Update resp_reservation with granted credit
-        self.resp_reservation.set(self.resp_reservation.get() + credit_grant);
+        self.resp_reservation
+            .set(self.resp_reservation.get() + credit_grant);
 
         unsafe {
             let buf_ptr = self.send_ring.as_ptr().add(meta_offset) as *mut u8;
@@ -987,7 +1013,8 @@ impl<U> EndpointInner<U> {
 
         let consumer_pos = self.last_recv_pos.get();
         let credit_grant = self.compute_credit_grant();
-        self.resp_reservation.set(self.resp_reservation.get() + credit_grant);
+        self.resp_reservation
+            .set(self.resp_reservation.get() + credit_grant);
 
         unsafe {
             let buf_ptr = self.send_ring.as_ptr().add(offset) as *mut u8;
@@ -1015,7 +1042,8 @@ impl<U> EndpointInner<U> {
 
         // Invariant: in_flight + 2*(current_r + grant) ≤ remote_ring.size
         // grant ≤ (remote_ring.size - in_flight) / 2 - current_r
-        let max_by_invariant = (remote_ring.size.saturating_sub(in_flight) / 2).saturating_sub(current_r);
+        let max_by_invariant =
+            (remote_ring.size.saturating_sub(in_flight) / 2).saturating_sub(current_r);
 
         // Policy: don't exceed max_resp_reservation
         let max_by_policy = self.max_resp_reservation.saturating_sub(current_r);
@@ -1087,7 +1115,12 @@ impl<U> Endpoint<U> {
     }
 
     /// Connect to a remote endpoint.
-    pub fn connect(&mut self, remote: &RemoteEndpointInfo, local_psn: u32, port: u8) -> io::Result<()> {
+    pub fn connect(
+        &mut self,
+        remote: &RemoteEndpointInfo,
+        local_psn: u32,
+        port: u8,
+    ) -> io::Result<()> {
         let inner = self.inner.borrow();
 
         // Set remote ring info
@@ -1128,8 +1161,8 @@ impl<U> Endpoint<U> {
             &remote_qp_info,
             port,
             local_psn,
-            4,            // max_rd_atomic
-            4,            // max_dest_rd_atomic
+            4, // max_rd_atomic
+            4, // max_dest_rd_atomic
             access_flags,
         )?;
 
@@ -1177,8 +1210,14 @@ impl<U> Endpoint<U> {
 
         // Handle wrap-around: check if metadata + message fits in current ring cycle
         let needs_meta = inner.meta_pos.get().is_none();
-        let total_size = if needs_meta { FLOW_METADATA_SIZE as u64 + msg_size } else { msg_size };
-        inner.handle_wrap_if_needed(total_size).map_err(error::CallError::Other)?;
+        let total_size = if needs_meta {
+            FLOW_METADATA_SIZE as u64 + msg_size
+        } else {
+            msg_size
+        };
+        inner
+            .handle_wrap_if_needed(total_size)
+            .map_err(error::CallError::Other)?;
 
         // Ensure batch metadata exists
         inner.ensure_metadata();
@@ -1187,7 +1226,9 @@ impl<U> Endpoint<U> {
         // (producer - consumer) + 2*R ≤ C  →  msg_size ≤ available - 2*R
         let producer = inner.send_ring_producer.get();
         let consumer = inner.remote_consumer.get();
-        let available = remote_ring.size.saturating_sub(producer.saturating_sub(consumer));
+        let available = remote_ring
+            .size
+            .saturating_sub(producer.saturating_sub(consumer));
         let reserved = 2 * inner.resp_reservation.get();
 
         if available < msg_size + reserved {
@@ -1206,20 +1247,25 @@ impl<U> Endpoint<U> {
 
         unsafe {
             let buf_ptr = inner.send_ring.as_ptr().add(send_offset) as *mut u8;
-            encode_header(buf_ptr, call_id, response_allowance_blocks as u64, data.len() as u32);
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                buf_ptr.add(HEADER_SIZE),
-                data.len(),
+            encode_header(
+                buf_ptr,
+                call_id,
+                response_allowance_blocks as u64,
+                data.len() as u32,
             );
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr.add(HEADER_SIZE), data.len());
         }
 
         // Update producer and batch count
         inner.send_ring_producer.set(producer + msg_size);
-        inner.batch_message_count.set(inner.batch_message_count.get() + 1);
+        inner
+            .batch_message_count
+            .set(inner.batch_message_count.get() + 1);
 
         // Deduct credit
-        inner.peer_credit_balance.set(inner.peer_credit_balance.get() - internal_allowance);
+        inner
+            .peer_credit_balance
+            .set(inner.peer_credit_balance.get() - internal_allowance);
 
         Ok(call_id)
     }
@@ -1276,7 +1322,11 @@ impl<U, F: Fn(U, &[u8])> RecvHandle<'_, U, F> {
 
         // Handle wrap-around
         let needs_meta = inner.meta_pos.get().is_none();
-        let total_size = if needs_meta { FLOW_METADATA_SIZE as u64 + msg_size } else { msg_size };
+        let total_size = if needs_meta {
+            FLOW_METADATA_SIZE as u64 + msg_size
+        } else {
+            msg_size
+        };
         inner.handle_wrap_if_needed(total_size)?;
 
         // Ensure batch metadata exists
@@ -1284,7 +1334,9 @@ impl<U, F: Fn(U, &[u8])> RecvHandle<'_, U, F> {
 
         // Deduct response reservation (R_i from the original request)
         let resp_res = inner.resp_reservation.get();
-        inner.resp_reservation.set(resp_res.saturating_sub(self.response_allowance));
+        inner
+            .resp_reservation
+            .set(resp_res.saturating_sub(self.response_allowance));
 
         // Write response message
         let producer = inner.send_ring_producer.get();
@@ -1295,18 +1347,15 @@ impl<U, F: Fn(U, &[u8])> RecvHandle<'_, U, F> {
             let buf_ptr = inner.send_ring.as_ptr().add(send_offset) as *mut u8;
             // piggyback = 0 for responses
             encode_header(buf_ptr, response_call_id, 0, data.len() as u32);
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                buf_ptr.add(HEADER_SIZE),
-                data.len(),
-            );
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr.add(HEADER_SIZE), data.len());
         }
 
         // Update producer and batch count
         inner.send_ring_producer.set(producer + msg_size);
-        inner.batch_message_count.set(inner.batch_message_count.get() + 1);
+        inner
+            .batch_message_count
+            .set(inner.batch_message_count.get() + 1);
 
         Ok(())
     }
 }
-

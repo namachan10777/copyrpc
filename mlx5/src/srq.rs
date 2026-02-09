@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::{io, mem::MaybeUninit, ptr::NonNull};
 
 use crate::pd::Pd;
-use crate::wqe::{SubmissionError, WQEBB_SIZE, write_data_seg, emit::bf_finish_rq};
+use crate::wqe::{SubmissionError, WQEBB_SIZE, emit::bf_finish_rq, write_data_seg};
 
 /// SRQ configuration.
 #[derive(Debug, Clone)]
@@ -174,7 +174,6 @@ impl<T> SrqState<T> {
         self.table[idx].take()
     }
 }
-
 
 // =============================================================================
 // Shared Receive Queue
@@ -380,7 +379,9 @@ impl<T> Srq<T> {
         if state.pending_start_ptr.get().is_none() {
             state.pending_start_ptr.set(Some(wqe_ptr));
         }
-        state.pending_wqe_count.set(state.pending_wqe_count.get() + 1);
+        state
+            .pending_wqe_count
+            .set(state.pending_wqe_count.get() + 1);
 
         Ok(())
     }
@@ -548,7 +549,13 @@ impl<'a, T> SrqBlueflameWqeBatch<'a, T> {
     /// Returns `RqFull` if the SRQ doesn't have enough space.
     /// Returns `BlueflameOverflow` if the batch buffer is full.
     #[inline]
-    pub fn post(&mut self, entry: T, addr: u64, len: u32, lkey: u32) -> Result<(), SubmissionError> {
+    pub fn post(
+        &mut self,
+        entry: T,
+        addr: u64,
+        len: u32,
+        lkey: u32,
+    ) -> Result<(), SubmissionError> {
         if self.state.available() <= self.wqe_count {
             return Err(SubmissionError::RqFull);
         }
@@ -591,7 +598,9 @@ impl<'a, T> SrqBlueflameWqeBatch<'a, T> {
         }
 
         // Advance SRQ producer index
-        self.state.pi.set(self.state.pi.get().wrapping_add(self.wqe_count));
+        self.state
+            .pi
+            .set(self.state.pi.get().wrapping_add(self.wqe_count));
 
         unsafe {
             bf_finish_rq(
@@ -606,4 +615,3 @@ impl<'a, T> SrqBlueflameWqeBatch<'a, T> {
         }
     }
 }
-

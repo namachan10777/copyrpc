@@ -1,6 +1,6 @@
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use mpi::collective::CommunicatorCollectives;
@@ -107,13 +107,7 @@ pub fn run(
                     num_threads,
                 )
             } else {
-                run_one_to_one(
-                    common,
-                    world,
-                    ring_size,
-                    num_endpoints,
-                    *inflight as usize,
-                )
+                run_one_to_one(common, world, ring_size, num_endpoints, *inflight as usize)
             }
         }
         ModeCmd::MultiClient { inflight } => {
@@ -137,7 +131,13 @@ fn run_one_to_one(
 ) -> Vec<BenchRow> {
     let rank = world.rank();
     let is_client = rank == 0;
-    crate::affinity::pin_thread_if_configured(common.affinity_mode, common.affinity_start, rank, 1, 0);
+    crate::affinity::pin_thread_if_configured(
+        common.affinity_mode,
+        common.affinity_start,
+        rank,
+        1,
+        0,
+    );
 
     type OnResponseFn = fn((), &[u8]);
     let ctx: Context<(), OnResponseFn> = ContextBuilder::new()
@@ -250,7 +250,12 @@ fn run_one_to_one(
 
             if !steady.is_empty() {
                 let avg_rps: f64 = rows.iter().map(|r| r.rps).sum::<f64>() / rows.len() as f64;
-                eprintln!("  Run {}: avg {:.0} RPS ({} steady epochs)", run + 1, avg_rps, steady.len());
+                eprintln!(
+                    "  Run {}: avg {:.0} RPS ({} steady epochs)",
+                    run + 1,
+                    avg_rps,
+                    steady.len()
+                );
             }
 
             all_rows.extend(rows);
@@ -303,7 +308,13 @@ fn run_one_to_one_threaded(
         let message_size = common.message_size;
 
         handles.push(std::thread::spawn(move || {
-            crate::affinity::pin_thread_if_configured(affinity_mode, affinity_start, rank, num_threads, tid);
+            crate::affinity::pin_thread_if_configured(
+                affinity_mode,
+                affinity_start,
+                rank,
+                num_threads,
+                tid,
+            );
 
             type OnResponseFn = fn((), &[u8]);
             let ctx: Context<(), OnResponseFn> = ContextBuilder::new()
@@ -393,11 +404,7 @@ fn run_one_to_one_threaded(
                         &stop,
                     );
                 } else {
-                    run_server_duration_atomic(
-                        &ctx,
-                        message_size,
-                        &stop,
-                    );
+                    run_server_duration_atomic(&ctx, message_size, &stop);
                 }
 
                 bar.wait(); // sync at run end
@@ -410,7 +417,9 @@ fn run_one_to_one_threaded(
     let mut all_local_infos: Vec<Option<Vec<EndpointConnectionInfo>>> =
         (0..num_threads).map(|_| None).collect();
     for _ in 0..num_threads {
-        let (tid, infos) = info_rx.recv().expect("Failed to receive endpoint info from worker");
+        let (tid, infos) = info_rx
+            .recv()
+            .expect("Failed to receive endpoint info from worker");
         all_local_infos[tid] = Some(infos);
     }
     let all_local_infos: Vec<Vec<EndpointConnectionInfo>> =
@@ -433,8 +442,9 @@ fn run_one_to_one_threaded(
         let mut thread_remote_infos = Vec::with_capacity(eps_per_thread);
         for i in 0..eps_per_thread {
             let offset = (start + i) * CONNECTION_INFO_SIZE;
-            thread_remote_infos
-                .push(EndpointConnectionInfo::from_bytes(&remote_bytes[offset..offset + CONNECTION_INFO_SIZE]));
+            thread_remote_infos.push(EndpointConnectionInfo::from_bytes(
+                &remote_bytes[offset..offset + CONNECTION_INFO_SIZE],
+            ));
         }
         remote_tx.send(thread_remote_infos).unwrap();
     }
@@ -765,7 +775,13 @@ fn run_multi_client(
     let size = world.size();
     let is_server = rank == 0;
     let num_clients = (size - 1) as usize;
-    crate::affinity::pin_thread_if_configured(common.affinity_mode, common.affinity_start, rank, 1, 0);
+    crate::affinity::pin_thread_if_configured(
+        common.affinity_mode,
+        common.affinity_start,
+        rank,
+        1,
+        0,
+    );
 
     type OnResponseFn = fn((), &[u8]);
     let ctx: Context<(), OnResponseFn> = ContextBuilder::new()
@@ -820,8 +836,7 @@ fn run_multi_client(
         for client_rank in 1..size {
             let i = (client_rank - 1) as usize;
             let local_bytes = local_infos[i].to_bytes();
-            let remote_bytes =
-                mpi_util::exchange_bytes(world, rank, client_rank, &local_bytes);
+            let remote_bytes = mpi_util::exchange_bytes(world, rank, client_rank, &local_bytes);
             let remote_ep = EndpointConnectionInfo::from_bytes(&remote_bytes);
             let remote = RemoteEndpointInfo {
                 qp_number: remote_ep.qp_number,
@@ -866,8 +881,7 @@ fn run_multi_client(
             );
 
             if !steady.is_empty() {
-                let avg_rps: f64 =
-                    rows.iter().map(|r| r.rps).sum::<f64>() / rows.len() as f64;
+                let avg_rps: f64 = rows.iter().map(|r| r.rps).sum::<f64>() / rows.len() as f64;
                 eprintln!(
                     "  Run {}: avg {:.0} RPS ({} steady epochs)",
                     run + 1,

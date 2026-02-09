@@ -8,10 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use inproc::{
-    create_flux_with, create_mesh_with, FetchAddMpsc, Flux, ReceivedMessage, Serial,
-};
 use inproc::mpsc::MpscChannel;
+use inproc::{FetchAddMpsc, Flux, ReceivedMessage, Serial, create_flux_with, create_mesh_with};
 use mempc::MpscChannel as MempcMpscChannel;
 
 fn pin_to_core(core_id: usize) {
@@ -33,17 +31,13 @@ const REQUESTS_PER_PEER: usize = 1024;
 // Flux (SPSC) benchmarks
 // ============================================================================
 
-fn run_flux_qd_bench<M: MempcMpscChannel>(
-    b: &mut criterion::Bencher,
-    num_nodes: usize,
-) {
+fn run_flux_qd_bench<M: MempcMpscChannel>(b: &mut criterion::Bencher, num_nodes: usize) {
     let capacity = QD * 4;
     let inflight_max = QD;
 
     b.iter(|| {
         let global_response_count = Arc::new(AtomicU64::new(0));
-        let total_expected =
-            (num_nodes * (num_nodes - 1) * REQUESTS_PER_PEER) as u64;
+        let total_expected = (num_nodes * (num_nodes - 1) * REQUESTS_PER_PEER) as u64;
         let barrier = Arc::new(Barrier::new(num_nodes));
 
         let nodes: Vec<Flux<Payload, (), _, M>> = {
@@ -120,13 +114,9 @@ fn run_flux_qd_bench<M: MempcMpscChannel>(
 // Mesh (MPSC) benchmarks
 // ============================================================================
 
-fn run_mesh_qd_bench<M: MpscChannel>(
-    b: &mut criterion::Bencher,
-    num_nodes: usize,
-) {
+fn run_mesh_qd_bench<M: MpscChannel>(b: &mut criterion::Bencher, num_nodes: usize) {
     b.iter(|| {
-        let nodes =
-            create_mesh_with::<Payload, (), fn((), Payload), M>(num_nodes, |(), _| {});
+        let nodes = create_mesh_with::<Payload, (), fn((), Payload), M>(num_nodes, |(), _| {});
         let mut handles = Vec::new();
 
         for (node_index, mut node) in nodes.into_iter().enumerate() {
@@ -153,9 +143,7 @@ fn run_mesh_qd_bench<M: MpscChannel>(
                     || responses_received < total_to_send
                 {
                     for &peer in &peers {
-                        if sent_per_peer[peer] < REQUESTS_PER_PEER
-                            && inflight_per_peer[peer] < QD
-                        {
+                        if sent_per_peer[peer] < REQUESTS_PER_PEER && inflight_per_peer[peer] < QD {
                             node.call(peer, black_box(payload), ()).unwrap();
                             sent_per_peer[peer] += 1;
                             inflight_per_peer[peer] += 1;
@@ -196,10 +184,18 @@ fn bench_qd8_2thread(c: &mut Criterion) {
     let mut group = c.benchmark_group("qd8_2thread");
     group.throughput(Throughput::Elements(total as u64));
 
-    group.bench_function("flux_onesided", |b| run_flux_qd_bench::<mempc::OnesidedMpsc>(b, 2));
-    group.bench_function("flux_fastforward", |b| run_flux_qd_bench::<mempc::FastForwardMpsc>(b, 2));
-    group.bench_function("flux_lamport", |b| run_flux_qd_bench::<mempc::LamportMpsc>(b, 2));
-    group.bench_function("mesh_fetch_add", |b| run_mesh_qd_bench::<FetchAddMpsc>(b, 2));
+    group.bench_function("flux_onesided", |b| {
+        run_flux_qd_bench::<mempc::OnesidedMpsc>(b, 2)
+    });
+    group.bench_function("flux_fastforward", |b| {
+        run_flux_qd_bench::<mempc::FastForwardMpsc>(b, 2)
+    });
+    group.bench_function("flux_lamport", |b| {
+        run_flux_qd_bench::<mempc::LamportMpsc>(b, 2)
+    });
+    group.bench_function("mesh_fetch_add", |b| {
+        run_mesh_qd_bench::<FetchAddMpsc>(b, 2)
+    });
 
     group.finish();
 }
@@ -210,10 +206,18 @@ fn bench_qd8_4thread(c: &mut Criterion) {
     let mut group = c.benchmark_group("qd8_4thread");
     group.throughput(Throughput::Elements(total as u64));
 
-    group.bench_function("flux_onesided", |b| run_flux_qd_bench::<mempc::OnesidedMpsc>(b, 4));
-    group.bench_function("flux_fastforward", |b| run_flux_qd_bench::<mempc::FastForwardMpsc>(b, 4));
-    group.bench_function("flux_lamport", |b| run_flux_qd_bench::<mempc::LamportMpsc>(b, 4));
-    group.bench_function("mesh_fetch_add", |b| run_mesh_qd_bench::<FetchAddMpsc>(b, 4));
+    group.bench_function("flux_onesided", |b| {
+        run_flux_qd_bench::<mempc::OnesidedMpsc>(b, 4)
+    });
+    group.bench_function("flux_fastforward", |b| {
+        run_flux_qd_bench::<mempc::FastForwardMpsc>(b, 4)
+    });
+    group.bench_function("flux_lamport", |b| {
+        run_flux_qd_bench::<mempc::LamportMpsc>(b, 4)
+    });
+    group.bench_function("mesh_fetch_add", |b| {
+        run_mesh_qd_bench::<FetchAddMpsc>(b, 4)
+    });
 
     group.finish();
 }

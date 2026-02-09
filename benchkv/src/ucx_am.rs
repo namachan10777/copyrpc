@@ -60,8 +60,7 @@ const UCS_OK: ucs_status_t = ucx_sys::ucs_status_t_UCS_OK as ucs_status_t;
 const UCP_API_MAJOR: u32 = ucx_sys::UCP_API_MAJOR;
 const UCP_API_MINOR: u32 = ucx_sys::UCP_API_MINOR;
 const UCP_FEATURE_AM: u64 = ucx_sys::ucp_feature_UCP_FEATURE_AM as u64;
-const UCP_PARAM_FIELD_FEATURES: u64 =
-    ucx_sys::ucp_params_field_UCP_PARAM_FIELD_FEATURES as u64;
+const UCP_PARAM_FIELD_FEATURES: u64 = ucx_sys::ucp_params_field_UCP_PARAM_FIELD_FEATURES as u64;
 const UCP_WORKER_PARAM_FIELD_THREAD_MODE: u64 =
     ucx_sys::ucp_worker_params_field_UCP_WORKER_PARAM_FIELD_THREAD_MODE as u64;
 const UCP_EP_PARAM_FIELD_REMOTE_ADDRESS: u64 =
@@ -84,9 +83,7 @@ fn status_to_result(status: ucs_status_t) -> io::Result<()> {
             if ptr.is_null() {
                 format!("UCX error: {}", status)
             } else {
-                std::ffi::CStr::from_ptr(ptr)
-                    .to_string_lossy()
-                    .into_owned()
+                std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
             }
         };
         Err(io::Error::other(msg))
@@ -194,15 +191,13 @@ impl UcpWorker {
         let mut addr_ptr: *mut ucp_address_t = ptr::null_mut();
         let mut addr_len: usize = 0;
 
-        let status = unsafe {
-            ucx_sys::ucp_worker_get_address(self.handle, &mut addr_ptr, &mut addr_len)
-        };
+        let status =
+            unsafe { ucx_sys::ucp_worker_get_address(self.handle, &mut addr_ptr, &mut addr_len) };
 
         status_to_result(status)?;
 
-        let addr_vec = unsafe {
-            std::slice::from_raw_parts(addr_ptr as *const u8, addr_len).to_vec()
-        };
+        let addr_vec =
+            unsafe { std::slice::from_raw_parts(addr_ptr as *const u8, addr_len).to_vec() };
 
         unsafe {
             ucx_sys::ucp_worker_release_address(self.handle, addr_ptr);
@@ -284,8 +279,9 @@ impl UcpEndpoint {
         };
 
         let mut ep: MaybeUninit<ucp_ep_h> = MaybeUninit::uninit();
-        let status =
-            unsafe { ucx_sys::ucp_ep_create(worker.handle(), &params as *const _, ep.as_mut_ptr()) };
+        let status = unsafe {
+            ucx_sys::ucp_ep_create(worker.handle(), &params as *const _, ep.as_mut_ptr())
+        };
 
         status_to_result(status)?;
 
@@ -347,7 +343,6 @@ impl UcpEndpoint {
             Ok(())
         }
     }
-
 }
 
 impl Drop for UcpEndpoint {

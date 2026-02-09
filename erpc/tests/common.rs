@@ -29,15 +29,16 @@ impl TestContext {
                 // Find an active port
                 for port in 1..=2u8 {
                     if let Ok(port_attr) = ctx.query_port(port)
-                        && port_attr.state == mlx5::types::PortState::Active {
-                            let pd = ctx.alloc_pd().ok()?;
-                            return Some(Self {
-                                ctx,
-                                pd,
-                                port,
-                                port_attr,
-                            });
-                        }
+                        && port_attr.state == mlx5::types::PortState::Active
+                    {
+                        let pd = ctx.alloc_pd().ok()?;
+                        return Some(Self {
+                            ctx,
+                            pd,
+                            port,
+                            port_attr,
+                        });
+                    }
                 }
             }
         }

@@ -81,21 +81,21 @@ pub unsafe fn flush(addr: *const u8, len: usize) {
                     addr = in(reg) line_addr,
                     options(nostack)
                 );
-            }
+            },
             FlushMethod::ClflushOpt => unsafe {
                 std::arch::asm!(
                     "clflushopt [{addr}]",
                     addr = in(reg) line_addr,
                     options(nostack)
                 );
-            }
+            },
             FlushMethod::Clflush => unsafe {
                 std::arch::asm!(
                     "clflush [{addr}]",
                     addr = in(reg) line_addr,
                     options(nostack)
                 );
-            }
+            },
         }
 
         current += 64;
@@ -121,7 +121,9 @@ pub fn drain() {
 /// The caller must ensure that `addr` points to a valid memory range of at least `len` bytes.
 #[inline]
 pub unsafe fn persist(addr: *const u8, len: usize) {
-    unsafe { flush(addr, len); }
+    unsafe {
+        flush(addr, len);
+    }
     drain();
 }
 
@@ -133,7 +135,11 @@ mod tests {
     fn test_detect_clwb_on_xeon_gold() {
         // Xeon Gold 6530 should support CLWB
         let method = detect_flush_method();
-        assert_eq!(method, FlushMethod::Clwb, "Xeon Gold 6530 should support CLWB");
+        assert_eq!(
+            method,
+            FlushMethod::Clwb,
+            "Xeon Gold 6530 should support CLWB"
+        );
     }
 
     #[test]

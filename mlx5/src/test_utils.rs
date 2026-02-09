@@ -207,11 +207,7 @@ pub fn poll_cq_timeout(cq: &Cq, timeout_ms: u64) -> Option<Cqe> {
 }
 
 /// Poll CQ for multiple completions using poll() method.
-pub fn poll_cq_batch(
-    cq: &Cq,
-    count: usize,
-    timeout_ms: u64,
-) -> Result<Vec<Cqe>, String> {
+pub fn poll_cq_batch(cq: &Cq, count: usize, timeout_ms: u64) -> Result<Vec<Cqe>, String> {
     let mut completions_count = 0;
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_millis(timeout_ms);

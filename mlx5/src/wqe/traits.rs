@@ -106,7 +106,6 @@ impl Av for &GrhAttr {
     }
 }
 
-
 // =============================================================================
 // Data State Markers
 // =============================================================================
@@ -116,4 +115,3 @@ impl Av for &GrhAttr {
 /// Builders in this state cannot call `finish_*()` methods.
 #[derive(Debug, Clone, Copy)]
 pub struct NoData;
-

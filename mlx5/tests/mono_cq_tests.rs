@@ -30,10 +30,15 @@ fn test_mono_cq_creation() {
 
     fn callback(_cqe: Cqe, _entry: u64) {}
 
-    let mono_cq = Rc::new(ctx
-        .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, callback as fn(_, _), &CqConfig::default())
-        .expect("Failed to create MonoCq"));
+    let mono_cq = Rc::new(
+        ctx.ctx
+            .create_mono_cq::<RcQpForMonoCq<u64>, _>(
+                256,
+                callback as fn(_, _),
+                &CqConfig::default(),
+            )
+            .expect("Failed to create MonoCq"),
+    );
 
     // Verify as_ptr returns non-null
     assert!(
@@ -65,10 +70,11 @@ fn test_mono_cq_with_rc_qp() {
     };
 
     // Create a single CQ for both QPs
-    let cq = Rc::new(ctx
-        .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, callback, &CqConfig::default())
-        .expect("Failed to create MonoCq"));
+    let cq = Rc::new(
+        ctx.ctx
+            .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, callback, &CqConfig::default())
+            .expect("Failed to create MonoCq"),
+    );
 
     let config = RcQpConfig::default();
 
@@ -138,7 +144,8 @@ fn test_mono_cq_with_rc_qp() {
         rkey: remote_mr.rkey(),
         sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
         signaled: 42u64,
-    }).expect("emit_wqe failed");
+    })
+    .expect("emit_wqe failed");
     qp1_ref.ring_sq_doorbell();
     drop(qp1_ref);
 
@@ -192,10 +199,15 @@ fn test_mono_cq_poll_empty() {
         panic!("Callback should not be called");
     }
 
-    let mono_cq = Rc::new(ctx
-        .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, callback as fn(_, _), &CqConfig::default())
-        .expect("Failed to create MonoCq"));
+    let mono_cq = Rc::new(
+        ctx.ctx
+            .create_mono_cq::<RcQpForMonoCq<u64>, _>(
+                256,
+                callback as fn(_, _),
+                &CqConfig::default(),
+            )
+            .expect("Failed to create MonoCq"),
+    );
 
     // Poll should return 0 when no completions
     let count = mono_cq.poll();
@@ -227,10 +239,11 @@ fn test_mono_cq_multiple_completions() {
     };
 
     // Use a single CQ for both QPs
-    let cq = Rc::new(ctx
-        .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, callback, &CqConfig::default())
-        .expect("Failed to create MonoCq"));
+    let cq = Rc::new(
+        ctx.ctx
+            .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, callback, &CqConfig::default())
+            .expect("Failed to create MonoCq"),
+    );
 
     let config = RcQpConfig::default();
 
@@ -299,7 +312,8 @@ fn test_mono_cq_multiple_completions() {
                 rkey: remote_mr.rkey(),
                 sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
                 signaled: 100 + i as u64,
-            }).expect("emit_wqe failed");
+            })
+            .expect("emit_wqe failed");
         }
         qp1_ref.ring_sq_doorbell();
     }
@@ -363,10 +377,11 @@ fn test_mono_cq_high_load() {
     };
 
     // Use larger CQ to accommodate high load - single CQ for both QPs
-    let cq = Rc::new(ctx
-        .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(512, callback, &CqConfig::default())
-        .expect("Failed to create MonoCq"));
+    let cq = Rc::new(
+        ctx.ctx
+            .create_mono_cq::<RcQpForMonoCq<u64>, _>(512, callback, &CqConfig::default())
+            .expect("Failed to create MonoCq"),
+    );
 
     let config = RcQpConfig::default();
 
@@ -440,7 +455,8 @@ fn test_mono_cq_high_load() {
                 rkey: remote_mr.rkey(),
                 sge: { addr: local_buf.addr() + offset, len: chunk_size, lkey: local_mr.lkey() },
                 signaled: i as u64,
-            }).expect("emit_wqe failed");
+            })
+            .expect("emit_wqe failed");
         }
         qp1_ref.ring_sq_doorbell();
     }
@@ -511,15 +527,17 @@ fn test_mono_cq_recv_rdma_write_imm() {
     };
 
     // Create separate CQs for each QP
-    let cq1 = Rc::new(ctx
-        .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, qp1_callback, &CqConfig::default())
-        .expect("Failed to create MonoCq 1"));
+    let cq1 = Rc::new(
+        ctx.ctx
+            .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, qp1_callback, &CqConfig::default())
+            .expect("Failed to create MonoCq 1"),
+    );
 
-    let cq2 = Rc::new(ctx
-        .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, qp2_callback, &CqConfig::default())
-        .expect("Failed to create MonoCq 2"));
+    let cq2 = Rc::new(
+        ctx.ctx
+            .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, qp2_callback, &CqConfig::default())
+            .expect("Failed to create MonoCq 2"),
+    );
 
     let config = RcQpConfig::default();
 
@@ -582,7 +600,12 @@ fn test_mono_cq_recv_rdma_write_imm() {
     for i in 0..num_ops {
         let offset = (i * 64) as u64;
         qp1.borrow()
-            .post_recv(1000 + i as u64, recv_buf.addr() + offset, 64, recv_mr.lkey())
+            .post_recv(
+                1000 + i as u64,
+                recv_buf.addr() + offset,
+                64,
+                recv_mr.lkey(),
+            )
             .expect("post_recv failed");
     }
     qp1.borrow().ring_rq_doorbell();
@@ -602,7 +625,8 @@ fn test_mono_cq_recv_rdma_write_imm() {
                 imm: imm_data,
                 sge: { addr: send_buf.addr() + offset, len: 64, lkey: send_mr.lkey() },
                 signaled: i as u64,
-            }).expect("emit_wqe failed");
+            })
+            .expect("emit_wqe failed");
         }
         qp2_ref.ring_sq_doorbell();
     }
@@ -672,14 +696,16 @@ fn test_mono_cq_bidirectional_pingpong() {
     fn noop_callback(_cqe: Cqe, _entry: u64) {}
 
     // Create CQs with noop callbacks - we'll track completions via poll return value
-    let qp1_cq = Rc::new(ctx
-        .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, noop_callback, &CqConfig::default())
-        .expect("qp1_cq"));
-    let qp2_cq = Rc::new(ctx
-        .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, noop_callback, &CqConfig::default())
-        .expect("qp2_cq"));
+    let qp1_cq = Rc::new(
+        ctx.ctx
+            .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, noop_callback, &CqConfig::default())
+            .expect("qp1_cq"),
+    );
+    let qp2_cq = Rc::new(
+        ctx.ctx
+            .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, noop_callback, &CqConfig::default())
+            .expect("qp2_cq"),
+    );
 
     let config = RcQpConfig::default();
 
@@ -766,7 +792,8 @@ fn test_mono_cq_bidirectional_pingpong() {
                 imm: imm,
                 sge: { addr: buf1.addr() + offset, len: msg_size, lkey: mr1.lkey() },
                 signaled: i as u64,
-            }).expect("emit_wqe");
+            })
+            .expect("emit_wqe");
             qp1_ref.ring_sq_doorbell();
         }
 
@@ -780,11 +807,7 @@ fn test_mono_cq_bidirectional_pingpong() {
             }
 
             if start.elapsed() > timeout {
-                panic!(
-                    "Timeout at iter {}: qp2_count={}",
-                    i,
-                    qp2_count.get()
-                );
+                panic!("Timeout at iter {}: qp2_count={}", i, qp2_count.get());
             }
         }
 
@@ -799,7 +822,8 @@ fn test_mono_cq_bidirectional_pingpong() {
                 imm: imm,
                 sge: { addr: buf2.addr() + offset, len: msg_size, lkey: mr2.lkey() },
                 signaled: i as u64,
-            }).expect("emit_wqe");
+            })
+            .expect("emit_wqe");
             qp2_ref.ring_sq_doorbell();
         }
 
@@ -812,11 +836,7 @@ fn test_mono_cq_bidirectional_pingpong() {
             }
 
             if start.elapsed() > timeout {
-                panic!(
-                    "Timeout at iter {}: qp1_count={}",
-                    i,
-                    qp1_count.get()
-                );
+                panic!("Timeout at iter {}: qp1_count={}", i, qp1_count.get());
             }
         }
     }
@@ -861,10 +881,11 @@ fn test_mono_cq_wraparound() {
     let batch_size = 32; // Submit in batches to avoid filling the CQ
 
     // Use a single CQ for both QPs
-    let cq = Rc::new(ctx
-        .ctx
-        .create_mono_cq::<RcQpForMonoCq<u64>, _>(cq_size, callback, &CqConfig::default())
-        .expect("Failed to create MonoCq"));
+    let cq = Rc::new(
+        ctx.ctx
+            .create_mono_cq::<RcQpForMonoCq<u64>, _>(cq_size, callback, &CqConfig::default())
+            .expect("Failed to create MonoCq"),
+    );
 
     let config = RcQpConfig::default();
 
@@ -931,7 +952,8 @@ fn test_mono_cq_wraparound() {
                     rkey: mr.lkey(),
                     sge: { addr: buf.addr() + offset, len: 32, lkey: mr.lkey() },
                     signaled: submitted + i as u64,
-                }).unwrap();
+                })
+                .unwrap();
             }
             qp.ring_sq_doorbell();
         }
@@ -990,10 +1012,20 @@ fn test_mono_cq_with_srq() {
     };
 
     // Create send CQ (normal CQ)
-    let send_cq = Rc::new(ctx.ctx.create_cq(256, &CqConfig::default()).expect("send_cq"));
+    let send_cq = Rc::new(
+        ctx.ctx
+            .create_cq(256, &CqConfig::default())
+            .expect("send_cq"),
+    );
 
     // Create SRQ
-    let srq: mlx5::srq::Srq<SrqEntry> = ctx.pd.create_srq(&SrqConfig { max_wr: 256, max_sge: 1 }).expect("SRQ");
+    let srq: mlx5::srq::Srq<SrqEntry> = ctx
+        .pd
+        .create_srq(&SrqConfig {
+            max_wr: 256,
+            max_sge: 1,
+        })
+        .expect("SRQ");
     let srq = Rc::new(srq);
 
     let config = RcQpConfig::default();
@@ -1003,14 +1035,16 @@ fn test_mono_cq_with_srq() {
     fn empty_sq_callback(_cqe: Cqe, _entry: SrqEntry) {}
 
     // Create recv CQ (MonoCq for SRQ-based QP with function pointer callback type)
-    let recv_cq: Rc<mlx5::mono_cq::MonoCq<RcQpForMonoCqWithSrqAndSqCb<SrqEntry, SqCallback>, _>> = Rc::new(
-        ctx.ctx
-            .create_mono_cq(256, recv_callback, &CqConfig::default())
-            .expect("recv_cq"),
-    );
+    let recv_cq: Rc<mlx5::mono_cq::MonoCq<RcQpForMonoCqWithSrqAndSqCb<SrqEntry, SqCallback>, _>> =
+        Rc::new(
+            ctx.ctx
+                .create_mono_cq(256, recv_callback, &CqConfig::default())
+                .expect("recv_cq"),
+        );
 
     // Create QP1 with SRQ using MonoCq for recv
-    let qp1 = ctx.ctx
+    let qp1 = ctx
+        .ctx
         .rc_qp_builder::<SrqEntry, SrqEntry>(&ctx.pd, &config)
         .with_srq(srq.clone())
         .sq_cq(send_cq.clone(), empty_sq_callback as SqCallback)
@@ -1024,7 +1058,8 @@ fn test_mono_cq_with_srq() {
     // QP1 is automatically registered with recv MonoCq during build()
 
     // Create QP2 (sender) - normal QP without SRQ
-    let qp2 = ctx.ctx
+    let qp2 = ctx
+        .ctx
         .rc_qp_builder::<u64, u64>(&ctx.pd, &config)
         .sq_cq(send_cq.clone(), |_cqe, _entry| {})
         .rq_cq(send_cq.clone(), |_cqe, _entry| {})
@@ -1047,15 +1082,27 @@ fn test_mono_cq_with_srq() {
     };
 
     let access = full_access().bits();
-    qp1.borrow_mut().connect(&remote2, ctx.port, 0, 4, 4, access).expect("connect QP1");
-    qp2.borrow_mut().connect(&remote1, ctx.port, 0, 4, 4, access).expect("connect QP2");
+    qp1.borrow_mut()
+        .connect(&remote2, ctx.port, 0, 4, 4, access)
+        .expect("connect QP1");
+    qp2.borrow_mut()
+        .connect(&remote1, ctx.port, 0, 4, 4, access)
+        .expect("connect QP2");
 
     // Allocate and register buffers
     let mut send_buf = AlignedBuffer::new(4096);
     let mut recv_buf = AlignedBuffer::new(4096);
 
-    let send_mr = unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }.expect("send_mr");
-    let recv_mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }.expect("recv_mr");
+    let send_mr = unsafe {
+        ctx.pd
+            .register(send_buf.as_ptr(), send_buf.size(), full_access())
+    }
+    .expect("send_mr");
+    let recv_mr = unsafe {
+        ctx.pd
+            .register(recv_buf.as_ptr(), recv_buf.size(), full_access())
+    }
+    .expect("recv_mr");
 
     send_buf.fill(0xAB);
     recv_buf.fill(0);
@@ -1063,7 +1110,8 @@ fn test_mono_cq_with_srq() {
     // Post recv to SRQ with QPN
     let num_ops = 8;
     for _ in 0..num_ops {
-        srq.post_recv(SrqEntry { qpn: qpn1 }, 0, 0, 0).expect("post_recv");
+        srq.post_recv(SrqEntry { qpn: qpn1 }, 0, 0, 0)
+            .expect("post_recv");
     }
     srq.ring_doorbell();
 
@@ -1082,7 +1130,8 @@ fn test_mono_cq_with_srq() {
                 imm: imm_data,
                 sge: { addr: send_buf.addr() + offset, len: 64, lkey: send_mr.lkey() },
                 signaled: i as u64,
-            }).expect("emit_wqe");
+            })
+            .expect("emit_wqe");
         }
         qp2_ref.ring_sq_doorbell();
     }
@@ -1138,11 +1187,11 @@ fn test_mono_cq_with_ud_qp() {
         }
     };
 
-    use mlx5::ud::{UdQpConfig, UdQpForMonoCq};
-    use mlx5::pd::RemoteUdQpInfo;
-    use mlx5::wqe::emit::UdAvIb;
     use mlx5::emit_ud_wqe;
+    use mlx5::pd::RemoteUdQpInfo;
+    use mlx5::ud::{UdQpConfig, UdQpForMonoCq};
     use mlx5::wqe::WqeFlags;
+    use mlx5::wqe::emit::UdAvIb;
     use std::cell::RefCell;
 
     const GRH_SIZE: usize = 40;
@@ -1152,15 +1201,19 @@ fn test_mono_cq_with_ud_qp() {
     let completions_clone = completions.clone();
 
     let callback = move |cqe: Cqe, entry: u64| {
-        eprintln!("UD callback: entry={}, opcode={:?}, syndrome={}", entry, cqe.opcode, cqe.syndrome);
+        eprintln!(
+            "UD callback: entry={}, opcode={:?}, syndrome={}",
+            entry, cqe.opcode, cqe.syndrome
+        );
         completions_clone.borrow_mut().push((cqe, entry));
     };
 
     // Create MonoCq for UD QPs
-    let cq = Rc::new(ctx
-        .ctx
-        .create_mono_cq::<UdQpForMonoCq<u64>, _>(256, callback, &CqConfig::default())
-        .expect("Failed to create MonoCq"));
+    let cq = Rc::new(
+        ctx.ctx
+            .create_mono_cq::<UdQpForMonoCq<u64>, _>(256, callback, &CqConfig::default())
+            .expect("Failed to create MonoCq"),
+    );
 
     let qkey: u32 = 0x1BCDEF00;
     let config = UdQpConfig {
@@ -1189,8 +1242,14 @@ fn test_mono_cq_with_ud_qp() {
     // QPs are automatically registered with MonoCq during build()
 
     // Activate QPs
-    sender.borrow_mut().activate(ctx.port, 0).expect("activate sender");
-    receiver.borrow_mut().activate(ctx.port, 0).expect("activate receiver");
+    sender
+        .borrow_mut()
+        .activate(ctx.port, 0)
+        .expect("activate sender");
+    receiver
+        .borrow_mut()
+        .activate(ctx.port, 0)
+        .expect("activate receiver");
 
     eprintln!("Sender QPN: 0x{:x}", sender.borrow().qpn());
     eprintln!("Receiver QPN: 0x{:x}", receiver.borrow().qpn());
@@ -1199,10 +1258,16 @@ fn test_mono_cq_with_ud_qp() {
     let mut send_buf = AlignedBuffer::new(4096);
     let recv_buf = AlignedBuffer::new(4096);
 
-    let send_mr = unsafe { ctx.pd.register(send_buf.as_ptr(), send_buf.size(), full_access()) }
-        .expect("register send MR");
-    let recv_mr = unsafe { ctx.pd.register(recv_buf.as_ptr(), recv_buf.size(), full_access()) }
-        .expect("register recv MR");
+    let send_mr = unsafe {
+        ctx.pd
+            .register(send_buf.as_ptr(), send_buf.size(), full_access())
+    }
+    .expect("register send MR");
+    let recv_mr = unsafe {
+        ctx.pd
+            .register(recv_buf.as_ptr(), recv_buf.size(), full_access())
+    }
+    .expect("register recv MR");
 
     // Prepare test data
     let test_data = b"UD MonoCq test data!";
@@ -1233,7 +1298,8 @@ fn test_mono_cq_with_ud_qp() {
             flags: WqeFlags::empty(),
             sge: { addr: send_buf.addr(), len: test_data.len() as u32, lkey: send_mr.lkey() },
             signaled: 42u64,
-        }).expect("emit_ud_wqe");
+        })
+        .expect("emit_ud_wqe");
         sender_ref.ring_sq_doorbell();
     }
 
@@ -1276,7 +1342,10 @@ fn test_mono_cq_with_ud_qp() {
         }
         assert_eq!(cqe.syndrome, 0, "CQE should have no error");
     }
-    assert!(found_send && found_recv, "Should have both send and recv completions");
+    assert!(
+        found_send && found_recv,
+        "Should have both send and recv completions"
+    );
 
     // Verify received data
     let received = recv_buf.read_bytes(GRH_SIZE + test_data.len());

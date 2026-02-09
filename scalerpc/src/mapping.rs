@@ -100,11 +100,10 @@ impl VirtualMapping {
         if let Some(entry) = self.entries[conn_id].take() {
             // Remove all slot mappings for this connection
             for &slot in &entry.slots {
-                if slot < self.slot_to_conn.len()
-                    && self.slot_to_conn[slot].is_some() {
-                        self.slot_to_conn[slot] = None;
-                        self.num_bound_slots -= 1;
-                    }
+                if slot < self.slot_to_conn.len() && self.slot_to_conn[slot].is_some() {
+                    self.slot_to_conn[slot] = None;
+                    self.num_bound_slots -= 1;
+                }
             }
             self.num_connections -= 1;
             Some(entry)
@@ -175,12 +174,7 @@ impl VirtualMapping {
     }
 
     /// Set remote slot information for a connection.
-    pub fn set_remote_slot(
-        &mut self,
-        conn_id: usize,
-        addr: u64,
-        rkey: u32,
-    ) -> Result<()> {
+    pub fn set_remote_slot(&mut self, conn_id: usize, addr: u64, rkey: u32) -> Result<()> {
         let entry = self
             .entries
             .get_mut(conn_id)

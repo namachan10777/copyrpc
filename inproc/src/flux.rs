@@ -15,8 +15,8 @@
 
 use std::marker::PhantomData;
 
-use mempc::{MpscChannel, MpscRecvRef, MpscServer, OnesidedMpsc, ReplyToken, Serial};
 use mempc::CallerWithUserData;
+use mempc::{MpscChannel, MpscRecvRef, MpscServer, OnesidedMpsc, ReplyToken, Serial};
 
 use crate::SendError;
 
@@ -228,12 +228,13 @@ where
     );
 
     // Create N MPSC channel groups (each group has n-1 callers and 1 server)
-    let mut groups: Vec<(Vec<Option<M::Caller<T, T>>>, Option<M::Server<T, T>>)> =
-        (0..n).map(|_| {
+    let mut groups: Vec<(Vec<Option<M::Caller<T, T>>>, Option<M::Server<T, T>>)> = (0..n)
+        .map(|_| {
             let (callers, server) = M::create::<T, T>(n - 1, capacity, inflight_max);
             let callers_opt: Vec<Option<M::Caller<T, T>>> = callers.into_iter().map(Some).collect();
             (callers_opt, Some(server))
-        }).collect();
+        })
+        .collect();
 
     // Build nodes
     let mut nodes = Vec::with_capacity(n);
@@ -370,10 +371,7 @@ mod tests {
         }
 
         // Next call should fail (inflight limit reached)
-        assert!(matches!(
-            nodes[0].call(1, 4, ()),
-            Err(SendError::Full(4))
-        ));
+        assert!(matches!(nodes[0].call(1, 4, ()), Err(SendError::Full(4))));
 
         // Publish calls so peer can see them
         nodes[0].poll();
@@ -396,8 +394,8 @@ mod tests {
 
     #[test]
     fn test_threaded() {
-        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::thread;
 
         let completed_count = Arc::new(AtomicU64::new(0));
@@ -421,8 +419,11 @@ mod tests {
                     if peer != id {
                         for _ in 0..100 {
                             loop {
-                                match node.call(peer, (id * 1000) as u64, Arc::new(AtomicU64::new(0)))
-                                {
+                                match node.call(
+                                    peer,
+                                    (id * 1000) as u64,
+                                    Arc::new(AtomicU64::new(0)),
+                                ) {
                                     Ok(_) => break,
                                     Err(SendError::Full(_)) => {
                                         node.poll();
@@ -481,7 +482,6 @@ mod tests {
         std::thread::scope(|s| {
             let handles: Vec<_> = nodes
                 .into_iter()
-
                 .map(|mut node| {
                     let end_barrier = Arc::clone(&end_barrier);
                     let global_count = Arc::clone(&global_response_count_clone);
@@ -499,10 +499,11 @@ mod tests {
                         while total_sent < total_sent_target || sent_replies < expected_requests {
                             for &peer in &peers {
                                 if sent_per_peer[peer] < iterations
-                                    && node.call(peer, sent_per_peer[peer], ()).is_ok() {
-                                        sent_per_peer[peer] += 1;
-                                        total_sent += 1;
-                                    }
+                                    && node.call(peer, sent_per_peer[peer], ()).is_ok()
+                                {
+                                    sent_per_peer[peer] += 1;
+                                    total_sent += 1;
+                                }
                             }
 
                             node.poll();
@@ -542,8 +543,8 @@ mod tests {
 
     #[test]
     fn test_ring_wrap() {
-        use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
 
         let response_count = Arc::new(AtomicU64::new(0));
         let response_count_clone = Arc::clone(&response_count);

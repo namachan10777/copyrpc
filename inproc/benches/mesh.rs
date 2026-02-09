@@ -3,17 +3,15 @@
 //! Measures n-to-n communication performance with different backends.
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use inproc::{FetchAddMpsc, Flux, ReceivedMessage, create_flux_with, create_mesh_with};
 use std::thread;
-use inproc::{
-    create_flux_with, create_mesh_with, FetchAddMpsc, Flux, ReceivedMessage,
-};
 
 fn pin_to_core(core_id: usize) {
     core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
 }
 
-use inproc::mpsc::MpscChannel;
 use inproc::Serial;
+use inproc::mpsc::MpscChannel;
 use mempc::MpscChannel as MempcMpscChannel;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,7 +56,9 @@ fn run_mesh_notify_bench<M: MpscChannel>(
             handles.push(thread::spawn(move || {
                 pin_to_core(31 - node_index);
                 let id = node.id();
-                let payload = Payload { data: [id as u64; 4] };
+                let payload = Payload {
+                    data: [id as u64; 4],
+                };
 
                 for peer in 0..n {
                     if peer != id {
@@ -119,7 +119,9 @@ fn run_mesh_call_reply_bench<M: MpscChannel>(
             handles.push(thread::spawn(move || {
                 pin_to_core(31 - node_index);
                 let id = node.id();
-                let payload = Payload { data: [id as u64; 4] };
+                let payload = Payload {
+                    data: [id as u64; 4],
+                };
 
                 for peer in 0..n {
                     if peer != id {
@@ -202,9 +204,14 @@ fn run_flux_call_reply_bench<M: MempcMpscChannel>(
 
         let nodes: Vec<Flux<Payload, (), _, M>> = {
             let counter = Arc::clone(&global_response_count);
-            create_flux_with(num_nodes, capacity, inflight_max, move |_: (), _: Payload| {
-                counter.fetch_add(1, Ordering::Relaxed);
-            })
+            create_flux_with(
+                num_nodes,
+                capacity,
+                inflight_max,
+                move |_: (), _: Payload| {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                },
+            )
         };
         let mut handles = Vec::new();
 
@@ -216,7 +223,9 @@ fn run_flux_call_reply_bench<M: MempcMpscChannel>(
             handles.push(thread::spawn(move || {
                 pin_to_core(31 - node_index);
                 let id = node.id();
-                let payload = Payload { data: [id as u64; 4] };
+                let payload = Payload {
+                    data: [id as u64; 4],
+                };
                 let peers: Vec<usize> = (0..n).filter(|&p| p != id).collect();
 
                 let total_to_send = peers.len() * calls;
@@ -264,5 +273,10 @@ fn run_flux_call_reply_bench<M: MempcMpscChannel>(
     });
 }
 
-criterion_group!(benches, bench_mesh_notify, bench_mesh_call_reply, bench_flux_call_reply);
+criterion_group!(
+    benches,
+    bench_mesh_notify,
+    bench_mesh_call_reply,
+    bench_flux_call_reply
+);
 criterion_main!(benches);

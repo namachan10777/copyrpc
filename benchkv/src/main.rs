@@ -20,11 +20,11 @@ use mpi::collective::CommunicatorCollectives;
 use mpi::topology::Communicator;
 
 use daemon::{
-    on_delegate_response, CopyrpcSetup, DaemonFlux, EndpointConnectionInfo, CONNECTION_INFO_SIZE,
+    CONNECTION_INFO_SIZE, CopyrpcSetup, DaemonFlux, EndpointConnectionInfo, on_delegate_response,
 };
 use epoch::EpochCollector;
-use message::{DelegatePayload, Request, Response};
 use ipc::RequestToken;
+use message::{DelegatePayload, Request, Response};
 
 #[derive(Parser, Debug)]
 #[command(name = "benchkv")]
@@ -110,8 +110,8 @@ enum SubCmd {
 fn main() {
     let cli = Cli::parse();
 
-    let (universe, _threading) = mpi::initialize_with_threading(mpi::Threading::Funneled)
-        .expect("Failed to initialize MPI");
+    let (universe, _threading) =
+        mpi::initialize_with_threading(mpi::Threading::Funneled).expect("Failed to initialize MPI");
     let world = universe.world();
     let rank = world.rank() as u32;
     let size = world.size() as u32;
@@ -168,8 +168,13 @@ fn run_meta(
     // CPU affinity
     let available_cores = affinity::get_available_cores(cli.device_index);
     let (ranks_on_node, rank_on_node) = mpi_util::node_local_rank(world);
-    let (daemon_cores, client_cores) =
-        affinity::assign_cores(&available_cores, num_daemons, num_clients, ranks_on_node, rank_on_node);
+    let (daemon_cores, client_cores) = affinity::assign_cores(
+        &available_cores,
+        num_daemons,
+        num_clients,
+        ranks_on_node,
+        rank_on_node,
+    );
 
     // Generate access patterns (one per client, before barrier)
     let pattern_len = 10000;
@@ -320,8 +325,9 @@ fn run_meta(
 
         // 2. For each remote rank, build D×D matrix, exchange, distribute
         //    Per-daemon accumulator for remote infos
-        let mut daemon_remote_infos: Vec<Vec<EndpointConnectionInfo>> =
-            (0..num_daemons).map(|_| Vec::with_capacity(num_daemons * num_remote_ranks)).collect();
+        let mut daemon_remote_infos: Vec<Vec<EndpointConnectionInfo>> = (0..num_daemons)
+            .map(|_| Vec::with_capacity(num_daemons * num_remote_ranks))
+            .collect();
 
         for peer_rank in 0..size {
             if peer_rank == rank {

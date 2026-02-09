@@ -327,7 +327,9 @@ fn run_benchmark_for_size(
     for i in 0..args.endpoints {
         let start = i * CONNECTION_INFO_SIZE;
         let end = start + CONNECTION_INFO_SIZE;
-        remote_infos.push(EndpointConnectionInfo::from_bytes(&remote_bytes[start..end]));
+        remote_infos.push(EndpointConnectionInfo::from_bytes(
+            &remote_bytes[start..end],
+        ));
     }
 
     for (i, ep) in endpoints.iter_mut().enumerate() {
@@ -474,11 +476,7 @@ fn run_client_pingpong<F: Fn((), &[u8])>(
 // Server Loop
 // =============================================================================
 
-fn run_server_loop<F: Fn((), &[u8])>(
-    ctx: &Context<(), F>,
-    message_size: usize,
-    iterations: u64,
-) {
+fn run_server_loop<F: Fn((), &[u8])>(ctx: &Context<(), F>, message_size: usize, iterations: u64) {
     let response_data = vec![0u8; message_size];
     let mut processed = 0u64;
 

@@ -8,12 +8,10 @@
 
 use std::marker::PhantomData;
 
-use crate::mpsc::{
-    MpscChannel, MpscChannelReceiver, MpscChannelSender, SendError, TryRecvError,
-};
+use crate::mpsc::{MpscChannel, MpscChannelReceiver, MpscChannelSender, SendError, TryRecvError};
 use crate::mpsc_fetchadd::FetchAddMpsc;
-use mempc::Serial;
 use crate::{ReceivedMessage, RecvError, SendError as CrateSendError};
+use mempc::Serial;
 
 /// Sender matrix: `all_senders[j][i]` holds node j's sender to node i's receive queue.
 type SenderMatrix<T, M> = Vec<Vec<Option<<M as MpscChannel>::Sender<TaggedMessage<T>>>>>;
@@ -212,7 +210,10 @@ pub fn create_mesh<T: Serial + Send>(n: usize) -> Vec<Mesh<T, (), fn((), T), Fet
 ///
 /// # Panics
 /// Panics if `n` is 0.
-pub fn create_mesh_with<T: Serial + Send, U, F: FnMut(U, T) + Clone, M: MpscChannel>(n: usize, on_response: F) -> Vec<Mesh<T, U, F, M>> {
+pub fn create_mesh_with<T: Serial + Send, U, F: FnMut(U, T) + Clone, M: MpscChannel>(
+    n: usize,
+    on_response: F,
+) -> Vec<Mesh<T, U, F, M>> {
     assert!(n > 0, "must have at least one node");
 
     // Create receivers and collect senders
@@ -409,9 +410,13 @@ mod tests {
         let callback_data = Arc::new(Mutex::new(Vec::new()));
         let callback_data_clone = callback_data.clone();
 
-        let mut nodes = create_mesh_with::<u32, u32, _, FetchAddMpsc>(2, move |user_data, response| {
-            callback_data_clone.lock().unwrap().push((user_data, response));
-        });
+        let mut nodes =
+            create_mesh_with::<u32, u32, _, FetchAddMpsc>(2, move |user_data, response| {
+                callback_data_clone
+                    .lock()
+                    .unwrap()
+                    .push((user_data, response));
+            });
 
         // Send request with user_data = 100
         let req_num = nodes[0].call(1, 42, 100).unwrap();

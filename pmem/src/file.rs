@@ -1,5 +1,5 @@
-use nix::fcntl::{open, OFlag};
-use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
+use nix::fcntl::{OFlag, open};
+use nix::sys::mman::{MapFlags, ProtFlags, mmap, munmap};
 use nix::sys::stat::Mode;
 use nix::unistd::{close, ftruncate};
 use std::io;

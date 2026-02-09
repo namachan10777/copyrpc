@@ -180,7 +180,7 @@ mod tests {
         let mock = MockCaller::new(8);
         let responses = Rc::new(RefCell::new(Vec::new()));
         let responses_clone = responses.clone();
-        
+
         let mut caller = CallerWithUserData::new(mock, 8, move |ud: String, resp| {
             responses_clone.borrow_mut().push((ud, resp));
         });
@@ -209,7 +209,7 @@ mod tests {
         let mock = MockCaller::new(16);
         let responses = Rc::new(RefCell::new(Vec::new()));
         let responses_clone = responses.clone();
-        
+
         let mut caller = CallerWithUserData::new(mock, 16, move |ud: u32, resp| {
             responses_clone.borrow_mut().push((ud, resp));
         });
@@ -253,7 +253,7 @@ mod tests {
         let mock = MockCaller::new(32);
         let responses = Rc::new(RefCell::new(Vec::new()));
         let responses_clone = responses.clone();
-        
+
         let mut caller = CallerWithUserData::new(mock, 32, move |ud: (usize, String), resp| {
             responses_clone.borrow_mut().push((ud, resp));
         });
@@ -302,7 +302,7 @@ mod tests {
         let responses = Rc::new(RefCell::new(Vec::new()));
         let responses_clone = responses.clone();
         let capacity = 8; // Small capacity to force modulo wrapping
-        
+
         let mut caller = CallerWithUserData::new(mock, capacity, move |ud: u64, resp| {
             responses_clone.borrow_mut().push((ud, resp));
         });
@@ -335,7 +335,7 @@ mod tests {
         let mock = MockCaller::new(16);
         let responses = Rc::new(RefCell::new(Vec::new()));
         let responses_clone = responses.clone();
-        
+
         let mut caller = CallerWithUserData::new(mock, 16, move |ud: usize, resp| {
             responses_clone.borrow_mut().push((ud, resp));
         });

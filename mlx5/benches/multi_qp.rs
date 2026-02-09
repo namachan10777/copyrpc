@@ -224,13 +224,17 @@ fn rc_server_thread_main(
     };
 
     let send_cq = match ctx.create_mono_cq::<RcQpForMonoCq<u64>, _>(
-        QPS_PER_THREAD as i32, send_callback, &CqConfig::default(),
+        QPS_PER_THREAD as i32,
+        send_callback,
+        &CqConfig::default(),
     ) {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
     };
     let recv_cq = match ctx.create_mono_cq::<RcQpForMonoCq<u64>, _>(
-        QPS_PER_THREAD as i32, recv_callback, &CqConfig::default(),
+        QPS_PER_THREAD as i32,
+        recv_callback,
+        &CqConfig::default(),
     ) {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
@@ -287,7 +291,11 @@ fn rc_server_thread_main(
             packet_sequence_number: 0,
             local_identifier: info.lid,
         };
-        if qps[i].borrow_mut().connect(&remote, port, 0, 4, 4, access).is_err() {
+        if qps[i]
+            .borrow_mut()
+            .connect(&remote, port, 0, 4, 4, access)
+            .is_err()
+        {
             return;
         }
     }
@@ -297,7 +305,12 @@ fn rc_server_thread_main(
         let offset = (i * RECV_BUF_ENTRY_SIZE) as u64;
         qps[i]
             .borrow()
-            .post_recv(i as u64, recv_buf.addr() + offset, RECV_BUF_ENTRY_SIZE as u32, recv_mr.lkey())
+            .post_recv(
+                i as u64,
+                recv_buf.addr() + offset,
+                RECV_BUF_ENTRY_SIZE as u32,
+                recv_mr.lkey(),
+            )
             .unwrap();
         qps[i].borrow().ring_rq_doorbell();
     }
@@ -325,7 +338,12 @@ fn rc_server_thread_main(
             let offset = (idx * RECV_BUF_ENTRY_SIZE) as u64;
             qps[idx]
                 .borrow()
-                .post_recv(idx as u64, recv_buf.addr() + offset, RECV_BUF_ENTRY_SIZE as u32, recv_mr.lkey())
+                .post_recv(
+                    idx as u64,
+                    recv_buf.addr() + offset,
+                    RECV_BUF_ENTRY_SIZE as u32,
+                    recv_mr.lkey(),
+                )
                 .unwrap();
         }
 
@@ -340,16 +358,22 @@ fn rc_server_thread_main(
             let qp = qps[idx].borrow();
             let ctx = qp.emit_ctx().expect("emit_ctx failed");
             if send_count % SIGNAL_INTERVAL == SIGNAL_INTERVAL - 1 {
-                let _ = emit_wqe!(&ctx, send {
-                    flags: WqeFlags::empty(),
-                    inline: echo_data.as_slice(),
-                    signaled: idx as u64,
-                });
+                let _ = emit_wqe!(
+                    &ctx,
+                    send {
+                        flags: WqeFlags::empty(),
+                        inline: echo_data.as_slice(),
+                        signaled: idx as u64,
+                    }
+                );
             } else {
-                let _ = emit_wqe!(&ctx, send {
-                    flags: WqeFlags::empty(),
-                    inline: echo_data.as_slice(),
-                });
+                let _ = emit_wqe!(
+                    &ctx,
+                    send {
+                        flags: WqeFlags::empty(),
+                        inline: echo_data.as_slice(),
+                    }
+                );
             }
             send_count += 1;
         }
@@ -373,16 +397,20 @@ fn setup_rc_multi_qp_benchmark() -> Option<RcMultiQpSetup<impl Fn(Cqe, u64), imp
     let send_callback = move |_cqe: Cqe, _entry: u64| {};
     let recv_callback = move |cqe: Cqe, _entry: u64| {
         if cqe.opcode.is_responder() && cqe.syndrome == 0 {
-            client_state_cb.rx_count.set(client_state_cb.rx_count.get() + 1);
+            client_state_cb
+                .rx_count
+                .set(client_state_cb.rx_count.get() + 1);
         }
     };
 
-    let send_cq = Rc::new(ctx.create_mono_cq(
-        NUM_CONNECTIONS as i32, send_callback, &CqConfig::default(),
-    ).ok()?);
-    let recv_cq = Rc::new(ctx.create_mono_cq(
-        NUM_CONNECTIONS as i32, recv_callback, &CqConfig::default(),
-    ).ok()?);
+    let send_cq = Rc::new(
+        ctx.create_mono_cq(NUM_CONNECTIONS as i32, send_callback, &CqConfig::default())
+            .ok()?,
+    );
+    let recv_cq = Rc::new(
+        ctx.create_mono_cq(NUM_CONNECTIONS as i32, recv_callback, &CqConfig::default())
+            .ok()?,
+    );
 
     let config = RcQpConfig {
         max_send_wr: RC_MAX_SEND_WR,
@@ -415,7 +443,8 @@ fn setup_rc_multi_qp_benchmark() -> Option<RcMultiQpSetup<impl Fn(Cqe, u64), imp
     let ready_counter = Arc::new(AtomicU32::new(0));
     let mut handles = Vec::with_capacity(NUM_SERVER_THREADS);
 
-    let mut all_server_infos: Vec<Option<Vec<ConnectionInfo>>> = (0..NUM_SERVER_THREADS).map(|_| None).collect();
+    let mut all_server_infos: Vec<Option<Vec<ConnectionInfo>>> =
+        (0..NUM_SERVER_THREADS).map(|_| None).collect();
 
     let mut server_info_rxs = Vec::new();
     let mut client_info_txs = Vec::new();
@@ -475,7 +504,12 @@ fn setup_rc_multi_qp_benchmark() -> Option<RcMultiQpSetup<impl Fn(Cqe, u64), imp
         let offset = (i * RECV_BUF_ENTRY_SIZE) as u64;
         qps[i]
             .borrow()
-            .post_recv(i as u64, recv_buf.addr() + offset, RECV_BUF_ENTRY_SIZE as u32, recv_mr.lkey())
+            .post_recv(
+                i as u64,
+                recv_buf.addr() + offset,
+                RECV_BUF_ENTRY_SIZE as u32,
+                recv_mr.lkey(),
+            )
             .unwrap();
         qps[i].borrow().ring_rq_doorbell();
     }
@@ -500,10 +534,7 @@ fn setup_rc_multi_qp_benchmark() -> Option<RcMultiQpSetup<impl Fn(Cqe, u64), imp
     })
 }
 
-fn run_rc_multi_qp_throughput<SF, RF>(
-    setup: &RcMultiQpSetup<SF, RF>,
-    iters: u64,
-) -> Duration
+fn run_rc_multi_qp_throughput<SF, RF>(setup: &RcMultiQpSetup<SF, RF>, iters: u64) -> Duration
 where
     SF: Fn(Cqe, u64),
     RF: Fn(Cqe, u64),
@@ -518,16 +549,22 @@ where
         let qp = setup.qps[i].borrow();
         let ctx = qp.emit_ctx().expect("emit_ctx failed");
         if send_count % signal_interval == signal_interval - 1 {
-            let _ = emit_wqe!(&ctx, send {
-                flags: WqeFlags::empty(),
-                inline: send_data.as_slice(),
-                signaled: i as u64,
-            });
+            let _ = emit_wqe!(
+                &ctx,
+                send {
+                    flags: WqeFlags::empty(),
+                    inline: send_data.as_slice(),
+                    signaled: i as u64,
+                }
+            );
         } else {
-            let _ = emit_wqe!(&ctx, send {
-                flags: WqeFlags::empty(),
-                inline: send_data.as_slice(),
-            });
+            let _ = emit_wqe!(
+                &ctx,
+                send {
+                    flags: WqeFlags::empty(),
+                    inline: send_data.as_slice(),
+                }
+            );
         }
         qp.ring_sq_doorbell();
         send_count += 1;
@@ -576,16 +613,22 @@ where
             let qp = setup.qps[qp_idx].borrow();
             let ctx = qp.emit_ctx().expect("emit_ctx failed");
             if send_count % signal_interval == signal_interval - 1 {
-                let _ = emit_wqe!(&ctx, send {
-                    flags: WqeFlags::empty(),
-                    inline: send_data.as_slice(),
-                    signaled: qp_idx as u64,
-                });
+                let _ = emit_wqe!(
+                    &ctx,
+                    send {
+                        flags: WqeFlags::empty(),
+                        inline: send_data.as_slice(),
+                        signaled: qp_idx as u64,
+                    }
+                );
             } else {
-                let _ = emit_wqe!(&ctx, send {
-                    flags: WqeFlags::empty(),
-                    inline: send_data.as_slice(),
-                });
+                let _ = emit_wqe!(
+                    &ctx,
+                    send {
+                        flags: WqeFlags::empty(),
+                        inline: send_data.as_slice(),
+                    }
+                );
             }
             qp.ring_sq_doorbell();
             send_count += 1;
@@ -649,13 +692,17 @@ fn ud_server_thread_main(
     });
 
     let send_cq = match ctx.create_mono_cq::<UdQpForMonoCq<u64>, _>(
-        QPS_PER_THREAD as i32, send_callback, &CqConfig::default(),
+        QPS_PER_THREAD as i32,
+        send_callback,
+        &CqConfig::default(),
     ) {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
     };
     let recv_cq = match ctx.create_mono_cq::<UdQpForMonoCq<u64>, _>(
-        QPS_PER_THREAD as i32, recv_callback, &CqConfig::default(),
+        QPS_PER_THREAD as i32,
+        recv_callback,
+        &CqConfig::default(),
     ) {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
@@ -709,7 +756,12 @@ fn ud_server_thread_main(
     for i in 0..QPS_PER_THREAD {
         let offset = (i * UD_RECV_ENTRY_SIZE) as u64;
         qp.borrow()
-            .post_recv(i as u64, recv_buf.addr() + offset, UD_RECV_ENTRY_SIZE as u32, recv_mr.lkey())
+            .post_recv(
+                i as u64,
+                recv_buf.addr() + offset,
+                UD_RECV_ENTRY_SIZE as u32,
+                recv_mr.lkey(),
+            )
             .unwrap();
     }
     qp.borrow().ring_rq_doorbell();
@@ -740,7 +792,12 @@ fn ud_server_thread_main(
                 let idx = recv_idx % QPS_PER_THREAD;
                 let offset = (idx * UD_RECV_ENTRY_SIZE) as u64;
                 qp_ref
-                    .post_recv(idx as u64, recv_buf.addr() + offset, UD_RECV_ENTRY_SIZE as u32, recv_mr.lkey())
+                    .post_recv(
+                        idx as u64,
+                        recv_buf.addr() + offset,
+                        UD_RECV_ENTRY_SIZE as u32,
+                        recv_mr.lkey(),
+                    )
                     .unwrap();
                 recv_idx += 1;
             }
@@ -752,18 +809,24 @@ fn ud_server_thread_main(
             let ctx = qp_ref.emit_ctx().expect("emit_ctx failed");
             for _ in 0..count {
                 if send_count % SIGNAL_INTERVAL == SIGNAL_INTERVAL - 1 {
-                    let _ = emit_ud_wqe!(&ctx, send {
-                        av: client_av,
-                        flags: WqeFlags::empty(),
-                        inline: echo_data.as_slice(),
-                        signaled: send_count as u64,
-                    });
+                    let _ = emit_ud_wqe!(
+                        &ctx,
+                        send {
+                            av: client_av,
+                            flags: WqeFlags::empty(),
+                            inline: echo_data.as_slice(),
+                            signaled: send_count as u64,
+                        }
+                    );
                 } else {
-                    let _ = emit_ud_wqe!(&ctx, send {
-                        av: client_av,
-                        flags: WqeFlags::empty(),
-                        inline: echo_data.as_slice(),
-                    });
+                    let _ = emit_ud_wqe!(
+                        &ctx,
+                        send {
+                            av: client_av,
+                            flags: WqeFlags::empty(),
+                            inline: echo_data.as_slice(),
+                        }
+                    );
                 }
                 send_count += 1;
             }
@@ -787,16 +850,28 @@ fn setup_ud_multi_qp_benchmark() -> Option<UdMultiQpSetup> {
     let send_callback: UdMonoCqSendCb = Box::new(move |_cqe: Cqe, _entry: u64| {});
     let recv_callback: UdMonoCqRecvCb = Box::new(move |cqe: Cqe, _entry: u64| {
         if cqe.opcode.is_responder() && cqe.syndrome == 0 {
-            client_state_cb.rx_count.set(client_state_cb.rx_count.get() + 1);
+            client_state_cb
+                .rx_count
+                .set(client_state_cb.rx_count.get() + 1);
         }
     });
 
-    let send_cq = Rc::new(ctx.create_mono_cq::<UdQpForMonoCq<u64>, _>(
-        NUM_CONNECTIONS as i32, send_callback, &CqConfig::default(),
-    ).ok()?);
-    let recv_cq = Rc::new(ctx.create_mono_cq::<UdQpForMonoCq<u64>, _>(
-        NUM_CONNECTIONS as i32, recv_callback, &CqConfig::default(),
-    ).ok()?);
+    let send_cq = Rc::new(
+        ctx.create_mono_cq::<UdQpForMonoCq<u64>, _>(
+            NUM_CONNECTIONS as i32,
+            send_callback,
+            &CqConfig::default(),
+        )
+        .ok()?,
+    );
+    let recv_cq = Rc::new(
+        ctx.create_mono_cq::<UdQpForMonoCq<u64>, _>(
+            NUM_CONNECTIONS as i32,
+            recv_callback,
+            &CqConfig::default(),
+        )
+        .ok()?,
+    );
 
     let qkey = 0x11111111u32;
     let ud_config = UdQpConfig {
@@ -864,7 +939,12 @@ fn setup_ud_multi_qp_benchmark() -> Option<UdMultiQpSetup> {
     for i in 0..NUM_CONNECTIONS {
         let offset = (i * UD_RECV_ENTRY_SIZE) as u64;
         qp.borrow()
-            .post_recv(i as u64, recv_buf.addr() + offset, UD_RECV_ENTRY_SIZE as u32, recv_mr.lkey())
+            .post_recv(
+                i as u64,
+                recv_buf.addr() + offset,
+                UD_RECV_ENTRY_SIZE as u32,
+                recv_mr.lkey(),
+            )
             .unwrap();
     }
     qp.borrow().ring_rq_doorbell();
@@ -903,18 +983,24 @@ fn run_ud_multi_qp_throughput(setup: &UdMultiQpSetup, iters: u64) -> Duration {
         let ctx = qp.emit_ctx().expect("emit_ctx failed");
         for i in 0..initial_fill {
             if send_count % signal_interval == signal_interval - 1 {
-                let _ = emit_ud_wqe!(&ctx, send {
-                    av: setup.server_avs[i % NUM_CONNECTIONS],
-                    flags: WqeFlags::empty(),
-                    inline: send_data.as_slice(),
-                    signaled: send_count as u64,
-                });
+                let _ = emit_ud_wqe!(
+                    &ctx,
+                    send {
+                        av: setup.server_avs[i % NUM_CONNECTIONS],
+                        flags: WqeFlags::empty(),
+                        inline: send_data.as_slice(),
+                        signaled: send_count as u64,
+                    }
+                );
             } else {
-                let _ = emit_ud_wqe!(&ctx, send {
-                    av: setup.server_avs[i % NUM_CONNECTIONS],
-                    flags: WqeFlags::empty(),
-                    inline: send_data.as_slice(),
-                });
+                let _ = emit_ud_wqe!(
+                    &ctx,
+                    send {
+                        av: setup.server_avs[i % NUM_CONNECTIONS],
+                        flags: WqeFlags::empty(),
+                        inline: send_data.as_slice(),
+                    }
+                );
             }
             send_count += 1;
         }
@@ -970,18 +1056,24 @@ fn run_ud_multi_qp_throughput(setup: &UdMultiQpSetup, iters: u64) -> Duration {
             for _ in 0..can_send {
                 let av_idx = sent % NUM_CONNECTIONS;
                 if send_count % signal_interval == signal_interval - 1 {
-                    let _ = emit_ud_wqe!(&ctx, send {
-                        av: setup.server_avs[av_idx],
-                        flags: WqeFlags::empty(),
-                        inline: send_data.as_slice(),
-                        signaled: send_count as u64,
-                    });
+                    let _ = emit_ud_wqe!(
+                        &ctx,
+                        send {
+                            av: setup.server_avs[av_idx],
+                            flags: WqeFlags::empty(),
+                            inline: send_data.as_slice(),
+                            signaled: send_count as u64,
+                        }
+                    );
                 } else {
-                    let _ = emit_ud_wqe!(&ctx, send {
-                        av: setup.server_avs[av_idx],
-                        flags: WqeFlags::empty(),
-                        inline: send_data.as_slice(),
-                    });
+                    let _ = emit_ud_wqe!(
+                        &ctx,
+                        send {
+                            av: setup.server_avs[av_idx],
+                            flags: WqeFlags::empty(),
+                            inline: send_data.as_slice(),
+                        }
+                    );
                 }
                 send_count += 1;
                 sent += 1;
@@ -1056,7 +1148,9 @@ fn dc_server_thread_main(
     let send_callback: DcMonoCqSendCb = Box::new(move |_cqe: Cqe, _entry: u64| {});
 
     let send_cq = match ctx.create_mono_cq::<DciForMonoCq<u64>, _>(
-        QPS_PER_THREAD as i32, send_callback, &CqConfig::default(),
+        QPS_PER_THREAD as i32,
+        send_callback,
+        &CqConfig::default(),
     ) {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
@@ -1134,8 +1228,13 @@ fn dc_server_thread_main(
     // Pre-post recv WQEs on SRQ
     for i in 0..QPS_PER_THREAD {
         let offset = (i * RECV_BUF_ENTRY_SIZE) as u64;
-        srq.post_recv(i as u64, recv_buf.addr() + offset, RECV_BUF_ENTRY_SIZE as u32, recv_mr.lkey())
-            .unwrap();
+        srq.post_recv(
+            i as u64,
+            recv_buf.addr() + offset,
+            RECV_BUF_ENTRY_SIZE as u32,
+            recv_mr.lkey(),
+        )
+        .unwrap();
     }
     srq.ring_doorbell();
 
@@ -1169,8 +1268,13 @@ fn dc_server_thread_main(
         for _ in 0..count {
             let idx = recv_idx % QPS_PER_THREAD;
             let offset = (idx * RECV_BUF_ENTRY_SIZE) as u64;
-            srq.post_recv(idx as u64, recv_buf.addr() + offset, RECV_BUF_ENTRY_SIZE as u32, recv_mr.lkey())
-                .unwrap();
+            srq.post_recv(
+                idx as u64,
+                recv_buf.addr() + offset,
+                RECV_BUF_ENTRY_SIZE as u32,
+                recv_mr.lkey(),
+            )
+            .unwrap();
             recv_idx += 1;
         }
         srq.ring_doorbell();
@@ -1181,18 +1285,24 @@ fn dc_server_thread_main(
             let ctx = dci_ref.emit_ctx().expect("emit_ctx failed");
             for _ in 0..count {
                 if send_count % SIGNAL_INTERVAL == SIGNAL_INTERVAL - 1 {
-                    let _ = emit_dci_wqe!(&ctx, send {
-                        av: client_av,
-                        flags: WqeFlags::empty(),
-                        inline: echo_data.as_slice(),
-                        signaled: send_count as u64,
-                    });
+                    let _ = emit_dci_wqe!(
+                        &ctx,
+                        send {
+                            av: client_av,
+                            flags: WqeFlags::empty(),
+                            inline: echo_data.as_slice(),
+                            signaled: send_count as u64,
+                        }
+                    );
                 } else {
-                    let _ = emit_dci_wqe!(&ctx, send {
-                        av: client_av,
-                        flags: WqeFlags::empty(),
-                        inline: echo_data.as_slice(),
-                    });
+                    let _ = emit_dci_wqe!(
+                        &ctx,
+                        send {
+                            av: client_av,
+                            flags: WqeFlags::empty(),
+                            inline: echo_data.as_slice(),
+                        }
+                    );
                 }
                 send_count += 1;
             }
@@ -1209,10 +1319,18 @@ fn setup_dc_multi_qp_benchmark() -> Option<DcMultiQpSetup> {
 
     let send_callback: DcMonoCqSendCb = Box::new(move |_cqe: Cqe, _entry: u64| {});
 
-    let send_cq = Rc::new(ctx.create_mono_cq::<DciForMonoCq<u64>, _>(
-        NUM_CONNECTIONS as i32, send_callback, &CqConfig::default(),
-    ).ok()?);
-    let recv_cq = Rc::new(ctx.create_cq(NUM_CONNECTIONS as i32, &CqConfig::default()).ok()?);
+    let send_cq = Rc::new(
+        ctx.create_mono_cq::<DciForMonoCq<u64>, _>(
+            NUM_CONNECTIONS as i32,
+            send_callback,
+            &CqConfig::default(),
+        )
+        .ok()?,
+    );
+    let recv_cq = Rc::new(
+        ctx.create_cq(NUM_CONNECTIONS as i32, &CqConfig::default())
+            .ok()?,
+    );
 
     // Client SRQ + DCT (for receiving echo)
     let srq_config = SrqConfig {
@@ -1293,8 +1411,13 @@ fn setup_dc_multi_qp_benchmark() -> Option<DcMultiQpSetup> {
     // Pre-post recv on client SRQ
     for i in 0..NUM_CONNECTIONS {
         let offset = (i * RECV_BUF_ENTRY_SIZE) as u64;
-        srq.post_recv(i as u64, recv_buf.addr() + offset, RECV_BUF_ENTRY_SIZE as u32, recv_mr.lkey())
-            .unwrap();
+        srq.post_recv(
+            i as u64,
+            recv_buf.addr() + offset,
+            RECV_BUF_ENTRY_SIZE as u32,
+            recv_mr.lkey(),
+        )
+        .unwrap();
     }
     srq.ring_doorbell();
 
@@ -1331,18 +1454,24 @@ fn run_dc_multi_qp_throughput(setup: &DcMultiQpSetup, iters: u64) -> Duration {
         let ctx = dci.emit_ctx().expect("emit_ctx failed");
         for i in 0..initial_fill {
             if send_count % signal_interval == signal_interval - 1 {
-                let _ = emit_dci_wqe!(&ctx, send {
-                    av: setup.server_avs[i],
-                    flags: WqeFlags::empty(),
-                    inline: send_data.as_slice(),
-                    signaled: send_count as u64,
-                });
+                let _ = emit_dci_wqe!(
+                    &ctx,
+                    send {
+                        av: setup.server_avs[i],
+                        flags: WqeFlags::empty(),
+                        inline: send_data.as_slice(),
+                        signaled: send_count as u64,
+                    }
+                );
             } else {
-                let _ = emit_dci_wqe!(&ctx, send {
-                    av: setup.server_avs[i],
-                    flags: WqeFlags::empty(),
-                    inline: send_data.as_slice(),
-                });
+                let _ = emit_dci_wqe!(
+                    &ctx,
+                    send {
+                        av: setup.server_avs[i],
+                        flags: WqeFlags::empty(),
+                        inline: send_data.as_slice(),
+                    }
+                );
             }
             send_count += 1;
         }
@@ -1377,13 +1506,15 @@ fn run_dc_multi_qp_throughput(setup: &DcMultiQpSetup, iters: u64) -> Duration {
         for i in 0..rx_count {
             let idx = (completed - rx_count + i) % NUM_CONNECTIONS;
             let offset = (idx * RECV_BUF_ENTRY_SIZE) as u64;
-            setup.srq.post_recv(
-                idx as u64,
-                setup.recv_buf.addr() + offset,
-                RECV_BUF_ENTRY_SIZE as u32,
-                setup.recv_mr.lkey(),
-            )
-            .unwrap();
+            setup
+                .srq
+                .post_recv(
+                    idx as u64,
+                    setup.recv_buf.addr() + offset,
+                    RECV_BUF_ENTRY_SIZE as u32,
+                    setup.recv_mr.lkey(),
+                )
+                .unwrap();
         }
         setup.srq.ring_doorbell();
 
@@ -1397,18 +1528,24 @@ fn run_dc_multi_qp_throughput(setup: &DcMultiQpSetup, iters: u64) -> Duration {
             for _ in 0..can_send {
                 let av_idx = sent % NUM_CONNECTIONS;
                 if send_count % signal_interval == signal_interval - 1 {
-                    let _ = emit_dci_wqe!(&ctx, send {
-                        av: setup.server_avs[av_idx],
-                        flags: WqeFlags::empty(),
-                        inline: send_data.as_slice(),
-                        signaled: send_count as u64,
-                    });
+                    let _ = emit_dci_wqe!(
+                        &ctx,
+                        send {
+                            av: setup.server_avs[av_idx],
+                            flags: WqeFlags::empty(),
+                            inline: send_data.as_slice(),
+                            signaled: send_count as u64,
+                        }
+                    );
                 } else {
-                    let _ = emit_dci_wqe!(&ctx, send {
-                        av: setup.server_avs[av_idx],
-                        flags: WqeFlags::empty(),
-                        inline: send_data.as_slice(),
-                    });
+                    let _ = emit_dci_wqe!(
+                        &ctx,
+                        send {
+                            av: setup.server_avs[av_idx],
+                            flags: WqeFlags::empty(),
+                            inline: send_data.as_slice(),
+                        }
+                    );
                 }
                 send_count += 1;
                 sent += 1;

@@ -10,13 +10,13 @@
 //! ```
 
 use std::cell::RefCell;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use mlx5::device::DeviceList;
 use mlx5::types::PortAttr;
@@ -85,9 +85,10 @@ fn open_mlx5_device() -> Option<(mlx5::device::Context, u8, PortAttr)> {
         if let Ok(ctx) = device.open() {
             for port in 1..=2u8 {
                 if let Ok(port_attr) = ctx.query_port(port)
-                    && port_attr.state == mlx5::types::PortState::Active {
-                        return Some((ctx, port, port_attr));
-                    }
+                    && port_attr.state == mlx5::types::PortState::Active
+                {
+                    return Some((ctx, port, port_attr));
+                }
             }
         }
     }
@@ -129,7 +130,8 @@ fn setup_benchmark() -> Option<BenchmarkSetup> {
     // Create client with on_response callback that increments counter
     let client: Rpc<()> = Rpc::new(&ctx, port, config.clone(), |_, _| {
         COMPLETED.with(|c| *c.borrow_mut() += 1);
-    }).ok()?;
+    })
+    .ok()?;
     let client_info = client.local_info();
     let client_conn_info = ConnectionInfo {
         qpn: client_info.qpn,
@@ -151,7 +153,13 @@ fn setup_benchmark() -> Option<BenchmarkSetup> {
     let server_config = config.clone();
     let handle = thread::spawn(move || {
         pin_to_core(14);
-        server_thread_main_with_config(server_info_tx, client_info_rx, server_ready_clone, server_stop, server_config);
+        server_thread_main_with_config(
+            server_info_tx,
+            client_info_rx,
+            server_ready_clone,
+            server_stop,
+            server_config,
+        );
     });
 
     client_info_tx.send(client_conn_info).ok()?;
@@ -202,7 +210,10 @@ thread_local! {
     static MULTI_QP_COMPLETED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
 }
 
-fn setup_multi_qp_benchmark(num_qps: usize, pipeline_depth: usize) -> Option<MultiQpBenchmarkSetup> {
+fn setup_multi_qp_benchmark(
+    num_qps: usize,
+    pipeline_depth: usize,
+) -> Option<MultiQpBenchmarkSetup> {
     let (ctx, port, _port_attr) = open_mlx5_device()?;
 
     let config = RpcConfig::default()
@@ -231,7 +242,8 @@ fn setup_multi_qp_benchmark(num_qps: usize, pipeline_depth: usize) -> Option<Mul
                     v[qp_idx] += 1;
                 }
             });
-        }).ok()?;
+        })
+        .ok()?;
         let info = client.local_info();
         client_infos.push(ConnectionInfo {
             qpn: info.qpn,
@@ -242,10 +254,14 @@ fn setup_multi_qp_benchmark(num_qps: usize, pipeline_depth: usize) -> Option<Mul
     }
 
     // Setup channels for server thread (single thread handles all QPs)
-    let (client_infos_tx, client_infos_rx): (Sender<Vec<ConnectionInfo>>, Receiver<Vec<ConnectionInfo>>) =
-        mpsc::channel();
-    let (server_infos_tx, server_infos_rx): (Sender<Vec<ConnectionInfo>>, Receiver<Vec<ConnectionInfo>>) =
-        mpsc::channel();
+    let (client_infos_tx, client_infos_rx): (
+        Sender<Vec<ConnectionInfo>>,
+        Receiver<Vec<ConnectionInfo>>,
+    ) = mpsc::channel();
+    let (server_infos_tx, server_infos_rx): (
+        Sender<Vec<ConnectionInfo>>,
+        Receiver<Vec<ConnectionInfo>>,
+    ) = mpsc::channel();
     let server_ready = Arc::new(AtomicU32::new(0));
     let server_ready_clone = server_ready.clone();
 
@@ -612,8 +628,7 @@ fn run_multi_qp_throughput_bench(
 
             // Send more requests if we have capacity
             let completed = MULTI_QP_COMPLETED.with(|c| c.borrow()[qp_idx]);
-            while sents[qp_idx] < iters_per_qp
-                && sents[qp_idx] - completed < pipeline_depth as u64
+            while sents[qp_idx] < iters_per_qp && sents[qp_idx] - completed < pipeline_depth as u64
             {
                 if clients[qp_idx]
                     .call(sessions[qp_idx], 1, &request_data, qp_idx)
@@ -795,12 +810,15 @@ fn setup_multi_session_benchmark(num_sessions: usize) -> Option<MultiSessionBenc
     // Create single client Rpc with callback
     let client: Rpc<usize> = Rpc::new(&ctx, port, config.clone(), |_session_idx, _payload| {
         MULTI_SESSION_COMPLETED.with(|c| *c.borrow_mut() += 1);
-    }).ok()?;
+    })
+    .ok()?;
     let client_info = client.local_info();
 
     // Setup communication channels
-    let (server_infos_tx, server_infos_rx): (Sender<Vec<ConnectionInfo>>, Receiver<Vec<ConnectionInfo>>) =
-        mpsc::channel();
+    let (server_infos_tx, server_infos_rx): (
+        Sender<Vec<ConnectionInfo>>,
+        Receiver<Vec<ConnectionInfo>>,
+    ) = mpsc::channel();
     let (client_info_tx, client_info_rx): (Sender<ConnectionInfo>, Receiver<ConnectionInfo>) =
         mpsc::channel();
     let (num_sessions_tx, num_sessions_rx): (Sender<usize>, Receiver<usize>) = mpsc::channel();
@@ -824,11 +842,13 @@ fn setup_multi_session_benchmark(num_sessions: usize) -> Option<MultiSessionBenc
     });
 
     // Send client info and num_sessions
-    client_info_tx.send(ConnectionInfo {
-        qpn: client_info.qpn,
-        qkey: client_info.qkey,
-        lid: client_info.lid,
-    }).ok()?;
+    client_info_tx
+        .send(ConnectionInfo {
+            qpn: client_info.qpn,
+            qkey: client_info.qkey,
+            lid: client_info.lid,
+        })
+        .ok()?;
     num_sessions_tx.send(num_sessions).ok()?;
 
     let server_infos = server_infos_rx.recv().ok()?;
@@ -1041,7 +1061,10 @@ fn bench_erpc_paper_conditions(c: &mut Criterion) {
         let setup = match setup_multi_session_benchmark(num_sessions) {
             Some(s) => s,
             None => {
-                eprintln!("Skipping eRPC paper benchmark ({}sessions): setup failed", num_sessions);
+                eprintln!(
+                    "Skipping eRPC paper benchmark ({}sessions): setup failed",
+                    num_sessions
+                );
                 continue;
             }
         };
@@ -1058,7 +1081,10 @@ fn bench_erpc_paper_conditions(c: &mut Criterion) {
 
         // 32B message with varying session count
         group.bench_function(
-            BenchmarkId::new("32B", format!("{}sessions_B{}", num_sessions, PIPELINE_DEPTH)),
+            BenchmarkId::new(
+                "32B",
+                format!("{}sessions_B{}", num_sessions, PIPELINE_DEPTH),
+            ),
             |b| {
                 b.iter_custom(|iters| {
                     run_multi_session_throughput_bench(
@@ -1076,5 +1102,11 @@ fn bench_erpc_paper_conditions(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_latency, bench_throughput, bench_multi_qp_throughput, bench_erpc_paper_conditions);
+criterion_group!(
+    benches,
+    bench_latency,
+    bench_throughput,
+    bench_multi_qp_throughput,
+    bench_erpc_paper_conditions
+);
 criterion_main!(benches);

@@ -2,7 +2,7 @@
 //!
 //! 16 client threads issue RPC calls concurrently to 1 server thread.
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -26,13 +26,8 @@ fn run_bench(b: &mut criterion::Bencher, depth: u32) {
     let end_barrier = Arc::new(Barrier::new(NUM_CLIENTS + 1));
 
     unsafe {
-        let server = ipc::Server::<u64, u64>::create(
-            &name,
-            NUM_CLIENTS as u32,
-            RING_DEPTH,
-            0,
-        )
-        .unwrap();
+        let server =
+            ipc::Server::<u64, u64>::create(&name, NUM_CLIENTS as u32, RING_DEPTH, 0).unwrap();
 
         let stop_server = stop.clone();
         let server_thread = thread::spawn(move || {
@@ -62,8 +57,7 @@ fn run_bench(b: &mut criterion::Bencher, depth: u32) {
 
                 if depth <= 1 {
                     let mut client =
-                        ipc::SyncClient::<u64, u64>::connect_sync(&name_clone)
-                            .unwrap();
+                        ipc::SyncClient::<u64, u64>::connect_sync(&name_clone).unwrap();
                     for _ in 0..100 {
                         client.call_blocking(0).unwrap();
                     }
@@ -81,12 +75,9 @@ fn run_bench(b: &mut criterion::Bencher, depth: u32) {
                 } else {
                     let count = std::cell::Cell::new(0u64);
                     let mut client =
-                        ipc::Client::<u64, u64, (), _>::connect(
-                            &name_clone,
-                            |(), _resp| {
-                                count.set(count.get() + 1);
-                            },
-                        )
+                        ipc::Client::<u64, u64, (), _>::connect(&name_clone, |(), _resp| {
+                            count.set(count.get() + 1);
+                        })
                         .unwrap();
                     for _ in 0..100 {
                         client.call(42u64, ()).unwrap();

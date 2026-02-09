@@ -51,15 +51,17 @@ impl From<SubmissionError> for std::io::Error {
 }
 
 pub use traits::{
-    // Transport type tags
-    InfiniBand, RoCE,
     // Address Vector trait and types
-    Av, NoAv,
+    Av,
+    // Transport type tags
+    InfiniBand,
+    NoAv,
     // Data state marker (NoData)
     NoData,
+    RoCE,
 };
 
-pub use emit::{SqState, BlueframeBatch};
+pub use emit::{BlueframeBatch, SqState};
 
 use bitflags::bitflags;
 
@@ -117,7 +119,8 @@ pub unsafe fn write_ctrl_seg(ptr: *mut u8, params: &CtrlSegParams) {
     let qpn_ds = (params.qpn << 8) | (params.ds_cnt as u32);
     // Combine sig (pcie_ctrl), dci_stream[15:8](0), dci_stream[7:0](0), fm_ce_se into single u32
     // Layout in big-endian: [sig/pcie_ctrl][stream_hi][stream_lo][fm_ce_se]
-    let sig_stream_fm = ((params.flags.pcie_ctrl() as u32) << 24) | (params.flags.fm_ce_se() as u32);
+    let sig_stream_fm =
+        ((params.flags.pcie_ctrl() as u32) << 24) | (params.flags.fm_ce_se() as u32);
 
     let ptr32 = ptr as *mut u32;
     std::ptr::write_volatile(ptr32, opmod_idx_opcode.to_be());

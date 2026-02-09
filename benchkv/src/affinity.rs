@@ -113,6 +113,9 @@ pub fn assign_cores(
 pub fn pin_thread(core_id: usize, label: &str) {
     match pin_to_core(core_id) {
         Ok(()) => eprintln!("{} pinned to core {}", label, core_id),
-        Err(errno) => eprintln!("{}: failed to pin to core {} (errno={})", label, core_id, errno),
+        Err(errno) => eprintln!(
+            "{}: failed to pin to core {} (errno={})",
+            label, core_id, errno
+        ),
     }
 }

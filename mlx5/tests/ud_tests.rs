@@ -43,8 +43,16 @@ fn test_ud_creation() {
         }
     };
 
-    let send_cq = Rc::new(ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ"));
-    let recv_cq = Rc::new(ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ"));
+    let send_cq = Rc::new(
+        ctx.ctx
+            .create_cq(256, &CqConfig::default())
+            .expect("Failed to create send CQ"),
+    );
+    let recv_cq = Rc::new(
+        ctx.ctx
+            .create_cq(256, &CqConfig::default())
+            .expect("Failed to create recv CQ"),
+    );
 
     let config = UdQpConfig {
         qkey: 0x12345678,
@@ -74,8 +82,16 @@ fn test_ud_activate() {
         }
     };
 
-    let send_cq = Rc::new(ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ"));
-    let recv_cq = Rc::new(ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ"));
+    let send_cq = Rc::new(
+        ctx.ctx
+            .create_cq(256, &CqConfig::default())
+            .expect("Failed to create send CQ"),
+    );
+    let recv_cq = Rc::new(
+        ctx.ctx
+            .create_cq(256, &CqConfig::default())
+            .expect("Failed to create recv CQ"),
+    );
 
     let config = UdQpConfig {
         qkey: 0x12345678,
@@ -116,10 +132,16 @@ fn test_ud_send_recv() {
     };
 
     // Create CQs
-    let send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
+    let send_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let recv_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ");
+    let recv_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ");
     let recv_cq = Rc::new(recv_cq);
 
     // Q_Key must have MSB=0 for non-privileged users (bit 31 indicates privileged Q_Key)
@@ -206,7 +228,8 @@ fn test_ud_send_recv() {
         flags: WqeFlags::empty(),
         sge: { addr: send_buf.addr(), len: test_data.len() as u32, lkey: send_mr.lkey() },
         signaled: 1u64,
-    }).expect("emit_ud_wqe failed");
+    })
+    .expect("emit_ud_wqe failed");
     sender_ref.ring_sq_doorbell();
     drop(sender_ref);
 
@@ -255,10 +278,16 @@ fn test_ud_send_raw_av() {
     };
 
     // Create CQs
-    let send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
+    let send_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let recv_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ");
+    let recv_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ");
     let recv_cq = Rc::new(recv_cq);
 
     let qkey: u32 = 0x11111111;
@@ -344,7 +373,8 @@ fn test_ud_send_raw_av() {
         flags: WqeFlags::empty(),
         sge: { addr: send_buf.addr(), len: test_data.len() as u32, lkey: send_mr.lkey() },
         signaled: 1u64,
-    }).expect("emit_ud_wqe failed");
+    })
+    .expect("emit_ud_wqe failed");
     sender_ref.ring_sq_doorbell();
     drop(sender_ref);
 
@@ -392,10 +422,16 @@ fn test_ud_multiple_destinations() {
     };
 
     // Create CQs
-    let cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create CQ");
+    let cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create CQ");
     let cq = Rc::new(cq);
 
-    let recv_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ");
+    let recv_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ");
     let recv_cq = Rc::new(recv_cq);
 
     let qkey: u32 = 0x22222222;
@@ -446,7 +482,12 @@ fn test_ud_multiple_destinations() {
         // Post receive
         receiver
             .borrow()
-            .post_recv(i as u64, recv_buf.addr(), 256 + GRH_SIZE as u32, recv_mr.lkey())
+            .post_recv(
+                i as u64,
+                recv_buf.addr(),
+                256 + GRH_SIZE as u32,
+                recv_mr.lkey(),
+            )
             .expect("post_recv failed");
         receiver.borrow().ring_rq_doorbell();
 
@@ -486,13 +527,14 @@ fn test_ud_multiple_destinations() {
                 flags: WqeFlags::empty(),
                 sge: { addr: send_buf.addr(), len: test_data.len() as u32, lkey: send_mr.lkey() },
                 signaled: (i + 1) as u64,
-            }).expect("emit_ud_wqe failed");
+            })
+            .expect("emit_ud_wqe failed");
             sender_ref.ring_sq_doorbell();
         }
 
         // Poll send CQ
-        let send_cqe =
-            poll_cq_timeout(&cq, 5000).unwrap_or_else(|| panic!("Send CQE timeout for receiver {}", i));
+        let send_cqe = poll_cq_timeout(&cq, 5000)
+            .unwrap_or_else(|| panic!("Send CQE timeout for receiver {}", i));
         assert_eq!(
             send_cqe.syndrome, 0,
             "Send CQE error for receiver {}: syndrome={}",
@@ -500,8 +542,8 @@ fn test_ud_multiple_destinations() {
         );
 
         // Poll recv CQ
-        let recv_cqe =
-            poll_cq_timeout(&recv_cq, 5000).unwrap_or_else(|| panic!("Recv CQE timeout for receiver {}", i));
+        let recv_cqe = poll_cq_timeout(&recv_cq, 5000)
+            .unwrap_or_else(|| panic!("Recv CQE timeout for receiver {}", i));
         assert_eq!(
             recv_cqe.syndrome, 0,
             "Recv CQE error for receiver {}: syndrome={}",
@@ -524,4 +566,3 @@ fn test_ud_multiple_destinations() {
     println!("UD multiple destinations test passed!");
     println!("  Single sender sent to {} receivers", num_receivers);
 }
-

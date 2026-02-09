@@ -48,12 +48,21 @@ fn test_rc_rdma_write_wraparound() {
     };
 
     // Create CQs
-    let send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
+    let send_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
+    let recv_cq1 = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
+    let recv_cq2 = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     // Use small queue to force wrap-around quickly
@@ -136,13 +145,14 @@ fn test_rc_rdma_write_wraparound() {
             rkey: remote_mr.rkey(),
             sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
             signaled: i as u64,
-        }).expect("emit_wqe failed");
+        })
+        .expect("emit_wqe failed");
         qp1_ref.ring_sq_doorbell();
         drop(qp1_ref);
 
         // Wait for completion
-        let cqe =
-            poll_cq_timeout(&send_cq, 5000).unwrap_or_else(|| panic!("CQE timeout at iteration {}", i));
+        let cqe = poll_cq_timeout(&send_cq, 5000)
+            .unwrap_or_else(|| panic!("CQE timeout at iteration {}", i));
         assert_eq!(
             cqe.syndrome, 0,
             "CQE error at iteration {}: syndrome={}",
@@ -177,12 +187,21 @@ fn test_rc_ring_sq_doorbell() {
         }
     };
 
-    let send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
+    let send_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
+    let recv_cq1 = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
+    let recv_cq2 = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     let config = RcQpConfig::default();
@@ -251,7 +270,8 @@ fn test_rc_ring_sq_doorbell() {
         rkey: remote_mr.rkey(),
         sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
         signaled: 1u64,
-    }).expect("emit_wqe failed");
+    })
+    .expect("emit_wqe failed");
 
     // Ring doorbell manually
     qp1_ref.ring_sq_doorbell();
@@ -291,10 +311,16 @@ fn test_dc_rdma_write_wraparound() {
     require_dct!(&ctx);
 
     // Create CQ for DCI with small size
-    let dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
+    let dci_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create DCI CQ");
     let dci_cq = Rc::new(dci_cq);
 
-    let dct_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCT CQ");
+    let dct_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create DCT CQ");
 
     let srq_config = SrqConfig {
         max_wr: 128,
@@ -313,8 +339,8 @@ fn test_dc_rdma_write_wraparound() {
     let dci = ctx
         .ctx
         .dci_builder::<u64>(&ctx.pd, &dci_config)
-            .sq_cq(dci_cq.clone(), |_cqe, _entry| {})
-            .build()
+        .sq_cq(dci_cq.clone(), |_cqe, _entry| {})
+        .build()
         .expect("Failed to create DCI");
     dci.borrow_mut()
         .activate(ctx.port, 0, 4)
@@ -325,8 +351,8 @@ fn test_dc_rdma_write_wraparound() {
     let mut dct = ctx
         .ctx
         .dct_builder(&ctx.pd, &srq, &dct_config)
-            .recv_cq(&dct_cq)
-            .build()
+        .recv_cq(&dct_cq)
+        .build()
         .expect("Failed to create DCT");
     let access = full_access().bits();
     dct.activate(ctx.port, access, 4)
@@ -367,11 +393,13 @@ fn test_dc_rdma_write_wraparound() {
             rkey: remote_mr.rkey(),
             sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
             signaled: i as u64,
-        }).expect("emit_dci_wqe failed");
+        })
+        .expect("emit_dci_wqe failed");
         dci_ref.ring_sq_doorbell();
         drop(dci_ref);
 
-        let cqe = poll_cq_timeout(&dci_cq, 5000).unwrap_or_else(|| panic!("CQE timeout at iteration {}", i));
+        let cqe = poll_cq_timeout(&dci_cq, 5000)
+            .unwrap_or_else(|| panic!("CQE timeout at iteration {}", i));
         assert_eq!(
             cqe.syndrome, 0,
             "CQE error at iteration {}: syndrome={}",
@@ -407,10 +435,16 @@ fn test_dc_ring_sq_doorbell() {
 
     require_dct!(&ctx);
 
-    let dci_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCI CQ");
+    let dci_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create DCI CQ");
     let dci_cq = Rc::new(dci_cq);
 
-    let dct_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create DCT CQ");
+    let dct_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create DCT CQ");
 
     let srq_config = SrqConfig {
         max_wr: 128,
@@ -425,8 +459,8 @@ fn test_dc_ring_sq_doorbell() {
     let dci = ctx
         .ctx
         .dci_builder::<u64>(&ctx.pd, &dci_config)
-            .sq_cq(dci_cq.clone(), |_cqe, _entry| {})
-            .build()
+        .sq_cq(dci_cq.clone(), |_cqe, _entry| {})
+        .build()
         .expect("Failed to create DCI");
     dci.borrow_mut()
         .activate(ctx.port, 0, 4)
@@ -437,8 +471,8 @@ fn test_dc_ring_sq_doorbell() {
     let mut dct = ctx
         .ctx
         .dct_builder(&ctx.pd, &srq, &dct_config)
-            .recv_cq(&dct_cq)
-            .build()
+        .recv_cq(&dct_cq)
+        .build()
         .expect("Failed to create DCT");
     let access = full_access().bits();
     dct.activate(ctx.port, access, 4)
@@ -475,7 +509,8 @@ fn test_dc_ring_sq_doorbell() {
         rkey: remote_mr.rkey(),
         sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
         signaled: 1u64,
-    }).expect("emit_dci_wqe failed");
+    })
+    .expect("emit_dci_wqe failed");
 
     dci_ref.ring_sq_doorbell();
     drop(dci_ref);
@@ -509,10 +544,16 @@ fn test_ud_send_wraparound() {
         }
     };
 
-    let send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
+    let send_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let recv_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ");
+    let recv_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ");
     let recv_cq = Rc::new(recv_cq);
 
     let qkey: u32 = 0x1BCDEF00;
@@ -585,7 +626,12 @@ fn test_ud_send_wraparound() {
         // Post receive (must include space for GRH)
         receiver
             .borrow()
-            .post_recv(i as u64, recv_buf.addr(), 256 + GRH_SIZE as u32, recv_mr.lkey())
+            .post_recv(
+                i as u64,
+                recv_buf.addr(),
+                256 + GRH_SIZE as u32,
+                recv_mr.lkey(),
+            )
             .expect("post_recv failed");
         receiver.borrow().ring_rq_doorbell();
 
@@ -597,19 +643,20 @@ fn test_ud_send_wraparound() {
             flags: WqeFlags::empty(),
             sge: { addr: send_buf.addr(), len: test_data.len() as u32, lkey: send_mr.lkey() },
             signaled: i as u64,
-        }).expect("emit_ud_wqe failed");
+        })
+        .expect("emit_ud_wqe failed");
         sender_ref.ring_sq_doorbell();
         drop(sender_ref);
 
         // Wait for send completion
-        let send_cqe =
-            poll_cq_timeout(&send_cq, 5000).unwrap_or_else(|| panic!("Send CQE timeout at iteration {}", i));
+        let send_cqe = poll_cq_timeout(&send_cq, 5000)
+            .unwrap_or_else(|| panic!("Send CQE timeout at iteration {}", i));
         assert_eq!(send_cqe.syndrome, 0, "Send CQE error at iteration {}", i);
         send_cq.flush();
 
         // Wait for recv completion
-        let recv_cqe =
-            poll_cq_timeout(&recv_cq, 5000).unwrap_or_else(|| panic!("Recv CQE timeout at iteration {}", i));
+        let recv_cqe = poll_cq_timeout(&recv_cq, 5000)
+            .unwrap_or_else(|| panic!("Recv CQE timeout at iteration {}", i));
         assert_eq!(recv_cqe.syndrome, 0, "Recv CQE error at iteration {}", i);
         recv_cq.flush();
 
@@ -648,12 +695,21 @@ fn test_rc_inline_wraparound() {
     };
 
     // Create CQs
-    let send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
+    let send_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
+    let recv_cq1 = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
+    let recv_cq2 = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     // Use small queue (16 WQEs) with max inline to force wrap-around
@@ -716,7 +772,10 @@ fn test_rc_inline_wraparound() {
     let test_data: Vec<u8> = (0..128).map(|i| i as u8).collect();
 
     println!("Testing RC inline data wrap-around...");
-    println!("Queue size: 16 WQEs, inline data size: {} bytes", test_data.len());
+    println!(
+        "Queue size: 16 WQEs, inline data size: {} bytes",
+        test_data.len()
+    );
 
     // Number of iterations to ensure multiple wrap-arounds
     // With 16 WQEs and ~3 WQEBBs per WQE, we should wrap around frequently
@@ -735,41 +794,56 @@ fn test_rc_inline_wraparound() {
         // Post SEND with inline data
         let qp1_ref = qp1.borrow();
         let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
-        let result = emit_wqe!(&ctx, send {
-            flags: WqeFlags::empty(),
-            inline: &test_data,
-            signaled: i as u64,
-        }).expect("emit_wqe failed");
+        let result = emit_wqe!(
+            &ctx,
+            send {
+                flags: WqeFlags::empty(),
+                inline: &test_data,
+                signaled: i as u64,
+            }
+        )
+        .expect("emit_wqe failed");
         qp1_ref.ring_sq_doorbell();
         drop(qp1_ref);
         let handle = result;
 
         // Detect wrap-around: wqe_idx decreased or jumped significantly
         if let Some(prev) = prev_wqe_idx
-            && (handle.wqe_idx < prev || (handle.wqe_idx == 0 && prev > 0)) {
-                wrap_around_count += 1;
-                println!(
-                    "  Iteration {}: WRAP-AROUND detected (wqe_idx {} -> {})",
-                    i, prev, handle.wqe_idx
-                );
-            }
+            && (handle.wqe_idx < prev || (handle.wqe_idx == 0 && prev > 0))
+        {
+            wrap_around_count += 1;
+            println!(
+                "  Iteration {}: WRAP-AROUND detected (wqe_idx {} -> {})",
+                i, prev, handle.wqe_idx
+            );
+        }
         prev_wqe_idx = Some(handle.wqe_idx);
 
         // Poll send CQ
         let send_cqe = poll_cq_timeout(&send_cq, 5000).expect("Send CQE timeout");
-        assert_eq!(send_cqe.syndrome, 0, "Send CQE error: syndrome={}", send_cqe.syndrome);
+        assert_eq!(
+            send_cqe.syndrome, 0,
+            "Send CQE error: syndrome={}",
+            send_cqe.syndrome
+        );
         send_cq.flush();
 
         // Poll recv CQ (qp2's recv CQ is recv_cq2)
         let recv_cqe = poll_cq_timeout(&recv_cq2, 5000).expect("Recv CQE timeout");
-        assert_eq!(recv_cqe.syndrome, 0, "Recv CQE error: syndrome={}", recv_cqe.syndrome);
+        assert_eq!(
+            recv_cqe.syndrome, 0,
+            "Recv CQE error: syndrome={}",
+            recv_cqe.syndrome
+        );
         recv_cq2.flush();
 
         // Verify data
         let received = recv_buf.read_bytes(test_data.len());
         assert_eq!(
-            &received[..], &test_data[..],
-            "Iteration {}: inline data mismatch", i
+            &received[..],
+            &test_data[..],
+            "Iteration {}: inline data mismatch",
+            i
         );
     }
 
@@ -793,12 +867,21 @@ fn test_rc_inline_variable_size_wraparound() {
     };
 
     // Create CQs
-    let send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
+    let send_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
+    let recv_cq1 = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
+    let recv_cq2 = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     // Use small queue with max inline
@@ -863,7 +946,9 @@ fn test_rc_inline_variable_size_wraparound() {
     // - 1-12 bytes: 1 WQEBB (ctrl seg + inline header + data)
     // - 13-60 bytes: 2 WQEBBs
     // - 61-124 bytes: 3 WQEBBs
-    let sizes = [8, 16, 32, 48, 64, 96, 128, 64, 32, 128, 48, 96, 16, 128, 8, 128];
+    let sizes = [
+        8, 16, 32, 48, 64, 96, 128, 64, 32, 128, 48, 96, 16, 128, 8, 128,
+    ];
 
     for (i, &size) in sizes.iter().enumerate() {
         let test_data: Vec<u8> = (0..size).map(|j| ((i + j) & 0xff) as u8).collect();
@@ -878,11 +963,15 @@ fn test_rc_inline_variable_size_wraparound() {
         // Post SEND with inline data
         let qp1_ref = qp1.borrow();
         let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
-        emit_wqe!(&ctx, send {
-            flags: WqeFlags::empty(),
-            inline: &test_data,
-            signaled: i as u64,
-        }).expect("emit_wqe failed");
+        emit_wqe!(
+            &ctx,
+            send {
+                flags: WqeFlags::empty(),
+                inline: &test_data,
+                signaled: i as u64,
+            }
+        )
+        .expect("emit_wqe failed");
         qp1_ref.ring_sq_doorbell();
         drop(qp1_ref);
 
@@ -898,8 +987,10 @@ fn test_rc_inline_variable_size_wraparound() {
         // Verify data
         let received = recv_buf.read_bytes(size);
         assert_eq!(
-            &received[..], &test_data[..],
-            "Data mismatch at size {}", size
+            &received[..],
+            &test_data[..],
+            "Data mismatch at size {}",
+            size
         );
     }
 

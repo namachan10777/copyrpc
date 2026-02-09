@@ -37,11 +37,8 @@ pub const CONNECTION_INFO_SIZE: usize = std::mem::size_of::<EndpointConnectionIn
 impl EndpointConnectionInfo {
     pub fn to_bytes(self) -> Vec<u8> {
         unsafe {
-            std::slice::from_raw_parts(
-                &self as *const Self as *const u8,
-                CONNECTION_INFO_SIZE,
-            )
-            .to_vec()
+            std::slice::from_raw_parts(&self as *const Self as *const u8, CONNECTION_INFO_SIZE)
+                .to_vec()
         }
     }
 
@@ -246,11 +243,7 @@ pub fn run_daemon(
             } else if target_rank == my_rank {
                 // Same rank, different daemon shard → Flux
                 let token = handle.into_token();
-                let _ = flux.call(
-                    target_daemon,
-                    DelegatePayload::Req(req),
-                    token,
-                );
+                let _ = flux.call(target_daemon, DelegatePayload::Req(req), token);
             } else {
                 // Remote rank → copyrpc
                 let token = handle.into_token();

@@ -17,10 +17,10 @@ mod common;
 use std::rc::Rc;
 
 use mlx5::cq::CqConfig;
+use mlx5::emit_wqe;
 use mlx5::qp::{QpState, RcQpConfig, RcQpIb};
 use mlx5::transport::IbRemoteQpInfo;
 use mlx5::wqe::WqeFlags;
-use mlx5::emit_wqe;
 
 use common::{AlignedBuffer, TestContext, full_access, poll_cq_timeout};
 
@@ -44,11 +44,20 @@ pub struct RcLoopbackPair {
 /// Helper to create a loopback RC QP pair.
 fn create_rc_loopback_pair(ctx: &TestContext) -> RcLoopbackPair {
     // Create separate send CQ (shared for polling) and recv CQs
-    let send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
+    let send_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
-    let recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
+    let recv_cq1 = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
+    let recv_cq2 = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     let config = RcQpConfig::default();
@@ -187,7 +196,8 @@ fn test_rc_rdma_write() {
             rkey: remote_mr.rkey(),
             sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
             signaled: 1u64,
-        }).expect("emit_wqe failed");
+        })
+        .expect("emit_wqe failed");
         qp1_ref.ring_sq_doorbell();
     }
 
@@ -258,7 +268,8 @@ fn test_rc_rdma_read() {
             rkey: remote_mr.rkey(),
             sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
             signaled: 1u64,
-        }).expect("emit_wqe failed");
+        })
+        .expect("emit_wqe failed");
     }
     qp1.borrow().ring_sq_doorbell();
 
@@ -328,7 +339,8 @@ fn test_rc_atomic_cas_success() {
             compare: compare_value,
             sge: { addr: local_buf.addr(), lkey: local_mr.lkey() },
             signaled: 1u64,
-        }).expect("emit_wqe failed");
+        })
+        .expect("emit_wqe failed");
     }
     qp1.borrow().ring_sq_doorbell();
 
@@ -410,7 +422,8 @@ fn test_rc_atomic_cas_failure() {
             compare: compare_value,
             sge: { addr: local_buf.addr(), lkey: local_mr.lkey() },
             signaled: 1u64,
-        }).expect("emit_wqe failed");
+        })
+        .expect("emit_wqe failed");
     }
     qp1.borrow().ring_sq_doorbell();
 
@@ -488,7 +501,8 @@ fn test_rc_atomic_fa() {
             add_value: add_value,
             sge: { addr: local_buf.addr(), lkey: local_mr.lkey() },
             signaled: 1u64,
-        }).expect("emit_wqe failed");
+        })
+        .expect("emit_wqe failed");
     }
     qp1.borrow().ring_sq_doorbell();
 
@@ -578,7 +592,10 @@ fn test_rc_rdma_write_imm() {
     qp2.borrow().ring_rq_doorbell();
 
     // Create a separate recv CQ for QP2
-    let _recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
+    let _recv_cq2 = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ2");
 
     // Note: The recv_cq is internal to RcLoopbackPair, we need to check the pair's recv_cq
     // Actually in our setup, qp2's recv CQ is _recv_cq2 which is private
@@ -598,7 +615,8 @@ fn test_rc_rdma_write_imm() {
             imm: imm_data,
             sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
             signaled: 1u64,
-        }).expect("emit_wqe failed");
+        })
+        .expect("emit_wqe failed");
     }
     qp1.borrow().ring_sq_doorbell();
 
@@ -642,12 +660,21 @@ fn test_rc_send_recv() {
     };
 
     // Create QPs with separate recv CQs that we can access
-    let send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
+    let send_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
+    let recv_cq1 = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
+    let recv_cq2 = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     // Shared state to capture recv CQE info
@@ -747,7 +774,8 @@ fn test_rc_send_recv() {
             flags: WqeFlags::empty(),
             sge: { addr: send_buf.addr(), len: test_data.len() as u32, lkey: send_mr.lkey() },
             signaled: 1u64,
-        }).expect("emit_wqe failed");
+        })
+        .expect("emit_wqe failed");
     }
     qp1.borrow().ring_sq_doorbell();
 
@@ -824,12 +852,21 @@ fn test_rc_send_recv_pingpong() {
     let recv2_opcode_clone = recv2_opcode.clone();
 
     // Create QPs with separate recv CQs
-    let send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
+    let send_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
+    let recv_cq1 = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
+    let recv_cq2 = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     let config = mlx5::qp::RcQpConfig {
@@ -909,7 +946,8 @@ fn test_rc_send_recv_pingpong() {
                 flags: WqeFlags::COMPLETION,
                 sge: { addr: buf1.addr(), len: 32, lkey: mr1.lkey() },
                 signaled: i as u64,
-            }).expect("emit_wqe");
+            })
+            .expect("emit_wqe");
         }
         qp1.borrow().ring_sq_doorbell();
 
@@ -949,7 +987,8 @@ fn test_rc_send_recv_pingpong() {
                 flags: WqeFlags::COMPLETION,
                 sge: { addr: buf2.addr(), len: 32, lkey: mr2.lkey() },
                 signaled: i as u64,
-            }).expect("emit_wqe");
+            })
+            .expect("emit_wqe");
         }
         qp2.borrow().ring_sq_doorbell();
 
@@ -1013,13 +1052,17 @@ fn test_rc_inline_data() {
     {
         let qp1_ref = qp1.borrow();
         let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
-        emit_wqe!(&ctx, write {
-            flags: WqeFlags::COMPLETION,
-            remote_addr: remote_buf.addr(),
-            rkey: remote_mr.rkey(),
-            inline: test_data,
-            signaled: 1u64,
-        }).expect("emit_wqe failed");
+        emit_wqe!(
+            &ctx,
+            write {
+                flags: WqeFlags::COMPLETION,
+                remote_addr: remote_buf.addr(),
+                rkey: remote_mr.rkey(),
+                inline: test_data,
+                signaled: 1u64,
+            }
+        )
+        .expect("emit_wqe failed");
     }
     qp1.borrow().ring_sq_doorbell();
 
@@ -1075,7 +1118,8 @@ fn test_rc_wqe_builder_unsignaled() {
             remote_addr: remote_buf.addr(),
             rkey: remote_mr.rkey(),
             sge: { addr: local_buf.addr(), len: test_data.len() as u32, lkey: local_mr.lkey() },
-        }).expect("emit_wqe failed");
+        })
+        .expect("emit_wqe failed");
     }
     qp1.borrow().ring_sq_doorbell();
 
@@ -1089,7 +1133,8 @@ fn test_rc_wqe_builder_unsignaled() {
             rkey: remote_mr.rkey(),
             sge: { addr: local_buf.addr(), len: 1, lkey: local_mr.lkey() },
             signaled: 1u64,
-        }).expect("emit_wqe failed");
+        })
+        .expect("emit_wqe failed");
     }
     qp1.borrow().ring_sq_doorbell();
 
@@ -1103,4 +1148,3 @@ fn test_rc_wqe_builder_unsignaled() {
 
     println!("RC wqe_builder_unsignaled test passed!");
 }
-

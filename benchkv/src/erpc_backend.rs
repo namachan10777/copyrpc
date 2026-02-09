@@ -9,10 +9,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use mpi::collective::CommunicatorCollectives;
 use erpc::{RemoteInfo, Rpc, RpcConfig};
 use mlx5::device::DeviceList;
+use mpi::collective::CommunicatorCollectives;
 
+use crate::Cli;
 use crate::affinity;
 use crate::epoch::EpochCollector;
 use crate::message::{RemoteRequest, RemoteResponse, Request, Response};
@@ -20,7 +21,6 @@ use crate::mpi_util;
 use crate::parquet_out;
 use crate::storage::ShardedStore;
 use crate::workload::AccessEntry;
-use crate::Cli;
 
 // === Connection info ===
 
@@ -78,8 +78,13 @@ pub fn run_erpc(
     // CPU affinity
     let available_cores = affinity::get_available_cores(cli.device_index);
     let (ranks_on_node, rank_on_node) = crate::mpi_util::node_local_rank(world);
-    let (daemon_cores, client_cores) =
-        affinity::assign_cores(&available_cores, num_daemons, num_clients, ranks_on_node, rank_on_node);
+    let (daemon_cores, client_cores) = affinity::assign_cores(
+        &available_cores,
+        num_daemons,
+        num_clients,
+        ranks_on_node,
+        rank_on_node,
+    );
 
     // Generate access patterns
     let pattern_len = 10000;
@@ -97,8 +102,7 @@ pub fn run_erpc(
         .collect();
 
     // Channels for info exchange: each thread sends its info to main
-    let (info_tx, info_rx) =
-        std::sync::mpsc::channel::<(usize, ErpcConnectionInfo)>();
+    let (info_tx, info_rx) = std::sync::mpsc::channel::<(usize, ErpcConnectionInfo)>();
 
     // Channels for main to send peer infos to each thread
     let total_threads = num_daemons + num_clients;
@@ -146,8 +150,8 @@ pub fn run_erpc(
                 .with_max_send_wr((req_window * 4) as u32)
                 .with_max_recv_wr((req_window * 4) as u32);
 
-            let rpc: Rpc<()> = Rpc::new(&ctx, port, config, |_, _| {})
-                .expect("Failed to create daemon Rpc");
+            let rpc: Rpc<()> =
+                Rpc::new(&ctx, port, config, |_, _| {}).expect("Failed to create daemon Rpc");
 
             let local = rpc.local_info();
             info_tx

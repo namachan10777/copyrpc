@@ -10,7 +10,10 @@ pub enum Error {
     /// Invalid slot index.
     InvalidSlotIndex(usize),
     /// Slot is not in expected state.
-    InvalidSlotState { expected: SlotState, actual: SlotState },
+    InvalidSlotState {
+        expected: SlotState,
+        actual: SlotState,
+    },
     /// IO error from underlying RDMA operations.
     Io(std::io::Error),
     /// Connection not found.
@@ -34,7 +37,11 @@ impl fmt::Display for Error {
             Error::NoFreeSlots => write!(f, "no free slots available"),
             Error::InvalidSlotIndex(idx) => write!(f, "invalid slot index: {}", idx),
             Error::InvalidSlotState { expected, actual } => {
-                write!(f, "invalid slot state: expected {:?}, got {:?}", expected, actual)
+                write!(
+                    f,
+                    "invalid slot state: expected {:?}, got {:?}",
+                    expected, actual
+                )
             }
             Error::Io(e) => write!(f, "IO error: {}", e),
             Error::ConnectionNotFound(id) => write!(f, "connection not found: {}", id),

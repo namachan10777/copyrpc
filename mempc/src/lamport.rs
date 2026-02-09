@@ -73,7 +73,9 @@ impl<T> LamportSender<T> {
 
     /// Publish local_head to shared_head, making writes visible to receiver.
     pub fn sync(&mut self) {
-        self.inner.shared_head.store(self.local_head, Ordering::Release);
+        self.inner
+            .shared_head
+            .store(self.local_head, Ordering::Release);
     }
 
     /// Check if receiver is still alive.
@@ -117,7 +119,9 @@ impl<T: Copy> LamportReceiver<T> {
 
     /// Publish local_tail to shared_tail, freeing slots for sender.
     pub fn sync(&mut self) {
-        self.inner.shared_tail.store(self.local_tail, Ordering::Release);
+        self.inner
+            .shared_tail
+            .store(self.local_tail, Ordering::Release);
     }
 
     /// Check if sender is still alive.
@@ -237,7 +241,9 @@ impl<'a, Req: Serial + Send, Resp: Serial + Send> LamportRecvRef<'a, Req, Resp> 
     }
 }
 
-impl<Req: Serial + Send, Resp: Serial + Send> crate::MpscRecvRef<Req> for LamportRecvRef<'_, Req, Resp> {
+impl<Req: Serial + Send, Resp: Serial + Send> crate::MpscRecvRef<Req>
+    for LamportRecvRef<'_, Req, Resp>
+{
     #[inline]
     fn caller_id(&self) -> usize {
         self.caller_id
@@ -270,7 +276,10 @@ pub struct LamportServer<Req: Serial + Send, Resp: Serial + Send> {
 }
 
 impl<Req: Serial + Send, Resp: Serial + Send> MpscServer<Req, Resp> for LamportServer<Req, Resp> {
-    type RecvRef<'a> = LamportRecvRef<'a, Req, Resp> where Self: 'a;
+    type RecvRef<'a>
+        = LamportRecvRef<'a, Req, Resp>
+    where
+        Self: 'a;
 
     fn poll(&mut self) -> u32 {
         let mut total = 0u32;

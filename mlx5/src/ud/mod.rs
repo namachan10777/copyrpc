@@ -16,7 +16,7 @@ use std::{io, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
 use crate::BuildResult;
 use crate::CompletionTarget;
-use crate::builder_common::{register_with_cqs, MaybeMonoCqRegister};
+use crate::builder_common::{MaybeMonoCqRegister, register_with_cqs};
 use crate::cq::{Cq, Cqe};
 use crate::device::Context;
 use crate::pd::{AddressHandle, Pd};
@@ -25,8 +25,8 @@ use crate::srq::Srq;
 use crate::transport::{InfiniBand, RoCE};
 use crate::wqe::{
     DATA_SEG_SIZE, OrderedWqeTable, SubmissionError, WQEBB_SIZE,
+    emit::{SendQueueState, UdEmitContext, bf_finish_rq},
     write_data_seg,
-    emit::{UdEmitContext, SendQueueState, bf_finish_rq},
 };
 
 // =============================================================================
@@ -381,8 +381,15 @@ impl UdAddressSeg {
 /// - `RqEntry`: Entry type stored in the RQ WQE table
 /// - `OnSqComplete`: SQ completion callback type `Fn(Cqe, SqEntry)`
 /// - `OnRqComplete`: RQ completion callback type `Fn(Cqe, RqEntry)`
-pub type UdQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
-    UdQp<SqEntry, RqEntry, InfiniBand, OrderedWqeTable<SqEntry>, UdOwnedRq<RqEntry>, OnSqComplete, OnRqComplete>;
+pub type UdQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = UdQp<
+    SqEntry,
+    RqEntry,
+    InfiniBand,
+    OrderedWqeTable<SqEntry>,
+    UdOwnedRq<RqEntry>,
+    OnSqComplete,
+    OnRqComplete,
+>;
 
 /// UD QP with SRQ (InfiniBand).
 ///
@@ -391,8 +398,15 @@ pub type UdQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
 /// - `RqEntry`: Entry type stored in the SRQ WQE table
 /// - `OnSqComplete`: SQ completion callback type `Fn(Cqe, SqEntry)`
 /// - `OnRqComplete`: RQ completion callback type `Fn(Cqe, RqEntry)`
-pub type UdQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
-    UdQp<SqEntry, RqEntry, InfiniBand, OrderedWqeTable<SqEntry>, UdSharedRq<RqEntry>, OnSqComplete, OnRqComplete>;
+pub type UdQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = UdQp<
+    SqEntry,
+    RqEntry,
+    InfiniBand,
+    OrderedWqeTable<SqEntry>,
+    UdSharedRq<RqEntry>,
+    OnSqComplete,
+    OnRqComplete,
+>;
 
 /// UD QP with owned RQ (RoCE).
 ///
@@ -403,8 +417,15 @@ pub type UdQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
 /// - `OnRqComplete`: RQ completion callback type `Fn(Cqe, RqEntry)`
 ///
 /// # NOTE: RoCE support is untested (IB-only hardware environment)
-pub type UdQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
-    UdQp<SqEntry, RqEntry, RoCE, OrderedWqeTable<SqEntry>, UdOwnedRq<RqEntry>, OnSqComplete, OnRqComplete>;
+pub type UdQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = UdQp<
+    SqEntry,
+    RqEntry,
+    RoCE,
+    OrderedWqeTable<SqEntry>,
+    UdOwnedRq<RqEntry>,
+    OnSqComplete,
+    OnRqComplete,
+>;
 
 /// UD QP with SRQ (RoCE).
 ///
@@ -415,8 +436,15 @@ pub type UdQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
 /// - `OnRqComplete`: RQ completion callback type `Fn(Cqe, RqEntry)`
 ///
 /// # NOTE: RoCE support is untested (IB-only hardware environment)
-pub type UdQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
-    UdQp<SqEntry, RqEntry, RoCE, OrderedWqeTable<SqEntry>, UdSharedRq<RqEntry>, OnSqComplete, OnRqComplete>;
+pub type UdQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> = UdQp<
+    SqEntry,
+    RqEntry,
+    RoCE,
+    OrderedWqeTable<SqEntry>,
+    UdSharedRq<RqEntry>,
+    OnSqComplete,
+    OnRqComplete,
+>;
 
 /// Type alias for UD QP with MonoCq (no callback stored, InfiniBand).
 ///
@@ -468,7 +496,9 @@ pub struct UdQp<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqCo
     _marker: std::marker::PhantomData<(Transport, RqEntry)>,
 }
 
-impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> Drop for UdQp<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> {
+impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> Drop
+    for UdQp<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete>
+{
     fn drop(&mut self) {
         let qpn = self.qpn();
         if let Some(cq) = self.send_cq.upgrade() {
@@ -483,7 +513,9 @@ impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> Dro
     }
 }
 
-impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> UdQp<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> {
+impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete>
+    UdQp<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete>
+{
     /// Get the QP number.
     pub fn qpn(&self) -> u32 {
         unsafe { (*self.qp.as_ptr()).qp_num }
@@ -688,7 +720,13 @@ impl<'a, Entry> UdRqBlueflameWqeBatch<'a, Entry> {
     /// Returns `RqFull` if the receive queue doesn't have enough space.
     /// Returns `BlueflameOverflow` if the batch buffer is full.
     #[inline]
-    pub fn post(&mut self, entry: Entry, addr: u64, len: u32, lkey: u32) -> Result<(), SubmissionError> {
+    pub fn post(
+        &mut self,
+        entry: Entry,
+        addr: u64,
+        len: u32,
+        lkey: u32,
+    ) -> Result<(), SubmissionError> {
         if self.rq.available() <= self.wqe_count as u32 {
             return Err(SubmissionError::RqFull);
         }
@@ -726,7 +764,9 @@ impl<'a, Entry> UdRqBlueflameWqeBatch<'a, Entry> {
         }
 
         // Advance RQ producer index
-        self.rq.pi.set(self.rq.pi.get().wrapping_add(self.wqe_count));
+        self.rq
+            .pi
+            .set(self.rq.pi.get().wrapping_add(self.wqe_count));
 
         unsafe {
             bf_finish_rq(
@@ -746,7 +786,9 @@ impl<'a, Entry> UdRqBlueflameWqeBatch<'a, Entry> {
 // OwnedRq-specific methods
 // =============================================================================
 
-impl<SqEntry, RqEntry, Transport, TableType, OnSqComplete, OnRqComplete> UdQp<SqEntry, RqEntry, Transport, TableType, UdOwnedRq<RqEntry>, OnSqComplete, OnRqComplete> {
+impl<SqEntry, RqEntry, Transport, TableType, OnSqComplete, OnRqComplete>
+    UdQp<SqEntry, RqEntry, Transport, TableType, UdOwnedRq<RqEntry>, OnSqComplete, OnRqComplete>
+{
     fn rq(&self) -> io::Result<&UdRecvQueueState<RqEntry>> {
         self.rq
             .as_ref()
@@ -778,16 +820,18 @@ impl<SqEntry, RqEntry, Transport, TableType, OnSqComplete, OnRqComplete> UdQp<Sq
 // SharedRq-specific methods
 // =============================================================================
 
-impl<SqEntry, RqEntry, Transport, TableType, OnSqComplete, OnRqComplete> UdQp<SqEntry, RqEntry, Transport, TableType, UdSharedRq<RqEntry>, OnSqComplete, OnRqComplete> {
+impl<SqEntry, RqEntry, Transport, TableType, OnSqComplete, OnRqComplete>
+    UdQp<SqEntry, RqEntry, Transport, TableType, UdSharedRq<RqEntry>, OnSqComplete, OnRqComplete>
+{
     /// Get a reference to the underlying SRQ.
     pub fn srq(&self) -> &Srq<RqEntry> {
         self.rq.srq()
     }
 }
 
-
-
-impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete> {
+impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
+    UdQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
+{
     /// Initialize direct queue access (internal implementation).
     fn init_direct_access_internal(&mut self) -> io::Result<()> {
         if self.sq.is_some() {
@@ -913,13 +957,23 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIb<SqEntry, RqEntry, OnSq
     /// # Errors
     /// Returns `BlueflameNotAvailable` if BlueFlame is not supported on this device.
     #[inline]
-    pub fn blueflame_rq_batch(&self) -> Result<UdRqBlueflameWqeBatch<'_, RqEntry>, SubmissionError> {
+    pub fn blueflame_rq_batch(
+        &self,
+    ) -> Result<UdRqBlueflameWqeBatch<'_, RqEntry>, SubmissionError> {
         let rq = self.rq.as_ref().ok_or(SubmissionError::RqFull)?;
-        let sq = self.sq.as_ref().ok_or(SubmissionError::BlueflameNotAvailable)?;
+        let sq = self
+            .sq
+            .as_ref()
+            .ok_or(SubmissionError::BlueflameNotAvailable)?;
         if sq.bf_size == 0 {
             return Err(SubmissionError::BlueflameNotAvailable);
         }
-        Ok(UdRqBlueflameWqeBatch::new(rq, sq.bf_reg, sq.bf_size, &sq.bf_offset))
+        Ok(UdRqBlueflameWqeBatch::new(
+            rq,
+            sq.bf_reg,
+            sq.bf_size,
+            &sq.bf_offset,
+        ))
     }
 
     /// Ring the SQ doorbell with minimum 8-byte BlueFlame write.
@@ -946,7 +1000,9 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIb<SqEntry, RqEntry, OnSq
     }
 }
 
-impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> {
+impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
+    UdQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
+{
     /// Initialize direct queue access for SRQ variant (SQ only).
     fn init_direct_access_internal(&mut self) -> io::Result<()> {
         if self.sq.is_some() {
@@ -1007,7 +1063,8 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpIbWithSrq<SqEntry, RqEntr
 // CompletionTarget Implementation (OwnedRq)
 // =============================================================================
 
-impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> CompletionTarget for UdQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
+impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> CompletionTarget
+    for UdQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
 where
     OnSqComplete: Fn(Cqe, SqEntry),
     OnRqComplete: Fn(Cqe, RqEntry),
@@ -1039,7 +1096,8 @@ where
 // CompletionTarget Implementation (SharedRq/SRQ)
 // =============================================================================
 
-impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> CompletionTarget for UdQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
+impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> CompletionTarget
+    for UdQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
 where
     OnSqComplete: Fn(Cqe, SqEntry),
     OnRqComplete: Fn(Cqe, RqEntry),
@@ -1051,8 +1109,7 @@ where
     fn dispatch_cqe(&self, cqe: Cqe) {
         if cqe.opcode.is_responder() {
             // RQ completion via SRQ (responder)
-            if let Some(entry) = self.rq.srq().process_recv_completion(cqe.wqe_counter)
-            {
+            if let Some(entry) = self.rq.srq().process_recv_completion(cqe.wqe_counter) {
                 (self.rq_callback)(cqe, entry);
             }
         } else {
@@ -1070,7 +1127,9 @@ where
 // RoCE init_direct_access_internal implementations
 // =============================================================================
 
-impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete> {
+impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
+    UdQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
+{
     /// Initialize direct queue access for RoCE (same as IB).
     fn init_direct_access_internal(&mut self) -> io::Result<()> {
         if self.sq.is_some() {
@@ -1115,7 +1174,9 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpRoCE<SqEntry, RqEntry, On
     }
 }
 
-impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete> {
+impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
+    UdQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
+{
     /// Initialize direct queue access for RoCE with SRQ (SQ only).
     fn init_direct_access_internal(&mut self) -> io::Result<()> {
         if self.sq.is_some() {
@@ -1149,7 +1210,8 @@ impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> UdQpRoCEWithSrq<SqEntry, RqEn
 // CompletionTarget impl for RoCE variants
 // =============================================================================
 
-impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> CompletionTarget for UdQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
+impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> CompletionTarget
+    for UdQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
 where
     OnSqComplete: Fn(Cqe, SqEntry),
     OnRqComplete: Fn(Cqe, RqEntry),
@@ -1177,7 +1239,8 @@ where
     }
 }
 
-impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> CompletionTarget for UdQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
+impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete> CompletionTarget
+    for UdQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
 where
     OnSqComplete: Fn(Cqe, SqEntry),
     OnRqComplete: Fn(Cqe, RqEntry),
@@ -1189,8 +1252,7 @@ where
     fn dispatch_cqe(&self, cqe: Cqe) {
         if cqe.opcode.is_responder() {
             // RQ completion via SRQ (responder)
-            if let Some(entry) = self.rq.srq().process_recv_completion(cqe.wqe_counter)
-            {
+            if let Some(entry) = self.rq.srq().process_recv_completion(cqe.wqe_counter) {
                 (self.rq_callback)(cqe, entry);
             }
         } else {
@@ -1208,7 +1270,7 @@ where
 // UdQpBuilder - Builder Pattern for UD QP Creation
 // =============================================================================
 
-use crate::qp::{NoCq, CqSet};
+use crate::qp::{CqSet, NoCq};
 
 /// Builder for UD Queue Pairs.
 ///
@@ -1224,7 +1286,19 @@ use crate::qp::{NoCq, CqSet};
 /// - `OnRq`: RQ completion callback type
 /// - `SqMono`: MonoCq reference for SQ (default `()`)
 /// - `RqMono`: MonoCq reference for RQ (default `()`)
-pub struct UdQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, RqCqState, OnSq, OnRq, SqMono = (), RqMono = ()> {
+pub struct UdQpBuilder<
+    'a,
+    SqEntry,
+    RqEntry,
+    T,
+    Rq,
+    SqCqState,
+    RqCqState,
+    OnSq,
+    OnRq,
+    SqMono = (),
+    RqMono = (),
+> {
     ctx: &'a Context,
     pd: &'a Pd,
     config: UdQpConfig,
@@ -1271,7 +1345,8 @@ impl Context {
         &'a self,
         pd: &'a Pd,
         config: &UdQpConfig,
-    ) -> UdQpBuilder<'a, SqEntry, RqEntry, InfiniBand, UdOwnedRq<RqEntry>, NoCq, NoCq, (), (), (), ()> {
+    ) -> UdQpBuilder<'a, SqEntry, RqEntry, InfiniBand, UdOwnedRq<RqEntry>, NoCq, NoCq, (), (), (), ()>
+    {
         UdQpBuilder {
             ctx: self,
             pd,
@@ -1327,7 +1402,19 @@ impl<'a, SqEntry, RqEntry, T, Rq, RqCqState, OnRq, RqMono>
     pub fn sq_mono_cq<Q, F>(
         self,
         mono_cq: &Rc<crate::mono_cq::MonoCq<Q, F>>,
-    ) -> UdQpBuilder<'a, SqEntry, RqEntry, T, Rq, CqSet, RqCqState, (), OnRq, Rc<crate::mono_cq::MonoCq<Q, F>>, RqMono>
+    ) -> UdQpBuilder<
+        'a,
+        SqEntry,
+        RqEntry,
+        T,
+        Rq,
+        CqSet,
+        RqCqState,
+        (),
+        OnRq,
+        Rc<crate::mono_cq::MonoCq<Q, F>>,
+        RqMono,
+    >
     where
         Q: crate::mono_cq::CompletionSource,
         F: Fn(Cqe, Q::Entry) + 'static,
@@ -1387,7 +1474,19 @@ impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, OnSq, SqMono>
     pub fn rq_mono_cq<Q, F>(
         self,
         mono_cq: &Rc<crate::mono_cq::MonoCq<Q, F>>,
-    ) -> UdQpBuilder<'a, SqEntry, RqEntry, T, Rq, SqCqState, CqSet, OnSq, (), SqMono, Rc<crate::mono_cq::MonoCq<Q, F>>>
+    ) -> UdQpBuilder<
+        'a,
+        SqEntry,
+        RqEntry,
+        T,
+        Rq,
+        SqCqState,
+        CqSet,
+        OnSq,
+        (),
+        SqMono,
+        Rc<crate::mono_cq::MonoCq<Q, F>>,
+    >
     where
         Q: crate::mono_cq::CompletionSource,
         F: Fn(Cqe, Q::Entry) + 'static,
@@ -1422,7 +1521,8 @@ impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, RqCqState, OnSq, OnRq, SqMono, RqMo
     /// # NOTE: RoCE support is untested (IB-only hardware environment)
     pub fn for_roce(
         self,
-    ) -> UdQpBuilder<'a, SqEntry, RqEntry, RoCE, Rq, SqCqState, RqCqState, OnSq, OnRq, SqMono, RqMono> {
+    ) -> UdQpBuilder<'a, SqEntry, RqEntry, RoCE, Rq, SqCqState, RqCqState, OnSq, OnRq, SqMono, RqMono>
+    {
         UdQpBuilder {
             ctx: self.ctx,
             pd: self.pd,
@@ -1442,14 +1542,37 @@ impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, RqCqState, OnSq, OnRq, SqMono, RqMo
 }
 
 impl<'a, SqEntry, RqEntry, T, SqCqState, RqCqState, OnSq, OnRq, SqMono, RqMono>
-    UdQpBuilder<'a, SqEntry, RqEntry, T, UdOwnedRq<RqEntry>, SqCqState, RqCqState, OnSq, OnRq, SqMono, RqMono>
+    UdQpBuilder<
+        'a,
+        SqEntry,
+        RqEntry,
+        T,
+        UdOwnedRq<RqEntry>,
+        SqCqState,
+        RqCqState,
+        OnSq,
+        OnRq,
+        SqMono,
+        RqMono,
+    >
 {
     /// Use Shared Receive Queue (SRQ) instead of owned RQ.
     pub fn with_srq(
         self,
         srq: Rc<Srq<RqEntry>>,
-    ) -> UdQpBuilder<'a, SqEntry, RqEntry, T, UdSharedRq<RqEntry>, SqCqState, RqCqState, OnSq, OnRq, SqMono, RqMono>
-    {
+    ) -> UdQpBuilder<
+        'a,
+        SqEntry,
+        RqEntry,
+        T,
+        UdSharedRq<RqEntry>,
+        SqCqState,
+        RqCqState,
+        OnSq,
+        OnRq,
+        SqMono,
+        RqMono,
+    > {
         UdQpBuilder {
             ctx: self.ctx,
             pd: self.pd,
@@ -1473,7 +1596,19 @@ impl<'a, SqEntry, RqEntry, T, SqCqState, RqCqState, OnSq, OnRq, SqMono, RqMono>
 // =============================================================================
 
 impl<'a, SqEntry, RqEntry, OnSq, OnRq>
-    UdQpBuilder<'a, SqEntry, RqEntry, InfiniBand, UdOwnedRq<RqEntry>, CqSet, CqSet, OnSq, OnRq, (), ()>
+    UdQpBuilder<
+        'a,
+        SqEntry,
+        RqEntry,
+        InfiniBand,
+        UdOwnedRq<RqEntry>,
+        CqSet,
+        CqSet,
+        OnSq,
+        OnRq,
+        (),
+        (),
+    >
 where
     SqEntry: 'static,
     RqEntry: 'static,
@@ -1590,10 +1725,12 @@ where
 
             // Register with send CQ only (recv CQ is MonoCq)
             if let Some(send_cq) = &send_cq_for_register
-                && let Some(cq) = send_cq.upgrade() {
-                    let weak: Weak<RefCell<dyn CompletionTarget>> = Rc::downgrade(&(qp_rc.clone() as Rc<RefCell<dyn CompletionTarget>>));
-                    cq.register_queue(qpn, weak);
-                }
+                && let Some(cq) = send_cq.upgrade()
+            {
+                let weak: Weak<RefCell<dyn CompletionTarget>> =
+                    Rc::downgrade(&(qp_rc.clone() as Rc<RefCell<dyn CompletionTarget>>));
+                cq.register_queue(qpn, weak);
+            }
 
             self.rq_mono_cq_ref.maybe_register(&qp_rc);
 
@@ -1607,7 +1744,19 @@ where
 // =============================================================================
 
 impl<'a, SqEntry, RqEntry, OnSq, OnRq>
-    UdQpBuilder<'a, SqEntry, RqEntry, InfiniBand, UdSharedRq<RqEntry>, CqSet, CqSet, OnSq, OnRq, (), ()>
+    UdQpBuilder<
+        'a,
+        SqEntry,
+        RqEntry,
+        InfiniBand,
+        UdSharedRq<RqEntry>,
+        CqSet,
+        CqSet,
+        OnSq,
+        OnRq,
+        (),
+        (),
+    >
 where
     SqEntry: 'static,
     RqEntry: 'static,
@@ -1616,9 +1765,10 @@ where
 {
     /// Build the UD QP with SRQ.
     pub fn build(self) -> BuildResult<UdQpIbWithSrq<SqEntry, RqEntry, OnSq, OnRq>> {
-        let srq = self.srq.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "SRQ not set")
-        })?;
+        let srq = self
+            .srq
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "SRQ not set"))?;
 
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
@@ -1659,7 +1809,9 @@ where
                 _marker: std::marker::PhantomData,
             };
 
-            UdQpIbWithSrq::<SqEntry, RqEntry, OnSq, OnRq>::init_direct_access_internal(&mut result)?;
+            UdQpIbWithSrq::<SqEntry, RqEntry, OnSq, OnRq>::init_direct_access_internal(
+                &mut result,
+            )?;
 
             let qp_rc = Rc::new(RefCell::new(result));
             let qpn = qp_rc.borrow().qpn();
@@ -1753,9 +1905,10 @@ where
     ///
     /// # NOTE: RoCE support is untested (IB-only hardware environment)
     pub fn build(self) -> BuildResult<UdQpRoCEWithSrq<SqEntry, RqEntry, OnSq, OnRq>> {
-        let srq = self.srq.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "SRQ not set")
-        })?;
+        let srq = self
+            .srq
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "SRQ not set"))?;
 
         unsafe {
             let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
@@ -1796,7 +1949,9 @@ where
                 _marker: std::marker::PhantomData,
             };
 
-            UdQpRoCEWithSrq::<SqEntry, RqEntry, OnSq, OnRq>::init_direct_access_internal(&mut result)?;
+            UdQpRoCEWithSrq::<SqEntry, RqEntry, OnSq, OnRq>::init_direct_access_internal(
+                &mut result,
+            )?;
 
             let qp_rc = Rc::new(RefCell::new(result));
             let qpn = qp_rc.borrow().qpn();
@@ -1813,7 +1968,19 @@ where
 // =============================================================================
 
 impl<'a, Entry, SqMono, RqMono>
-    UdQpBuilder<'a, Entry, Entry, InfiniBand, UdOwnedRq<Entry>, CqSet, CqSet, (), (), SqMono, RqMono>
+    UdQpBuilder<
+        'a,
+        Entry,
+        Entry,
+        InfiniBand,
+        UdOwnedRq<Entry>,
+        CqSet,
+        CqSet,
+        (),
+        (),
+        SqMono,
+        RqMono,
+    >
 where
     Entry: 'static,
     SqMono: MaybeMonoCqRegister<UdQpForMonoCq<Entry>>,
@@ -1850,7 +2017,7 @@ where
                 rq: UdOwnedRq::new(None),
                 sq_callback: (),
                 rq_callback: (),
-                send_cq: Weak::new(),  // MonoCq doesn't use Cq registration
+                send_cq: Weak::new(), // MonoCq doesn't use Cq registration
                 recv_cq: Weak::new(),
                 _pd: self.pd.clone(),
                 _marker: std::marker::PhantomData,
@@ -1910,7 +2077,7 @@ where
                 rq: UdOwnedRq::new(None),
                 sq_callback: (),
                 rq_callback: (),
-                send_cq: Weak::new(),  // MonoCq doesn't use Cq registration
+                send_cq: Weak::new(), // MonoCq doesn't use Cq registration
                 recv_cq: Weak::new(),
                 _pd: self.pd.clone(),
                 _marker: std::marker::PhantomData,

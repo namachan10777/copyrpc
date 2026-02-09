@@ -26,14 +26,14 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
 use mlx5::cq::{CqConfig, Cqe};
 use mlx5::device::{Context, DeviceList};
-use mlx5::emit_wqe;
 use mlx5::emit_ud_wqe;
+use mlx5::emit_wqe;
 use mlx5::mono_cq::MonoCqRc;
 use mlx5::pd::{AccessFlags, MemoryRegion, Pd};
 use mlx5::qp::{RcQpConfig, RcQpForMonoCq};
 use mlx5::test_utils::{self, AlignedBuffer};
-use mlx5::ud::{UdQpConfig, UdQpIb};
 use mlx5::transport::IbRemoteQpInfo;
+use mlx5::ud::{UdQpConfig, UdQpIb};
 use mlx5::wqe::WqeFlags;
 use mlx5::wqe::emit::UdAvIb;
 
@@ -288,7 +288,8 @@ fn open_mlx5_device() -> Option<Context> {
     None
 }
 
-fn setup_send_recv_benchmark() -> Option<SendRecvBenchmarkSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u64)>> {
+fn setup_send_recv_benchmark()
+-> Option<SendRecvBenchmarkSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u64)>> {
     let ctx = open_mlx5_device()?;
     let port = 1u8;
     let port_attr = ctx.query_port(port).ok()?;
@@ -304,8 +305,22 @@ fn setup_send_recv_benchmark() -> Option<SendRecvBenchmarkSetup<impl Fn(Cqe, u64
         }
     };
 
-    let send_cq = Rc::new(ctx.create_mono_cq(SEND_RECV_QUEUE_DEPTH as i32, send_callback, &CqConfig::default()).ok()?);
-    let recv_cq = Rc::new(ctx.create_mono_cq(SEND_RECV_QUEUE_DEPTH as i32, recv_callback, &CqConfig::default()).ok()?);
+    let send_cq = Rc::new(
+        ctx.create_mono_cq(
+            SEND_RECV_QUEUE_DEPTH as i32,
+            send_callback,
+            &CqConfig::default(),
+        )
+        .ok()?,
+    );
+    let recv_cq = Rc::new(
+        ctx.create_mono_cq(
+            SEND_RECV_QUEUE_DEPTH as i32,
+            recv_callback,
+            &CqConfig::default(),
+        )
+        .ok()?,
+    );
 
     let config = RcQpConfig {
         max_send_wr: SEND_RECV_QUEUE_DEPTH as u32,
@@ -406,7 +421,8 @@ fn setup_send_recv_benchmark() -> Option<SendRecvBenchmarkSetup<impl Fn(Cqe, u64
     })
 }
 
-fn setup_write_imm_benchmark() -> Option<WriteImmBenchmarkSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u64)>> {
+fn setup_write_imm_benchmark()
+-> Option<WriteImmBenchmarkSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u64)>> {
     let ctx = open_mlx5_device()?;
     let port = 1u8;
     let port_attr = ctx.query_port(port).ok()?;
@@ -422,8 +438,22 @@ fn setup_write_imm_benchmark() -> Option<WriteImmBenchmarkSetup<impl Fn(Cqe, u64
         }
     };
 
-    let send_cq = Rc::new(ctx.create_mono_cq(SEND_RECV_QUEUE_DEPTH as i32, send_callback, &CqConfig::default()).ok()?);
-    let recv_cq = Rc::new(ctx.create_mono_cq(SEND_RECV_QUEUE_DEPTH as i32, recv_callback, &CqConfig::default()).ok()?);
+    let send_cq = Rc::new(
+        ctx.create_mono_cq(
+            SEND_RECV_QUEUE_DEPTH as i32,
+            send_callback,
+            &CqConfig::default(),
+        )
+        .ok()?,
+    );
+    let recv_cq = Rc::new(
+        ctx.create_mono_cq(
+            SEND_RECV_QUEUE_DEPTH as i32,
+            recv_callback,
+            &CqConfig::default(),
+        )
+        .ok()?,
+    );
 
     let config = RcQpConfig {
         max_send_wr: SEND_RECV_QUEUE_DEPTH as u32,
@@ -454,10 +484,14 @@ fn setup_write_imm_benchmark() -> Option<WriteImmBenchmarkSetup<impl Fn(Cqe, u64
         recv_buf_rkey: recv_mr.rkey(),
     };
 
-    let (server_info_tx, server_info_rx): (Sender<WriteImmConnectionInfo>, Receiver<WriteImmConnectionInfo>) =
-        mpsc::channel();
-    let (client_info_tx, client_info_rx): (Sender<WriteImmConnectionInfo>, Receiver<WriteImmConnectionInfo>) =
-        mpsc::channel();
+    let (server_info_tx, server_info_rx): (
+        Sender<WriteImmConnectionInfo>,
+        Receiver<WriteImmConnectionInfo>,
+    ) = mpsc::channel();
+    let (client_info_tx, client_info_rx): (
+        Sender<WriteImmConnectionInfo>,
+        Receiver<WriteImmConnectionInfo>,
+    ) = mpsc::channel();
     let server_ready = Arc::new(AtomicU32::new(0));
     let server_ready_clone = server_ready.clone();
 
@@ -527,7 +561,9 @@ fn setup_write_imm_benchmark() -> Option<WriteImmBenchmarkSetup<impl Fn(Cqe, u64
     })
 }
 
-fn setup_rdma_loopback_benchmark(relaxed: bool) -> Option<RdmaLoopbackSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u64)>> {
+fn setup_rdma_loopback_benchmark(
+    relaxed: bool,
+) -> Option<RdmaLoopbackSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u64)>> {
     let ctx = open_mlx5_device()?;
     let port = 1u8;
     let port_attr = ctx.query_port(port).ok()?;
@@ -536,8 +572,14 @@ fn setup_rdma_loopback_benchmark(relaxed: bool) -> Option<RdmaLoopbackSetup<impl
     let send_callback = move |_cqe: Cqe, _entry: u64| {};
     let recv_callback = move |_cqe: Cqe, _entry: u64| {};
 
-    let send_cq = Rc::new(ctx.create_mono_cq(RDMA_QUEUE_DEPTH as i32, send_callback, &CqConfig::default()).ok()?);
-    let recv_cq = Rc::new(ctx.create_mono_cq(RDMA_QUEUE_DEPTH as i32, recv_callback, &CqConfig::default()).ok()?);
+    let send_cq = Rc::new(
+        ctx.create_mono_cq(RDMA_QUEUE_DEPTH as i32, send_callback, &CqConfig::default())
+            .ok()?,
+    );
+    let recv_cq = Rc::new(
+        ctx.create_mono_cq(RDMA_QUEUE_DEPTH as i32, recv_callback, &CqConfig::default())
+            .ok()?,
+    );
 
     let config = RcQpConfig {
         max_send_wr: RDMA_QUEUE_DEPTH as u32,
@@ -566,7 +608,11 @@ fn setup_rdma_loopback_benchmark(relaxed: bool) -> Option<RdmaLoopbackSetup<impl
     let local_buf = AlignedBuffer::new(RDMA_BUFFER_SIZE);
     let remote_buf = AlignedBuffer::new(RDMA_BUFFER_SIZE);
 
-    let access = if relaxed { full_access_relaxed() } else { full_access() };
+    let access = if relaxed {
+        full_access_relaxed()
+    } else {
+        full_access()
+    };
     let local_mr = unsafe { pd.register(local_buf.as_ptr(), local_buf.size(), access) }.ok()?;
     let remote_mr = unsafe { pd.register(remote_buf.as_ptr(), remote_buf.size(), access) }.ok()?;
 
@@ -663,12 +709,20 @@ fn server_thread_main(
         }
     };
 
-    let send_cq = match ctx.create_mono_cq::<RcQpForMonoCq<u64>, _>(SEND_RECV_QUEUE_DEPTH as i32, send_callback, &CqConfig::default()) {
+    let send_cq = match ctx.create_mono_cq::<RcQpForMonoCq<u64>, _>(
+        SEND_RECV_QUEUE_DEPTH as i32,
+        send_callback,
+        &CqConfig::default(),
+    ) {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
     };
 
-    let recv_cq = match ctx.create_mono_cq::<RcQpForMonoCq<u64>, _>(SEND_RECV_QUEUE_DEPTH as i32, recv_callback, &CqConfig::default()) {
+    let recv_cq = match ctx.create_mono_cq::<RcQpForMonoCq<u64>, _>(
+        SEND_RECV_QUEUE_DEPTH as i32,
+        recv_callback,
+        &CqConfig::default(),
+    ) {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
     };
@@ -783,16 +837,22 @@ fn server_thread_main(
             for _ in 0..count {
                 // Echo back with inline data (3:1 signaling ratio)
                 if send_count % SEND_RECV_SIGNAL_INTERVAL == SEND_RECV_SIGNAL_INTERVAL - 1 {
-                    let _ = emit_wqe!(&ctx, send {
-                        flags: WqeFlags::empty(),
-                        inline: echo_data.as_slice(),
-                        signaled: send_count as u64,
-                    });
+                    let _ = emit_wqe!(
+                        &ctx,
+                        send {
+                            flags: WqeFlags::empty(),
+                            inline: echo_data.as_slice(),
+                            signaled: send_count as u64,
+                        }
+                    );
                 } else {
-                    let _ = emit_wqe!(&ctx, send {
-                        flags: WqeFlags::empty(),
-                        inline: echo_data.as_slice(),
-                    });
+                    let _ = emit_wqe!(
+                        &ctx,
+                        send {
+                            flags: WqeFlags::empty(),
+                            inline: echo_data.as_slice(),
+                        }
+                    );
                 }
                 send_count += 1;
             }
@@ -840,12 +900,20 @@ fn write_imm_server_thread_main(
         }
     };
 
-    let send_cq = match ctx.create_mono_cq::<RcQpForMonoCq<u64>, _>(SEND_RECV_QUEUE_DEPTH as i32, send_callback, &CqConfig::default()) {
+    let send_cq = match ctx.create_mono_cq::<RcQpForMonoCq<u64>, _>(
+        SEND_RECV_QUEUE_DEPTH as i32,
+        send_callback,
+        &CqConfig::default(),
+    ) {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
     };
 
-    let recv_cq = match ctx.create_mono_cq::<RcQpForMonoCq<u64>, _>(SEND_RECV_QUEUE_DEPTH as i32, recv_callback, &CqConfig::default()) {
+    let recv_cq = match ctx.create_mono_cq::<RcQpForMonoCq<u64>, _>(
+        SEND_RECV_QUEUE_DEPTH as i32,
+        recv_callback,
+        &CqConfig::default(),
+    ) {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
     };
@@ -962,22 +1030,28 @@ fn write_imm_server_thread_main(
             let ctx = qp_ref.emit_ctx().expect("emit_ctx failed");
             for _ in 0..count {
                 if send_count % SEND_RECV_SIGNAL_INTERVAL == SEND_RECV_SIGNAL_INTERVAL - 1 {
-                    let _ = emit_wqe!(&ctx, write_imm {
-                        flags: WqeFlags::empty(),
-                        remote_addr: remote_addr,
-                        rkey: remote_rkey,
-                        imm: 0u32,
-                        inline: echo_data.as_slice(),
-                        signaled: send_count as u64,
-                    });
+                    let _ = emit_wqe!(
+                        &ctx,
+                        write_imm {
+                            flags: WqeFlags::empty(),
+                            remote_addr: remote_addr,
+                            rkey: remote_rkey,
+                            imm: 0u32,
+                            inline: echo_data.as_slice(),
+                            signaled: send_count as u64,
+                        }
+                    );
                 } else {
-                    let _ = emit_wqe!(&ctx, write_imm {
-                        flags: WqeFlags::empty(),
-                        remote_addr: remote_addr,
-                        rkey: remote_rkey,
-                        imm: 0u32,
-                        inline: echo_data.as_slice(),
-                    });
+                    let _ = emit_wqe!(
+                        &ctx,
+                        write_imm {
+                            flags: WqeFlags::empty(),
+                            remote_addr: remote_addr,
+                            rkey: remote_rkey,
+                            imm: 0u32,
+                            inline: echo_data.as_slice(),
+                        }
+                    );
                 }
                 send_count += 1;
             }
@@ -1099,7 +1173,12 @@ fn ud_server_thread_main(
     for i in 0..UD_QUEUE_DEPTH {
         let offset = (i * UD_RECV_ENTRY_SIZE) as u64;
         qp.borrow()
-            .post_recv(i as u64, recv_buf.addr() + offset, recv_buf_size, recv_mr.lkey())
+            .post_recv(
+                i as u64,
+                recv_buf.addr() + offset,
+                recv_buf_size,
+                recv_mr.lkey(),
+            )
             .unwrap();
     }
     qp.borrow().ring_rq_doorbell();
@@ -1131,7 +1210,12 @@ fn ud_server_thread_main(
                 let idx = recv_idx % UD_QUEUE_DEPTH;
                 let offset = (idx * UD_RECV_ENTRY_SIZE) as u64;
                 qp_ref
-                    .post_recv(idx as u64, recv_buf.addr() + offset, recv_buf_size, recv_mr.lkey())
+                    .post_recv(
+                        idx as u64,
+                        recv_buf.addr() + offset,
+                        recv_buf_size,
+                        recv_mr.lkey(),
+                    )
                     .unwrap();
                 recv_idx += 1;
             }
@@ -1145,12 +1229,15 @@ fn ud_server_thread_main(
 
             for _ in 0..count {
                 // UD macro only supports signaled mode
-                let _ = emit_ud_wqe!(&ctx, send {
-                    av: av,
-                    flags: WqeFlags::empty(),
-                    inline: echo_data.as_slice(),
-                    signaled: send_count as u64,
-                });
+                let _ = emit_ud_wqe!(
+                    &ctx,
+                    send {
+                        av: av,
+                        flags: WqeFlags::empty(),
+                        inline: echo_data.as_slice(),
+                        signaled: send_count as u64,
+                    }
+                );
                 send_count += 1;
             }
         }
@@ -1181,8 +1268,14 @@ fn setup_ud_send_recv_benchmark() -> Option<UdSendRecvBenchmarkSetup> {
         }
     });
 
-    let send_cq = Rc::new(ctx.create_cq(UD_QUEUE_DEPTH as i32, &CqConfig::default()).ok()?);
-    let recv_cq = Rc::new(ctx.create_cq(UD_QUEUE_DEPTH as i32, &CqConfig::default()).ok()?);
+    let send_cq = Rc::new(
+        ctx.create_cq(UD_QUEUE_DEPTH as i32, &CqConfig::default())
+            .ok()?,
+    );
+    let recv_cq = Rc::new(
+        ctx.create_cq(UD_QUEUE_DEPTH as i32, &CqConfig::default())
+            .ok()?,
+    );
 
     let qkey = 0x11111111u32;
     let ud_config = UdQpConfig {
@@ -1248,7 +1341,12 @@ fn setup_ud_send_recv_benchmark() -> Option<UdSendRecvBenchmarkSetup> {
     for i in 0..UD_QUEUE_DEPTH {
         let offset = (i * UD_RECV_ENTRY_SIZE) as u64;
         qp.borrow()
-            .post_recv(i as u64, recv_buf.addr() + offset, recv_buf_size, recv_mr.lkey())
+            .post_recv(
+                i as u64,
+                recv_buf.addr() + offset,
+                recv_buf_size,
+                recv_mr.lkey(),
+            )
             .unwrap();
     }
     qp.borrow().ring_rq_doorbell();
@@ -1286,10 +1384,7 @@ fn setup_ud_send_recv_benchmark() -> Option<UdSendRecvBenchmarkSetup> {
 // =============================================================================
 
 /// 32B inline send throughput benchmark (queue depth = 1024, 1/4 signaling ratio).
-fn run_send_inline_throughput<SF, RF>(
-    client: &mut SendRecvEndpoint<SF, RF>,
-    iters: u64,
-) -> Duration
+fn run_send_inline_throughput<SF, RF>(client: &mut SendRecvEndpoint<SF, RF>, iters: u64) -> Duration
 where
     SF: Fn(Cqe, u64),
     RF: Fn(Cqe, u64),
@@ -1310,28 +1405,37 @@ where
             let base = batch * signal_interval;
             // (signal_interval - 1) unsignaled
             for _ in 0..(signal_interval - 1) {
-                let _ = emit_wqe!(&ctx, send {
-                    flags: WqeFlags::empty(),
-                    inline: send_data.as_slice(),
-                });
+                let _ = emit_wqe!(
+                    &ctx,
+                    send {
+                        flags: WqeFlags::empty(),
+                        inline: send_data.as_slice(),
+                    }
+                );
             }
             // 1 signaled
             let idx = base + signal_interval - 1;
-            let _ = emit_wqe!(&ctx, send {
-                flags: WqeFlags::empty(),
-                inline: send_data.as_slice(),
-                signaled: idx as u64,
-            });
+            let _ = emit_wqe!(
+                &ctx,
+                send {
+                    flags: WqeFlags::empty(),
+                    inline: send_data.as_slice(),
+                    signaled: idx as u64,
+                }
+            );
         }
 
         // Remainder (all signaled for correctness)
         for j in 0..remainder {
             let idx = full_batches * signal_interval + j;
-            let _ = emit_wqe!(&ctx, send {
-                flags: WqeFlags::empty(),
-                inline: send_data.as_slice(),
-                signaled: idx as u64,
-            });
+            let _ = emit_wqe!(
+                &ctx,
+                send {
+                    flags: WqeFlags::empty(),
+                    inline: send_data.as_slice(),
+                    signaled: idx as u64,
+                }
+            );
         }
         qp.ring_sq_doorbell();
     }
@@ -1364,15 +1468,22 @@ where
             for _ in 0..rx_count {
                 let idx = recv_idx % SEND_RECV_QUEUE_DEPTH;
                 let offset = (idx * 64) as u64;
-                qp.post_recv(idx as u64, client.recv_buf.addr() + offset, 64, client.recv_mr.lkey())
-                    .unwrap();
+                qp.post_recv(
+                    idx as u64,
+                    client.recv_buf.addr() + offset,
+                    64,
+                    client.recv_mr.lkey(),
+                )
+                .unwrap();
                 recv_idx += 1;
             }
         }
 
         // Send more if needed with 3:1 signaling ratio
         let remaining = iters.saturating_sub(sent);
-        let can_send = (SEND_RECV_QUEUE_DEPTH as u64).saturating_sub(inflight).min(remaining) as usize;
+        let can_send = (SEND_RECV_QUEUE_DEPTH as u64)
+            .saturating_sub(inflight)
+            .min(remaining) as usize;
         let to_send = can_send.min(rx_count);
 
         if to_send > 0 {
@@ -1384,26 +1495,35 @@ where
             for batch in 0..full_batches {
                 // (signal_interval - 1) unsignaled
                 for _ in 0..(signal_interval - 1) {
-                    let _ = emit_wqe!(&ctx, send {
-                        flags: WqeFlags::empty(),
-                        inline: send_data.as_slice(),
-                    });
+                    let _ = emit_wqe!(
+                        &ctx,
+                        send {
+                            flags: WqeFlags::empty(),
+                            inline: send_data.as_slice(),
+                        }
+                    );
                 }
                 // 1 signaled
-                let _ = emit_wqe!(&ctx, send {
-                    flags: WqeFlags::empty(),
-                    inline: send_data.as_slice(),
-                    signaled: batch as u64,
-                });
+                let _ = emit_wqe!(
+                    &ctx,
+                    send {
+                        flags: WqeFlags::empty(),
+                        inline: send_data.as_slice(),
+                        signaled: batch as u64,
+                    }
+                );
             }
 
             // Remainder (all signaled)
             for j in 0..remainder {
-                let _ = emit_wqe!(&ctx, send {
-                    flags: WqeFlags::empty(),
-                    inline: send_data.as_slice(),
-                    signaled: j as u64,
-                });
+                let _ = emit_wqe!(
+                    &ctx,
+                    send {
+                        flags: WqeFlags::empty(),
+                        inline: send_data.as_slice(),
+                        signaled: j as u64,
+                    }
+                );
             }
 
             inflight += to_send as u64;
@@ -1458,26 +1578,35 @@ where
         for batch in 0..full_batches {
             let base = batch * signal_interval;
             for _ in 0..(signal_interval - 1) {
-                let _ = emit_wqe!(&ctx, send {
-                    flags: WqeFlags::empty(),
-                    inline: send_data.as_slice(),
-                });
+                let _ = emit_wqe!(
+                    &ctx,
+                    send {
+                        flags: WqeFlags::empty(),
+                        inline: send_data.as_slice(),
+                    }
+                );
             }
             let idx = base + signal_interval - 1;
-            let _ = emit_wqe!(&ctx, send {
-                flags: WqeFlags::empty(),
-                inline: send_data.as_slice(),
-                signaled: idx as u64,
-            });
+            let _ = emit_wqe!(
+                &ctx,
+                send {
+                    flags: WqeFlags::empty(),
+                    inline: send_data.as_slice(),
+                    signaled: idx as u64,
+                }
+            );
         }
 
         for j in 0..remainder {
             let idx = full_batches * signal_interval + j;
-            let _ = emit_wqe!(&ctx, send {
-                flags: WqeFlags::empty(),
-                inline: send_data.as_slice(),
-                signaled: idx as u64,
-            });
+            let _ = emit_wqe!(
+                &ctx,
+                send {
+                    flags: WqeFlags::empty(),
+                    inline: send_data.as_slice(),
+                    signaled: idx as u64,
+                }
+            );
         }
         qp.ring_sq_doorbell();
     }
@@ -1511,15 +1640,22 @@ where
             for _ in 0..rx_count {
                 let idx = recv_idx % SEND_RECV_QUEUE_DEPTH;
                 let offset = (idx * 64) as u64;
-                qp.post_recv(idx as u64, client.recv_buf.addr() + offset, 64, client.recv_mr.lkey())
-                    .unwrap();
+                qp.post_recv(
+                    idx as u64,
+                    client.recv_buf.addr() + offset,
+                    64,
+                    client.recv_mr.lkey(),
+                )
+                .unwrap();
                 recv_idx += 1;
             }
         }
 
         // Send more, limited by max_inflight
         let remaining = iters.saturating_sub(sent);
-        let can_send = (max_inflight as u64).saturating_sub(inflight).min(remaining) as usize;
+        let can_send = (max_inflight as u64)
+            .saturating_sub(inflight)
+            .min(remaining) as usize;
         let to_send = can_send.min(rx_count);
 
         if to_send > 0 {
@@ -1530,25 +1666,34 @@ where
 
             for _ in 0..full_batches {
                 for _ in 0..(signal_interval - 1) {
-                    let _ = emit_wqe!(&ctx, send {
+                    let _ = emit_wqe!(
+                        &ctx,
+                        send {
+                            flags: WqeFlags::empty(),
+                            inline: send_data.as_slice(),
+                        }
+                    );
+                }
+                let _ = emit_wqe!(
+                    &ctx,
+                    send {
                         flags: WqeFlags::empty(),
                         inline: send_data.as_slice(),
-                    });
-                }
-                let _ = emit_wqe!(&ctx, send {
-                    flags: WqeFlags::empty(),
-                    inline: send_data.as_slice(),
-                    signaled: send_count as u64,
-                });
+                        signaled: send_count as u64,
+                    }
+                );
                 send_count += signal_interval;
             }
 
             for _ in 0..remainder {
-                let _ = emit_wqe!(&ctx, send {
-                    flags: WqeFlags::empty(),
-                    inline: send_data.as_slice(),
-                    signaled: send_count as u64,
-                });
+                let _ = emit_wqe!(
+                    &ctx,
+                    send {
+                        flags: WqeFlags::empty(),
+                        inline: send_data.as_slice(),
+                        signaled: send_count as u64,
+                    }
+                );
                 send_count += 1;
             }
 
@@ -1581,10 +1726,7 @@ where
 }
 
 /// 32B inline send latency benchmark (ping-pong, queue depth = 1).
-fn run_send_latency<SF, RF>(
-    client: &mut SendRecvEndpoint<SF, RF>,
-    iters: u64,
-) -> Duration
+fn run_send_latency<SF, RF>(client: &mut SendRecvEndpoint<SF, RF>, iters: u64) -> Duration
 where
     SF: Fn(Cqe, u64),
     RF: Fn(Cqe, u64),
@@ -1600,11 +1742,15 @@ where
         {
             let qp = client.qp.borrow();
             let ctx = qp.emit_ctx().expect("emit_ctx failed");
-            emit_wqe!(&ctx, send {
-                flags: WqeFlags::empty(),
-                inline: send_data.as_slice(),
-                signaled: idx as u64,
-            }).expect("emit_wqe failed");
+            emit_wqe!(
+                &ctx,
+                send {
+                    flags: WqeFlags::empty(),
+                    inline: send_data.as_slice(),
+                    signaled: idx as u64,
+                }
+            )
+            .expect("emit_wqe failed");
             qp.ring_sq_doorbell();
         }
 
@@ -1620,8 +1766,13 @@ where
                 let qp = client.qp.borrow();
                 let replenish_idx = client.rq_next_idx % SEND_RECV_QUEUE_DEPTH;
                 let replenish_offset = (replenish_idx * 64) as u64;
-                qp.post_recv(replenish_idx as u64, client.recv_buf.addr() + replenish_offset, 64, client.recv_mr.lkey())
-                    .unwrap();
+                qp.post_recv(
+                    replenish_idx as u64,
+                    client.recv_buf.addr() + replenish_offset,
+                    64,
+                    client.recv_mr.lkey(),
+                )
+                .unwrap();
                 qp.ring_rq_doorbell();
                 client.rq_next_idx += 1;
                 break;
@@ -1661,35 +1812,44 @@ where
         for batch in 0..full_batches {
             let base = batch * signal_interval;
             for _ in 0..(signal_interval - 1) {
-                let _ = emit_wqe!(&ctx, write_imm {
+                let _ = emit_wqe!(
+                    &ctx,
+                    write_imm {
+                        flags: WqeFlags::empty(),
+                        remote_addr: remote_addr,
+                        rkey: remote_rkey,
+                        imm: 0u32,
+                        inline: send_data.as_slice(),
+                    }
+                );
+            }
+            let idx = base + signal_interval - 1;
+            let _ = emit_wqe!(
+                &ctx,
+                write_imm {
                     flags: WqeFlags::empty(),
                     remote_addr: remote_addr,
                     rkey: remote_rkey,
                     imm: 0u32,
                     inline: send_data.as_slice(),
-                });
-            }
-            let idx = base + signal_interval - 1;
-            let _ = emit_wqe!(&ctx, write_imm {
-                flags: WqeFlags::empty(),
-                remote_addr: remote_addr,
-                rkey: remote_rkey,
-                imm: 0u32,
-                inline: send_data.as_slice(),
-                signaled: idx as u64,
-            });
+                    signaled: idx as u64,
+                }
+            );
         }
 
         for j in 0..remainder {
             let idx = full_batches * signal_interval + j;
-            let _ = emit_wqe!(&ctx, write_imm {
-                flags: WqeFlags::empty(),
-                remote_addr: remote_addr,
-                rkey: remote_rkey,
-                imm: 0u32,
-                inline: send_data.as_slice(),
-                signaled: idx as u64,
-            });
+            let _ = emit_wqe!(
+                &ctx,
+                write_imm {
+                    flags: WqeFlags::empty(),
+                    remote_addr: remote_addr,
+                    rkey: remote_rkey,
+                    imm: 0u32,
+                    inline: send_data.as_slice(),
+                    signaled: idx as u64,
+                }
+            );
         }
         qp.ring_sq_doorbell();
     }
@@ -1722,15 +1882,22 @@ where
             for _ in 0..rx_count {
                 let idx = recv_idx % SEND_RECV_QUEUE_DEPTH;
                 let offset = (idx * 64) as u64;
-                qp.post_recv(idx as u64, client.recv_buf.addr() + offset, 64, client.recv_mr.lkey())
-                    .unwrap();
+                qp.post_recv(
+                    idx as u64,
+                    client.recv_buf.addr() + offset,
+                    64,
+                    client.recv_mr.lkey(),
+                )
+                .unwrap();
                 recv_idx += 1;
             }
         }
 
         // Send more if needed with 1/4 signaling ratio
         let remaining = iters.saturating_sub(sent);
-        let can_send = (SEND_RECV_QUEUE_DEPTH as u64).saturating_sub(inflight).min(remaining) as usize;
+        let can_send = (SEND_RECV_QUEUE_DEPTH as u64)
+            .saturating_sub(inflight)
+            .min(remaining) as usize;
         let to_send = can_send.min(rx_count);
 
         if to_send > 0 {
@@ -1741,33 +1908,42 @@ where
 
             for batch in 0..full_batches {
                 for _ in 0..(signal_interval - 1) {
-                    let _ = emit_wqe!(&ctx, write_imm {
+                    let _ = emit_wqe!(
+                        &ctx,
+                        write_imm {
+                            flags: WqeFlags::empty(),
+                            remote_addr: remote_addr,
+                            rkey: remote_rkey,
+                            imm: 0u32,
+                            inline: send_data.as_slice(),
+                        }
+                    );
+                }
+                let _ = emit_wqe!(
+                    &ctx,
+                    write_imm {
                         flags: WqeFlags::empty(),
                         remote_addr: remote_addr,
                         rkey: remote_rkey,
                         imm: 0u32,
                         inline: send_data.as_slice(),
-                    });
-                }
-                let _ = emit_wqe!(&ctx, write_imm {
-                    flags: WqeFlags::empty(),
-                    remote_addr: remote_addr,
-                    rkey: remote_rkey,
-                    imm: 0u32,
-                    inline: send_data.as_slice(),
-                    signaled: batch as u64,
-                });
+                        signaled: batch as u64,
+                    }
+                );
             }
 
             for j in 0..remainder {
-                let _ = emit_wqe!(&ctx, write_imm {
-                    flags: WqeFlags::empty(),
-                    remote_addr: remote_addr,
-                    rkey: remote_rkey,
-                    imm: 0u32,
-                    inline: send_data.as_slice(),
-                    signaled: j as u64,
-                });
+                let _ = emit_wqe!(
+                    &ctx,
+                    write_imm {
+                        flags: WqeFlags::empty(),
+                        remote_addr: remote_addr,
+                        rkey: remote_rkey,
+                        imm: 0u32,
+                        inline: send_data.as_slice(),
+                        signaled: j as u64,
+                    }
+                );
             }
 
             inflight += to_send as u64;
@@ -1804,10 +1980,7 @@ where
 
 /// UD 32B inline send throughput benchmark (queue depth = 1024, all signaled).
 /// Note: emit_ud_wqe! macro only supports signaled mode, so all WQEs are signaled.
-fn run_ud_send_inline_throughput(
-    client: &mut UdSendRecvEndpoint,
-    iters: u64,
-) -> Duration {
+fn run_ud_send_inline_throughput(client: &mut UdSendRecvEndpoint, iters: u64) -> Duration {
     let send_data = vec![0xAAu8; SMALL_MSG_SIZE];
     let recv_buf_size = UD_RECV_ENTRY_SIZE as u32;
 
@@ -1821,12 +1994,15 @@ fn run_ud_send_inline_throughput(
         let ctx = qp.emit_ctx().expect("emit_ctx failed");
 
         for i in 0..initial_fill {
-            let _ = emit_ud_wqe!(&ctx, send {
-                av: av,
-                flags: WqeFlags::empty(),
-                inline: send_data.as_slice(),
-                signaled: i as u64,
-            });
+            let _ = emit_ud_wqe!(
+                &ctx,
+                send {
+                    av: av,
+                    flags: WqeFlags::empty(),
+                    inline: send_data.as_slice(),
+                    signaled: i as u64,
+                }
+            );
         }
         qp.ring_sq_doorbell();
     }
@@ -1859,15 +2035,22 @@ fn run_ud_send_inline_throughput(
             for _ in 0..rx_count {
                 let idx = recv_idx % UD_QUEUE_DEPTH;
                 let offset = (idx * UD_RECV_ENTRY_SIZE) as u64;
-                qp.post_recv(idx as u64, client.recv_buf.addr() + offset, recv_buf_size, client.recv_mr.lkey())
-                    .unwrap();
+                qp.post_recv(
+                    idx as u64,
+                    client.recv_buf.addr() + offset,
+                    recv_buf_size,
+                    client.recv_mr.lkey(),
+                )
+                .unwrap();
                 recv_idx += 1;
             }
         }
 
         // Send more if needed (all signaled)
         let remaining = iters.saturating_sub(sent);
-        let can_send = (UD_QUEUE_DEPTH as u64).saturating_sub(inflight).min(remaining) as usize;
+        let can_send = (UD_QUEUE_DEPTH as u64)
+            .saturating_sub(inflight)
+            .min(remaining) as usize;
         let to_send = can_send.min(rx_count);
 
         if to_send > 0 {
@@ -1875,12 +2058,15 @@ fn run_ud_send_inline_throughput(
             let ctx = qp.emit_ctx().expect("emit_ctx failed");
 
             for i in 0..to_send {
-                let _ = emit_ud_wqe!(&ctx, send {
-                    av: av,
-                    flags: WqeFlags::empty(),
-                    inline: send_data.as_slice(),
-                    signaled: i as u64,
-                });
+                let _ = emit_ud_wqe!(
+                    &ctx,
+                    send {
+                        av: av,
+                        flags: WqeFlags::empty(),
+                        inline: send_data.as_slice(),
+                        signaled: i as u64,
+                    }
+                );
             }
 
             inflight += to_send as u64;
@@ -1912,10 +2098,7 @@ fn run_ud_send_inline_throughput(
 }
 
 /// UD 32B inline send latency benchmark (ping-pong, queue depth = 1).
-fn run_ud_send_latency(
-    client: &mut UdSendRecvEndpoint,
-    iters: u64,
-) -> Duration {
+fn run_ud_send_latency(client: &mut UdSendRecvEndpoint, iters: u64) -> Duration {
     let send_data = vec![0xAAu8; SMALL_MSG_SIZE];
     let recv_buf_size = UD_RECV_ENTRY_SIZE as u32;
     let av = UdAvIb::new(client.remote_qpn, client.qkey, client.remote_lid);
@@ -1929,12 +2112,16 @@ fn run_ud_send_latency(
         {
             let qp = client.qp.borrow();
             let ctx = qp.emit_ctx().expect("emit_ctx failed");
-            emit_ud_wqe!(&ctx, send {
-                av: av,
-                flags: WqeFlags::empty(),
-                inline: send_data.as_slice(),
-                signaled: idx as u64,
-            }).expect("emit_wqe failed");
+            emit_ud_wqe!(
+                &ctx,
+                send {
+                    av: av,
+                    flags: WqeFlags::empty(),
+                    inline: send_data.as_slice(),
+                    signaled: idx as u64,
+                }
+            )
+            .expect("emit_wqe failed");
             qp.ring_sq_doorbell();
         }
 
@@ -1949,8 +2136,13 @@ fn run_ud_send_latency(
                 let qp = client.qp.borrow();
                 let replenish_idx = client.rq_next_idx % UD_QUEUE_DEPTH;
                 let replenish_offset = (replenish_idx * UD_RECV_ENTRY_SIZE) as u64;
-                qp.post_recv(replenish_idx as u64, client.recv_buf.addr() + replenish_offset, recv_buf_size, client.recv_mr.lkey())
-                    .unwrap();
+                qp.post_recv(
+                    replenish_idx as u64,
+                    client.recv_buf.addr() + replenish_offset,
+                    recv_buf_size,
+                    client.recv_mr.lkey(),
+                )
+                .unwrap();
                 qp.ring_rq_doorbell();
                 client.rq_next_idx += 1;
                 break;
@@ -1975,7 +2167,11 @@ where
     let rkey = endpoint.remote_mr.rkey();
     let local_addr = endpoint.local_buf.addr();
     let lkey = endpoint.local_mr.lkey();
-    let wqe_flags = if relaxed { WqeFlags::RELAXED_ORDERING } else { WqeFlags::empty() };
+    let wqe_flags = if relaxed {
+        WqeFlags::RELAXED_ORDERING
+    } else {
+        WqeFlags::empty()
+    };
     // Use min of configured interval and iters to handle small iteration counts
     let signal_interval = RDMA_SIGNAL_INTERVAL.min(iters as usize).max(1);
 
@@ -2025,7 +2221,8 @@ where
                         rkey: rkey,
                         sge: { addr: local_addr, len: RDMA_MSG_SIZE as u32, lkey: lkey },
                         signaled: send_idx as u64,
-                    }).expect("emit_wqe failed");
+                    })
+                    .expect("emit_wqe failed");
                     signals_posted += 1;
                 } else {
                     emit_wqe!(&ctx, write {
@@ -2033,7 +2230,8 @@ where
                         remote_addr: remote_addr,
                         rkey: rkey,
                         sge: { addr: local_addr, len: RDMA_MSG_SIZE as u32, lkey: lkey },
-                    }).expect("emit_wqe failed");
+                    })
+                    .expect("emit_wqe failed");
                 }
                 send_idx += 1;
                 posted += 1;
@@ -2060,7 +2258,11 @@ where
     let rkey = endpoint.remote_mr.rkey();
     let local_addr = endpoint.local_buf.addr();
     let lkey = endpoint.local_mr.lkey();
-    let wqe_flags = if relaxed { WqeFlags::RELAXED_ORDERING } else { WqeFlags::empty() };
+    let wqe_flags = if relaxed {
+        WqeFlags::RELAXED_ORDERING
+    } else {
+        WqeFlags::empty()
+    };
     // Use min of configured interval and iters to handle small iteration counts
     let signal_interval = RDMA_SIGNAL_INTERVAL.min(iters as usize).max(1);
 
@@ -2110,7 +2312,8 @@ where
                         rkey: rkey,
                         sge: { addr: local_addr, len: RDMA_MSG_SIZE as u32, lkey: lkey },
                         signaled: send_idx as u64,
-                    }).expect("emit_wqe failed");
+                    })
+                    .expect("emit_wqe failed");
                     signals_posted += 1;
                 } else {
                     emit_wqe!(&ctx, read {
@@ -2118,7 +2321,8 @@ where
                         remote_addr: remote_addr,
                         rkey: rkey,
                         sge: { addr: local_addr, len: RDMA_MSG_SIZE as u32, lkey: lkey },
-                    }).expect("emit_wqe failed");
+                    })
+                    .expect("emit_wqe failed");
                 }
                 send_idx += 1;
                 posted += 1;
@@ -2157,9 +2361,7 @@ fn bench_send_inline_32b(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     group.bench_function("32B", |b| {
-        b.iter_custom(|iters| {
-            run_send_inline_throughput(&mut client.borrow_mut(), iters)
-        });
+        b.iter_custom(|iters| run_send_inline_throughput(&mut client.borrow_mut(), iters));
     });
 
     group.finish();
@@ -2217,9 +2419,7 @@ fn bench_send_latency_32b(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     group.bench_function("32B", |b| {
-        b.iter_custom(|iters| {
-            run_send_latency(&mut client.borrow_mut(), iters)
-        });
+        b.iter_custom(|iters| run_send_latency(&mut client.borrow_mut(), iters));
     });
 
     group.finish();
@@ -2246,9 +2446,7 @@ fn bench_write_1m(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(RDMA_MSG_SIZE as u64));
 
     group.bench_function("normal", |b| {
-        b.iter_custom(|iters| {
-            run_write_1m(&mut endpoint.borrow_mut(), iters, false)
-        });
+        b.iter_custom(|iters| run_write_1m(&mut endpoint.borrow_mut(), iters, false));
     });
 
     group.finish();
@@ -2275,9 +2473,7 @@ fn bench_write_1m_relaxed(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(RDMA_MSG_SIZE as u64));
 
     group.bench_function("relaxed", |b| {
-        b.iter_custom(|iters| {
-            run_write_1m(&mut endpoint.borrow_mut(), iters, true)
-        });
+        b.iter_custom(|iters| run_write_1m(&mut endpoint.borrow_mut(), iters, true));
     });
 
     group.finish();
@@ -2304,9 +2500,7 @@ fn bench_read_1m(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(RDMA_MSG_SIZE as u64));
 
     group.bench_function("normal", |b| {
-        b.iter_custom(|iters| {
-            run_read_1m(&mut endpoint.borrow_mut(), iters, false)
-        });
+        b.iter_custom(|iters| run_read_1m(&mut endpoint.borrow_mut(), iters, false));
     });
 
     group.finish();
@@ -2333,9 +2527,7 @@ fn bench_read_1m_relaxed(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(RDMA_MSG_SIZE as u64));
 
     group.bench_function("relaxed", |b| {
-        b.iter_custom(|iters| {
-            run_read_1m(&mut endpoint.borrow_mut(), iters, true)
-        });
+        b.iter_custom(|iters| run_read_1m(&mut endpoint.borrow_mut(), iters, true));
     });
 
     group.finish();
@@ -2367,9 +2559,7 @@ fn bench_ud_send_inline_32b(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     group.bench_function("32B", |b| {
-        b.iter_custom(|iters| {
-            run_ud_send_inline_throughput(&mut client.borrow_mut(), iters)
-        });
+        b.iter_custom(|iters| run_ud_send_inline_throughput(&mut client.borrow_mut(), iters));
     });
 
     group.finish();
@@ -2397,9 +2587,7 @@ fn bench_ud_send_latency_32b(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     group.bench_function("32B", |b| {
-        b.iter_custom(|iters| {
-            run_ud_send_latency(&mut client.borrow_mut(), iters)
-        });
+        b.iter_custom(|iters| run_ud_send_latency(&mut client.borrow_mut(), iters));
     });
 
     group.finish();
@@ -2431,9 +2619,7 @@ fn bench_write_imm_inline_32b(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     group.bench_function("32B", |b| {
-        b.iter_custom(|iters| {
-            run_write_imm_inline_throughput(&mut client.borrow_mut(), iters)
-        });
+        b.iter_custom(|iters| run_write_imm_inline_throughput(&mut client.borrow_mut(), iters));
     });
 
     group.finish();

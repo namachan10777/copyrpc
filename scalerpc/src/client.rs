@@ -56,8 +56,7 @@ fn next_req_id() -> u64 {
 }
 
 /// Client state in the ScaleRPC protocol (Figure 7).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClientState {
     /// Initial state before first request.
     #[default]
@@ -69,7 +68,6 @@ pub enum ClientState {
     /// Group switched out, waiting for next time slice.
     Idle,
 }
-
 
 /// Local request buffer for warmup mechanism.
 ///
@@ -400,13 +398,15 @@ impl RpcClient {
         self.connection_states
             .get(conn_id)
             .and_then(|s| s.as_ref())
-            .map(|s| (
-                s.pending_notification.get(),
-                s.endpoint_entry_seq.get(),
-                s.last_acknowledged_seq.get(),
-                s.warmup_buffer.borrow().request_count(),
-                s.last_notified_count.get(),
-            ))
+            .map(|s| {
+                (
+                    s.pending_notification.get(),
+                    s.endpoint_entry_seq.get(),
+                    s.last_acknowledged_seq.get(),
+                    s.warmup_buffer.borrow().request_count(),
+                    s.last_notified_count.get(),
+                )
+            })
     }
 
     /// Get the event buffer address for a connection.
@@ -455,7 +455,16 @@ impl RpcClient {
 
         let send_cq = self.shared_send_cq.as_ref().unwrap().clone();
         let recv_cq = self.shared_recv_cq.as_ref().unwrap().clone();
-        let conn = Connection::new(ctx, pd, conn_id, port, send_cq, recv_cq, sq_callback, rq_callback)?;
+        let conn = Connection::new(
+            ctx,
+            pd,
+            conn_id,
+            port,
+            send_cq,
+            recv_cq,
+            sq_callback,
+            rq_callback,
+        )?;
 
         // Register with mapping
         {
@@ -543,7 +552,8 @@ impl RpcClient {
             .ok_or(Error::ConnectionNotFound(conn_id))?;
 
         // Store remote slot info in mapping
-        self.mapping.borrow_mut()
+        self.mapping
+            .borrow_mut()
             .set_remote_slot(conn_id, remote.slot_addr, remote.slot_rkey)?;
 
         // Store endpoint entry info for warmup notification and server info
@@ -553,7 +563,9 @@ impl RpcClient {
             state.server_conn_id.set(remote.server_conn_id);
             // Store server's pool size for call_direct slot cycling
             if remote.pool_num_slots > 0 {
-                state.server_pool_num_slots.set(remote.pool_num_slots as usize);
+                state
+                    .server_pool_num_slots
+                    .set(remote.pool_num_slots as usize);
                 // Initialize credit window size to match server pool size
                 state.credit_window_size.set(remote.pool_num_slots as usize);
             }
@@ -973,7 +985,9 @@ impl RpcClient {
             } else {
                 conn_state.direct_slot_index.get() % server_pool_size
             };
-            conn_state.direct_slot_index.set(conn_state.direct_slot_index.get() + 1);
+            conn_state
+                .direct_slot_index
+                .set(conn_state.direct_slot_index.get() + 1);
 
             (remote_base_addr, remote_rkey, server_slot_idx)
         };
@@ -983,10 +997,15 @@ impl RpcClient {
 
         // Use pre-allocated response slot (ring buffer, no Mutex lock needed)
         // The ring buffer is sized larger than pipeline depth to avoid reuse before response arrives
-        let response_slot_idx = conn_state.response_slot_index.get() % conn_state.response_slots.len();
-        conn_state.response_slot_index.set(conn_state.response_slot_index.get() + 1);
+        let response_slot_idx =
+            conn_state.response_slot_index.get() % conn_state.response_slots.len();
+        conn_state
+            .response_slot_index
+            .set(conn_state.response_slot_index.get() + 1);
         let response_slot_index = conn_state.response_slots[response_slot_idx];
-        let response_slot_addr = self.pool.slot_data_addr(response_slot_index)
+        let response_slot_addr = self
+            .pool
+            .slot_data_addr(response_slot_index)
             .ok_or(Error::InvalidSlotIndex(response_slot_index))?;
 
         let req_id = next_req_id();
@@ -1009,10 +1028,14 @@ impl RpcClient {
         let send_slot_idx = conn_state.direct_send_slot_index.get() % conn_state.send_slots.len();
         conn_state.direct_send_slot_index.set(send_slot_idx + 1);
         let local_slot_index = conn_state.send_slots[send_slot_idx];
-        let local_slot = self.pool.get_slot(local_slot_index)
+        let local_slot = self
+            .pool
+            .get_slot(local_slot_index)
             .ok_or(Error::InvalidSlotIndex(local_slot_index))?;
         let local_slot_ptr = local_slot.data_ptr();
-        let local_slot_addr = self.pool.slot_data_addr(local_slot_index)
+        let local_slot_addr = self
+            .pool
+            .slot_data_addr(local_slot_index)
             .ok_or(Error::InvalidSlotIndex(local_slot_index))?;
 
         // Write request to local buffer
@@ -1034,7 +1057,7 @@ impl RpcClient {
         // Calculate remote address for this slot
         // The server slot address is: base_addr + slot_idx * slot_size
         // Note: slot_size is 4096 (16 byte header + 4080 byte data), not MESSAGE_BLOCK_SIZE (4080)
-        const SLOT_SIZE: usize = 4096;  // Must match pool::DEFAULT_SLOT_SIZE
+        const SLOT_SIZE: usize = 4096; // Must match pool::DEFAULT_SLOT_SIZE
         let remote_slot_addr = remote_base_addr + (server_slot_idx * SLOT_SIZE) as u64;
 
         // RDMA WRITE to server's processing pool
@@ -1224,7 +1247,11 @@ impl RpcClient {
         ) {
             if let Some(Some(state)) = self.connection_states.get(conn_id) {
                 // Update mapping with new processing pool address
-                if let Ok(()) = self.mapping.borrow_mut().set_remote_slot(conn_id, pool_addr, pool_rkey) {
+                if let Ok(()) = self
+                    .mapping
+                    .borrow_mut()
+                    .set_remote_slot(conn_id, pool_addr, pool_rkey)
+                {
                     // Transition to Process state
                     state.state.set(ClientState::Process);
                     // Note: direct_slot_index is set in check_events() when it processes
@@ -1235,7 +1262,9 @@ impl RpcClient {
         }
 
         // Then handle context switch sequence tracking (for state cleanup and Idle transitions)
-        if let (Some(sched_seq), Some(fetched_seq)) = (response.context_switch_seq(), response.fetched_seq()) {
+        if let (Some(sched_seq), Some(fetched_seq)) =
+            (response.context_switch_seq(), response.fetched_seq())
+        {
             if let Some(Some(state)) = self.connection_states.get(conn_id) {
                 // We use fetched_seq (not sched_seq) to track what the server has acknowledged.
                 // This allows both event buffer and piggybacked responses to process independently.
@@ -1489,9 +1518,7 @@ impl RpcResponse {
 
     /// Get the payload data.
     pub fn payload(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(self.payload_ptr, self.header.payload_len as usize)
-        }
+        unsafe { std::slice::from_raw_parts(self.payload_ptr, self.header.payload_len as usize) }
     }
 
     /// Copy payload to a buffer.

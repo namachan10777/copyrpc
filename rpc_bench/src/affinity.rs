@@ -19,7 +19,11 @@ fn core_for_thread(
         offset <= start_core,
         "Affinity error: need core offset {} but start_core is {} \
          (local_rank={}, threads_per_rank={}, thread_index={})",
-        offset, start_core, local_rank, threads_per_rank, thread_index
+        offset,
+        start_core,
+        local_rank,
+        threads_per_rank,
+        thread_index
     );
     start_core - offset
 }
@@ -28,9 +32,10 @@ fn core_for_thread(
 /// Uses OMPI_COMM_WORLD_LOCAL_RANK (OpenMPI), falling back to global MPI rank.
 fn get_local_rank(mpi_rank: i32) -> usize {
     if let Ok(val) = std::env::var("OMPI_COMM_WORLD_LOCAL_RANK")
-        && let Ok(lr) = val.parse::<usize>() {
-            return lr;
-        }
+        && let Ok(lr) = val.parse::<usize>()
+    {
+        return lr;
+    }
     mpi_rank as usize
 }
 

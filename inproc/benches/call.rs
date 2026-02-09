@@ -4,11 +4,13 @@
 //! Tests the bidirectional RPC pattern with proper flow control.
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use inproc::Serial;
+use mempc::{
+    FastForwardMpsc, LamportMpsc, MpscCaller, MpscChannel, MpscRecvRef, MpscServer, OnesidedMpsc,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use inproc::Serial;
-use mempc::{MpscCaller, MpscChannel, MpscRecvRef, MpscServer, OnesidedMpsc, FastForwardMpsc, LamportMpsc};
 
 fn pin_to_core(core_id: usize) {
     core_affinity::set_for_current(core_affinity::CoreId { id: core_id });

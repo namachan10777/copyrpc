@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use mpi::collective::CommunicatorCollectives;
 
+use crate::Cli;
 use crate::affinity;
 use crate::epoch::EpochCollector;
 use crate::message::{RemoteResponse, Request, Response};
@@ -24,7 +25,6 @@ use crate::parquet_out;
 use crate::storage::ShardedStore;
 use crate::ucx_am::{UcpContext, UcpEndpoint, UcpWorker};
 use crate::workload::AccessEntry;
-use crate::Cli;
 
 // === Connection info (fixed-size for MPI exchange) ===
 
@@ -134,8 +134,7 @@ unsafe extern "C" fn daemon_am_recv_cb(
     _length: usize,
     _param: *const ucx_sys::ucp_am_recv_param_t,
 ) -> ucx_sys::ucs_status_t {
-    let header_bytes =
-        unsafe { std::slice::from_raw_parts(header as *const u8, header_length) };
+    let header_bytes = unsafe { std::slice::from_raw_parts(header as *const u8, header_length) };
     let ucx_req = UcxNetworkRequest::from_bytes(header_bytes);
     UCX_RECV_QUEUE.with(|q| {
         q.borrow_mut().push((ucx_req.sender_id, ucx_req.request));
@@ -173,8 +172,13 @@ pub fn run_ucx_am(
     // CPU affinity
     let available_cores = affinity::get_available_cores(cli.device_index);
     let (ranks_on_node, rank_on_node) = crate::mpi_util::node_local_rank(world);
-    let (daemon_cores, client_cores) =
-        affinity::assign_cores(&available_cores, num_daemons, num_clients, ranks_on_node, rank_on_node);
+    let (daemon_cores, client_cores) = affinity::assign_cores(
+        &available_cores,
+        num_daemons,
+        num_clients,
+        ranks_on_node,
+        rank_on_node,
+    );
 
     // Generate access patterns
     let pattern_len = 10000;

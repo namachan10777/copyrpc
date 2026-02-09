@@ -14,8 +14,8 @@ use crate::serial::Serial;
 use crate::{CallError, MpscCaller, MpscChannel, MpscServer, ReplyToken};
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // ============================================================================
 // Cache-line padding
@@ -145,8 +145,7 @@ impl<T> RequestRing<T> {
         let token = tail as u64;
 
         // Free slot for next cycle (seq = tail + capacity)
-        slot.seq
-            .store(tail + self.capacity, Ordering::Release);
+        slot.seq.store(tail + self.capacity, Ordering::Release);
         self.tail.store(tail + 1, Ordering::Release);
 
         Some((caller_id, data, token))
@@ -382,7 +381,10 @@ impl<Req: Serial, Resp: Serial> crate::MpscRecvRef<Req> for FetchAddRecvRef<'_, 
 }
 
 impl<Req: Serial, Resp: Serial> MpscServer<Req, Resp> for FetchAddServer<Req, Resp> {
-    type RecvRef<'a> = FetchAddRecvRef<'a, Req, Resp> where Self: 'a;
+    type RecvRef<'a>
+        = FetchAddRecvRef<'a, Req, Resp>
+    where
+        Self: 'a;
 
     fn poll(&mut self) -> u32 {
         self.req_ring.available() as u32
@@ -476,8 +478,7 @@ mod tests {
 
     #[test]
     fn basic_single_caller() {
-        let (mut callers, mut server) =
-            FetchAddMpsc::create::<u64, u64>(1, 16, 16);
+        let (mut callers, mut server) = FetchAddMpsc::create::<u64, u64>(1, 16, 16);
         let caller = &mut callers[0];
 
         // Send request
@@ -503,8 +504,7 @@ mod tests {
 
     #[test]
     fn multi_caller_concurrent() {
-        let (mut callers, mut server) =
-            FetchAddMpsc::create::<u64, u64>(4, 16, 8);
+        let (mut callers, mut server) = FetchAddMpsc::create::<u64, u64>(4, 16, 8);
 
         // Each caller sends 2 requests
         for (i, caller) in callers.iter_mut().enumerate() {
@@ -542,8 +542,7 @@ mod tests {
 
     #[test]
     fn ring_wraparound() {
-        let (mut callers, mut server) =
-            FetchAddMpsc::create::<u64, u64>(1, 8, 8);
+        let (mut callers, mut server) = FetchAddMpsc::create::<u64, u64>(1, 8, 8);
         let caller = &mut callers[0];
 
         // Fill and drain ring multiple times
@@ -568,8 +567,7 @@ mod tests {
 
     #[test]
     fn inflight_limit() {
-        let (mut callers, _server) =
-            FetchAddMpsc::create::<u64, u64>(1, 16, 4);
+        let (mut callers, _server) = FetchAddMpsc::create::<u64, u64>(1, 16, 4);
         let caller = &mut callers[0];
 
         // Send up to limit
@@ -586,8 +584,7 @@ mod tests {
 
     #[test]
     fn zero_copy_recv_ref() {
-        let (mut callers, mut server) =
-            FetchAddMpsc::create::<u64, u64>(1, 16, 16);
+        let (mut callers, mut server) = FetchAddMpsc::create::<u64, u64>(1, 16, 16);
         let caller = &mut callers[0];
 
         caller.call(999).unwrap();
@@ -604,8 +601,7 @@ mod tests {
 
     #[test]
     fn deferred_reply() {
-        let (mut callers, mut server) =
-            FetchAddMpsc::create::<u64, u64>(2, 16, 8);
+        let (mut callers, mut server) = FetchAddMpsc::create::<u64, u64>(2, 16, 8);
 
         // Send from both callers
         callers[0].call(10).unwrap();
@@ -636,8 +632,7 @@ mod tests {
     fn full_ring() {
         // With fetch_add design, senders spin when ring is full.
         // Use inflight limit to prevent blocking.
-        let (mut callers, _server) =
-            FetchAddMpsc::create::<u64, u64>(1, 4, 4);
+        let (mut callers, _server) = FetchAddMpsc::create::<u64, u64>(1, 4, 4);
         let caller = &mut callers[0];
 
         // Fill ring up to inflight limit
@@ -654,8 +649,7 @@ mod tests {
 
     #[test]
     fn disconnect_detection() {
-        let (mut callers, server) =
-            FetchAddMpsc::create::<u64, u64>(1, 16, 16);
+        let (mut callers, server) = FetchAddMpsc::create::<u64, u64>(1, 16, 16);
 
         drop(server);
 
@@ -668,8 +662,7 @@ mod tests {
 
     #[test]
     fn stress_multi_caller() {
-        let (callers, mut server) =
-            FetchAddMpsc::create::<u64, u64>(8, 256, 32);
+        let (callers, mut server) = FetchAddMpsc::create::<u64, u64>(8, 256, 32);
 
         const MSGS_PER_CALLER: usize = 100;
 

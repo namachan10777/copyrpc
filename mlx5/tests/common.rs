@@ -190,11 +190,7 @@ mod inline {
         }
     }
 
-    pub fn poll_cq_batch(
-        cq: &Cq,
-        count: usize,
-        timeout_ms: u64,
-    ) -> Result<Vec<Cqe>, String> {
+    pub fn poll_cq_batch(cq: &Cq, count: usize, timeout_ms: u64) -> Result<Vec<Cqe>, String> {
         let mut completions_count = 0;
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_millis(timeout_ms);

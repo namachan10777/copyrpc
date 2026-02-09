@@ -1,5 +1,5 @@
-use nix::fcntl::{open, OFlag};
-use nix::sys::mman::{mmap, munmap, MapFlags, ProtFlags};
+use nix::fcntl::{OFlag, open};
+use nix::sys::mman::{MapFlags, ProtFlags, mmap, munmap};
 use nix::sys::stat::Mode;
 use nix::unistd::close;
 use std::io;
@@ -117,7 +117,10 @@ mod tests {
         unsafe {
             let region = DevDaxRegion::open(path).expect("failed to open devdax device");
             assert!(region.len() > 0, "device size should be non-zero");
-            assert!(!region.as_ptr().is_null(), "mapped pointer should be non-null");
+            assert!(
+                !region.as_ptr().is_null(),
+                "mapped pointer should be non-null"
+            );
 
             // Try writing and reading back
             let ptr = region.as_ptr();

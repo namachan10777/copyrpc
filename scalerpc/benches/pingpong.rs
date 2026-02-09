@@ -29,10 +29,8 @@ use mlx5::device::{Context, DeviceList};
 use mlx5::pd::Pd;
 use mlx5::types::PortAttr;
 
-use scalerpc::{
-    ClientConfig, GroupConfig, PoolConfig, RpcClient, RpcServer, ServerConfig,
-};
 use scalerpc::connection::RemoteEndpoint;
+use scalerpc::{ClientConfig, GroupConfig, PoolConfig, RpcClient, RpcServer, ServerConfig};
 
 fn pin_to_core(core_id: usize) {
     core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
@@ -237,7 +235,9 @@ fn setup_benchmark(config: &BenchConfig) -> Option<BenchmarkSetup> {
     };
 
     let mut client = RpcClient::new(&test_ctx.pd, client_config).ok()?;
-    let conn_id = client.add_connection(&test_ctx.ctx, &test_ctx.pd, test_ctx.port).ok()?;
+    let conn_id = client
+        .add_connection(&test_ctx.ctx, &test_ctx.pd, test_ctx.port)
+        .ok()?;
 
     let client_endpoint = client.local_endpoint(conn_id).ok()?;
     let client_info: ConnectionInfo = client_endpoint.into();
@@ -256,7 +256,13 @@ fn setup_benchmark(config: &BenchConfig) -> Option<BenchmarkSetup> {
     let server_config = config.clone();
     let handle = thread::spawn(move || {
         pin_to_core(14);
-        server_thread_main(&server_config, server_info_tx, client_info_rx, server_ready_clone, server_stop);
+        server_thread_main(
+            &server_config,
+            server_info_tx,
+            client_info_rx,
+            server_ready_clone,
+            server_stop,
+        );
     });
 
     client_info_tx.send(client_info).ok()?;
@@ -319,7 +325,7 @@ fn server_thread_main(
         },
         num_recv_slots: 256,
         group: GroupConfig {
-            num_groups: 1,  // Single QP test uses 1 group
+            num_groups: 1, // Single QP test uses 1 group
             ..GroupConfig::default()
         },
         max_connections: 1, // Single QP test uses 1 connection
@@ -433,8 +439,13 @@ fn run_throughput_bench(
     let timeout = Duration::from_secs(10);
     while completed < iters {
         if start.elapsed() > timeout {
-            eprintln!("[bench] TIMEOUT: completed={}/{}, sent={}, pending={}",
-                     completed, iters, sent, pending_requests.len());
+            eprintln!(
+                "[bench] TIMEOUT: completed={}/{}, sent={}, pending={}",
+                completed,
+                iters,
+                sent,
+                pending_requests.len()
+            );
             break;
         }
         // Check for completed requests
@@ -578,17 +589,23 @@ fn setup_multi_qp_benchmark(config: &BenchConfig) -> Option<MultiQpBenchmarkSetu
     let mut client_infos = Vec::with_capacity(num_qps);
 
     for _ in 0..num_qps {
-        let conn_id = client.add_connection(&test_ctx.ctx, &test_ctx.pd, test_ctx.port).ok()?;
+        let conn_id = client
+            .add_connection(&test_ctx.ctx, &test_ctx.pd, test_ctx.port)
+            .ok()?;
         let endpoint = client.local_endpoint(conn_id).ok()?;
         conn_ids.push(conn_id);
         client_infos.push(endpoint.into());
     }
 
     // Setup communication channels for multi-QP
-    let (server_info_tx, server_info_rx): (Sender<Vec<ConnectionInfo>>, Receiver<Vec<ConnectionInfo>>) =
-        mpsc::channel();
-    let (client_info_tx, client_info_rx): (Sender<Vec<ConnectionInfo>>, Receiver<Vec<ConnectionInfo>>) =
-        mpsc::channel();
+    let (server_info_tx, server_info_rx): (
+        Sender<Vec<ConnectionInfo>>,
+        Receiver<Vec<ConnectionInfo>>,
+    ) = mpsc::channel();
+    let (client_info_tx, client_info_rx): (
+        Sender<Vec<ConnectionInfo>>,
+        Receiver<Vec<ConnectionInfo>>,
+    ) = mpsc::channel();
     let server_ready = Arc::new(AtomicU32::new(0));
     let server_ready_clone = server_ready.clone();
 
@@ -598,7 +615,13 @@ fn setup_multi_qp_benchmark(config: &BenchConfig) -> Option<MultiQpBenchmarkSetu
     let server_config = config.clone();
     let handle = thread::spawn(move || {
         pin_to_core(14);
-        multi_qp_server_thread_main(&server_config, server_info_tx, client_info_rx, server_ready_clone, server_stop);
+        multi_qp_server_thread_main(
+            &server_config,
+            server_info_tx,
+            client_info_rx,
+            server_ready_clone,
+            server_stop,
+        );
     });
 
     client_info_tx.send(client_infos).ok()?;
@@ -731,7 +754,8 @@ fn run_multi_qp_throughput_bench(
     pipeline_depth: usize,
 ) -> Duration {
     let request_data = vec![0xAAu8; msg_size];
-    let mut pending_requests: Vec<(usize, scalerpc::PendingRpc<'_>)> = Vec::with_capacity(pipeline_depth);
+    let mut pending_requests: Vec<(usize, scalerpc::PendingRpc<'_>)> =
+        Vec::with_capacity(pipeline_depth);
     let mut completed = 0u64;
     let mut sent = 0u64;
     let num_qps = conn_ids.len();
@@ -807,20 +831,44 @@ fn bench_multi_qp_throughput(c: &mut Criterion) {
     // Multi-QP, 32B messages
     // Format: {qps}qp_{groups}g_{slots}s_d{depth}
     group.bench_function(
-        BenchmarkId::new(format!("{}qp_{}g_{}s_d{}", num_qps, config.num_groups, num_slots, pipeline_depth), "32B"),
+        BenchmarkId::new(
+            format!(
+                "{}qp_{}g_{}s_d{}",
+                num_qps, config.num_groups, num_slots, pipeline_depth
+            ),
+            "32B",
+        ),
         |b| {
             b.iter_custom(|iters| {
-                run_multi_qp_throughput_bench(&client, &conn_ids, SMALL_MSG_SIZE, iters, pipeline_depth)
+                run_multi_qp_throughput_bench(
+                    &client,
+                    &conn_ids,
+                    SMALL_MSG_SIZE,
+                    iters,
+                    pipeline_depth,
+                )
             });
         },
     );
 
     // Multi-QP, 4KB messages
     group.bench_function(
-        BenchmarkId::new(format!("{}qp_{}g_{}s_d{}", num_qps, config.num_groups, num_slots, pipeline_depth), "4KB"),
+        BenchmarkId::new(
+            format!(
+                "{}qp_{}g_{}s_d{}",
+                num_qps, config.num_groups, num_slots, pipeline_depth
+            ),
+            "4KB",
+        ),
         |b| {
             b.iter_custom(|iters| {
-                run_multi_qp_throughput_bench(&client, &conn_ids, LARGE_MSG_SIZE, iters, pipeline_depth)
+                run_multi_qp_throughput_bench(
+                    &client,
+                    &conn_ids,
+                    LARGE_MSG_SIZE,
+                    iters,
+                    pipeline_depth,
+                )
             });
         },
     );
@@ -828,5 +876,10 @@ fn bench_multi_qp_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_latency, bench_throughput, bench_multi_qp_throughput);
+criterion_group!(
+    benches,
+    bench_latency,
+    bench_throughput,
+    bench_multi_qp_throughput
+);
 criterion_main!(benches);

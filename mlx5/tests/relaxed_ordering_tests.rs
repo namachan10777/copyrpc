@@ -23,7 +23,7 @@ use mlx5::qp::{RcQpConfig, RcQpIb};
 use mlx5::transport::IbRemoteQpInfo;
 use mlx5::wqe::WqeFlags;
 
-use common::{full_access, poll_cq_batch, AlignedBuffer, TestContext};
+use common::{AlignedBuffer, TestContext, full_access, poll_cq_batch};
 
 /// Callback type alias for tests
 type TestCallback = fn(mlx5::cq::Cqe, u64);
@@ -178,7 +178,8 @@ fn test_fence_ordering() {
                 rkey: remote_mr.rkey(),
                 sge: { addr: local_read_buf.addr(), len: 8, lkey: local_read_mr.lkey() },
                 signaled: i * 2 - 1,
-            }).expect("emit_wqe failed");
+            })
+            .expect("emit_wqe failed");
 
             qp_ref.ring_sq_doorbell();
         }
@@ -202,7 +203,8 @@ fn test_fence_ordering() {
                 rkey: remote_mr.rkey(),
                 sge: { addr: local_write_buf.addr(), len: 8, lkey: local_write_mr.lkey() },
                 signaled: i * 2,
-            }).expect("emit_wqe failed");
+            })
+            .expect("emit_wqe failed");
 
             qp_ref.ring_sq_doorbell();
         }
@@ -212,7 +214,10 @@ fn test_fence_ordering() {
     }
 
     // Verify: read values should be monotonically increasing (0, 1, 2, ... N-1)
-    println!("Read values: {:?}", &read_values[..10.min(read_values.len())]);
+    println!(
+        "Read values: {:?}",
+        &read_values[..10.min(read_values.len())]
+    );
 
     for (idx, &val) in read_values.iter().enumerate() {
         assert_eq!(
@@ -313,7 +318,8 @@ fn test_relaxed_ordering_variants() {
                     rkey: remote_mr.rkey(),
                     sge: { addr: local_write_buf.addr(), len: 8, lkey: local_write_mr.lkey() },
                     signaled: i * 2 - 1,
-                }).expect("emit_wqe failed");
+                })
+                .expect("emit_wqe failed");
 
                 qp_ref.ring_sq_doorbell();
             }
@@ -331,7 +337,8 @@ fn test_relaxed_ordering_variants() {
                     rkey: remote_mr.rkey(),
                     sge: { addr: local_read_buf.addr(), len: 8, lkey: local_read_mr.lkey() },
                     signaled: i * 2,
-                }).expect("emit_wqe failed");
+                })
+                .expect("emit_wqe failed");
 
                 qp_ref.ring_sq_doorbell();
             }
@@ -385,7 +392,11 @@ fn test_fence_with_relaxed_mr() {
     };
     let local_read_mr = unsafe {
         ctx.pd
-            .register(local_read_buf.as_ptr(), local_read_buf.size(), relaxed_access)
+            .register(
+                local_read_buf.as_ptr(),
+                local_read_buf.size(),
+                relaxed_access,
+            )
             .expect("Failed to register local read MR")
     };
     let local_write_mr = unsafe {
@@ -423,7 +434,8 @@ fn test_fence_with_relaxed_mr() {
                 rkey: remote_mr.rkey(),
                 sge: { addr: local_read_buf.addr(), len: 8, lkey: local_read_mr.lkey() },
                 signaled: i * 2 - 1,
-            }).expect("emit_wqe failed");
+            })
+            .expect("emit_wqe failed");
 
             qp_ref.ring_sq_doorbell();
         }
@@ -445,7 +457,8 @@ fn test_fence_with_relaxed_mr() {
                 rkey: remote_mr.rkey(),
                 sge: { addr: local_write_buf.addr(), len: 8, lkey: local_write_mr.lkey() },
                 signaled: i * 2,
-            }).expect("emit_wqe failed");
+            })
+            .expect("emit_wqe failed");
 
             qp_ref.ring_sq_doorbell();
         }
@@ -488,7 +501,8 @@ fn test_fence_batched_read_write() {
     let access = full_access();
 
     let mut remote_buf = AlignedBuffer::new(4096);
-    let mut local_read_bufs: Vec<AlignedBuffer> = (0..10).map(|_| AlignedBuffer::new(4096)).collect();
+    let mut local_read_bufs: Vec<AlignedBuffer> =
+        (0..10).map(|_| AlignedBuffer::new(4096)).collect();
     let mut local_write_bufs: Vec<AlignedBuffer> =
         (0..10).map(|_| AlignedBuffer::new(4096)).collect();
 
@@ -545,7 +559,8 @@ fn test_fence_batched_read_write() {
                 rkey: remote_mr.rkey(),
                 sge: { addr: local_read_bufs[i].addr(), len: 8, lkey: local_read_mrs[i].lkey() },
                 signaled: (i * 2) as u64,
-            }).expect("emit_wqe failed");
+            })
+            .expect("emit_wqe failed");
 
             // WRITE new value with FENCE (ensures READ completed)
             emit_wqe!(&ctx, write {
@@ -554,7 +569,8 @@ fn test_fence_batched_read_write() {
                 rkey: remote_mr.rkey(),
                 sge: { addr: local_write_bufs[i].addr(), len: 8, lkey: local_write_mrs[i].lkey() },
                 signaled: (i * 2 + 1) as u64,
-            }).expect("emit_wqe failed");
+            })
+            .expect("emit_wqe failed");
         }
 
         qp_ref.ring_sq_doorbell();
@@ -630,13 +646,18 @@ fn test_relaxed_ordering_basic() {
             rkey: remote_mr.rkey(),
             sge: { addr: local_buf.addr(), len: 8, lkey: local_mr.lkey() },
             signaled: 1u64,
-        }).expect("emit_wqe failed");
+        })
+        .expect("emit_wqe failed");
         qp_ref.ring_sq_doorbell();
     }
     poll_cq_batch(&pair.send_cq, 1, 5000).expect("WRITE timeout");
 
     // Verify WRITE succeeded
-    assert_eq!(remote_buf.read_u64(0), 42, "WRITE with RELAXED_ORDERING failed");
+    assert_eq!(
+        remote_buf.read_u64(0),
+        42,
+        "WRITE with RELAXED_ORDERING failed"
+    );
 
     // Test READ with RELAXED_ORDERING
     local_buf.write_u64(0, 0);
@@ -649,13 +670,18 @@ fn test_relaxed_ordering_basic() {
             rkey: remote_mr.rkey(),
             sge: { addr: local_buf.addr(), len: 8, lkey: local_mr.lkey() },
             signaled: 2u64,
-        }).expect("emit_wqe failed");
+        })
+        .expect("emit_wqe failed");
         qp_ref.ring_sq_doorbell();
     }
     poll_cq_batch(&pair.send_cq, 1, 5000).expect("READ timeout");
 
     // Verify READ succeeded
-    assert_eq!(local_buf.read_u64(0), 42, "READ with RELAXED_ORDERING failed");
+    assert_eq!(
+        local_buf.read_u64(0),
+        42,
+        "READ with RELAXED_ORDERING failed"
+    );
 
     println!("Basic RELAXED_ORDERING test passed!");
 }

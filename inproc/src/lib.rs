@@ -10,12 +10,12 @@ pub mod mesh;
 pub mod mpsc;
 pub mod mpsc_fetchadd;
 
-pub use flux::{create_flux, create_flux_with, Flux, RecvHandle};
-pub use mesh::{create_mesh, create_mesh_with, Mesh};
-pub use mpsc_fetchadd::FetchAddMpsc;
-pub use mempc::Serial;
-pub use mempc::{OnesidedMpsc, FastForwardMpsc, LamportMpsc, FetchAddMpsc as MempcFetchAddMpsc};
+pub use flux::{Flux, RecvHandle, create_flux, create_flux_with};
 pub use mempc::ReplyToken;
+pub use mempc::Serial;
+pub use mempc::{FastForwardMpsc, FetchAddMpsc as MempcFetchAddMpsc, LamportMpsc, OnesidedMpsc};
+pub use mesh::{Mesh, create_mesh, create_mesh_with};
+pub use mpsc_fetchadd::FetchAddMpsc;
 
 /// A received message, distinguishing between notifications, requests, and responses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

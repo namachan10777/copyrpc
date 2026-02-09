@@ -50,8 +50,7 @@ pub struct MessageSlot {
 impl MessageSlot {
     /// Get the current state of the slot.
     pub fn state(&self) -> SlotState {
-        SlotState::from_u8(self.header.state.load(Ordering::Acquire))
-            .unwrap_or(SlotState::Free)
+        SlotState::from_u8(self.header.state.load(Ordering::Acquire)).unwrap_or(SlotState::Free)
     }
 
     /// Set the state of the slot.
@@ -91,9 +90,7 @@ impl MessageSlot {
 
     /// Get pointer to the data area.
     pub fn data_ptr(&self) -> *mut u8 {
-        unsafe {
-            (self as *const Self as *mut u8).add(SLOT_HEADER_SIZE)
-        }
+        unsafe { (self as *const Self as *mut u8).add(SLOT_HEADER_SIZE) }
     }
 
     /// Get the data area as a slice.
@@ -160,9 +157,8 @@ impl MessagePool {
         }
 
         // Register memory with HCA
-        let access = AccessFlags::LOCAL_WRITE
-            | AccessFlags::REMOTE_WRITE
-            | AccessFlags::REMOTE_READ;
+        let access =
+            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ;
         let mr = unsafe { pd.register(buffer, buffer_size, access)? };
 
         // Initialize free list with all slot indices
@@ -217,9 +213,7 @@ impl MessagePool {
         if index >= self.num_slots {
             return None;
         }
-        unsafe {
-            Some(&*(self.buffer.add(index * self.slot_size) as *const MessageSlot))
-        }
+        unsafe { Some(&*(self.buffer.add(index * self.slot_size) as *const MessageSlot)) }
     }
 
     /// Get the address of a slot's data area.
@@ -256,10 +250,7 @@ impl MessagePool {
                         actual: slot.state(),
                     });
                 }
-                Ok(SlotHandle {
-                    pool: self,
-                    index,
-                })
+                Ok(SlotHandle { pool: self, index })
             }
             None => Err(Error::NoFreeSlots),
         }

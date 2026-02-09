@@ -48,12 +48,21 @@ fn test_scatter_to_cqe_diagnostic() {
     };
 
     // Create CQs
-    let send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
+    let send_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
+    let recv_cq1 = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
+    let recv_cq2 = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     // Configure QP with scatter-to-CQE enabled
@@ -156,13 +165,14 @@ fn test_scatter_to_cqe_diagnostic() {
             flags: WqeFlags::empty(),
             sge: { addr: send_buf.addr(), len: size as u32, lkey: send_mr.lkey() },
             signaled: i as u64,
-        }).expect("emit_wqe failed");
+        })
+        .expect("emit_wqe failed");
         qp1_ref.ring_sq_doorbell();
         drop(qp1_ref);
 
         // Wait for send completion
-        let send_cqe =
-            poll_cq_timeout(&send_cq, 5000).unwrap_or_else(|| panic!("Send CQE timeout for size {}", size));
+        let send_cqe = poll_cq_timeout(&send_cq, 5000)
+            .unwrap_or_else(|| panic!("Send CQE timeout for size {}", size));
         assert_eq!(
             send_cqe.syndrome, 0,
             "Send CQE error for size {}: syndrome={}",
@@ -200,19 +210,26 @@ fn test_scatter_to_cqe_diagnostic() {
             buffer_count += 1;
             println!(
                 "  Size {:3}: buffer receive (opcode={:?}, is_inline_scatter={})",
-                size, recv_cqe.opcode, recv_cqe.is_inline_scatter()
+                size,
+                recv_cqe.opcode,
+                recv_cqe.is_inline_scatter()
             );
         } else if data_in_cqe {
             scatter_count += 1;
             println!(
                 "  Size {:3}: scatter-to-CQE (opcode={:?}, is_inline_scatter={})",
-                size, recv_cqe.opcode, recv_cqe.is_inline_scatter()
+                size,
+                recv_cqe.opcode,
+                recv_cqe.is_inline_scatter()
             );
         } else {
             // Data not found in expected locations
             println!(
                 "  Size {:3}: DATA MISMATCH - opcode={:?}, is_inline_scatter={}, byte_cnt={}",
-                size, recv_cqe.opcode, recv_cqe.is_inline_scatter(), recv_cqe.byte_cnt
+                size,
+                recv_cqe.opcode,
+                recv_cqe.is_inline_scatter(),
+                recv_cqe.byte_cnt
             );
             println!(
                 "            buffer[0..4]: {:?}, expected: {:?}",
@@ -247,12 +264,21 @@ fn test_scatter_to_cqe_disabled() {
         }
     };
 
-    let send_cq = ctx.ctx.create_cq(64, &CqConfig::default()).expect("Failed to create send CQ");
+    let send_cq = ctx
+        .ctx
+        .create_cq(64, &CqConfig::default())
+        .expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let recv_cq1 = ctx.ctx.create_cq(64, &CqConfig::default()).expect("Failed to create recv CQ1");
+    let recv_cq1 = ctx
+        .ctx
+        .create_cq(64, &CqConfig::default())
+        .expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let recv_cq2 = ctx.ctx.create_cq(64, &CqConfig::default()).expect("Failed to create recv CQ2");
+    let recv_cq2 = ctx
+        .ctx
+        .create_cq(64, &CqConfig::default())
+        .expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     // Scatter-to-CQE disabled (default)
@@ -342,11 +368,15 @@ fn test_scatter_to_cqe_disabled() {
         // Post inline send
         let qp1_ref = qp1.borrow();
         let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
-        emit_wqe!(&ctx, send {
-            flags: WqeFlags::empty(),
-            inline: &test_data,
-            signaled: i as u64,
-        }).expect("emit_wqe failed");
+        emit_wqe!(
+            &ctx,
+            send {
+                flags: WqeFlags::empty(),
+                inline: &test_data,
+                signaled: i as u64,
+            }
+        )
+        .expect("emit_wqe failed");
         qp1_ref.ring_sq_doorbell();
         drop(qp1_ref);
 
@@ -404,12 +434,21 @@ fn test_small_inline_wraparound() {
         }
     };
 
-    let send_cq = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create send CQ");
+    let send_cq = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create send CQ");
     let send_cq = Rc::new(send_cq);
 
-    let recv_cq1 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ1");
+    let recv_cq1 = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ1");
     let recv_cq1 = Rc::new(recv_cq1);
-    let recv_cq2 = ctx.ctx.create_cq(256, &CqConfig::default()).expect("Failed to create recv CQ2");
+    let recv_cq2 = ctx
+        .ctx
+        .create_cq(256, &CqConfig::default())
+        .expect("Failed to create recv CQ2");
     let recv_cq2 = Rc::new(recv_cq2);
 
     // Small queue to trigger wrap-around
@@ -474,7 +513,10 @@ fn test_small_inline_wraparound() {
     println!("Testing small inline Send with wrap-around...");
 
     for &size in &small_sizes {
-        println!("  Testing size {} bytes ({} iterations)...", size, iterations_per_size);
+        println!(
+            "  Testing size {} bytes ({} iterations)...",
+            size, iterations_per_size
+        );
 
         for i in 0..iterations_per_size {
             let test_data: Vec<u8> = (0..size).map(|j| ((i * size + j) & 0xFF) as u8).collect();
@@ -482,24 +524,33 @@ fn test_small_inline_wraparound() {
 
             // Post receive
             qp2.borrow()
-                .post_recv((size * 100 + i) as u64, recv_buf.addr(), 256, recv_mr.lkey())
+                .post_recv(
+                    (size * 100 + i) as u64,
+                    recv_buf.addr(),
+                    256,
+                    recv_mr.lkey(),
+                )
                 .expect("post_recv failed");
             qp2.borrow().ring_rq_doorbell();
 
             // Post small inline send
             let qp1_ref = qp1.borrow();
             let ctx = qp1_ref.emit_ctx().expect("emit_ctx failed");
-            emit_wqe!(&ctx, send {
-                flags: WqeFlags::empty(),
-                inline: &test_data,
-                signaled: (size * 100 + i) as u64,
-            }).expect("emit_wqe failed");
+            emit_wqe!(
+                &ctx,
+                send {
+                    flags: WqeFlags::empty(),
+                    inline: &test_data,
+                    signaled: (size * 100 + i) as u64,
+                }
+            )
+            .expect("emit_wqe failed");
             qp1_ref.ring_sq_doorbell();
             drop(qp1_ref);
 
             // Wait for completions
-            let send_cqe = poll_cq_timeout(&send_cq, 5000).unwrap_or_else(|| panic!("Send CQE timeout at size={}, iter={}",
-                size, i));
+            let send_cqe = poll_cq_timeout(&send_cq, 5000)
+                .unwrap_or_else(|| panic!("Send CQE timeout at size={}, iter={}", size, i));
             assert_eq!(
                 send_cqe.syndrome, 0,
                 "Send error at size={}, iter={}: syndrome={}",
@@ -507,8 +558,8 @@ fn test_small_inline_wraparound() {
             );
             send_cq.flush();
 
-            let recv_cqe = poll_cq_timeout(&recv_cq2, 5000).unwrap_or_else(|| panic!("Recv CQE timeout at size={}, iter={}",
-                size, i));
+            let recv_cqe = poll_cq_timeout(&recv_cq2, 5000)
+                .unwrap_or_else(|| panic!("Recv CQE timeout at size={}, iter={}", size, i));
             assert_eq!(
                 recv_cqe.syndrome, 0,
                 "Recv error at size={}, iter={}: syndrome={}",

@@ -9,13 +9,13 @@
 //! ```
 
 use std::cell::{Cell, RefCell};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use copyrpc::{Context, ContextBuilder, Endpoint, EndpointConfig, RemoteEndpointInfo};
 use mlx5::srq::SrqConfig;
@@ -73,7 +73,6 @@ fn on_response_callback(_user_data: (), _data: &[u8]) {
 fn get_and_reset_response_count() -> usize {
     RESPONSE_COUNT.with(|c| c.replace(0)) as usize
 }
-
 
 // =============================================================================
 // Client State
@@ -186,7 +185,13 @@ fn setup_copyrpc_benchmark(config: &BenchConfig) -> Option<BenchmarkSetup> {
     let num_endpoints = config.num_endpoints;
     let handle = thread::spawn(move || {
         pin_to_core(14);
-        server_thread_main(server_info_tx, client_info_rx, server_ready_clone, server_stop, num_endpoints);
+        server_thread_main(
+            server_info_tx,
+            client_info_rx,
+            server_ready_clone,
+            server_stop,
+            num_endpoints,
+        );
     });
 
     client_info_tx
@@ -431,9 +436,18 @@ fn benchmarks(c: &mut Criterion) {
     pin_to_core(15);
 
     let configs = [
-        BenchConfig { num_endpoints: 8, requests_per_ep: 256 },
-        BenchConfig { num_endpoints: 1, requests_per_ep: 32 },
-        BenchConfig { num_endpoints: 1, requests_per_ep: 1 },
+        BenchConfig {
+            num_endpoints: 8,
+            requests_per_ep: 256,
+        },
+        BenchConfig {
+            num_endpoints: 1,
+            requests_per_ep: 32,
+        },
+        BenchConfig {
+            num_endpoints: 1,
+            requests_per_ep: 1,
+        },
     ];
 
     let mut group = c.benchmark_group("copyrpc_api");
@@ -447,7 +461,13 @@ fn benchmarks(c: &mut Criterion) {
             let mut server_handle = setup._server_handle;
 
             group.bench_function(
-                BenchmarkId::new("copyrpc", format!("{}ep_{}qd_{}B", config.num_endpoints, config.requests_per_ep, MESSAGE_SIZE)),
+                BenchmarkId::new(
+                    "copyrpc",
+                    format!(
+                        "{}ep_{}qd_{}B",
+                        config.num_endpoints, config.requests_per_ep, MESSAGE_SIZE
+                    ),
+                ),
                 |b| {
                     b.iter_custom(|iters| run_copyrpc_bench(&mut client.borrow_mut(), iters));
                 },

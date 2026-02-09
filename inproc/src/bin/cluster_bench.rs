@@ -13,13 +13,11 @@ use arrow::array::{Float64Array, StringArray, UInt32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use clap::{Parser, ValueEnum};
-use parquet::arrow::ArrowWriter;
 use inproc::Serial;
-use inproc::{
-    create_flux_with, create_mesh_with, Flux, ReceivedMessage, FetchAddMpsc,
-};
 use inproc::mpsc::MpscChannel;
+use inproc::{FetchAddMpsc, Flux, ReceivedMessage, create_flux_with, create_mesh_with};
 use mempc::MpscChannel as MempcMpscChannel;
+use parquet::arrow::ArrowWriter;
 
 /// 32-byte payload for benchmarking
 #[derive(Clone, Copy, Debug)]
@@ -195,7 +193,13 @@ fn run_flux_benchmark<M: MempcMpscChannel>(
         })
         .collect();
 
-    monitor_and_collect(per_thread_completed, stop_flag, barrier, handles, duration_secs)
+    monitor_and_collect(
+        per_thread_completed,
+        stop_flag,
+        barrier,
+        handles,
+        duration_secs,
+    )
 }
 
 // ============================================================================
@@ -293,7 +297,13 @@ fn run_mesh_benchmark<M: MpscChannel>(
         })
         .collect();
 
-    monitor_and_collect(per_thread_completed, stop_flag, barrier, handles, duration_secs)
+    monitor_and_collect(
+        per_thread_completed,
+        stop_flag,
+        barrier,
+        handles,
+        duration_secs,
+    )
 }
 
 // ============================================================================
@@ -459,7 +469,10 @@ fn main() {
     }
 
     // FastForward
-    if matches!(args.transport, TransportType::FastForward | TransportType::All) {
+    if matches!(
+        args.transport,
+        TransportType::FastForward | TransportType::All
+    ) {
         results.push(run_transport_benchmark(
             "flux",
             "fastforward",

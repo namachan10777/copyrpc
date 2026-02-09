@@ -9,10 +9,8 @@
 
 mod common;
 
-use scalerpc::{
-    ClientConfig, MessagePool, PoolConfig, RpcClient, RpcServer, ServerConfig,
-};
 use common::TestContext;
+use scalerpc::{ClientConfig, MessagePool, PoolConfig, RpcClient, RpcServer, ServerConfig};
 
 /// Test basic message pool operations with actual RDMA MR registration.
 #[test]
@@ -91,7 +89,9 @@ fn test_client_creation() {
     assert_eq!(conn_id, 0);
 
     // Get local endpoint
-    let endpoint = client.local_endpoint(conn_id).expect("Failed to get endpoint");
+    let endpoint = client
+        .local_endpoint(conn_id)
+        .expect("Failed to get endpoint");
     assert!(endpoint.qpn != 0);
     assert!(endpoint.lid != 0);
 
@@ -139,7 +139,9 @@ fn test_server_creation() {
     assert_eq!(conn_id, 0);
 
     // Get local endpoint
-    let endpoint = server.local_endpoint(conn_id).expect("Failed to get endpoint");
+    let endpoint = server
+        .local_endpoint(conn_id)
+        .expect("Failed to get endpoint");
     assert!(endpoint.qpn != 0);
 
     println!("Server creation test passed!");
@@ -189,13 +191,18 @@ fn test_loopback_rpc() {
     let mut server = RpcServer::new(&ctx.pd, server_config)
         .expect("Failed to create server")
         .with_handler(|rpc_type: u16, payload: &[u8], response_buf: &mut [u8]| {
-            println!("Server received RPC type={}, payload_len={}", rpc_type, payload.len());
+            println!(
+                "Server received RPC type={}, payload_len={}",
+                rpc_type,
+                payload.len()
+            );
             // Echo back with prefix
             let prefix = b"ECHO: ";
             let prefix_len = prefix.len();
             let payload_len = payload.len().min(response_buf.len() - prefix_len);
             response_buf[..prefix_len].copy_from_slice(prefix);
-            response_buf[prefix_len..prefix_len + payload_len].copy_from_slice(&payload[..payload_len]);
+            response_buf[prefix_len..prefix_len + payload_len]
+                .copy_from_slice(&payload[..payload_len]);
             (0, prefix_len + payload_len)
         });
 
@@ -211,18 +218,31 @@ fn test_loopback_rpc() {
     let client_endpoint = client.local_endpoint(client_conn).expect("client endpoint");
     let server_endpoint = server.local_endpoint(server_conn).expect("server endpoint");
 
-    println!("Client endpoint: QPN=0x{:x}, LID=0x{:x}", client_endpoint.qpn, client_endpoint.lid);
-    println!("Server endpoint: QPN=0x{:x}, LID=0x{:x}", server_endpoint.qpn, server_endpoint.lid);
+    println!(
+        "Client endpoint: QPN=0x{:x}, LID=0x{:x}",
+        client_endpoint.qpn, client_endpoint.lid
+    );
+    println!(
+        "Server endpoint: QPN=0x{:x}, LID=0x{:x}",
+        server_endpoint.qpn, server_endpoint.lid
+    );
 
     // Connect
-    client.connect(client_conn, server_endpoint).expect("client connect");
-    server.connect(server_conn, client_endpoint).expect("server connect");
+    client
+        .connect(client_conn, server_endpoint)
+        .expect("client connect");
+    server
+        .connect(server_conn, client_endpoint)
+        .expect("server connect");
 
     println!("Connections established!");
 
     // Make async RPC call so we can manually drive the server
     let request_payload = b"Hello from client!";
-    println!("Sending RPC request: {:?}", std::str::from_utf8(request_payload));
+    println!(
+        "Sending RPC request: {:?}",
+        std::str::from_utf8(request_payload)
+    );
 
     let pending = client
         .call_async(client_conn, 1, request_payload)
@@ -280,10 +300,17 @@ fn test_loopback_rpc() {
         std::hint::spin_loop();
     };
 
-    assert!(response.is_success(), "RPC failed with status {}", response.status());
+    assert!(
+        response.is_success(),
+        "RPC failed with status {}",
+        response.status()
+    );
 
     let response_payload = response.payload();
-    println!("Client received response: {:?}", std::str::from_utf8(response_payload));
+    println!(
+        "Client received response: {:?}",
+        std::str::from_utf8(response_payload)
+    );
 
     assert!(response_payload.starts_with(b"ECHO: "));
 
@@ -336,7 +363,7 @@ fn test_context_switch_piggyback() {
             },
             num_recv_slots: 64,
             group: scalerpc::config::GroupConfig {
-                num_groups: 1,  // Single group for reliability
+                num_groups: 1, // Single group for reliability
                 time_slice_us: 100,
                 ..Default::default()
             },
@@ -492,7 +519,7 @@ fn test_flush_warmup_batching() {
             },
             num_recv_slots: 64,
             group: scalerpc::config::GroupConfig {
-                num_groups: 1,  // Single group for simplicity
+                num_groups: 1, // Single group for simplicity
                 time_slice_us: 100,
                 ..Default::default()
             },
@@ -501,12 +528,14 @@ fn test_flush_warmup_batching() {
 
         let requests_clone = requests_processed_clone.clone();
         let mut server = match RpcServer::new(&ctx.pd, server_config) {
-            Ok(s) => s.with_handler(move |_rpc_type: u16, payload: &[u8], response_buf: &mut [u8]| {
-                requests_clone.fetch_add(1, Ordering::Relaxed);
-                let len = payload.len().min(response_buf.len());
-                response_buf[..len].copy_from_slice(&payload[..len]);
-                (0, len)
-            }),
+            Ok(s) => s.with_handler(
+                move |_rpc_type: u16, payload: &[u8], response_buf: &mut [u8]| {
+                    requests_clone.fetch_add(1, Ordering::Relaxed);
+                    let len = payload.len().min(response_buf.len());
+                    response_buf[..len].copy_from_slice(&payload[..len]);
+                    (0, len)
+                },
+            ),
             Err(e) => {
                 eprintln!("Failed to create server: {}", e);
                 return;
@@ -616,12 +645,13 @@ fn test_flush_warmup_batching() {
 
     let processed = requests_processed.load(Ordering::Relaxed);
     println!("Server processed: {} requests", processed);
-    println!("Client completed: {}/{} responses", completed, pendings.len());
-
-    assert!(
-        completed > 0,
-        "At least some requests should complete"
+    println!(
+        "Client completed: {}/{} responses",
+        completed,
+        pendings.len()
     );
+
+    assert!(completed > 0, "At least some requests should complete");
 
     println!("Test passed: flush_warmup batching works!");
 }
@@ -770,7 +800,10 @@ fn test_poll_pending_with_state_transition() {
 
     let final_state = client.state(conn_id).expect("get state");
     println!("Final state: {:?}", final_state);
-    println!("Response has context_switch: {}", response.has_context_switch());
+    println!(
+        "Response has context_switch: {}",
+        response.has_context_switch()
+    );
 
     stop_flag.store(true, Ordering::SeqCst);
     server_handle.join().unwrap();
@@ -921,22 +954,29 @@ fn test_process_mode_transition() {
     };
 
     assert!(response1.is_success(), "RPC1 failed");
-    println!("3. Response1 has context_switch: {}, has_processing_pool_info: {}",
-             response1.has_context_switch(),
-             response1.has_processing_pool_info());
+    println!(
+        "3. Response1 has context_switch: {}, has_processing_pool_info: {}",
+        response1.has_context_switch(),
+        response1.has_processing_pool_info()
+    );
 
     let after_response1 = client.state(conn_id).expect("get state");
     println!("4. After response1 (with pool info): {:?}", after_response1);
 
     // If pool info was received, state should be Process
     if response1.has_processing_pool_info() {
-        assert_eq!(after_response1, ClientState::Process,
-            "State should be Process after receiving pool info");
+        assert_eq!(
+            after_response1,
+            ClientState::Process,
+            "State should be Process after receiving pool info"
+        );
 
         // 5. Send more requests in Process mode (direct RDMA WRITE)
         println!("5. Sending requests in Process mode...");
         for i in 0..3 {
-            let pending = client.call_async(conn_id, 1, &payload).expect("call_async in process mode");
+            let pending = client
+                .call_async(conn_id, 1, &payload)
+                .expect("call_async in process mode");
             client.poll();
 
             // Wait for response

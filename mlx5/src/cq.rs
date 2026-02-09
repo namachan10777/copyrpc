@@ -408,8 +408,7 @@ impl Cqe {
         // Scatter-to-CQE is indicated by flag bits in op_own, not by opcode.
         // MLX5_INLINE_SCATTER_32 (0x04) = bit 2: data in current CQE offset 0-31
         // MLX5_INLINE_SCATTER_64 (0x08) = bit 3: data in previous CQE (cqe - 1)
-        let is_inline_scatter =
-            (op_own & (MLX5_INLINE_SCATTER_32 | MLX5_INLINE_SCATTER_64)) != 0;
+        let is_inline_scatter = (op_own & (MLX5_INLINE_SCATTER_32 | MLX5_INLINE_SCATTER_64)) != 0;
 
         let wqe_counter = u16::from_be(std::ptr::read_volatile(ptr.add(60) as *const u16));
 

@@ -27,12 +27,12 @@ pub struct TimelyState {
 }
 
 // Timely parameters (from the paper)
-const TIMELY_T_LOW: u64 = 30;      // Low threshold in microseconds
-const TIMELY_T_HIGH: u64 = 500;    // High threshold in microseconds
-const TIMELY_ALPHA: f64 = 0.875;   // EWMA smoothing factor
-const TIMELY_BETA: f64 = 0.8;      // Multiplicative decrease factor
-const TIMELY_DELTA: f64 = 10.0;    // Additive increase (Mpps)
-const TIMELY_MIN_RTT: u64 = 10;    // Minimum RTT floor in microseconds
+const TIMELY_T_LOW: u64 = 30; // Low threshold in microseconds
+const TIMELY_T_HIGH: u64 = 500; // High threshold in microseconds
+const TIMELY_ALPHA: f64 = 0.875; // EWMA smoothing factor
+const TIMELY_BETA: f64 = 0.8; // Multiplicative decrease factor
+const TIMELY_DELTA: f64 = 10.0; // Additive increase (Mpps)
+const TIMELY_MIN_RTT: u64 = 10; // Minimum RTT floor in microseconds
 const TIMELY_UPDATE_INTERVAL: u32 = 16; // Packets between updates
 
 impl TimelyState {

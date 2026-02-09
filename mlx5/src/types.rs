@@ -596,9 +596,7 @@ impl Gid {
     ///
     /// # NOTE: RoCE support is untested
     pub fn from_ipv6(ip: Ipv6Addr) -> Self {
-        Self {
-            raw: ip.octets(),
-        }
+        Self { raw: ip.octets() }
     }
 
     /// Check if this GID is an IPv4-mapped address.

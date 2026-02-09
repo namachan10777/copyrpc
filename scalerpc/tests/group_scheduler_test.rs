@@ -205,7 +205,9 @@ fn test_single_group_communication() {
         std::hint::spin_loop();
     }
 
-    client.connect(conn_id, server_info.into()).expect("connect");
+    client
+        .connect(conn_id, server_info.into())
+        .expect("connect");
 
     // Send requests
     let payload = vec![0xAAu8; 32];
@@ -393,7 +395,9 @@ fn test_two_groups_context_switch() {
                 std::hint::spin_loop();
             }
 
-            client.connect(conn_id, server_info.into()).expect("connect");
+            client
+                .connect(conn_id, server_info.into())
+                .expect("connect");
 
             let payload = vec![0xA0 + i as u8; 32];
 
@@ -625,7 +629,9 @@ fn test_three_groups_round_robin() {
                 std::hint::spin_loop();
             }
 
-            client.connect(conn_id, server_info.into()).expect("connect");
+            client
+                .connect(conn_id, server_info.into())
+                .expect("connect");
 
             let payload = vec![0xB0 + i as u8; 32];
 

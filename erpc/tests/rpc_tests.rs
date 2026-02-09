@@ -12,8 +12,8 @@ mod common;
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
-use erpc::{Rpc, RpcConfig, RemoteInfo, PktHdr};
 use common::TestContext;
+use erpc::{PktHdr, RemoteInfo, Rpc, RpcConfig};
 
 // =============================================================================
 // Basic Transport Tests
@@ -93,8 +93,10 @@ fn test_session_creation() {
 
     // Create two RPC instances (simulating client/server)
     let config = RpcConfig::default();
-    let rpc1: Rpc<()> = Rpc::new(&ctx.ctx, ctx.port, config.clone(), |_, _| {}).expect("Failed to create RPC 1");
-    let rpc2: Rpc<()> = Rpc::new(&ctx.ctx, ctx.port, config, |_, _| {}).expect("Failed to create RPC 2");
+    let rpc1: Rpc<()> =
+        Rpc::new(&ctx.ctx, ctx.port, config.clone(), |_, _| {}).expect("Failed to create RPC 1");
+    let rpc2: Rpc<()> =
+        Rpc::new(&ctx.ctx, ctx.port, config, |_, _| {}).expect("Failed to create RPC 2");
 
     // Get endpoint info
     let info1 = rpc1.local_info();
@@ -113,8 +115,12 @@ fn test_session_creation() {
     };
 
     // Create sessions
-    let session1 = rpc1.create_session(&remote2).expect("Failed to create session on RPC1");
-    let session2 = rpc2.create_session(&remote1).expect("Failed to create session on RPC2");
+    let session1 = rpc1
+        .create_session(&remote2)
+        .expect("Failed to create session on RPC1");
+    let session2 = rpc2
+        .create_session(&remote1)
+        .expect("Failed to create session on RPC2");
 
     println!("Sessions created successfully!");
     println!("  Session 1: {:?}", session1);
@@ -142,7 +148,8 @@ fn test_rpc_loopback() {
         .with_session_credits(32);
 
     // Create server RPC (server doesn't need response callback)
-    let server: Rpc<()> = Rpc::new(&ctx.ctx, ctx.port, config.clone(), |_, _| {}).expect("Failed to create server RPC");
+    let server: Rpc<()> = Rpc::new(&ctx.ctx, ctx.port, config.clone(), |_, _| {})
+        .expect("Failed to create server RPC");
     let server_info = server.local_info();
 
     // Create client RPC with on_response callback
@@ -155,7 +162,8 @@ fn test_rpc_loopback() {
         println!("Client received response: len={}", data.len());
         *response_received_clone.borrow_mut() = true;
         *response_data_clone.borrow_mut() = data.to_vec();
-    }).expect("Failed to create client RPC");
+    })
+    .expect("Failed to create client RPC");
 
     // Create session from client to server
     let server_remote = RemoteInfo {
@@ -163,7 +171,9 @@ fn test_rpc_loopback() {
         qkey: server_info.qkey,
         lid: server_info.lid,
     };
-    let session = client.create_session(&server_remote).expect("Failed to create session");
+    let session = client
+        .create_session(&server_remote)
+        .expect("Failed to create session");
 
     // Run event loop to complete session handshake
     // Client sends ConnectRequest -> Server receives and sends ConnectResponse -> Client receives
@@ -190,12 +200,14 @@ fn test_rpc_loopback() {
     // Send a request using call()
     let request_data = b"Hello, eRPC!";
 
-    client.call(
-        session,
-        1, // req_type
-        request_data,
-        (), // user_data (unused in this test)
-    ).expect("Failed to send request");
+    client
+        .call(
+            session,
+            1, // req_type
+            request_data,
+            (), // user_data (unused in this test)
+        )
+        .expect("Failed to send request");
 
     println!("Request sent, polling for completion...");
 
@@ -211,7 +223,11 @@ fn test_rpc_loopback() {
         while let Some(req) = server.recv() {
             // Zero-copy: get data reference from request
             let data = req.data(&server);
-            println!("Server received request: type={}, len={}", req.req_type, data.len());
+            println!(
+                "Server received request: type={}, len={}",
+                req.req_type,
+                data.len()
+            );
             // Echo back the data
             let data_copy = data.to_vec();
             let _ = server.reply(&req, &data_copy);
@@ -226,8 +242,14 @@ fn test_rpc_loopback() {
 
     if *response_received.borrow() {
         println!("Loopback RPC test passed!");
-        println!("  Request data: {:?}", String::from_utf8_lossy(request_data));
-        println!("  Response data: {:?}", String::from_utf8_lossy(&response_data.borrow()));
+        println!(
+            "  Request data: {:?}",
+            String::from_utf8_lossy(request_data)
+        );
+        println!(
+            "  Response data: {:?}",
+            String::from_utf8_lossy(&response_data.borrow())
+        );
     } else {
         // Note: This test may not complete in loopback mode due to
         // incomplete event loop integration. This is expected for now.
@@ -245,12 +267,12 @@ fn test_packet_header_serialize() {
     let buf = common::AlignedBuffer::new(64);
 
     let hdr = PktHdr::new(
-        42,         // req_type
-        1234,       // msg_size
-        5,          // dest_session_num
+        42,   // req_type
+        1234, // msg_size
+        5,    // dest_session_num
         erpc::PktType::Req,
-        10,         // pkt_num
-        99999,      // req_num
+        10,    // pkt_num
+        99999, // req_num
     );
 
     // Write to buffer
@@ -296,7 +318,12 @@ fn test_buffer_pool_allocation() {
     for i in 0..16 {
         match pool.alloc() {
             Some((idx, buf)) => {
-                println!("Allocated buffer {}: idx={}, addr=0x{:x}", i, idx, buf.addr());
+                println!(
+                    "Allocated buffer {}: idx={}, addr=0x{:x}",
+                    i,
+                    idx,
+                    buf.addr()
+                );
                 allocated.push(idx);
             }
             None => {
@@ -306,7 +333,10 @@ fn test_buffer_pool_allocation() {
     }
 
     // Should fail to allocate more
-    assert!(pool.alloc().is_none(), "Should not be able to allocate more than pool size");
+    assert!(
+        pool.alloc().is_none(),
+        "Should not be able to allocate more than pool size"
+    );
 
     // Free all buffers
     for idx in allocated {
@@ -314,7 +344,10 @@ fn test_buffer_pool_allocation() {
     }
 
     // Should be able to allocate again
-    assert!(pool.alloc().is_some(), "Should be able to allocate after freeing");
+    assert!(
+        pool.alloc().is_some(),
+        "Should be able to allocate after freeing"
+    );
 
     println!("Buffer pool allocation test passed!");
 }

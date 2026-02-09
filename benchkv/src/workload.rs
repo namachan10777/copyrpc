@@ -32,11 +32,7 @@ pub fn generate_pattern(
                 let rank = rng.random_range(0..num_ranks);
                 let key = rng.random_range(0..key_range);
                 let is_read = rng.random::<f64>() < read_ratio;
-                pattern.push(AccessEntry {
-                    rank,
-                    key,
-                    is_read,
-                });
+                pattern.push(AccessEntry { rank, key, is_read });
             }
         }
         KeyDistribution::Zipfian => {
@@ -48,11 +44,7 @@ pub fn generate_pattern(
                 let rank = (global_key / key_range) as u32;
                 let key = global_key % key_range;
                 let is_read = rng.random::<f64>() < read_ratio;
-                pattern.push(AccessEntry {
-                    rank,
-                    key,
-                    is_read,
-                });
+                pattern.push(AccessEntry { rank, key, is_read });
             }
         }
     }

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use inproc::Serial;
-use inproc::{create_flux_with, Flux};
+use inproc::{Flux, create_flux_with};
 use mempc::MpscChannel;
 
 #[derive(Clone, Copy, Debug)]

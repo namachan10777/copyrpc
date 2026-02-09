@@ -215,11 +215,7 @@ impl RequestHeader {
     /// # Safety
     /// The destination must be at least `SIZE` bytes.
     pub unsafe fn write_to(&self, dst: *mut u8) {
-        std::ptr::copy_nonoverlapping(
-            self as *const Self as *const u8,
-            dst,
-            Self::SIZE,
-        );
+        std::ptr::copy_nonoverlapping(self as *const Self as *const u8, dst, Self::SIZE);
     }
 
     /// Read a header from a byte slice.
@@ -322,7 +318,13 @@ impl ResponseHeader {
     /// endpoint entry sequence:
     /// - Lower 32 bits: scheduler sequence (truncated)
     /// - Upper 32 bits: fetched endpoint entry sequence (fetched_seq)
-    pub fn with_context_switch(req_id: u64, status: u32, payload_len: u32, scheduler_seq: u64, fetched_seq: u32) -> Self {
+    pub fn with_context_switch(
+        req_id: u64,
+        status: u32,
+        payload_len: u32,
+        scheduler_seq: u64,
+        fetched_seq: u32,
+    ) -> Self {
         // Encode both seq and fetched_seq in context_switch_seq
         // Lower 32 bits: scheduler_seq (truncated), Upper 32 bits: fetched_seq
         let context_switch_seq = ((fetched_seq as u64) << 32) | (scheduler_seq as u32 as u64);
@@ -410,7 +412,9 @@ impl ResponseHeader {
             req_id,
             status,
             payload_len,
-            flags: response_flags::FLAG_CONTEXT_SWITCH | response_flags::FLAG_PROCESSING_POOL_INFO | response_flags::FLAG_CREDIT_ACK,
+            flags: response_flags::FLAG_CONTEXT_SWITCH
+                | response_flags::FLAG_PROCESSING_POOL_INFO
+                | response_flags::FLAG_CREDIT_ACK,
             context_switch_seq,
             processing_pool_addr: pool_addr,
             processing_pool_rkey: pool_rkey,
@@ -497,11 +501,7 @@ impl ResponseHeader {
     /// # Safety
     /// The destination must be at least `SIZE` bytes.
     pub unsafe fn write_to(&self, dst: *mut u8) {
-        std::ptr::copy_nonoverlapping(
-            self as *const Self as *const u8,
-            dst,
-            Self::SIZE,
-        );
+        std::ptr::copy_nonoverlapping(self as *const Self as *const u8, dst, Self::SIZE);
     }
 
     /// Read a header from a byte slice.
@@ -615,11 +615,7 @@ impl ContextSwitchEvent {
     /// # Safety
     /// `dst` must point to at least `SIZE` bytes.
     pub unsafe fn write_to(&self, dst: *mut u8) {
-        std::ptr::copy_nonoverlapping(
-            self as *const Self as *const u8,
-            dst,
-            Self::SIZE,
-        );
+        std::ptr::copy_nonoverlapping(self as *const Self as *const u8, dst, Self::SIZE);
     }
 
     /// Read from a buffer.
@@ -746,8 +742,13 @@ mod tests {
     fn test_response_header_with_processing_pool_info() {
         // scheduler_seq = 42, fetched_seq = 5, pool_addr = 0x1234_5678_9ABC_DEF0, pool_rkey = 0xABCD
         let header = ResponseHeader::with_processing_pool_info(
-            789, 0, 100, 42, 5,
-            0x1234_5678_9ABC_DEF0, 0xABCD
+            789,
+            0,
+            100,
+            42,
+            5,
+            0x1234_5678_9ABC_DEF0,
+            0xABCD,
         );
         assert!(header.is_valid());
         assert!(header.is_success());
@@ -755,7 +756,10 @@ mod tests {
         assert!(header.has_processing_pool_info());
         assert_eq!(header.get_context_switch_seq(), 42);
         assert_eq!(header.get_fetched_seq(), 5);
-        assert_eq!(header.get_processing_pool_addr(), Some(0x1234_5678_9ABC_DEF0));
+        assert_eq!(
+            header.get_processing_pool_addr(),
+            Some(0x1234_5678_9ABC_DEF0)
+        );
         assert_eq!(header.get_processing_pool_rkey(), Some(0xABCD));
 
         let mut buf = [0u8; ResponseHeader::SIZE];
@@ -763,10 +767,16 @@ mod tests {
             header.write_to(buf.as_mut_ptr());
             let read_back = ResponseHeader::read_from(buf.as_ptr());
             let flags = { read_back.flags };
-            assert_eq!(flags, response_flags::FLAG_CONTEXT_SWITCH | response_flags::FLAG_PROCESSING_POOL_INFO);
+            assert_eq!(
+                flags,
+                response_flags::FLAG_CONTEXT_SWITCH | response_flags::FLAG_PROCESSING_POOL_INFO
+            );
             assert_eq!(read_back.get_context_switch_seq(), 42);
             assert_eq!(read_back.get_fetched_seq(), 5);
-            assert_eq!(read_back.get_processing_pool_addr(), Some(0x1234_5678_9ABC_DEF0));
+            assert_eq!(
+                read_back.get_processing_pool_addr(),
+                Some(0x1234_5678_9ABC_DEF0)
+            );
             assert_eq!(read_back.get_processing_pool_rkey(), Some(0xABCD));
         }
     }

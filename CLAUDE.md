@@ -35,6 +35,9 @@ mlx5_sys, fastmap → mlx5 → copyrpc, erpc, scalerpc → rpc_bench
 コード変更時は必ず以下を実行してregressionがないか確認する。
 
 ```bash
+# フォーマット
+cargo fmt
+
 # ユニットテスト
 cargo test --package mlx5 --lib
 

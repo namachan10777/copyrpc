@@ -12,10 +12,10 @@ fn main() {
     println!("cargo:warning=Detected OFED: {}", version.trim());
 
     // ヘッダを直接チェックして拡張フィールドの有無を検出
-    let verbs_h = std::fs::read_to_string("/usr/include/infiniband/verbs.h")
-        .expect("Cannot read verbs.h");
-    let mlx5dv_h = std::fs::read_to_string("/usr/include/infiniband/mlx5dv.h")
-        .expect("Cannot read mlx5dv.h");
+    let verbs_h =
+        std::fs::read_to_string("/usr/include/infiniband/verbs.h").expect("Cannot read verbs.h");
+    let mlx5dv_h =
+        std::fs::read_to_string("/usr/include/infiniband/mlx5dv.h").expect("Cannot read mlx5dv.h");
 
     if verbs_h.contains("active_speed_ex") {
         println!("cargo:rustc-cfg=has_extended_port_attr");

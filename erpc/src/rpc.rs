@@ -10,7 +10,7 @@ use mlx5::device::Context;
 use crate::buffer::ZeroCopyPool;
 use crate::config::RpcConfig;
 use crate::error::{Error, Result};
-use crate::packet::{PktHdr, PktType, SmPktHdr, SmPktType, PKT_HDR_SIZE, SM_PKT_HDR_SIZE};
+use crate::packet::{PKT_HDR_SIZE, PktHdr, PktType, SM_PKT_HDR_SIZE, SmPktHdr, SmPktType};
 use crate::session::{SessionHandle, SessionState, SessionTable};
 use crate::timing::{RdtscClock, TimerEntry, TimingWheel, current_time_us, likely};
 use crate::transport::{BufferType, GRH_SIZE, RemoteInfo, TransportEntry, UdTransport};
@@ -311,8 +311,13 @@ impl<U: 'static> Rpc<U> {
         // Post send
         let av = {
             let sessions = self.sessions.borrow();
-            let sess = sessions.get(session).ok_or(Error::SessionNotFound(session.session_num()))?;
-            let ah = sess.ah.as_ref().ok_or(Error::SessionNotConnected(session.session_num()))?;
+            let sess = sessions
+                .get(session)
+                .ok_or(Error::SessionNotFound(session.session_num()))?;
+            let ah = sess
+                .ah
+                .as_ref()
+                .ok_or(Error::SessionNotConnected(session.session_num()))?;
             UdTransport::ah_to_av(ah)
         };
 
@@ -356,18 +361,19 @@ impl<U: 'static> Rpc<U> {
 
         let sessions = self.sessions.borrow();
         if let Some(sess) = sessions.get(session)
-            && let Some(ref cc) = sess.cc_state {
-                let rate = cc.rate(); // packets per microsecond (Mpps)
-                if rate > 0.0 {
-                    // rate is in Mpps (millions of packets per second)
-                    // Convert to bytes/μs: rate * MTU
-                    let bytes_per_us = rate * (self.mtu as f64);
-                    if bytes_per_us > 0.0 {
-                        let interval_us = (bytes_sent as f64 / bytes_per_us) as u64;
-                        sess.next_send_time_us.set(now + interval_us);
-                    }
+            && let Some(ref cc) = sess.cc_state
+        {
+            let rate = cc.rate(); // packets per microsecond (Mpps)
+            if rate > 0.0 {
+                // rate is in Mpps (millions of packets per second)
+                // Convert to bytes/μs: rate * MTU
+                let bytes_per_us = rate * (self.mtu as f64);
+                if bytes_per_us > 0.0 {
+                    let interval_us = (bytes_sent as f64 / bytes_per_us) as u64;
+                    sess.next_send_time_us.set(now + interval_us);
                 }
             }
+        }
     }
 
     /// Send an asynchronous RPC request (copyrpc-style API).
@@ -421,7 +427,10 @@ impl<U: 'static> Rpc<U> {
             let remote_session_num = sess.remote_session_num;
 
             // Get AV while we have the session borrowed
-            let ah = sess.ah.as_ref().ok_or(Error::SessionNotConnected(session.session_num()))?;
+            let ah = sess
+                .ah
+                .as_ref()
+                .ok_or(Error::SessionNotConnected(session.session_num()))?;
             let av = UdTransport::ah_to_av(ah);
 
             (req_num, sslot_idx, remote_session_num, av)
@@ -460,7 +469,8 @@ impl<U: 'static> Rpc<U> {
                     buf_type: BufferType::Request,
                 };
                 let addr = send_buffers.slot_addr(buf_idx);
-                self.transport.post_send_raw(av, addr, pkt_len, lkey, entry)?;
+                self.transport
+                    .post_send_raw(av, addr, pkt_len, lkey, entry)?;
             }
 
             // Update session state and start timer
@@ -529,7 +539,8 @@ impl<U: 'static> Rpc<U> {
                     buf_type: BufferType::Request,
                 };
                 let addr = send_buffers.slot_addr(buf_idx);
-                self.transport.post_send_raw(av, addr, pkt_len, lkey, entry)?;
+                self.transport
+                    .post_send_raw(av, addr, pkt_len, lkey, entry)?;
             }
         }
 
@@ -598,7 +609,10 @@ impl<U: 'static> Rpc<U> {
             sess.consume_credit().expect("credit should be available");
 
             let remote_session_num = sess.remote_session_num;
-            let ah = sess.ah.as_ref().ok_or(Error::SessionNotConnected(session.session_num()))?;
+            let ah = sess
+                .ah
+                .as_ref()
+                .ok_or(Error::SessionNotConnected(session.session_num()))?;
             let av = UdTransport::ah_to_av(ah);
 
             (req_num, sslot_idx, remote_session_num, av)
@@ -633,7 +647,8 @@ impl<U: 'static> Rpc<U> {
                     buf_type: BufferType::Request,
                 };
                 let addr = send_buffers.slot_addr(buf_idx);
-                self.transport.post_send_raw(av, addr, pkt_len, lkey, entry)?;
+                self.transport
+                    .post_send_raw(av, addr, pkt_len, lkey, entry)?;
             }
 
             {
@@ -664,7 +679,10 @@ impl<U: 'static> Rpc<U> {
         }
 
         // Multi-packet path not supported in try_call (use call() for large messages)
-        Err(Error::MessageTooLarge { size: msg_size, max: self.mtu - PKT_HDR_SIZE })
+        Err(Error::MessageTooLarge {
+            size: msg_size,
+            max: self.mtu - PKT_HDR_SIZE,
+        })
     }
 
     /// Poll for an incoming request (non-blocking, copyrpc-style API).
@@ -683,7 +701,8 @@ impl<U: 'static> Rpc<U> {
     /// * `request` - The incoming request to respond to
     /// * `data` - Response payload
     pub fn reply(&self, request: &IncomingRequest, data: &[u8]) -> Result<()> {
-        let result = self.send_response(request.session_num, request.req_num, request.req_type, data);
+        let result =
+            self.send_response(request.session_num, request.req_num, request.req_type, data);
         // Release the receive buffer after sending response
         self.release_recv_buffer(request.buf_idx);
         result
@@ -756,8 +775,13 @@ impl<U: 'static> Rpc<U> {
         let av = {
             let sessions = self.sessions.borrow();
             let handle = SessionHandle(session_num);
-            let sess = sessions.get(handle).ok_or(Error::SessionNotFound(session_num))?;
-            let ah = sess.ah.as_ref().ok_or(Error::SessionNotConnected(session_num))?;
+            let sess = sessions
+                .get(handle)
+                .ok_or(Error::SessionNotFound(session_num))?;
+            let ah = sess
+                .ah
+                .as_ref()
+                .ok_or(Error::SessionNotConnected(session_num))?;
             UdTransport::ah_to_av(ah)
         };
 
@@ -775,7 +799,8 @@ impl<U: 'static> Rpc<U> {
             let send_buffers = self.send_buffers.borrow();
             let addr = send_buffers.slot_addr(buf_info.idx);
             let lkey = send_buffers.lkey();
-            self.transport.post_send_raw(av, addr, total_len as u32, lkey, entry)?;
+            self.transport
+                .post_send_raw(av, addr, total_len as u32, lkey, entry)?;
         }
         // Doorbell is batched in run_event_loop_once()
 
@@ -827,7 +852,8 @@ impl<U: 'static> Rpc<U> {
                 // Invalid packet, free buffer and return error
                 drop(recv_buffers);
                 self.recv_buffers.borrow_mut().free(buf_idx);
-                self.posted_recv_count.set(self.posted_recv_count.get().saturating_sub(1));
+                self.posted_recv_count
+                    .set(self.posted_recv_count.get().saturating_sub(1));
                 return Err(Error::BufferTooSmall {
                     required: GRH_SIZE + PKT_HDR_SIZE,
                     available: byte_cnt as usize,
@@ -867,7 +893,8 @@ impl<U: 'static> Rpc<U> {
             };
             // Free buffer for SM packets
             self.recv_buffers.borrow_mut().free(buf_idx);
-            self.posted_recv_count.set(self.posted_recv_count.get().saturating_sub(1));
+            self.posted_recv_count
+                .set(self.posted_recv_count.get().saturating_sub(1));
             return self.handle_sm_packet(&hdr, &payload);
         }
 
@@ -878,7 +905,8 @@ impl<U: 'static> Rpc<U> {
                 // Buffer will be freed when reply() is called
                 self.handle_request_zero_copy(&hdr, buf_idx, payload_offset, payload_len)?;
                 // Decrement posted recv count (buffer is held by IncomingRequest)
-                self.posted_recv_count.set(self.posted_recv_count.get().saturating_sub(1));
+                self.posted_recv_count
+                    .set(self.posted_recv_count.get().saturating_sub(1));
             }
             PktType::Resp => {
                 // Response packets: zero-copy path
@@ -923,12 +951,14 @@ impl<U: 'static> Rpc<U> {
 
                 // Free buffer after processing
                 self.recv_buffers.borrow_mut().free(buf_idx);
-                self.posted_recv_count.set(self.posted_recv_count.get().saturating_sub(1));
+                self.posted_recv_count
+                    .set(self.posted_recv_count.get().saturating_sub(1));
             }
             PktType::CreditReturn => {
                 // Free buffer immediately for credit return
                 self.recv_buffers.borrow_mut().free(buf_idx);
-                self.posted_recv_count.set(self.posted_recv_count.get().saturating_sub(1));
+                self.posted_recv_count
+                    .set(self.posted_recv_count.get().saturating_sub(1));
                 self.handle_credit_return(&hdr)?;
             }
         }
@@ -1016,10 +1046,11 @@ impl<U: 'static> Rpc<U> {
         let handle = SessionHandle(client_session_num);
 
         if let Some(session) = sessions.get_mut(handle)
-            && session.state == SessionState::Connecting {
-                // Set the correct remote session number from the server
-                session.connect(server_session_num);
-            }
+            && session.state == SessionState::Connecting
+        {
+            // Set the correct remote session number from the server
+            session.connect(server_session_num);
+        }
 
         Ok(())
     }
@@ -1051,13 +1082,18 @@ impl<U: 'static> Rpc<U> {
                 context: 0,
                 buf_type: BufferType::Request, // Receive buffers use default type
             };
-            if self.transport.post_recv_raw(addr, capacity, lkey, entry).is_ok() {
+            if self
+                .transport
+                .post_recv_raw(addr, capacity, lkey, entry)
+                .is_ok()
+            {
                 count += 1;
             }
         }
 
         // Update posted count
-        self.posted_recv_count.set(self.posted_recv_count.get() + count);
+        self.posted_recv_count
+            .set(self.posted_recv_count.get() + count);
         // RQ doorbell is batched in run_event_loop_once()
     }
 
@@ -1093,7 +1129,9 @@ impl<U: 'static> Rpc<U> {
         let pending = {
             let mut sessions = self.sessions.borrow_mut();
             let handle = SessionHandle(dest_session);
-            let sess = sessions.get_mut(handle).ok_or(Error::SessionNotFound(dest_session))?;
+            let sess = sessions
+                .get_mut(handle)
+                .ok_or(Error::SessionNotFound(dest_session))?;
 
             // Find the matching slot
             let sslot_idx = match sess.find_sslot_by_req_num(hdr.req_num()) {
@@ -1109,7 +1147,9 @@ impl<U: 'static> Rpc<U> {
 
             // Cancel the retransmission timer (fast path with known wheel_slot)
             if let Some(wheel_slot) = sslot.timer_wheel_slot {
-                self.timing_wheel.borrow_mut().cancel_fast(wheel_slot, hdr.req_num());
+                self.timing_wheel
+                    .borrow_mut()
+                    .cancel_fast(wheel_slot, hdr.req_num());
             }
 
             let tx_ts = sslot.tx_ts;
@@ -1139,15 +1179,21 @@ impl<U: 'static> Rpc<U> {
 
         // Call callback
         if let Some(p) = pending
-            && let Some(ud) = p.user_data {
-                (self.on_response)(ud, payload);
-            }
+            && let Some(ud) = p.user_data
+        {
+            (self.on_response)(ud, payload);
+        }
 
         Ok(())
     }
 
     /// Handle a multi-packet response.
-    fn handle_response_multi_packet(&self, hdr: &PktHdr, payload: &[u8], batch_ts: u64) -> Result<()> {
+    fn handle_response_multi_packet(
+        &self,
+        hdr: &PktHdr,
+        payload: &[u8],
+        batch_ts: u64,
+    ) -> Result<()> {
         let dest_session = hdr.dest_session_num();
         let pkt_num = hdr.pkt_num();
         let msg_size = hdr.msg_size();
@@ -1156,7 +1202,9 @@ impl<U: 'static> Rpc<U> {
         let (is_complete, pending, data) = {
             let mut sessions = self.sessions.borrow_mut();
             let handle = SessionHandle(dest_session);
-            let sess = sessions.get_mut(handle).ok_or(Error::SessionNotFound(dest_session))?;
+            let sess = sessions
+                .get_mut(handle)
+                .ok_or(Error::SessionNotFound(dest_session))?;
 
             // Find the matching slot
             let sslot_idx = match sess.find_sslot_by_req_num(hdr.req_num()) {
@@ -1203,7 +1251,9 @@ impl<U: 'static> Rpc<U> {
 
                 // Cancel the retransmission timer (fast path with known wheel_slot)
                 if let Some(wheel_slot) = sslot.timer_wheel_slot {
-                    self.timing_wheel.borrow_mut().cancel_fast(wheel_slot, hdr.req_num());
+                    self.timing_wheel
+                        .borrow_mut()
+                        .cancel_fast(wheel_slot, hdr.req_num());
                 }
 
                 let tx_ts = sslot.tx_ts;
@@ -1245,10 +1295,11 @@ impl<U: 'static> Rpc<U> {
         // Call on_response callback outside of borrow
         if is_complete
             && let Some(p) = pending
-                && let Some(ud) = p.user_data
-                    && let Some(resp_data) = data {
-                        (self.on_response)(ud, &resp_data);
-                    }
+            && let Some(ud) = p.user_data
+            && let Some(resp_data) = data
+        {
+            (self.on_response)(ud, &resp_data);
+        }
 
         Ok(())
     }
@@ -1272,7 +1323,9 @@ impl<U: 'static> Rpc<U> {
         // Use pre-allocated buffer to avoid allocation in hot path
         let mut expired = self.expired_timers.borrow_mut();
         expired.clear();
-        self.timing_wheel.borrow_mut().advance_into(batch_ts, &mut expired);
+        self.timing_wheel
+            .borrow_mut()
+            .advance_into(batch_ts, &mut expired);
 
         for entry in expired.drain(..) {
             self.handle_timeout(entry, batch_ts);
@@ -1312,9 +1365,10 @@ impl<U: 'static> Rpc<U> {
                             None
                         } else {
                             // Need to retransmit all request packets
-                            sslot.user_data.as_ref().map(|p| {
-                                (p.single_buf_idx, p.multi_buf_indices.clone())
-                            })
+                            sslot
+                                .user_data
+                                .as_ref()
+                                .map(|p| (p.single_buf_idx, p.multi_buf_indices.clone()))
                         }
                     } else {
                         None
@@ -1331,22 +1385,46 @@ impl<U: 'static> Rpc<U> {
         if let Some((single_idx, multi_indices)) = should_retransmit {
             // Single-packet fast path
             if let Some(idx) = single_idx {
-                let _ = self.retransmit_single(entry.session_num, idx, entry.sslot_idx, entry.req_num, now);
+                let _ = self.retransmit_single(
+                    entry.session_num,
+                    idx,
+                    entry.sslot_idx,
+                    entry.req_num,
+                    now,
+                );
             }
             // Multi-packet path
             if let Some(ref indices) = multi_indices {
-                let _ = self.retransmit(entry.session_num, indices, entry.sslot_idx, entry.req_num, now);
+                let _ = self.retransmit(
+                    entry.session_num,
+                    indices,
+                    entry.sslot_idx,
+                    entry.req_num,
+                    now,
+                );
             }
         }
     }
 
     /// Retransmit a single-packet request.
-    fn retransmit_single(&self, session_num: u16, buf_idx: usize, sslot_idx: usize, req_num: u64, now: u64) -> Result<()> {
+    fn retransmit_single(
+        &self,
+        session_num: u16,
+        buf_idx: usize,
+        sslot_idx: usize,
+        req_num: u64,
+        now: u64,
+    ) -> Result<()> {
         let av = {
             let sessions = self.sessions.borrow();
             let handle = SessionHandle(session_num);
-            let sess = sessions.get(handle).ok_or(Error::SessionNotFound(session_num))?;
-            let ah = sess.ah.as_ref().ok_or(Error::SessionNotConnected(session_num))?;
+            let sess = sessions
+                .get(handle)
+                .ok_or(Error::SessionNotFound(session_num))?;
+            let ah = sess
+                .ah
+                .as_ref()
+                .ok_or(Error::SessionNotConnected(session_num))?;
             UdTransport::ah_to_av(ah)
         };
 
@@ -1361,7 +1439,8 @@ impl<U: 'static> Rpc<U> {
                 buf_type: BufferType::Request,
             };
             let addr = send_buffers.slot_addr(buf_idx);
-            self.transport.post_send_raw(av, addr, pkt_len, lkey, entry)?;
+            self.transport
+                .post_send_raw(av, addr, pkt_len, lkey, entry)?;
         }
 
         // Re-arm timer
@@ -1378,22 +1457,35 @@ impl<U: 'static> Rpc<U> {
             let mut sessions = self.sessions.borrow_mut();
             let handle = SessionHandle(session_num);
             if let Some(sess) = sessions.get_mut(handle)
-                && let Some(sslot) = sess.sslot_mut(sslot_idx) {
-                    sslot.timer_wheel_slot = wheel_slot;
-                }
+                && let Some(sslot) = sess.sslot_mut(sslot_idx)
+            {
+                sslot.timer_wheel_slot = wheel_slot;
+            }
         }
 
         Ok(())
     }
 
     /// Retransmit all packets of a request.
-    fn retransmit(&self, session_num: u16, req_buf_indices: &[usize], sslot_idx: usize, req_num: u64, now: u64) -> Result<()> {
+    fn retransmit(
+        &self,
+        session_num: u16,
+        req_buf_indices: &[usize],
+        sslot_idx: usize,
+        req_num: u64,
+        now: u64,
+    ) -> Result<()> {
         // Get address vector before dropping session borrow
         let av = {
             let sessions = self.sessions.borrow();
             let handle = SessionHandle(session_num);
-            let sess = sessions.get(handle).ok_or(Error::SessionNotFound(session_num))?;
-            let ah = sess.ah.as_ref().ok_or(Error::SessionNotConnected(session_num))?;
+            let sess = sessions
+                .get(handle)
+                .ok_or(Error::SessionNotFound(session_num))?;
+            let ah = sess
+                .ah
+                .as_ref()
+                .ok_or(Error::SessionNotConnected(session_num))?;
             UdTransport::ah_to_av(ah)
         };
 
@@ -1412,7 +1504,8 @@ impl<U: 'static> Rpc<U> {
                 };
 
                 let addr = send_buffers.slot_addr(req_buf_idx);
-                self.transport.post_send_raw(av, addr, pkt_len, lkey, entry)?;
+                self.transport
+                    .post_send_raw(av, addr, pkt_len, lkey, entry)?;
             }
         }
         // Doorbell is batched in run_event_loop_once()
@@ -1431,9 +1524,10 @@ impl<U: 'static> Rpc<U> {
             let mut sessions = self.sessions.borrow_mut();
             let handle = SessionHandle(session_num);
             if let Some(sess) = sessions.get_mut(handle)
-                && let Some(sslot) = sess.sslot_mut(sslot_idx) {
-                    sslot.timer_wheel_slot = wheel_slot;
-                }
+                && let Some(sslot) = sess.sslot_mut(sslot_idx)
+            {
+                sslot.timer_wheel_slot = wheel_slot;
+            }
         }
 
         Ok(())
@@ -1570,7 +1664,12 @@ impl<U: 'static> Rpc<U> {
             // Retry the call with the stalled request
             // Note: This may fail again if slots are exhausted or session disconnected,
             // but we don't re-queue in that case to avoid infinite loops
-            let _ = self.call(stalled.session, stalled.req_type, &stalled.data, stalled.user_data);
+            let _ = self.call(
+                stalled.session,
+                stalled.req_type,
+                &stalled.data,
+                stalled.user_data,
+            );
 
             processed += 1;
         }

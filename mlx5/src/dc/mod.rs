@@ -10,10 +10,10 @@ use std::{io, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
 use crate::BuildResult;
 use crate::CompletionTarget;
-use crate::builder_common::{register_with_send_cq, MaybeMonoCqRegister};
+use crate::builder_common::{MaybeMonoCqRegister, register_with_send_cq};
 use crate::cq::{Cq, Cqe};
-use crate::mono_cq::CompletionSource;
 use crate::device::Context;
+use crate::mono_cq::CompletionSource;
 use crate::mono_cq::MonoCq;
 use crate::pd::Pd;
 use crate::qp::QpInfo;
@@ -75,7 +75,8 @@ pub(super) type DciSendQueueState<Entry, TableType> = SendQueueState<Entry, Tabl
 // =============================================================================
 
 /// Type alias for DCI with ordered WQE table (InfiniBand transport).
-pub type DciWithTable<Entry, OnComplete> = Dci<Entry, InfiniBand, OrderedWqeTable<Entry>, OnComplete>;
+pub type DciWithTable<Entry, OnComplete> =
+    Dci<Entry, InfiniBand, OrderedWqeTable<Entry>, OnComplete>;
 
 /// Type alias for DCI with ordered WQE table (InfiniBand transport).
 pub type DciIb<Entry, OnComplete> = Dci<Entry, InfiniBand, OrderedWqeTable<Entry>, OnComplete>;
@@ -336,7 +337,9 @@ where
     }
 }
 
-impl<Entry, Transport, TableType, OnComplete> Drop for Dci<Entry, Transport, TableType, OnComplete> {
+impl<Entry, Transport, TableType, OnComplete> Drop
+    for Dci<Entry, Transport, TableType, OnComplete>
+{
     fn drop(&mut self) {
         // Unregister from CQ before destroying QP
         if let Some(cq) = self.send_cq.upgrade() {
@@ -516,14 +519,15 @@ impl<Entry, Transport, TableType, OnComplete> Dci<Entry, Transport, TableType, O
             sq.ring_doorbell_bf();
         }
     }
-
 }
 
 impl<Entry, OnComplete> DciWithTable<Entry, OnComplete> {
     #[doc(hidden)]
     #[inline]
     pub fn emit_ctx(&self) -> io::Result<DciEmitContext<'_, Entry>> {
-        let sq = self.sq.as_ref()
+        let sq = self
+            .sq
+            .as_ref()
             .ok_or_else(|| io::Error::other("direct access not initialized"))?;
         Ok(DciEmitContext {
             buf: sq.buf,
@@ -859,4 +863,3 @@ impl<T> Dct<T> {
         self.srq.process_recv_completion(wqe_idx)
     }
 }
-

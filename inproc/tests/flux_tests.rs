@@ -1,10 +1,10 @@
 //! Integration tests for Flux (SPSC-based n-to-n).
 
+use inproc::{Flux, SendError, create_flux};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use inproc::{create_flux, Flux, SendError};
 
 #[test]
 fn test_two_node_communication() {
@@ -182,9 +182,10 @@ fn test_threaded_all_to_all() {
         (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
     let counts_clone: Vec<Arc<AtomicU64>> = response_counts.clone();
 
-    let nodes: Vec<Flux<u64, usize, _>> = create_flux(n, 2048, 256, move |node_idx: &mut usize, _: u64| {
-        counts_clone[*node_idx].fetch_add(1, Ordering::Relaxed);
-    });
+    let nodes: Vec<Flux<u64, usize, _>> =
+        create_flux(n, 2048, 256, move |node_idx: &mut usize, _: u64| {
+            counts_clone[*node_idx].fetch_add(1, Ordering::Relaxed);
+        });
 
     let handles: Vec<_> = nodes
         .into_iter()
@@ -251,15 +252,11 @@ fn test_simple_ping_pong() {
     let response_received = Arc::new(AtomicU64::new(0));
     let response_clone = Arc::clone(&response_received);
 
-    let mut nodes: Vec<Flux<u64, u64, _>> = create_flux(
-        2,
-        64,
-        32,
-        move |expected: &mut u64, response: u64| {
+    let mut nodes: Vec<Flux<u64, u64, _>> =
+        create_flux(2, 64, 32, move |expected: &mut u64, response: u64| {
             assert_eq!(*expected, response);
             response_clone.fetch_add(1, Ordering::Relaxed);
-        },
-    );
+        });
 
     let iterations = 100u64;
 

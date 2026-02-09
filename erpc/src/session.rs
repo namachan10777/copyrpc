@@ -273,11 +273,7 @@ pub struct Session<U> {
 
 impl<U> Session<U> {
     /// Create a new session.
-    pub fn new(
-        local_session_num: u16,
-        remote: RemoteInfo,
-        config: &RpcConfig,
-    ) -> Self {
+    pub fn new(local_session_num: u16, remote: RemoteInfo, config: &RpcConfig) -> Self {
         let req_window = config.req_window;
         let sslots = (0..req_window).map(SSlot::new).collect();
 

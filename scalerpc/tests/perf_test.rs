@@ -172,7 +172,9 @@ fn test_latency() {
         std::hint::spin_loop();
     }
 
-    client.connect(conn_id, server_info.into()).expect("connect");
+    client
+        .connect(conn_id, server_info.into())
+        .expect("connect");
 
     // Warmup
     let payload = vec![0xAAu8; 32];
@@ -211,7 +213,10 @@ fn test_latency() {
     println!("Iterations: {}", iterations);
     println!("Total time: {:.2?}", elapsed);
     println!("Average RTT: {:.2} µs", avg_latency_us);
-    println!("Throughput: {:.2} MRPS", 1.0 / (avg_latency_us / 1_000_000.0) / 1_000_000.0);
+    println!(
+        "Throughput: {:.2} MRPS",
+        1.0 / (avg_latency_us / 1_000_000.0) / 1_000_000.0
+    );
 
     stop_flag.store(true, Ordering::SeqCst);
     server_handle.join().unwrap();
@@ -262,7 +267,7 @@ fn test_throughput() {
 
         let server_config = ServerConfig {
             pool: PoolConfig {
-                num_slots: 64,  // Balanced for slot scanning
+                num_slots: 64, // Balanced for slot scanning
                 slot_data_size: 4080,
             },
             num_recv_slots: 64,
@@ -314,7 +319,9 @@ fn test_throughput() {
         std::hint::spin_loop();
     }
 
-    client.connect(conn_id, server_info.into()).expect("connect");
+    client
+        .connect(conn_id, server_info.into())
+        .expect("connect");
 
     // Default to pipeline depth 8 for good throughput.
     // Use SCALERPC_PIPELINE_DEPTH env var to customize.
@@ -332,8 +339,7 @@ fn test_throughput() {
     println!("Pipeline depth: {}", pipeline_depth);
     println!("Total requests: {}", total_requests);
 
-    let mut pending_requests: Vec<scalerpc::PendingRpc<'_>> =
-        Vec::with_capacity(pipeline_depth);
+    let mut pending_requests: Vec<scalerpc::PendingRpc<'_>> = Vec::with_capacity(pipeline_depth);
     let mut completed = 0usize;
     let mut sent = 0usize;
 
@@ -356,8 +362,13 @@ fn test_throughput() {
     let timeout = std::time::Duration::from_secs(30);
     while completed < total_requests {
         if start.elapsed() > timeout {
-            panic!("Test timed out after {:?}. completed={}, sent={}, pending={}",
-                   timeout, completed, sent, pending_requests.len());
+            panic!(
+                "Test timed out after {:?}. completed={}, sent={}, pending={}",
+                timeout,
+                completed,
+                sent,
+                pending_requests.len()
+            );
         }
 
         // Check for completed requests
@@ -439,7 +450,7 @@ fn test_throughput_4kb() {
 
         let server_config = ServerConfig {
             pool: PoolConfig {
-                num_slots: 64,  // Balanced for slot scanning
+                num_slots: 64, // Balanced for slot scanning
                 slot_data_size: 4080,
             },
             num_recv_slots: 64,
@@ -491,7 +502,9 @@ fn test_throughput_4kb() {
         std::hint::spin_loop();
     }
 
-    client.connect(conn_id, server_info.into()).expect("connect");
+    client
+        .connect(conn_id, server_info.into())
+        .expect("connect");
 
     // Default to pipeline depth 8 for good throughput.
     let pipeline_depth = std::env::var("SCALERPC_PIPELINE_DEPTH")
@@ -508,8 +521,7 @@ fn test_throughput_4kb() {
     println!("Pipeline depth: {}", pipeline_depth);
     println!("Total requests: {}", total_requests);
 
-    let mut pending_requests: Vec<scalerpc::PendingRpc<'_>> =
-        Vec::with_capacity(pipeline_depth);
+    let mut pending_requests: Vec<scalerpc::PendingRpc<'_>> = Vec::with_capacity(pipeline_depth);
     let mut completed = 0usize;
     let mut sent = 0usize;
 
@@ -532,8 +544,13 @@ fn test_throughput_4kb() {
     let timeout = std::time::Duration::from_secs(30);
     while completed < total_requests {
         if start.elapsed() > timeout {
-            panic!("Test timed out after {:?}. completed={}, sent={}, pending={}",
-                   timeout, completed, sent, pending_requests.len());
+            panic!(
+                "Test timed out after {:?}. completed={}, sent={}, pending={}",
+                timeout,
+                completed,
+                sent,
+                pending_requests.len()
+            );
         }
 
         let mut i = 0;
@@ -678,7 +695,9 @@ fn test_throughput_process_mode() {
         std::hint::spin_loop();
     }
 
-    client.connect(conn_id, server_info.into()).expect("connect");
+    client
+        .connect(conn_id, server_info.into())
+        .expect("connect");
 
     let pipeline_depth = std::env::var("SCALERPC_PIPELINE_DEPTH")
         .ok()
@@ -695,8 +714,7 @@ fn test_throughput_process_mode() {
     println!("Total requests: {}", total_requests);
     println!("Client pool slots: {}", client_pool_size);
 
-    let mut pending_requests: Vec<scalerpc::PendingRpc<'_>> =
-        Vec::with_capacity(pipeline_depth);
+    let mut pending_requests: Vec<scalerpc::PendingRpc<'_>> = Vec::with_capacity(pipeline_depth);
     let mut completed = 0usize;
     let mut sent = 0usize;
 
@@ -719,8 +737,13 @@ fn test_throughput_process_mode() {
     let timeout = std::time::Duration::from_secs(30);
     while completed < total_requests {
         if start.elapsed() > timeout {
-            panic!("Test timed out after {:?}. completed={}, sent={}, pending={}",
-                   timeout, completed, sent, pending_requests.len());
+            panic!(
+                "Test timed out after {:?}. completed={}, sent={}, pending={}",
+                timeout,
+                completed,
+                sent,
+                pending_requests.len()
+            );
         }
 
         let mut i = 0;

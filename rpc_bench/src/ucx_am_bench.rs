@@ -43,9 +43,7 @@ pub fn run(
             }
             run_one_to_one(common, world, *inflight as usize)
         }
-        ModeCmd::MultiClient { inflight } => {
-            run_multi_client(common, world, *inflight as usize)
-        }
+        ModeCmd::MultiClient { inflight } => run_multi_client(common, world, *inflight as usize),
     }
 }
 
@@ -445,10 +443,7 @@ unsafe fn get_worker_address(
     (addr, addr_len)
 }
 
-unsafe fn create_endpoint(
-    worker: ucx_sys::ucp_worker_h,
-    remote_addr: &[u8],
-) -> ucx_sys::ucp_ep_h {
+unsafe fn create_endpoint(worker: ucx_sys::ucp_worker_h, remote_addr: &[u8]) -> ucx_sys::ucp_ep_h {
     let ep_params = ucx_sys::ucp_ep_params_t {
         field_mask: ucx_sys::ucp_ep_params_field_UCP_EP_PARAM_FIELD_REMOTE_ADDRESS as u64,
         address: remote_addr.as_ptr() as *const ucx_sys::ucp_address_t,
@@ -554,7 +549,8 @@ unsafe fn register_response_handler(worker: ucx_sys::ucp_worker_h) {
     let handler_param = ucx_sys::ucp_am_handler_param_t {
         field_mask: (ucx_sys::ucp_am_handler_param_field_UCP_AM_HANDLER_PARAM_FIELD_ID
             | ucx_sys::ucp_am_handler_param_field_UCP_AM_HANDLER_PARAM_FIELD_CB
-            | ucx_sys::ucp_am_handler_param_field_UCP_AM_HANDLER_PARAM_FIELD_FLAGS) as u64,
+            | ucx_sys::ucp_am_handler_param_field_UCP_AM_HANDLER_PARAM_FIELD_FLAGS)
+            as u64,
         id: AM_RESPONSE,
         cb: Some(response_handler),
         flags: ucx_sys::ucp_am_cb_flags_UCP_AM_FLAG_WHOLE_MSG,
@@ -569,7 +565,8 @@ unsafe fn register_request_handler(worker: ucx_sys::ucp_worker_h) {
     let handler_param = ucx_sys::ucp_am_handler_param_t {
         field_mask: (ucx_sys::ucp_am_handler_param_field_UCP_AM_HANDLER_PARAM_FIELD_ID
             | ucx_sys::ucp_am_handler_param_field_UCP_AM_HANDLER_PARAM_FIELD_CB
-            | ucx_sys::ucp_am_handler_param_field_UCP_AM_HANDLER_PARAM_FIELD_FLAGS) as u64,
+            | ucx_sys::ucp_am_handler_param_field_UCP_AM_HANDLER_PARAM_FIELD_FLAGS)
+            as u64,
         id: AM_REQUEST,
         cb: Some(request_handler),
         flags: ucx_sys::ucp_am_cb_flags_UCP_AM_FLAG_WHOLE_MSG,

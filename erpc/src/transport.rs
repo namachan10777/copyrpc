@@ -16,13 +16,13 @@ use mlx5::device::Context;
 use mlx5::mono_cq::MonoCq;
 use mlx5::pd::{AddressHandle, Pd, RemoteUdQpInfo};
 use mlx5::ud::{UdQpConfig, UdQpForMonoCqWithSqCb};
-pub use mlx5::wqe::emit::UdAvIb;
 use mlx5::wqe::WqeFlags;
+pub use mlx5::wqe::emit::UdAvIb;
 
 use crate::buffer::MsgBuffer;
 use crate::config::RpcConfig;
 use crate::error::{Error, Result};
-use crate::packet::{PktHdr, PKT_HDR_SIZE};
+use crate::packet::{PKT_HDR_SIZE, PktHdr};
 
 /// Buffer type for distinguishing request vs response buffers.
 ///
@@ -126,7 +126,11 @@ struct SendCompletionBuffers {
 /// This function handles signaled interval logic for send completions.
 /// Uses swap to avoid Vec allocations - pending_response_bufs is swapped out,
 /// processed, and remaining items are swapped back.
-fn process_send_completion(completions: &Rc<RefCell<SendCompletionBuffers>>, _cqe: Cqe, entry: TransportEntry) {
+fn process_send_completion(
+    completions: &Rc<RefCell<SendCompletionBuffers>>,
+    _cqe: Cqe,
+    entry: TransportEntry,
+) {
     let mut comps = completions.borrow_mut();
     // The signaled WQE's send_counter is stored in entry.context
     // Release only pending buffers with counter <= this counter
@@ -244,9 +248,9 @@ impl UdTransport {
             send_completions: Vec::with_capacity(config.max_send_wr as usize),
             pending_response_bufs: Vec::with_capacity(config.max_send_wr as usize),
         }));
-        let recv_completions = Rc::new(RefCell::new(
-            Vec::with_capacity(config.max_recv_wr as usize)
-        ));
+        let recv_completions = Rc::new(RefCell::new(Vec::with_capacity(
+            config.max_recv_wr as usize,
+        )));
 
         // Create send callback that handles signaled interval
         let send_comps_clone = send_completions.clone();
@@ -264,13 +268,11 @@ impl UdTransport {
         });
 
         // Create recv CQ (MonoCq for direct dispatch)
-        let recv_cq = Rc::new(
-            ctx.create_mono_cq::<HybridQp, _>(
-                config.max_recv_wr as i32,
-                recv_callback,
-                &cq_config,
-            )?,
-        );
+        let recv_cq = Rc::new(ctx.create_mono_cq::<HybridQp, _>(
+            config.max_recv_wr as i32,
+            recv_callback,
+            &cq_config,
+        )?);
 
         // Create UD QP configuration
         let qp_config = UdQpConfig {
@@ -350,12 +352,7 @@ impl UdTransport {
     /// For unsignaled Response sends, the buffer index is queued for deferred
     /// deallocation when the next signaled completion arrives.
     /// The buffer must be registered.
-    pub fn post_send(
-        &self,
-        av: UdAvIb,
-        buf: &MsgBuffer,
-        entry: TransportEntry,
-    ) -> Result<()> {
+    pub fn post_send(&self, av: UdAvIb, buf: &MsgBuffer, entry: TransportEntry) -> Result<()> {
         let qp = self.qp.borrow();
         let lkey = buf.lkey().ok_or_else(|| {
             Error::Io(std::io::Error::new(
@@ -384,7 +381,10 @@ impl UdTransport {
         } else {
             // Queue Response buffers for deferred deallocation with counter
             if entry.buf_type == BufferType::Response && entry.buf_idx != usize::MAX {
-                self.send_completions.borrow_mut().pending_response_bufs.push((count, entry.buf_idx));
+                self.send_completions
+                    .borrow_mut()
+                    .pending_response_bufs
+                    .push((count, entry.buf_idx));
             }
             mlx5::emit_ud_wqe!(&ctx, send {
                 av: av,
@@ -433,7 +433,10 @@ impl UdTransport {
         } else {
             // Queue Response buffers for deferred deallocation with counter
             if entry.buf_type == BufferType::Response && entry.buf_idx != usize::MAX {
-                self.send_completions.borrow_mut().pending_response_bufs.push((count, entry.buf_idx));
+                self.send_completions
+                    .borrow_mut()
+                    .pending_response_bufs
+                    .push((count, entry.buf_idx));
             }
             mlx5::emit_ud_wqe!(&ctx, send {
                 av: av,
@@ -450,11 +453,7 @@ impl UdTransport {
     ///
     /// This variant does not generate a completion, which reduces CQ overhead.
     /// Use with caution: the buffer must remain valid until the send completes.
-    pub fn post_send_unsignaled(
-        &self,
-        av: UdAvIb,
-        buf: &MsgBuffer,
-    ) -> Result<()> {
+    pub fn post_send_unsignaled(&self, av: UdAvIb, buf: &MsgBuffer) -> Result<()> {
         let qp = self.qp.borrow();
         let lkey = buf.lkey().ok_or_else(|| {
             Error::Io(std::io::Error::new(
@@ -505,18 +504,24 @@ impl UdTransport {
         self.send_counter.set(count.wrapping_add(1));
 
         if should_signal {
-            mlx5::emit_ud_wqe!(&ctx, send {
-                av: av,
-                flags: WqeFlags::empty(),
-                inline: data,
-                signaled: entry,
-            })?;
+            mlx5::emit_ud_wqe!(
+                &ctx,
+                send {
+                    av: av,
+                    flags: WqeFlags::empty(),
+                    inline: data,
+                    signaled: entry,
+                }
+            )?;
         } else {
-            mlx5::emit_ud_wqe!(&ctx, send {
-                av: av,
-                flags: WqeFlags::empty(),
-                inline: data,
-            })?;
+            mlx5::emit_ud_wqe!(
+                &ctx,
+                send {
+                    av: av,
+                    flags: WqeFlags::empty(),
+                    inline: data,
+                }
+            )?;
         }
 
         self.pending_sends.set(self.pending_sends.get() + 1);
@@ -544,7 +549,13 @@ impl UdTransport {
     /// Post a receive operation with raw parameters.
     ///
     /// This variant is useful when buffer info has already been extracted.
-    pub fn post_recv_raw(&self, addr: u64, len: u32, lkey: u32, entry: TransportEntry) -> Result<()> {
+    pub fn post_recv_raw(
+        &self,
+        addr: u64,
+        len: u32,
+        lkey: u32,
+        entry: TransportEntry,
+    ) -> Result<()> {
         let qp = self.qp.borrow();
         qp.post_recv(entry, addr, len, lkey)?;
         self.pending_recvs.set(self.pending_recvs.get() + 1);

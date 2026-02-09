@@ -182,7 +182,10 @@ impl TimingWheel {
         if wheel_slot >= self.num_slots {
             return false;
         }
-        if let Some(pos) = self.slots[wheel_slot].iter().position(|e| e.req_num == req_num) {
+        if let Some(pos) = self.slots[wheel_slot]
+            .iter()
+            .position(|e| e.req_num == req_num)
+        {
             self.slots[wheel_slot].remove(pos);
             return true;
         }
@@ -326,7 +329,8 @@ impl RdtscClock {
         let tsc = rdtsc();
         let delta_cycles = tsc.wrapping_sub(self.base_tsc);
         // delta_us = delta_cycles * us_per_cycle_scaled >> 32
-        let delta_us = ((delta_cycles as u128 * self.us_per_cycle_scaled as u128) >> SCALE_SHIFT) as u64;
+        let delta_us =
+            ((delta_cycles as u128 * self.us_per_cycle_scaled as u128) >> SCALE_SHIFT) as u64;
         self.base_us + delta_us
     }
 }

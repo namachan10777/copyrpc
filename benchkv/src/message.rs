@@ -71,7 +71,10 @@ pub struct RemoteResponse {
 impl RemoteRequest {
     pub fn as_bytes(&self) -> &[u8] {
         unsafe {
-            std::slice::from_raw_parts(self as *const Self as *const u8, std::mem::size_of::<Self>())
+            std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                std::mem::size_of::<Self>(),
+            )
         }
     }
 
@@ -84,7 +87,10 @@ impl RemoteRequest {
 impl RemoteResponse {
     pub fn as_bytes(&self) -> &[u8] {
         unsafe {
-            std::slice::from_raw_parts(self as *const Self as *const u8, std::mem::size_of::<Self>())
+            std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                std::mem::size_of::<Self>(),
+            )
         }
     }
 
@@ -96,8 +102,8 @@ impl RemoteResponse {
 
 // === Thread-local response queues ===
 
-use std::cell::RefCell;
 use ipc::RequestToken;
+use std::cell::RefCell;
 
 /// Response routed back from the Flux on_response callback.
 #[derive(Debug)]

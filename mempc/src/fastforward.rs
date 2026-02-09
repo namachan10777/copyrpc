@@ -15,8 +15,8 @@ use crate::{CallError, MpscCaller, MpscChannel, MpscServer, ReplyToken};
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::ptr;
-use std::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering, compiler_fence};
 
 // ============================================================================
 // SPSC Core
@@ -146,7 +146,9 @@ pub struct FastForwardCaller<Req: Serial, Resp: Serial> {
     max_inflight: usize,
 }
 
-impl<Req: Serial + Send, Resp: Serial + Send> MpscCaller<Req, Resp> for FastForwardCaller<Req, Resp> {
+impl<Req: Serial + Send, Resp: Serial + Send> MpscCaller<Req, Resp>
+    for FastForwardCaller<Req, Resp>
+{
     fn call(&mut self, req: Req) -> Result<u64, CallError<Req>> {
         if self.inflight >= self.max_inflight {
             return Err(CallError::InflightExceeded(req));
@@ -203,8 +205,13 @@ impl<Req: Serial, Resp: Serial> FastForwardServer<Req, Resp> {
     }
 }
 
-impl<Req: Serial + Send, Resp: Serial + Send> MpscServer<Req, Resp> for FastForwardServer<Req, Resp> {
-    type RecvRef<'a> = FastForwardRecvRef<'a, Req, Resp> where Self: 'a;
+impl<Req: Serial + Send, Resp: Serial + Send> MpscServer<Req, Resp>
+    for FastForwardServer<Req, Resp>
+{
+    type RecvRef<'a>
+        = FastForwardRecvRef<'a, Req, Resp>
+    where
+        Self: 'a;
 
     fn poll(&mut self) -> u32 {
         self.available.clear();
@@ -442,8 +449,7 @@ mod tests {
 
     #[test]
     fn test_mpsc_basic() {
-        let (mut callers, mut server) =
-            FastForwardMpsc::create::<u64, u64>(2, 4, 4);
+        let (mut callers, mut server) = FastForwardMpsc::create::<u64, u64>(2, 4, 4);
 
         assert_eq!(callers[0].call(10), Ok(0));
         assert_eq!(callers[1].call(20), Ok(0));
@@ -467,8 +473,7 @@ mod tests {
 
     #[test]
     fn test_mpsc_multi_caller() {
-        let (mut callers, mut server) =
-            FastForwardMpsc::create::<u64, u64>(3, 4, 4);
+        let (mut callers, mut server) = FastForwardMpsc::create::<u64, u64>(3, 4, 4);
 
         for (i, caller) in callers.iter_mut().enumerate() {
             assert_eq!(caller.call((i as u64 + 1) * 10), Ok(0));
@@ -494,20 +499,21 @@ mod tests {
 
     #[test]
     fn test_mpsc_inflight_limit() {
-        let (mut callers, mut _server) =
-            FastForwardMpsc::create::<u64, u64>(1, 4, 2);
+        let (mut callers, mut _server) = FastForwardMpsc::create::<u64, u64>(1, 4, 2);
 
         assert_eq!(callers[0].call(1), Ok(0));
         assert_eq!(callers[0].call(2), Ok(1));
-        assert!(matches!(callers[0].call(3), Err(CallError::InflightExceeded(3))));
+        assert!(matches!(
+            callers[0].call(3),
+            Err(CallError::InflightExceeded(3))
+        ));
 
         assert_eq!(callers[0].pending_count(), 2);
     }
 
     #[test]
     fn test_mpsc_ring_full() {
-        let (mut callers, mut _server) =
-            FastForwardMpsc::create::<u64, u64>(1, 2, 10);
+        let (mut callers, mut _server) = FastForwardMpsc::create::<u64, u64>(1, 2, 10);
 
         assert_eq!(callers[0].call(1), Ok(0));
         assert_eq!(callers[0].call(2), Ok(1));
@@ -516,8 +522,7 @@ mod tests {
 
     #[test]
     fn test_mpsc_zero_copy_recv() {
-        let (mut callers, mut server) =
-            FastForwardMpsc::create::<u64, u64>(1, 4, 4);
+        let (mut callers, mut server) = FastForwardMpsc::create::<u64, u64>(1, 4, 4);
 
         callers[0].call(42).unwrap();
         server.poll();
@@ -533,8 +538,7 @@ mod tests {
 
     #[test]
     fn test_mpsc_deferred_reply() {
-        let (mut callers, mut server) =
-            FastForwardMpsc::create::<u64, u64>(2, 4, 4);
+        let (mut callers, mut server) = FastForwardMpsc::create::<u64, u64>(2, 4, 4);
 
         callers[0].call(10).unwrap();
         callers[1].call(20).unwrap();
@@ -561,8 +565,7 @@ mod tests {
 
     #[test]
     fn test_mpsc_ring_wraparound() {
-        let (mut callers, mut server) =
-            FastForwardMpsc::create::<u64, u64>(1, 4, 4);
+        let (mut callers, mut server) = FastForwardMpsc::create::<u64, u64>(1, 4, 4);
 
         for i in 0..10 {
             callers[0].call(i).unwrap();
@@ -579,8 +582,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "FastForwardRecvRef dropped without reply() or into_token()")]
     fn test_recv_ref_drop_panic() {
-        let (mut callers, mut server) =
-            FastForwardMpsc::create::<u64, u64>(1, 4, 4);
+        let (mut callers, mut server) = FastForwardMpsc::create::<u64, u64>(1, 4, 4);
 
         callers[0].call(42).unwrap();
         server.poll();

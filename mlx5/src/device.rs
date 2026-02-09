@@ -241,12 +241,8 @@ impl Context {
     pub fn query_gid(&self, port_num: u8, index: u8) -> io::Result<Gid> {
         unsafe {
             let mut gid: MaybeUninit<mlx5_sys::ibv_gid> = MaybeUninit::zeroed();
-            let ret = mlx5_sys::ibv_query_gid(
-                self.as_ptr(),
-                port_num,
-                index as i32,
-                gid.as_mut_ptr(),
-            );
+            let ret =
+                mlx5_sys::ibv_query_gid(self.as_ptr(), port_num, index as i32, gid.as_mut_ptr());
             if ret != 0 {
                 return Err(io::Error::from_raw_os_error(-ret));
             }

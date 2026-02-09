@@ -10,10 +10,7 @@ fn main() {
     println!("cargo:rustc-link-lib=uct");
 
     let mut builder = bindgen::Builder::default()
-        .header_contents(
-            "wrapper.h",
-            "#include <ucp/api/ucp.h>\n",
-        )
+        .header_contents("wrapper.h", "#include <ucp/api/ucp.h>\n")
         .allowlist_function("ucp_.*")
         .allowlist_type("ucp_.*")
         .allowlist_var("UCP_.*")
@@ -41,11 +38,7 @@ fn main() {
 
 fn find_ucx_include() -> Option<PathBuf> {
     // Check common paths
-    let candidates = [
-        "/usr/include",
-        "/usr/local/include",
-        "/opt/ucx/include",
-    ];
+    let candidates = ["/usr/include", "/usr/local/include", "/opt/ucx/include"];
 
     for path in &candidates {
         let header = PathBuf::from(path).join("ucp/api/ucp.h");

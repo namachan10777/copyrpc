@@ -137,14 +137,10 @@ fn main() {
     );
 
     match args.transport {
-        TransportType::Onesided => {
-            run_bench::<mempc::OnesidedMpsc>(args.duration, args.start_core)
-        }
+        TransportType::Onesided => run_bench::<mempc::OnesidedMpsc>(args.duration, args.start_core),
         TransportType::FastForward => {
             run_bench::<mempc::FastForwardMpsc>(args.duration, args.start_core)
         }
-        TransportType::Lamport => {
-            run_bench::<mempc::LamportMpsc>(args.duration, args.start_core)
-        }
+        TransportType::Lamport => run_bench::<mempc::LamportMpsc>(args.duration, args.start_core),
     }
 }

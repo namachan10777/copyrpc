@@ -1,6 +1,6 @@
 // Simple program to inspect assembly of SPSC hot paths
 
-use inproc::transport::fastforward::{self, Sender, Receiver};
+use inproc::transport::fastforward::{self, Receiver, Sender};
 
 // Prevent compiler from optimizing away the operations
 #[inline(never)]

@@ -1,6 +1,6 @@
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use mpi::collective::CommunicatorCollectives;
@@ -88,7 +88,13 @@ pub fn run(
                     num_threads,
                 )
             } else {
-                run_one_to_one(common, world, session_credits, req_window, *inflight as usize)
+                run_one_to_one(
+                    common,
+                    world,
+                    session_credits,
+                    req_window,
+                    *inflight as usize,
+                )
             }
         }
         ModeCmd::MultiClient { inflight } => {
@@ -98,7 +104,13 @@ pub fn run(
                 }
                 return Vec::new();
             }
-            run_multi_client(common, world, session_credits, req_window, *inflight as usize)
+            run_multi_client(
+                common,
+                world,
+                session_credits,
+                req_window,
+                *inflight as usize,
+            )
         }
     }
 }
@@ -112,7 +124,13 @@ fn run_one_to_one(
 ) -> Vec<BenchRow> {
     let rank = world.rank();
     let is_client = rank == 0;
-    crate::affinity::pin_thread_if_configured(common.affinity_mode, common.affinity_start, rank, 1, 0);
+    crate::affinity::pin_thread_if_configured(
+        common.affinity_mode,
+        common.affinity_start,
+        rank,
+        1,
+        0,
+    );
 
     let (ctx, port) = open_mlx5_device(common.device_index, common.port);
 
@@ -172,7 +190,14 @@ fn run_one_to_one(
             world.barrier();
 
             let mut collector = EpochCollector::new(interval);
-            run_erpc_client_duration(&rpc, session, common.message_size, inflight, duration, &mut collector);
+            run_erpc_client_duration(
+                &rpc,
+                session,
+                common.message_size,
+                inflight,
+                duration,
+                &mut collector,
+            );
             collector.finish();
 
             let steady = collector.steady_state(common.trim);
@@ -190,7 +215,12 @@ fn run_one_to_one(
 
             if !steady.is_empty() {
                 let avg_rps: f64 = rows.iter().map(|r| r.rps).sum::<f64>() / rows.len() as f64;
-                eprintln!("  Run {}: avg {:.0} RPS ({} steady epochs)", run + 1, avg_rps, steady.len());
+                eprintln!(
+                    "  Run {}: avg {:.0} RPS ({} steady epochs)",
+                    run + 1,
+                    avg_rps,
+                    steady.len()
+                );
             }
 
             all_rows.extend(rows);
@@ -199,8 +229,8 @@ fn run_one_to_one(
         all_rows
     } else {
         // Server
-        let rpc: Rpc<()> = Rpc::new(&ctx, port, config, |_, _| {})
-            .expect("Failed to create server Rpc");
+        let rpc: Rpc<()> =
+            Rpc::new(&ctx, port, config, |_, _| {}).expect("Failed to create server Rpc");
 
         let local = rpc.local_info();
         let local_info = ErpcConnectionInfo {
@@ -213,12 +243,13 @@ fn run_one_to_one(
         let remote_bytes = mpi_util::exchange_bytes(world, rank, 0, &local_info.to_bytes());
         let remote_info = ErpcConnectionInfo::from_bytes(&remote_bytes);
 
-        let session = rpc.create_session(&RemoteInfo {
-            qpn: remote_info.qpn,
-            qkey: remote_info.qkey,
-            lid: remote_info.lid,
-        })
-        .expect("Failed to create server session");
+        let session = rpc
+            .create_session(&RemoteInfo {
+                qpn: remote_info.qpn,
+                qkey: remote_info.qkey,
+                lid: remote_info.lid,
+            })
+            .expect("Failed to create server session");
 
         // Wait for handshake on server side too
         let handshake_start = Instant::now();
@@ -285,7 +316,13 @@ fn run_one_to_one_threaded(
         let message_size = common.message_size;
 
         handles.push(std::thread::spawn(move || {
-            crate::affinity::pin_thread_if_configured(affinity_mode, affinity_start, rank, num_threads, tid);
+            crate::affinity::pin_thread_if_configured(
+                affinity_mode,
+                affinity_start,
+                rank,
+                num_threads,
+                tid,
+            );
 
             let (ctx, mlx5_port) = open_mlx5_device(device_index, port);
 
@@ -438,7 +475,8 @@ fn run_one_to_one_threaded(
     // Distribute remote infos
     for (tid, remote_tx) in remote_txs.iter().enumerate() {
         let offset = tid * ERPC_INFO_SIZE;
-        let remote_info = ErpcConnectionInfo::from_bytes(&remote_bytes[offset..offset + ERPC_INFO_SIZE]);
+        let remote_info =
+            ErpcConnectionInfo::from_bytes(&remote_bytes[offset..offset + ERPC_INFO_SIZE]);
         remote_tx.send(remote_info).unwrap();
     }
 
@@ -585,11 +623,7 @@ fn run_erpc_client_duration_atomic(
     }
 }
 
-fn run_erpc_server_duration_atomic(
-    rpc: &Rpc<()>,
-    message_size: usize,
-    stop_flag: &AtomicBool,
-) {
+fn run_erpc_server_duration_atomic(rpc: &Rpc<()>, message_size: usize, stop_flag: &AtomicBool) {
     let mut response_buf = vec![0u8; message_size];
 
     while !stop_flag.load(Ordering::Relaxed) {
@@ -735,7 +769,13 @@ fn run_multi_client(
     let size = world.size();
     let is_server = rank == 0;
     let num_clients = (size - 1) as usize;
-    crate::affinity::pin_thread_if_configured(common.affinity_mode, common.affinity_start, rank, 1, 0);
+    crate::affinity::pin_thread_if_configured(
+        common.affinity_mode,
+        common.affinity_start,
+        rank,
+        1,
+        0,
+    );
 
     let (ctx, port) = open_mlx5_device(common.device_index, common.port);
 
@@ -751,8 +791,8 @@ fn run_multi_client(
 
     if is_server {
         // Server: one Rpc, sessions auto-accepted
-        let rpc: Rpc<()> = Rpc::new(&ctx, port, config, |_, _| {})
-            .expect("Failed to create server Rpc");
+        let rpc: Rpc<()> =
+            Rpc::new(&ctx, port, config, |_, _| {}).expect("Failed to create server Rpc");
 
         let local = rpc.local_info();
         let local_info = ErpcConnectionInfo {
@@ -788,7 +828,12 @@ fn run_multi_client(
             world.barrier();
 
             let mut collector = EpochCollector::new(interval);
-            run_erpc_server_duration_with_epoch(&rpc, common.message_size, duration, &mut collector);
+            run_erpc_server_duration_with_epoch(
+                &rpc,
+                common.message_size,
+                duration,
+                &mut collector,
+            );
             collector.finish();
 
             let steady = collector.steady_state(common.trim);
@@ -864,7 +909,14 @@ fn run_multi_client(
             world.barrier();
 
             let mut collector = EpochCollector::new(interval);
-            run_erpc_client_duration(&rpc, session, common.message_size, inflight, duration, &mut collector);
+            run_erpc_client_duration(
+                &rpc,
+                session,
+                common.message_size,
+                inflight,
+                duration,
+                &mut collector,
+            );
         }
 
         Vec::new()

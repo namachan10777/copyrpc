@@ -1,7 +1,7 @@
 //! Shared memory management using `/dev/shm`.
 
 use nix::fcntl::OFlag;
-use nix::sys::mman::{mmap, munmap, shm_open, shm_unlink, MapFlags, ProtFlags};
+use nix::sys::mman::{MapFlags, ProtFlags, mmap, munmap, shm_open, shm_unlink};
 use nix::sys::stat::Mode;
 use nix::unistd::{close, ftruncate};
 use std::ffi::CString;
@@ -153,10 +153,9 @@ impl Drop for SharedMemory {
 }
 
 fn path_to_cstring<P: AsRef<Path>>(path: P) -> io::Result<CString> {
-    let path_str = path
-        .as_ref()
-        .to_str()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path contains invalid UTF-8"))?;
+    let path_str = path.as_ref().to_str().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "path contains invalid UTF-8")
+    })?;
 
     // Ensure the path starts with /
     let name = if path_str.starts_with('/') {

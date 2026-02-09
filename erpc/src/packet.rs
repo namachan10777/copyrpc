@@ -438,7 +438,12 @@ mod tests {
 
     #[test]
     fn test_pkt_types() {
-        for pkt_type in [PktType::Req, PktType::ReqForResp, PktType::Resp, PktType::CreditReturn] {
+        for pkt_type in [
+            PktType::Req,
+            PktType::ReqForResp,
+            PktType::Resp,
+            PktType::CreditReturn,
+        ] {
             let hdr = PktHdr::new(0, 0, 0, pkt_type, 0, 0);
             assert_eq!(hdr.pkt_type(), pkt_type);
         }
