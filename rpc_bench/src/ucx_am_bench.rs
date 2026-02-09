@@ -152,10 +152,11 @@ fn run_one_to_one(
 
             collector.finish();
             let steady = collector.steady_state(common.trim);
+            let filtered = crate::epoch::filter_bottom_quartile(steady);
             let rows = parquet_out::rows_from_epochs(
                 "ucx_am",
                 "1to1",
-                steady,
+                &filtered,
                 msg_size as u64,
                 1,
                 inflight as u32,
@@ -164,12 +165,13 @@ fn run_one_to_one(
                 run_idx,
             );
 
-            if !steady.is_empty() {
+            if !filtered.is_empty() {
                 let avg_rps: f64 = rows.iter().map(|r| r.rps).sum::<f64>() / rows.len() as f64;
                 eprintln!(
-                    "  Run {}: avg {:.0} RPS ({} steady epochs)",
+                    "  Run {}: avg {:.0} RPS ({}/{} epochs)",
                     run_idx + 1,
                     avg_rps,
+                    filtered.len(),
                     steady.len()
                 );
             }
@@ -359,10 +361,11 @@ fn run_multi_client(
 
             collector.finish();
             let steady = collector.steady_state(common.trim);
+            let filtered = crate::epoch::filter_bottom_quartile(steady);
             let rows = parquet_out::rows_from_epochs(
                 "ucx_am",
                 "multi_client",
-                steady,
+                &filtered,
                 msg_size as u64,
                 1,
                 inflight as u32,
@@ -371,13 +374,14 @@ fn run_multi_client(
                 run_idx,
             );
 
-            if !steady.is_empty() {
+            if !filtered.is_empty() {
                 let avg_rps: f64 = rows.iter().map(|r| r.rps).sum::<f64>() / rows.len() as f64;
                 eprintln!(
-                    "  Client {} Run {}: avg {:.0} RPS ({} steady epochs)",
+                    "  Client {} Run {}: avg {:.0} RPS ({}/{} epochs)",
                     rank,
                     run_idx + 1,
                     avg_rps,
+                    filtered.len(),
                     steady.len()
                 );
             }

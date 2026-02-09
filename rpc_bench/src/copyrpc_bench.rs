@@ -236,10 +236,11 @@ fn run_one_to_one(
             collector.finish();
 
             let steady = collector.steady_state(common.trim);
+            let filtered = crate::epoch::filter_bottom_quartile(steady);
             let rows = parquet_out::rows_from_epochs(
                 "copyrpc",
                 "1to1",
-                steady,
+                &filtered,
                 common.message_size as u64,
                 num_endpoints as u32,
                 inflight_per_ep as u32,
@@ -248,13 +249,13 @@ fn run_one_to_one(
                 run,
             );
 
-            if !steady.is_empty() {
+            if !filtered.is_empty() {
                 let avg_rps: f64 = rows.iter().map(|r| r.rps).sum::<f64>() / rows.len() as f64;
                 eprintln!(
-                    "  Run {}: avg {:.0} RPS ({} steady epochs)",
+                    "  Run {}: avg {:.0} RPS ({}/{} epochs)",
                     run + 1,
                     avg_rps,
-                    steady.len()
+                    filtered.len(), steady.len()
                 );
             }
 
@@ -500,10 +501,11 @@ fn run_one_to_one_threaded(
             collector.finish();
 
             let steady = collector.steady_state(common.trim);
+            let filtered = crate::epoch::filter_bottom_quartile(steady);
             let rows = parquet_out::rows_from_epochs(
                 "copyrpc",
                 "1to1",
-                steady,
+                &filtered,
                 common.message_size as u64,
                 num_endpoints as u32,
                 inflight_per_ep as u32,
@@ -512,13 +514,13 @@ fn run_one_to_one_threaded(
                 run,
             );
 
-            if !steady.is_empty() {
+            if !filtered.is_empty() {
                 let avg_rps: f64 = rows.iter().map(|r| r.rps).sum::<f64>() / rows.len() as f64;
                 eprintln!(
-                    "  Run {}: avg {:.0} RPS ({} steady epochs, {} threads)",
+                    "  Run {}: avg {:.0} RPS ({}/{} epochs, {} threads)",
                     run + 1,
                     avg_rps,
-                    steady.len(),
+                    filtered.len(), steady.len(),
                     num_threads
                 );
             }
@@ -868,10 +870,11 @@ fn run_multi_client(
             collector.finish();
 
             let steady = collector.steady_state(common.trim);
+            let filtered = crate::epoch::filter_bottom_quartile(steady);
             let rows = parquet_out::rows_from_epochs(
                 "copyrpc",
                 "multi_client",
-                steady,
+                &filtered,
                 common.message_size as u64,
                 1,
                 inflight_per_client as u32,
@@ -880,13 +883,13 @@ fn run_multi_client(
                 run,
             );
 
-            if !steady.is_empty() {
+            if !filtered.is_empty() {
                 let avg_rps: f64 = rows.iter().map(|r| r.rps).sum::<f64>() / rows.len() as f64;
                 eprintln!(
-                    "  Run {}: avg {:.0} RPS ({} steady epochs)",
+                    "  Run {}: avg {:.0} RPS ({}/{} epochs)",
                     run + 1,
                     avg_rps,
-                    steady.len()
+                    filtered.len(), steady.len()
                 );
             }
 

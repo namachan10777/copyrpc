@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+#[derive(Clone)]
 pub struct EpochData {
     pub index: u32,
     pub completed: u64,
@@ -84,4 +85,22 @@ impl EpochCollector {
     pub fn all_epochs(&self) -> &[EpochData] {
         &self.epochs
     }
+}
+
+/// RPS下位25%のepochを除外して返す。4個未満ならフィルタしない。
+pub fn filter_bottom_quartile(epochs: &[EpochData]) -> Vec<EpochData> {
+    if epochs.len() < 4 {
+        return epochs.to_vec();
+    }
+    let mut rps_values: Vec<f64> = epochs
+        .iter()
+        .map(|e| e.completed as f64 / (e.duration_ns as f64 / 1e9))
+        .collect();
+    rps_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let threshold = rps_values[epochs.len() / 4];
+    epochs
+        .iter()
+        .filter(|e| e.completed as f64 / (e.duration_ns as f64 / 1e9) >= threshold)
+        .cloned()
+        .collect()
 }

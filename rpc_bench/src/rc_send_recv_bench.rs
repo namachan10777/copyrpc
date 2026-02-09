@@ -60,7 +60,7 @@ pub fn run(
     let rank = world.rank();
     match mode {
         ModeCmd::OneToOne {
-            endpoints: _,
+            endpoints,
             inflight,
             threads,
         } => {
@@ -74,7 +74,13 @@ pub fn run(
             if num_threads > 1 {
                 run_one_to_one_threaded(common, world, num_slots, *inflight as usize, num_threads)
             } else {
-                run_one_to_one(common, world, num_slots, *inflight as usize)
+                run_one_to_one(
+                    common,
+                    world,
+                    num_slots,
+                    *inflight as usize,
+                    *endpoints as usize,
+                )
             }
         }
         ModeCmd::MultiClient { inflight: _ } => {
@@ -99,6 +105,7 @@ fn run_one_to_one(
     world: &mpi::topology::SimpleCommunicator,
     num_slots: usize,
     inflight: usize,
+    num_endpoints: usize,
 ) -> Vec<BenchRow> {
     let rank = world.rank();
     let is_client = rank == 0;
@@ -110,14 +117,15 @@ fn run_one_to_one(
         0,
     );
 
+    let signal_interval = (SIGNAL_INTERVAL as usize).min(inflight).max(1) as u32;
+
     let ctx = open_mlx5_device(common.device_index);
     let pd = ctx.alloc_pd().expect("Failed to alloc PD");
 
     let slot_size = common.message_size.max(64);
+    let total_inflight = inflight * num_endpoints;
 
-    // Separate pools for send and recv
-    // Use num_slots / 2 for each, or at least inflight * 2
-    let send_slots = (num_slots / 2).max(inflight * 2);
+    let send_slots = (num_slots / 2).max(total_inflight * 2);
     let send_total = send_slots * slot_size;
     let send_layout = std::alloc::Layout::from_size_align(send_total, 4096).unwrap();
     let send_base = unsafe { std::alloc::alloc_zeroed(send_layout) };
@@ -131,8 +139,7 @@ fn run_one_to_one(
         Rc::new(RefCell::new((0..send_slots as u32).rev().collect()));
     let send_addr = move |idx: u32| -> u64 { send_base as u64 + (idx as u64) * (slot_size as u64) };
 
-    // Recv pool
-    let recv_slots = (num_slots / 2).max(inflight * 2);
+    let recv_slots = (num_slots / 2).max(total_inflight * 2);
     let recv_total = recv_slots * slot_size;
     let recv_layout = std::alloc::Layout::from_size_align(recv_total, 4096).unwrap();
     let recv_base = unsafe { std::alloc::alloc_zeroed(recv_layout) };
@@ -146,21 +153,24 @@ fn run_one_to_one(
         Rc::new(RefCell::new((0..recv_slots as u32).rev().collect()));
     let recv_addr = move |idx: u32| -> u64 { recv_base as u64 + (idx as u64) * (slot_size as u64) };
 
-    // Shared state for callbacks
-    let send_completed_slots: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
-    let recv_completed_slots: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
-
-    let send_slots_cb = send_completed_slots.clone();
-    let recv_slots_cb = recv_completed_slots.clone();
-
+    // Shared CQs across all endpoints
+    let cq_size = (4096 * num_endpoints as i32).min(65536);
     let send_cq = Rc::new(
-        ctx.create_cq(4096, &CqConfig::default())
+        ctx.create_cq(cq_size, &CqConfig::default())
             .expect("Failed to create send CQ"),
     );
     let recv_cq = Rc::new(
-        ctx.create_cq(4096, &CqConfig::default())
+        ctx.create_cq(cq_size, &CqConfig::default())
             .expect("Failed to create recv CQ"),
     );
+
+    // Per-endpoint completion tracking
+    let ep_send_completed: Vec<Rc<RefCell<Vec<u32>>>> = (0..num_endpoints)
+        .map(|_| Rc::new(RefCell::new(Vec::new())))
+        .collect();
+    let ep_recv_completed: Vec<Rc<RefCell<Vec<u32>>>> = (0..num_endpoints)
+        .map(|_| Rc::new(RefCell::new(Vec::new())))
+        .collect();
 
     let config = RcQpConfig {
         max_send_wr: inflight as u32 * 2,
@@ -171,57 +181,76 @@ fn run_one_to_one(
         enable_scatter_to_cqe: false,
     };
 
-    let qp = ctx
-        .rc_qp_builder::<u32, u32>(&pd, &config)
-        .sq_cq(send_cq.clone(), move |_cqe, slot_idx| {
-            send_slots_cb.borrow_mut().push(slot_idx);
-        })
-        .rq_cq(recv_cq.clone(), move |_cqe, slot_idx| {
-            recv_slots_cb.borrow_mut().push(slot_idx);
-        })
-        .build()
-        .expect("Failed to build RC QP");
+    // Create QPs (all closures in the loop have the same type)
+    let mut qps = Vec::with_capacity(num_endpoints);
+    for ep in 0..num_endpoints {
+        let send_cb = ep_send_completed[ep].clone();
+        let recv_cb = ep_recv_completed[ep].clone();
+        let qp = ctx
+            .rc_qp_builder::<u32, u32>(&pd, &config)
+            .sq_cq(send_cq.clone(), move |_cqe, slot_idx| {
+                send_cb.borrow_mut().push(slot_idx);
+            })
+            .rq_cq(recv_cq.clone(), move |_cqe, slot_idx| {
+                recv_cb.borrow_mut().push(slot_idx);
+            })
+            .build()
+            .expect("Failed to build RC QP");
+        qps.push(qp);
+    }
 
-    let qpn = qp.borrow().qpn();
+    // Exchange connection info for all endpoints
     let lid = ctx
         .query_port(common.port)
         .expect("Failed to query port")
         .lid;
 
-    let local_info = RcConnectionInfo {
-        qp_number: qpn,
-        packet_sequence_number: 0,
-        local_identifier: lid,
-        _pad: 0,
-    };
+    let mut local_bytes = Vec::with_capacity(num_endpoints * RC_INFO_SIZE);
+    for qp in &qps {
+        let info = RcConnectionInfo {
+            qp_number: qp.borrow().qpn(),
+            packet_sequence_number: 0,
+            local_identifier: lid,
+            _pad: 0,
+        };
+        local_bytes.extend_from_slice(&info.to_bytes());
+    }
 
-    let remote_bytes = mpi_util::exchange_bytes(world, rank, 1 - rank, &local_info.to_bytes());
-    let remote_info = RcConnectionInfo::from_bytes(&remote_bytes);
+    let remote_bytes = mpi_util::exchange_bytes(world, rank, 1 - rank, &local_bytes);
 
     let access = AccessFlags::LOCAL_WRITE.bits();
-    qp.borrow_mut()
-        .connect(
-            &IbRemoteQpInfo {
-                qp_number: remote_info.qp_number,
-                packet_sequence_number: remote_info.packet_sequence_number,
-                local_identifier: remote_info.local_identifier,
-            },
-            common.port,
-            0,
-            1,
-            1,
-            access,
-        )
-        .expect("Failed to connect QP");
-
-    // Pre-post recv WRs using recv pool
-    for _ in 0..inflight {
-        let slot_idx = recv_free.borrow_mut().pop().expect("Recv pool exhausted");
-        qp.borrow()
-            .post_recv(slot_idx, recv_addr(slot_idx), slot_size as u32, recv_lkey)
-            .expect("Failed to post recv");
+    for ep in 0..num_endpoints {
+        let offset = ep * RC_INFO_SIZE;
+        let remote_info =
+            RcConnectionInfo::from_bytes(&remote_bytes[offset..offset + RC_INFO_SIZE]);
+        qps[ep]
+            .borrow_mut()
+            .connect(
+                &IbRemoteQpInfo {
+                    qp_number: remote_info.qp_number,
+                    packet_sequence_number: remote_info.packet_sequence_number,
+                    local_identifier: remote_info.local_identifier,
+                },
+                common.port,
+                0,
+                1,
+                1,
+                access,
+            )
+            .expect("Failed to connect QP");
     }
-    qp.borrow().ring_rq_doorbell();
+
+    // Pre-post recv WRs on each QP
+    for ep in 0..num_endpoints {
+        for _ in 0..inflight {
+            let slot_idx = recv_free.borrow_mut().pop().expect("Recv pool exhausted");
+            qps[ep]
+                .borrow()
+                .post_recv(slot_idx, recv_addr(slot_idx), slot_size as u32, recv_lkey)
+                .expect("Failed to post recv");
+        }
+        qps[ep].borrow().ring_rq_doorbell();
+    }
 
     world.barrier();
 
@@ -235,46 +264,37 @@ fn run_one_to_one(
 
         if is_client {
             let mut collector = EpochCollector::new(interval);
-            let mut send_count = 0u32;
-            let mut unsignaled_send_slots: Vec<u32> = Vec::new();
+            let mut send_counts: Vec<u32> = vec![0; num_endpoints];
+            let mut unsignaled_sends: Vec<Vec<u32>> =
+                (0..num_endpoints).map(|_| Vec::new()).collect();
 
-            // Helper: emit a send WQE using a slot from send_free
-            // Returns true if sent
-            let do_send = |send_count: &mut u32, unsignaled: &mut Vec<u32>| -> bool {
-                let Some(slot_idx) = send_free.borrow_mut().pop() else {
-                    return false;
-                };
-                let qp_ref = qp.borrow();
-                let emit = qp_ref.emit_ctx().expect("emit_ctx failed");
-                *send_count += 1;
-                if (*send_count).is_multiple_of(SIGNAL_INTERVAL) {
-                    // Signaled: on completion, all unsignaled slots before this are also done
-                    emit_wqe!(&emit, send {
-                        flags: WqeFlags::empty(),
-                        sge: { addr: send_addr(slot_idx), len: msg_size as u32, lkey: send_lkey },
-                        signaled: slot_idx,
-                    })
-                    .expect("emit_wqe failed");
-                    // The unsignaled slots accumulated since last signal are now safe
-                    // They will be freed when this signaled CQE arrives
-                } else {
-                    emit_wqe!(&emit, send {
-                        flags: WqeFlags::empty(),
-                        sge: { addr: send_addr(slot_idx), len: msg_size as u32, lkey: send_lkey },
-                    })
-                    .expect("emit_wqe failed");
-                    unsignaled.push(slot_idx);
+            // Initial send burst on each endpoint
+            for ep in 0..num_endpoints {
+                for _ in 0..inflight {
+                    let Some(slot_idx) = send_free.borrow_mut().pop() else {
+                        break;
+                    };
+                    let qp_ref = qps[ep].borrow();
+                    let emit = qp_ref.emit_ctx().expect("emit_ctx failed");
+                    send_counts[ep] += 1;
+                    if send_counts[ep].is_multiple_of(signal_interval) {
+                        emit_wqe!(&emit, send {
+                            flags: WqeFlags::empty(),
+                            sge: { addr: send_addr(slot_idx), len: msg_size as u32, lkey: send_lkey },
+                            signaled: slot_idx,
+                        })
+                        .expect("emit_wqe failed");
+                    } else {
+                        emit_wqe!(&emit, send {
+                            flags: WqeFlags::empty(),
+                            sge: { addr: send_addr(slot_idx), len: msg_size as u32, lkey: send_lkey },
+                        })
+                        .expect("emit_wqe failed");
+                        unsignaled_sends[ep].push(slot_idx);
+                    }
                 }
-                true
-            };
-
-            // Initial send burst
-            for _ in 0..inflight {
-                if !do_send(&mut send_count, &mut unsignaled_send_slots) {
-                    break;
-                }
+                qps[ep].borrow().ring_sq_doorbell();
             }
-            qp.borrow().ring_sq_doorbell();
 
             let start = Instant::now();
 
@@ -284,51 +304,76 @@ fn run_one_to_one(
                 recv_cq.poll();
                 recv_cq.flush();
 
-                // Free signaled send-completed slots + all prior unsignaled
-                {
-                    let mut slots = send_completed_slots.borrow_mut();
+                // Free send-completed slots per endpoint
+                for ep in 0..num_endpoints {
+                    let mut slots = ep_send_completed[ep].borrow_mut();
                     if !slots.is_empty() {
                         for &slot_idx in slots.iter() {
                             send_free.borrow_mut().push(slot_idx);
                         }
-                        // Also free unsignaled slots (they completed before the signaled one)
                         let mut sf = send_free.borrow_mut();
-                        for slot_idx in unsignaled_send_slots.drain(..) {
+                        for slot_idx in unsignaled_sends[ep].drain(..) {
                             sf.push(slot_idx);
                         }
                         slots.clear();
                     }
                 }
 
-                // Process recv completions (responses)
-                let recv_slots_done: Vec<u32> = {
-                    let mut slots = recv_completed_slots.borrow_mut();
-                    std::mem::take(&mut *slots)
-                };
+                // Process recv completions per endpoint
+                for ep in 0..num_endpoints {
+                    let recv_done: Vec<u32> = {
+                        let mut slots = ep_recv_completed[ep].borrow_mut();
+                        std::mem::take(&mut *slots)
+                    };
 
-                let new_completions = recv_slots_done.len() as u64;
-                if new_completions > 0 {
-                    collector.record(new_completions);
+                    if recv_done.is_empty() {
+                        continue;
+                    }
 
-                    // Re-post recv slots
-                    for &slot_idx in &recv_slots_done {
-                        qp.borrow()
-                            .post_recv(slot_idx, recv_addr(slot_idx), slot_size as u32, recv_lkey)
+                    collector.record(recv_done.len() as u64);
+
+                    // Re-post recv slots on this endpoint's QP
+                    for &slot_idx in &recv_done {
+                        qps[ep]
+                            .borrow()
+                            .post_recv(
+                                slot_idx,
+                                recv_addr(slot_idx),
+                                slot_size as u32,
+                                recv_lkey,
+                            )
                             .expect("Failed to re-post recv");
                     }
-                    qp.borrow().ring_rq_doorbell();
+                    qps[ep].borrow().ring_rq_doorbell();
 
-                    // Send new requests
+                    // Send new requests on this endpoint
                     let mut sent_any = false;
-                    for _ in 0..recv_slots_done.len() {
-                        if do_send(&mut send_count, &mut unsignaled_send_slots) {
-                            sent_any = true;
-                        } else {
+                    for _ in 0..recv_done.len() {
+                        let Some(slot_idx) = send_free.borrow_mut().pop() else {
                             break;
+                        };
+                        let qp_ref = qps[ep].borrow();
+                        let emit = qp_ref.emit_ctx().expect("emit_ctx failed");
+                        send_counts[ep] += 1;
+                        if send_counts[ep].is_multiple_of(signal_interval) {
+                            emit_wqe!(&emit, send {
+                                flags: WqeFlags::empty(),
+                                sge: { addr: send_addr(slot_idx), len: msg_size as u32, lkey: send_lkey },
+                                signaled: slot_idx,
+                            })
+                            .expect("emit_wqe failed");
+                        } else {
+                            emit_wqe!(&emit, send {
+                                flags: WqeFlags::empty(),
+                                sge: { addr: send_addr(slot_idx), len: msg_size as u32, lkey: send_lkey },
+                            })
+                            .expect("emit_wqe failed");
+                            unsignaled_sends[ep].push(slot_idx);
                         }
+                        sent_any = true;
                     }
                     if sent_any {
-                        qp.borrow().ring_sq_doorbell();
+                        qps[ep].borrow().ring_sq_doorbell();
                     }
                 }
             }
@@ -340,45 +385,51 @@ fn run_one_to_one(
                 send_cq.flush();
                 recv_cq.poll();
                 recv_cq.flush();
-                {
-                    let mut slots = send_completed_slots.borrow_mut();
+                for ep in 0..num_endpoints {
+                    let mut slots = ep_send_completed[ep].borrow_mut();
                     for &slot_idx in slots.iter() {
                         send_free.borrow_mut().push(slot_idx);
                     }
                     slots.clear();
                 }
-                {
-                    let mut slots = recv_completed_slots.borrow_mut();
-                    if slots.is_empty() {
-                        break;
+                let mut any_recv = false;
+                for ep in 0..num_endpoints {
+                    let mut slots = ep_recv_completed[ep].borrow_mut();
+                    if !slots.is_empty() {
+                        any_recv = true;
+                        for &slot_idx in slots.iter() {
+                            recv_free.borrow_mut().push(slot_idx);
+                        }
+                        slots.clear();
                     }
-                    for &slot_idx in slots.iter() {
-                        recv_free.borrow_mut().push(slot_idx);
-                    }
-                    slots.clear();
+                }
+                if !any_recv {
+                    break;
                 }
             }
 
             collector.finish();
             let steady = collector.steady_state(common.trim);
+            let filtered = crate::epoch::filter_bottom_quartile(steady);
             let rows = parquet_out::rows_from_epochs(
                 "rc_send_recv",
                 "1to1",
-                steady,
+                &filtered,
                 msg_size as u64,
-                1,
+                num_endpoints as u32,
                 inflight as u32,
                 1,
                 1,
                 run_idx,
             );
 
-            if !steady.is_empty() {
+            if !filtered.is_empty() {
                 let avg_rps: f64 = rows.iter().map(|r| r.rps).sum::<f64>() / rows.len() as f64;
                 eprintln!(
-                    "  Run {}: avg {:.0} RPS ({} steady epochs)",
+                    "  Run {}: avg {:.0} RPS ({}/{} epochs)",
                     run_idx + 1,
                     avg_rps,
+                    filtered.len(),
                     steady.len()
                 );
             }
@@ -387,8 +438,9 @@ fn run_one_to_one(
         } else {
             // Server: receive requests, echo back responses
             let start = Instant::now();
-            let mut send_count = 0u32;
-            let mut unsignaled_send_slots: Vec<u32> = Vec::new();
+            let mut send_counts: Vec<u32> = vec![0; num_endpoints];
+            let mut unsignaled_sends: Vec<Vec<u32>> =
+                (0..num_endpoints).map(|_| Vec::new()).collect();
 
             while start.elapsed() < duration {
                 recv_cq.poll();
@@ -396,33 +448,53 @@ fn run_one_to_one(
                 send_cq.poll();
                 send_cq.flush();
 
-                // Free signaled send-completed slots + unsignaled
-                {
-                    let mut slots = send_completed_slots.borrow_mut();
+                // Free send-completed slots per endpoint
+                for ep in 0..num_endpoints {
+                    let mut slots = ep_send_completed[ep].borrow_mut();
                     if !slots.is_empty() {
                         for &slot_idx in slots.iter() {
                             send_free.borrow_mut().push(slot_idx);
                         }
                         let mut sf = send_free.borrow_mut();
-                        for slot_idx in unsignaled_send_slots.drain(..) {
+                        for slot_idx in unsignaled_sends[ep].drain(..) {
                             sf.push(slot_idx);
                         }
                         slots.clear();
                     }
                 }
 
-                // Process recv completions: echo back
-                let recv_slots_done: Vec<u32> = {
-                    let mut slots = recv_completed_slots.borrow_mut();
-                    std::mem::take(&mut *slots)
-                };
+                // Process recv completions per endpoint: echo back
+                for ep in 0..num_endpoints {
+                    let recv_done: Vec<u32> = {
+                        let mut slots = ep_recv_completed[ep].borrow_mut();
+                        std::mem::take(&mut *slots)
+                    };
 
-                let mut sent_any = false;
-                for &recv_slot_idx in &recv_slots_done {
-                    // Allocate a send slot
-                    let Some(send_slot_idx) = send_free.borrow_mut().pop() else {
-                        // No send slots available; just re-post recv
-                        qp.borrow()
+                    let mut sent_any = false;
+                    for &recv_slot_idx in &recv_done {
+                        let Some(send_slot_idx) = send_free.borrow_mut().pop() else {
+                            qps[ep]
+                                .borrow()
+                                .post_recv(
+                                    recv_slot_idx,
+                                    recv_addr(recv_slot_idx),
+                                    slot_size as u32,
+                                    recv_lkey,
+                                )
+                                .expect("Failed to re-post recv");
+                            continue;
+                        };
+
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                recv_addr(recv_slot_idx) as *const u8,
+                                send_addr(send_slot_idx) as *mut u8,
+                                msg_size,
+                            );
+                        }
+
+                        qps[ep]
+                            .borrow()
                             .post_recv(
                                 recv_slot_idx,
                                 recv_addr(recv_slot_idx),
@@ -430,55 +502,34 @@ fn run_one_to_one(
                                 recv_lkey,
                             )
                             .expect("Failed to re-post recv");
-                        continue;
-                    };
 
-                    // Copy request data to send buffer
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            recv_addr(recv_slot_idx) as *const u8,
-                            send_addr(send_slot_idx) as *mut u8,
-                            msg_size,
-                        );
+                        let qp_ref = qps[ep].borrow();
+                        let emit = qp_ref.emit_ctx().expect("emit_ctx failed");
+                        send_counts[ep] += 1;
+                        if send_counts[ep].is_multiple_of(signal_interval) {
+                            emit_wqe!(&emit, send {
+                                flags: WqeFlags::empty(),
+                                sge: { addr: send_addr(send_slot_idx), len: msg_size as u32, lkey: send_lkey },
+                                signaled: send_slot_idx,
+                            })
+                            .expect("emit_wqe failed");
+                        } else {
+                            emit_wqe!(&emit, send {
+                                flags: WqeFlags::empty(),
+                                sge: { addr: send_addr(send_slot_idx), len: msg_size as u32, lkey: send_lkey },
+                            })
+                            .expect("emit_wqe failed");
+                            unsignaled_sends[ep].push(send_slot_idx);
+                        }
+                        sent_any = true;
                     }
 
-                    // Re-post recv slot
-                    qp.borrow()
-                        .post_recv(
-                            recv_slot_idx,
-                            recv_addr(recv_slot_idx),
-                            slot_size as u32,
-                            recv_lkey,
-                        )
-                        .expect("Failed to re-post recv");
-
-                    // Send response
-                    let qp_ref = qp.borrow();
-                    let emit = qp_ref.emit_ctx().expect("emit_ctx failed");
-                    send_count += 1;
-                    if send_count.is_multiple_of(SIGNAL_INTERVAL) {
-                        emit_wqe!(&emit, send {
-                            flags: WqeFlags::empty(),
-                            sge: { addr: send_addr(send_slot_idx), len: msg_size as u32, lkey: send_lkey },
-                            signaled: send_slot_idx,
-                        })
-                        .expect("emit_wqe failed");
-                    } else {
-                        emit_wqe!(&emit, send {
-                            flags: WqeFlags::empty(),
-                            sge: { addr: send_addr(send_slot_idx), len: msg_size as u32, lkey: send_lkey },
-                        })
-                        .expect("emit_wqe failed");
-                        unsignaled_send_slots.push(send_slot_idx);
+                    if !recv_done.is_empty() {
+                        qps[ep].borrow().ring_rq_doorbell();
                     }
-                    sent_any = true;
-                }
-
-                if !recv_slots_done.is_empty() {
-                    qp.borrow().ring_rq_doorbell();
-                }
-                if sent_any {
-                    qp.borrow().ring_sq_doorbell();
+                    if sent_any {
+                        qps[ep].borrow().ring_sq_doorbell();
+                    }
                 }
             }
 
@@ -489,22 +540,26 @@ fn run_one_to_one(
                 recv_cq.flush();
                 send_cq.poll();
                 send_cq.flush();
-                {
-                    let mut slots = send_completed_slots.borrow_mut();
+                for ep in 0..num_endpoints {
+                    let mut slots = ep_send_completed[ep].borrow_mut();
                     for &slot_idx in slots.iter() {
                         send_free.borrow_mut().push(slot_idx);
                     }
                     slots.clear();
                 }
-                {
-                    let mut slots = recv_completed_slots.borrow_mut();
-                    if slots.is_empty() {
-                        break;
+                let mut any_recv = false;
+                for ep in 0..num_endpoints {
+                    let mut slots = ep_recv_completed[ep].borrow_mut();
+                    if !slots.is_empty() {
+                        any_recv = true;
+                        for &slot_idx in slots.iter() {
+                            recv_free.borrow_mut().push(slot_idx);
+                        }
+                        slots.clear();
                     }
-                    for &slot_idx in slots.iter() {
-                        recv_free.borrow_mut().push(slot_idx);
-                    }
-                    slots.clear();
+                }
+                if !any_recv {
+                    break;
                 }
             }
         }
@@ -974,10 +1029,11 @@ fn run_one_to_one_threaded(
             collector.finish();
 
             let steady = collector.steady_state(common.trim);
+            let filtered = crate::epoch::filter_bottom_quartile(steady);
             let rows = parquet_out::rows_from_epochs(
                 "rc_send_recv",
                 "1to1",
-                steady,
+                &filtered,
                 common.message_size as u64,
                 1,
                 inflight as u32,
@@ -986,12 +1042,13 @@ fn run_one_to_one_threaded(
                 run_idx,
             );
 
-            if !steady.is_empty() {
+            if !filtered.is_empty() {
                 let avg_rps: f64 = rows.iter().map(|r| r.rps).sum::<f64>() / rows.len() as f64;
                 eprintln!(
-                    "  Run {}: avg {:.0} RPS ({} steady epochs, {} threads)",
+                    "  Run {}: avg {:.0} RPS ({}/{} epochs, {} threads)",
                     run_idx + 1,
                     avg_rps,
+                    filtered.len(),
                     steady.len(),
                     num_threads
                 );
