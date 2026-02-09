@@ -378,6 +378,117 @@ if let Some(user_data) = endpoint.pending_calls.try_remove(original_call_id as u
 - **Out-of-Orderレスポンス**: IOキューとしての自由度を確保。サーバ側が複数リクエストを受け取った後、処理完了順にレスポンスを返せる。NVMe SQのようなセマンティクス
 - **デッドロック自由性との関係**: reply()にリングフルチェックがないのは、call()時にcredit予約済みだから。Out-of-Orderでもこの不変条件は保たれる（予約はcall_id単位、順序無関係）
 
+## mlx5マイクロアーキテクチャレベル最適化
+
+ibverbsをバイパスし、mlx5 NICハードウェアに直接アクセスすることで実現するマイクロアーキレベルの最適化群。
+
+### BlueFlame (BF) 最適化
+
+通常のドアベルモデルでは、WQEをホストメモリに書き込んだ後、ドアベルレジスタにProducer Indexを書き込んでNICに通知し、NICがDMAでWQEを読む。BlueFlameはWQEデータ自体をNICのBFレジスタにMMIO書き込みし、DMA読み取り1往復分（~200-400ns）を削減する。
+
+**3つのドアベルモード**:
+
+1. **ring_doorbell()**: BFレジスタにCtrl Segの先頭8Bのみ書き込み。NICはここからopcode/QPN/WQE indexを読み、残りはDMA。最小レイテンシ削減
+2. **ring_doorbell_bf()**: BFレジスタにWQE全体（最大bf_size=64-256B）を`mlx5_bf_copy!`で書き込み。NICのDMA読み取りが完全に不要。最大削減~400-800ns
+3. **BlueframeBatch**: スタック上の256Bバッファに複数WQEを蓄積し、`finish()`で1回のBF書き込みに集約。ドアベル固定コスト（sfence + MMIO）を複数WQEで償却
+
+**BFダブルバッファリング** (`wqe/emit.rs`):
+```rust
+self.bf_offset.set(bf_offset ^ self.bf_size);
+```
+連続するドアベルが異なる物理アドレスに書き込まれ、PCIe Write Combiningによる合併を防止。
+
+**mlx5_bf_copy!マクロ** (`barrier.rs`):
+- x86: `_mm512_stream_si512` (AVX-512非テンポラルストア) で64Bを1命令で書き込み。キャッシュ汚染なし、1 PCIeトランザクションで完結
+- ARM: `stnp` (Store Non-Temporal Pair) で32Bずつ×2回
+
+**メモリバリア**:
+- `mmio_flush_writes!()`: x86では`sfence`。WCバッファをフラッシュし、SQ書き込みがメモリに到達してからドアベルが見えるよう保証
+- `udma_to_device_barrier!()`: x86ではTSOにより無操作。ARM64では`dmb oshst`
+
+### Inline最適化
+
+ペイロードをWQE内に直接埋め込み、NICがホストメモリからペイロードをDMA読み取りする往復を削減。
+
+**Inlineヘッダーフォーマット** (`wqe/mod.rs`):
+```
+[bit31=1(inline flag)][bit30-0=byte_count]
+[payload...][padding to 16B boundary]
+```
+
+**WQEレイアウト比較**:
+```
+通常(SGE):  [Ctrl:16B][DataSeg:16B → DMAでペイロード取得]  合計48B + DMA
+Inline:     [Ctrl:16B][Header:4B][Payload:N][Pad]          合計=16+ceil((4+N)/16)*16, DMA不要
+```
+
+デフォルト `max_inline_data=64B`。SEND WQEなら1 WQEBB (64B) に収まるサイズ。
+
+**ハイブリッドモード（Inline + SGE）**: WRITE_IMMでは、Inlineにヘッダ（小サイズ）、SGEにボディ（大サイズ）を分離可能:
+```
+[Ctrl:16B][RDMA:16B][InlineHeader:4B][HeaderPayload:N][Pad][DataSeg:16B]
+```
+
+**BlueFlame + Inline併用**: BlueframeBatchのスタックバッファにInlineデータを構築 → `finish()`でWQE+ペイロードが単一MMIO書き込みで送信。NICのDMA読み取りが完全に不要。
+
+### Scatter-to-CQE（受信側Inline）
+
+`enable_scatter_to_cqe`フラグ有効時、小さい受信データ（<32B for 64B CQE）をCQE内に直接埋め込み。受信バッファへのDMA書き込みが不要。
+
+CQEオフセット0-31に受信データが格納され、`op_own`フィールドのscatterフラグビットで検出。
+
+## CQポーリングの本質: 受信イベント直列化のNICオフロード
+
+### 問題の構造
+
+複数QPから非同期に到着するメッセージを、CPUで処理するには直列化が必要。
+直列化の方法は2つ:
+
+1. **Memory polling**: 各QPの受信バッファにvalidフラグを設置し、CPUが全QPをラウンドロビンでポーリング。直列化はCPUが行う
+2. **CQ polling**: NICが全QPの完了イベントを1つのCQに書き込む。直列化はNICが行う
+
+Memory pollingではQP数に比例してポーリングコストが増加する。各QPバッファのキャッシュラインをタッチする必要があり、QP数が多いとL1/L2キャッシュを圧迫する。
+
+CQ pollingの本質は、**受信イベントの直列化をCPUではなくNICにオフロードする**こと。NICは元々全QPの受信処理を行っており、CQEの書き込みは追加コストがほぼゼロ。一方CPUは、1つのCQバッファの先頭だけを監視すれば全QPの受信を検出できる。
+
+### なぜibverbsではCQ pollingが不利に見えたか
+
+従来の比較（HERD等）ではibverbs `ibv_poll_cq()`経由のCQ pollingが遅かった。しかしこれはibverbs実装の問題:
+
+1. **spin lock**: ibverbsの`ibv_poll_cq()`は内部でスレッドセーフティのためにspin lockを取得。ポーリングのホットパスにロックが入る
+2. **コピー**: CQEをハードウェアバッファから`ibv_wc`構造体にコピー。メモリ帯域幅を消費
+3. **間接呼び出し**: `ibv_poll_cq()`は関数ポインタ経由のディスパッチ
+
+これらのオーバーヘッドがCQ pollingの性能を歪めていた。
+
+### MonoCqによる真のCQ polling性能
+
+本実装ではibverbsをバイパスし、CQハードウェアバッファに直接アクセス:
+
+1. **owner bitチェック** (`mono_cq.rs`): CQEの63バイト目の最下位ビットを`read_volatile`で読むだけ。ロックなし、コピーなし
+2. **メモリバリア**: owner bit確認後、`udma_from_device_barrier!()`（x86ではcompiler fenceのみ、ハードウェアバリア不要）でCQEデータの可視性を保証
+3. **DDIO**: NICはCQEをL3キャッシュに直接書き込む（Direct Data I/O）。CPUはL3からの読み出しのみで完結し、メインメモリアクセスは発生しない
+4. **プリフェッチ**: 2番目以降のCQEに対して`prefetch_for_read!`を発行。dispatch_cqe()の処理時間で次のCQEのメモリレイテンシを隠蔽
+
+**結果**: CQ pollingの1回あたりのコストは、実質的にowner bitのキャッシュライン読み出し1回。QP数に対してスケールせず、memory pollingと同等以上の性能を達成。
+
+### MonoCqの単形化による最適化
+
+`MonoCq<Q, F>`はジェネリック型パラメータにより、コンパイル時に全てのコールバックがinline化:
+
+- `Q: CompletionSource` → `process_cqe()`がinline化。vtableオーバーヘッドゼロ
+- `F: Fn(Cqe, Q::Entry)` → コールバックがinline化。関数ポインタ呼び出しなし
+- `FastMap<Weak<Q>>` → QPNをキーとしたO(1)ルックアップ。ハッシュ計算なし
+
+対照的にibverbsの`ibv_poll_cq()`は:
+- `ibv_cq`→`mlx5_cq`のキャスト、関数ポインタ経由のディスパッチ
+- `ibv_wc`構造体への全フィールドコピー
+- QPNからアプリケーションコンテキストへのルックアップはアプリ側の責任（通常HashMap）
+
+### 圧縮CQE対応
+
+大量の完了を効率処理するための圧縮CQE (format=3) にも対応。1つの64B CQEに最大8個のミニCQE（各8B）を格納。`MiniCqeIterator`でイテレーション。CQ メモリ帯域幅を最大~87.5%削減。
+
 ## 論文での記述ポイント
 
 1. **バッチングによるWQE消費削減**: call()/reply()は送信を遅延し、poll()で一括WRITE+IMM。WQE1個で複数メッセージを転送
@@ -389,3 +500,6 @@ if let Some(user_data) = endpoint.pending_calls.try_remove(original_call_id as u
 7. **SRQ共有**: 全エンドポイントで1つのSRQ。0長SGE（データはWRITEでリングに到着するため）
 8. **RDMA READフォールバック**: piggbackが古くなった場合（RingFull時等）にremote consumerをREADで直接取得
 9. **In-Order取り込み / Out-of-Orderレスポンス**: フロー制御のためにリクエストはIn-Orderで処理しつつ、IOキューの自由度のためにレスポンスはOut-of-Order。NVMe SQライクなセマンティクス
+10. **BlueFlame最適化**: 3モード（最小8B/フルWQE/バッチ）。AVX-512非テンポラルストアでキャッシュ汚染なしの64B MMIO書き込み。ダブルバッファリングでPCIe WC合併を防止
+11. **Inline最適化**: ペイロードをWQE内に埋め込みDMA削減。BF+Inlineの併用でWQE+ペイロードが単一MMIO書き込みで完結
+12. **CQポーリングの本質**: 受信イベントの直列化をCPUからNICにオフロード。ibverbsのspin lock/コピー/間接呼び出しが従来のCQ polling vs memory polling比較を歪めていた。MonoCqの直接アクセスにより真の性能を回復
