@@ -52,9 +52,10 @@ use mlx5::emit_wqe;
 use mlx5::wqe::WqeFlags;
 
 use encoding::{
-    HEADER_SIZE, decode_header, decode_imm, encode_header, encode_imm,
-    from_response_id, is_padding_marker, is_response, padded_message_size,
-    to_response_id, write_padding_marker,
+    ALIGNMENT, FLOW_METADATA_SIZE, HEADER_SIZE, WRAP_MESSAGE_COUNT,
+    decode_flow_metadata, decode_header, decode_imm, encode_flow_metadata,
+    encode_header, encode_imm, from_response_id, is_response, padded_message_size,
+    to_response_id,
 };
 use error::{Error, Result};
 use ring::RemoteConsumer;
@@ -77,6 +78,9 @@ pub struct EndpointConfig {
     pub recv_ring_size: usize,
     /// RC QP configuration.
     pub qp_config: RcQpConfig,
+    /// Maximum response reservation (credit) in bytes.
+    /// Default: send_ring_size / 4.
+    pub max_resp_reservation: u64,
 }
 
 impl Default for EndpointConfig {
@@ -92,6 +96,7 @@ impl Default for EndpointConfig {
                 max_inline_data: 256,
                 enable_scatter_to_cqe: false,
             },
+            max_resp_reservation: DEFAULT_RING_SIZE as u64 / 4,
         }
     }
 }
@@ -115,6 +120,8 @@ pub struct RemoteEndpointInfo {
     pub consumer_addr: u64,
     /// Remote consumer position MR rkey (for RDMA READ).
     pub consumer_rkey: u32,
+    /// Initial credit (bytes) granted by remote for response reservation.
+    pub initial_credit: u64,
 }
 
 /// Remote ring buffer information for RDMA WRITE operations.
@@ -193,6 +200,8 @@ struct RecvMessage<U> {
     data_offset: usize,
     /// Length of the payload.
     data_len: usize,
+    /// Response allowance in bytes (from request header piggyback).
+    response_allowance: u64,
 }
 
 /// RPC context managing multiple endpoints.
@@ -530,15 +539,15 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
                 call_id: msg.call_id,
                 data_ptr,
                 data_len: msg.data_len,
+                response_allowance: msg.response_allowance,
             }
         })
     }
 
     /// Process a single CQE.
     ///
-    /// This is called internally when a completion is received.
-    /// A single CQE may contain multiple batched messages, so we process
-    /// all messages from last_recv_pos up to recv_ring_producer.
+    /// Each CQE corresponds to one WRITE+IMM which starts with flow_metadata (32B),
+    /// followed by message_count messages (or a wrap if message_count == WRAP_MESSAGE_COUNT).
     /// For requests, pushes to recv_stack.
     /// For responses, invokes callback.
     #[inline(always)]
@@ -558,62 +567,76 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
         // Decode the immediate value to get the offset delta
         let delta = decode_imm(cqe.imm);
 
-        // Borrow endpoint once to update producer and get ring metadata
-        let endpoint_ref = endpoint.borrow();
-        let new_producer = endpoint_ref.recv_ring_producer.get() + delta;
-        endpoint_ref.recv_ring_producer.set(new_producer);
-        let recv_ring_len = endpoint_ref.recv_ring.len();
-        let recv_ring_mask = recv_ring_len as u64 - 1;
-        drop(endpoint_ref);
+        // Update recv_ring_producer
+        {
+            let ep = endpoint.borrow();
+            let new_producer = ep.recv_ring_producer.get() + delta;
+            ep.recv_ring_producer.set(new_producer);
+        }
 
-        // Process all messages in the batch
-        loop {
-            let endpoint_ref = endpoint.borrow();
-            let pos = endpoint_ref.last_recv_pos.get();
-            let producer = endpoint_ref.recv_ring_producer.get();
+        // Read flow_metadata at current position
+        let (consumer_pos, credit_grant, message_count);
+        {
+            let ep = endpoint.borrow();
+            let pos = ep.last_recv_pos.get();
+            let recv_ring_mask = ep.recv_ring.len() as u64 - 1;
+            let meta_offset = (pos & recv_ring_mask) as usize;
 
-            // Check if there are more messages to process
-            if pos >= producer {
-                // Update consumer_position for RDMA READ by remote
-                endpoint_ref.consumer_position.store(pos, Ordering::Release);
-                break;
+            unsafe {
+                (consumer_pos, credit_grant, message_count) =
+                    decode_flow_metadata(ep.recv_ring[meta_offset..].as_ptr());
             }
 
+            // Update flow control from metadata
+            ep.remote_consumer.update(consumer_pos);
+            ep.peer_credit_balance.set(ep.peer_credit_balance.get() + credit_grant);
+
+            // Advance past metadata
+            ep.last_recv_pos.set(pos + FLOW_METADATA_SIZE as u64);
+        }
+
+        if message_count == WRAP_MESSAGE_COUNT {
+            // Wrap: skip to next ring cycle
+            let ep = endpoint.borrow();
+            let pos = ep.last_recv_pos.get();
+            let recv_ring_len = ep.recv_ring.len() as u64;
+            let offset = pos & (recv_ring_len - 1);
+            let remaining = recv_ring_len - offset;
+            let new_pos = pos + remaining;
+            ep.last_recv_pos.set(new_pos);
+            ep.consumer_position.store(new_pos, Ordering::Release);
+            return;
+        }
+
+        // Process exactly message_count messages
+        for _ in 0..message_count {
+            let ep = endpoint.borrow();
+            let pos = ep.last_recv_pos.get();
+            let recv_ring_mask = ep.recv_ring.len() as u64 - 1;
             let header_offset = (pos & recv_ring_mask) as usize;
-            let header_slice = &endpoint_ref.recv_ring[header_offset..header_offset + HEADER_SIZE];
 
             let (call_id, piggyback, payload_len) = unsafe {
-                decode_header(header_slice.as_ptr())
+                decode_header(ep.recv_ring[header_offset..].as_ptr())
             };
 
-            endpoint_ref.remote_consumer.update(piggyback as u64);
-
-            // Check for padding marker (rare case)
-            if is_padding_marker(call_id) {
-                endpoint_ref.last_recv_pos.set(pos + piggyback as u64);
-                drop(endpoint_ref);
-                continue;
-            }
-
-            // Compute message size once
             let msg_size = padded_message_size(payload_len);
             let new_pos = pos + msg_size;
+            ep.last_recv_pos.set(new_pos);
 
             if is_response(call_id) {
                 // Response - invoke callback
                 let original_call_id = from_response_id(call_id);
-                let user_data = endpoint_ref.pending_calls.borrow_mut().try_remove(original_call_id as usize);
-                endpoint_ref.last_recv_pos.set(new_pos);
+                let user_data = ep.pending_calls.borrow_mut().try_remove(original_call_id as usize);
 
                 if let Some(user_data) = user_data {
                     let data_offset = header_offset + HEADER_SIZE;
-                    let data_slice = &endpoint_ref.recv_ring[data_offset..data_offset + payload_len as usize];
+                    let data_slice = &ep.recv_ring[data_offset..data_offset + payload_len as usize];
                     (self.on_response)(user_data, data_slice);
                 }
             } else {
-                // Request - push to recv_stack
-                endpoint_ref.last_recv_pos.set(new_pos);
-                drop(endpoint_ref);
+                // Request - piggyback is response_allowance_blocks
+                let response_allowance = piggyback as u64 * ALIGNMENT;
+                drop(ep);
 
                 self.recv_stack.borrow_mut().push(RecvMessage {
                     endpoint: endpoint.clone(),
@@ -621,8 +644,16 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
                     call_id,
                     data_offset: header_offset + HEADER_SIZE,
                     data_len: payload_len as usize,
+                    response_allowance,
                 });
             }
+        }
+
+        // Update consumer_position for RDMA READ by remote
+        {
+            let ep = endpoint.borrow();
+            let pos = ep.last_recv_pos.get();
+            ep.consumer_position.store(pos, Ordering::Release);
         }
     }
 }
@@ -651,7 +682,7 @@ struct EndpointInner<U> {
     recv_ring_producer: Cell<u64>,
     /// Last received message position (consumer).
     last_recv_pos: Cell<u64>,
-    /// Remote consumer position (piggyback updates).
+    /// Remote consumer position (piggyback + RDMA READ updates).
     remote_consumer: RemoteConsumer,
     /// Counter for unsignaled WQEs (for periodic signaling).
     unsignaled_count: Cell<u32>,
@@ -673,6 +704,16 @@ struct EndpointInner<U> {
     read_buffer_mr: MemoryRegion,
     /// Remote consumer position MR information.
     remote_consumer_mr: Cell<Option<RemoteConsumerMr>>,
+    /// Response reservation (R): credits issued minus responses written (bytes).
+    resp_reservation: Cell<u64>,
+    /// Maximum response reservation (policy limit).
+    max_resp_reservation: u64,
+    /// Credit balance from peer (bytes of request we can send).
+    peer_credit_balance: Cell<u64>,
+    /// Current batch metadata position (virtual), None if no batch open.
+    meta_pos: Cell<Option<u64>>,
+    /// Number of messages in the current batch.
+    batch_message_count: Cell<u32>,
 }
 
 impl<U> EndpointInner<U> {
@@ -738,6 +779,9 @@ impl<U> EndpointInner<U> {
             .rq_mono_cq(recv_cq)
             .build()?;
 
+        let max_resp_reservation = config.max_resp_reservation.min(config.send_ring_size as u64 / 4);
+
+
         let inner = Rc::new(RefCell::new(Self {
             qp,
             send_ring,
@@ -759,6 +803,11 @@ impl<U> EndpointInner<U> {
             read_buffer,
             read_buffer_mr,
             remote_consumer_mr: Cell::new(None),
+            resp_reservation: Cell::new(0),
+            max_resp_reservation,
+            peer_credit_balance: Cell::new(0),
+            meta_pos: Cell::new(None),
+            batch_message_count: Cell::new(0),
         }));
 
         // SRQ recv buffers are pre-posted in Context::build() and replenished in poll()
@@ -779,14 +828,24 @@ impl<U> EndpointInner<U> {
             recv_ring_size: self.recv_ring.len() as u64,
             consumer_addr: self.consumer_position_mr.addr() as u64,
             consumer_rkey: self.consumer_position_mr.rkey(),
+            initial_credit: self.max_resp_reservation.min(self.send_ring.len() as u64 / 4),
         }
     }
 
     /// Emit WQE for accumulated data (without doorbell).
     ///
+    /// If a batch is open (meta_pos is Some), finalizes the metadata first.
+    /// No split WQE needed - ensure_metadata + emit_wrap guarantee all batches
+    /// stay within a single ring cycle.
+    ///
     /// Returns Ok(true) if WQE was emitted, Ok(false) if nothing to emit.
     #[inline(always)]
     fn emit_wqe(&self) -> Result<bool> {
+        // Finalize batch metadata if open
+        if self.meta_pos.get().is_some() {
+            self.fill_metadata();
+        }
+
         let remote_ring = self
             .remote_recv_ring
             .get()
@@ -805,80 +864,16 @@ impl<U> EndpointInner<U> {
         let start_offset = (start & (self.send_ring.len() as u64 - 1)) as usize;
         let remote_offset = start & (remote_ring.size - 1);
         let remote_addr = remote_ring.addr + remote_offset;
-        let ring_len = self.send_ring.len();
-
-        // Check for wrap-around: if data spans ring boundary, emit in two parts
-        if start_offset + delta as usize > ring_len {
-            // Part 1: from start_offset to end of ring
-            let part1_len = ring_len - start_offset;
-            let part1_imm = encode_imm(part1_len as u64);
-
-            let qpn = self.qpn();
-            let count = self.unsignaled_count.get();
-
-            // Emit part 1
-            {
-                let qp = self.qp.borrow();
-                let ctx = qp.emit_ctx().map_err(Error::Io)?;
-                emit_wqe!(&ctx, write_imm {
-                    flags: WqeFlags::empty(),
-                    remote_addr: remote_addr,
-                    rkey: remote_ring.rkey,
-                    imm: part1_imm,
-                    sge: { addr: self.send_ring_mr.addr() as u64 + start_offset as u64, len: part1_len as u32, lkey: self.send_ring_mr.lkey() },
-                }).map_err(|e| Error::Io(e.into()))?;
-            }
-
-            // Part 2: from beginning of ring
-            let part2_len = delta as usize - part1_len;
-            let part2_imm = encode_imm(part2_len as u64);
-            let part2_remote_addr = remote_ring.addr + ((remote_offset + part1_len as u64) & (remote_ring.size - 1));
-
-            // Determine if part 2 should be signaled
-            let should_signal = (count + 1) >= SIGNAL_INTERVAL;
-
-            {
-                let qp = self.qp.borrow();
-                let ctx = qp.emit_ctx().map_err(Error::Io)?;
-                if should_signal {
-                    emit_wqe!(&ctx, write_imm {
-                        flags: WqeFlags::empty(),
-                        remote_addr: part2_remote_addr,
-                        rkey: remote_ring.rkey,
-                        imm: part2_imm,
-                        sge: { addr: self.send_ring_mr.addr() as u64, len: part2_len as u32, lkey: self.send_ring_mr.lkey() },
-                        signaled: SrqEntry { qpn, is_read: false },
-                    }).map_err(|e| Error::Io(e.into()))?;
-                    self.unsignaled_count.set(0);
-                } else {
-                    emit_wqe!(&ctx, write_imm {
-                        flags: WqeFlags::empty(),
-                        remote_addr: part2_remote_addr,
-                        rkey: remote_ring.rkey,
-                        imm: part2_imm,
-                        sge: { addr: self.send_ring_mr.addr() as u64, len: part2_len as u32, lkey: self.send_ring_mr.lkey() },
-                    }).map_err(|e| Error::Io(e.into()))?;
-                    self.unsignaled_count.set(count + 2); // 2 WQEs emitted
-                }
-            }
-
-            self.flush_start_pos.set(end);
-            return Ok(true);
-        }
 
         // Determine if this WQE should be signaled
         let count = self.unsignaled_count.get();
         let should_signal = count >= SIGNAL_INTERVAL;
-
-        // Get QPN before borrowing qp to avoid borrow conflict
         let qpn = self.qpn();
 
         {
             let qp = self.qp.borrow();
             let ctx = qp.emit_ctx().map_err(Error::Io)?;
             if should_signal {
-                // Signal this WQE to allow SQ progress tracking
-                // Mark with is_read=false to distinguish from READ completions
                 emit_wqe!(&ctx, write_imm {
                     flags: WqeFlags::empty(),
                     remote_addr: remote_addr,
@@ -928,6 +923,130 @@ impl<U> EndpointInner<U> {
         let threshold = remote_ring.size / 4;
         available < threshold
     }
+
+    /// Ensure a batch metadata placeholder exists at the current position.
+    /// If no batch is open, writes a 32B placeholder and advances producer.
+    fn ensure_metadata(&self) {
+        if self.meta_pos.get().is_some() {
+            return;
+        }
+
+        let producer = self.send_ring_producer.get();
+        let ring_size = self.send_ring.len() as u64;
+        let offset = (producer & (ring_size - 1)) as usize;
+
+        // Write placeholder flow_metadata (zeros)
+        unsafe {
+            let buf_ptr = self.send_ring.as_ptr().add(offset) as *mut u8;
+            std::ptr::write_bytes(buf_ptr, 0, FLOW_METADATA_SIZE);
+        }
+
+        self.meta_pos.set(Some(producer));
+        self.batch_message_count.set(0);
+        self.send_ring_producer.set(producer + FLOW_METADATA_SIZE as u64);
+    }
+
+    /// Fill the current batch's flow_metadata with final values.
+    /// Called before emit_wqe to finalize the batch header.
+    fn fill_metadata(&self) {
+        let meta_pos = match self.meta_pos.get() {
+            Some(pos) => pos,
+            None => return,
+        };
+
+        let ring_size = self.send_ring.len() as u64;
+        let meta_offset = (meta_pos & (ring_size - 1)) as usize;
+
+        let consumer_pos = self.last_recv_pos.get();
+        let credit_grant = self.compute_credit_grant();
+        let message_count = self.batch_message_count.get();
+
+        // Update resp_reservation with granted credit
+        self.resp_reservation.set(self.resp_reservation.get() + credit_grant);
+
+        unsafe {
+            let buf_ptr = self.send_ring.as_ptr().add(meta_offset) as *mut u8;
+            encode_flow_metadata(buf_ptr, consumer_pos, credit_grant, message_count);
+        }
+
+        self.meta_pos.set(None);
+        self.batch_message_count.set(0);
+    }
+
+    /// Emit a wrap flow_metadata at the current position and advance producer
+    /// past the ring boundary. Must be called when meta_pos is None.
+    fn emit_wrap(&self) -> Result<()> {
+        debug_assert!(self.meta_pos.get().is_none());
+
+        let producer = self.send_ring_producer.get();
+        let ring_size = self.send_ring.len() as u64;
+        let offset = (producer & (ring_size - 1)) as usize;
+        let remaining = ring_size as usize - offset;
+
+        debug_assert!(remaining >= FLOW_METADATA_SIZE);
+
+        let consumer_pos = self.last_recv_pos.get();
+        let credit_grant = self.compute_credit_grant();
+        self.resp_reservation.set(self.resp_reservation.get() + credit_grant);
+
+        unsafe {
+            let buf_ptr = self.send_ring.as_ptr().add(offset) as *mut u8;
+            encode_flow_metadata(buf_ptr, consumer_pos, credit_grant, WRAP_MESSAGE_COUNT);
+        }
+
+        self.send_ring_producer.set(producer + remaining as u64);
+        self.emit_wqe()?;
+
+        Ok(())
+    }
+
+    /// Compute the credit grant for the current batch.
+    /// Returns bytes of credit to grant to the peer.
+    fn compute_credit_grant(&self) -> u64 {
+        let remote_ring = match self.remote_recv_ring.get() {
+            Some(r) => r,
+            None => return 0,
+        };
+
+        let producer = self.send_ring_producer.get();
+        let consumer = self.remote_consumer.get();
+        let in_flight = producer.saturating_sub(consumer);
+        let current_r = self.resp_reservation.get();
+
+        // Invariant: in_flight + 2*(current_r + grant) ≤ remote_ring.size
+        // grant ≤ (remote_ring.size - in_flight) / 2 - current_r
+        let max_by_invariant = (remote_ring.size.saturating_sub(in_flight) / 2).saturating_sub(current_r);
+
+        // Policy: don't exceed max_resp_reservation
+        let max_by_policy = self.max_resp_reservation.saturating_sub(current_r);
+
+        // Align down to ALIGNMENT
+        let grant = max_by_invariant.min(max_by_policy);
+        grant & !(ALIGNMENT - 1)
+    }
+
+    /// Handle wrap-around if the next write of `total_size` bytes doesn't fit
+    /// in the current ring cycle. Closes the current batch if open, emits wrap.
+    fn handle_wrap_if_needed(&self, total_size: u64) -> Result<bool> {
+        let producer = self.send_ring_producer.get();
+        let ring_size = self.send_ring.len() as u64;
+        let offset = (producer & (ring_size - 1)) as usize;
+
+        // Use strict `<` to force a wrap when the write would exactly reach the
+        // ring boundary. Otherwise the next write in the same batch would start at
+        // offset 0, causing the batch SGE to span the ring boundary.
+        if offset as u64 + total_size < ring_size {
+            return Ok(false);
+        }
+
+        // Close current batch if open
+        if self.meta_pos.get().is_some() {
+            self.fill_metadata();
+            self.emit_wqe()?;
+        }
+        self.emit_wrap()?;
+        Ok(true)
+    }
 }
 
 /// Local endpoint information for connection establishment.
@@ -945,6 +1064,8 @@ pub struct LocalEndpointInfo {
     pub consumer_addr: u64,
     /// Local consumer position MR rkey (for RDMA READ).
     pub consumer_rkey: u32,
+    /// Initial credit (bytes) for response reservation.
+    pub initial_credit: u64,
 }
 
 /// An RPC endpoint representing a connection to a remote peer.
@@ -982,6 +1103,15 @@ impl<U> Endpoint<U> {
             rkey: remote.consumer_rkey,
         }));
 
+        // Initialize credit:
+        // - resp_reservation = initial credit we promised (capped to ring_size/4)
+        //   This ensures 2*R ≤ C/2, leaving at least half the ring for messages.
+        let initial_credit = inner.max_resp_reservation.min(remote.recv_ring_size / 4);
+        inner.resp_reservation.set(initial_credit);
+
+        // - peer_credit_balance = credit the remote promised us
+        inner.peer_credit_balance.set(remote.initial_credit);
+
         // Connect the QP
         let remote_qp_info = IbRemoteQpInfo {
             qp_number: remote.qp_number,
@@ -1011,12 +1141,16 @@ impl<U> Endpoint<U> {
     /// The call is written to the send buffer. Actual transmission happens
     /// when Context::poll() is called.
     ///
+    /// `response_allowance` specifies the maximum response data size (bytes).
+    /// Internally padded and includes metadata overhead for flow control safety.
+    ///
     /// When the response arrives, the Context's on_response callback will
     /// be invoked with the provided user_data.
     pub fn call(
         &self,
         data: &[u8],
         user_data: U,
+        response_allowance: u64,
     ) -> std::result::Result<u32, error::CallError<U>> {
         let inner = self.inner.borrow();
 
@@ -1025,40 +1159,38 @@ impl<U> Endpoint<U> {
             .get()
             .ok_or(error::CallError::Other(Error::RemoteConsumerUnknown))?;
 
+        // Internal response_allowance includes metadata overhead for wrap safety:
+        // R_i = padded_message_size(D) + FLOW_METADATA_SIZE
+        let resp_msg_size = padded_message_size(response_allowance as u32);
+        let internal_allowance = resp_msg_size + FLOW_METADATA_SIZE as u64;
+        // Align up to ALIGNMENT
+        let internal_allowance = (internal_allowance + ALIGNMENT - 1) & !(ALIGNMENT - 1);
+
+        // Check credit balance
+        if inner.peer_credit_balance.get() < internal_allowance {
+            inner.flush().map_err(error::CallError::Other)?;
+            return Err(error::CallError::InsufficientCredit(user_data));
+        }
+
         // Calculate message size
         let msg_size = padded_message_size(data.len() as u32);
 
-        let mut producer = inner.send_ring_producer.get();
-        let send_ring_size = inner.send_ring.len() as u64;
-        let mut send_offset = (producer & (send_ring_size - 1)) as usize;
+        // Handle wrap-around: check if metadata + message fits in current ring cycle
+        let needs_meta = inner.meta_pos.get().is_none();
+        let total_size = if needs_meta { FLOW_METADATA_SIZE as u64 + msg_size } else { msg_size };
+        inner.handle_wrap_if_needed(total_size).map_err(error::CallError::Other)?;
 
-        // Check if write would wrap around the local send buffer
-        if send_offset + msg_size as usize > inner.send_ring.len() {
-            // First emit any pending WQEs before the wrap point
-            inner.emit_wqe().map_err(error::CallError::Other)?;
+        // Ensure batch metadata exists
+        inner.ensure_metadata();
 
-            // Write padding marker at current offset
-            let remaining = inner.send_ring.len() - send_offset;
-            unsafe {
-                let buf_ptr = inner.send_ring.as_ptr().add(send_offset) as *mut u8;
-                write_padding_marker(buf_ptr, remaining as u32);
-            }
-            // Advance producer past the padding (to next ring cycle start)
-            producer += remaining as u64;
-            inner.send_ring_producer.set(producer);
-
-            // Emit the padding marker WQE (sends padding to remote)
-            inner.emit_wqe().map_err(error::CallError::Other)?;
-
-            // Recalculate offset (should now be 0)
-            send_offset = 0;
-        }
-
-        // Check if we have space in the remote ring
+        // Check available space with credit invariant:
+        // (producer - consumer) + 2*R ≤ C  →  msg_size ≤ available - 2*R
+        let producer = inner.send_ring_producer.get();
         let consumer = inner.remote_consumer.get();
-        let available = remote_ring.size - (producer - consumer);
+        let available = remote_ring.size.saturating_sub(producer.saturating_sub(consumer));
+        let reserved = 2 * inner.resp_reservation.get();
 
-        if available < msg_size {
+        if available < msg_size + reserved {
             // No space: flush and set force_read flag to trigger RDMA READ
             inner.flush().map_err(error::CallError::Other)?;
             inner.force_read.set(true);
@@ -1068,12 +1200,13 @@ impl<U> Endpoint<U> {
         // Allocate call ID from slab (index is the call_id)
         let call_id = inner.pending_calls.borrow_mut().insert(user_data) as u32;
 
-        // Prepare message in send ring
-        let local_consumer = inner.last_recv_pos.get();
+        // Write message with response_allowance in piggyback field (as ALIGNMENT blocks)
+        let send_offset = (producer & (inner.send_ring.len() as u64 - 1)) as usize;
+        let response_allowance_blocks = (internal_allowance / ALIGNMENT) as u32;
 
         unsafe {
             let buf_ptr = inner.send_ring.as_ptr().add(send_offset) as *mut u8;
-            encode_header(buf_ptr, call_id, local_consumer, data.len() as u32);
+            encode_header(buf_ptr, call_id, response_allowance_blocks as u64, data.len() as u32);
             std::ptr::copy_nonoverlapping(
                 data.as_ptr(),
                 buf_ptr.add(HEADER_SIZE),
@@ -1081,16 +1214,18 @@ impl<U> Endpoint<U> {
             );
         }
 
-        // Update producer
+        // Update producer and batch count
         inner.send_ring_producer.set(producer + msg_size);
+        inner.batch_message_count.set(inner.batch_message_count.get() + 1);
+
+        // Deduct credit
+        inner.peer_credit_balance.set(inner.peer_credit_balance.get() - internal_allowance);
 
         Ok(call_id)
     }
 }
 
 /// Handle to a received RPC request.
-///
-/// When dropped, advances the consumer position in the receive ring.
 pub struct RecvHandle<'a, U, F>
 where
     F: Fn(U, &[u8]),
@@ -1101,6 +1236,7 @@ where
     call_id: u32,
     data_ptr: *const u8,
     data_len: usize,
+    response_allowance: u64,
 }
 
 impl<U, F: Fn(U, &[u8])> RecvHandle<'_, U, F> {
@@ -1124,10 +1260,13 @@ impl<U, F: Fn(U, &[u8])> RecvHandle<'_, U, F> {
     ///
     /// The reply is written to the send buffer. Actual transmission happens
     /// when Context::poll() is called.
+    ///
+    /// The credit-based invariant guarantees this will always have space
+    /// (reply cannot fail with RingFull under normal operation).
     pub fn reply(&self, data: &[u8]) -> Result<()> {
         let inner = self.endpoint.borrow();
 
-        let remote_ring = inner
+        inner
             .remote_recv_ring
             .get()
             .ok_or(Error::RemoteConsumerUnknown)?;
@@ -1135,52 +1274,27 @@ impl<U, F: Fn(U, &[u8])> RecvHandle<'_, U, F> {
         // Calculate message size
         let msg_size = padded_message_size(data.len() as u32);
 
-        let mut producer = inner.send_ring_producer.get();
-        let send_ring_size = inner.send_ring.len() as u64;
-        let mut send_offset = (producer & (send_ring_size - 1)) as usize;
+        // Handle wrap-around
+        let needs_meta = inner.meta_pos.get().is_none();
+        let total_size = if needs_meta { FLOW_METADATA_SIZE as u64 + msg_size } else { msg_size };
+        inner.handle_wrap_if_needed(total_size)?;
 
-        // Check if write would wrap around the local send buffer
-        if send_offset + msg_size as usize > inner.send_ring.len() {
-            // First emit any pending WQEs before the wrap point
-            inner.emit_wqe()?;
+        // Ensure batch metadata exists
+        inner.ensure_metadata();
 
-            // Write padding marker at current offset
-            let remaining = inner.send_ring.len() - send_offset;
-            unsafe {
-                let buf_ptr = inner.send_ring.as_ptr().add(send_offset) as *mut u8;
-                write_padding_marker(buf_ptr, remaining as u32);
-            }
-            // Advance producer past the padding (to next ring cycle start)
-            producer += remaining as u64;
-            inner.send_ring_producer.set(producer);
+        // Deduct response reservation (R_i from the original request)
+        let resp_res = inner.resp_reservation.get();
+        inner.resp_reservation.set(resp_res.saturating_sub(self.response_allowance));
 
-            // Emit the padding marker WQE (sends padding to remote)
-            inner.emit_wqe()?;
-
-            // Recalculate offset (should now be 0)
-            send_offset = 0;
-        }
-
-        // Check if we have space in the remote ring
-        let consumer = inner.remote_consumer.get();
-        let available = remote_ring.size - (producer - consumer);
-
-        if available < msg_size {
-            // No space: flush and set force_read flag to trigger RDMA READ
-            inner.flush()?;
-            inner.force_read.set(true);
-            return Err(Error::RingFull);
-        }
-
-        // Response call_id has MSB set
+        // Write response message
+        let producer = inner.send_ring_producer.get();
+        let send_offset = (producer & (inner.send_ring.len() as u64 - 1)) as usize;
         let response_call_id = to_response_id(self.call_id);
-
-        // Prepare message in send ring
-        let local_consumer = inner.last_recv_pos.get();
 
         unsafe {
             let buf_ptr = inner.send_ring.as_ptr().add(send_offset) as *mut u8;
-            encode_header(buf_ptr, response_call_id, local_consumer, data.len() as u32);
+            // piggyback = 0 for responses
+            encode_header(buf_ptr, response_call_id, 0, data.len() as u32);
             std::ptr::copy_nonoverlapping(
                 data.as_ptr(),
                 buf_ptr.add(HEADER_SIZE),
@@ -1188,8 +1302,9 @@ impl<U, F: Fn(U, &[u8])> RecvHandle<'_, U, F> {
             );
         }
 
-        // Update producer
+        // Update producer and batch count
         inner.send_ring_producer.set(producer + msg_size);
+        inner.batch_message_count.set(inner.batch_message_count.get() + 1);
 
         Ok(())
     }

@@ -50,6 +50,7 @@ struct EndpointConnectionInfo {
     recv_ring_size: u64,
     consumer_addr: u64,
     consumer_rkey: u32,
+    initial_credit: u64,
 }
 
 #[derive(Clone)]
@@ -161,6 +162,7 @@ fn setup_copyrpc_benchmark(config: &BenchConfig) -> Option<BenchmarkSetup> {
             recv_ring_size: info.recv_ring_size,
             consumer_addr: info.consumer_addr,
             consumer_rkey: info.consumer_rkey,
+            initial_credit: info.initial_credit,
         });
 
         endpoints.push(ep);
@@ -211,6 +213,7 @@ fn setup_copyrpc_benchmark(config: &BenchConfig) -> Option<BenchmarkSetup> {
             recv_ring_size: server_ep.recv_ring_size,
             consumer_addr: server_ep.consumer_addr,
             consumer_rkey: server_ep.consumer_rkey,
+            initial_credit: server_ep.initial_credit,
         };
 
         ep.connect(&remote, 0, ctx.port()).ok()?;
@@ -291,6 +294,7 @@ fn server_thread_main(
             recv_ring_size: info.recv_ring_size,
             consumer_addr: info.consumer_addr,
             consumer_rkey: info.consumer_rkey,
+            initial_credit: info.initial_credit,
         });
 
         endpoints.push(ep);
@@ -323,6 +327,7 @@ fn server_thread_main(
             recv_ring_size: client_ep.recv_ring_size,
             consumer_addr: client_ep.consumer_addr,
             consumer_rkey: client_ep.consumer_rkey,
+            initial_credit: client_ep.initial_credit,
         };
 
         if ep.connect(&remote, 0, ctx.port()).is_err() {
@@ -371,7 +376,7 @@ fn run_copyrpc_bench(client: &mut CopyrpcClient, iters: u64) -> Duration {
     // Initial fill: send initial requests on each endpoint
     for ep in client.endpoints.iter() {
         for _ in 0..client.requests_per_ep {
-            if ep.call(&request_data, ()).is_ok() {
+            if ep.call(&request_data, (), 64).is_ok() {
                 inflight += 1;
             }
         }
@@ -402,7 +407,7 @@ fn run_copyrpc_bench(client: &mut CopyrpcClient, iters: u64) -> Duration {
             let ep_id = i & ep_mask;
             let ep = &client.endpoints[ep_id];
 
-            if ep.call(&request_data, ()).is_ok() {
+            if ep.call(&request_data, (), 64).is_ok() {
                 inflight += 1;
             }
         }

@@ -52,6 +52,8 @@ impl From<io::Error> for Error {
 pub enum CallError<U> {
     /// Ring buffer is full. `user_data` is returned for retry.
     RingFull(U),
+    /// Insufficient credit for response. `user_data` is returned for retry.
+    InsufficientCredit(U),
     /// Fatal error. `user_data` is lost.
     Other(Error),
 }
@@ -60,6 +62,7 @@ impl<U> CallError<U> {
     pub fn into_inner(self) -> Option<U> {
         match self {
             CallError::RingFull(u) => Some(u),
+            CallError::InsufficientCredit(u) => Some(u),
             CallError::Other(_) => None,
         }
     }
@@ -69,6 +72,7 @@ impl<U: std::fmt::Debug> std::fmt::Display for CallError<U> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CallError::RingFull(_) => write!(f, "Ring buffer is full"),
+            CallError::InsufficientCredit(_) => write!(f, "Insufficient credit for response"),
             CallError::Other(e) => write!(f, "{}", e),
         }
     }

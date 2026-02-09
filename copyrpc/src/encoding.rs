@@ -46,9 +46,13 @@ pub const HEADER_SIZE: usize = 12;
 /// Bit flag in call_id indicating this is a response (not a request).
 pub const RESPONSE_FLAG: u32 = 0x8000_0000;
 
-/// Special call_id indicating a padding marker for wrap-around.
-/// When the ring buffer wraps, we write this marker at the end and jump to the beginning.
-pub const PADDING_MARKER: u32 = 0xFFFF_FFFF;
+/// Message count value indicating a wrap-around in the ring buffer.
+/// When message_count == WRAP_MESSAGE_COUNT, the receiver should wrap to the beginning.
+pub const WRAP_MESSAGE_COUNT: u32 = u32::MAX;
+
+/// Flow control metadata size in bytes.
+/// Contains consumer position, credit grant, and message count.
+pub const FLOW_METADATA_SIZE: usize = 32;
 
 /// Encode a message header into the buffer.
 ///
@@ -86,13 +90,7 @@ pub unsafe fn decode_header(buf: *const u8) -> (u32, u32, u32) {
 /// Check if a call_id indicates a response message.
 #[inline]
 pub fn is_response(call_id: u32) -> bool {
-    call_id != PADDING_MARKER && (call_id & RESPONSE_FLAG) != 0
-}
-
-/// Check if a call_id indicates a padding marker (wrap-around).
-#[inline]
-pub fn is_padding_marker(call_id: u32) -> bool {
-    call_id == PADDING_MARKER
+    (call_id & RESPONSE_FLAG) != 0
 }
 
 /// Convert a request call_id to a response call_id.
@@ -116,21 +114,47 @@ pub fn padded_message_size(payload_len: u32) -> u64 {
     (total + ALIGNMENT - 1) & !(ALIGNMENT - 1)
 }
 
-/// Write a padding marker at the given buffer position.
+/// Encode flow control metadata into the buffer.
 ///
-/// The padding marker fills the remaining space at the end of the ring buffer
-/// when a message would wrap around. The `remaining` parameter is the number
-/// of bytes from the current position to the end of the ring.
+/// Metadata layout (32 bytes):
+/// - offset 0-7: consumer_pos (u64 LE)
+/// - offset 8-15: credit_grant (u64 LE)
+/// - offset 16-19: message_count (u32 LE)
+/// - offset 20-31: zero padding
 ///
 /// # Safety
-/// The buffer must have at least HEADER_SIZE bytes available.
+/// The buffer must have at least FLOW_METADATA_SIZE bytes available.
 #[inline]
-pub unsafe fn write_padding_marker(buf: *mut u8, remaining: u32) {
-    let ptr = buf as *mut u32;
-    std::ptr::write(ptr, PADDING_MARKER.to_le());
-    // Store remaining space in piggyback field for receiver to know how much to skip
-    std::ptr::write(ptr.add(1), remaining.to_le());
-    std::ptr::write(ptr.add(2), 0u32.to_le()); // payload_len = 0
+pub unsafe fn encode_flow_metadata(
+    buf: *mut u8,
+    consumer_pos: u64,
+    credit_grant: u64,
+    message_count: u32,
+) {
+    let ptr = buf as *mut u64;
+    std::ptr::write(ptr, consumer_pos.to_le());
+    std::ptr::write(ptr.add(1), credit_grant.to_le());
+    let ptr32 = buf.add(16) as *mut u32;
+    std::ptr::write(ptr32, message_count.to_le());
+    // Zero out padding bytes 20-31
+    std::ptr::write_bytes(buf.add(20), 0, 12);
+}
+
+/// Decode flow control metadata from the buffer.
+///
+/// # Safety
+/// The buffer must have at least FLOW_METADATA_SIZE bytes of valid data.
+///
+/// # Returns
+/// (consumer_pos, credit_grant, message_count)
+#[inline]
+pub unsafe fn decode_flow_metadata(buf: *const u8) -> (u64, u64, u32) {
+    let ptr = buf as *const u64;
+    let consumer_pos = u64::from_le(std::ptr::read(ptr));
+    let credit_grant = u64::from_le(std::ptr::read(ptr.add(1)));
+    let ptr32 = buf.add(16) as *const u32;
+    let message_count = u32::from_le(std::ptr::read(ptr32));
+    (consumer_pos, credit_grant, message_count)
 }
 
 #[cfg(test)]
@@ -186,5 +210,57 @@ mod tests {
         assert_eq!(padded_message_size(21), 64); // 12 + 21 = 33 -> 64
         assert_eq!(padded_message_size(52), 64); // 12 + 52 = 64 -> 64
         assert_eq!(padded_message_size(53), 96); // 12 + 53 = 65 -> 96
+    }
+
+    #[test]
+    fn test_flow_metadata_encoding() {
+        let mut buf = [0u8; FLOW_METADATA_SIZE];
+        unsafe {
+            encode_flow_metadata(buf.as_mut_ptr(), 12345, 67890, 42);
+            let (consumer_pos, credit_grant, message_count) = decode_flow_metadata(buf.as_ptr());
+            assert_eq!(consumer_pos, 12345);
+            assert_eq!(credit_grant, 67890);
+            assert_eq!(message_count, 42);
+
+            // Verify zero padding
+            for i in 20..32 {
+                assert_eq!(buf[i], 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_flow_metadata_wrap_message_count() {
+        let mut buf = [0u8; FLOW_METADATA_SIZE];
+        unsafe {
+            encode_flow_metadata(buf.as_mut_ptr(), 1000, 2000, WRAP_MESSAGE_COUNT);
+            let (consumer_pos, credit_grant, message_count) = decode_flow_metadata(buf.as_ptr());
+            assert_eq!(consumer_pos, 1000);
+            assert_eq!(credit_grant, 2000);
+            assert_eq!(message_count, WRAP_MESSAGE_COUNT);
+            assert_eq!(message_count, u32::MAX);
+        }
+    }
+
+    #[test]
+    fn test_flow_metadata_roundtrip() {
+        let test_cases = [
+            (0u64, 0u64, 0u32),
+            (1, 1, 1),
+            (u64::MAX, u64::MAX, u32::MAX),
+            (0x1234_5678_9ABC_DEF0, 0xFEDC_BA98_7654_3210, 0x1234_5678),
+        ];
+
+        for (consumer_pos, credit_grant, message_count) in test_cases {
+            let mut buf = [0u8; FLOW_METADATA_SIZE];
+            unsafe {
+                encode_flow_metadata(buf.as_mut_ptr(), consumer_pos, credit_grant, message_count);
+                let (decoded_consumer_pos, decoded_credit_grant, decoded_message_count) =
+                    decode_flow_metadata(buf.as_ptr());
+                assert_eq!(decoded_consumer_pos, consumer_pos);
+                assert_eq!(decoded_credit_grant, credit_grant);
+                assert_eq!(decoded_message_count, message_count);
+            }
+        }
     }
 }

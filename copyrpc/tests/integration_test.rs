@@ -23,6 +23,7 @@ struct EndpointConnectionInfo {
     recv_ring_size: u64,
     consumer_addr: u64,
     consumer_rkey: u32,
+    initial_credit: u64,
 }
 
 // =============================================================================
@@ -124,6 +125,7 @@ fn test_simple_pingpong() {
         recv_ring_size: info.recv_ring_size,
         consumer_addr: info.consumer_addr,
         consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
     };
 
     // Setup communication channels with server
@@ -161,6 +163,7 @@ fn test_simple_pingpong() {
         recv_ring_size: server_info.recv_ring_size,
         consumer_addr: server_info.consumer_addr,
         consumer_rkey: server_info.consumer_rkey,
+        initial_credit: server_info.initial_credit,
     };
 
     ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
@@ -170,7 +173,7 @@ fn test_simple_pingpong() {
     let user_data = CallUserData { call_id: 1 };
 
     eprintln!("Sending request...");
-    ep.call(&request_data, user_data).expect("Failed to send request");
+    ep.call(&request_data, user_data, 64).expect("Failed to send request");
 
     // Poll for response with timeout
     let start = std::time::Instant::now();
@@ -247,6 +250,7 @@ fn server_thread(
         recv_ring_size: info.recv_ring_size,
         consumer_addr: info.consumer_addr,
         consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
     };
 
     if info_tx.send(server_info).is_err() {
@@ -267,6 +271,7 @@ fn server_thread(
         recv_ring_size: client_info.recv_ring_size,
         consumer_addr: client_info.consumer_addr,
         consumer_rkey: client_info.consumer_rkey,
+        initial_credit: client_info.initial_credit,
     };
 
     if ep.connect(&remote, 0, ctx.port()).is_err() {
@@ -348,6 +353,7 @@ fn test_multi_endpoint_pingpong() {
             recv_ring_size: info.recv_ring_size,
             consumer_addr: info.consumer_addr,
             consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
         });
 
         endpoints.push(ep);
@@ -393,6 +399,7 @@ fn test_multi_endpoint_pingpong() {
             recv_ring_size: server_ep.recv_ring_size,
             consumer_addr: server_ep.consumer_addr,
             consumer_rkey: server_ep.consumer_rkey,
+            initial_credit: server_ep.initial_credit,
         };
 
         ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
@@ -406,7 +413,7 @@ fn test_multi_endpoint_pingpong() {
     for (ep_id, ep) in endpoints.iter().enumerate() {
         for slot_id in 0..REQUESTS_PER_EP {
             let user_data = CallUserData { call_id: (ep_id * REQUESTS_PER_EP + slot_id) as u32 };
-            ep.call(&request_data, user_data).expect("Failed to send request");
+            ep.call(&request_data, user_data, 64).expect("Failed to send request");
             total_sent += 1;
         }
     }
@@ -490,6 +497,7 @@ fn test_srq_exhaustion_pingpong() {
         recv_ring_size: info.recv_ring_size,
         consumer_addr: info.consumer_addr,
         consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
     };
 
     // Setup communication channels with server
@@ -527,6 +535,7 @@ fn test_srq_exhaustion_pingpong() {
         recv_ring_size: server_info.recv_ring_size,
         consumer_addr: server_info.consumer_addr,
         consumer_rkey: server_info.consumer_rkey,
+        initial_credit: server_info.initial_credit,
     };
 
     ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
@@ -540,7 +549,7 @@ fn test_srq_exhaustion_pingpong() {
 
         // Send request
         let user_data = CallUserData { call_id: i as u32 };
-        ep.call(&request_data, user_data).expect("Failed to send request");
+        ep.call(&request_data, user_data, 64).expect("Failed to send request");
 
         // Poll until response received
         let iter_start = std::time::Instant::now();
@@ -612,6 +621,7 @@ fn srq_exhaustion_server_thread(
         recv_ring_size: info.recv_ring_size,
         consumer_addr: info.consumer_addr,
         consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
     };
 
     if info_tx.send(server_info).is_err() {
@@ -632,6 +642,7 @@ fn srq_exhaustion_server_thread(
         recv_ring_size: client_info.recv_ring_size,
         consumer_addr: client_info.consumer_addr,
         consumer_rkey: client_info.consumer_rkey,
+        initial_credit: client_info.initial_credit,
     };
 
     if ep.connect(&remote, 0, ctx.port()).is_err() {
@@ -705,6 +716,7 @@ fn test_benchmark_style_pingpong() {
         recv_ring_size: info.recv_ring_size,
         consumer_addr: info.consumer_addr,
         consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
     };
 
     // Setup communication channels with server
@@ -742,6 +754,7 @@ fn test_benchmark_style_pingpong() {
         recv_ring_size: server_info.recv_ring_size,
         consumer_addr: server_info.consumer_addr,
         consumer_rkey: server_info.consumer_rkey,
+        initial_credit: server_info.initial_credit,
     };
 
     ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
@@ -755,7 +768,7 @@ fn test_benchmark_style_pingpong() {
     // Initial fill: send initial requests
     for i in 0..MAX_INFLIGHT {
         let user_data = CallUserData { call_id: i as u32 };
-        ep.call(&request_data, user_data).expect("Failed to send initial request");
+        ep.call(&request_data, user_data, 64).expect("Failed to send initial request");
         inflight += 1;
     }
 
@@ -791,7 +804,7 @@ fn test_benchmark_style_pingpong() {
 
         for _ in 0..can_send {
             let user_data = CallUserData { call_id: completed_count as u32 };
-            if ep.call(&request_data, user_data).is_ok() {
+            if ep.call(&request_data, user_data, 64).is_ok() {
                 inflight += 1;
             }
         }
@@ -863,6 +876,7 @@ fn benchmark_style_server_thread(
         recv_ring_size: info.recv_ring_size,
         consumer_addr: info.consumer_addr,
         consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
     };
 
     if info_tx.send(server_info).is_err() {
@@ -883,6 +897,7 @@ fn benchmark_style_server_thread(
         recv_ring_size: client_info.recv_ring_size,
         consumer_addr: client_info.consumer_addr,
         consumer_rkey: client_info.consumer_rkey,
+        initial_credit: client_info.initial_credit,
     };
 
     if ep.connect(&remote, 0, ctx.port()).is_err() {
@@ -962,6 +977,7 @@ fn multi_endpoint_server_thread(
             recv_ring_size: info.recv_ring_size,
             consumer_addr: info.consumer_addr,
             consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
         });
 
         endpoints.push(ep);
@@ -995,6 +1011,7 @@ fn multi_endpoint_server_thread(
             recv_ring_size: client_ep.recv_ring_size,
             consumer_addr: client_ep.consumer_addr,
             consumer_rkey: client_ep.consumer_rkey,
+            initial_credit: client_ep.initial_credit,
         };
 
         if ep.connect(&remote, 0, ctx.port()).is_err() {
@@ -1076,6 +1093,7 @@ fn test_ring_wraparound() {
         recv_ring_size: info.recv_ring_size,
         consumer_addr: info.consumer_addr,
         consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
     };
 
     let (server_info_tx, server_info_rx): (
@@ -1111,6 +1129,7 @@ fn test_ring_wraparound() {
         recv_ring_size: server_info.recv_ring_size,
         consumer_addr: server_info.consumer_addr,
         consumer_rkey: server_info.consumer_rkey,
+        initial_credit: server_info.initial_credit,
     };
 
     ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
@@ -1123,7 +1142,7 @@ fn test_ring_wraparound() {
         let before = completed.load(Ordering::SeqCst);
 
         let user_data = CallUserData { call_id: i as u32 };
-        if let Err(e) = ep.call(&request_data, user_data) {
+        if let Err(e) = ep.call(&request_data, user_data, 64) {
             eprintln!("Client: call failed at iteration {}: {:?}", i, e);
             // On RingFull, poll and retry
             ctx.poll();
@@ -1203,6 +1222,7 @@ fn wraparound_server_thread(
         recv_ring_size: info.recv_ring_size,
         consumer_addr: info.consumer_addr,
         consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
     };
 
     if info_tx.send(server_info).is_err() {
@@ -1223,6 +1243,7 @@ fn wraparound_server_thread(
         recv_ring_size: client_info.recv_ring_size,
         consumer_addr: client_info.consumer_addr,
         consumer_rkey: client_info.consumer_rkey,
+        initial_credit: client_info.initial_credit,
     };
 
     if ep.connect(&remote, 0, ctx.port()).is_err() {
@@ -1294,6 +1315,7 @@ fn test_high_throughput_sustained() {
         recv_ring_size: info.recv_ring_size,
         consumer_addr: info.consumer_addr,
         consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
     };
 
     let (server_info_tx, server_info_rx): (
@@ -1329,6 +1351,7 @@ fn test_high_throughput_sustained() {
         recv_ring_size: server_info.recv_ring_size,
         consumer_addr: server_info.consumer_addr,
         consumer_rkey: server_info.consumer_rkey,
+        initial_credit: server_info.initial_credit,
     };
 
     ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
@@ -1342,7 +1365,7 @@ fn test_high_throughput_sustained() {
     // Initial fill
     while inflight < MAX_INFLIGHT && sent < ITERATIONS {
         let user_data = CallUserData { call_id: sent as u32 };
-        if ep.call(&request_data, user_data).is_ok() {
+        if ep.call(&request_data, user_data, 64).is_ok() {
             inflight += 1;
             sent += 1;
         }
@@ -1369,7 +1392,7 @@ fn test_high_throughput_sustained() {
         // Send more requests to maintain queue depth
         while inflight < MAX_INFLIGHT && sent < ITERATIONS {
             let user_data = CallUserData { call_id: sent as u32 };
-            match ep.call(&request_data, user_data) {
+            match ep.call(&request_data, user_data, 64) {
                 Ok(_) => {
                     inflight += 1;
                     sent += 1;
@@ -1445,6 +1468,7 @@ fn high_throughput_server_thread(
         recv_ring_size: info.recv_ring_size,
         consumer_addr: info.consumer_addr,
         consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
     };
 
     if info_tx.send(server_info).is_err() {
@@ -1465,6 +1489,7 @@ fn high_throughput_server_thread(
         recv_ring_size: client_info.recv_ring_size,
         consumer_addr: client_info.consumer_addr,
         consumer_rkey: client_info.consumer_rkey,
+        initial_credit: client_info.initial_credit,
     };
 
     if ep.connect(&remote, 0, ctx.port()).is_err() {
@@ -1534,6 +1559,7 @@ fn test_debug_small_iterations() {
         recv_ring_size: info.recv_ring_size,
         consumer_addr: info.consumer_addr,
         consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
     };
 
     let (server_info_tx, server_info_rx): (
@@ -1569,6 +1595,7 @@ fn test_debug_small_iterations() {
         recv_ring_size: server_info.recv_ring_size,
         consumer_addr: server_info.consumer_addr,
         consumer_rkey: server_info.consumer_rkey,
+        initial_credit: server_info.initial_credit,
     };
 
     ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
@@ -1583,7 +1610,7 @@ fn test_debug_small_iterations() {
     while inflight < MAX_INFLIGHT && sent < ITERATIONS {
         let user_data = CallUserData { call_id: sent as u32 };
         eprintln!("CLIENT: Sending request #{}", sent);
-        if ep.call(&request_data, user_data).is_ok() {
+        if ep.call(&request_data, user_data, 64).is_ok() {
             inflight += 1;
             sent += 1;
         } else {
@@ -1617,7 +1644,7 @@ fn test_debug_small_iterations() {
         // Send more requests
         while inflight < MAX_INFLIGHT && sent < ITERATIONS {
             let user_data = CallUserData { call_id: sent as u32 };
-            match ep.call(&request_data, user_data) {
+            match ep.call(&request_data, user_data, 64) {
                 Ok(_) => {
                     eprintln!("CLIENT: Sending request #{}", sent);
                     inflight += 1;
@@ -1687,6 +1714,7 @@ fn debug_server_thread(
         recv_ring_size: info.recv_ring_size,
         consumer_addr: info.consumer_addr,
         consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
     };
 
     if info_tx.send(server_info).is_err() {
@@ -1707,6 +1735,7 @@ fn debug_server_thread(
         recv_ring_size: client_info.recv_ring_size,
         consumer_addr: client_info.consumer_addr,
         consumer_rkey: client_info.consumer_rkey,
+        initial_credit: client_info.initial_credit,
     };
 
     if ep.connect(&remote, 0, ctx.port()).is_err() {
@@ -1785,6 +1814,7 @@ fn test_benchmark_pattern() {
         recv_ring_size: info.recv_ring_size,
         consumer_addr: info.consumer_addr,
         consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
     };
 
     let (server_info_tx, server_info_rx): (
@@ -1820,6 +1850,7 @@ fn test_benchmark_pattern() {
         recv_ring_size: server_info.recv_ring_size,
         consumer_addr: server_info.consumer_addr,
         consumer_rkey: server_info.consumer_rkey,
+        initial_credit: server_info.initial_credit,
     };
 
     ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
@@ -1835,7 +1866,7 @@ fn test_benchmark_pattern() {
 
         // Send initial request (1 concurrent)
         let user_data = CallUserData { call_id: total_sent as u32 };
-        if ep.call(&request_data, user_data).is_ok() {
+        if ep.call(&request_data, user_data, 64).is_ok() {
             inflight += 1;
             total_sent += 1;
         }
@@ -1866,7 +1897,7 @@ fn test_benchmark_pattern() {
             let remaining = iters.saturating_sub(round_completed);
             if inflight == 0 && remaining > 0 {
                 let user_data = CallUserData { call_id: total_sent as u32 };
-                if ep.call(&request_data, user_data).is_ok() {
+                if ep.call(&request_data, user_data, 64).is_ok() {
                     inflight += 1;
                     total_sent += 1;
                 }
@@ -1936,6 +1967,7 @@ fn benchmark_pattern_server(
         recv_ring_size: info.recv_ring_size,
         consumer_addr: info.consumer_addr,
         consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
     };
 
     if info_tx.send(server_info).is_err() {
@@ -1956,6 +1988,7 @@ fn benchmark_pattern_server(
         recv_ring_size: client_info.recv_ring_size,
         consumer_addr: client_info.consumer_addr,
         consumer_rkey: client_info.consumer_rkey,
+        initial_credit: client_info.initial_credit,
     };
 
     if ep.connect(&remote, 0, ctx.port()).is_err() {
@@ -2041,6 +2074,7 @@ fn test_emit_wqe_boundary_split() {
         recv_ring_size: info.recv_ring_size,
         consumer_addr: info.consumer_addr,
         consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
     };
 
     let (server_info_tx, server_info_rx): (
@@ -2076,6 +2110,7 @@ fn test_emit_wqe_boundary_split() {
         recv_ring_size: server_info.recv_ring_size,
         consumer_addr: server_info.consumer_addr,
         consumer_rkey: server_info.consumer_rkey,
+        initial_credit: server_info.initial_credit,
     };
 
     ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
@@ -2099,12 +2134,12 @@ fn test_emit_wqe_boundary_split() {
         let mut _batch_sent = 0;
         for i in 0..BATCH_SIZE {
             let user_data = CallUserData { call_id: (batch * BATCH_SIZE + i) as u32 };
-            match ep.call(&request_data, user_data) {
+            match ep.call(&request_data, user_data, 64) {
                 Ok(_) => {
                     total_sent += 1;
                     _batch_sent += 1;
                 }
-                Err(copyrpc::error::CallError::RingFull(_)) => {
+                Err(copyrpc::error::CallError::RingFull(_) | copyrpc::error::CallError::InsufficientCredit(_)) => {
                     ringfull_count += 1;
                     // Need to poll and drain before continuing
                     break;
@@ -2201,6 +2236,7 @@ fn emit_wqe_boundary_server_thread(
         recv_ring_size: info.recv_ring_size,
         consumer_addr: info.consumer_addr,
         consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
     };
 
     if info_tx.send(server_info).is_err() {
@@ -2221,6 +2257,7 @@ fn emit_wqe_boundary_server_thread(
         recv_ring_size: client_info.recv_ring_size,
         consumer_addr: client_info.consumer_addr,
         consumer_rkey: client_info.consumer_rkey,
+        initial_credit: client_info.initial_credit,
     };
 
     if ep.connect(&remote, 0, ctx.port()).is_err() {
@@ -2255,4 +2292,957 @@ fn emit_wqe_boundary_server_thread(
     }
 
     eprintln!("Server: emit_wqe boundary test server exiting (sent {} replies)", replies_sent);
+}
+
+// =============================================================================
+// Credit-Based Flow Control Tests
+// =============================================================================
+
+/// Generic server thread helper for credit-based flow control tests.
+/// Reduces boilerplate by accepting ring size as parameter.
+fn generic_server_thread(
+    info_tx: Sender<EndpointConnectionInfo>,
+    info_rx: Receiver<EndpointConnectionInfo>,
+    ready_signal: Arc<AtomicU32>,
+    stop_flag: Arc<AtomicBool>,
+    ring_size: usize,
+) {
+    let on_response: fn(CallUserData, &[u8]) = |_user_data, _data| {};
+
+    let ctx: Context<CallUserData, _> = match ContextBuilder::new()
+        .device_index(0)
+        .port(1)
+        .srq_config(SrqConfig {
+            max_wr: 1024,
+            max_sge: 1,
+        })
+        .cq_size(2048)
+        .on_response(on_response)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Server: Failed to create context: {:?}", e);
+            return;
+        }
+    };
+
+    let ep_config = EndpointConfig {
+        send_ring_size: ring_size,
+        recv_ring_size: ring_size,
+        ..Default::default()
+    };
+    let mut ep = match ctx.create_endpoint(&ep_config) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Server: Failed to create endpoint: {:?}", e);
+            return;
+        }
+    };
+
+    let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
+
+    let server_info = EndpointConnectionInfo {
+        qp_number: info.qp_number,
+        packet_sequence_number: 0,
+        local_identifier: lid,
+        recv_ring_addr: info.recv_ring_addr,
+        recv_ring_rkey: info.recv_ring_rkey,
+        recv_ring_size: info.recv_ring_size,
+        consumer_addr: info.consumer_addr,
+        consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
+    };
+
+    if info_tx.send(server_info).is_err() {
+        return;
+    }
+
+    let client_info = match info_rx.recv() {
+        Ok(info) => info,
+        Err(_) => return,
+    };
+
+    let remote = RemoteEndpointInfo {
+        qp_number: client_info.qp_number,
+        packet_sequence_number: client_info.packet_sequence_number,
+        local_identifier: client_info.local_identifier,
+        recv_ring_addr: client_info.recv_ring_addr,
+        recv_ring_rkey: client_info.recv_ring_rkey,
+        recv_ring_size: client_info.recv_ring_size,
+        consumer_addr: client_info.consumer_addr,
+        consumer_rkey: client_info.consumer_rkey,
+        initial_credit: client_info.initial_credit,
+    };
+
+    if ep.connect(&remote, 0, ctx.port()).is_err() {
+        eprintln!("Server: Failed to connect");
+        return;
+    }
+
+    ready_signal.store(1, Ordering::Release);
+
+    let response_data = vec![0u8; 32];
+    let mut replies_sent = 0;
+
+    while !stop_flag.load(Ordering::Relaxed) {
+        ctx.poll();
+
+        while let Some(req) = ctx.recv() {
+            // Retry on RingFull
+            loop {
+                match req.reply(&response_data) {
+                    Ok(()) => {
+                        replies_sent += 1;
+                        break;
+                    }
+                    Err(copyrpc::error::Error::RingFull) => {
+                        ctx.poll();
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    eprintln!("Server: Exiting (sent {} replies)", replies_sent);
+}
+
+// =============================================================================
+// Test 1: Small ring with large response allowance
+// =============================================================================
+
+/// Test credit-based flow control with a small ring and large response_allowance.
+/// Validates that 200 sequential pingpongs complete successfully.
+#[test]
+fn test_credit_small_ring_large_response() {
+    const RING_SIZE: usize = 4096;
+    const RESPONSE_ALLOWANCE: u64 = 512;
+    const ITERATIONS: usize = 200;
+
+    let completed = Arc::new(AtomicU32::new(0));
+    let completed_for_callback = completed.clone();
+
+    let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+        completed_for_callback.fetch_add(1, Ordering::SeqCst);
+    };
+
+    let ctx: Context<CallUserData, _> = ContextBuilder::new()
+        .device_index(0)
+        .port(1)
+        .srq_config(SrqConfig {
+            max_wr: 1024,
+            max_sge: 1,
+        })
+        .cq_size(2048)
+        .on_response(on_response)
+        .build()
+        .expect("Failed to create client context");
+
+    let ep_config = EndpointConfig {
+        send_ring_size: RING_SIZE,
+        recv_ring_size: RING_SIZE,
+        ..Default::default()
+    };
+    let mut ep = ctx.create_endpoint(&ep_config).expect("Failed to create endpoint");
+
+    let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
+
+    let client_info = EndpointConnectionInfo {
+        qp_number: info.qp_number,
+        packet_sequence_number: 0,
+        local_identifier: lid,
+        recv_ring_addr: info.recv_ring_addr,
+        recv_ring_rkey: info.recv_ring_rkey,
+        recv_ring_size: info.recv_ring_size,
+        consumer_addr: info.consumer_addr,
+        consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
+    };
+
+    let (server_info_tx, server_info_rx): (
+        Sender<EndpointConnectionInfo>,
+        Receiver<EndpointConnectionInfo>,
+    ) = mpsc::channel();
+    let (client_info_tx, client_info_rx): (
+        Sender<EndpointConnectionInfo>,
+        Receiver<EndpointConnectionInfo>,
+    ) = mpsc::channel();
+    let server_ready = Arc::new(AtomicU32::new(0));
+    let server_ready_clone = server_ready.clone();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let server_stop = stop_flag.clone();
+
+    let handle: JoinHandle<()> = thread::spawn(move || {
+        generic_server_thread(server_info_tx, client_info_rx, server_ready_clone, server_stop, RING_SIZE);
+    });
+
+    client_info_tx.send(client_info).expect("Failed to send client info");
+    let server_info = server_info_rx.recv().expect("Failed to receive server info");
+
+    while server_ready.load(Ordering::Acquire) == 0 {
+        std::hint::spin_loop();
+    }
+
+    let remote = RemoteEndpointInfo {
+        qp_number: server_info.qp_number,
+        packet_sequence_number: server_info.packet_sequence_number,
+        local_identifier: server_info.local_identifier,
+        recv_ring_addr: server_info.recv_ring_addr,
+        recv_ring_rkey: server_info.recv_ring_rkey,
+        recv_ring_size: server_info.recv_ring_size,
+        consumer_addr: server_info.consumer_addr,
+        consumer_rkey: server_info.consumer_rkey,
+        initial_credit: server_info.initial_credit,
+    };
+
+    ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
+
+    // Sequential pingpong with large response allowance
+    let request_data = vec![0u8; 32];
+    let timeout = Duration::from_secs(10);
+
+    for i in 0..ITERATIONS {
+        let before = completed.load(Ordering::SeqCst);
+        let user_data = CallUserData { call_id: i as u32 };
+
+        ep.call(&request_data, user_data, RESPONSE_ALLOWANCE).expect("Failed to send request");
+
+        let iter_start = std::time::Instant::now();
+        while completed.load(Ordering::SeqCst) <= before {
+            if iter_start.elapsed() > timeout {
+                stop_flag.store(true, Ordering::SeqCst);
+                let _ = handle.join();
+                panic!("Timeout at iteration {} (completed={})", i, completed.load(Ordering::SeqCst));
+            }
+            ctx.poll();
+        }
+    }
+
+    stop_flag.store(true, Ordering::SeqCst);
+    handle.join().expect("Server thread panicked");
+
+    let final_completed = completed.load(Ordering::SeqCst);
+    assert_eq!(final_completed as usize, ITERATIONS,
+        "Did not complete all iterations (completed={}, expected={})",
+        final_completed, ITERATIONS);
+}
+
+// =============================================================================
+// Test 2: Mixed response allowance sizes
+// =============================================================================
+
+/// Test credit-based flow control with varying response_allowance values.
+/// Cycles through different allowances to validate dynamic behavior.
+#[test]
+fn test_credit_mixed_sizes() {
+    const RING_SIZE: usize = 8192;
+    const ITERATIONS: usize = 200;
+    const ALLOWANCES: [u64; 4] = [32, 256, 512, 1024];
+
+    let completed = Arc::new(AtomicU32::new(0));
+    let completed_for_callback = completed.clone();
+
+    let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+        completed_for_callback.fetch_add(1, Ordering::SeqCst);
+    };
+
+    let ctx: Context<CallUserData, _> = ContextBuilder::new()
+        .device_index(0)
+        .port(1)
+        .srq_config(SrqConfig {
+            max_wr: 1024,
+            max_sge: 1,
+        })
+        .cq_size(2048)
+        .on_response(on_response)
+        .build()
+        .expect("Failed to create client context");
+
+    let ep_config = EndpointConfig {
+        send_ring_size: RING_SIZE,
+        recv_ring_size: RING_SIZE,
+        ..Default::default()
+    };
+    let mut ep = ctx.create_endpoint(&ep_config).expect("Failed to create endpoint");
+
+    let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
+
+    let client_info = EndpointConnectionInfo {
+        qp_number: info.qp_number,
+        packet_sequence_number: 0,
+        local_identifier: lid,
+        recv_ring_addr: info.recv_ring_addr,
+        recv_ring_rkey: info.recv_ring_rkey,
+        recv_ring_size: info.recv_ring_size,
+        consumer_addr: info.consumer_addr,
+        consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
+    };
+
+    let (server_info_tx, server_info_rx): (
+        Sender<EndpointConnectionInfo>,
+        Receiver<EndpointConnectionInfo>,
+    ) = mpsc::channel();
+    let (client_info_tx, client_info_rx): (
+        Sender<EndpointConnectionInfo>,
+        Receiver<EndpointConnectionInfo>,
+    ) = mpsc::channel();
+    let server_ready = Arc::new(AtomicU32::new(0));
+    let server_ready_clone = server_ready.clone();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let server_stop = stop_flag.clone();
+
+    let handle: JoinHandle<()> = thread::spawn(move || {
+        generic_server_thread(server_info_tx, client_info_rx, server_ready_clone, server_stop, RING_SIZE);
+    });
+
+    client_info_tx.send(client_info).expect("Failed to send client info");
+    let server_info = server_info_rx.recv().expect("Failed to receive server info");
+
+    while server_ready.load(Ordering::Acquire) == 0 {
+        std::hint::spin_loop();
+    }
+
+    let remote = RemoteEndpointInfo {
+        qp_number: server_info.qp_number,
+        packet_sequence_number: server_info.packet_sequence_number,
+        local_identifier: server_info.local_identifier,
+        recv_ring_addr: server_info.recv_ring_addr,
+        recv_ring_rkey: server_info.recv_ring_rkey,
+        recv_ring_size: server_info.recv_ring_size,
+        consumer_addr: server_info.consumer_addr,
+        consumer_rkey: server_info.consumer_rkey,
+        initial_credit: server_info.initial_credit,
+    };
+
+    ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
+
+    // Sequential pingpong with cycling response allowances
+    let request_data = vec![0u8; 32];
+    let timeout = Duration::from_secs(10);
+
+    for i in 0..ITERATIONS {
+        let before = completed.load(Ordering::SeqCst);
+        let user_data = CallUserData { call_id: i as u32 };
+        let allowance = ALLOWANCES[i % ALLOWANCES.len()];
+
+        ep.call(&request_data, user_data, allowance).expect("Failed to send request");
+
+        let iter_start = std::time::Instant::now();
+        while completed.load(Ordering::SeqCst) <= before {
+            if iter_start.elapsed() > timeout {
+                stop_flag.store(true, Ordering::SeqCst);
+                let _ = handle.join();
+                panic!("Timeout at iteration {} (completed={})", i, completed.load(Ordering::SeqCst));
+            }
+            ctx.poll();
+        }
+    }
+
+    stop_flag.store(true, Ordering::SeqCst);
+    handle.join().expect("Server thread panicked");
+
+    let final_completed = completed.load(Ordering::SeqCst);
+    assert_eq!(final_completed as usize, ITERATIONS,
+        "Did not complete all iterations (completed={}, expected={})",
+        final_completed, ITERATIONS);
+}
+
+// =============================================================================
+// Test 3: Bidirectional stress test
+// =============================================================================
+
+/// Test credit-based flow control with bidirectional traffic.
+/// Both client and server send calls to each other and reply to incoming requests.
+#[test]
+fn test_credit_bidirectional_stress() {
+    const RING_SIZE: usize = 16384;
+    const CALLS_PER_SIDE: usize = 500;
+    const QUEUE_DEPTH: usize = 4;
+    const RESPONSE_ALLOWANCE: u64 = 128;
+
+    let client_completed = Arc::new(AtomicU32::new(0));
+    let client_completed_for_callback = client_completed.clone();
+
+    let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+        client_completed_for_callback.fetch_add(1, Ordering::SeqCst);
+    };
+
+    let ctx: Context<CallUserData, _> = ContextBuilder::new()
+        .device_index(0)
+        .port(1)
+        .srq_config(SrqConfig {
+            max_wr: 1024,
+            max_sge: 1,
+        })
+        .cq_size(2048)
+        .on_response(on_response)
+        .build()
+        .expect("Failed to create client context");
+
+    let ep_config = EndpointConfig {
+        send_ring_size: RING_SIZE,
+        recv_ring_size: RING_SIZE,
+        ..Default::default()
+    };
+    let mut ep = ctx.create_endpoint(&ep_config).expect("Failed to create endpoint");
+
+    let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
+
+    let client_info = EndpointConnectionInfo {
+        qp_number: info.qp_number,
+        packet_sequence_number: 0,
+        local_identifier: lid,
+        recv_ring_addr: info.recv_ring_addr,
+        recv_ring_rkey: info.recv_ring_rkey,
+        recv_ring_size: info.recv_ring_size,
+        consumer_addr: info.consumer_addr,
+        consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
+    };
+
+    let (server_info_tx, server_info_rx): (
+        Sender<EndpointConnectionInfo>,
+        Receiver<EndpointConnectionInfo>,
+    ) = mpsc::channel();
+    let (client_info_tx, client_info_rx): (
+        Sender<EndpointConnectionInfo>,
+        Receiver<EndpointConnectionInfo>,
+    ) = mpsc::channel();
+    let server_ready = Arc::new(AtomicU32::new(0));
+    let server_ready_clone = server_ready.clone();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let server_stop = stop_flag.clone();
+
+    let server_completed = Arc::new(AtomicU32::new(0));
+    let server_completed_clone = server_completed.clone();
+
+    // Server thread that also sends calls
+    let handle: JoinHandle<()> = thread::spawn(move || {
+        let server_completed_for_callback = server_completed_clone.clone();
+        let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+            server_completed_for_callback.fetch_add(1, Ordering::SeqCst);
+        };
+
+        let ctx: Context<CallUserData, _> = match ContextBuilder::new()
+            .device_index(0)
+            .port(1)
+            .srq_config(SrqConfig {
+                max_wr: 1024,
+                max_sge: 1,
+            })
+            .cq_size(2048)
+            .on_response(on_response)
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Server: Failed to create context: {:?}", e);
+                return;
+            }
+        };
+
+        let ep_config = EndpointConfig {
+            send_ring_size: RING_SIZE,
+            recv_ring_size: RING_SIZE,
+            ..Default::default()
+        };
+        let mut ep = match ctx.create_endpoint(&ep_config) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("Server: Failed to create endpoint: {:?}", e);
+                return;
+            }
+        };
+
+        let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
+
+        let server_info = EndpointConnectionInfo {
+            qp_number: info.qp_number,
+            packet_sequence_number: 0,
+            local_identifier: lid,
+            recv_ring_addr: info.recv_ring_addr,
+            recv_ring_rkey: info.recv_ring_rkey,
+            recv_ring_size: info.recv_ring_size,
+            consumer_addr: info.consumer_addr,
+            consumer_rkey: info.consumer_rkey,
+            initial_credit: info.initial_credit,
+        };
+
+        if server_info_tx.send(server_info).is_err() {
+            return;
+        }
+
+        let client_info = match client_info_rx.recv() {
+            Ok(info) => info,
+            Err(_) => return,
+        };
+
+        let remote = RemoteEndpointInfo {
+            qp_number: client_info.qp_number,
+            packet_sequence_number: client_info.packet_sequence_number,
+            local_identifier: client_info.local_identifier,
+            recv_ring_addr: client_info.recv_ring_addr,
+            recv_ring_rkey: client_info.recv_ring_rkey,
+            recv_ring_size: client_info.recv_ring_size,
+            consumer_addr: client_info.consumer_addr,
+            consumer_rkey: client_info.consumer_rkey,
+            initial_credit: client_info.initial_credit,
+        };
+
+        if ep.connect(&remote, 0, ctx.port()).is_err() {
+            eprintln!("Server: Failed to connect");
+            return;
+        }
+
+        server_ready_clone.store(1, Ordering::Release);
+
+        let response_data = vec![0u8; 32];
+        let request_data = vec![0u8; 32];
+        let mut sent: usize = 0;
+
+        while !server_stop.load(Ordering::Relaxed) {
+            ctx.poll();
+
+            // Receive and reply to incoming requests
+            while let Some(req) = ctx.recv() {
+                loop {
+                    match req.reply(&response_data) {
+                        Ok(()) => break,
+                        Err(copyrpc::error::Error::RingFull) => {
+                            ctx.poll();
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+
+            // Send calls to client
+            let completed = server_completed_clone.load(Ordering::SeqCst) as usize;
+            let mut inflight = sent.saturating_sub(completed);
+
+            while inflight < QUEUE_DEPTH && sent < CALLS_PER_SIDE {
+                let user_data = CallUserData { call_id: sent as u32 };
+                match ep.call(&request_data, user_data, RESPONSE_ALLOWANCE) {
+                    Ok(_) => {
+                        sent += 1;
+                        inflight += 1;
+                    }
+                    Err(copyrpc::error::CallError::RingFull(_) | copyrpc::error::CallError::InsufficientCredit(_)) => {
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        eprintln!("Server: Exiting (sent {} calls, completed {})", sent, server_completed_clone.load(Ordering::SeqCst));
+    });
+
+    client_info_tx.send(client_info).expect("Failed to send client info");
+    let server_info = server_info_rx.recv().expect("Failed to receive server info");
+
+    while server_ready.load(Ordering::Acquire) == 0 {
+        std::hint::spin_loop();
+    }
+
+    let remote = RemoteEndpointInfo {
+        qp_number: server_info.qp_number,
+        packet_sequence_number: server_info.packet_sequence_number,
+        local_identifier: server_info.local_identifier,
+        recv_ring_addr: server_info.recv_ring_addr,
+        recv_ring_rkey: server_info.recv_ring_rkey,
+        recv_ring_size: server_info.recv_ring_size,
+        consumer_addr: server_info.consumer_addr,
+        consumer_rkey: server_info.consumer_rkey,
+        initial_credit: server_info.initial_credit,
+    };
+
+    ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
+
+    // Client sends calls and replies to incoming requests
+    let request_data = vec![0u8; 32];
+    let response_data = vec![0u8; 32];
+    let mut sent = 0;
+    let mut inflight = 0;
+    let timeout = Duration::from_secs(20);
+    let start = std::time::Instant::now();
+
+    while sent < CALLS_PER_SIDE || inflight > 0 {
+        if start.elapsed() > timeout {
+            stop_flag.store(true, Ordering::SeqCst);
+            let _ = handle.join();
+            panic!("Timeout (sent={}, inflight={}, completed={})",
+                sent, inflight, client_completed.load(Ordering::SeqCst));
+        }
+
+        ctx.poll();
+
+        // Receive and reply to incoming requests
+        while let Some(req) = ctx.recv() {
+            loop {
+                match req.reply(&response_data) {
+                    Ok(()) => break,
+                    Err(copyrpc::error::Error::RingFull) => {
+                        ctx.poll();
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // Update inflight count
+        let completed = client_completed.load(Ordering::SeqCst) as usize;
+        inflight = sent.saturating_sub(completed);
+
+        // Send more calls
+        while inflight < QUEUE_DEPTH && sent < CALLS_PER_SIDE {
+            let user_data = CallUserData { call_id: sent as u32 };
+            match ep.call(&request_data, user_data, RESPONSE_ALLOWANCE) {
+                Ok(_) => {
+                    sent += 1;
+                    inflight += 1;
+                }
+                Err(copyrpc::error::CallError::RingFull(_) | copyrpc::error::CallError::InsufficientCredit(_)) => {
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    eprintln!("Client: Completed all calls (sent={}, completed={})",
+        sent, client_completed.load(Ordering::SeqCst));
+
+    stop_flag.store(true, Ordering::SeqCst);
+    handle.join().expect("Server thread panicked");
+
+    assert_eq!(client_completed.load(Ordering::SeqCst) as usize, CALLS_PER_SIDE,
+        "Client did not receive all responses");
+    assert_eq!(server_completed.load(Ordering::SeqCst) as usize, CALLS_PER_SIDE,
+        "Server did not receive all responses");
+}
+
+// =============================================================================
+// Test 4: Deep queue with tiny ring
+// =============================================================================
+
+/// Test credit-based flow control with a small ring and deep queue.
+/// Stresses credit exhaustion and recovery with multiple inflight requests.
+#[test]
+fn test_credit_deep_queue_tiny_ring() {
+    const RING_SIZE: usize = 2048;
+    const RESPONSE_ALLOWANCE: u64 = 256;
+    const QUEUE_DEPTH: usize = 3;
+    const ITERATIONS: usize = 200;
+
+    let completed = Arc::new(AtomicU32::new(0));
+    let completed_for_callback = completed.clone();
+
+    let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+        completed_for_callback.fetch_add(1, Ordering::SeqCst);
+    };
+
+    let ctx: Context<CallUserData, _> = ContextBuilder::new()
+        .device_index(0)
+        .port(1)
+        .srq_config(SrqConfig {
+            max_wr: 1024,
+            max_sge: 1,
+        })
+        .cq_size(2048)
+        .on_response(on_response)
+        .build()
+        .expect("Failed to create client context");
+
+    let ep_config = EndpointConfig {
+        send_ring_size: RING_SIZE,
+        recv_ring_size: RING_SIZE,
+        ..Default::default()
+    };
+    let mut ep = ctx.create_endpoint(&ep_config).expect("Failed to create endpoint");
+
+    let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
+
+    let client_info = EndpointConnectionInfo {
+        qp_number: info.qp_number,
+        packet_sequence_number: 0,
+        local_identifier: lid,
+        recv_ring_addr: info.recv_ring_addr,
+        recv_ring_rkey: info.recv_ring_rkey,
+        recv_ring_size: info.recv_ring_size,
+        consumer_addr: info.consumer_addr,
+        consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
+    };
+
+    let (server_info_tx, server_info_rx): (
+        Sender<EndpointConnectionInfo>,
+        Receiver<EndpointConnectionInfo>,
+    ) = mpsc::channel();
+    let (client_info_tx, client_info_rx): (
+        Sender<EndpointConnectionInfo>,
+        Receiver<EndpointConnectionInfo>,
+    ) = mpsc::channel();
+    let server_ready = Arc::new(AtomicU32::new(0));
+    let server_ready_clone = server_ready.clone();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let server_stop = stop_flag.clone();
+
+    let handle: JoinHandle<()> = thread::spawn(move || {
+        generic_server_thread(server_info_tx, client_info_rx, server_ready_clone, server_stop, RING_SIZE);
+    });
+
+    client_info_tx.send(client_info).expect("Failed to send client info");
+    let server_info = server_info_rx.recv().expect("Failed to receive server info");
+
+    while server_ready.load(Ordering::Acquire) == 0 {
+        std::hint::spin_loop();
+    }
+
+    let remote = RemoteEndpointInfo {
+        qp_number: server_info.qp_number,
+        packet_sequence_number: server_info.packet_sequence_number,
+        local_identifier: server_info.local_identifier,
+        recv_ring_addr: server_info.recv_ring_addr,
+        recv_ring_rkey: server_info.recv_ring_rkey,
+        recv_ring_size: server_info.recv_ring_size,
+        consumer_addr: server_info.consumer_addr,
+        consumer_rkey: server_info.consumer_rkey,
+        initial_credit: server_info.initial_credit,
+    };
+
+    ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
+
+    // Pipelined sends with retry on RingFull/InsufficientCredit
+    let request_data = vec![0u8; 32];
+    let mut sent = 0;
+    let mut inflight = 0;
+    let timeout = Duration::from_secs(10);
+    let start = std::time::Instant::now();
+
+    while sent < ITERATIONS || inflight > 0 {
+        if start.elapsed() > timeout {
+            stop_flag.store(true, Ordering::SeqCst);
+            let _ = handle.join();
+            panic!("Timeout (sent={}, inflight={}, completed={})",
+                sent, inflight, completed.load(Ordering::SeqCst));
+        }
+
+        ctx.poll();
+
+        let current_completed = completed.load(Ordering::SeqCst) as usize;
+        inflight = sent.saturating_sub(current_completed);
+
+        // Send more requests to maintain queue depth
+        while inflight < QUEUE_DEPTH && sent < ITERATIONS {
+            let user_data = CallUserData { call_id: sent as u32 };
+            match ep.call(&request_data, user_data, RESPONSE_ALLOWANCE) {
+                Ok(_) => {
+                    sent += 1;
+                    inflight += 1;
+                }
+                Err(copyrpc::error::CallError::RingFull(_) | copyrpc::error::CallError::InsufficientCredit(_)) => {
+                    // Poll and retry
+                    break;
+                }
+                Err(e) => {
+                    panic!("Unexpected error: {:?}", e);
+                }
+            }
+        }
+    }
+
+    stop_flag.store(true, Ordering::SeqCst);
+    handle.join().expect("Server thread panicked");
+
+    let final_completed = completed.load(Ordering::SeqCst);
+    assert_eq!(final_completed as usize, ITERATIONS,
+        "Did not complete all iterations (completed={}, expected={})",
+        final_completed, ITERATIONS);
+}
+
+// =============================================================================
+// Test 5: Credit exhaustion and recovery
+// =============================================================================
+
+/// Test credit-based flow control exhaustion and recovery.
+/// Sends calls until InsufficientCredit occurs, then polls to regain credit.
+#[test]
+fn test_credit_exhaustion_recovery() {
+    const RING_SIZE: usize = 8192;
+    const RESPONSE_ALLOWANCE: u64 = 512;
+    const MIN_COMPLETED: usize = 20;
+
+    let completed = Arc::new(AtomicU32::new(0));
+    let completed_for_callback = completed.clone();
+
+    let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+        completed_for_callback.fetch_add(1, Ordering::SeqCst);
+    };
+
+    let ctx: Context<CallUserData, _> = ContextBuilder::new()
+        .device_index(0)
+        .port(1)
+        .srq_config(SrqConfig {
+            max_wr: 1024,
+            max_sge: 1,
+        })
+        .cq_size(2048)
+        .on_response(on_response)
+        .build()
+        .expect("Failed to create client context");
+
+    let ep_config = EndpointConfig {
+        send_ring_size: RING_SIZE,
+        recv_ring_size: RING_SIZE,
+        ..Default::default()
+    };
+    let mut ep = ctx.create_endpoint(&ep_config).expect("Failed to create endpoint");
+
+    let (info, lid, _port) = ep.local_info(ctx.lid(), ctx.port());
+
+    let client_info = EndpointConnectionInfo {
+        qp_number: info.qp_number,
+        packet_sequence_number: 0,
+        local_identifier: lid,
+        recv_ring_addr: info.recv_ring_addr,
+        recv_ring_rkey: info.recv_ring_rkey,
+        recv_ring_size: info.recv_ring_size,
+        consumer_addr: info.consumer_addr,
+        consumer_rkey: info.consumer_rkey,
+        initial_credit: info.initial_credit,
+    };
+
+    let (server_info_tx, server_info_rx): (
+        Sender<EndpointConnectionInfo>,
+        Receiver<EndpointConnectionInfo>,
+    ) = mpsc::channel();
+    let (client_info_tx, client_info_rx): (
+        Sender<EndpointConnectionInfo>,
+        Receiver<EndpointConnectionInfo>,
+    ) = mpsc::channel();
+    let server_ready = Arc::new(AtomicU32::new(0));
+    let server_ready_clone = server_ready.clone();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let server_stop = stop_flag.clone();
+
+    let handle: JoinHandle<()> = thread::spawn(move || {
+        generic_server_thread(server_info_tx, client_info_rx, server_ready_clone, server_stop, RING_SIZE);
+    });
+
+    client_info_tx.send(client_info).expect("Failed to send client info");
+    let server_info = server_info_rx.recv().expect("Failed to receive server info");
+
+    while server_ready.load(Ordering::Acquire) == 0 {
+        std::hint::spin_loop();
+    }
+
+    let remote = RemoteEndpointInfo {
+        qp_number: server_info.qp_number,
+        packet_sequence_number: server_info.packet_sequence_number,
+        local_identifier: server_info.local_identifier,
+        recv_ring_addr: server_info.recv_ring_addr,
+        recv_ring_rkey: server_info.recv_ring_rkey,
+        recv_ring_size: server_info.recv_ring_size,
+        consumer_addr: server_info.consumer_addr,
+        consumer_rkey: server_info.consumer_rkey,
+        initial_credit: server_info.initial_credit,
+    };
+
+    ep.connect(&remote, 0, ctx.port()).expect("Failed to connect");
+
+    let request_data = vec![0u8; 32];
+    let mut sent = 0;
+    let mut insufficient_credit_count = 0;
+
+    // Phase 1: Send until InsufficientCredit
+    eprintln!("Phase 1: Sending until credit exhaustion...");
+    loop {
+        let user_data = CallUserData { call_id: sent as u32 };
+        match ep.call(&request_data, user_data, RESPONSE_ALLOWANCE) {
+            Ok(_) => {
+                sent += 1;
+            }
+            Err(copyrpc::error::CallError::InsufficientCredit(_)) => {
+                insufficient_credit_count += 1;
+                eprintln!("InsufficientCredit at sent={}", sent);
+                break;
+            }
+            Err(copyrpc::error::CallError::RingFull(_)) => {
+                eprintln!("RingFull at sent={}", sent);
+                break;
+            }
+            Err(e) => {
+                panic!("Unexpected error: {:?}", e);
+            }
+        }
+    }
+
+    assert!(insufficient_credit_count > 0, "Did not observe InsufficientCredit");
+
+    // Phase 2: Poll to regain credit
+    eprintln!("Phase 2: Polling to regain credit...");
+    let timeout = Duration::from_secs(10);
+    let start = std::time::Instant::now();
+
+    while completed.load(Ordering::SeqCst) < sent as u32 {
+        if start.elapsed() > timeout {
+            stop_flag.store(true, Ordering::SeqCst);
+            let _ = handle.join();
+            panic!("Timeout waiting for responses (sent={}, completed={})",
+                sent, completed.load(Ordering::SeqCst));
+        }
+        ctx.poll();
+    }
+
+    eprintln!("Phase 3: Sending more calls after recovery...");
+    let recovery_start = sent;
+
+    // Phase 3: Send more calls after recovery
+    for i in 0..MIN_COMPLETED {
+        let user_data = CallUserData { call_id: (recovery_start + i) as u32 };
+        loop {
+            match ep.call(&request_data, user_data, RESPONSE_ALLOWANCE) {
+                Ok(_) => {
+                    sent += 1;
+                    break;
+                }
+                Err(copyrpc::error::CallError::RingFull(_) | copyrpc::error::CallError::InsufficientCredit(_)) => {
+                    ctx.poll();
+                    continue;
+                }
+                Err(e) => {
+                    panic!("Unexpected error: {:?}", e);
+                }
+            }
+        }
+    }
+
+    // Wait for all responses
+    let start = std::time::Instant::now();
+    while completed.load(Ordering::SeqCst) < sent as u32 {
+        if start.elapsed() > timeout {
+            stop_flag.store(true, Ordering::SeqCst);
+            let _ = handle.join();
+            panic!("Timeout in final drain (sent={}, completed={})",
+                sent, completed.load(Ordering::SeqCst));
+        }
+        ctx.poll();
+    }
+
+    stop_flag.store(true, Ordering::SeqCst);
+    handle.join().expect("Server thread panicked");
+
+    let final_completed = completed.load(Ordering::SeqCst) as usize;
+    eprintln!("Test completed: sent={}, completed={}, insufficient_credit_count={}",
+        sent, final_completed, insufficient_credit_count);
+
+    assert!(final_completed >= MIN_COMPLETED,
+        "Did not complete enough iterations after recovery (completed={}, expected>={})",
+        final_completed, MIN_COMPLETED);
 }
