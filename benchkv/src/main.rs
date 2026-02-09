@@ -19,11 +19,8 @@ use clap::Parser;
 use mpi::collective::CommunicatorCollectives;
 use mpi::topology::Communicator;
 
-use daemon::{
-    CONNECTION_INFO_SIZE, CopyrpcSetup, DaemonFlux, EndpointConnectionInfo, on_delegate_response,
-};
+use daemon::{CopyrpcSetup, DaemonFlux, EndpointConnectionInfo, on_delegate_response};
 use epoch::EpochCollector;
-use ipc::RequestToken;
 use message::{DelegatePayload, Request, Response};
 
 #[derive(Parser, Debug)]
@@ -196,7 +193,8 @@ fn run_meta(
         .map(|d| format!("/benchkv_{}_{}", rank, d))
         .collect();
 
-    let max_clients_per_daemon = num_clients.div_ceil(num_daemons).max(1) as u32;
+    // All clients connect to all daemons
+    let max_clients_per_daemon = num_clients as u32;
     let mut servers: Vec<Option<ipc::Server<Request, Response>>> = shm_paths
         .iter()
         .map(|path| {
@@ -214,30 +212,18 @@ fn run_meta(
         })
         .collect();
 
-    // Create Flux network
+    // Create Flux network (used for copyrpc recv forwarding between daemons)
     let flux_capacity = 1024;
     let flux_inflight_max = 256;
-    let mut flux_nodes: Vec<Option<DaemonFlux>> = if num_daemons > 1 {
-        inproc::create_flux::<DelegatePayload, RequestToken, _>(
-            num_daemons,
-            flux_capacity,
-            flux_inflight_max,
-            on_delegate_response as fn(RequestToken, DelegatePayload),
-        )
-        .into_iter()
-        .map(Some)
-        .collect()
-    } else {
-        inproc::create_flux::<DelegatePayload, RequestToken, _>(
-            1,
-            flux_capacity,
-            flux_inflight_max,
-            on_delegate_response as fn(RequestToken, DelegatePayload),
-        )
-        .into_iter()
-        .map(Some)
-        .collect()
-    };
+    let mut flux_nodes: Vec<Option<DaemonFlux>> = inproc::create_flux::<DelegatePayload, usize, _>(
+        num_daemons.max(1),
+        flux_capacity,
+        flux_inflight_max,
+        on_delegate_response as fn(usize, DelegatePayload),
+    )
+    .into_iter()
+    .map(Some)
+    .collect();
 
     // Shared state
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -249,13 +235,17 @@ fn run_meta(
     let ready_barrier = Arc::new(Barrier::new(num_daemons + 1));
 
     // copyrpc setup channels (per-daemon for multi-node)
-    let num_remote_ranks = (size - 1) as usize;
+    // Each daemon handles remote ranks where rank % num_daemons == daemon_id
     let (copyrpc_local_rxs, copyrpc_remote_txs, copyrpc_setups) = if size > 1 {
         let mut local_rxs = Vec::with_capacity(num_daemons);
         let mut remote_txs = Vec::with_capacity(num_daemons);
         let mut setups = Vec::with_capacity(num_daemons);
 
-        for _ in 0..num_daemons {
+        for d in 0..num_daemons {
+            let my_remote_ranks: Vec<u32> = (0..size)
+                .filter(|&r| r != rank && (r as usize) % num_daemons == d)
+                .collect();
+
             let (local_tx, local_rx) = std::sync::mpsc::channel();
             let (remote_tx, remote_rx) = std::sync::mpsc::channel();
             local_rxs.push(local_rx);
@@ -266,8 +256,7 @@ fn run_meta(
                 device_index: cli.device_index,
                 port: cli.port,
                 ring_size: cli.ring_size,
-                num_remote_ranks,
-                num_daemons,
+                my_remote_ranks,
             }));
         }
 
@@ -314,60 +303,58 @@ fn run_meta(
     }
 
     // Main thread: MPI exchange for copyrpc (if multi-node)
+    // New topology: 1:1 per peer_rank
+    //   Pairing: (my_rank, daemon peer_rank%D) ↔ (peer_rank, daemon my_rank%D)
     if size > 1 {
         // 1. Collect local endpoint infos from all daemons
-        //    Each daemon sends D * num_remote_ranks infos, ordered by
-        //    [rank_offset * D + target_daemon]
+        //    Each daemon sends infos ordered by its my_remote_ranks list
         let daemon_local_infos: Vec<Vec<EndpointConnectionInfo>> = copyrpc_local_rxs
             .iter()
             .map(|rx| rx.recv().expect("Failed to receive daemon local info"))
             .collect();
 
-        // 2. For each remote rank, build D×D matrix, exchange, distribute
-        //    Per-daemon accumulator for remote infos
-        let mut daemon_remote_infos: Vec<Vec<EndpointConnectionInfo>> = (0..num_daemons)
-            .map(|_| Vec::with_capacity(num_daemons * num_remote_ranks))
+        // Compute each daemon's remote ranks list (same as what was passed to CopyrpcSetup)
+        let daemon_remote_ranks: Vec<Vec<u32>> = (0..num_daemons)
+            .map(|d| {
+                (0..size)
+                    .filter(|&r| r != rank && (r as usize) % num_daemons == d)
+                    .collect()
+            })
             .collect();
 
+        // 2. Per-daemon accumulator for remote infos
+        let mut daemon_remote_infos: Vec<Vec<EndpointConnectionInfo>> = (0..num_daemons)
+            .map(|d| Vec::with_capacity(daemon_remote_ranks[d].len()))
+            .collect();
+
+        // 3. For each peer rank, exchange 1 endpoint info
         for peer_rank in 0..size {
             if peer_rank == rank {
                 continue;
             }
-            let rank_offset = if peer_rank < rank {
-                peer_rank as usize
-            } else {
-                (peer_rank - 1) as usize
-            };
+            // Local daemon handling this peer: peer_rank % num_daemons
+            let local_daemon = (peer_rank as usize) % num_daemons;
+            // Find the index of peer_rank in that daemon's my_remote_ranks
+            let local_ep_idx = daemon_remote_ranks[local_daemon]
+                .iter()
+                .position(|&r| r == peer_rank)
+                .expect("peer_rank must be in local_daemon's remote_ranks");
 
-            // Build send matrix: D×D infos
-            // Layout: [d_local * D + d_remote]
-            let mut send_bytes =
-                Vec::with_capacity(num_daemons * num_daemons * CONNECTION_INFO_SIZE);
-            for local_infos in &daemon_local_infos {
-                for d_remote in 0..num_daemons {
-                    let idx = rank_offset * num_daemons + d_remote;
-                    send_bytes.extend(local_infos[idx].to_bytes());
-                }
-            }
+            // Send this daemon's endpoint info for this peer
+            let send_bytes = daemon_local_infos[local_daemon][local_ep_idx].to_bytes();
 
-            // Exchange D×D infos with peer rank
+            // Exchange with peer rank
             let recv_bytes =
                 mpi_util::exchange_bytes(world, rank as i32, peer_rank as i32, &send_bytes);
 
-            // Parse receive matrix: [d_remote * D + d_local]
-            // For our daemon d, extract recv_matrix[j * D + d] for j in 0..D
-            for (d, remote_infos) in daemon_remote_infos.iter_mut().enumerate() {
-                for remote_d in 0..num_daemons {
-                    let matrix_idx = remote_d * num_daemons + d;
-                    let byte_offset = matrix_idx * CONNECTION_INFO_SIZE;
-                    remote_infos.push(EndpointConnectionInfo::from_bytes(
-                        &recv_bytes[byte_offset..],
-                    ));
-                }
-            }
+            // The received info belongs to the remote daemon that handles our rank:
+            // remote daemon = rank % num_daemons (on peer_rank's node)
+            // But we need to give it to the local daemon that owns the connection: local_daemon
+            let remote_info = EndpointConnectionInfo::from_bytes(&recv_bytes);
+            daemon_remote_infos[local_daemon].push(remote_info);
         }
 
-        // 3. Send remote infos to each daemon
+        // 4. Send remote infos to each daemon (in my_remote_ranks order)
         for (d, tx) in copyrpc_remote_txs.iter().enumerate() {
             tx.send(std::mem::take(&mut daemon_remote_infos[d]))
                 .expect("Failed to send remote info to daemon");
@@ -381,11 +368,10 @@ fn run_meta(
     std::thread::sleep(Duration::from_millis(10));
     world.barrier();
 
-    // Spawn client threads
+    // Spawn client threads (each connects to ALL daemons)
     let mut client_handles = Vec::with_capacity(num_clients);
     for c in 0..num_clients {
-        let daemon_id = c % num_daemons;
-        let shm_path = shm_paths[daemon_id].clone();
+        let paths = shm_paths.clone();
         let pattern = patterns[c].clone();
         let stop = stop_flag.clone();
         let comp = completions[c].clone();
@@ -395,7 +381,7 @@ fn run_meta(
             if let Some(core_id) = core {
                 affinity::pin_thread(core_id, &format!("client-{}", c));
             }
-            client::run_client(&shm_path, &pattern, queue_depth, &stop, &comp);
+            client::run_client(&paths, num_daemons, rank, &pattern, queue_depth, &stop, &comp);
         }));
     }
 

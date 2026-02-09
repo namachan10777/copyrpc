@@ -20,48 +20,73 @@ fn make_request(entry: &AccessEntry) -> Request {
     }
 }
 
+/// Determine which local daemon should handle this request.
+/// - LOCAL (target_rank == my_rank): route to key-owning daemon (key % num_daemons)
+/// - REMOTE (target_rank != my_rank): route to daemon handling copyrpc for that rank
+///   (target_rank % num_daemons)
+#[inline]
+fn target_daemon(entry: &AccessEntry, num_daemons: usize, my_rank: u32) -> usize {
+    if entry.rank == my_rank {
+        (entry.key % num_daemons as u64) as usize
+    } else {
+        (entry.rank as usize) % num_daemons
+    }
+}
+
 pub fn run_client(
-    shm_path: &str,
+    shm_paths: &[String],
+    num_daemons: usize,
+    my_rank: u32,
     pattern: &[AccessEntry],
     queue_depth: u32,
     stop_flag: &AtomicBool,
     completions: &AtomicU64,
 ) {
-    let mut client = unsafe {
-        Client::<Request, Response, (), _>::connect(shm_path, |(), _resp| {
-            completions.fetch_add(1, Ordering::Relaxed);
+    // Connect to all daemons
+    let mut clients: Vec<Client<Request, Response, (), _>> = shm_paths
+        .iter()
+        .map(|path| {
+            unsafe {
+                Client::<Request, Response, (), _>::connect(path, |(), _resp| {
+                    completions.fetch_add(1, Ordering::Relaxed);
+                })
+            }
+            .expect("Client failed to connect")
         })
-    }
-    .expect("Client failed to connect");
+        .collect();
 
     let pattern_len = pattern.len();
     let mut pattern_idx = 0usize;
 
-    // Initial fill: pipeline queue_depth requests
+    // Initial fill: pipeline queue_depth requests across daemons
     for _ in 0..queue_depth {
         let entry = &pattern[pattern_idx % pattern_len];
         pattern_idx += 1;
-        if client.call(make_request(entry), ()).is_err() {
+        let daemon = target_daemon(entry, num_daemons, my_rank);
+        if clients[daemon].call(make_request(entry), ()).is_err() {
             return;
         }
     }
 
-    // Steady state: poll for completions, send replacements
+    // Steady state: poll all daemons for completions, send replacements
     while !stop_flag.load(Ordering::Relaxed) {
-        match client.poll() {
-            Ok(n) => {
-                for _ in 0..n {
-                    let entry = &pattern[pattern_idx % pattern_len];
-                    pattern_idx += 1;
-                    if client.call(make_request(entry), ()).is_err() {
-                        return;
-                    }
-                }
-                if n == 0 {
-                    std::hint::spin_loop();
-                }
+        let mut total_n = 0u32;
+        for client in &mut clients {
+            match client.poll() {
+                Ok(n) => total_n += n,
+                Err(_) => return,
             }
-            Err(_) => break,
+        }
+        for _ in 0..total_n {
+            let entry = &pattern[pattern_idx % pattern_len];
+            pattern_idx += 1;
+            let daemon = target_daemon(entry, num_daemons, my_rank);
+            if clients[daemon].call(make_request(entry), ()).is_err() {
+                return;
+            }
+        }
+        if total_n == 0 {
+            std::hint::spin_loop();
         }
     }
 }

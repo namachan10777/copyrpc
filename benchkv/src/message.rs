@@ -106,9 +106,10 @@ use ipc::RequestToken;
 use std::cell::RefCell;
 
 /// Response routed back from the Flux on_response callback.
+/// `pending_idx` indexes into the daemon's pending copyrpc recv handle buffer.
 #[derive(Debug)]
 pub struct FluxResponseEntry {
-    pub token: RequestToken,
+    pub pending_idx: usize,
     pub response: Response,
 }
 

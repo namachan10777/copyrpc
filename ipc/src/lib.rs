@@ -570,7 +570,17 @@ impl<Req: Serial, Resp: Serial, U, F: FnMut(U, Resp)> Client<Req, Resp, U, F> {
             return Err(CallError::ServerDisconnected);
         }
 
-        while self.in_flight >= self.ring_depth {
+        // Wait until the next ring slot's previous response has been consumed.
+        // Using in_flight alone is insufficient: out-of-order responses can free
+        // a *different* slot, allowing head to advance into a slot whose response
+        // is still pending, overwriting its user_data and causing a panic on the
+        // duplicate token.
+        let mask = self.ring_depth as usize - 1;
+        loop {
+            let next_slot = self.req_tx.head() & mask;
+            if self.user_data[next_slot].is_none() {
+                break;
+            }
             if self.poll()? == 0 {
                 std::hint::spin_loop();
             }
