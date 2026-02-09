@@ -14,7 +14,7 @@ RDMA NICは十分に高速なので、NICの基本（DCでAV切り替えると�
 
 - 1ノードに1デーモンプロセス（複数スレッドあり）
 - clientは全てのノード内Daemonと接続し、適切な中継Daemonへリクエストを配送する
-- ConnectionはDaemon単位でシャーディングされている
+- Connectionはrank id mod デーモンスレッド数でシャーディングされている
 - client → (ipc) → daemon → (inproc: daemon内delegation) → daemon thread → (copyrpc: ノード間) → remote daemon
 
 ## 構成要素
@@ -26,7 +26,7 @@ RDMA NICは十分に高速なので、NICの基本（DCでAV切り替えると�
   - 性能評価: QD=1、多数clientのベンチマークによって性能評価。多数のSOTA実装との比較（学術論文中心、後で補足）
 - inproc
   - daemon内delegation
-  - 性能評価: 中QD(8とか32くらい）、少数clientのall-to-allベンチマークによって性能評価。多数のSOTA実装との比較（学術論文中心、後で補足）
+  - 性能評価: 中QD(8とか32くらい）、daemonワーカースレッド同士の全対全ベンチマークによって性能評価。多数のSOTA実装との比較（学術論文中心、後で補足）
 - copyrpc
   - daemon/daemonのノード間通信を行う
   - RDMA Write with Immediateでのバッファ転送が主体。送信リングに書いてから送るため1回コピーが入る
