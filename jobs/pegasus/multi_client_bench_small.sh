@@ -1,9 +1,9 @@
 #!/bin/bash
-#PBS -b 9
-#PBS -q gen_S
+#PBS -b 7
+#PBS -q gpu_S
 #PBS -A NBBG
 #PBS -v WORKDIR=/work/NBB/mnakano/ghq/github.com/namachan10777/copyrpc
-#PBS -l elapstim_req=01:00:00
+#PBS -l elapstim_req=00:30:00
 #PBS -o /work/NBB/mnakano/ghq/github.com/namachan10777/copyrpc/jobs/pegasus/logs/%r.log
 #PBS -j o
 
@@ -34,7 +34,7 @@ SERVER=$(head -1 "$HOSTFILE")
 mapfile -t ALL_HOSTS < "$HOSTFILE"
 CLIENT_HOSTS=("${ALL_HOSTS[@]:1}")
 
-for NC in 1 2 3 4 6 8 12 16 24 32 48 64 96 128; do
+for NC in 1 2 3 4 6; do
   NP=$((NC + 1))
 
   # Generate rankfile: rank 0 -> server node, ranks 1..NC -> round-robin on client nodes
@@ -68,4 +68,4 @@ for NC in 1 2 3 4 6 8 12 16 24 32 48 64 96 128; do
     || echo "FAILED: ucx-am NC=$NC"
 done
 
-echo "=== All multi-client benchmarks completed ==="
+echo "=== All multi-client (small) benchmarks completed ==="

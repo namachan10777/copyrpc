@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -b 2
-#PBS -q gen_S
+#PBS -q gpu_S
 #PBS -A NBBG
 #PBS -v WORKDIR=/work/NBB/mnakano/ghq/github.com/namachan10777/copyrpc
 #PBS -l elapstim_req=04:00:00
