@@ -11,6 +11,12 @@
 
 \usepackage[dvips]{graphicx}
 \usepackage{latexsym}
+\usepackage{url}
+
+% ipsjクラスの\doiがDOI中のアンダースコアを処理できない問題を回避
+\makeatletter
+\renewcommand{\doi}[1]{\url{https://doi.org/#1}}
+\makeatother
 
 \begin{document}
 
@@ -38,7 +44,83 @@ LocustaRPCは，RDMAを活用した低遅延通信と，
 
 \section{はじめに}
 
+現代のHPCシステムでは、富岳NEXT、Sirius、El Capitanに代表されるように、
+ノード内並列性を大幅に向上させたFat node設計が主流となりつつある。
+この傾向により、ノード数は数千規模に抑えられる一方で、ノードあたりのプロセス数は数百から数千に及び、
+システム全体のプロセス数は数百万のオーダーに達する。
+
+こうした環境において、HPCミドルウェア、特にad-hocファイルシステムやキーバリューストアの
+RPC基盤にはスケーラビリティの課題が生じる。
+従来のRPC設計では個々のクライアントがNICを直接利用するため、
+プロセス数の増大に伴い接続数が爆発的に増加し、NICリソースの枯渇やメモリ消費の増大を招く。
+
+既存のRDMA RPCシステム\cite{kaliaDatacenterRPCsCan2019,kaliaFaSSTFastScalable2016,chenScalableRDMARPC2019,monga2021BirdsFeatherFlock}は
+主にネットワーク層の最適化やNICキャッシュの効率化に注力してきた。
+しかし、現代のRDMA NICは十分に高速であり、
+少数コアでNICを操作する設計においては、真のボトルネックはCPUがどれだけ効率的にメモリ操作を行えるかにある。
+
+そこで本研究では、ノード内IPC、プロセス内デリゲーション、ノード間RDMA通信の全ての通信層を
+メモリアクセス最適化問題として統一的に扱うRPC基盤、LocustaRPCを提案する。
+LocustaRPCは、ノードごとに配置されたサービスデーモンがリクエストを集約し、
+接続数を削減しつつQueue depthを活用する設計により、Fat node環境でのスケーラビリティを実現する。
+
+本稿の貢献は以下の通りである。
+\begin{enumerate}
+    \item メモリアクセス最適化を軸とした、デーモン中継型RPCアーキテクチャの設計
+    \item ibverbsをバイパスした直接デバイスアクセスによるCQポーリング効率化と、
+          memory pollingとの比較における従来評価の再検討
+    \item キャッシュ制御（CLDEMOTE、HITM回避）を意識したノード内通信の設計と最適化
+    \item Connect-X7上でのEnd-to-End性能評価
+\end{enumerate}
+
 \section{関連研究}
+
+\subsection{RDMA RPCシステム}
+
+eRPC\cite{kaliaDatacenterRPCsCan2019}は汎用的かつ高速なRPCフレームワークであり、
+1コアあたり10M RPCの処理性能を達成している。
+しかし、個々のクライアントがNICを直接操作する設計であり、Fat node環境での接続爆発には対応していない。
+
+FaSST\cite{kaliaFaSSTFastScalable2016}はtwo-sided datagram RPCを採用し、
+doorbell batchingにより高いスループットを達成したが、
+大規模接続時のスケーラビリティに課題が残る。
+
+HERD\cite{kaliaUsingRDMAEfficiently2014}はRDMA Writeとメッセージングverbsの組み合わせにより
+キーバリューサービスで26M ops/secを達成した。
+HERDが採用したmemory polling（受信バッファ上のフラグをポーリング）は後続研究で広く参照されているが、
+これはibverbsのCQポーリングAPIにおけるspin lockオーバーヘッドが大きかったことが背景にある。
+本研究ではibverbsをバイパスすることでCQポーリングの再評価を行う。
+
+ScaleRPC\cite{chenScalableRDMARPC2019}は接続グルーピングによりNICキャッシュの飽和とスラッシングを
+バランスさせ、メタデータアクセスで90--160\%の改善を報告した。
+しかし、CPU側のメモリアクセスパターン最適化は扱っていない。
+
+Flock\cite{monga2021BirdsFeatherFlock}はスレッド間での接続共有とcoalescing同期により
+RDMA RPCのスケーラビリティを改善した。
+本研究はこれと異なり、デーモン中継による接続集約という
+アーキテクチャレベルでの解決を図る。
+
+これらの既存研究はネットワーク層およびNIC層の最適化が中心であるのに対し、
+本研究ではNICが十分高速であるという前提の下、CPU側のメモリアクセスを主要なボトルネックとして捉え、
+全スタックに渡るメモリアクセス最適化を行う。
+
+\subsection{RDMA設計指針とNICマイクロアーキテクチャ}
+
+Kaliaらは高性能RDMAシステムの設計指針として、doorbell batching、DDIO、NUMA配置の重要性を示した\cite{kalia2016DesignGuidelinesHigh}。
+本研究はこれらの知見をノード内通信からノード間通信まで、スタック全体に拡張して適用する。
+
+Kongら\cite{kong2023UnderstandingRDMAMicroarchitecture}はRDMA NICのマイクロアーキテクチャリソース（QPコンテキストキャッシュ等）を定量的に分析し、
+QP数増加時の性能低下メカニズムを明らかにした。
+本研究では、Connect-X7においてはQP数1000程度まで実用的な性能が維持されることを踏まえ、
+アーキテクチャレベルでの接続集約により QP数を管理可能な範囲に抑える設計を採用する。
+
+\subsection{ノード内通信とデリゲーション}
+
+Calciuら\cite{calciuMessagePassingShared2013}はマルチコア環境における
+メッセージパッシングと共有メモリの性能を定量的に比較し、
+デリゲーションの有効性と限界を示した。
+本研究はこの知見を踏まえ、SPSCベースのデリゲーション機構を採用しつつ、
+キャッシュコヒーレンシプロトコルの影響を最小化するメモリアクセス設計を行う。
 
 \section{設計}
 
@@ -58,6 +140,8 @@ LocustaRPCは，RDMAを活用した低遅延通信と，
     \item 通信のメモリアクセスパイプライン最適化と、sfence集約によるIPC向上
 \end{enumerate}
 
+
+以降、これら3つの目標を達成するために、メモリアクセス最適化を軸とした提案手法を述べる。
 
 \section{提案手法}
 
@@ -131,11 +215,157 @@ Client-Daemon通信はx86\_64のTSOを活用し、SPSCでOut-of-Order返答が�
 クライアントごとにLaneを分離し、サーバ側が全てをPollingすることでクライアント調停コストを最小化する。
 また、Laneに対して連続的に多重化されたリクエストをDrainすることで性能を稼ぐ。
 
+\subsection{メモリアクセス最適化戦略}
+
+前節までの設計を横断する共通の最適化原理として、本節ではメモリアクセスの観点からの最適化戦略を述べる。
+
+\subsubsection{キャッシュコヒーレンシ最適化}
+
+コア間通信において、キャッシュコヒーレンシプロトコル（MESIFのForward遷移等）によるL1-L1転送は
+最も直接的なデータ共有手段である。
+しかし、実測ではCLDEMOTE命令によりデータを明示的にL3に降格させ、
+他コアがL3から読み出す方がレイテンシが低い場合がある。
+これは、Forward遷移に伴うスヌープのオーバーヘッドが、
+L3の共有キャッシュとしてのアクセスレイテンシを上回るためと考えられる。
+
+本設計では、SPSC通信においてプロデューサ側でCLDEMOTEを活用し、
+コンシューマがL3から効率的に読み出せるようにする。
+また、キャッシュライン境界での64Bアラインメントと、Lane分離によるfalse sharingの回避、
+SPSC設計によるHITM（Hardware Interrupt To Modify）イベントの削減を行う。
+
+\subsubsection{Store Buffer最適化}
+
+x86\_64のTSO（Total Store Ordering）メモリモデルでは、
+ストアはStore bufferを経由して順序保証される。
+これを活用し、SPSCリングバッファにおいてlock-freeなプロデューサ-コンシューマ通信を実現する。
+
+さらに、poll()駆動の送信モデルにおいて、複数のリクエストを蓄積してから一括送信することで、
+sfence（Store Fence）の発行回数を集約し、Store bufferの圧力を低減する。
+リングバッファへの逐次書き込みにおいては、Write combiningが期待できる連続アドレスへの書き込みパターンを維持する。
+
+\subsubsection{ibverbsバイパス}
+
+libibverbsは汎用的なRDMAアクセスを提供するが、
+thread safety保証のためのspin lockや、APIレイヤでの余分なメモリコピーが
+性能上の大きなオーバーヘッドとなる。
+特にCQポーリングにおけるspin lockは、memory pollingがCQポーリングより高速であるという
+従来の評価結果に大きく影響していると考えられる。
+
+本実装ではmlx5デバイスのメモリマップドレジスタに直接アクセスし、
+WQE（Work Queue Element）の構築とCQE（Completion Queue Entry）の読み取りを
+ibverbsを介さずに行う。
+これにより、spin lockの排除とコピー削減を実現し、
+CQポーリングがmemory pollingと同等以上の性能を発揮できることを示す。
+
+\subsubsection{NIC-CPU協調最適化}
+
+3000ノード級の環境では、ノードあたり数千のQPが存在し得る。
+個別のQPごとにポーリングを行うとCPUコストが線形に増加するため、
+複数QPのCompletion Eventを単一のCQに集約し、NIC HW側で通知の集約を行わせる。
+これにより、ポーリング対象を1箇所に絞りつつ、各QPの受信完了をImmediate値で識別する。
+
+また、NICのDDIO（Data Direct I/O）によりCQEはL3キャッシュに直接書き込まれるため、
+ポーリングループではL3からの読み出しのみで完結する。
+送信側ではdoorbell batchingにより、複数WQEに対して1回のMMIO書き込みで通知を行い、
+PCIeトランザクション数を削減する。
+
 \section{実装}
+
+LocustaRPCはRust言語で実装されている。
+主要なコンポーネントは以下のクレートで構成される。
+
+\subsection{システム構成}
+
+mlx5クレートはConnect-X系NICへの直接アクセスを提供し、ibverbsに依存しない。
+copyrpcクレートはmlx5上にRPC通信を実装し、
+ipcクレートは共有メモリベースのClient-Daemon通信を、
+inprocクレートはデーモン内のスレッド間デリゲーションを提供する。
+
+\subsection{直接デバイスアクセス}
+
+mlx5クレートでは、NICのデバイスファイルを直接mmapし、
+WQEの構築、doorbellの発行、CQEの読み取りをユーザ空間から直接行う。
+これにより、ibverbsのspin lockおよびAPI層でのメモリコピーを完全に排除する。
+QPの生成やMemory Region登録等の制御パス操作についてはibverbs経由で行い、
+データパスのみを直接アクセスとすることで、実装の複雑性を抑えている。
+
+\subsection{メモリ管理}
+
+IPC通信では、クライアントとデーモンが/dev/shmを介してメモリ領域を共有する。
+デーモンはこの共有領域をNICにMemory Regionとして登録することで、
+大規模バッファ転送においてクライアント-デーモン間のメモリコピーを不要にする。
+リングバッファはキャッシュライン（64B）アラインで確保し、false sharingを防止する。
+
+% TODO: perf c2cによるHITM計測、Store buffer監視の具体的手法を記述
 
 \section{評価}
 
+\subsection{評価環境}
+
+評価にはfern03およびfern04を使用する。
+各ノードはIntel Xeon Gold 6530（32コア）を搭載し、
+NICとしてMellanox Connect-X7をNUMA 0に接続している。
+NUMAノードは1個の構成であり、コア0--1はIRQ処理用に予約し、ベンチマークでは使用しない。
+ノード間はInfiniBandで接続される。
+
+\subsection{ノード内通信性能}
+
+Client-Daemon通信（IPC）およびデーモン内デリゲーション（inproc）の性能を評価する。
+
+IPC評価では、QD=1でクライアント数を1--32まで変化させ、
+SPSC集約方式とMPSC方式のスループット・レイテンシを比較する。
+合わせて、perf c2cによるHITMイベント数を計測し、
+キャッシュコヒーレンシオーバーヘッドの定量分析を行う。
+
+inproc評価では、QD=8--32でデーモンワーカースレッド間の全対全通信性能を測定し、
+学術論文中のSOTA実装との比較を行う。
+% TODO: 比較対象の具体的な論文リストを確定
+
+\subsection{RPC性能}
+
+ノード間RPC通信について、以下の3手法を比較する。
+\begin{itemize}
+    \item copyrpc: 本提案手法
+    \item UCX Active Message: UCXフレームワークによるRPC
+    \item Naive send/recv: ibverbs上の素朴なsend/recv実装
+\end{itemize}
+
+メッセージサイズ（64B, 256B, 1KB, 4KB）ごとのレイテンシとスループットを測定する。
+また、QP数を10から3000まで変化させたスケーラビリティ評価と、
+バッチサイズによるdoorbell batching効果の分析を行う。
+
+% TODO: 間に合えば memory polling vs CQ pollingの直接比較
+
+\subsection{統合評価}
+
+benchkvを用いたEnd-to-End評価を行う。
+benchkvはrank IDとキーによる単純なキーバリューストアであり、
+アーキテクチャの評価を主目的とする。
+
+YCSBライクなワークロードとして、read/write比率を
+90\%/10\%、50\%/50\%、10\%/90\%に設定した3パターンで評価する。
+メトリクスとして、IOPS、レイテンシ（p50, p99）を測定し、
+メモリアクセス指標（HITMイベント数、キャッシュミス率）とIOPSの相関を分析する。
+
+マルチノード構成でのスケーラビリティ評価も行い、
+デーモン中継アーキテクチャが大規模環境で有効であることを検証する。
+
 \section{おわりに}
+
+本稿では、Fat node環境におけるスケーラブルなRPC基盤LocustaRPCを提案した。
+LocustaRPCは、ノード内IPC、デーモン内デリゲーション、ノード間RDMA通信の全てを
+メモリアクセス最適化問題として統一的に捉え、
+デーモン中継型アーキテクチャにより接続数削減とQueue depth活用を両立する。
+
+ibverbsのバイパスによるCQポーリング効率化、CLDEMOTEを活用したキャッシュ制御、
+sfence集約によるStore buffer最適化など、各通信層においてメモリアクセスパターンを
+意識した設計を行った。
+
+% TODO: 評価結果のサマリを記述
+
+今後の課題として、マルチNUMAノード環境での評価、
+ファイルシステムやデータ分析など多様なワークロードへの適用、
+次世代NIC（RDMAX等）のハードウェア支援との統合が挙げられる。
 
 \begin{acknowledgment}
 謝辞をここに記述する．
