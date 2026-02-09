@@ -325,6 +325,7 @@ impl<Req, Resp> Drop for FetchAddCaller<Req, Resp> {
 pub struct FetchAddServer<Req, Resp> {
     req_ring: Arc<RequestRing<Req>>,
     resp_rings: Vec<Arc<ResponseRing<Resp>>>,
+    recv_counts: Vec<u64>,
     disconnected: bool,
 }
 
@@ -391,7 +392,9 @@ impl<Req: Serial, Resp: Serial> MpscServer<Req, Resp> for FetchAddServer<Req, Re
     }
 
     fn try_recv(&mut self) -> Option<Self::RecvRef<'_>> {
-        let (caller_id, data, slot_token) = self.req_ring.try_pop()?;
+        let (caller_id, data, _ring_token) = self.req_ring.try_pop()?;
+        let slot_token = self.recv_counts[caller_id];
+        self.recv_counts[caller_id] += 1;
         Some(FetchAddRecvRef {
             server: self,
             caller_id,
@@ -461,6 +464,7 @@ impl MpscChannel for FetchAddMpsc {
         let server = FetchAddServer {
             req_ring,
             resp_rings,
+            recv_counts: vec![0u64; max_callers],
             disconnected: false,
         };
 
