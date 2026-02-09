@@ -4,15 +4,14 @@
 //! This uses O(N) channels but has potential contention when multiple
 //! nodes send to the same target.
 //!
-//! The `Mesh` struct is generic over the MPSC channel implementation:
-//! - `StdMpsc`: default, uses `std::sync::mpsc`
-//! - `CrossbeamMpsc` (feature `crossbeam`): uses `crossbeam-channel`
+//! Uses `FetchAddMpsc` (lock-free bounded ring) as the default MPSC channel.
 
 use std::marker::PhantomData;
 
 use crate::mpsc::{
-    MpscChannel, MpscChannelReceiver, MpscChannelSender, SendError, StdMpsc, TryRecvError,
+    MpscChannel, MpscChannelReceiver, MpscChannelSender, SendError, TryRecvError,
 };
+use crate::mpsc_fetchadd::FetchAddMpsc;
 use crate::serial::Serial;
 use crate::{ReceivedMessage, RecvError, SendError as CrateSendError};
 
@@ -20,10 +19,7 @@ use crate::{ReceivedMessage, RecvError, SendError as CrateSendError};
 type SenderMatrix<T, M> = Vec<Vec<Option<<M as MpscChannel>::Sender<TaggedMessage<T>>>>>;
 
 /// Default Mesh type with no-op callback for responses.
-pub type DefaultMesh<T> = Mesh<T, (), fn((), T), StdMpsc>;
-
-#[cfg(feature = "crossbeam")]
-pub use crate::mpsc::CrossbeamMpsc;
+pub type DefaultMesh<T> = Mesh<T, (), fn((), T)>;
 
 /// Message kind for internal protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,9 +43,9 @@ struct TaggedMessage<T> {
 /// Each node has a single receive queue that all other nodes send to.
 ///
 /// The `M` type parameter selects the MPSC channel implementation.
-/// Use [`create_mesh`] for the default `StdMpsc` implementation, or
+/// Use [`create_mesh`] for the default `FetchAddMpsc` implementation, or
 /// [`create_mesh_with`] to select a different implementation.
-pub struct Mesh<T: Send, U = (), F: FnMut(U, T) = fn((), T), M: MpscChannel = StdMpsc> {
+pub struct Mesh<T: Send, U = (), F: FnMut(U, T) = fn((), T), M: MpscChannel = FetchAddMpsc> {
     id: usize,
     num_nodes: usize,
     rx: M::Receiver<TaggedMessage<T>>,
@@ -197,7 +193,7 @@ impl<T: Serial + Send, U, F: FnMut(U, T), M: MpscChannel> Mesh<T, U, F, M> {
     }
 }
 
-/// Creates a Mesh network with `n` nodes using the default `StdMpsc` channel.
+/// Creates a Mesh network with `n` nodes using the default `FetchAddMpsc` channel.
 ///
 /// Returns a vector of `Mesh` nodes, each capable of communicating with
 /// all other nodes through a single shared MPSC receive queue.
@@ -205,8 +201,8 @@ impl<T: Serial + Send, U, F: FnMut(U, T), M: MpscChannel> Mesh<T, U, F, M> {
 /// # Panics
 /// Panics if `n` is 0.
 #[allow(clippy::type_complexity)]
-pub fn create_mesh<T: Serial + Send>(n: usize) -> Vec<Mesh<T, (), fn((), T), StdMpsc>> {
-    create_mesh_with::<T, (), fn((), T), StdMpsc>(n, |(), _| {})
+pub fn create_mesh<T: Serial + Send>(n: usize) -> Vec<Mesh<T, (), fn((), T), FetchAddMpsc>> {
+    create_mesh_with::<T, (), fn((), T), FetchAddMpsc>(n, |(), _| {})
 }
 
 /// Creates a Mesh network with `n` nodes using a custom MPSC channel implementation.
@@ -258,10 +254,10 @@ pub fn create_mesh_with<T: Serial + Send, U, F: FnMut(U, T) + Clone, M: MpscChan
 }
 
 // ============================================================================
-// Backward compatibility: specialized implementation for StdMpsc
+// Convenience implementation for default FetchAddMpsc
 // ============================================================================
 
-impl<T: Serial + Send> Mesh<T, (), fn((), T), StdMpsc> {
+impl<T: Serial + Send> Mesh<T, (), fn((), T), FetchAddMpsc> {
     /// Creates a Mesh network with `n` nodes using the default channel.
     ///
     /// This is a convenience method equivalent to `create_mesh(n)`.
@@ -406,66 +402,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "crossbeam")]
-    #[test]
-    fn test_crossbeam_mesh() {
-        let mut nodes = create_mesh_with::<u32, (), fn((), u32), CrossbeamMpsc>(2, |(), _| {});
-
-        nodes[0].notify(1, 42).unwrap();
-        assert_eq!(
-            nodes[1].try_recv().unwrap(),
-            (0, ReceivedMessage::Notify(42))
-        );
-
-        nodes[1].notify(0, 123).unwrap();
-        assert_eq!(
-            nodes[0].try_recv().unwrap(),
-            (1, ReceivedMessage::Notify(123))
-        );
-    }
-
-    #[cfg(feature = "crossbeam")]
-    #[test]
-    fn test_crossbeam_mesh_threaded() {
-        use std::thread;
-
-        let nodes = create_mesh_with::<u64, (), fn((), u64), CrossbeamMpsc>(4, |(), _| {});
-        let mut handles = Vec::new();
-
-        for mut node in nodes {
-            handles.push(thread::spawn(move || {
-                let id = node.id();
-                let n = node.num_peers() + 1;
-
-                // Send to all peers
-                for peer in 0..n {
-                    if peer != id {
-                        for i in 0..100 {
-                            node.notify(peer, (id * 1000 + i) as u64).unwrap();
-                        }
-                    }
-                }
-
-                // Receive from all peers
-                let mut count = 0;
-                let expected = (n - 1) * 100;
-                while count < expected {
-                    match node.try_recv() {
-                        Ok(_) => count += 1,
-                        Err(RecvError::Empty) => std::hint::spin_loop(),
-                        Err(RecvError::Disconnected) => break,
-                    }
-                }
-
-                count
-            }));
-        }
-
-        for h in handles {
-            assert_eq!(h.join().unwrap(), 300); // 3 peers * 100 messages
-        }
-    }
-
     #[test]
     fn test_callback_on_response() {
         use std::sync::{Arc, Mutex};
@@ -473,7 +409,7 @@ mod tests {
         let callback_data = Arc::new(Mutex::new(Vec::new()));
         let callback_data_clone = callback_data.clone();
 
-        let mut nodes = create_mesh_with::<u32, u32, _, StdMpsc>(2, move |user_data, response| {
+        let mut nodes = create_mesh_with::<u32, u32, _, FetchAddMpsc>(2, move |user_data, response| {
             callback_data_clone.lock().unwrap().push((user_data, response));
         });
 

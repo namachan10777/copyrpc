@@ -11,13 +11,10 @@ arrow = { workspace = true, optional = true }
 core_affinity = { workspace = true, optional = true }
 rtrb = { version = "0.3", optional = true }
 omango = { version = "0.2", optional = true }
-crossbeam-channel = { version = "0.5", optional = true }
-
 [features]
 bench-bin = ["clap", "parquet", "arrow", "core_affinity"]
 rtrb = ["dep:rtrb"]
 omango = ["dep:omango"]
-crossbeam = ["dep:crossbeam-channel"]
 
 [dev-dependencies]
 criterion.workspace = true
@@ -29,6 +26,10 @@ harness = false
 
 [[bench]]
 name = "mesh"
+harness = false
+
+[[bench]]
+name = "qd"
 harness = false
 
 [[bin]]

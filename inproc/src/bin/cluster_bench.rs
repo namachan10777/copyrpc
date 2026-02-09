@@ -18,15 +18,13 @@ use inproc::Serial;
 use inproc::{
     create_flux_with_transport, create_mesh_with, FastForwardTransport, Flux, LamportTransport,
     Mesh, OnesidedTransport, OnesidedImmediateTransport, OnesidedValidityTransport,
-    ReceivedMessage, StdMpsc, Transport,
+    ReceivedMessage, FetchAddMpsc, Transport,
 };
 
 #[cfg(feature = "rtrb")]
 use inproc::RtrbTransport;
 #[cfg(feature = "omango")]
 use inproc::OmangoTransport;
-#[cfg(feature = "crossbeam")]
-use inproc::CrossbeamMpsc;
 
 use inproc::mpsc::MpscChannel;
 
@@ -576,10 +574,9 @@ fn main() {
     // --- Mesh benchmarks (MPSC) ---
 
     if matches!(args.transport, TransportType::All) {
-        // StdMpsc
         results.push(run_transport_benchmark(
             "mesh",
-            "std_mpsc",
+            "fetch_add",
             args.threads,
             args.capacity,
             args.duration,
@@ -587,22 +584,7 @@ fn main() {
             args.warmup,
             args.runs,
             args.start_core,
-            run_mesh_benchmark::<StdMpsc>,
-        ));
-
-        // CrossbeamMpsc
-        #[cfg(feature = "crossbeam")]
-        results.push(run_transport_benchmark(
-            "mesh",
-            "crossbeam",
-            args.threads,
-            args.capacity,
-            args.duration,
-            args.inflight,
-            args.warmup,
-            args.runs,
-            args.start_core,
-            run_mesh_benchmark::<CrossbeamMpsc>,
+            run_mesh_benchmark::<FetchAddMpsc>,
         ));
     }
 

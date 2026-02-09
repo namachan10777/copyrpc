@@ -5,11 +5,8 @@
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::thread;
 use inproc::{
-    create_flux_with_transport, create_mesh_with, FetchAddMpsc, Flux, ReceivedMessage, StdMpsc,
+    create_flux_with_transport, create_mesh_with, FetchAddMpsc, Flux, ReceivedMessage,
 };
-
-#[cfg(feature = "crossbeam")]
-use inproc::CrossbeamMpsc;
 
 fn pin_to_core(core_id: usize) {
     core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
@@ -45,15 +42,6 @@ fn bench_mesh_notify(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("mesh_notify");
     group.throughput(Throughput::Elements(TOTAL_MSGS as u64));
-
-    group.bench_function("std_mpsc", |b| {
-        run_mesh_notify_bench::<StdMpsc>(b, NUM_NODES, MSGS_PER_NODE);
-    });
-
-    #[cfg(feature = "crossbeam")]
-    group.bench_function("crossbeam", |b| {
-        run_mesh_notify_bench::<CrossbeamMpsc>(b, NUM_NODES, MSGS_PER_NODE);
-    });
 
     group.bench_function("fetch_add", |b| {
         run_mesh_notify_bench::<FetchAddMpsc>(b, NUM_NODES, MSGS_PER_NODE);
@@ -119,15 +107,6 @@ fn bench_mesh_call_reply(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("mesh_call_reply");
     group.throughput(Throughput::Elements(TOTAL_CALLS as u64));
-
-    group.bench_function("std_mpsc", |b| {
-        run_mesh_call_reply_bench::<StdMpsc>(b, NUM_NODES, CALLS_PER_NODE);
-    });
-
-    #[cfg(feature = "crossbeam")]
-    group.bench_function("crossbeam", |b| {
-        run_mesh_call_reply_bench::<CrossbeamMpsc>(b, NUM_NODES, CALLS_PER_NODE);
-    });
 
     group.bench_function("fetch_add", |b| {
         run_mesh_call_reply_bench::<FetchAddMpsc>(b, NUM_NODES, CALLS_PER_NODE);
