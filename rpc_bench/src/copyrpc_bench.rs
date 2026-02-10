@@ -255,7 +255,8 @@ fn run_one_to_one(
                     "  Run {}: avg {:.0} RPS ({}/{} epochs)",
                     run + 1,
                     avg_rps,
-                    filtered.len(), steady.len()
+                    filtered.len(),
+                    steady.len()
                 );
             }
 
@@ -520,7 +521,8 @@ fn run_one_to_one_threaded(
                     "  Run {}: avg {:.0} RPS ({}/{} epochs, {} threads)",
                     run + 1,
                     avg_rps,
-                    filtered.len(), steady.len(),
+                    filtered.len(),
+                    steady.len(),
                     num_threads
                 );
             }
@@ -889,7 +891,8 @@ fn run_multi_client(
                     "  Run {}: avg {:.0} RPS ({}/{} epochs)",
                     run + 1,
                     avg_rps,
-                    filtered.len(), steady.len()
+                    filtered.len(),
+                    steady.len()
                 );
             }
 

@@ -303,8 +303,7 @@ pub fn run_daemon(
             // 4c. copyrpc recv (incoming requests from remote nodes)
             while let Some(recv_handle) = ctx.recv() {
                 let req = RemoteRequest::from_bytes(recv_handle.data()).request;
-                let target_daemon =
-                    ShardedStore::owner_of(req.key(), num_daemons_u64) as usize;
+                let target_daemon = ShardedStore::owner_of(req.key(), num_daemons_u64) as usize;
 
                 if target_daemon == daemon_id {
                     // This daemon owns the key → handle locally

@@ -336,12 +336,7 @@ fn run_one_to_one(
                     for &slot_idx in &recv_done {
                         qps[ep]
                             .borrow()
-                            .post_recv(
-                                slot_idx,
-                                recv_addr(slot_idx),
-                                slot_size as u32,
-                                recv_lkey,
-                            )
+                            .post_recv(slot_idx, recv_addr(slot_idx), slot_size as u32, recv_lkey)
                             .expect("Failed to re-post recv");
                     }
                     qps[ep].borrow().ring_rq_doorbell();

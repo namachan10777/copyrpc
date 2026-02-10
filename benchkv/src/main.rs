@@ -381,7 +381,15 @@ fn run_meta(
             if let Some(core_id) = core {
                 affinity::pin_thread(core_id, &format!("client-{}", c));
             }
-            client::run_client(&paths, num_daemons, rank, &pattern, queue_depth, &stop, &comp);
+            client::run_client(
+                &paths,
+                num_daemons,
+                rank,
+                &pattern,
+                queue_depth,
+                &stop,
+                &comp,
+            );
         }));
     }
 
