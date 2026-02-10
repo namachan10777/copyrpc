@@ -11,6 +11,7 @@ pub mod common;
 pub mod fastforward;
 pub mod fetch_add;
 pub mod hazard;
+pub mod jiffy;
 pub mod lamport;
 pub mod lcrq;
 pub mod lprq;
@@ -120,6 +121,7 @@ pub trait MpscChannel: 'static + Send + Sync {
 pub use bbq::BbqMpsc;
 pub use fastforward::FastForwardMpsc;
 pub use fetch_add::FetchAddMpsc;
+pub use jiffy::JiffyMpsc;
 pub use lamport::LamportMpsc;
 pub use lcrq::LcrqMpsc;
 pub use lprq::LprqMpsc;
