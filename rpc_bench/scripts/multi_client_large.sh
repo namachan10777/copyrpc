@@ -23,7 +23,7 @@ export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu
 cargo build --release --bin rpc_bench
 
 BENCH="$WORKDIR/target/release/rpc_bench"
-OUTDIR="$LOGDIR/results"
+OUTDIR="$WORKDIR/rpc_bench/result/multi_client"
 mkdir -p "$OUTDIR"
 
 DURATION=10

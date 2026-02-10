@@ -23,17 +23,19 @@ export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu
 cargo build --release --bin rpc_bench
 
 BENCH="$WORKDIR/target/release/rpc_bench"
-OUTDIR="$LOGDIR/results"
+OUTDIR="$WORKDIR/rpc_bench/result/one_to_one"
 mkdir -p "$OUTDIR"
 
 DURATION=10
 RUNS=3
 MSG_SIZE=32
 
+ENDPOINTS="1 2 3 4 6 8 12 16 24 32 48 64 96 128 192 256 384 512 768 1024 1536 2048 3072 4096"
+
 # copyrpc: QD x Threads x Endpoints (E >= T, E % T == 0)
-for QD in 1 32 256; do
-  for T in 1 2 4 8 16; do
-    for E in 1 2 3 4 6 8 12 16 24 32 48 64 96 128 192 256 384 512 768 1024; do
+for QD in 1 8 256; do
+  for T in 1 2 4 8; do
+    for E in $ENDPOINTS; do
       if [[ $E -lt $T || $((E % T)) -ne 0 ]]; then continue; fi
       echo "=== copyrpc QD=$QD T=$T E=$E ==="
       timeout 120 mpirun -np 2 "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
@@ -46,8 +48,8 @@ for QD in 1 32 256; do
 done
 
 # erpc: QD x Threads
-for QD in 1 32 256; do
-  for T in 1 2 4 8 16; do
+for QD in 1 8 256; do
+  for T in 1 2 4 8; do
     echo "=== erpc QD=$QD T=$T ==="
     timeout 120 mpirun -np 2 "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
       -o "$OUTDIR/erpc_qd${QD}_t${T}.parquet" \
@@ -58,8 +60,8 @@ for QD in 1 32 256; do
 done
 
 # rc-send: QD x Threads
-for QD in 1 32 256; do
-  for T in 1 2 4 8 16; do
+for QD in 1 8 256; do
+  for T in 1 2 4 8; do
     echo "=== rc-send QD=$QD T=$T ==="
     timeout 120 mpirun -np 2 "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
       -o "$OUTDIR/rc_send_qd${QD}_t${T}.parquet" \
@@ -70,7 +72,7 @@ for QD in 1 32 256; do
 done
 
 # ucx-am: QD (single-thread only)
-for QD in 1 32 256; do
+for QD in 1 8 256; do
   echo "=== ucx-am QD=$QD ==="
   timeout 120 mpirun -np 2 "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
     -o "$OUTDIR/ucx_am_qd${QD}.parquet" \

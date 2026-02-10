@@ -35,6 +35,7 @@ inproc/bench_results/
 bench_results/
 *.parquet
 mempc_bench/result/
+rpc_bench/result/
 
 # Python
 .venv/
