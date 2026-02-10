@@ -234,73 +234,20 @@ pub fn run_daemon(
     > = Vec::new();
     let mut free_slots: Vec<usize> = Vec::new();
 
+    // Adaptive ipc poll: skip ipc poll when copyrpc had no responses
+    // (clients can't have new requests if no QD slots were freed).
+    let mut ipc_poll_skip = 0u32;
+    const IPC_POLL_INTERVAL: u32 = 4;
+
     while !stop_flag.load(Ordering::Relaxed) {
-        // === Phase 1: Process ipc client requests ===
-        server.poll();
-
-        while let Some(handle) = server.recv() {
-            let req = *handle.data();
-            let target_rank = req.rank();
-
-            if target_rank == my_rank {
-                // Client routed correctly to key-owning daemon
-                debug_assert_eq!(
-                    ShardedStore::owner_of(req.key(), num_daemons_u64) as usize,
-                    daemon_id
-                );
-                let resp = handle_local(&mut store, &req);
-                handle.reply(resp);
-            } else {
-                // Remote rank → copyrpc forward
-                let token = handle.into_token();
-                remote_queue.push((token, req, target_rank));
-            }
-        }
-
-        // === Phase 2: Flux poll (for copyrpc recv forwarding responses) ===
-        flux.poll();
-
-        // === Phase 3: Process Flux received requests (forwarded from copyrpc recv) ===
-        while let Some((_from, flux_token, payload)) = flux.try_recv_raw() {
-            if let DelegatePayload::Req(req) = payload {
-                debug_assert_eq!(
-                    ShardedStore::owner_of(req.key(), num_daemons_u64) as usize,
-                    daemon_id
-                );
-                let resp = handle_local(&mut store, &req);
-                reply_flux(&mut flux, flux_token, DelegatePayload::Resp(resp));
-            }
-        }
-
-        // === Phase 4: copyrpc ===
+        // === Phase 1: copyrpc poll + recv + drain ===
+        // Process RDMA completions first so ipc replies go out before ipc poll,
+        // giving clients the best chance to submit new requests.
+        let mut copyrpc_resp_count = 0u32;
         if let Some(ctx) = ctx_ref {
-            // 4a. Send queued remote requests via copyrpc
-            for (token, req, target_rank) in remote_queue.drain(..) {
-                let remote_req = RemoteRequest { request: req };
-                let ep_idx = rank_to_ep_index(target_rank);
-                let mut pending = token;
-                loop {
-                    match copyrpc_endpoints[ep_idx].call(remote_req.as_bytes(), pending, 0u64) {
-                        Ok(_) => break,
-                        Err(copyrpc::error::CallError::RingFull(returned)) => {
-                            pending = returned;
-                            ctx.poll();
-                            COPYRPC_RESPONSES.with(|r| {
-                                for entry in r.borrow_mut().drain(..) {
-                                    server.reply(entry.token, entry.response);
-                                }
-                            });
-                            continue;
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }
-
-            // 4b. copyrpc poll
             ctx.poll();
 
-            // 4c. copyrpc recv (incoming requests from remote nodes)
+            // copyrpc recv (incoming requests from remote nodes)
             while let Some(recv_handle) = ctx.recv() {
                 let req = RemoteRequest::from_bytes(recv_handle.data()).request;
                 let target_daemon = ShardedStore::owner_of(req.key(), num_daemons_u64) as usize;
@@ -333,15 +280,82 @@ pub fn run_daemon(
                 }
             }
 
-            // 4d. Drain copyrpc on_response results (reply to ipc clients)
+            // Drain copyrpc on_response results → reply to ipc clients
             COPYRPC_RESPONSES.with(|r| {
-                for entry in r.borrow_mut().drain(..) {
+                let mut r = r.borrow_mut();
+                copyrpc_resp_count = r.len() as u32;
+                for entry in r.drain(..) {
                     server.reply(entry.token, entry.response);
                 }
             });
         }
 
-        // === Phase 5: Flux responses → copyrpc reply (deferred) ===
+        // === Phase 2: ipc poll + recv (conditional) ===
+        // Poll ipc when: copyrpc just replied to clients (new QD capacity),
+        // or we haven't polled in IPC_POLL_INTERVAL iterations (catch local traffic).
+        ipc_poll_skip += 1;
+        if copyrpc_resp_count > 0 || ipc_poll_skip >= IPC_POLL_INTERVAL {
+            server.poll();
+            ipc_poll_skip = 0;
+        }
+
+        while let Some(handle) = server.recv() {
+            let req = *handle.data();
+            let target_rank = req.rank();
+
+            if target_rank == my_rank {
+                debug_assert_eq!(
+                    ShardedStore::owner_of(req.key(), num_daemons_u64) as usize,
+                    daemon_id
+                );
+                let resp = handle_local(&mut store, &req);
+                handle.reply(resp);
+            } else {
+                let token = handle.into_token();
+                remote_queue.push((token, req, target_rank));
+            }
+        }
+
+        // === Phase 3: copyrpc send ===
+        if let Some(ctx) = ctx_ref {
+            for (token, req, target_rank) in remote_queue.drain(..) {
+                let remote_req = RemoteRequest { request: req };
+                let ep_idx = rank_to_ep_index(target_rank);
+                let mut pending = token;
+                loop {
+                    match copyrpc_endpoints[ep_idx].call(remote_req.as_bytes(), pending, 0u64) {
+                        Ok(_) => break,
+                        Err(copyrpc::error::CallError::RingFull(returned)) => {
+                            pending = returned;
+                            ctx.poll();
+                            COPYRPC_RESPONSES.with(|r| {
+                                for entry in r.borrow_mut().drain(..) {
+                                    server.reply(entry.token, entry.response);
+                                }
+                            });
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+
+        // === Phase 4: Flux poll + recv ===
+        flux.poll();
+
+        while let Some((_from, flux_token, payload)) = flux.try_recv_raw() {
+            if let DelegatePayload::Req(req) = payload {
+                debug_assert_eq!(
+                    ShardedStore::owner_of(req.key(), num_daemons_u64) as usize,
+                    daemon_id
+                );
+                let resp = handle_local(&mut store, &req);
+                reply_flux(&mut flux, flux_token, DelegatePayload::Resp(resp));
+            }
+        }
+
+        // === Phase 5: Flux responses → copyrpc reply ===
         FLUX_RESPONSES.with(|r| {
             for entry in r.borrow_mut().drain(..) {
                 if let Some(recv_handle) = pending_copyrpc_handles[entry.pending_idx].take() {
