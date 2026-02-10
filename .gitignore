@@ -37,5 +37,11 @@ bench_results/qd_compare/
 bench_results/qd_perf/
 bench_results/qd/
 
+# Python
+.venv/
+
+# Benchmark visualization output
+bench_results/viz/
+
 # Job logs
 jobs/*/logs/
