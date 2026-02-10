@@ -19,43 +19,38 @@ use crate::{CallError, MpscCaller, Serial};
 /// # Example
 /// ```ignore
 /// let caller = /* some MpscCaller */;
-/// let mut with_ud = CallerWithUserData::new(caller, 128, |ctx, resp| {
+/// let mut with_ud = CallerWithUserData::new(caller, 128);
+/// with_ud.call(request, 42)?;
+/// with_ud.poll(&mut |ctx, resp| {
 ///     println!("Request {} completed with response {:?}", ctx, resp);
 /// });
-/// with_ud.call(request, 42)?;
-/// with_ud.poll(); // Invokes callback with (42, response)
 /// ```
-pub struct CallerWithUserData<C, Req, Resp, U, F>
+pub struct CallerWithUserData<C, Req, Resp, U>
 where
     C: MpscCaller<Req, Resp>,
     Req: Serial,
     Resp: Serial,
-    F: FnMut(U, Resp),
 {
     caller: C,
     user_data: Vec<Option<U>>,
-    on_response: F,
     _phantom: std::marker::PhantomData<(Req, Resp)>,
 }
 
-impl<C, Req, Resp, U, F> CallerWithUserData<C, Req, Resp, U, F>
+impl<C, Req, Resp, U> CallerWithUserData<C, Req, Resp, U>
 where
     C: MpscCaller<Req, Resp>,
     Req: Serial,
     Resp: Serial,
-    F: FnMut(U, Resp),
 {
     /// Creates a new `CallerWithUserData` wrapper.
     ///
     /// # Parameters
     /// - `caller`: Inner `MpscCaller` to wrap
     /// - `capacity`: Size of the user_data slot array (must be >= max inflight requests)
-    /// - `on_response`: Callback invoked for each completed response as `on_response(user_data, response)`
-    pub fn new(caller: C, capacity: usize, on_response: F) -> Self {
+    pub fn new(caller: C, capacity: usize) -> Self {
         Self {
             caller,
             user_data: (0..capacity).map(|_| None).collect(),
-            on_response,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -82,12 +77,12 @@ where
     /// Calls `sync()` on the inner caller to flush pending writes, then drains all available responses
     /// via `try_recv_response()`. For each response, retrieves the associated user_data and invokes
     /// `on_response(user_data, response)`.
-    pub fn poll(&mut self) {
+    pub fn poll(&mut self, on_response: &mut impl FnMut(U, Resp)) {
         self.caller.sync();
         while let Some((token, resp)) = self.caller.try_recv_response() {
             let slot = token as usize % self.user_data.len();
             if let Some(ud) = self.user_data[slot].take() {
-                (self.on_response)(ud, resp);
+                on_response(ud, resp);
             }
         }
     }
@@ -180,10 +175,11 @@ mod tests {
         let mock = MockCaller::new(8);
         let responses = Rc::new(RefCell::new(Vec::new()));
         let responses_clone = responses.clone();
-
-        let mut caller = CallerWithUserData::new(mock, 8, move |ud: String, resp| {
+        let mut on_resp = move |ud: String, resp| {
             responses_clone.borrow_mut().push((ud, resp));
-        });
+        };
+
+        let mut caller = CallerWithUserData::new(mock, 8);
 
         // Issue a call with user_data
         caller.call(Req(100), "first".to_string()).unwrap();
@@ -193,7 +189,7 @@ mod tests {
         caller.caller_mut().simulate_response();
 
         // Poll to receive response
-        caller.poll();
+        caller.poll(&mut on_resp);
 
         // Verify callback was invoked with correct user_data and response
         let resp_vec = responses.borrow();
@@ -209,10 +205,11 @@ mod tests {
         let mock = MockCaller::new(16);
         let responses = Rc::new(RefCell::new(Vec::new()));
         let responses_clone = responses.clone();
-
-        let mut caller = CallerWithUserData::new(mock, 16, move |ud: u32, resp| {
+        let mut on_resp = move |ud: u32, resp| {
             responses_clone.borrow_mut().push((ud, resp));
-        });
+        };
+
+        let mut caller = CallerWithUserData::new(mock, 16);
 
         // Issue multiple calls with different user_data
         caller.call(Req(10), 1000).unwrap();
@@ -225,7 +222,7 @@ mod tests {
         caller.caller_mut().simulate_response(); // token 0, req 10
         caller.caller_mut().simulate_response(); // token 1, req 20
 
-        caller.poll();
+        caller.poll(&mut on_resp);
 
         // Verify first two responses
         {
@@ -238,7 +235,7 @@ mod tests {
 
         // Simulate third response
         caller.caller_mut().simulate_response(); // token 2, req 30
-        caller.poll();
+        caller.poll(&mut on_resp);
 
         // Verify third response
         let resp_vec = responses.borrow();
@@ -253,10 +250,11 @@ mod tests {
         let mock = MockCaller::new(32);
         let responses = Rc::new(RefCell::new(Vec::new()));
         let responses_clone = responses.clone();
-
-        let mut caller = CallerWithUserData::new(mock, 32, move |ud: (usize, String), resp| {
+        let mut on_resp = move |ud: (usize, String), resp| {
             responses_clone.borrow_mut().push((ud, resp));
-        });
+        };
+
+        let mut caller = CallerWithUserData::new(mock, 32);
 
         // Issue requests with tagged user_data
         for i in 0..10 {
@@ -269,7 +267,7 @@ mod tests {
             caller.caller_mut().simulate_response();
         }
 
-        caller.poll();
+        caller.poll(&mut on_resp);
 
         // Verify all 10 responses arrived with correct pairing
         let resp_vec = responses.borrow();
@@ -284,7 +282,7 @@ mod tests {
     #[test]
     fn test_inflight_exceeded_error() {
         let mock = MockCaller::new(2);
-        let mut caller = CallerWithUserData::new(mock, 4, |_ud: (), _resp| {});
+        let mut caller = CallerWithUserData::new(mock, 4);
 
         // Fill up to max_inflight
         caller.call(Req(1), ()).unwrap();
@@ -302,10 +300,11 @@ mod tests {
         let responses = Rc::new(RefCell::new(Vec::new()));
         let responses_clone = responses.clone();
         let capacity = 8; // Small capacity to force modulo wrapping
-
-        let mut caller = CallerWithUserData::new(mock, capacity, move |ud: u64, resp| {
+        let mut on_resp = move |ud: u64, resp| {
             responses_clone.borrow_mut().push((ud, resp));
-        });
+        };
+
+        let mut caller = CallerWithUserData::new(mock, capacity);
 
         // Manually set high token value to simulate wrapping
         caller.caller_mut().next_token = 1000;
@@ -320,7 +319,7 @@ mod tests {
             caller.caller_mut().simulate_response();
         }
 
-        caller.poll();
+        caller.poll(&mut on_resp);
 
         // Verify correct pairing despite token wrapping
         let resp_vec = responses.borrow();
@@ -335,22 +334,23 @@ mod tests {
         let mock = MockCaller::new(16);
         let responses = Rc::new(RefCell::new(Vec::new()));
         let responses_clone = responses.clone();
-
-        let mut caller = CallerWithUserData::new(mock, 16, move |ud: usize, resp| {
+        let mut on_resp = move |ud: usize, resp| {
             responses_clone.borrow_mut().push((ud, resp));
-        });
+        };
+
+        let mut caller = CallerWithUserData::new(mock, 16);
 
         // Issue calls
         caller.call(Req(1), 10).unwrap();
         caller.call(Req(2), 20).unwrap();
 
         // Poll with no responses ready
-        caller.poll();
+        caller.poll(&mut on_resp);
         assert_eq!(responses.borrow().len(), 0);
 
         // Simulate one response
         caller.caller_mut().simulate_response();
-        caller.poll();
+        caller.poll(&mut on_resp);
         {
             let resp_vec = responses.borrow();
             assert_eq!(resp_vec.len(), 1);
@@ -358,12 +358,12 @@ mod tests {
         }
 
         // Poll again with no new responses
-        caller.poll();
+        caller.poll(&mut on_resp);
         assert_eq!(responses.borrow().len(), 1);
 
         // Simulate second response
         caller.caller_mut().simulate_response();
-        caller.poll();
+        caller.poll(&mut on_resp);
         let resp_vec = responses.borrow();
         assert_eq!(resp_vec.len(), 2);
         assert_eq!(resp_vec[1], (20, Resp(4)));

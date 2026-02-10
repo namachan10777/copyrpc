@@ -139,8 +139,7 @@ fn run_one_to_one(
         0,
     );
 
-    type OnResponseFn = fn((), &[u8]);
-    let ctx: Context<(), OnResponseFn> = ContextBuilder::new()
+    let ctx: Context<()> = ContextBuilder::new()
         .device_index(common.device_index)
         .port(common.port)
         .srq_config(SrqConfig {
@@ -148,7 +147,6 @@ fn run_one_to_one(
             max_sge: 1,
         })
         .cq_size(4096)
-        .on_response(on_response_callback as OnResponseFn)
         .build()
         .expect("Failed to create copyrpc context");
 
@@ -320,8 +318,7 @@ fn run_one_to_one_threaded(
                 tid,
             );
 
-            type OnResponseFn = fn((), &[u8]);
-            let ctx: Context<(), OnResponseFn> = ContextBuilder::new()
+            let ctx: Context<()> = ContextBuilder::new()
                 .device_index(device_index)
                 .port(port)
                 .srq_config(SrqConfig {
@@ -329,7 +326,6 @@ fn run_one_to_one_threaded(
                     max_sge: 1,
                 })
                 .cq_size(4096)
-                .on_response(on_response_callback as OnResponseFn)
                 .build()
                 .expect("Failed to create copyrpc context");
 
@@ -551,8 +547,8 @@ fn run_one_to_one_threaded(
     all_rows
 }
 
-fn run_client_duration_atomic<F: Fn((), &[u8])>(
-    ctx: &Context<(), F>,
+fn run_client_duration_atomic(
+    ctx: &Context<()>,
     endpoints: &[Endpoint<()>],
     message_size: usize,
     inflight_per_ep: usize,
@@ -573,12 +569,12 @@ fn run_client_duration_atomic<F: Fn((), &[u8])>(
             }
         }
     }
-    ctx.poll();
+    ctx.poll(on_response_callback);
 
     let mut ep_idx = 0;
 
     while !stop_flag.load(Ordering::Relaxed) {
-        ctx.poll();
+        ctx.poll(on_response_callback);
 
         let new_completions = get_and_reset_response_count();
         if new_completions > 0 {
@@ -593,7 +589,7 @@ fn run_client_duration_atomic<F: Fn((), &[u8])>(
             if ep.call(&request_data, (), 0u64).is_ok() {
                 inflight += 1;
             } else {
-                ctx.poll();
+                ctx.poll(on_response_callback);
                 let new = get_and_reset_response_count();
                 inflight = inflight.saturating_sub(new as usize);
                 if new > 0 {
@@ -607,27 +603,23 @@ fn run_client_duration_atomic<F: Fn((), &[u8])>(
     // Drain
     let drain_deadline = Instant::now() + Duration::from_secs(2);
     while inflight > 0 && Instant::now() < drain_deadline {
-        ctx.poll();
+        ctx.poll(on_response_callback);
         let new = get_and_reset_response_count();
         inflight = inflight.saturating_sub(new as usize);
     }
 }
 
-fn run_server_duration_atomic<F: Fn((), &[u8])>(
-    ctx: &Context<(), F>,
-    message_size: usize,
-    stop_flag: &AtomicBool,
-) {
+fn run_server_duration_atomic(ctx: &Context<()>, message_size: usize, stop_flag: &AtomicBool) {
     let response_data = vec![0u8; message_size];
 
     while !stop_flag.load(Ordering::Relaxed) {
-        ctx.poll();
+        ctx.poll(|_, _| {});
         while let Some(req) = ctx.recv() {
             loop {
                 match req.reply(&response_data) {
                     Ok(()) => break,
                     Err(copyrpc::error::Error::RingFull) => {
-                        ctx.poll();
+                        ctx.poll(|_, _| {});
                         continue;
                     }
                     Err(_) => break,
@@ -639,7 +631,7 @@ fn run_server_duration_atomic<F: Fn((), &[u8])>(
     // Drain remaining requests
     let drain_deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < drain_deadline {
-        ctx.poll();
+        ctx.poll(|_, _| {});
         let mut got_any = false;
         while let Some(req) = ctx.recv() {
             got_any = true;
@@ -647,7 +639,7 @@ fn run_server_duration_atomic<F: Fn((), &[u8])>(
                 match req.reply(&response_data) {
                     Ok(()) => break,
                     Err(copyrpc::error::Error::RingFull) => {
-                        ctx.poll();
+                        ctx.poll(|_, _| {});
                         continue;
                     }
                     Err(_) => break,
@@ -658,11 +650,11 @@ fn run_server_duration_atomic<F: Fn((), &[u8])>(
             break;
         }
     }
-    ctx.poll();
+    ctx.poll(|_, _| {});
 }
 
-fn run_client_duration<F: Fn((), &[u8])>(
-    ctx: &Context<(), F>,
+fn run_client_duration(
+    ctx: &Context<()>,
     endpoints: &[Endpoint<()>],
     message_size: usize,
     inflight_per_ep: usize,
@@ -683,13 +675,13 @@ fn run_client_duration<F: Fn((), &[u8])>(
             }
         }
     }
-    ctx.poll();
+    ctx.poll(on_response_callback);
 
     let start = Instant::now();
     let mut ep_idx = 0;
 
     while start.elapsed() < duration {
-        ctx.poll();
+        ctx.poll(on_response_callback);
 
         let new_completions = get_and_reset_response_count();
         if new_completions > 0 {
@@ -704,7 +696,7 @@ fn run_client_duration<F: Fn((), &[u8])>(
             if ep.call(&request_data, (), 0u64).is_ok() {
                 inflight += 1;
             } else {
-                ctx.poll();
+                ctx.poll(on_response_callback);
                 let new = get_and_reset_response_count();
                 inflight = inflight.saturating_sub(new as usize);
                 if new > 0 {
@@ -718,28 +710,24 @@ fn run_client_duration<F: Fn((), &[u8])>(
     // Drain
     let drain_deadline = Instant::now() + Duration::from_secs(2);
     while inflight > 0 && Instant::now() < drain_deadline {
-        ctx.poll();
+        ctx.poll(on_response_callback);
         let new = get_and_reset_response_count();
         inflight = inflight.saturating_sub(new as usize);
     }
 }
 
-fn run_server_duration<F: Fn((), &[u8])>(
-    ctx: &Context<(), F>,
-    message_size: usize,
-    duration: Duration,
-) {
+fn run_server_duration(ctx: &Context<()>, message_size: usize, duration: Duration) {
     let response_data = vec![0u8; message_size];
     let start = Instant::now();
 
     while start.elapsed() < duration {
-        ctx.poll();
+        ctx.poll(|_, _| {});
         while let Some(req) = ctx.recv() {
             loop {
                 match req.reply(&response_data) {
                     Ok(()) => break,
                     Err(copyrpc::error::Error::RingFull) => {
-                        ctx.poll();
+                        ctx.poll(|_, _| {});
                         continue;
                     }
                     Err(_) => break,
@@ -751,7 +739,7 @@ fn run_server_duration<F: Fn((), &[u8])>(
     // Drain remaining requests after duration
     let drain_deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < drain_deadline {
-        ctx.poll();
+        ctx.poll(|_, _| {});
         let mut got_any = false;
         while let Some(req) = ctx.recv() {
             got_any = true;
@@ -759,7 +747,7 @@ fn run_server_duration<F: Fn((), &[u8])>(
                 match req.reply(&response_data) {
                     Ok(()) => break,
                     Err(copyrpc::error::Error::RingFull) => {
-                        ctx.poll();
+                        ctx.poll(|_, _| {});
                         continue;
                     }
                     Err(_) => break,
@@ -770,7 +758,7 @@ fn run_server_duration<F: Fn((), &[u8])>(
             break;
         }
     }
-    ctx.poll();
+    ctx.poll(|_, _| {});
 }
 
 fn run_multi_client(
@@ -791,8 +779,7 @@ fn run_multi_client(
         0,
     );
 
-    type OnResponseFn = fn((), &[u8]);
-    let ctx: Context<(), OnResponseFn> = ContextBuilder::new()
+    let ctx: Context<()> = ContextBuilder::new()
         .device_index(common.device_index)
         .port(common.port)
         .srq_config(SrqConfig {
@@ -800,7 +787,6 @@ fn run_multi_client(
             max_sge: 1,
         })
         .cq_size(4096)
-        .on_response(on_response_callback as OnResponseFn)
         .build()
         .expect("Failed to create copyrpc context");
 
@@ -967,8 +953,8 @@ fn run_multi_client(
     }
 }
 
-fn run_server_duration_with_epoch<F: Fn((), &[u8])>(
-    ctx: &Context<(), F>,
+fn run_server_duration_with_epoch(
+    ctx: &Context<()>,
     message_size: usize,
     duration: Duration,
     collector: &mut EpochCollector,
@@ -977,13 +963,13 @@ fn run_server_duration_with_epoch<F: Fn((), &[u8])>(
     let start = Instant::now();
 
     while start.elapsed() < duration {
-        ctx.poll();
+        ctx.poll(|_, _| {});
         while let Some(req) = ctx.recv() {
             loop {
                 match req.reply(&response_data) {
                     Ok(()) => break,
                     Err(copyrpc::error::Error::RingFull) => {
-                        ctx.poll();
+                        ctx.poll(|_, _| {});
                         continue;
                     }
                     Err(_) => break,
@@ -996,7 +982,7 @@ fn run_server_duration_with_epoch<F: Fn((), &[u8])>(
     // Drain remaining
     let drain_deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < drain_deadline {
-        ctx.poll();
+        ctx.poll(|_, _| {});
         let mut got_any = false;
         while let Some(req) = ctx.recv() {
             got_any = true;
@@ -1004,7 +990,7 @@ fn run_server_duration_with_epoch<F: Fn((), &[u8])>(
                 match req.reply(&response_data) {
                     Ok(()) => break,
                     Err(copyrpc::error::Error::RingFull) => {
-                        ctx.poll();
+                        ctx.poll(|_, _| {});
                         continue;
                     }
                     Err(_) => break,
@@ -1015,5 +1001,5 @@ fn run_server_duration_with_epoch<F: Fn((), &[u8])>(
             break;
         }
     }
-    ctx.poll();
+    ctx.poll(|_, _| {});
 }

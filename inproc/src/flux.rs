@@ -21,14 +21,14 @@ use mempc::{MpscChannel, MpscRecvRef, MpscServer, OnesidedMpsc, ReplyToken, Seri
 use crate::SendError;
 
 /// Handle for a received request that allows replying.
-pub struct RecvHandle<'a, T: Serial + Send, U, F: FnMut(U, T), M: MpscChannel = OnesidedMpsc> {
-    flux: &'a mut Flux<T, U, F, M>,
+pub struct RecvHandle<'a, T: Serial + Send, U, M: MpscChannel = OnesidedMpsc> {
+    flux: &'a mut Flux<T, U, M>,
     from: usize,
     token: ReplyToken,
     data: T,
 }
 
-impl<'a, T: Serial + Send, U, F: FnMut(U, T), M: MpscChannel> RecvHandle<'a, T, U, F, M> {
+impl<'a, T: Serial + Send, U, M: MpscChannel> RecvHandle<'a, T, U, M> {
     /// Returns the sender's node ID.
     #[inline]
     pub fn from(&self) -> usize {
@@ -51,17 +51,17 @@ impl<'a, T: Serial + Send, U, F: FnMut(U, T), M: MpscChannel> RecvHandle<'a, T, 
 /// A node in a Flux network with callback-based response handling.
 ///
 /// Generic over the MPSC channel implementation.
-pub struct Flux<T: Serial + Send, U, F: FnMut(U, T), M: MpscChannel = OnesidedMpsc> {
+pub struct Flux<T: Serial + Send, U, M: MpscChannel = OnesidedMpsc> {
     id: usize,
     num_nodes: usize,
     server: M::Server<T, T>,
-    callers: Vec<CallerWithUserData<M::Caller<T, T>, T, T, U, F>>,
+    callers: Vec<CallerWithUserData<M::Caller<T, T>, T, T, U>>,
     /// peer_ids[i] = peer node ID for callers[i]
     peer_ids: Vec<usize>,
     _marker: PhantomData<M>,
 }
 
-impl<T: Serial + Send, U, F: FnMut(U, T), M: MpscChannel> Flux<T, U, F, M> {
+impl<T: Serial + Send, U, M: MpscChannel> Flux<T, U, M> {
     /// Returns this node's ID.
     #[inline]
     pub fn id(&self) -> usize {
@@ -104,21 +104,21 @@ impl<T: Serial + Send, U, F: FnMut(U, T), M: MpscChannel> Flux<T, U, F, M> {
     /// Polls for messages from peers.
     ///
     /// - Requests: available for retrieval via `try_recv()`
-    /// - Responses: invokes callback (handled by CallerWithUserData)
+    /// - Responses: invokes the provided callback
     #[inline]
-    pub fn poll(&mut self) {
+    pub fn poll(&mut self, mut on_response: impl FnMut(U, T)) {
         // Poll server for incoming requests
         self.server.poll();
 
         // Poll all callers for responses (invokes callback)
         for caller in self.callers.iter_mut() {
-            caller.poll();
+            caller.poll(&mut on_response);
         }
     }
 
     /// Tries to receive the next request from the server.
     #[inline]
-    pub fn try_recv(&mut self) -> Option<RecvHandle<'_, T, U, F, M>> {
+    pub fn try_recv(&mut self) -> Option<RecvHandle<'_, T, U, M>> {
         let recv_ref = self.server.try_recv()?;
 
         // Copy data (T: Serial = Copy) and extract token
@@ -177,22 +177,19 @@ impl<T: Serial + Send, U, F: FnMut(U, T), M: MpscChannel> Flux<T, U, F, M> {
 /// * `n` - Number of nodes
 /// * `capacity` - Channel buffer capacity (will be rounded to power of 2)
 /// * `inflight_max` - Maximum inflight requests per channel (must be < capacity)
-/// * `on_response` - Callback invoked when responses arrive
 ///
 /// # Panics
 /// Panics if `n` is 0, `capacity` is 0, or `inflight_max >= capacity`.
-pub fn create_flux<T, U, F>(
+pub fn create_flux<T, U>(
     n: usize,
     capacity: usize,
     inflight_max: usize,
-    on_response: F,
-) -> Vec<Flux<T, U, F, OnesidedMpsc>>
+) -> Vec<Flux<T, U, OnesidedMpsc>>
 where
     T: Serial + Send,
     U: Send,
-    F: FnMut(U, T) + Clone,
 {
-    create_flux_with::<T, U, F, OnesidedMpsc>(n, capacity, inflight_max, on_response)
+    create_flux_with::<T, U, OnesidedMpsc>(n, capacity, inflight_max)
 }
 
 /// Creates a Flux network with `n` nodes using the specified MPSC channel.
@@ -201,20 +198,17 @@ where
 /// * `n` - Number of nodes
 /// * `capacity` - Channel buffer capacity (will be rounded to power of 2)
 /// * `inflight_max` - Maximum inflight requests per channel (must be < capacity)
-/// * `on_response` - Callback invoked when responses arrive
 ///
 /// # Panics
 /// Panics if `n` is 0, `capacity` is 0, or `inflight_max >= capacity`.
-pub fn create_flux_with<T, U, F, M>(
+pub fn create_flux_with<T, U, M>(
     n: usize,
     capacity: usize,
     inflight_max: usize,
-    on_response: F,
-) -> Vec<Flux<T, U, F, M>>
+) -> Vec<Flux<T, U, M>>
 where
     T: Serial + Send,
     U: Send,
-    F: FnMut(U, T) + Clone,
     M: MpscChannel,
 {
     assert!(n > 0, "must have at least one node");
@@ -263,9 +257,9 @@ where
         }
 
         // Wrap each caller with CallerWithUserData
-        let callers: Vec<CallerWithUserData<M::Caller<T, T>, T, T, U, F>> = callers_raw
+        let callers: Vec<CallerWithUserData<M::Caller<T, T>, T, T, U>> = callers_raw
             .into_iter()
-            .map(|caller| CallerWithUserData::new(caller, actual_capacity, on_response.clone()))
+            .map(|caller| CallerWithUserData::new(caller, actual_capacity))
             .collect();
 
         nodes.push(Flux {
@@ -288,7 +282,7 @@ mod tests {
 
     #[test]
     fn test_create_flux() {
-        let nodes: Vec<Flux<u32, (), _, OnesidedMpsc>> = create_flux(3, 16, 8, |_, _| {});
+        let nodes: Vec<Flux<u32, ()>> = create_flux(3, 16, 8);
         assert_eq!(nodes.len(), 3);
         assert_eq!(nodes[0].num_peers(), 2);
         assert_eq!(nodes[1].num_peers(), 2);
@@ -302,26 +296,26 @@ mod tests {
 
         let responses: Rc<RefCell<Vec<(u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
         let responses_clone = Rc::clone(&responses);
+        let mut on_resp = move |user_data, data| {
+            responses_clone.borrow_mut().push((user_data, data));
+        };
 
-        let mut nodes: Vec<Flux<u32, u32, _, OnesidedMpsc>> =
-            create_flux(2, 16, 8, move |user_data, data| {
-                responses_clone.borrow_mut().push((user_data, data));
-            });
+        let mut nodes: Vec<Flux<u32, u32>> = create_flux(2, 16, 8);
 
         // Node 0 calls node 1 with user_data=100
         nodes[0].call(1, 42, 100).unwrap();
-        nodes[0].poll();
+        nodes[0].poll(|_, _| {});
 
         // Node 1 receives and replies
-        nodes[1].poll();
+        nodes[1].poll(|_, _| {});
         let handle = nodes[1].try_recv().unwrap();
         assert_eq!(handle.from(), 0);
         assert_eq!(handle.data(), 42);
         handle.reply(43);
-        nodes[1].poll();
+        nodes[1].poll(|_, _| {});
 
         // Node 0 receives response (callback is invoked)
-        nodes[0].poll();
+        nodes[0].poll(&mut on_resp);
 
         let responses = responses.borrow();
         assert_eq!(responses.len(), 1);
@@ -330,15 +324,15 @@ mod tests {
 
     #[test]
     fn test_poll_round_robin() {
-        let mut nodes: Vec<Flux<u32, (), _, OnesidedMpsc>> = create_flux(3, 16, 8, |_, _| {});
+        let mut nodes: Vec<Flux<u32, ()>> = create_flux(3, 16, 8);
 
         // Node 1 and 2 both send to node 0
         nodes[1].call(0, 100, ()).unwrap();
-        nodes[1].poll();
+        nodes[1].poll(|_, _| {});
         nodes[2].call(0, 200, ()).unwrap();
-        nodes[2].poll();
+        nodes[2].poll(|_, _| {});
 
-        nodes[0].poll();
+        nodes[0].poll(|_, _| {});
 
         let mut received = Vec::new();
         while let Some(handle) = nodes[0].try_recv() {
@@ -353,7 +347,7 @@ mod tests {
 
     #[test]
     fn test_invalid_peer() {
-        let mut nodes: Vec<Flux<u32, (), _, OnesidedMpsc>> = create_flux(2, 16, 8, |_, _| {});
+        let mut nodes: Vec<Flux<u32, ()>> = create_flux(2, 16, 8);
 
         assert!(matches!(
             nodes[0].call(5, 42, ()),
@@ -363,7 +357,7 @@ mod tests {
 
     #[test]
     fn test_inflight_limit() {
-        let mut nodes: Vec<Flux<u32, (), _, OnesidedMpsc>> = create_flux(2, 16, 4, |_, _| {});
+        let mut nodes: Vec<Flux<u32, ()>> = create_flux(2, 16, 4);
 
         // Send up to inflight_max
         for i in 0..4 {
@@ -374,19 +368,19 @@ mod tests {
         assert!(matches!(nodes[0].call(1, 4, ()), Err(SendError::Full(4))));
 
         // Publish calls so peer can see them
-        nodes[0].poll();
+        nodes[0].poll(|_, _| {});
 
         // Process responses to free up slots
-        nodes[1].poll();
+        nodes[1].poll(|_, _| {});
         while let Some(handle) = nodes[1].try_recv() {
             let data = handle.data();
             handle.reply(data);
         }
         // Publish replies
-        nodes[1].poll();
+        nodes[1].poll(|_, _| {});
 
         // Receive responses
-        nodes[0].poll();
+        nodes[0].poll(|_, _| {});
 
         // Now we can send again
         assert!(nodes[0].call(1, 5, ()).is_ok());
@@ -400,16 +394,12 @@ mod tests {
 
         let completed_count = Arc::new(AtomicU64::new(0));
 
-        let nodes: Vec<Flux<u64, Arc<AtomicU64>, _, OnesidedMpsc>> = {
-            let completed = Arc::clone(&completed_count);
-            create_flux(4, 1024, 256, move |_, _| {
-                completed.fetch_add(1, Ordering::Relaxed);
-            })
-        };
+        let nodes: Vec<Flux<u64, Arc<AtomicU64>>> = create_flux(4, 1024, 256);
 
         let mut handles = Vec::new();
 
         for mut node in nodes {
+            let completed = Arc::clone(&completed_count);
             handles.push(thread::spawn(move || {
                 let id = node.id();
                 let n = node.num_peers() + 1;
@@ -426,7 +416,9 @@ mod tests {
                                 ) {
                                     Ok(_) => break,
                                     Err(SendError::Full(_)) => {
-                                        node.poll();
+                                        node.poll(|_, _| {
+                                            completed.fetch_add(1, Ordering::Relaxed);
+                                        });
                                         std::hint::spin_loop();
                                     }
                                     Err(e) => panic!("send error: {:?}", e),
@@ -435,13 +427,17 @@ mod tests {
                         }
                     }
                 }
-                node.poll();
+                node.poll(|_, _| {
+                    completed.fetch_add(1, Ordering::Relaxed);
+                });
 
                 // Receive from all peers and reply
                 let mut request_count = 0;
                 let expected = (n - 1) * 100;
                 while request_count < expected {
-                    node.poll();
+                    node.poll(|_, _| {
+                        completed.fetch_add(1, Ordering::Relaxed);
+                    });
                     while let Some(handle) = node.try_recv() {
                         let data = handle.data();
                         handle.reply(data);
@@ -469,22 +465,17 @@ mod tests {
         let inflight_max = (capacity / 4).max(1);
 
         let global_response_count = Arc::new(AtomicU64::new(0));
-        let global_count_clone = Arc::clone(&global_response_count);
 
-        let nodes: Vec<Flux<u64, (), _, OnesidedMpsc>> =
-            create_flux(n, capacity, inflight_max, move |_: (), _: u64| {
-                global_count_clone.fetch_add(1, Ordering::Relaxed);
-            });
+        let nodes: Vec<Flux<u64, ()>> = create_flux(n, capacity, inflight_max);
         let end_barrier = Arc::new(Barrier::new(n));
         let expected_total = n as u64 * iterations * ((n - 1) as u64);
-        let global_response_count_clone = Arc::clone(&global_response_count);
 
         std::thread::scope(|s| {
             let handles: Vec<_> = nodes
                 .into_iter()
                 .map(|mut node| {
                     let end_barrier = Arc::clone(&end_barrier);
-                    let global_count = Arc::clone(&global_response_count_clone);
+                    let global_count = Arc::clone(&global_response_count);
                     s.spawn(move || {
                         let id = node.id();
                         let num_peers = node.num_peers();
@@ -506,7 +497,9 @@ mod tests {
                                 }
                             }
 
-                            node.poll();
+                            node.poll(|_: (), _: u64| {
+                                global_count.fetch_add(1, Ordering::Relaxed);
+                            });
 
                             while let Some(handle) = node.try_recv() {
                                 let data = handle.data();
@@ -517,7 +510,9 @@ mod tests {
 
                         // Wait for all responses to be processed globally
                         while global_count.load(Ordering::Relaxed) < expected_total {
-                            node.poll();
+                            node.poll(|_: (), _: u64| {
+                                global_count.fetch_add(1, Ordering::Relaxed);
+                            });
                             while let Some(handle) = node.try_recv() {
                                 let data = handle.data();
                                 handle.reply(data);
@@ -548,11 +543,11 @@ mod tests {
 
         let response_count = Arc::new(AtomicU64::new(0));
         let response_count_clone = Arc::clone(&response_count);
+        let mut on_resp = move |_: (), _: u64| {
+            response_count_clone.fetch_add(1, Ordering::Relaxed);
+        };
 
-        let mut nodes: Vec<Flux<u64, (), _, OnesidedMpsc>> =
-            create_flux(2, 8, 4, move |_: (), _: u64| {
-                response_count_clone.fetch_add(1, Ordering::Relaxed);
-            });
+        let mut nodes: Vec<Flux<u64, ()>> = create_flux(2, 8, 4);
 
         // Send many iterations to test ring buffer wrap
         for iteration in 0..24u64 {
@@ -562,14 +557,14 @@ mod tests {
             }
 
             // Node 1 processes all requests and replies
-            nodes[1].poll();
+            nodes[1].poll(|_, _| {});
             while let Some(handle) = nodes[1].try_recv() {
                 let data = handle.data();
                 handle.reply(data + 1000);
             }
 
             // Node 0 receives all responses
-            nodes[0].poll();
+            nodes[0].poll(&mut on_resp);
         }
 
         assert!(response_count.load(Ordering::Relaxed) >= 24);
@@ -582,18 +577,18 @@ mod tests {
 
         let responses: Rc<RefCell<Vec<(u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
         let responses_clone = Rc::clone(&responses);
+        let mut on_resp = move |user_data, data| {
+            responses_clone.borrow_mut().push((user_data, data));
+        };
 
-        let mut nodes: Vec<Flux<u32, u32, _, OnesidedMpsc>> =
-            create_flux(2, 16, 8, move |user_data, data| {
-                responses_clone.borrow_mut().push((user_data, data));
-            });
+        let mut nodes: Vec<Flux<u32, u32>> = create_flux(2, 16, 8);
 
         // Node 0 calls node 1 with user_data=100
         nodes[0].call(1, 42, 100).unwrap();
-        nodes[0].poll();
+        nodes[0].poll(|_, _| {});
 
         // Node 1 receives via try_recv_raw and replies via reply()
-        nodes[1].poll();
+        nodes[1].poll(|_, _| {});
         let (from, token, data) = nodes[1].try_recv_raw().unwrap();
         assert_eq!(from, 0);
         assert_eq!(data, 42);
@@ -603,10 +598,10 @@ mod tests {
 
         // Reply using the stored token (no 'to' parameter needed)
         nodes[1].reply(token, 43);
-        nodes[1].poll();
+        nodes[1].poll(|_, _| {});
 
         // Node 0 receives response
-        nodes[0].poll();
+        nodes[0].poll(&mut on_resp);
 
         let responses = responses.borrow();
         assert_eq!(responses.len(), 1);
@@ -620,31 +615,31 @@ mod tests {
 
         let responses: Rc<RefCell<Vec<(u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
         let responses_clone = Rc::clone(&responses);
+        let mut on_resp = move |user_data, data| {
+            responses_clone.borrow_mut().push((user_data, data));
+        };
 
-        let mut nodes: Vec<Flux<u32, u32, _, OnesidedMpsc>> =
-            create_flux(3, 16, 8, move |user_data, data| {
-                responses_clone.borrow_mut().push((user_data, data));
-            });
+        let mut nodes: Vec<Flux<u32, u32>> = create_flux(3, 16, 8);
 
         // Node 1 and 2 both call node 0
         nodes[1].call(0, 100, 10).unwrap();
-        nodes[1].poll();
+        nodes[1].poll(|_, _| {});
         nodes[2].call(0, 200, 20).unwrap();
-        nodes[2].poll();
+        nodes[2].poll(|_, _| {});
 
         // Node 0 receives both via try_recv_raw (no borrow conflict)
-        nodes[0].poll();
+        nodes[0].poll(|_, _| {});
         let req1 = nodes[0].try_recv_raw().unwrap();
         let req2 = nodes[0].try_recv_raw().unwrap();
 
         // Reply in reverse order (no 'to' parameter needed)
         nodes[0].reply(req2.1, req2.2 + 1);
         nodes[0].reply(req1.1, req1.2 + 1);
-        nodes[0].poll();
+        nodes[0].poll(|_, _| {});
 
         // Both callers receive responses
-        nodes[1].poll();
-        nodes[2].poll();
+        nodes[1].poll(&mut on_resp);
+        nodes[2].poll(&mut on_resp);
 
         let responses = responses.borrow();
         assert_eq!(responses.len(), 2);
@@ -659,23 +654,23 @@ mod tests {
 
         let responses: Rc<RefCell<Vec<(u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
         let responses_clone = Rc::clone(&responses);
+        let mut on_resp = move |user_data, data| {
+            responses_clone.borrow_mut().push((user_data, data));
+        };
 
-        let mut nodes: Vec<Flux<u32, u32, _, FastForwardMpsc>> =
-            create_flux_with(2, 16, 8, move |user_data, data| {
-                responses_clone.borrow_mut().push((user_data, data));
-            });
+        let mut nodes: Vec<Flux<u32, u32, FastForwardMpsc>> = create_flux_with(2, 16, 8);
 
         nodes[0].call(1, 42, 100).unwrap();
-        nodes[0].poll();
+        nodes[0].poll(|_, _| {});
 
-        nodes[1].poll();
+        nodes[1].poll(|_, _| {});
         let handle = nodes[1].try_recv().unwrap();
         assert_eq!(handle.from(), 0);
         assert_eq!(handle.data(), 42);
         handle.reply(43);
-        nodes[1].poll();
+        nodes[1].poll(|_, _| {});
 
-        nodes[0].poll();
+        nodes[0].poll(&mut on_resp);
 
         let responses = responses.borrow();
         assert_eq!(responses.len(), 1);
@@ -689,23 +684,23 @@ mod tests {
 
         let responses: Rc<RefCell<Vec<(u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
         let responses_clone = Rc::clone(&responses);
+        let mut on_resp = move |user_data, data| {
+            responses_clone.borrow_mut().push((user_data, data));
+        };
 
-        let mut nodes: Vec<Flux<u32, u32, _, LamportMpsc>> =
-            create_flux_with(2, 16, 8, move |user_data, data| {
-                responses_clone.borrow_mut().push((user_data, data));
-            });
+        let mut nodes: Vec<Flux<u32, u32, LamportMpsc>> = create_flux_with(2, 16, 8);
 
         nodes[0].call(1, 42, 100).unwrap();
-        nodes[0].poll();
+        nodes[0].poll(|_, _| {});
 
-        nodes[1].poll();
+        nodes[1].poll(|_, _| {});
         let handle = nodes[1].try_recv().unwrap();
         assert_eq!(handle.from(), 0);
         assert_eq!(handle.data(), 42);
         handle.reply(43);
-        nodes[1].poll();
+        nodes[1].poll(|_, _| {});
 
-        nodes[0].poll();
+        nodes[0].poll(&mut on_resp);
 
         let responses = responses.borrow();
         assert_eq!(responses.len(), 1);

@@ -6,6 +6,7 @@ mod erpc_backend;
 mod message;
 mod mpi_util;
 mod parquet_out;
+mod qd_sample;
 mod storage;
 mod ucx_am;
 mod ucx_am_backend;
@@ -19,7 +20,7 @@ use clap::Parser;
 use mpi::collective::CommunicatorCollectives;
 use mpi::topology::Communicator;
 
-use daemon::{CopyrpcSetup, DaemonFlux, EndpointConnectionInfo, on_delegate_response};
+use daemon::{CopyrpcSetup, DaemonFlux, EndpointConnectionInfo};
 use epoch::EpochCollector;
 use message::{DelegatePayload, Request, Response};
 
@@ -82,6 +83,14 @@ struct Cli {
     /// copyrpc ring buffer size
     #[arg(long, default_value = "1048576")]
     ring_size: usize,
+
+    /// Output directory for queue-depth samples (CSV). Disabled if not set.
+    #[arg(long)]
+    qd_sample_dir: Option<String>,
+
+    /// Queue-depth sampling interval (every N loop iterations)
+    #[arg(long, default_value = "1024")]
+    qd_sample_interval: u32,
 
     #[command(subcommand)]
     subcommand: SubCmd,
@@ -215,11 +224,10 @@ fn run_meta(
     // Create Flux network (used for copyrpc recv forwarding between daemons)
     let flux_capacity = 1024;
     let flux_inflight_max = 256;
-    let mut flux_nodes: Vec<Option<DaemonFlux>> = inproc::create_flux::<DelegatePayload, usize, _>(
+    let mut flux_nodes: Vec<Option<DaemonFlux>> = inproc::create_flux::<DelegatePayload, usize>(
         num_daemons.max(1),
         flux_capacity,
         flux_inflight_max,
-        on_delegate_response as fn(usize, DelegatePayload),
     )
     .into_iter()
     .map(Some)
@@ -283,6 +291,7 @@ fn run_meta(
         };
 
         let core = daemon_cores.get(d).copied();
+        let qd_interval = cli.qd_sample_dir.as_ref().map(|_| cli.qd_sample_interval);
 
         daemon_handles.push(std::thread::spawn(move || {
             if let Some(core_id) = core {
@@ -299,7 +308,8 @@ fn run_meta(
                 copyrpc_setup,
                 &stop,
                 &barrier,
-            );
+                qd_interval,
+            )
         }));
     }
 
@@ -460,8 +470,26 @@ fn run_meta(
     // Stop
     stop_flag.store(true, Ordering::Release);
 
-    for h in daemon_handles {
-        h.join().expect("Daemon thread panicked");
+    for (d, h) in daemon_handles.into_iter().enumerate() {
+        let samples = h.join().expect("Daemon thread panicked");
+        if let Some(ref dir) = cli.qd_sample_dir {
+            std::fs::create_dir_all(dir).ok();
+            let path = format!("{}/qd_rank{}_d{}.csv", dir, rank, d);
+            if let Err(e) = qd_sample::write_csv(&path, &samples) {
+                eprintln!(
+                    "  rank {} daemon {}: failed to write QD samples: {}",
+                    rank, d, e
+                );
+            } else {
+                eprintln!(
+                    "  rank {} daemon {}: {} QD samples -> {}",
+                    rank,
+                    d,
+                    samples.len(),
+                    path
+                );
+            }
+        }
     }
     for h in client_handles {
         h.join().expect("Client thread panicked");

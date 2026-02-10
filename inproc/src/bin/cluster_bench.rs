@@ -125,8 +125,7 @@ fn run_flux_benchmark<M: MempcMpscChannel>(
         (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
     let stop_flag = Arc::new(AtomicBool::new(false));
 
-    let nodes: Vec<Flux<Payload, (), _, M>> =
-        create_flux_with(n, capacity, max_inflight, |_: (), _: Payload| {});
+    let nodes: Vec<Flux<Payload, (), M>> = create_flux_with(n, capacity, max_inflight);
 
     let barrier = Arc::new(Barrier::new(n + 1));
     let payload = Payload::default();
@@ -163,7 +162,7 @@ fn run_flux_benchmark<M: MempcMpscChannel>(
                         }
 
                         if !any_sent || (total_sent & 0x1F) == 0 {
-                            node.poll();
+                            node.poll(|_, _| {});
                             while let Some(handle) = node.try_recv() {
                                 let data = handle.data();
                                 handle.reply(data);

@@ -78,10 +78,8 @@ fn get_and_reset_response_count() -> usize {
 // Client State
 // =============================================================================
 
-type OnResponseFn = fn((), &[u8]);
-
 struct CopyrpcClient {
-    ctx: Context<(), OnResponseFn>,
+    ctx: Context<()>,
     endpoints: Vec<Endpoint<()>>,
     num_endpoints: usize,
     requests_per_ep: usize,
@@ -124,7 +122,7 @@ fn setup_copyrpc_benchmark(config: &BenchConfig) -> Option<BenchmarkSetup> {
     // Reset response counter
     get_and_reset_response_count();
 
-    let ctx: Context<(), OnResponseFn> = ContextBuilder::new()
+    let ctx: Context<()> = ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -135,7 +133,6 @@ fn setup_copyrpc_benchmark(config: &BenchConfig) -> Option<BenchmarkSetup> {
             max_sge: 1,
         })
         .cq_size(4096)
-        .on_response(on_response_callback as OnResponseFn)
         .build()
         .ok()?;
 
@@ -254,9 +251,7 @@ fn server_thread_main(
     stop_flag: Arc<AtomicBool>,
     num_endpoints: usize,
 ) {
-    let on_response: fn((), &[u8]) = |_user_data, _data| {};
-
-    let ctx: Context<(), _> = match ContextBuilder::new()
+    let ctx: Context<()> = match ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -267,7 +262,6 @@ fn server_thread_main(
             max_sge: 1,
         })
         .cq_size(4096)
-        .on_response(on_response)
         .build()
     {
         Ok(c) => c,
@@ -347,7 +341,7 @@ fn server_thread_main(
 
     // Server loop: receive requests and send replies
     while !stop_flag.load(Ordering::Relaxed) {
-        ctx.poll();
+        ctx.poll(|_, _| {});
 
         // Process received requests
         while let Some(req) = ctx.recv() {
@@ -356,7 +350,7 @@ fn server_thread_main(
                 match req.reply(&response_data) {
                     Ok(()) => break,
                     Err(copyrpc::error::Error::RingFull) => {
-                        ctx.poll();
+                        ctx.poll(|_, _| {});
                         continue;
                     }
                     Err(_) => break,
@@ -388,13 +382,13 @@ fn run_copyrpc_bench(client: &mut CopyrpcClient, iters: u64) -> Duration {
     }
 
     // Flush initial batch
-    client.ctx.poll();
+    client.ctx.poll(on_response_callback);
 
     let start = std::time::Instant::now();
 
     while completed < iters {
         // Poll for completions - this triggers on_response callbacks
-        client.ctx.poll();
+        client.ctx.poll(on_response_callback);
 
         // Get completions from on_response callback via thread-local counter
         let new_completions = get_and_reset_response_count();
@@ -420,7 +414,7 @@ fn run_copyrpc_bench(client: &mut CopyrpcClient, iters: u64) -> Duration {
 
     // Drain remaining inflight requests
     while inflight > 0 {
-        client.ctx.poll();
+        client.ctx.poll(on_response_callback);
         let new_completions = get_and_reset_response_count();
         inflight = inflight.saturating_sub(new_completions);
     }

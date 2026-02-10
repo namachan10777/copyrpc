@@ -205,11 +205,7 @@ struct RecvMessage<U> {
 ///
 /// Type parameters:
 /// - `U`: User data type associated with pending RPC calls
-/// - `F`: Response callback type `Fn(U, &[u8])`
-pub struct Context<U, F>
-where
-    F: Fn(U, &[u8]),
-{
+pub struct Context<U> {
     /// mlx5 device context.
     mlx5_ctx: Mlx5Context,
     /// Protection domain.
@@ -228,8 +224,6 @@ where
     send_cqe_buffer: Rc<SendCqeBuffer>,
     /// Registered endpoints by QPN.
     endpoints: RefCell<FastMap<Rc<RefCell<EndpointInner<U>>>>>,
-    /// Response callback.
-    on_response: F,
     /// Port number (for connection establishment).
     port: u8,
     /// Local LID.
@@ -241,16 +235,15 @@ where
 }
 
 /// Builder for creating a Context.
-pub struct ContextBuilder<U, F> {
+pub struct ContextBuilder<U> {
     device_index: usize,
     port: u8,
     srq_config: SrqConfig,
     cq_size: i32,
-    on_response: Option<F>,
     _marker: PhantomData<U>,
 }
 
-impl<U, F> Default for ContextBuilder<U, F> {
+impl<U> Default for ContextBuilder<U> {
     fn default() -> Self {
         Self {
             device_index: 0,
@@ -260,13 +253,12 @@ impl<U, F> Default for ContextBuilder<U, F> {
                 max_sge: 1,
             },
             cq_size: DEFAULT_CQ_SIZE,
-            on_response: None,
             _marker: PhantomData,
         }
     }
 }
 
-impl<U, F: Fn(U, &[u8])> ContextBuilder<U, F> {
+impl<U> ContextBuilder<U> {
     /// Create a new context builder.
     pub fn new() -> Self {
         Self::default()
@@ -296,18 +288,8 @@ impl<U, F: Fn(U, &[u8])> ContextBuilder<U, F> {
         self
     }
 
-    /// Set the response callback.
-    pub fn on_response(mut self, callback: F) -> Self {
-        self.on_response = Some(callback);
-        self
-    }
-
     /// Build the context.
-    pub fn build(self) -> io::Result<Context<U, F>> {
-        let on_response = self
-            .on_response
-            .ok_or_else(|| io::Error::other("on_response callback is required"))?;
-
+    pub fn build(self) -> io::Result<Context<U>> {
         let devices = mlx5::device::DeviceList::list()?;
         let device = devices
             .get(self.device_index)
@@ -355,7 +337,6 @@ impl<U, F: Fn(U, &[u8])> ContextBuilder<U, F> {
             recv_cq,
             send_cqe_buffer,
             endpoints: RefCell::new(FastMap::new()),
-            on_response,
             port: self.port,
             lid,
             recv_stack: RefCell::new(Vec::new()),
@@ -364,9 +345,9 @@ impl<U, F: Fn(U, &[u8])> ContextBuilder<U, F> {
     }
 }
 
-impl<U, F: Fn(U, &[u8])> Context<U, F> {
+impl<U> Context<U> {
     /// Create a new context builder.
-    pub fn builder() -> ContextBuilder<U, F> {
+    pub fn builder() -> ContextBuilder<U> {
         ContextBuilder::new()
     }
 
@@ -412,11 +393,10 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
     /// 3. Polls the send CQ to handle READ completions
     /// 4. Flushes all endpoints' accumulated data
     /// 5. Issues READ operations for endpoints that need consumer position updates
-    pub fn poll(&self) {
+    pub fn poll(&self, mut on_response: impl FnMut(U, &[u8])) {
         // Split borrows to avoid self-reference in closure
         let recv_cq = &self.recv_cq;
         let endpoints = &self.endpoints;
-        let on_response = &self.on_response;
         let recv_stack = &self.recv_stack;
 
         // 1. Poll recv CQ (MonoCq) — callback is inlined, no CqeBuffer
@@ -433,7 +413,7 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
                     );
                     return;
                 }
-                Self::process_cqe_static(cqe, cqe.qp_num, endpoints, on_response, recv_stack);
+                Self::process_cqe_static(cqe, cqe.qp_num, endpoints, &mut on_response, recv_stack);
             });
             if count == 0 {
                 break;
@@ -541,7 +521,7 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
     ///
     /// Call poll() first to populate the recv_stack.
     /// Returns `None` if no request is available.
-    pub fn recv(&self) -> Option<RecvHandle<'_, U, F>> {
+    pub fn recv(&self) -> Option<RecvHandle<'_, U>> {
         self.recv_stack.borrow_mut().pop().map(|msg| {
             let data_ptr = msg.endpoint.borrow().recv_ring.as_ptr();
             let data_ptr = unsafe { data_ptr.add(msg.data_offset) };
@@ -568,7 +548,7 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
         cqe: Cqe,
         qpn: u32,
         endpoints: &RefCell<FastMap<Rc<RefCell<EndpointInner<U>>>>>,
-        on_response: &F,
+        on_response: &mut impl FnMut(U, &[u8]),
         recv_stack: &RefCell<Vec<RecvMessage<U>>>,
     ) {
         let endpoints = endpoints.borrow();
@@ -1321,11 +1301,8 @@ impl<U> Endpoint<U> {
 }
 
 /// Handle to a received RPC request.
-pub struct RecvHandle<'a, U, F>
-where
-    F: Fn(U, &[u8]),
-{
-    _lifetime: PhantomData<&'a Context<U, F>>,
+pub struct RecvHandle<'a, U> {
+    _lifetime: PhantomData<&'a Context<U>>,
     endpoint: Rc<RefCell<EndpointInner<U>>>,
     qpn: u32,
     call_id: u32,
@@ -1334,7 +1311,7 @@ where
     response_allowance: u64,
 }
 
-impl<U, F: Fn(U, &[u8])> RecvHandle<'_, U, F> {
+impl<U> RecvHandle<'_, U> {
     /// Zero-copy access to the request data in the receive ring buffer.
     #[inline]
     pub fn data(&self) -> &[u8] {

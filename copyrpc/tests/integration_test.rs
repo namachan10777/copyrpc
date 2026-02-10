@@ -44,7 +44,7 @@ struct CallUserData {
 fn test_context_creation() {
     let on_response: fn(CallUserData, &[u8]) = |_user_data, _data| {};
 
-    let result: Result<Context<CallUserData, _>, _> = ContextBuilder::new()
+    let result: Result<Context<CallUserData>, _> = ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -52,7 +52,6 @@ fn test_context_creation() {
             max_sge: 1,
         })
         .cq_size(1024)
-        .on_response(on_response)
         .build();
 
     assert!(
@@ -70,7 +69,7 @@ fn test_context_creation() {
 fn test_endpoint_creation() {
     let on_response: fn(CallUserData, &[u8]) = |_user_data, _data| {};
 
-    let ctx: Context<CallUserData, _> = ContextBuilder::new()
+    let ctx: Context<CallUserData> = ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -78,7 +77,6 @@ fn test_endpoint_creation() {
             max_sge: 1,
         })
         .cq_size(1024)
-        .on_response(on_response)
         .build()
         .expect("Failed to create context");
 
@@ -98,12 +96,12 @@ fn test_simple_pingpong() {
     let completed_for_callback = completed.clone();
 
     // Use a closure that captures the completed counter
-    let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+    let mut on_response = move |_user_data: CallUserData, _data: &[u8]| {
         eprintln!("Client: on_response called!");
         completed_for_callback.fetch_add(1, Ordering::SeqCst);
     };
 
-    let ctx: Context<CallUserData, _> = ContextBuilder::new()
+    let ctx: Context<CallUserData> = ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -111,7 +109,6 @@ fn test_simple_pingpong() {
             max_sge: 1,
         })
         .cq_size(1024)
-        .on_response(on_response)
         .build()
         .expect("Failed to create client context");
 
@@ -198,7 +195,7 @@ fn test_simple_pingpong() {
     let mut poll_count = 0;
 
     while start.elapsed() < timeout {
-        ctx.poll();
+        ctx.poll(&mut on_response);
         poll_count += 1;
 
         if poll_count % 100000 == 0 {
@@ -233,7 +230,7 @@ fn server_thread(
 ) {
     let on_response: fn(CallUserData, &[u8]) = |_user_data, _data| {};
 
-    let ctx: Context<CallUserData, _> = match ContextBuilder::new()
+    let ctx: Context<CallUserData> = match ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -241,7 +238,6 @@ fn server_thread(
             max_sge: 1,
         })
         .cq_size(1024)
-        .on_response(on_response)
         .build()
     {
         Ok(c) => c,
@@ -307,7 +303,7 @@ fn server_thread(
     eprintln!("Server: Starting loop...");
 
     while !stop_flag.load(Ordering::Relaxed) {
-        ctx.poll();
+        ctx.poll(|_, _| {});
 
         while let Some(req) = ctx.recv() {
             eprintln!("Server: Received request, sending reply...");
@@ -338,11 +334,11 @@ fn test_multi_endpoint_pingpong() {
     let completed = Arc::new(AtomicU32::new(0));
     let completed_for_callback = completed.clone();
 
-    let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+    let mut on_response = move |_user_data: CallUserData, _data: &[u8]| {
         completed_for_callback.fetch_add(1, Ordering::SeqCst);
     };
 
-    let ctx: Context<CallUserData, _> = ContextBuilder::new()
+    let ctx: Context<CallUserData> = ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -350,7 +346,6 @@ fn test_multi_endpoint_pingpong() {
             max_sge: 1,
         })
         .cq_size(4096)
-        .on_response(on_response)
         .build()
         .expect("Failed to create client context");
 
@@ -456,14 +451,14 @@ fn test_multi_endpoint_pingpong() {
     eprintln!("Client: Sent {} requests", total_sent);
 
     // Flush initial batch
-    ctx.poll();
+    ctx.poll(&mut on_response);
 
     // Poll for responses with timeout
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(10);
 
     while start.elapsed() < timeout {
-        ctx.poll();
+        ctx.poll(&mut on_response);
 
         let current_completed = completed.load(Ordering::SeqCst);
         if current_completed as usize >= total_sent {
@@ -508,11 +503,11 @@ fn test_srq_exhaustion_pingpong() {
     let completed = Arc::new(AtomicU32::new(0));
     let completed_for_callback = completed.clone();
 
-    let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+    let mut on_response = move |_user_data: CallUserData, _data: &[u8]| {
         completed_for_callback.fetch_add(1, Ordering::SeqCst);
     };
 
-    let ctx: Context<CallUserData, _> = ContextBuilder::new()
+    let ctx: Context<CallUserData> = ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -520,7 +515,6 @@ fn test_srq_exhaustion_pingpong() {
             max_sge: 1,
         })
         .cq_size(1024)
-        .on_response(on_response)
         .build()
         .expect("Failed to create client context");
 
@@ -618,7 +612,7 @@ fn test_srq_exhaustion_pingpong() {
                     before + 1
                 );
             }
-            ctx.poll();
+            ctx.poll(&mut on_response);
         }
     }
 
@@ -643,7 +637,7 @@ fn srq_exhaustion_server_thread(
 ) {
     let on_response: fn(CallUserData, &[u8]) = |_user_data, _data| {};
 
-    let ctx: Context<CallUserData, _> = match ContextBuilder::new()
+    let ctx: Context<CallUserData> = match ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -651,7 +645,6 @@ fn srq_exhaustion_server_thread(
             max_sge: 1,
         })
         .cq_size(1024)
-        .on_response(on_response)
         .build()
     {
         Ok(c) => c,
@@ -716,7 +709,7 @@ fn srq_exhaustion_server_thread(
     let mut replies_sent = 0;
 
     while !stop_flag.load(Ordering::Relaxed) {
-        ctx.poll();
+        ctx.poll(|_, _| {});
 
         while let Some(req) = ctx.recv() {
             if let Err(e) = req.reply(&response_data) {
@@ -746,11 +739,11 @@ fn test_benchmark_style_pingpong() {
     let completed = Arc::new(AtomicU32::new(0));
     let completed_for_callback = completed.clone();
 
-    let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+    let mut on_response = move |_user_data: CallUserData, _data: &[u8]| {
         completed_for_callback.fetch_add(1, Ordering::SeqCst);
     };
 
-    let ctx: Context<CallUserData, _> = ContextBuilder::new()
+    let ctx: Context<CallUserData> = ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -758,7 +751,6 @@ fn test_benchmark_style_pingpong() {
             max_sge: 1,
         })
         .cq_size(1024)
-        .on_response(on_response)
         .build()
         .expect("Failed to create client context");
 
@@ -846,7 +838,7 @@ fn test_benchmark_style_pingpong() {
     }
 
     // Flush initial batch
-    ctx.poll();
+    ctx.poll(&mut on_response);
 
     let start = std::time::Instant::now();
 
@@ -863,7 +855,7 @@ fn test_benchmark_style_pingpong() {
         }
 
         // Poll for completions
-        ctx.poll();
+        ctx.poll(&mut on_response);
 
         // Get completions from on_response callback
         let prev_completed = completed.load(Ordering::SeqCst) as usize;
@@ -888,7 +880,7 @@ fn test_benchmark_style_pingpong() {
     // Drain remaining inflight requests
     let drain_start = std::time::Instant::now();
     while inflight > 0 && drain_start.elapsed() < Duration::from_secs(5) {
-        ctx.poll();
+        ctx.poll(&mut on_response);
         let prev_completed = completed.load(Ordering::SeqCst) as usize;
         let new_completions = prev_completed.saturating_sub(completed_count);
         completed_count = prev_completed;
@@ -915,7 +907,7 @@ fn benchmark_style_server_thread(
 ) {
     let on_response: fn(CallUserData, &[u8]) = |_user_data, _data| {};
 
-    let ctx: Context<CallUserData, _> = match ContextBuilder::new()
+    let ctx: Context<CallUserData> = match ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -923,7 +915,6 @@ fn benchmark_style_server_thread(
             max_sge: 1,
         })
         .cq_size(1024)
-        .on_response(on_response)
         .build()
     {
         Ok(c) => c,
@@ -988,7 +979,7 @@ fn benchmark_style_server_thread(
     let mut replies_sent = 0;
 
     while !stop_flag.load(Ordering::Relaxed) {
-        ctx.poll();
+        ctx.poll(|_, _| {});
 
         while let Some(req) = ctx.recv() {
             if let Err(e) = req.reply(&response_data) {
@@ -1010,7 +1001,7 @@ fn multi_endpoint_server_thread(
 ) {
     let on_response: fn(CallUserData, &[u8]) = |_user_data, _data| {};
 
-    let ctx: Context<CallUserData, _> = match ContextBuilder::new()
+    let ctx: Context<CallUserData> = match ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -1018,7 +1009,6 @@ fn multi_endpoint_server_thread(
             max_sge: 1,
         })
         .cq_size(4096)
-        .on_response(on_response)
         .build()
     {
         Ok(c) => c,
@@ -1109,7 +1099,7 @@ fn multi_endpoint_server_thread(
     eprintln!("Server: Starting loop...");
 
     while !stop_flag.load(Ordering::Relaxed) {
-        ctx.poll();
+        ctx.poll(|_, _| {});
 
         while let Some(req) = ctx.recv() {
             if let Err(e) = req.reply(&response_data) {
@@ -1139,11 +1129,11 @@ fn test_ring_wraparound() {
     let completed = Arc::new(AtomicU32::new(0));
     let completed_for_callback = completed.clone();
 
-    let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+    let mut on_response = move |_user_data: CallUserData, _data: &[u8]| {
         completed_for_callback.fetch_add(1, Ordering::SeqCst);
     };
 
-    let ctx: Context<CallUserData, _> = ContextBuilder::new()
+    let ctx: Context<CallUserData> = ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -1151,7 +1141,6 @@ fn test_ring_wraparound() {
             max_sge: 1,
         })
         .cq_size(1024)
-        .on_response(on_response)
         .build()
         .expect("Failed to create client context");
 
@@ -1238,7 +1227,7 @@ fn test_ring_wraparound() {
         if let Err(e) = ep.call(&request_data, user_data, 64) {
             eprintln!("Client: call failed at iteration {}: {:?}", i, e);
             // On RingFull, poll and retry
-            ctx.poll();
+            ctx.poll(&mut on_response);
             continue;
         }
 
@@ -1253,7 +1242,7 @@ fn test_ring_wraparound() {
                     completed.load(Ordering::SeqCst)
                 );
             }
-            ctx.poll();
+            ctx.poll(&mut on_response);
         }
     }
 
@@ -1283,7 +1272,7 @@ fn wraparound_server_thread(
 ) {
     let on_response: fn(CallUserData, &[u8]) = |_user_data, _data| {};
 
-    let ctx: Context<CallUserData, _> = match ContextBuilder::new()
+    let ctx: Context<CallUserData> = match ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -1291,7 +1280,6 @@ fn wraparound_server_thread(
             max_sge: 1,
         })
         .cq_size(1024)
-        .on_response(on_response)
         .build()
     {
         Ok(c) => c,
@@ -1360,7 +1348,7 @@ fn wraparound_server_thread(
     let mut replies_sent = 0;
 
     while !stop_flag.load(Ordering::Relaxed) {
-        ctx.poll();
+        ctx.poll(|_, _| {});
 
         while let Some(req) = ctx.recv() {
             if let Err(e) = req.reply(&response_data) {
@@ -1391,11 +1379,11 @@ fn test_high_throughput_sustained() {
     let completed = Arc::new(AtomicU32::new(0));
     let completed_for_callback = completed.clone();
 
-    let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+    let mut on_response = move |_user_data: CallUserData, _data: &[u8]| {
         completed_for_callback.fetch_add(1, Ordering::SeqCst);
     };
 
-    let ctx: Context<CallUserData, _> = ContextBuilder::new()
+    let ctx: Context<CallUserData> = ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -1403,7 +1391,6 @@ fn test_high_throughput_sustained() {
             max_sge: 1,
         })
         .cq_size(1024)
-        .on_response(on_response)
         .build()
         .expect("Failed to create client context");
 
@@ -1490,7 +1477,7 @@ fn test_high_throughput_sustained() {
             sent += 1;
         }
     }
-    ctx.poll();
+    ctx.poll(&mut on_response);
 
     let start = std::time::Instant::now();
 
@@ -1504,7 +1491,7 @@ fn test_high_throughput_sustained() {
             );
         }
 
-        ctx.poll();
+        ctx.poll(&mut on_response);
 
         let prev_completed = completed.load(Ordering::SeqCst) as usize;
         let new_completions = prev_completed.saturating_sub(completed_count);
@@ -1529,7 +1516,7 @@ fn test_high_throughput_sustained() {
     // Drain remaining
     let drain_start = std::time::Instant::now();
     while inflight > 0 && drain_start.elapsed() < Duration::from_secs(5) {
-        ctx.poll();
+        ctx.poll(&mut on_response);
         let prev_completed = completed.load(Ordering::SeqCst) as usize;
         let new_completions = prev_completed.saturating_sub(completed_count);
         completed_count = prev_completed;
@@ -1560,7 +1547,7 @@ fn high_throughput_server_thread(
 ) {
     let on_response: fn(CallUserData, &[u8]) = |_user_data, _data| {};
 
-    let ctx: Context<CallUserData, _> = match ContextBuilder::new()
+    let ctx: Context<CallUserData> = match ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -1568,7 +1555,6 @@ fn high_throughput_server_thread(
             max_sge: 1,
         })
         .cq_size(1024)
-        .on_response(on_response)
         .build()
     {
         Ok(c) => c,
@@ -1633,7 +1619,7 @@ fn high_throughput_server_thread(
     let mut replies_sent = 0;
 
     while !stop_flag.load(Ordering::Relaxed) {
-        ctx.poll();
+        ctx.poll(|_, _| {});
 
         while let Some(req) = ctx.recv() {
             if req.reply(&response_data).is_ok() {
@@ -1661,12 +1647,12 @@ fn test_debug_small_iterations() {
     let completed = Arc::new(AtomicU32::new(0));
     let completed_for_callback = completed.clone();
 
-    let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+    let mut on_response = move |_user_data: CallUserData, _data: &[u8]| {
         let prev = completed_for_callback.fetch_add(1, Ordering::SeqCst);
         eprintln!("CLIENT: on_response callback #{}", prev + 1);
     };
 
-    let ctx: Context<CallUserData, _> = ContextBuilder::new()
+    let ctx: Context<CallUserData> = ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -1674,7 +1660,6 @@ fn test_debug_small_iterations() {
             max_sge: 1,
         })
         .cq_size(1024)
-        .on_response(on_response)
         .build()
         .expect("Failed to create client context");
 
@@ -1765,7 +1750,7 @@ fn test_debug_small_iterations() {
             break;
         }
     }
-    ctx.poll();
+    ctx.poll(&mut on_response);
     eprintln!("CLIENT: Initial batch sent={}, inflight={}", sent, inflight);
 
     let start = std::time::Instant::now();
@@ -1780,7 +1765,7 @@ fn test_debug_small_iterations() {
             );
         }
 
-        ctx.poll();
+        ctx.poll(&mut on_response);
 
         let prev_completed = completed.load(Ordering::SeqCst) as usize;
         let new_completions = prev_completed.saturating_sub(completed_count);
@@ -1835,7 +1820,7 @@ fn debug_server_thread(
 ) {
     let on_response: fn(CallUserData, &[u8]) = |_user_data, _data| {};
 
-    let ctx: Context<CallUserData, _> = match ContextBuilder::new()
+    let ctx: Context<CallUserData> = match ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -1843,7 +1828,6 @@ fn debug_server_thread(
             max_sge: 1,
         })
         .cq_size(1024)
-        .on_response(on_response)
         .build()
     {
         Ok(c) => c,
@@ -1909,7 +1893,7 @@ fn debug_server_thread(
     let mut poll_count = 0;
 
     while !stop_flag.load(Ordering::Relaxed) {
-        ctx.poll();
+        ctx.poll(|_, _| {});
         poll_count += 1;
 
         let mut recv_count = 0;
@@ -1946,11 +1930,11 @@ fn test_benchmark_pattern() {
     let completed = Arc::new(AtomicU32::new(0));
     let completed_for_callback = completed.clone();
 
-    let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+    let mut on_response = move |_user_data: CallUserData, _data: &[u8]| {
         completed_for_callback.fetch_add(1, Ordering::SeqCst);
     };
 
-    let ctx: Context<CallUserData, _> = ContextBuilder::new()
+    let ctx: Context<CallUserData> = ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -1958,7 +1942,6 @@ fn test_benchmark_pattern() {
             max_sge: 1,
         })
         .cq_size(1024)
-        .on_response(on_response)
         .build()
         .expect("Failed to create client context");
 
@@ -2047,7 +2030,7 @@ fn test_benchmark_pattern() {
             inflight += 1;
             total_sent += 1;
         }
-        ctx.poll();
+        ctx.poll(&mut on_response);
 
         let mut round_completed = 0usize;
         let timeout = std::time::Instant::now() + Duration::from_secs(10);
@@ -2063,7 +2046,7 @@ fn test_benchmark_pattern() {
                 );
             }
 
-            ctx.poll();
+            ctx.poll(&mut on_response);
 
             let current_completed = completed.load(Ordering::SeqCst) as usize;
             let new_completions =
@@ -2121,7 +2104,7 @@ fn benchmark_pattern_server(
 ) {
     let on_response: fn(CallUserData, &[u8]) = |_user_data, _data| {};
 
-    let ctx: Context<CallUserData, _> = match ContextBuilder::new()
+    let ctx: Context<CallUserData> = match ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -2129,7 +2112,6 @@ fn benchmark_pattern_server(
             max_sge: 1,
         })
         .cq_size(1024)
-        .on_response(on_response)
         .build()
     {
         Ok(c) => c,
@@ -2193,7 +2175,7 @@ fn benchmark_pattern_server(
     let response_data = vec![0u8; 32];
 
     while !stop_flag.load(Ordering::Relaxed) {
-        ctx.poll();
+        ctx.poll(|_, _| {});
 
         while let Some(req) = ctx.recv() {
             if req.reply(&response_data).is_ok() {
@@ -2235,11 +2217,11 @@ fn test_emit_wqe_boundary_split() {
     let completed = Arc::new(AtomicU32::new(0));
     let completed_for_callback = completed.clone();
 
-    let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+    let mut on_response = move |_user_data: CallUserData, _data: &[u8]| {
         completed_for_callback.fetch_add(1, Ordering::SeqCst);
     };
 
-    let ctx: Context<CallUserData, _> = ContextBuilder::new()
+    let ctx: Context<CallUserData> = ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -2247,7 +2229,6 @@ fn test_emit_wqe_boundary_split() {
             max_sge: 1,
         })
         .cq_size(2048)
-        .on_response(on_response)
         .build()
         .expect("Failed to create client context");
 
@@ -2365,7 +2346,7 @@ fn test_emit_wqe_boundary_split() {
 
         // Poll to flush the batch - this triggers emit_wqe with accumulated data
         // If the data spans the ring boundary, emit_wqe must split it correctly
-        ctx.poll();
+        ctx.poll(&mut on_response);
 
         // Wait for responses before continuing (to free up ring space)
         let wait_start = std::time::Instant::now();
@@ -2379,7 +2360,7 @@ fn test_emit_wqe_boundary_split() {
                 );
                 break;
             }
-            ctx.poll();
+            ctx.poll(&mut on_response);
         }
     }
 
@@ -2388,7 +2369,7 @@ fn test_emit_wqe_boundary_split() {
     while completed.load(Ordering::SeqCst) < total_sent as u32
         && drain_start.elapsed() < Duration::from_secs(5)
     {
-        ctx.poll();
+        ctx.poll(&mut on_response);
     }
 
     let final_completed = completed.load(Ordering::SeqCst);
@@ -2419,7 +2400,7 @@ fn emit_wqe_boundary_server_thread(
 ) {
     let on_response: fn(CallUserData, &[u8]) = |_user_data, _data| {};
 
-    let ctx: Context<CallUserData, _> = match ContextBuilder::new()
+    let ctx: Context<CallUserData> = match ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -2427,7 +2408,6 @@ fn emit_wqe_boundary_server_thread(
             max_sge: 1,
         })
         .cq_size(2048)
-        .on_response(on_response)
         .build()
     {
         Ok(c) => c,
@@ -2496,7 +2476,7 @@ fn emit_wqe_boundary_server_thread(
     let mut replies_sent = 0u64;
 
     while !stop_flag.load(Ordering::Relaxed) {
-        ctx.poll();
+        ctx.poll(|_, _| {});
 
         while let Some(req) = ctx.recv() {
             // Retry on RingFull
@@ -2507,7 +2487,7 @@ fn emit_wqe_boundary_server_thread(
                         break;
                     }
                     Err(copyrpc::error::Error::RingFull) => {
-                        ctx.poll();
+                        ctx.poll(|_, _| {});
                         continue;
                     }
                     Err(_) => break,
@@ -2537,7 +2517,7 @@ fn generic_server_thread(
 ) {
     let on_response: fn(CallUserData, &[u8]) = |_user_data, _data| {};
 
-    let ctx: Context<CallUserData, _> = match ContextBuilder::new()
+    let ctx: Context<CallUserData> = match ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -2545,7 +2525,6 @@ fn generic_server_thread(
             max_sge: 1,
         })
         .cq_size(2048)
-        .on_response(on_response)
         .build()
     {
         Ok(c) => c,
@@ -2614,7 +2593,7 @@ fn generic_server_thread(
     let mut replies_sent = 0;
 
     while !stop_flag.load(Ordering::Relaxed) {
-        ctx.poll();
+        ctx.poll(|_, _| {});
 
         while let Some(req) = ctx.recv() {
             // Retry on RingFull
@@ -2625,7 +2604,7 @@ fn generic_server_thread(
                         break;
                     }
                     Err(copyrpc::error::Error::RingFull) => {
-                        ctx.poll();
+                        ctx.poll(|_, _| {});
                         continue;
                     }
                     Err(_) => break,
@@ -2652,11 +2631,11 @@ fn test_credit_small_ring_large_response() {
     let completed = Arc::new(AtomicU32::new(0));
     let completed_for_callback = completed.clone();
 
-    let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+    let mut on_response = move |_user_data: CallUserData, _data: &[u8]| {
         completed_for_callback.fetch_add(1, Ordering::SeqCst);
     };
 
-    let ctx: Context<CallUserData, _> = ContextBuilder::new()
+    let ctx: Context<CallUserData> = ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -2664,7 +2643,6 @@ fn test_credit_small_ring_large_response() {
             max_sge: 1,
         })
         .cq_size(2048)
-        .on_response(on_response)
         .build()
         .expect("Failed to create client context");
 
@@ -2762,7 +2740,7 @@ fn test_credit_small_ring_large_response() {
                     completed.load(Ordering::SeqCst)
                 );
             }
-            ctx.poll();
+            ctx.poll(&mut on_response);
         }
     }
 
@@ -2792,11 +2770,11 @@ fn test_credit_mixed_sizes() {
     let completed = Arc::new(AtomicU32::new(0));
     let completed_for_callback = completed.clone();
 
-    let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+    let mut on_response = move |_user_data: CallUserData, _data: &[u8]| {
         completed_for_callback.fetch_add(1, Ordering::SeqCst);
     };
 
-    let ctx: Context<CallUserData, _> = ContextBuilder::new()
+    let ctx: Context<CallUserData> = ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -2804,7 +2782,6 @@ fn test_credit_mixed_sizes() {
             max_sge: 1,
         })
         .cq_size(2048)
-        .on_response(on_response)
         .build()
         .expect("Failed to create client context");
 
@@ -2903,7 +2880,7 @@ fn test_credit_mixed_sizes() {
                     completed.load(Ordering::SeqCst)
                 );
             }
-            ctx.poll();
+            ctx.poll(&mut on_response);
         }
     }
 
@@ -2934,11 +2911,11 @@ fn test_credit_bidirectional_stress() {
     let client_completed = Arc::new(AtomicU32::new(0));
     let client_completed_for_callback = client_completed.clone();
 
-    let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+    let mut on_response = move |_user_data: CallUserData, _data: &[u8]| {
         client_completed_for_callback.fetch_add(1, Ordering::SeqCst);
     };
 
-    let ctx: Context<CallUserData, _> = ContextBuilder::new()
+    let ctx: Context<CallUserData> = ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -2946,7 +2923,6 @@ fn test_credit_bidirectional_stress() {
             max_sge: 1,
         })
         .cq_size(2048)
-        .on_response(on_response)
         .build()
         .expect("Failed to create client context");
 
@@ -2992,11 +2968,11 @@ fn test_credit_bidirectional_stress() {
     // Server thread that also sends calls
     let handle: JoinHandle<()> = thread::spawn(move || {
         let server_completed_for_callback = server_completed_clone.clone();
-        let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+        let mut on_response = move |_user_data: CallUserData, _data: &[u8]| {
             server_completed_for_callback.fetch_add(1, Ordering::SeqCst);
         };
 
-        let ctx: Context<CallUserData, _> = match ContextBuilder::new()
+        let ctx: Context<CallUserData> = match ContextBuilder::new()
             .device_index(0)
             .port(1)
             .srq_config(SrqConfig {
@@ -3004,7 +2980,6 @@ fn test_credit_bidirectional_stress() {
                 max_sge: 1,
             })
             .cq_size(2048)
-            .on_response(on_response)
             .build()
         {
             Ok(c) => c,
@@ -3074,7 +3049,7 @@ fn test_credit_bidirectional_stress() {
         let mut sent: usize = 0;
 
         while !server_stop.load(Ordering::Relaxed) {
-            ctx.poll();
+            ctx.poll(&mut on_response);
 
             // Receive and reply to incoming requests
             while let Some(req) = ctx.recv() {
@@ -3082,7 +3057,7 @@ fn test_credit_bidirectional_stress() {
                     match req.reply(&response_data) {
                         Ok(()) => break,
                         Err(copyrpc::error::Error::RingFull) => {
-                            ctx.poll();
+                            ctx.poll(&mut on_response);
                             continue;
                         }
                         Err(_) => break,
@@ -3167,7 +3142,7 @@ fn test_credit_bidirectional_stress() {
             );
         }
 
-        ctx.poll();
+        ctx.poll(&mut on_response);
 
         // Receive and reply to incoming requests
         while let Some(req) = ctx.recv() {
@@ -3175,7 +3150,7 @@ fn test_credit_bidirectional_stress() {
                 match req.reply(&response_data) {
                     Ok(()) => break,
                     Err(copyrpc::error::Error::RingFull) => {
-                        ctx.poll();
+                        ctx.poll(&mut on_response);
                         continue;
                     }
                     Err(_) => break,
@@ -3245,11 +3220,11 @@ fn test_credit_deep_queue_tiny_ring() {
     let completed = Arc::new(AtomicU32::new(0));
     let completed_for_callback = completed.clone();
 
-    let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+    let mut on_response = move |_user_data: CallUserData, _data: &[u8]| {
         completed_for_callback.fetch_add(1, Ordering::SeqCst);
     };
 
-    let ctx: Context<CallUserData, _> = ContextBuilder::new()
+    let ctx: Context<CallUserData> = ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -3257,7 +3232,6 @@ fn test_credit_deep_queue_tiny_ring() {
             max_sge: 1,
         })
         .cq_size(2048)
-        .on_response(on_response)
         .build()
         .expect("Failed to create client context");
 
@@ -3352,7 +3326,7 @@ fn test_credit_deep_queue_tiny_ring() {
             );
         }
 
-        ctx.poll();
+        ctx.poll(&mut on_response);
 
         let current_completed = completed.load(Ordering::SeqCst) as usize;
         inflight = sent.saturating_sub(current_completed);
@@ -3407,11 +3381,11 @@ fn test_credit_exhaustion_recovery() {
     let completed = Arc::new(AtomicU32::new(0));
     let completed_for_callback = completed.clone();
 
-    let on_response = move |_user_data: CallUserData, _data: &[u8]| {
+    let mut on_response = move |_user_data: CallUserData, _data: &[u8]| {
         completed_for_callback.fetch_add(1, Ordering::SeqCst);
     };
 
-    let ctx: Context<CallUserData, _> = ContextBuilder::new()
+    let ctx: Context<CallUserData> = ContextBuilder::new()
         .device_index(0)
         .port(1)
         .srq_config(SrqConfig {
@@ -3419,7 +3393,6 @@ fn test_credit_exhaustion_recovery() {
             max_sge: 1,
         })
         .cq_size(2048)
-        .on_response(on_response)
         .build()
         .expect("Failed to create client context");
 
@@ -3544,7 +3517,7 @@ fn test_credit_exhaustion_recovery() {
                 completed.load(Ordering::SeqCst)
             );
         }
-        ctx.poll();
+        ctx.poll(&mut on_response);
     }
 
     eprintln!("Phase 3: Sending more calls after recovery...");
@@ -3565,7 +3538,7 @@ fn test_credit_exhaustion_recovery() {
                     copyrpc::error::CallError::RingFull(_)
                     | copyrpc::error::CallError::InsufficientCredit(_),
                 ) => {
-                    ctx.poll();
+                    ctx.poll(&mut on_response);
                     continue;
                 }
                 Err(e) => {
@@ -3587,7 +3560,7 @@ fn test_credit_exhaustion_recovery() {
                 completed.load(Ordering::SeqCst)
             );
         }
-        ctx.poll();
+        ctx.poll(&mut on_response);
     }
 
     stop_flag.store(true, Ordering::SeqCst);

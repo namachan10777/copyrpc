@@ -99,28 +99,3 @@ impl RemoteResponse {
         unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const Self) }
     }
 }
-
-// === Thread-local response queues ===
-
-use ipc::RequestToken;
-use std::cell::RefCell;
-
-/// Response routed back from the Flux on_response callback.
-/// `pending_idx` indexes into the daemon's pending copyrpc recv handle buffer.
-#[derive(Debug)]
-pub struct FluxResponseEntry {
-    pub pending_idx: usize,
-    pub response: Response,
-}
-
-/// Response routed back from the copyrpc on_response callback.
-#[derive(Debug)]
-pub struct CopyrpcResponseEntry {
-    pub token: RequestToken,
-    pub response: Response,
-}
-
-thread_local! {
-    pub static FLUX_RESPONSES: RefCell<Vec<FluxResponseEntry>> = const { RefCell::new(Vec::new()) };
-    pub static COPYRPC_RESPONSES: RefCell<Vec<CopyrpcResponseEntry>> = const { RefCell::new(Vec::new()) };
-}

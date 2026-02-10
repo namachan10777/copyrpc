@@ -33,11 +33,11 @@ fn test_call_reply() {
     let mut nodes: Vec<Mesh<u32>> = create_mesh(2);
 
     // Node 0 calls Node 1
-    let req_num = nodes[0].call(1, 42).unwrap();
+    let req_num = nodes[0].call(1, 42, ()).unwrap();
     assert_eq!(req_num, 0);
 
     // Second call should have different req_num
-    let req_num2 = nodes[0].call(1, 43).unwrap();
+    let req_num2 = nodes[0].call(1, 43, ()).unwrap();
     assert_eq!(req_num2, 1);
 
     // Node 1 receives requests and replies
@@ -315,7 +315,7 @@ fn test_ping_pong_pairs() {
                 if id < partner {
                     // Initiator
                     for i in 0..iterations {
-                        let req_num = node.call(partner, i).unwrap();
+                        let req_num = node.call(partner, i, ()).unwrap();
                         loop {
                             match node.try_recv() {
                                 Ok((from, ReceivedMessage::Response { req_num: r, data })) => {

@@ -263,8 +263,7 @@ fn run_benchmark_for_size(
     }
 
     // Create context and endpoints
-    type OnResponseFn = fn((), &[u8]);
-    let ctx: Context<(), OnResponseFn> = ContextBuilder::new()
+    let ctx: Context<()> = ContextBuilder::new()
         .device_index(args.device_index)
         .port(args.port)
         .srq_config(SrqConfig {
@@ -272,7 +271,6 @@ fn run_benchmark_for_size(
             max_sge: 1,
         })
         .cq_size(4096)
-        .on_response(on_response_callback as OnResponseFn)
         .build()?;
 
     let ep_config = EndpointConfig {
@@ -401,8 +399,8 @@ fn run_benchmark_for_size(
 
 const REQUESTS_PER_EP: usize = 256;
 
-fn run_client_pingpong<F: Fn((), &[u8])>(
-    ctx: &Context<(), F>,
+fn run_client_pingpong(
+    ctx: &Context<()>,
     endpoints: &[Endpoint<()>],
     message_size: usize,
     iterations: u64,
@@ -431,13 +429,13 @@ fn run_client_pingpong<F: Fn((), &[u8])>(
     }
 
     // Flush initial batch
-    ctx.poll();
+    ctx.poll(on_response_callback);
 
     let start = Instant::now();
 
     while completed < iterations {
         // Poll for completions
-        ctx.poll();
+        ctx.poll(on_response_callback);
 
         // Get completions from callback
         let new_completions = get_and_reset_response_count();
@@ -454,7 +452,7 @@ fn run_client_pingpong<F: Fn((), &[u8])>(
                 inflight += 1;
             } else {
                 // Ring full, poll and retry
-                ctx.poll();
+                ctx.poll(on_response_callback);
                 let new = get_and_reset_response_count();
                 completed += new as u64;
                 inflight = inflight.saturating_sub(new);
@@ -464,7 +462,7 @@ fn run_client_pingpong<F: Fn((), &[u8])>(
 
     // Drain remaining inflight requests
     while inflight > 0 {
-        ctx.poll();
+        ctx.poll(on_response_callback);
         let new_completions = get_and_reset_response_count();
         inflight = inflight.saturating_sub(new_completions);
     }
@@ -476,12 +474,12 @@ fn run_client_pingpong<F: Fn((), &[u8])>(
 // Server Loop
 // =============================================================================
 
-fn run_server_loop<F: Fn((), &[u8])>(ctx: &Context<(), F>, message_size: usize, iterations: u64) {
+fn run_server_loop(ctx: &Context<()>, message_size: usize, iterations: u64) {
     let response_data = vec![0u8; message_size];
     let mut processed = 0u64;
 
     while processed < iterations {
-        ctx.poll();
+        ctx.poll(|_, _| {});
 
         while let Some(req) = ctx.recv() {
             // Reply with retry on RingFull
@@ -489,7 +487,7 @@ fn run_server_loop<F: Fn((), &[u8])>(ctx: &Context<(), F>, message_size: usize, 
                 match req.reply(&response_data) {
                     Ok(()) => break,
                     Err(copyrpc::error::Error::RingFull) => {
-                        ctx.poll();
+                        ctx.poll(|_, _| {});
                         continue;
                     }
                     Err(_) => break,
@@ -500,7 +498,7 @@ fn run_server_loop<F: Fn((), &[u8])>(ctx: &Context<(), F>, message_size: usize, 
     }
 
     // Final flush to ensure all replies are sent
-    ctx.poll();
+    ctx.poll(|_, _| {});
 }
 
 // =============================================================================

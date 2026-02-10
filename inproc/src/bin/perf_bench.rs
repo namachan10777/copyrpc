@@ -61,10 +61,7 @@ fn run_bench<M: MpscChannel>(duration_secs: u64, inflight_max: usize, start_core
     let completed = Arc::new(AtomicU64::new(0));
     let completed_clone = Arc::clone(&completed);
 
-    let nodes: Vec<Flux<Payload, (), _, M>> =
-        create_flux_with(2, capacity, inflight_max, move |_: (), _: Payload| {
-            completed_clone.fetch_add(1, Ordering::Relaxed);
-        });
+    let nodes: Vec<Flux<Payload, (), M>> = create_flux_with(2, capacity, inflight_max);
 
     let mut nodes: Vec<_> = nodes.into_iter().collect();
     let mut node1 = nodes.pop().unwrap();
@@ -82,7 +79,7 @@ fn run_bench<M: MpscChannel>(duration_secs: u64, inflight_max: usize, start_core
         pin_to_core(start_core - 1);
         barrier2.wait();
         while !stop2.load(Ordering::Relaxed) {
-            node1.poll();
+            node1.poll(|_, _| {});
             while let Some(h) = node1.try_recv() {
                 let data = h.data();
                 h.reply(data);
@@ -106,12 +103,18 @@ fn run_bench<M: MpscChannel>(duration_secs: u64, inflight_max: usize, start_core
                 break;
             }
         }
-        node0.poll();
+        let counter = Arc::clone(&completed_clone);
+        node0.poll(move |_: (), _: Payload| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
     }
 
     // Wait for remaining responses
     while completed.load(Ordering::Relaxed) < sent {
-        node0.poll();
+        let counter = Arc::clone(&completed_clone);
+        node0.poll(move |_: (), _: Payload| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
         std::hint::spin_loop();
     }
 

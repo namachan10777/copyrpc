@@ -115,10 +115,7 @@ fn run_flux_benchmark<M: MpscChannel>(
     max_inflight: usize,
     start_core: usize,
 ) -> RunResult {
-    let nodes: Vec<Flux<Payload, (), _, M>> =
-        create_flux_with(n, capacity, max_inflight, |_: (), resp: Payload| {
-            std::hint::black_box(resp);
-        });
+    let nodes: Vec<Flux<Payload, (), M>> = create_flux_with(n, capacity, max_inflight);
 
     let barrier = Arc::new(Barrier::new(n + 1));
     let payload = Payload::default();
@@ -152,7 +149,9 @@ fn run_flux_benchmark<M: MpscChannel>(
                             }
                         }
 
-                        node.poll();
+                        node.poll(|_: (), resp: Payload| {
+                            std::hint::black_box(resp);
+                        });
                         while let Some(handle) = node.try_recv() {
                             let data = handle.data();
                             handle.reply(data);

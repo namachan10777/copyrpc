@@ -1057,10 +1057,8 @@ mod tests {
         let path = test_path();
         unsafe {
             let mut server = Server::<u64, u64>::create(&path, 4, 8, 0).unwrap();
-            let mut client0 =
-                Client::<u64, u64, (), _>::connect(&path, |(), _| {}).unwrap();
-            let mut client1 =
-                Client::<u64, u64, (), _>::connect(&path, |(), _| {}).unwrap();
+            let mut client0 = Client::<u64, u64, (), _>::connect(&path, |(), _| {}).unwrap();
+            let mut client1 = Client::<u64, u64, (), _>::connect(&path, |(), _| {}).unwrap();
 
             // Send from both clients
             client0.call(10, ()).unwrap();
