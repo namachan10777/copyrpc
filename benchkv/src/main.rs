@@ -1,5 +1,6 @@
 mod affinity;
 mod client;
+mod copyrpc_direct_backend;
 mod daemon;
 mod epoch;
 mod erpc_backend;
@@ -111,6 +112,8 @@ enum SubCmd {
     },
     /// UCX Active Message meta_put/meta_get benchmark
     UcxAm,
+    /// copyrpc direct (no ipc/Flux) meta_put/meta_get benchmark
+    CopyrpcDirect,
 }
 
 fn main() {
@@ -148,6 +151,14 @@ fn main() {
         SubCmd::UcxAm => {
             ucx_am_backend::run_ucx_am(&cli, &world, rank, size, num_daemons, num_clients)
         }
+        SubCmd::CopyrpcDirect => copyrpc_direct_backend::run_copyrpc_direct(
+            &cli,
+            &world,
+            rank,
+            size,
+            num_daemons,
+            num_clients,
+        ),
     };
 
     // Rank 0: write parquet

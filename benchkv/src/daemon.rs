@@ -33,6 +33,34 @@ pub struct EndpointConnectionInfo {
 pub const CONNECTION_INFO_SIZE: usize = std::mem::size_of::<EndpointConnectionInfo>();
 
 impl EndpointConnectionInfo {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        qp_number: u32,
+        packet_sequence_number: u32,
+        local_identifier: u16,
+        recv_ring_addr: u64,
+        recv_ring_rkey: u32,
+        recv_ring_size: u64,
+        consumer_addr: u64,
+        consumer_rkey: u32,
+        initial_credit: u64,
+    ) -> Self {
+        Self {
+            qp_number,
+            packet_sequence_number,
+            local_identifier,
+            _padding: 0,
+            recv_ring_addr,
+            recv_ring_rkey,
+            _padding2: 0,
+            recv_ring_size,
+            consumer_addr,
+            consumer_rkey,
+            _padding3: 0,
+            initial_credit,
+        }
+    }
+
     pub fn to_bytes(self) -> Vec<u8> {
         unsafe {
             std::slice::from_raw_parts(&self as *const Self as *const u8, CONNECTION_INFO_SIZE)
@@ -130,20 +158,17 @@ pub fn run_daemon(
                 .create_endpoint(&ep_config)
                 .expect("Failed to create copyrpc endpoint");
             let (info, lid, _) = ep.local_info(ctx.lid(), ctx.port());
-            local_infos.push(EndpointConnectionInfo {
-                qp_number: info.qp_number,
-                packet_sequence_number: 0,
-                local_identifier: lid,
-                _padding: 0,
-                recv_ring_addr: info.recv_ring_addr,
-                recv_ring_rkey: info.recv_ring_rkey,
-                _padding2: 0,
-                recv_ring_size: info.recv_ring_size,
-                consumer_addr: info.consumer_addr,
-                consumer_rkey: info.consumer_rkey,
-                _padding3: 0,
-                initial_credit: info.initial_credit,
-            });
+            local_infos.push(EndpointConnectionInfo::new(
+                info.qp_number,
+                0,
+                lid,
+                info.recv_ring_addr,
+                info.recv_ring_rkey,
+                info.recv_ring_size,
+                info.consumer_addr,
+                info.consumer_rkey,
+                info.initial_credit,
+            ));
             copyrpc_endpoints.push(ep);
         }
 
