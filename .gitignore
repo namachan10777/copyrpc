@@ -32,16 +32,12 @@ target
 
 # Benchmark results
 inproc/bench_results/
+bench_results/
 *.parquet
-bench_results/qd_compare/
-bench_results/qd_perf/
-bench_results/qd/
+mempc_bench/result/
 
 # Python
 .venv/
-
-# Benchmark visualization output
-bench_results/viz/
 
 # Job logs
 jobs/*/logs/
