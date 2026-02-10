@@ -31,7 +31,7 @@ pub mod encoding;
 pub mod error;
 pub mod ring;
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::io;
 
 use fastmap::FastMap;
@@ -165,26 +165,25 @@ type SqCqCallback = Box<dyn Fn(Cqe, SrqEntry)>;
 /// Type alias for the RC QP with SRQ used in copyrpc (for MonoCq).
 type CopyrpcQp = RcQpForMonoCqWithSrqAndSqCb<SrqEntry, SqCqCallback>;
 
-/// CQE buffer for storing receive completions.
-/// MonoCq callback pushes CQEs here, then poll() processes them.
-struct CqeBuffer {
-    entries: RefCell<Vec<(Cqe, SrqEntry)>>,
+/// Buffer for send CQE completions (READ completion processing).
+/// Uses UnsafeCell to avoid RefCell overhead in the hot path.
+/// Safety: Single-threaded access guaranteed (Rc, not Send/Sync).
+struct SendCqeBuffer {
+    entries: UnsafeCell<Vec<(Cqe, SrqEntry)>>,
 }
 
-impl CqeBuffer {
+impl SendCqeBuffer {
     fn new() -> Self {
         Self {
-            entries: RefCell::new(Vec::new()),
+            entries: UnsafeCell::new(Vec::new()),
         }
     }
 
     fn push(&self, cqe: Cqe, entry: SrqEntry) {
-        self.entries.borrow_mut().push((cqe, entry));
+        // Safety: Single-threaded access guaranteed by Rc (not Send/Sync).
+        unsafe { &mut *self.entries.get() }.push((cqe, entry));
     }
 }
-
-/// Type alias for the recv MonoCq callback.
-type RecvCqCallback = Box<dyn Fn(Cqe, SrqEntry)>;
 
 /// Internal struct for received messages stored in recv_stack.
 struct RecvMessage<U> {
@@ -224,11 +223,9 @@ where
     /// Send completion queue.
     send_cq: Rc<mlx5::cq::Cq>,
     /// Receive completion queue (MonoCq for SRQ-based completion processing).
-    recv_cq: Rc<MonoCq<CopyrpcQp, RecvCqCallback>>,
-    /// CQE buffer for recv completions (MonoCq callback pushes here).
-    cqe_buffer: Rc<CqeBuffer>,
+    recv_cq: Rc<MonoCq<CopyrpcQp>>,
     /// CQE buffer for send completions (for READ completion processing).
-    send_cqe_buffer: Rc<CqeBuffer>,
+    send_cqe_buffer: Rc<SendCqeBuffer>,
     /// Registered endpoints by QPN.
     endpoints: RefCell<FastMap<Rc<RefCell<EndpointInner<U>>>>>,
     /// Response callback.
@@ -342,29 +339,11 @@ impl<U, F: Fn(U, &[u8])> ContextBuilder<U, F> {
 
         let send_cq = Rc::new(mlx5_ctx.create_cq(self.cq_size, &CqConfig::default())?);
 
-        // Create CQE buffer for MonoCq callback
-        let cqe_buffer = Rc::new(CqeBuffer::new());
-        let cqe_buffer_for_callback = cqe_buffer.clone();
-
         // Create CQE buffer for send CQ (for READ completion processing)
-        let send_cqe_buffer = Rc::new(CqeBuffer::new());
+        let send_cqe_buffer = Rc::new(SendCqeBuffer::new());
 
-        // Create MonoCq for recv with callback that pushes to buffer
-        let recv_callback: RecvCqCallback = Box::new(move |cqe, entry| {
-            // Log error CQEs
-            if cqe.opcode == mlx5::cq::CqeOpcode::ReqErr
-                || cqe.opcode == mlx5::cq::CqeOpcode::RespErr
-            {
-                eprintln!(
-                    "[recv_cq ERROR] qpn={}, opcode={:?}, syndrome={}",
-                    entry.qpn, cqe.opcode, cqe.syndrome
-                );
-                return;
-            }
-            cqe_buffer_for_callback.push(cqe, entry);
-        });
-        let recv_cq =
-            Rc::new(mlx5_ctx.create_mono_cq(self.cq_size, recv_callback, &CqConfig::default())?);
+        // Create MonoCq for recv (callback passed to poll at call site)
+        let recv_cq = Rc::new(mlx5_ctx.create_mono_cq(self.cq_size, &CqConfig::default())?);
 
         Ok(Context {
             mlx5_ctx,
@@ -374,7 +353,6 @@ impl<U, F: Fn(U, &[u8])> ContextBuilder<U, F> {
             srq_max_wr,
             send_cq,
             recv_cq,
-            cqe_buffer,
             send_cqe_buffer,
             endpoints: RefCell::new(FastMap::new()),
             on_response,
@@ -427,56 +405,70 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
     /// Poll for completions and process all pending operations.
     ///
     /// This method:
-    /// 1. Polls the receive CQ (MonoCq) - callbacks push CQEs to buffer
-    /// 2. Processes buffered CQEs via process_cqe
+    /// 1. Polls the receive CQ (MonoCq) with inline callback — no CqeBuffer
     ///    - Requests are pushed to recv_stack
     ///    - Responses invoke the on_response callback
+    /// 2. Reposts recv buffers to SRQ
     /// 3. Polls the send CQ to handle READ completions
     /// 4. Flushes all endpoints' accumulated data
     /// 5. Issues READ operations for endpoints that need consumer position updates
     pub fn poll(&self) {
-        // 1. Poll recv CQ (MonoCq) - callbacks push CQEs to cqe_buffer
+        // Split borrows to avoid self-reference in closure
+        let recv_cq = &self.recv_cq;
+        let endpoints = &self.endpoints;
+        let on_response = &self.on_response;
+        let recv_stack = &self.recv_stack;
+
+        // 1. Poll recv CQ (MonoCq) — callback is inlined, no CqeBuffer
+        let mut recv_count = 0u32;
         loop {
-            let count = self.recv_cq.poll();
+            let count = recv_cq.poll(|cqe, _entry| {
+                // Skip error CQEs
+                if cqe.opcode == mlx5::cq::CqeOpcode::ReqErr
+                    || cqe.opcode == mlx5::cq::CqeOpcode::RespErr
+                {
+                    eprintln!(
+                        "[recv_cq ERROR] qpn={}, opcode={:?}, syndrome={}",
+                        cqe.qp_num, cqe.opcode, cqe.syndrome
+                    );
+                    return;
+                }
+                Self::process_cqe_static(cqe, cqe.qp_num, endpoints, on_response, recv_stack);
+            });
             if count == 0 {
                 break;
             }
+            recv_count += count as u32;
         }
-        self.recv_cq.flush();
 
-        // 2. Process buffered CQEs in-place (preserves Vec capacity)
-        let num_cqes;
-        {
-            let mut entries = self.cqe_buffer.entries.borrow_mut();
-            num_cqes = entries.len();
-            for (cqe, _entry) in entries.drain(..) {
-                self.process_cqe(cqe, cqe.qp_num);
+        // Early return if no completions at all
+        if recv_count > 0 {
+            recv_cq.flush();
+
+            // 2. Repost recvs to SRQ when below 2/3 threshold
+            let posted = self.srq_posted.get().saturating_sub(recv_count);
+            self.srq_posted.set(posted);
+
+            let threshold = self.srq_max_wr * 2 / 3;
+            if posted < threshold {
+                let to_post = self.srq_max_wr - posted;
+                for _ in 0..to_post {
+                    let _ = self.srq.post_recv(
+                        SrqEntry {
+                            qpn: 0,
+                            is_read: false,
+                        },
+                        0,
+                        0,
+                        0,
+                    );
+                }
+                self.srq.ring_doorbell();
+                self.srq_posted.set(self.srq_max_wr);
             }
         }
 
-        // 3. Repost recvs to SRQ when below 2/3 threshold
-        let posted = self.srq_posted.get().saturating_sub(num_cqes as u32);
-        self.srq_posted.set(posted);
-
-        let threshold = self.srq_max_wr * 2 / 3;
-        if posted < threshold {
-            let to_post = self.srq_max_wr - posted;
-            for _ in 0..to_post {
-                let _ = self.srq.post_recv(
-                    SrqEntry {
-                        qpn: 0,
-                        is_read: false,
-                    },
-                    0,
-                    0,
-                    0,
-                );
-            }
-            self.srq.ring_doorbell();
-            self.srq_posted.set(self.srq_max_wr);
-        }
-
-        // 4. Poll send CQ for READ completions
+        // 3. Poll send CQ for READ completions
         loop {
             let count = self.send_cq.poll();
             if count == 0 {
@@ -485,9 +477,10 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
         }
         self.send_cq.flush();
 
-        // 5. Process send CQEs (READ completions) in-place
+        // 4. Process send CQEs (READ completions)
         {
-            let mut entries = self.send_cqe_buffer.entries.borrow_mut();
+            // Safety: Single-threaded access guaranteed by Rc (not Send/Sync).
+            let entries = unsafe { &mut *self.send_cqe_buffer.entries.get() };
             for (_cqe, entry) in entries.drain(..) {
                 // Only process READ completions (is_read=true)
                 // WRITE+IMM completions (is_read=false) are just for SQ progress tracking
@@ -508,7 +501,7 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
             }
         }
 
-        // 6. Flush all endpoints and issue READ operations if needed
+        // 5. Flush all endpoints and issue READ operations if needed
         for (_, ep) in self.endpoints.borrow().iter() {
             let ep_ref = ep.borrow();
 
@@ -564,21 +557,21 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
         })
     }
 
-    /// Process a single CQE.
+    /// Process a single CQE (static version for use in poll closure).
     ///
     /// Each CQE corresponds to one WRITE+IMM which starts with flow_metadata (32B),
     /// followed by message_count messages (or a wrap if message_count == WRAP_MESSAGE_COUNT).
     /// For requests, pushes to recv_stack.
     /// For responses, invokes callback.
     #[inline(always)]
-    fn process_cqe(&self, cqe: Cqe, qpn: u32) {
-        // Skip error CQEs
-        use mlx5::cq::CqeOpcode;
-        if cqe.opcode == CqeOpcode::ReqErr || cqe.opcode == CqeOpcode::RespErr {
-            return;
-        }
-
-        let endpoints = self.endpoints.borrow();
+    fn process_cqe_static(
+        cqe: Cqe,
+        qpn: u32,
+        endpoints: &RefCell<FastMap<Rc<RefCell<EndpointInner<U>>>>>,
+        on_response: &F,
+        recv_stack: &RefCell<Vec<RecvMessage<U>>>,
+    ) {
+        let endpoints = endpoints.borrow();
         let endpoint = match endpoints.get(qpn) {
             Some(ep) => ep,
             None => return,
@@ -654,14 +647,14 @@ impl<U, F: Fn(U, &[u8])> Context<U, F> {
                 if let Some(user_data) = user_data {
                     let data_offset = header_offset + HEADER_SIZE;
                     let data_slice = &ep.recv_ring[data_offset..data_offset + payload_len as usize];
-                    (self.on_response)(user_data, data_slice);
+                    on_response(user_data, data_slice);
                 }
             } else {
                 // Request - piggyback is response_allowance_blocks
                 let response_allowance = piggyback as u64 * ALIGNMENT;
                 drop(ep);
 
-                self.recv_stack.borrow_mut().push(RecvMessage {
+                recv_stack.borrow_mut().push(RecvMessage {
                     endpoint: endpoint.clone(),
                     qpn,
                     call_id,
@@ -755,8 +748,8 @@ impl<U> EndpointInner<U> {
         pd: &Pd,
         srq: &Rc<Srq<SrqEntry>>,
         send_cq: &Rc<mlx5::cq::Cq>,
-        recv_cq: &Rc<MonoCq<CopyrpcQp, RecvCqCallback>>,
-        send_cqe_buffer: &Rc<CqeBuffer>,
+        recv_cq: &Rc<MonoCq<CopyrpcQp>>,
+        send_cqe_buffer: &Rc<SendCqeBuffer>,
         config: &EndpointConfig,
     ) -> io::Result<Rc<RefCell<Self>>> {
         // Allocate ring buffers

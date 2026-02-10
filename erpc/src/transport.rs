@@ -177,9 +177,6 @@ const SIGNALED_INTERVAL: u32 = 4;
 /// Send completion callback type.
 type SendCallback = Box<dyn Fn(Cqe, TransportEntry)>;
 
-/// Recv completion callback type (used internally to collect completions).
-type RecvCallback = Box<dyn Fn(Cqe, TransportEntry)>;
-
 /// QP type for hybrid mode (SQ: normal CQ, RQ: MonoCq).
 type HybridQp = UdQpForMonoCqWithSqCb<TransportEntry, SendCallback>;
 
@@ -193,7 +190,7 @@ pub struct UdTransport {
     /// Send completion queue (normal Cq with callback).
     send_cq: Rc<Cq>,
     /// Receive completion queue (MonoCq for direct dispatch).
-    recv_cq: Rc<MonoCq<HybridQp, RecvCallback>>,
+    recv_cq: Rc<MonoCq<HybridQp>>,
     /// Protection domain.
     pd: Pd,
     /// Port number.
@@ -258,21 +255,9 @@ impl UdTransport {
             process_send_completion(&send_comps_clone, cqe, entry);
         });
 
-        // Create recv callback that collects completions
-        let recv_comps_clone = recv_completions.clone();
-        let recv_callback: RecvCallback = Box::new(move |cqe, entry| {
-            recv_comps_clone.borrow_mut().push(RecvCompletion {
-                buf_idx: entry.buf_idx,
-                byte_cnt: cqe.byte_cnt,
-            });
-        });
-
-        // Create recv CQ (MonoCq for direct dispatch)
-        let recv_cq = Rc::new(ctx.create_mono_cq::<HybridQp, _>(
-            config.max_recv_wr as i32,
-            recv_callback,
-            &cq_config,
-        )?);
+        // Create recv CQ (MonoCq for direct dispatch, callback passed to poll)
+        let recv_cq =
+            Rc::new(ctx.create_mono_cq::<HybridQp>(config.max_recv_wr as i32, &cq_config)?);
 
         // Create UD QP configuration
         let qp_config = UdQpConfig {
@@ -597,7 +582,13 @@ impl UdTransport {
     /// Returns a slice view via callback to avoid allocation while keeping capacity.
     #[inline]
     pub fn poll_recv_completions<R>(&self, f: impl FnOnce(&[RecvCompletion]) -> R) -> R {
-        let count = self.recv_cq.poll();
+        let recv_completions = &self.recv_completions;
+        let count = self.recv_cq.poll(|cqe, entry| {
+            recv_completions.borrow_mut().push(RecvCompletion {
+                buf_idx: entry.buf_idx,
+                byte_cnt: cqe.byte_cnt,
+            });
+        });
         self.recv_cq.flush();
         if count > 0 {
             let pending = self.pending_recvs.get();
@@ -612,13 +603,18 @@ impl UdTransport {
 
     /// Poll the receive CQ and dispatch completions via MonoCq callback.
     ///
-    /// This method polls the recv CQ and invokes the recv_callback (passed at
-    /// construction) for each completion. The callback is called inline from
-    /// the poll loop for maximum performance.
+    /// This method polls the recv CQ with an inline callback for maximum
+    /// performance via monomorphization.
     ///
     /// Returns the number of completions processed.
     pub fn poll_recv_cq(&self) -> usize {
-        let count = self.recv_cq.poll();
+        let recv_completions = &self.recv_completions;
+        let count = self.recv_cq.poll(|cqe, entry| {
+            recv_completions.borrow_mut().push(RecvCompletion {
+                buf_idx: entry.buf_idx,
+                byte_cnt: cqe.byte_cnt,
+            });
+        });
         self.recv_cq.flush();
         if count > 0 {
             let pending = self.pending_recvs.get();
@@ -634,7 +630,7 @@ impl UdTransport {
         self.poll_send_completions(|comps| comps.len())
     }
 
-    /// Poll both CQs (discarding completions).
+    /// Poll both CQs (discarding recv completions via noop).
     ///
     /// Returns (send_completions_count, recv_completions_count).
     pub fn poll(&self) -> (usize, usize) {

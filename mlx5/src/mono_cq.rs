@@ -1,22 +1,21 @@
 //! Monomorphic Completion Queue (MonoCq) for inlined callback dispatch.
 //!
 //! This module provides a generic CQ that eliminates vtable overhead by
-//! statically knowing the queue type and callback type at compile time.
+//! statically knowing the queue type at compile time. The callback is passed
+//! as an argument to `poll()`, enabling monomorphization without storing a
+//! callback in the CQ struct.
 //!
 //! # Performance Benefits
 //!
 //! The standard `Cq::poll()` uses dynamic dispatch (`dyn CompletionTarget`)
-//! which prevents inlining of the callback. `MonoCq<Q, F>` keeps type information,
+//! which prevents inlining of the callback. `MonoCq<Q>` keeps type information,
 //! enabling the compiler to inline both `process_cqe` and the callback.
 //!
 //! # Usage
 //!
 //! ```ignore
-//! // Create MonoCq with callback on the CQ side
-//! let mono_cq = ctx.create_mono_cq(256, |cqe, entry| {
-//!     // This callback is inlined!
-//!     println!("Completed: {:?}", entry);
-//! })?;
+//! // Create MonoCq (no callback stored)
+//! let mono_cq = ctx.create_mono_cq::<QpType>(256, &CqConfig::default())?;
 //!
 //! // Create QP using builder with MonoCq — registration is automatic
 //! let qp = ctx.rc_qp_builder::<Entry, Entry>(&pd, &config)
@@ -24,8 +23,10 @@
 //!     .rq_mono_cq(&mono_cq)
 //!     .build()?;
 //!
-//! // Poll with inlined dispatch
-//! mono_cq.poll();
+//! // Poll with inlined dispatch — callback is monomorphized at call site
+//! mono_cq.poll(|cqe, entry| {
+//!     println!("Completed: {:?}", entry);
+//! });
 //! ```
 
 use std::cell::{Cell, RefCell, UnsafeCell};
@@ -103,31 +104,29 @@ struct MonoCqState {
 /// Monomorphic Completion Queue with inlined callback dispatch.
 ///
 /// Unlike `Cq` which uses `dyn CompletionTarget` for dynamic dispatch,
-/// `MonoCq<Q, F>` keeps the queue type `Q` and callback type as generics,
-/// enabling the compiler to inline processing and callback.
+/// `MonoCq<Q>` keeps the queue type `Q` as a generic, enabling the compiler
+/// to inline processing. The callback is passed to `poll()` as a closure
+/// argument, enabling monomorphization at the call site.
 ///
 /// # Type Parameters
 ///
 /// - `Q`: Queue type implementing `CompletionSource`
-/// - `F`: Callback type `Fn(Cqe, Q::Entry)`
 ///
 /// # Design
 ///
-/// MonoCq uses a single Entry type and single callback for all completions (SQ and RQ).
-/// If you need different Entry types or callbacks for SQ vs RQ, use separate CQs.
+/// MonoCq uses a single Entry type for all completions (SQ and RQ).
+/// If you need different Entry types for SQ vs RQ, use separate CQs.
 ///
 /// # Constraints
 ///
 /// All registered queues must be of the same type `Q`. For heterogeneous
 /// queues, use the standard `Cq` instead.
-pub struct MonoCq<Q, F>
+pub struct MonoCq<Q>
 where
     Q: CompletionSource,
-    F: Fn(Cqe, Q::Entry),
 {
     cq: NonNull<mlx5_sys::ibv_cq>,
     state: MonoCqState,
-    callback: F,
     /// Registered queues for completion dispatch.
     /// Uses FastMap for O(1) lookup without hash computation.
     queues: RefCell<FastMap<Weak<RefCell<Q>>>>,
@@ -135,10 +134,9 @@ where
     _ctx: Context,
 }
 
-impl<Q, F> Drop for MonoCq<Q, F>
+impl<Q> Drop for MonoCq<Q>
 where
     Q: CompletionSource,
-    F: Fn(Cqe, Q::Entry),
 {
     fn drop(&mut self) {
         unsafe {
@@ -150,17 +148,15 @@ where
 impl Context {
     /// Create a Monomorphic Completion Queue with inlined callback dispatch.
     ///
-    /// The callback is stored on the CQ and called for each completion,
-    /// enabling the compiler to inline the callback code.
+    /// The callback is passed to `poll()` at the call site, enabling the
+    /// compiler to inline the callback code via monomorphization.
     ///
     /// # Arguments
     /// * `cqe` - Minimum number of CQ entries (actual may be larger)
-    /// * `callback` - Completion callback `Fn(Cqe, Q::Entry)` called for each completion
     /// * `config` - CQ configuration options (CQE size, compression, etc.)
     ///
     /// # Type Parameters
     /// * `Q` - Queue type implementing `CompletionSource`
-    /// * `F` - Callback type
     ///
     /// # CQE Compression
     /// When `config.compression_format` is Some:
@@ -172,15 +168,9 @@ impl Context {
     ///
     /// # Errors
     /// Returns an error if the CQ cannot be created.
-    pub fn create_mono_cq<Q, F>(
-        &self,
-        cqe: i32,
-        callback: F,
-        config: &CqConfig,
-    ) -> io::Result<MonoCq<Q, F>>
+    pub fn create_mono_cq<Q>(&self, cqe: i32, config: &CqConfig) -> io::Result<MonoCq<Q>>
     where
         Q: CompletionSource,
-        F: Fn(Cqe, Q::Entry),
     {
         // Check device support for CQE compression if requested
         if config.compression_format.is_some() {
@@ -306,7 +296,6 @@ impl Context {
                     cqe_compression,
                     compressed_cqe_count: Cell::new(0),
                 },
-                callback,
                 queues: RefCell::new(FastMap::new()),
                 _ctx: self.clone(),
             })
@@ -314,10 +303,9 @@ impl Context {
     }
 }
 
-impl<Q, F> MonoCq<Q, F>
+impl<Q> MonoCq<Q>
 where
     Q: CompletionSource,
-    F: Fn(Cqe, Q::Entry),
 {
     /// Get the raw ibv_cq pointer.
     pub fn as_ptr(&self) -> *mut mlx5_sys::ibv_cq {
@@ -364,20 +352,22 @@ where
     ///
     /// This is the main performance-critical method. Unlike `Cq::poll()`,
     /// both `process_cqe` and the callback are statically known and can be inlined.
+    /// The callback is passed as a closure argument, enabling monomorphization
+    /// at the call site without storing it in the struct.
     ///
     /// Returns the number of completions processed.
     #[inline]
-    pub fn poll(&self) -> usize {
+    pub fn poll(&self, mut callback: impl FnMut(Cqe, Q::Entry)) -> usize {
         // First CQE: no prefetch
         let Some(cqe) = self.try_next_cqe(false) else {
             return 0;
         };
-        self.dispatch_cqe(cqe);
+        self.dispatch_cqe(cqe, &mut callback);
 
         // Subsequent CQEs: prefetch next slot
         let mut count = 1;
         while let Some(cqe) = self.try_next_cqe(true) {
-            self.dispatch_cqe(cqe);
+            self.dispatch_cqe(cqe, &mut callback);
             count += 1;
         }
         count
@@ -385,11 +375,11 @@ where
 
     /// Dispatch a CQE to the appropriate queue and callback.
     #[inline]
-    fn dispatch_cqe(&self, cqe: Cqe) {
+    fn dispatch_cqe(&self, cqe: Cqe, callback: &mut impl FnMut(Cqe, Q::Entry)) {
         if let Some(queue) = self.find_queue(cqe.qp_num) {
             let qp = queue.borrow();
             if let Some(entry) = qp.process_cqe(cqe) {
-                (self.callback)(cqe, entry);
+                callback(cqe, entry);
             }
         }
     }
@@ -624,20 +614,18 @@ where
 
 use crate::qp::{RcQpForMonoCq, RcQpForMonoCqWithSrq};
 
-/// MonoCq for RcQp without callback (callback on CQ side).
+/// MonoCq for RcQp (callback passed to poll).
 ///
 /// Use with `create_rc_qp_for_mono_cq()` which creates QPs with `()` callback.
 ///
 /// # Type Parameters
 /// - `Entry`: Entry type for completions (same for SQ and RQ)
-/// - `F`: Callback type `Fn(Cqe, Entry)`
-pub type MonoCqRc<Entry, F> = MonoCq<RcQpForMonoCq<Entry>, F>;
+pub type MonoCqRc<Entry> = MonoCq<RcQpForMonoCq<Entry>>;
 
-/// MonoCq for RcQp with Shared Receive Queue without callback (callback on CQ side).
+/// MonoCq for RcQp with Shared Receive Queue (callback passed to poll).
 ///
 /// Use with `with_srq()` builder method to create QPs that share an SRQ.
 ///
 /// # Type Parameters
 /// - `Entry`: Entry type for completions (same for SQ and SRQ)
-/// - `F`: Callback type `Fn(Cqe, Entry)`
-pub type MonoCqRcWithSrq<Entry, F> = MonoCq<RcQpForMonoCqWithSrq<Entry>, F>;
+pub type MonoCqRcWithSrq<Entry> = MonoCq<RcQpForMonoCqWithSrq<Entry>>;

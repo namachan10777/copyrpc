@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
-use mlx5::cq::{Cq, CqConfig, Cqe};
+use mlx5::cq::{Cq, CqConfig};
 use mlx5::dc::{DciConfig, DciForMonoCq, DctConfig};
 use mlx5::device::Context;
 use mlx5::emit_dci_wqe;
@@ -175,14 +175,10 @@ impl ServerRecvState {
 // RC Multi-QP Benchmark
 // =============================================================================
 
-struct RcMultiQpSetup<SF, RF>
-where
-    SF: Fn(Cqe, u64),
-    RF: Fn(Cqe, u64),
-{
+struct RcMultiQpSetup {
     qps: Vec<Rc<RefCell<RcQpForMonoCq<u64>>>>,
-    send_cq: Rc<MonoCqRc<u64, SF>>,
-    recv_cq: Rc<MonoCqRc<u64, RF>>,
+    send_cq: Rc<MonoCqRc<u64>>,
+    recv_cq: Rc<MonoCqRc<u64>>,
     client_state: ClientRecvState,
     _send_mr: MemoryRegion,
     recv_mr: MemoryRegion,
@@ -214,28 +210,16 @@ fn rc_server_thread_main(
     });
 
     let recv_state = Rc::new(ServerRecvState::new());
-    let recv_state_cb = recv_state.clone();
 
-    let send_callback = move |_cqe: Cqe, _entry: u64| {};
-    let recv_callback = move |cqe: Cqe, entry: u64| {
-        if cqe.opcode.is_responder() && cqe.syndrome == 0 {
-            recv_state_cb.push(entry);
-        }
-    };
-
-    let send_cq = match ctx.create_mono_cq::<RcQpForMonoCq<u64>, _>(
-        QPS_PER_THREAD as i32,
-        send_callback,
-        &CqConfig::default(),
-    ) {
+    let send_cq = match ctx
+        .create_mono_cq::<RcQpForMonoCq<u64>>(QPS_PER_THREAD as i32, &CqConfig::default())
+    {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
     };
-    let recv_cq = match ctx.create_mono_cq::<RcQpForMonoCq<u64>, _>(
-        QPS_PER_THREAD as i32,
-        recv_callback,
-        &CqConfig::default(),
-    ) {
+    let recv_cq = match ctx
+        .create_mono_cq::<RcQpForMonoCq<u64>>(QPS_PER_THREAD as i32, &CqConfig::default())
+    {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
     };
@@ -322,14 +306,19 @@ fn rc_server_thread_main(
     let mut send_count = 0usize;
 
     while !stop_flag.load(Ordering::Relaxed) {
-        recv_cq.poll();
+        let recv_state_ref = recv_state.clone();
+        recv_cq.poll(|cqe, entry| {
+            if cqe.opcode.is_responder() && cqe.syndrome == 0 {
+                recv_state_ref.push(entry);
+            }
+        });
         recv_cq.flush();
         let received = recv_state.drain();
         if received.is_empty() {
             continue;
         }
 
-        send_cq.poll();
+        send_cq.poll(|_, _| {});
         send_cq.flush();
 
         // Phase 1: Repost all recvs
@@ -385,30 +374,20 @@ fn rc_server_thread_main(
     }
 }
 
-fn setup_rc_multi_qp_benchmark() -> Option<RcMultiQpSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u64)>> {
+fn setup_rc_multi_qp_benchmark() -> Option<RcMultiQpSetup> {
     let ctx = open_mlx5_device()?;
     let port = 1u8;
     let port_attr = ctx.query_port(port).ok()?;
     let pd = Rc::new(ctx.alloc_pd().ok()?);
 
     let client_state = ClientRecvState::new();
-    let client_state_cb = client_state.clone();
-
-    let send_callback = move |_cqe: Cqe, _entry: u64| {};
-    let recv_callback = move |cqe: Cqe, _entry: u64| {
-        if cqe.opcode.is_responder() && cqe.syndrome == 0 {
-            client_state_cb
-                .rx_count
-                .set(client_state_cb.rx_count.get() + 1);
-        }
-    };
 
     let send_cq = Rc::new(
-        ctx.create_mono_cq(NUM_CONNECTIONS as i32, send_callback, &CqConfig::default())
+        ctx.create_mono_cq::<RcQpForMonoCq<u64>>(NUM_CONNECTIONS as i32, &CqConfig::default())
             .ok()?,
     );
     let recv_cq = Rc::new(
-        ctx.create_mono_cq(NUM_CONNECTIONS as i32, recv_callback, &CqConfig::default())
+        ctx.create_mono_cq::<RcQpForMonoCq<u64>>(NUM_CONNECTIONS as i32, &CqConfig::default())
             .ok()?,
     );
 
@@ -534,11 +513,7 @@ fn setup_rc_multi_qp_benchmark() -> Option<RcMultiQpSetup<impl Fn(Cqe, u64), imp
     })
 }
 
-fn run_rc_multi_qp_throughput<SF, RF>(setup: &RcMultiQpSetup<SF, RF>, iters: u64) -> Duration
-where
-    SF: Fn(Cqe, u64),
-    RF: Fn(Cqe, u64),
-{
+fn run_rc_multi_qp_throughput(setup: &RcMultiQpSetup, iters: u64) -> Duration {
     let send_data = vec![0xAAu8; SMALL_MSG_SIZE];
     let total = iters as usize * NUM_CONNECTIONS;
     let signal_interval = SIGNAL_INTERVAL.min(total).max(1);
@@ -577,7 +552,14 @@ where
 
     while completed < total {
         setup.client_state.reset();
-        setup.recv_cq.poll();
+        let client_state_ref = setup.client_state.clone();
+        setup.recv_cq.poll(|cqe, _entry| {
+            if cqe.opcode.is_responder() && cqe.syndrome == 0 {
+                client_state_ref
+                    .rx_count
+                    .set(client_state_ref.rx_count.get() + 1);
+            }
+        });
         setup.recv_cq.flush();
         let rx_count = setup.client_state.rx_count.get();
 
@@ -587,7 +569,7 @@ where
             continue;
         }
 
-        setup.send_cq.poll();
+        setup.send_cq.poll(|_, _| {});
         setup.send_cq.flush();
 
         // Repost recv WQEs (round-robin across QPs)
@@ -643,13 +625,10 @@ where
 // UD Multi-QP Benchmark (MonoCq)
 // =============================================================================
 
-type UdMonoCqSendCb = Box<dyn Fn(Cqe, u64)>;
-type UdMonoCqRecvCb = Box<dyn Fn(Cqe, u64)>;
-
 struct UdMultiQpSetup {
     qp: Rc<RefCell<UdQpForMonoCq<u64>>>,
-    send_cq: Rc<mlx5::mono_cq::MonoCq<UdQpForMonoCq<u64>, UdMonoCqSendCb>>,
-    recv_cq: Rc<mlx5::mono_cq::MonoCq<UdQpForMonoCq<u64>, UdMonoCqRecvCb>>,
+    send_cq: Rc<mlx5::mono_cq::MonoCq<UdQpForMonoCq<u64>>>,
+    recv_cq: Rc<mlx5::mono_cq::MonoCq<UdQpForMonoCq<u64>>>,
     client_state: ClientRecvState,
     _send_mr: MemoryRegion,
     recv_mr: MemoryRegion,
@@ -682,28 +661,16 @@ fn ud_server_thread_main(
     });
 
     let recv_count = Rc::new(Cell::new(0usize));
-    let recv_count_cb = recv_count.clone();
 
-    let send_callback: Box<dyn Fn(Cqe, u64)> = Box::new(move |_cqe: Cqe, _entry: u64| {});
-    let recv_callback: Box<dyn Fn(Cqe, u64)> = Box::new(move |cqe: Cqe, _entry: u64| {
-        if cqe.opcode.is_responder() && cqe.syndrome == 0 {
-            recv_count_cb.set(recv_count_cb.get() + 1);
-        }
-    });
-
-    let send_cq = match ctx.create_mono_cq::<UdQpForMonoCq<u64>, _>(
-        QPS_PER_THREAD as i32,
-        send_callback,
-        &CqConfig::default(),
-    ) {
+    let send_cq = match ctx
+        .create_mono_cq::<UdQpForMonoCq<u64>>(QPS_PER_THREAD as i32, &CqConfig::default())
+    {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
     };
-    let recv_cq = match ctx.create_mono_cq::<UdQpForMonoCq<u64>, _>(
-        QPS_PER_THREAD as i32,
-        recv_callback,
-        &CqConfig::default(),
-    ) {
+    let recv_cq = match ctx
+        .create_mono_cq::<UdQpForMonoCq<u64>>(QPS_PER_THREAD as i32, &CqConfig::default())
+    {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
     };
@@ -775,14 +742,19 @@ fn ud_server_thread_main(
 
     while !stop_flag.load(Ordering::Relaxed) {
         recv_count.set(0);
-        recv_cq.poll();
+        let recv_count_ref = recv_count.clone();
+        recv_cq.poll(|cqe, _entry| {
+            if cqe.opcode.is_responder() && cqe.syndrome == 0 {
+                recv_count_ref.set(recv_count_ref.get() + 1);
+            }
+        });
         recv_cq.flush();
         let count = recv_count.get();
         if count == 0 {
             continue;
         }
 
-        send_cq.poll();
+        send_cq.poll(|_, _| {});
         send_cq.flush();
 
         // Repost recv
@@ -845,32 +817,14 @@ fn setup_ud_multi_qp_benchmark() -> Option<UdMultiQpSetup> {
     let pd = Rc::new(ctx.alloc_pd().ok()?);
 
     let client_state = ClientRecvState::new();
-    let client_state_cb = client_state.clone();
-
-    let send_callback: UdMonoCqSendCb = Box::new(move |_cqe: Cqe, _entry: u64| {});
-    let recv_callback: UdMonoCqRecvCb = Box::new(move |cqe: Cqe, _entry: u64| {
-        if cqe.opcode.is_responder() && cqe.syndrome == 0 {
-            client_state_cb
-                .rx_count
-                .set(client_state_cb.rx_count.get() + 1);
-        }
-    });
 
     let send_cq = Rc::new(
-        ctx.create_mono_cq::<UdQpForMonoCq<u64>, _>(
-            NUM_CONNECTIONS as i32,
-            send_callback,
-            &CqConfig::default(),
-        )
-        .ok()?,
+        ctx.create_mono_cq::<UdQpForMonoCq<u64>>(NUM_CONNECTIONS as i32, &CqConfig::default())
+            .ok()?,
     );
     let recv_cq = Rc::new(
-        ctx.create_mono_cq::<UdQpForMonoCq<u64>, _>(
-            NUM_CONNECTIONS as i32,
-            recv_callback,
-            &CqConfig::default(),
-        )
-        .ok()?,
+        ctx.create_mono_cq::<UdQpForMonoCq<u64>>(NUM_CONNECTIONS as i32, &CqConfig::default())
+            .ok()?,
     );
 
     let qkey = 0x11111111u32;
@@ -1015,7 +969,14 @@ fn run_ud_multi_qp_throughput(setup: &UdMultiQpSetup, iters: u64) -> Duration {
 
     while completed < total {
         setup.client_state.reset();
-        setup.recv_cq.poll();
+        let client_state_ref = setup.client_state.clone();
+        setup.recv_cq.poll(|cqe, _entry| {
+            if cqe.opcode.is_responder() && cqe.syndrome == 0 {
+                client_state_ref
+                    .rx_count
+                    .set(client_state_ref.rx_count.get() + 1);
+            }
+        });
         setup.recv_cq.flush();
         let rx_count = setup.client_state.rx_count.get();
 
@@ -1026,7 +987,7 @@ fn run_ud_multi_qp_throughput(setup: &UdMultiQpSetup, iters: u64) -> Duration {
             continue;
         }
 
-        setup.send_cq.poll();
+        setup.send_cq.poll(|_, _| {});
         setup.send_cq.flush();
 
         // Repost recv WQEs
@@ -1094,11 +1055,18 @@ fn run_ud_multi_qp_throughput(setup: &UdMultiQpSetup, iters: u64) -> Duration {
     // Drain remaining inflight
     while inflight > 0 {
         setup.client_state.reset();
-        setup.recv_cq.poll();
+        let client_state_ref = setup.client_state.clone();
+        setup.recv_cq.poll(|cqe, _entry| {
+            if cqe.opcode.is_responder() && cqe.syndrome == 0 {
+                client_state_ref
+                    .rx_count
+                    .set(client_state_ref.rx_count.get() + 1);
+            }
+        });
         setup.recv_cq.flush();
         inflight -= setup.client_state.rx_count.get();
 
-        setup.send_cq.poll();
+        setup.send_cq.poll(|_, _| {});
         setup.send_cq.flush();
     }
 
@@ -1109,11 +1077,9 @@ fn run_ud_multi_qp_throughput(setup: &UdMultiQpSetup, iters: u64) -> Duration {
 // DC Multi-QP Benchmark (MonoCq for DCI send, regular Cq for DCT recv)
 // =============================================================================
 
-type DcMonoCqSendCb = Box<dyn Fn(Cqe, u64)>;
-
 struct DcMultiQpSetup {
     dci: Rc<RefCell<DciForMonoCq<u64>>>,
-    send_cq: Rc<mlx5::mono_cq::MonoCq<DciForMonoCq<u64>, DcMonoCqSendCb>>,
+    send_cq: Rc<mlx5::mono_cq::MonoCq<DciForMonoCq<u64>>>,
     recv_cq: Rc<Cq>,
     _dct: mlx5::dc::Dct<u64>,
     srq: mlx5::srq::Srq<u64>,
@@ -1145,13 +1111,9 @@ fn dc_server_thread_main(
         Err(_) => return,
     });
 
-    let send_callback: DcMonoCqSendCb = Box::new(move |_cqe: Cqe, _entry: u64| {});
-
-    let send_cq = match ctx.create_mono_cq::<DciForMonoCq<u64>, _>(
-        QPS_PER_THREAD as i32,
-        send_callback,
-        &CqConfig::default(),
-    ) {
+    let send_cq = match ctx
+        .create_mono_cq::<DciForMonoCq<u64>>(QPS_PER_THREAD as i32, &CqConfig::default())
+    {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
     };
@@ -1256,7 +1218,7 @@ fn dc_server_thread_main(
             continue;
         }
 
-        send_cq.poll();
+        send_cq.poll(|_, _| {});
         send_cq.flush();
 
         // Process SRQ completions
@@ -1317,15 +1279,9 @@ fn setup_dc_multi_qp_benchmark() -> Option<DcMultiQpSetup> {
     let port_attr = ctx.query_port(port).ok()?;
     let pd = Rc::new(ctx.alloc_pd().ok()?);
 
-    let send_callback: DcMonoCqSendCb = Box::new(move |_cqe: Cqe, _entry: u64| {});
-
     let send_cq = Rc::new(
-        ctx.create_mono_cq::<DciForMonoCq<u64>, _>(
-            NUM_CONNECTIONS as i32,
-            send_callback,
-            &CqConfig::default(),
-        )
-        .ok()?,
+        ctx.create_mono_cq::<DciForMonoCq<u64>>(NUM_CONNECTIONS as i32, &CqConfig::default())
+            .ok()?,
     );
     let recv_cq = Rc::new(
         ctx.create_cq(NUM_CONNECTIONS as i32, &CqConfig::default())
@@ -1494,7 +1450,7 @@ fn run_dc_multi_qp_throughput(setup: &DcMultiQpSetup, iters: u64) -> Duration {
             continue;
         }
 
-        setup.send_cq.poll();
+        setup.send_cq.poll(|_, _| {});
         setup.send_cq.flush();
 
         // Process SRQ completions
@@ -1561,7 +1517,7 @@ fn run_dc_multi_qp_throughput(setup: &DcMultiQpSetup, iters: u64) -> Duration {
         setup.recv_cq.flush();
         inflight -= rx_count;
 
-        setup.send_cq.poll();
+        setup.send_cq.poll(|_, _| {});
         setup.send_cq.flush();
 
         for _ in 0..rx_count {

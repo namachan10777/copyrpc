@@ -179,12 +179,11 @@ impl<'a, Entry, T> DciBuilder<'a, Entry, T, NoCq, (), ()> {
     }
 
     /// Set MonoCq (callback is stored in MonoCq).
-    pub fn sq_mono_cq<Q, F>(
+    pub fn sq_mono_cq<Q>(
         self,
-        mono_cq: &Rc<MonoCq<Q, F>>,
-    ) -> DciBuilder<'a, Entry, T, CqSet, (), Rc<MonoCq<Q, F>>>
+        mono_cq: &Rc<MonoCq<Q>>,
+    ) -> DciBuilder<'a, Entry, T, CqSet, (), Rc<MonoCq<Q>>>
     where
-        F: Fn(Cqe, Q::Entry) + 'static,
         Q: crate::mono_cq::CompletionSource,
     {
         DciBuilder {
@@ -692,9 +691,8 @@ impl<'a, Entry> DctBuilder<'a, Entry, NoCq> {
     }
 
     /// Set MonoCq for receive completions.
-    pub fn recv_mono_cq<Q, F>(self, mono_cq: &MonoCq<Q, F>) -> DctBuilder<'a, Entry, CqSet>
+    pub fn recv_mono_cq<Q>(self, mono_cq: &MonoCq<Q>) -> DctBuilder<'a, Entry, CqSet>
     where
-        F: Fn(Cqe, Q::Entry) + 'static,
         Q: crate::mono_cq::CompletionSource,
     {
         DctBuilder {

@@ -28,15 +28,9 @@ fn test_mono_cq_creation() {
         }
     };
 
-    fn callback(_cqe: Cqe, _entry: u64) {}
-
     let mono_cq = Rc::new(
         ctx.ctx
-            .create_mono_cq::<RcQpForMonoCq<u64>, _>(
-                256,
-                callback as fn(_, _),
-                &CqConfig::default(),
-            )
+            .create_mono_cq::<RcQpForMonoCq<u64>>(256, &CqConfig::default())
             .expect("Failed to create MonoCq"),
     );
 
@@ -62,17 +56,11 @@ fn test_mono_cq_with_rc_qp() {
 
     // Track completions (both SQ and RQ)
     let completions: Rc<RefCell<Vec<(Cqe, u64)>>> = Rc::new(RefCell::new(Vec::new()));
-    let completions_clone = completions.clone();
-
-    // Single callback handles both SQ and RQ completions
-    let callback = move |cqe: Cqe, entry: u64| {
-        completions_clone.borrow_mut().push((cqe, entry));
-    };
 
     // Create a single CQ for both QPs
     let cq = Rc::new(
         ctx.ctx
-            .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, callback, &CqConfig::default())
+            .create_mono_cq::<RcQpForMonoCq<u64>>(256, &CqConfig::default())
             .expect("Failed to create MonoCq"),
     );
 
@@ -154,7 +142,9 @@ fn test_mono_cq_with_rc_qp() {
     let timeout = std::time::Duration::from_secs(5);
 
     loop {
-        let count = cq.poll();
+        let count = cq.poll(|cqe, entry| {
+            completions.borrow_mut().push((cqe, entry));
+        });
         if count > 0 {
             cq.flush();
             break;
@@ -195,22 +185,16 @@ fn test_mono_cq_poll_empty() {
         }
     };
 
-    fn callback(_cqe: Cqe, _entry: u64) {
-        panic!("Callback should not be called");
-    }
-
     let mono_cq = Rc::new(
         ctx.ctx
-            .create_mono_cq::<RcQpForMonoCq<u64>, _>(
-                256,
-                callback as fn(_, _),
-                &CqConfig::default(),
-            )
+            .create_mono_cq::<RcQpForMonoCq<u64>>(256, &CqConfig::default())
             .expect("Failed to create MonoCq"),
     );
 
     // Poll should return 0 when no completions
-    let count = mono_cq.poll();
+    let count = mono_cq.poll(|_, _| {
+        panic!("Callback should not be called");
+    });
     assert_eq!(count, 0, "Empty CQ should return 0 completions");
 
     // flush() should be safe to call even with no completions
@@ -232,16 +216,11 @@ fn test_mono_cq_multiple_completions() {
 
     // Track completions
     let completions: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
-    let completions_clone = completions.clone();
-
-    let callback = move |_cqe: Cqe, entry: u64| {
-        completions_clone.borrow_mut().push(entry);
-    };
 
     // Use a single CQ for both QPs
     let cq = Rc::new(
         ctx.ctx
-            .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, callback, &CqConfig::default())
+            .create_mono_cq::<RcQpForMonoCq<u64>>(256, &CqConfig::default())
             .expect("Failed to create MonoCq"),
     );
 
@@ -323,7 +302,9 @@ fn test_mono_cq_multiple_completions() {
     let timeout = std::time::Duration::from_secs(5);
 
     while completions.borrow().len() < num_ops {
-        let count = cq.poll();
+        let count = cq.poll(|_cqe, entry| {
+            completions.borrow_mut().push(entry);
+        });
         if count > 0 {
             cq.flush();
         }
@@ -370,16 +351,11 @@ fn test_mono_cq_high_load() {
     };
 
     let send_completions: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
-    let send_completions_clone = send_completions.clone();
-
-    let callback = move |_cqe: Cqe, entry: u64| {
-        send_completions_clone.borrow_mut().push(entry);
-    };
 
     // Use larger CQ to accommodate high load - single CQ for both QPs
     let cq = Rc::new(
         ctx.ctx
-            .create_mono_cq::<RcQpForMonoCq<u64>, _>(512, callback, &CqConfig::default())
+            .create_mono_cq::<RcQpForMonoCq<u64>>(512, &CqConfig::default())
             .expect("Failed to create MonoCq"),
     );
 
@@ -466,7 +442,9 @@ fn test_mono_cq_high_load() {
     let timeout = std::time::Duration::from_secs(10);
 
     while send_completions.borrow().len() < num_ops {
-        let count = cq.poll();
+        let count = cq.poll(|_cqe, entry| {
+            send_completions.borrow_mut().push(entry);
+        });
         if count > 0 {
             cq.flush();
         }
@@ -510,32 +488,20 @@ fn test_mono_cq_recv_rdma_write_imm() {
 
     // Track send completions from QP2
     let send_completions: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
-    let send_completions_clone = send_completions.clone();
 
     // Track recv completions on QP1 (captures IMM data)
     let recv_completions: Rc<RefCell<Vec<(u32, u64)>>> = Rc::new(RefCell::new(Vec::new()));
-    let recv_completions_clone = recv_completions.clone();
-
-    // QP1's callback tracks recv completions (IMM data)
-    let qp1_callback = move |cqe: Cqe, entry: u64| {
-        recv_completions_clone.borrow_mut().push((cqe.imm, entry));
-    };
-
-    // QP2's callback tracks send completions
-    let qp2_callback = move |_cqe: Cqe, entry: u64| {
-        send_completions_clone.borrow_mut().push(entry);
-    };
 
     // Create separate CQs for each QP
     let cq1 = Rc::new(
         ctx.ctx
-            .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, qp1_callback, &CqConfig::default())
+            .create_mono_cq::<RcQpForMonoCq<u64>>(256, &CqConfig::default())
             .expect("Failed to create MonoCq 1"),
     );
 
     let cq2 = Rc::new(
         ctx.ctx
-            .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, qp2_callback, &CqConfig::default())
+            .create_mono_cq::<RcQpForMonoCq<u64>>(256, &CqConfig::default())
             .expect("Failed to create MonoCq 2"),
     );
 
@@ -637,13 +603,17 @@ fn test_mono_cq_recv_rdma_write_imm() {
 
     // We only care about recv completions for this test
     while recv_completions.borrow().len() < num_ops {
-        let recv_count = cq1.poll();
+        let recv_count = cq1.poll(|cqe, entry| {
+            recv_completions.borrow_mut().push((cqe.imm, entry));
+        });
         if recv_count > 0 {
             cq1.flush();
         }
 
         // Also drain send CQ (cq2) to avoid overflow
-        let send_count = cq2.poll();
+        let send_count = cq2.poll(|_cqe, entry| {
+            send_completions.borrow_mut().push(entry);
+        });
         if send_count > 0 {
             cq2.flush();
         }
@@ -693,17 +663,15 @@ fn test_mono_cq_bidirectional_pingpong() {
     let qp1_count = Rc::new(Cell::new(0usize));
     let qp2_count = Rc::new(Cell::new(0usize));
 
-    fn noop_callback(_cqe: Cqe, _entry: u64) {}
-
-    // Create CQs with noop callbacks - we'll track completions via poll return value
+    // Create CQs - we'll track completions via poll return value
     let qp1_cq = Rc::new(
         ctx.ctx
-            .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, noop_callback, &CqConfig::default())
+            .create_mono_cq::<RcQpForMonoCq<u64>>(256, &CqConfig::default())
             .expect("qp1_cq"),
     );
     let qp2_cq = Rc::new(
         ctx.ctx
-            .create_mono_cq::<RcQpForMonoCq<u64>, _>(256, noop_callback, &CqConfig::default())
+            .create_mono_cq::<RcQpForMonoCq<u64>>(256, &CqConfig::default())
             .expect("qp2_cq"),
     );
 
@@ -799,7 +767,7 @@ fn test_mono_cq_bidirectional_pingpong() {
 
         // Wait for QP2 to receive (poll returns number of completions)
         while qp2_count.get() <= i {
-            let count = qp2_cq.poll();
+            let count = qp2_cq.poll(|_, _| {});
             if count > 0 {
                 // Assume mixed send/recv completions
                 qp2_count.set(qp2_count.get() + count as usize);
@@ -829,7 +797,7 @@ fn test_mono_cq_bidirectional_pingpong() {
 
         // Wait for QP1 to receive
         while qp1_count.get() <= i {
-            let count = qp1_cq.poll();
+            let count = qp1_cq.poll(|_, _| {});
             if count > 0 {
                 qp1_count.set(qp1_count.get() + count as usize);
                 qp1_cq.flush();
@@ -842,9 +810,9 @@ fn test_mono_cq_bidirectional_pingpong() {
     }
 
     // Drain remaining completions
-    qp1_cq.poll();
+    qp1_cq.poll(|_, _| {});
     qp1_cq.flush();
-    qp2_cq.poll();
+    qp2_cq.poll(|_, _| {});
     qp2_cq.flush();
 
     println!(
@@ -870,11 +838,6 @@ fn test_mono_cq_wraparound() {
     };
 
     let completion_count = Rc::new(Cell::new(0u64));
-    let completion_count_clone = completion_count.clone();
-
-    let callback = move |_cqe: Cqe, _entry: u64| {
-        completion_count_clone.set(completion_count_clone.get() + 1);
-    };
 
     let cq_size = 256; // Standard CQ size
     let num_operations = cq_size * 3; // Process 768 completions to wrap around ~3 times
@@ -883,7 +846,7 @@ fn test_mono_cq_wraparound() {
     // Use a single CQ for both QPs
     let cq = Rc::new(
         ctx.ctx
-            .create_mono_cq::<RcQpForMonoCq<u64>, _>(cq_size, callback, &CqConfig::default())
+            .create_mono_cq::<RcQpForMonoCq<u64>>(cq_size, &CqConfig::default())
             .expect("Failed to create MonoCq"),
     );
 
@@ -963,7 +926,9 @@ fn test_mono_cq_wraparound() {
         let expected = completion_count.get() + batch_size as u64;
         let timeout = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while completion_count.get() < expected {
-            cq.poll();
+            cq.poll(|_cqe, _entry| {
+                completion_count.set(completion_count.get() + 1);
+            });
             cq.flush();
             if std::time::Instant::now() > timeout {
                 panic!(
@@ -1004,12 +969,6 @@ fn test_mono_cq_with_srq() {
 
     // Track recv completions
     let recv_completions: Rc<RefCell<Vec<(u32, SrqEntry)>>> = Rc::new(RefCell::new(Vec::new()));
-    let recv_completions_clone = recv_completions.clone();
-
-    let recv_callback = move |cqe: Cqe, entry: SrqEntry| {
-        eprintln!("recv_callback: qpn={}, imm={}", entry.qpn, cqe.imm);
-        recv_completions_clone.borrow_mut().push((cqe.imm, entry));
-    };
 
     // Create send CQ (normal CQ)
     let send_cq = Rc::new(
@@ -1035,10 +994,10 @@ fn test_mono_cq_with_srq() {
     fn empty_sq_callback(_cqe: Cqe, _entry: SrqEntry) {}
 
     // Create recv CQ (MonoCq for SRQ-based QP with function pointer callback type)
-    let recv_cq: Rc<mlx5::mono_cq::MonoCq<RcQpForMonoCqWithSrqAndSqCb<SrqEntry, SqCallback>, _>> =
+    let recv_cq: Rc<mlx5::mono_cq::MonoCq<RcQpForMonoCqWithSrqAndSqCb<SrqEntry, SqCallback>>> =
         Rc::new(
             ctx.ctx
-                .create_mono_cq(256, recv_callback, &CqConfig::default())
+                .create_mono_cq(256, &CqConfig::default())
                 .expect("recv_cq"),
         );
 
@@ -1141,7 +1100,10 @@ fn test_mono_cq_with_srq() {
     let timeout = std::time::Duration::from_secs(10);
 
     while recv_completions.borrow().len() < num_ops {
-        let recv_count = recv_cq.poll();
+        let recv_count = recv_cq.poll(|cqe, entry| {
+            eprintln!("recv_callback: qpn={}, imm={}", entry.qpn, cqe.imm);
+            recv_completions.borrow_mut().push((cqe.imm, entry));
+        });
         if recv_count > 0 {
             eprintln!("recv_cq.poll() returned {}", recv_count);
             recv_cq.flush();
@@ -1198,20 +1160,11 @@ fn test_mono_cq_with_ud_qp() {
 
     // Track completions
     let completions: Rc<RefCell<Vec<(Cqe, u64)>>> = Rc::new(RefCell::new(Vec::new()));
-    let completions_clone = completions.clone();
-
-    let callback = move |cqe: Cqe, entry: u64| {
-        eprintln!(
-            "UD callback: entry={}, opcode={:?}, syndrome={}",
-            entry, cqe.opcode, cqe.syndrome
-        );
-        completions_clone.borrow_mut().push((cqe, entry));
-    };
 
     // Create MonoCq for UD QPs
     let cq = Rc::new(
         ctx.ctx
-            .create_mono_cq::<UdQpForMonoCq<u64>, _>(256, callback, &CqConfig::default())
+            .create_mono_cq::<UdQpForMonoCq<u64>>(256, &CqConfig::default())
             .expect("Failed to create MonoCq"),
     );
 
@@ -1308,7 +1261,13 @@ fn test_mono_cq_with_ud_qp() {
     let timeout = std::time::Duration::from_secs(5);
 
     while completions.borrow().len() < 2 {
-        let count = cq.poll();
+        let count = cq.poll(|cqe, entry| {
+            eprintln!(
+                "UD callback: entry={}, opcode={:?}, syndrome={}",
+                entry, cqe.opcode, cqe.syndrome
+            );
+            completions.borrow_mut().push((cqe, entry));
+        });
         if count > 0 {
             eprintln!("poll returned {}", count);
             cq.flush();

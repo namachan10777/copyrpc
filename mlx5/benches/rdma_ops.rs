@@ -154,14 +154,10 @@ impl Drop for ServerHandle {
 // Endpoint State for Send/Recv benchmarks
 // =============================================================================
 
-struct SendRecvEndpoint<SF, RF>
-where
-    SF: Fn(Cqe, u64),
-    RF: Fn(Cqe, u64),
-{
+struct SendRecvEndpoint {
     qp: Rc<RefCell<RcQpForMonoCq<u64>>>,
-    send_cq: Rc<MonoCqRc<u64, SF>>,
-    recv_cq: Rc<MonoCqRc<u64, RF>>,
+    send_cq: Rc<MonoCqRc<u64>>,
+    recv_cq: Rc<MonoCqRc<u64>>,
     shared_state: SharedCqeState,
     _send_mr: MemoryRegion,
     recv_mr: MemoryRegion,
@@ -171,12 +167,8 @@ where
     rq_next_idx: usize,
 }
 
-struct SendRecvBenchmarkSetup<SF, RF>
-where
-    SF: Fn(Cqe, u64),
-    RF: Fn(Cqe, u64),
-{
-    client: SendRecvEndpoint<SF, RF>,
+struct SendRecvBenchmarkSetup {
+    client: SendRecvEndpoint,
     _server_handle: ServerHandle,
     _pd: Rc<Pd>,
     _ctx: Context,
@@ -186,14 +178,10 @@ where
 // Endpoint State for WRITE WITH IMM benchmarks
 // =============================================================================
 
-struct WriteImmEndpoint<SF, RF>
-where
-    SF: Fn(Cqe, u64),
-    RF: Fn(Cqe, u64),
-{
+struct WriteImmEndpoint {
     qp: Rc<RefCell<RcQpForMonoCq<u64>>>,
-    send_cq: Rc<MonoCqRc<u64, SF>>,
-    recv_cq: Rc<MonoCqRc<u64, RF>>,
+    send_cq: Rc<MonoCqRc<u64>>,
+    recv_cq: Rc<MonoCqRc<u64>>,
     shared_state: SharedCqeState,
     _send_mr: MemoryRegion,
     recv_mr: MemoryRegion,
@@ -203,12 +191,8 @@ where
     remote_rkey: u32,
 }
 
-struct WriteImmBenchmarkSetup<SF, RF>
-where
-    SF: Fn(Cqe, u64),
-    RF: Fn(Cqe, u64),
-{
-    client: WriteImmEndpoint<SF, RF>,
+struct WriteImmBenchmarkSetup {
+    client: WriteImmEndpoint,
     _server_handle: ServerHandle,
     _pd: Rc<Pd>,
     _ctx: Context,
@@ -250,26 +234,18 @@ struct UdSendRecvBenchmarkSetup {
 // Endpoint State for RDMA Read/Write benchmarks (loopback)
 // =============================================================================
 
-struct RdmaLoopbackEndpoint<SF, RF>
-where
-    SF: Fn(Cqe, u64),
-    RF: Fn(Cqe, u64),
-{
+struct RdmaLoopbackEndpoint {
     qp: Rc<RefCell<RcQpForMonoCq<u64>>>,
-    send_cq: Rc<MonoCqRc<u64, SF>>,
-    _recv_cq: Rc<MonoCqRc<u64, RF>>,
+    send_cq: Rc<MonoCqRc<u64>>,
+    _recv_cq: Rc<MonoCqRc<u64>>,
     local_mr: MemoryRegion,
     remote_mr: MemoryRegion,
     local_buf: AlignedBuffer,
     remote_buf: AlignedBuffer,
 }
 
-struct RdmaLoopbackSetup<SF, RF>
-where
-    SF: Fn(Cqe, u64),
-    RF: Fn(Cqe, u64),
-{
-    endpoint: RdmaLoopbackEndpoint<SF, RF>,
+struct RdmaLoopbackSetup {
+    endpoint: RdmaLoopbackEndpoint,
     _pd: Rc<Pd>,
     _ctx: Context,
 }
@@ -288,38 +264,21 @@ fn open_mlx5_device() -> Option<Context> {
     None
 }
 
-fn setup_send_recv_benchmark()
--> Option<SendRecvBenchmarkSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u64)>> {
+fn setup_send_recv_benchmark() -> Option<SendRecvBenchmarkSetup> {
     let ctx = open_mlx5_device()?;
     let port = 1u8;
     let port_attr = ctx.query_port(port).ok()?;
     let pd = Rc::new(ctx.alloc_pd().ok()?);
 
     let shared_state = SharedCqeState::new();
-    let shared_state_for_recv = shared_state.clone();
-
-    let send_callback = move |_cqe: Cqe, _entry: u64| {};
-    let recv_callback = move |cqe: Cqe, _entry: u64| {
-        if cqe.opcode.is_responder() && cqe.syndrome == 0 {
-            shared_state_for_recv.push(&cqe);
-        }
-    };
 
     let send_cq = Rc::new(
-        ctx.create_mono_cq(
-            SEND_RECV_QUEUE_DEPTH as i32,
-            send_callback,
-            &CqConfig::default(),
-        )
-        .ok()?,
+        ctx.create_mono_cq(SEND_RECV_QUEUE_DEPTH as i32, &CqConfig::default())
+            .ok()?,
     );
     let recv_cq = Rc::new(
-        ctx.create_mono_cq(
-            SEND_RECV_QUEUE_DEPTH as i32,
-            recv_callback,
-            &CqConfig::default(),
-        )
-        .ok()?,
+        ctx.create_mono_cq(SEND_RECV_QUEUE_DEPTH as i32, &CqConfig::default())
+            .ok()?,
     );
 
     let config = RcQpConfig {
@@ -421,38 +380,21 @@ fn setup_send_recv_benchmark()
     })
 }
 
-fn setup_write_imm_benchmark()
--> Option<WriteImmBenchmarkSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u64)>> {
+fn setup_write_imm_benchmark() -> Option<WriteImmBenchmarkSetup> {
     let ctx = open_mlx5_device()?;
     let port = 1u8;
     let port_attr = ctx.query_port(port).ok()?;
     let pd = Rc::new(ctx.alloc_pd().ok()?);
 
     let shared_state = SharedCqeState::new();
-    let shared_state_for_recv = shared_state.clone();
-
-    let send_callback = move |_cqe: Cqe, _entry: u64| {};
-    let recv_callback = move |cqe: Cqe, _entry: u64| {
-        if cqe.opcode.is_responder() && cqe.syndrome == 0 {
-            shared_state_for_recv.push(&cqe);
-        }
-    };
 
     let send_cq = Rc::new(
-        ctx.create_mono_cq(
-            SEND_RECV_QUEUE_DEPTH as i32,
-            send_callback,
-            &CqConfig::default(),
-        )
-        .ok()?,
+        ctx.create_mono_cq(SEND_RECV_QUEUE_DEPTH as i32, &CqConfig::default())
+            .ok()?,
     );
     let recv_cq = Rc::new(
-        ctx.create_mono_cq(
-            SEND_RECV_QUEUE_DEPTH as i32,
-            recv_callback,
-            &CqConfig::default(),
-        )
-        .ok()?,
+        ctx.create_mono_cq(SEND_RECV_QUEUE_DEPTH as i32, &CqConfig::default())
+            .ok()?,
     );
 
     let config = RcQpConfig {
@@ -561,23 +503,18 @@ fn setup_write_imm_benchmark()
     })
 }
 
-fn setup_rdma_loopback_benchmark(
-    relaxed: bool,
-) -> Option<RdmaLoopbackSetup<impl Fn(Cqe, u64), impl Fn(Cqe, u64)>> {
+fn setup_rdma_loopback_benchmark(relaxed: bool) -> Option<RdmaLoopbackSetup> {
     let ctx = open_mlx5_device()?;
     let port = 1u8;
     let port_attr = ctx.query_port(port).ok()?;
     let pd = Rc::new(ctx.alloc_pd().ok()?);
 
-    let send_callback = move |_cqe: Cqe, _entry: u64| {};
-    let recv_callback = move |_cqe: Cqe, _entry: u64| {};
-
     let send_cq = Rc::new(
-        ctx.create_mono_cq(RDMA_QUEUE_DEPTH as i32, send_callback, &CqConfig::default())
+        ctx.create_mono_cq(RDMA_QUEUE_DEPTH as i32, &CqConfig::default())
             .ok()?,
     );
     let recv_cq = Rc::new(
-        ctx.create_mono_cq(RDMA_QUEUE_DEPTH as i32, recv_callback, &CqConfig::default())
+        ctx.create_mono_cq(RDMA_QUEUE_DEPTH as i32, &CqConfig::default())
             .ok()?,
     );
 
@@ -700,29 +637,17 @@ fn server_thread_main(
     });
 
     let shared_state = Rc::new(ServerSharedState::new());
-    let shared_state_for_recv = shared_state.clone();
 
-    let send_callback = move |_cqe: Cqe, _entry: u64| {};
-    let recv_callback = move |cqe: Cqe, _entry: u64| {
-        if cqe.opcode.is_responder() && cqe.syndrome == 0 {
-            shared_state_for_recv.push(&cqe);
-        }
-    };
-
-    let send_cq = match ctx.create_mono_cq::<RcQpForMonoCq<u64>, _>(
-        SEND_RECV_QUEUE_DEPTH as i32,
-        send_callback,
-        &CqConfig::default(),
-    ) {
+    let send_cq = match ctx
+        .create_mono_cq::<RcQpForMonoCq<u64>>(SEND_RECV_QUEUE_DEPTH as i32, &CqConfig::default())
+    {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
     };
 
-    let recv_cq = match ctx.create_mono_cq::<RcQpForMonoCq<u64>, _>(
-        SEND_RECV_QUEUE_DEPTH as i32,
-        recv_callback,
-        &CqConfig::default(),
-    ) {
+    let recv_cq = match ctx
+        .create_mono_cq::<RcQpForMonoCq<u64>>(SEND_RECV_QUEUE_DEPTH as i32, &CqConfig::default())
+    {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
     };
@@ -805,7 +730,11 @@ fn server_thread_main(
 
     while !stop_flag.load(Ordering::Relaxed) {
         shared_state.reset();
-        recv_cq.poll();
+        recv_cq.poll(|cqe, _entry| {
+            if cqe.opcode.is_responder() && cqe.syndrome == 0 {
+                shared_state.push(&cqe);
+            }
+        });
         recv_cq.flush();
         let count = shared_state.rx_count.get();
 
@@ -813,7 +742,7 @@ fn server_thread_main(
             continue;
         }
 
-        send_cq.poll();
+        send_cq.poll(|_, _| {});
         send_cq.flush();
 
         // Repost receives and send echoes
@@ -891,29 +820,17 @@ fn write_imm_server_thread_main(
     });
 
     let shared_state = Rc::new(ServerSharedState::new());
-    let shared_state_for_recv = shared_state.clone();
 
-    let send_callback = move |_cqe: Cqe, _entry: u64| {};
-    let recv_callback = move |cqe: Cqe, _entry: u64| {
-        if cqe.opcode.is_responder() && cqe.syndrome == 0 {
-            shared_state_for_recv.push(&cqe);
-        }
-    };
-
-    let send_cq = match ctx.create_mono_cq::<RcQpForMonoCq<u64>, _>(
-        SEND_RECV_QUEUE_DEPTH as i32,
-        send_callback,
-        &CqConfig::default(),
-    ) {
+    let send_cq = match ctx
+        .create_mono_cq::<RcQpForMonoCq<u64>>(SEND_RECV_QUEUE_DEPTH as i32, &CqConfig::default())
+    {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
     };
 
-    let recv_cq = match ctx.create_mono_cq::<RcQpForMonoCq<u64>, _>(
-        SEND_RECV_QUEUE_DEPTH as i32,
-        recv_callback,
-        &CqConfig::default(),
-    ) {
+    let recv_cq = match ctx
+        .create_mono_cq::<RcQpForMonoCq<u64>>(SEND_RECV_QUEUE_DEPTH as i32, &CqConfig::default())
+    {
         Ok(cq) => Rc::new(cq),
         Err(_) => return,
     };
@@ -1000,7 +917,11 @@ fn write_imm_server_thread_main(
 
     while !stop_flag.load(Ordering::Relaxed) {
         shared_state.reset();
-        recv_cq.poll();
+        recv_cq.poll(|cqe, _entry| {
+            if cqe.opcode.is_responder() && cqe.syndrome == 0 {
+                shared_state.push(&cqe);
+            }
+        });
         recv_cq.flush();
         let count = shared_state.rx_count.get();
 
@@ -1008,7 +929,7 @@ fn write_imm_server_thread_main(
             continue;
         }
 
-        send_cq.poll();
+        send_cq.poll(|_, _| {});
         send_cq.flush();
 
         // Repost receives
@@ -1384,11 +1305,7 @@ fn setup_ud_send_recv_benchmark() -> Option<UdSendRecvBenchmarkSetup> {
 // =============================================================================
 
 /// 32B inline send throughput benchmark (queue depth = 1024, 1/4 signaling ratio).
-fn run_send_inline_throughput<SF, RF>(client: &mut SendRecvEndpoint<SF, RF>, iters: u64) -> Duration
-where
-    SF: Fn(Cqe, u64),
-    RF: Fn(Cqe, u64),
-{
+fn run_send_inline_throughput(client: &mut SendRecvEndpoint, iters: u64) -> Duration {
     let send_data = vec![0xAAu8; SMALL_MSG_SIZE];
     // Use min of configured interval and iters to handle small iteration counts
     let signal_interval = SEND_RECV_SIGNAL_INTERVAL.min(iters as usize).max(1);
@@ -1448,7 +1365,11 @@ where
 
     while completed < iters {
         client.shared_state.reset();
-        client.recv_cq.poll();
+        client.recv_cq.poll(|cqe, _entry| {
+            if cqe.opcode.is_responder() && cqe.syndrome == 0 {
+                client.shared_state.push(&cqe);
+            }
+        });
         client.recv_cq.flush();
         let rx_count = client.shared_state.rx_count.get();
 
@@ -1459,7 +1380,7 @@ where
             continue;
         }
 
-        client.send_cq.poll();
+        client.send_cq.poll(|_, _| {});
         client.send_cq.flush();
 
         // Repost receives
@@ -1543,11 +1464,15 @@ where
     // Drain remaining inflight
     while inflight > 0 {
         client.shared_state.reset();
-        client.recv_cq.poll();
+        client.recv_cq.poll(|cqe, _entry| {
+            if cqe.opcode.is_responder() && cqe.syndrome == 0 {
+                client.shared_state.push(&cqe);
+            }
+        });
         client.recv_cq.flush();
         inflight -= client.shared_state.rx_count.get() as u64;
 
-        client.send_cq.poll();
+        client.send_cq.poll(|_, _| {});
         client.send_cq.flush();
     }
 
@@ -1555,15 +1480,11 @@ where
 }
 
 /// 32B inline send throughput benchmark with limited in-flight (matching copyrpc config).
-fn run_send_inline_limited_inflight<SF, RF>(
-    client: &mut SendRecvEndpoint<SF, RF>,
+fn run_send_inline_limited_inflight(
+    client: &mut SendRecvEndpoint,
     iters: u64,
     max_inflight: usize,
-) -> Duration
-where
-    SF: Fn(Cqe, u64),
-    RF: Fn(Cqe, u64),
-{
+) -> Duration {
     let send_data = vec![0xAAu8; SMALL_MSG_SIZE];
     let signal_interval = SEND_RECV_SIGNAL_INTERVAL.min(iters as usize).max(1);
 
@@ -1620,7 +1541,11 @@ where
 
     while completed < iters {
         client.shared_state.reset();
-        client.recv_cq.poll();
+        client.recv_cq.poll(|cqe, _entry| {
+            if cqe.opcode.is_responder() && cqe.syndrome == 0 {
+                client.shared_state.push(&cqe);
+            }
+        });
         client.recv_cq.flush();
         let rx_count = client.shared_state.rx_count.get();
 
@@ -1631,7 +1556,7 @@ where
             continue;
         }
 
-        client.send_cq.poll();
+        client.send_cq.poll(|_, _| {});
         client.send_cq.flush();
 
         // Repost receives
@@ -1714,11 +1639,15 @@ where
     // Drain remaining inflight
     while inflight > 0 {
         client.shared_state.reset();
-        client.recv_cq.poll();
+        client.recv_cq.poll(|cqe, _entry| {
+            if cqe.opcode.is_responder() && cqe.syndrome == 0 {
+                client.shared_state.push(&cqe);
+            }
+        });
         client.recv_cq.flush();
         inflight -= client.shared_state.rx_count.get() as u64;
 
-        client.send_cq.poll();
+        client.send_cq.poll(|_, _| {});
         client.send_cq.flush();
     }
 
@@ -1726,11 +1655,7 @@ where
 }
 
 /// 32B inline send latency benchmark (ping-pong, queue depth = 1).
-fn run_send_latency<SF, RF>(client: &mut SendRecvEndpoint<SF, RF>, iters: u64) -> Duration
-where
-    SF: Fn(Cqe, u64),
-    RF: Fn(Cqe, u64),
-{
+fn run_send_latency(client: &mut SendRecvEndpoint, iters: u64) -> Duration {
     let send_data = vec![0xAAu8; SMALL_MSG_SIZE];
 
     let start = std::time::Instant::now();
@@ -1756,10 +1681,14 @@ where
 
         // Wait for echo response
         loop {
-            client.send_cq.poll();
+            client.send_cq.poll(|_, _| {});
             client.send_cq.flush();
             client.shared_state.reset();
-            client.recv_cq.poll();
+            client.recv_cq.poll(|cqe, _entry| {
+                if cqe.opcode.is_responder() && cqe.syndrome == 0 {
+                    client.shared_state.push(&cqe);
+                }
+            });
             client.recv_cq.flush();
             if client.shared_state.rx_count.get() > 0 {
                 // Immediate replenish for latency benchmark
@@ -1788,14 +1717,7 @@ where
 // =============================================================================
 
 /// 32B inline WRITE WITH IMM throughput benchmark (queue depth = 1024, 1/4 signaling ratio).
-fn run_write_imm_inline_throughput<SF, RF>(
-    client: &mut WriteImmEndpoint<SF, RF>,
-    iters: u64,
-) -> Duration
-where
-    SF: Fn(Cqe, u64),
-    RF: Fn(Cqe, u64),
-{
+fn run_write_imm_inline_throughput(client: &mut WriteImmEndpoint, iters: u64) -> Duration {
     let send_data = vec![0xAAu8; SMALL_MSG_SIZE];
     let remote_addr = client.remote_addr;
     let remote_rkey = client.remote_rkey;
@@ -1862,7 +1784,11 @@ where
 
     while completed < iters {
         client.shared_state.reset();
-        client.recv_cq.poll();
+        client.recv_cq.poll(|cqe, _entry| {
+            if cqe.opcode.is_responder() && cqe.syndrome == 0 {
+                client.shared_state.push(&cqe);
+            }
+        });
         client.recv_cq.flush();
         let rx_count = client.shared_state.rx_count.get();
 
@@ -1873,7 +1799,7 @@ where
             continue;
         }
 
-        client.send_cq.poll();
+        client.send_cq.poll(|_, _| {});
         client.send_cq.flush();
 
         // Repost receives
@@ -1963,11 +1889,15 @@ where
     // Drain remaining inflight
     while inflight > 0 {
         client.shared_state.reset();
-        client.recv_cq.poll();
+        client.recv_cq.poll(|cqe, _entry| {
+            if cqe.opcode.is_responder() && cqe.syndrome == 0 {
+                client.shared_state.push(&cqe);
+            }
+        });
         client.recv_cq.flush();
         inflight -= client.shared_state.rx_count.get() as u64;
 
-        client.send_cq.poll();
+        client.send_cq.poll(|_, _| {});
         client.send_cq.flush();
     }
 
@@ -2154,15 +2084,7 @@ fn run_ud_send_latency(client: &mut UdSendRecvEndpoint, iters: u64) -> Duration 
 }
 
 /// 4KiB WRITE benchmark.
-fn run_write_1m<SF, RF>(
-    endpoint: &mut RdmaLoopbackEndpoint<SF, RF>,
-    iters: u64,
-    relaxed: bool,
-) -> Duration
-where
-    SF: Fn(Cqe, u64),
-    RF: Fn(Cqe, u64),
-{
+fn run_write_1m(endpoint: &mut RdmaLoopbackEndpoint, iters: u64, relaxed: bool) -> Duration {
     let remote_addr = endpoint.remote_buf.addr();
     let rkey = endpoint.remote_mr.rkey();
     let local_addr = endpoint.local_buf.addr();
@@ -2177,7 +2099,7 @@ where
 
     // Drain any pending completions first
     loop {
-        let n = endpoint.send_cq.poll();
+        let n = endpoint.send_cq.poll(|_, _| {});
         endpoint.send_cq.flush();
         if n == 0 {
             break;
@@ -2194,7 +2116,7 @@ where
 
     while signals_received < expected_signals {
         // Poll completions
-        let n = endpoint.send_cq.poll();
+        let n = endpoint.send_cq.poll(|_, _| {});
         endpoint.send_cq.flush();
         signals_received += n;
 
@@ -2245,15 +2167,7 @@ where
 }
 
 /// 4KiB READ benchmark.
-fn run_read_1m<SF, RF>(
-    endpoint: &mut RdmaLoopbackEndpoint<SF, RF>,
-    iters: u64,
-    relaxed: bool,
-) -> Duration
-where
-    SF: Fn(Cqe, u64),
-    RF: Fn(Cqe, u64),
-{
+fn run_read_1m(endpoint: &mut RdmaLoopbackEndpoint, iters: u64, relaxed: bool) -> Duration {
     let remote_addr = endpoint.remote_buf.addr();
     let rkey = endpoint.remote_mr.rkey();
     let local_addr = endpoint.local_buf.addr();
@@ -2268,7 +2182,7 @@ where
 
     // Drain any pending completions first
     loop {
-        let n = endpoint.send_cq.poll();
+        let n = endpoint.send_cq.poll(|_, _| {});
         endpoint.send_cq.flush();
         if n == 0 {
             break;
@@ -2285,7 +2199,7 @@ where
 
     while signals_received < expected_signals {
         // Poll completions
-        let n = endpoint.send_cq.poll();
+        let n = endpoint.send_cq.poll(|_, _| {});
         endpoint.send_cq.flush();
         signals_received += n;
 

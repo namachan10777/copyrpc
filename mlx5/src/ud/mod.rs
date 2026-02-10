@@ -1399,9 +1399,9 @@ impl<'a, SqEntry, RqEntry, T, Rq, RqCqState, OnRq, RqMono>
     }
 
     /// Set MonoCq for SQ (callback is on CQ side).
-    pub fn sq_mono_cq<Q, F>(
+    pub fn sq_mono_cq<Q>(
         self,
-        mono_cq: &Rc<crate::mono_cq::MonoCq<Q, F>>,
+        mono_cq: &Rc<crate::mono_cq::MonoCq<Q>>,
     ) -> UdQpBuilder<
         'a,
         SqEntry,
@@ -1412,12 +1412,11 @@ impl<'a, SqEntry, RqEntry, T, Rq, RqCqState, OnRq, RqMono>
         RqCqState,
         (),
         OnRq,
-        Rc<crate::mono_cq::MonoCq<Q, F>>,
+        Rc<crate::mono_cq::MonoCq<Q>>,
         RqMono,
     >
     where
         Q: crate::mono_cq::CompletionSource,
-        F: Fn(Cqe, Q::Entry) + 'static,
     {
         UdQpBuilder {
             ctx: self.ctx,
@@ -1471,9 +1470,9 @@ impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, OnSq, SqMono>
     }
 
     /// Set MonoCq for RQ (callback is on CQ side).
-    pub fn rq_mono_cq<Q, F>(
+    pub fn rq_mono_cq<Q>(
         self,
-        mono_cq: &Rc<crate::mono_cq::MonoCq<Q, F>>,
+        mono_cq: &Rc<crate::mono_cq::MonoCq<Q>>,
     ) -> UdQpBuilder<
         'a,
         SqEntry,
@@ -1485,11 +1484,10 @@ impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, OnSq, SqMono>
         OnSq,
         (),
         SqMono,
-        Rc<crate::mono_cq::MonoCq<Q, F>>,
+        Rc<crate::mono_cq::MonoCq<Q>>,
     >
     where
         Q: crate::mono_cq::CompletionSource,
-        F: Fn(Cqe, Q::Entry) + 'static,
     {
         UdQpBuilder {
             ctx: self.ctx,
