@@ -412,16 +412,16 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
         while (self.recv_scan_pos as usize) < self.max_clients as usize {
             let client_idx = ((self.recv_start + self.recv_scan_pos) % self.max_clients) as usize;
 
-            if self.req_avail[client_idx] > 0
-                && let Some((slot_idx, data)) = self.req_rxs[client_idx].try_recv()
-            {
-                self.req_avail[client_idx] -= 1;
-                return Some(RecvHandle {
-                    server: self,
-                    client_idx,
-                    slot_idx,
-                    data,
-                });
+            if self.req_avail[client_idx] > 0 {
+                if let Some((slot_idx, data)) = self.req_rxs[client_idx].try_recv() {
+                    self.req_avail[client_idx] -= 1;
+                    return Some(RecvHandle {
+                        server: self,
+                        client_idx,
+                        slot_idx,
+                        data,
+                    });
+                }
             }
 
             self.recv_scan_pos += 1;
