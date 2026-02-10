@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Float64Array, StringArray, UInt32Array, UInt64Array};
+use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray, UInt32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -19,6 +19,14 @@ pub struct BenchRow {
     pub clients: u32,
     pub threads: u32,
     pub run_index: u32,
+    pub timestamp: i64,
+}
+
+pub fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -32,6 +40,7 @@ pub fn rows_from_epochs(
     clients: u32,
     threads: u32,
     run_index: u32,
+    timestamp: i64,
 ) -> Vec<BenchRow> {
     epochs
         .iter()
@@ -48,6 +57,7 @@ pub fn rows_from_epochs(
                 clients,
                 threads,
                 run_index,
+                timestamp,
             }
         })
         .collect()
@@ -69,6 +79,7 @@ pub fn write_parquet(path: &str, rows: &[BenchRow]) -> Result<(), Box<dyn std::e
         Field::new("clients", DataType::UInt32, false),
         Field::new("threads", DataType::UInt32, false),
         Field::new("run_index", DataType::UInt32, false),
+        Field::new("timestamp", DataType::Int64, false),
     ]));
 
     let batch = RecordBatch::try_new(
@@ -103,6 +114,9 @@ pub fn write_parquet(path: &str, rows: &[BenchRow]) -> Result<(), Box<dyn std::e
             )) as ArrayRef,
             Arc::new(UInt32Array::from(
                 rows.iter().map(|r| r.run_index).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.timestamp).collect::<Vec<_>>(),
             )) as ArrayRef,
         ],
     )?;

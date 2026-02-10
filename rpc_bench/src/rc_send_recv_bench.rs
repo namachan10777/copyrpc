@@ -406,6 +406,7 @@ fn run_one_to_one(
             collector.finish();
             let steady = collector.steady_state(common.trim);
             let filtered = crate::epoch::filter_bottom_quartile(steady);
+            let timestamp = parquet_out::now_unix_secs();
             let rows = parquet_out::rows_from_epochs(
                 "rc_send_recv",
                 "1to1",
@@ -416,6 +417,7 @@ fn run_one_to_one(
                 1,
                 1,
                 run_idx,
+                timestamp,
             );
 
             if !filtered.is_empty() {
@@ -1025,6 +1027,7 @@ fn run_one_to_one_threaded(
 
             let steady = collector.steady_state(common.trim);
             let filtered = crate::epoch::filter_bottom_quartile(steady);
+            let timestamp = parquet_out::now_unix_secs();
             let rows = parquet_out::rows_from_epochs(
                 "rc_send_recv",
                 "1to1",
@@ -1035,6 +1038,7 @@ fn run_one_to_one_threaded(
                 1,
                 num_threads as u32,
                 run_idx,
+                timestamp,
             );
 
             if !filtered.is_empty() {

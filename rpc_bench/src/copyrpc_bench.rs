@@ -237,6 +237,7 @@ fn run_one_to_one(
 
             let steady = collector.steady_state(common.trim);
             let filtered = crate::epoch::filter_bottom_quartile(steady);
+            let timestamp = parquet_out::now_unix_secs();
             let rows = parquet_out::rows_from_epochs(
                 "copyrpc",
                 "1to1",
@@ -247,6 +248,7 @@ fn run_one_to_one(
                 1,
                 1,
                 run,
+                timestamp,
             );
 
             if !filtered.is_empty() {
@@ -503,6 +505,7 @@ fn run_one_to_one_threaded(
 
             let steady = collector.steady_state(common.trim);
             let filtered = crate::epoch::filter_bottom_quartile(steady);
+            let timestamp = parquet_out::now_unix_secs();
             let rows = parquet_out::rows_from_epochs(
                 "copyrpc",
                 "1to1",
@@ -513,6 +516,7 @@ fn run_one_to_one_threaded(
                 1,
                 num_threads as u32,
                 run,
+                timestamp,
             );
 
             if !filtered.is_empty() {
@@ -873,6 +877,7 @@ fn run_multi_client(
 
             let steady = collector.steady_state(common.trim);
             let filtered = crate::epoch::filter_bottom_quartile(steady);
+            let timestamp = parquet_out::now_unix_secs();
             let rows = parquet_out::rows_from_epochs(
                 "copyrpc",
                 "multi_client",
@@ -883,6 +888,7 @@ fn run_multi_client(
                 num_clients as u32,
                 1,
                 run,
+                timestamp,
             );
 
             if !filtered.is_empty() {
