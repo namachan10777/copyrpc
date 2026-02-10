@@ -14,8 +14,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build Docker image
-        run: docker build -t ipsj-latex papers/ipsj-hpc203
+        uses: docker/build-push-action@v6
+        with:
+          context: papers/ipsj-hpc203
+          tags: ipsj-latex:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Build PDF
         run: docker run --rm -v ${{ github.workspace }}/papers/ipsj-hpc203:/workdir ipsj-latex latexmk hpc203.tex
