@@ -4,12 +4,12 @@
 #PBS -A NBB
 #PBS -v WORKDIR=/work/NBB/mnakano/ghq/github.com/namachan10777/copyrpc
 #PBS -l elapstim_req=01:00:00
-#PBS -o /work/NBB/mnakano/ghq/github.com/namachan10777/copyrpc/jobs/pegasus/logs/%r.log
+#PBS -o /work/NBB/mnakano/ghq/github.com/namachan10777/copyrpc/rpc_bench/logs/%r.log
 #PBS -j o
 
 set -eux
 
-export LOGDIR="$WORKDIR/jobs/pegasus/logs/$(echo $PBS_JOBID | sed -E 's/^[^:]*:([0-9]+)\.nqsv$/\1/')"
+export LOGDIR="$WORKDIR/rpc_bench/logs/$(echo $PBS_JOBID | sed -E 's/^[^:]*:([0-9]+)\.nqsv$/\1/')"
 mkdir -p "$LOGDIR"
 
 cd "$WORKDIR"
