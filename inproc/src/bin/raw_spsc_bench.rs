@@ -1,15 +1,15 @@
 //! Raw SPSC benchmark without Flux overhead.
 //!
-//! Tests MpscChannel's call/reply pattern directly.
+//! Tests OnesidedMpsc's call/reply pattern directly.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use inproc::Serial;
-use mempc::{MpscCaller, MpscChannel, MpscRecvRef, MpscServer};
+use mempc::{MpscCaller, MpscChannel, MpscRecvRef, MpscServer, OnesidedMpsc};
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -25,19 +25,9 @@ impl Default for Payload {
     }
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum TransportType {
-    Onesided,
-    FastForward,
-    Lamport,
-}
-
 #[derive(Parser)]
 #[command(name = "raw_spsc_bench")]
 struct Args {
-    #[arg(short, long, value_enum)]
-    transport: TransportType,
-
     #[arg(short, long, default_value = "3")]
     duration: u64,
 
@@ -50,10 +40,15 @@ fn pin_to_core(core_id: usize) {
     core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
 }
 
-fn run_bench<M: MpscChannel>(duration_secs: u64, start_core: usize) {
+fn main() {
+    let args = Args::parse();
+
+    println!("Running onesided transport for {}s", args.duration);
+
     let capacity = 1024;
     let inflight_max = 256;
-    let (mut callers, mut server) = M::create::<Payload, Payload>(1, capacity, inflight_max);
+    let (mut callers, mut server) =
+        OnesidedMpsc::create::<Payload, Payload>(1, capacity, inflight_max);
     let mut caller = callers.pop().unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -62,6 +57,7 @@ fn run_bench<M: MpscChannel>(duration_secs: u64, start_core: usize) {
     let barrier2 = Arc::clone(&barrier);
 
     let payload = Payload::default();
+    let start_core = args.start_core;
 
     // Responder thread
     let handle = thread::spawn(move || {
@@ -83,10 +79,10 @@ fn run_bench<M: MpscChannel>(duration_secs: u64, start_core: usize) {
     });
 
     // Sender thread (main)
-    pin_to_core(start_core);
+    pin_to_core(args.start_core);
     barrier.wait();
     let start = Instant::now();
-    let run_duration = Duration::from_secs(duration_secs);
+    let run_duration = Duration::from_secs(args.duration);
 
     let mut sent = 0u64;
     let mut received = 0u64;
@@ -126,21 +122,4 @@ fn run_bench<M: MpscChannel>(duration_secs: u64, start_core: usize) {
         "Sent: {}, Received: {}, Responder: {}, Duration: {:?}, Throughput: {:.2} Mops/s",
         sent, received, responder_count, elapsed, mops
     );
-}
-
-fn main() {
-    let args = Args::parse();
-
-    println!(
-        "Running {:?} transport for {}s",
-        args.transport, args.duration
-    );
-
-    match args.transport {
-        TransportType::Onesided => run_bench::<mempc::OnesidedMpsc>(args.duration, args.start_core),
-        TransportType::FastForward => {
-            run_bench::<mempc::FastForwardMpsc>(args.duration, args.start_core)
-        }
-        TransportType::Lamport => run_bench::<mempc::LamportMpsc>(args.duration, args.start_core),
-    }
 }

@@ -1,6 +1,6 @@
 //! Cluster All-to-All Benchmark Binary
 //!
-//! Benchmarks MpscChannel (Flux) and MPSC (Mesh) implementations with N-thread
+//! Benchmarks Flux (OnesidedMpsc) implementation with N-thread
 //! all-to-all communication pattern. Uses a management thread for monitoring
 //! and statistics collection.
 
@@ -12,11 +12,9 @@ use std::time::{Duration, Instant};
 use arrow::array::{Float64Array, StringArray, UInt32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use inproc::Serial;
-use inproc::mpsc::MpscChannel;
-use inproc::{FetchAddMpsc, Flux, ReceivedMessage, create_flux_with, create_mesh_with};
-use mempc::MpscChannel as MempcMpscChannel;
+use inproc::{Flux, create_flux};
 use parquet::arrow::ArrowWriter;
 
 /// 32-byte payload for benchmarking
@@ -34,17 +32,9 @@ impl Default for Payload {
     }
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum TransportType {
-    Onesided,
-    FastForward,
-    Lamport,
-    All,
-}
-
 #[derive(Parser)]
 #[command(name = "cluster_bench")]
-#[command(about = "N-thread all-to-all benchmark: Flux (MpscChannel) vs Mesh (MPSC)")]
+#[command(about = "N-thread all-to-all Flux (OnesidedMpsc) benchmark")]
 struct Args {
     /// Number of worker threads
     #[arg(short = 'n', long, default_value = "16")]
@@ -69,10 +59,6 @@ struct Args {
     /// Output parquet file
     #[arg(short, long, default_value = "cluster_bench.parquet")]
     output: String,
-
-    /// Transport implementation to benchmark
-    #[arg(short = 't', long, value_enum, default_value = "all")]
-    transport: TransportType,
 
     /// Max inflight requests per channel
     #[arg(short = 'i', long, default_value = "256")]
@@ -109,12 +95,8 @@ fn pin_to_core(core_id: usize) {
     core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
 }
 
-// ============================================================================
-// Flux benchmark (SPSC MpscChannel based)
-// ============================================================================
-
-/// Run Flux benchmark for a specific MpscChannel implementation
-fn run_flux_benchmark<M: MempcMpscChannel>(
+/// Run Flux benchmark with OnesidedMpsc
+fn run_flux_benchmark(
     n: usize,
     capacity: usize,
     duration_secs: u64,
@@ -125,7 +107,7 @@ fn run_flux_benchmark<M: MempcMpscChannel>(
         (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
     let stop_flag = Arc::new(AtomicBool::new(false));
 
-    let nodes: Vec<Flux<Payload, (), M>> = create_flux_with(n, capacity, max_inflight);
+    let nodes: Vec<Flux<Payload, ()>> = create_flux(n, capacity, max_inflight);
 
     let barrier = Arc::new(Barrier::new(n + 1));
     let payload = Payload::default();
@@ -201,114 +183,6 @@ fn run_flux_benchmark<M: MempcMpscChannel>(
     )
 }
 
-// ============================================================================
-// Mesh benchmark (MPSC based)
-// ============================================================================
-
-/// Run Mesh benchmark for a specific MPSC implementation
-fn run_mesh_benchmark<M: MpscChannel>(
-    n: usize,
-    _capacity: usize,
-    duration_secs: u64,
-    max_inflight: usize,
-    start_core: usize,
-) -> RunResult {
-    let per_thread_completed: Vec<Arc<AtomicU64>> =
-        (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
-    let stop_flag = Arc::new(AtomicBool::new(false));
-
-    let nodes = create_mesh_with::<Payload, (), fn((), Payload), M>(n, |(), _| {});
-
-    let barrier = Arc::new(Barrier::new(n + 1));
-    let payload = Payload::default();
-
-    let handles: Vec<_> = nodes
-        .into_iter()
-        .enumerate()
-        .map(|(thread_idx, mut node)| {
-            let barrier = Arc::clone(&barrier);
-            let stop_flag = Arc::clone(&stop_flag);
-            let my_completed = Arc::clone(&per_thread_completed[thread_idx]);
-            let core = start_core - thread_idx;
-            thread::spawn(move || {
-                pin_to_core(core);
-                let id = node.id();
-                let peers: Vec<usize> = (0..n).filter(|&p| p != id).collect();
-
-                barrier.wait();
-
-                let mut total_completed = 0u64;
-                let mut inflight = 0usize;
-
-                'outer: loop {
-                    for _ in 0..1024 {
-                        // Send requests to all peers (with inflight limiting)
-                        if inflight < max_inflight {
-                            for &peer in &peers {
-                                if inflight >= max_inflight {
-                                    break;
-                                }
-                                if node.call(peer, payload, ()).is_ok() {
-                                    inflight += 1;
-                                }
-                            }
-                        }
-
-                        // Process incoming messages
-                        loop {
-                            match node.try_recv() {
-                                Ok((from, ReceivedMessage::Request { req_num, data })) => {
-                                    node.reply(from, req_num, data).ok();
-                                }
-                                Ok((_, ReceivedMessage::Response { .. })) => {
-                                    total_completed += 1;
-                                    inflight -= 1;
-                                }
-                                Ok((_, ReceivedMessage::Notify(_))) => {}
-                                Err(_) => break,
-                            }
-                        }
-                    }
-
-                    my_completed.store(total_completed, Relaxed);
-
-                    if stop_flag.load(Relaxed) {
-                        break 'outer;
-                    }
-                }
-
-                // Drain remaining
-                loop {
-                    match node.try_recv() {
-                        Ok((from, ReceivedMessage::Request { req_num, data })) => {
-                            node.reply(from, req_num, data).ok();
-                        }
-                        Ok((_, ReceivedMessage::Response { .. })) => {
-                            total_completed += 1;
-                        }
-                        _ => break,
-                    }
-                }
-                my_completed.store(total_completed, Relaxed);
-
-                total_completed
-            })
-        })
-        .collect();
-
-    monitor_and_collect(
-        per_thread_completed,
-        stop_flag,
-        barrier,
-        handles,
-        duration_secs,
-    )
-}
-
-// ============================================================================
-// Shared monitoring infrastructure
-// ============================================================================
-
 fn monitor_and_collect(
     per_thread_completed: Vec<Arc<AtomicU64>>,
     stop_flag: Arc<AtomicBool>,
@@ -368,27 +242,29 @@ fn compute_stats(durations: &[Duration]) -> (f64, u64, u64, f64) {
     (mean, min, max, stddev)
 }
 
-fn run_transport_benchmark(
-    kind: &str,
-    transport_name: &str,
-    n: usize,
-    capacity: usize,
-    duration_secs: u64,
-    inflight: usize,
-    warmup: usize,
-    runs: usize,
-    start_core: usize,
-    run_fn: fn(usize, usize, u64, usize, usize) -> RunResult,
-) -> BenchResult {
+fn main() {
+    let args = Args::parse();
+
+    if args.threads < 2 {
+        eprintln!("Need at least 2 threads");
+        std::process::exit(1);
+    }
+
     println!(
-        "Benchmarking {} ({}/{}): n={}, duration={}s",
-        transport_name, kind, transport_name, n, duration_secs
+        "Benchmarking flux (onesided): n={}, duration={}s",
+        args.threads, args.duration
     );
 
     // Warmup
-    for w in 0..warmup {
-        println!("  Warmup {}/{}", w + 1, warmup);
-        run_fn(n, capacity, duration_secs.min(3), inflight, start_core);
+    for w in 0..args.warmup {
+        println!("  Warmup {}/{}", w + 1, args.warmup);
+        run_flux_benchmark(
+            args.threads,
+            args.capacity,
+            args.duration.min(3),
+            args.inflight,
+            args.start_core,
+        );
     }
 
     // Benchmark runs
@@ -397,9 +273,15 @@ fn run_transport_benchmark(
     let mut durations = Vec::new();
     let mut total_ops = Vec::new();
 
-    for r in 0..runs {
-        println!("  Run {}/{}", r + 1, runs);
-        let result = run_fn(n, capacity, duration_secs, inflight, start_core);
+    for r in 0..args.runs {
+        println!("  Run {}/{}", r + 1, args.runs);
+        let result = run_flux_benchmark(
+            args.threads,
+            args.capacity,
+            args.duration,
+            args.inflight,
+            args.start_core,
+        );
         durations.push(result.duration);
         total_ops.push(result.total_completed);
         all_mins.push(result.min_rps);
@@ -423,104 +305,23 @@ fn run_transport_benchmark(
     );
 
     let (mean_ns, min_ns, max_ns, stddev_ns) = compute_stats(&durations);
-    BenchResult {
-        threads: n as u32,
-        kind: kind.to_string(),
-        transport: transport_name.to_string(),
-        duration_secs,
+    let result = BenchResult {
+        threads: args.threads as u32,
+        kind: "flux".to_string(),
+        transport: "onesided".to_string(),
+        duration_secs: args.duration,
         total_calls,
-        runs: runs as u32,
+        runs: args.runs as u32,
         duration_ns_mean: mean_ns,
         duration_ns_min: min_ns,
         duration_ns_max: max_ns,
         duration_ns_stddev: stddev_ns,
         throughput_mops_mean: avg_min_mops,
         latency_ns_mean: 1_000_000_000.0 / (avg_min_mops * 1_000_000.0),
-    }
-}
-
-fn main() {
-    let args = Args::parse();
-
-    if args.threads < 2 {
-        eprintln!("Need at least 2 threads");
-        std::process::exit(1);
-    }
-
-    let mut results = Vec::new();
-
-    // --- Flux benchmarks (SPSC MpscChannel) ---
-
-    // Onesided
-    if matches!(args.transport, TransportType::Onesided | TransportType::All) {
-        results.push(run_transport_benchmark(
-            "flux",
-            "onesided",
-            args.threads,
-            args.capacity,
-            args.duration,
-            args.inflight,
-            args.warmup,
-            args.runs,
-            args.start_core,
-            run_flux_benchmark::<mempc::OnesidedMpsc>,
-        ));
-    }
-
-    // FastForward
-    if matches!(
-        args.transport,
-        TransportType::FastForward | TransportType::All
-    ) {
-        results.push(run_transport_benchmark(
-            "flux",
-            "fastforward",
-            args.threads,
-            args.capacity,
-            args.duration,
-            args.inflight,
-            args.warmup,
-            args.runs,
-            args.start_core,
-            run_flux_benchmark::<mempc::FastForwardMpsc>,
-        ));
-    }
-
-    // Lamport
-    if matches!(args.transport, TransportType::Lamport | TransportType::All) {
-        results.push(run_transport_benchmark(
-            "flux",
-            "lamport",
-            args.threads,
-            args.capacity,
-            args.duration,
-            args.inflight,
-            args.warmup,
-            args.runs,
-            args.start_core,
-            run_flux_benchmark::<mempc::LamportMpsc>,
-        ));
-    }
-
-    // --- Mesh benchmarks (MPSC) ---
-
-    if matches!(args.transport, TransportType::All) {
-        results.push(run_transport_benchmark(
-            "mesh",
-            "fetch_add",
-            args.threads,
-            args.capacity,
-            args.duration,
-            args.inflight,
-            args.warmup,
-            args.runs,
-            args.start_core,
-            run_mesh_benchmark::<FetchAddMpsc>,
-        ));
-    }
+    };
 
     // Write to parquet
-    write_parquet(&args.output, &results).expect("Failed to write parquet file");
+    write_parquet(&args.output, &[result]).expect("Failed to write parquet file");
     println!("Results written to {}", args.output);
 }
 

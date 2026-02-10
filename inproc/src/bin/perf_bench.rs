@@ -1,7 +1,7 @@
 //! Simple benchmark for perf profiling.
 //!
 //! Run with: cargo build --release --bin perf_bench --features bench-bin
-//! Then: perf record -g ./target/release/perf_bench --transport onesided
+//! Then: perf record -g ./target/release/perf_bench
 //!       perf report
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -9,10 +9,9 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use inproc::Serial;
-use inproc::{Flux, create_flux_with};
-use mempc::MpscChannel;
+use inproc::{Flux, create_flux};
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -28,19 +27,9 @@ impl Default for Payload {
     }
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum TransportType {
-    Onesided,
-    FastForward,
-    Lamport,
-}
-
 #[derive(Parser)]
 #[command(name = "perf_bench")]
 struct Args {
-    #[arg(short, long, value_enum)]
-    transport: TransportType,
-
     #[arg(short, long, default_value = "5")]
     duration: u64,
 
@@ -56,12 +45,18 @@ fn pin_to_core(core_id: usize) {
     core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
 }
 
-fn run_bench<M: MpscChannel>(duration_secs: u64, inflight_max: usize, start_core: usize) {
+fn main() {
+    let args = Args::parse();
+
+    println!(
+        "Running onesided transport for {}s with inflight={}",
+        args.duration, args.inflight
+    );
+
     let capacity = 1024;
     let completed = Arc::new(AtomicU64::new(0));
-    let completed_clone = Arc::clone(&completed);
 
-    let nodes: Vec<Flux<Payload, (), M>> = create_flux_with(2, capacity, inflight_max);
+    let nodes: Vec<Flux<Payload, ()>> = create_flux(2, capacity, args.inflight);
 
     let mut nodes: Vec<_> = nodes.into_iter().collect();
     let mut node1 = nodes.pop().unwrap();
@@ -73,6 +68,7 @@ fn run_bench<M: MpscChannel>(duration_secs: u64, inflight_max: usize, start_core
     let barrier2 = Arc::clone(&barrier);
 
     let payload = Payload::default();
+    let start_core = args.start_core;
 
     // Responder thread
     let handle = thread::spawn(move || {
@@ -88,10 +84,11 @@ fn run_bench<M: MpscChannel>(duration_secs: u64, inflight_max: usize, start_core
     });
 
     // Sender thread (main)
-    pin_to_core(start_core);
+    pin_to_core(args.start_core);
     barrier.wait();
     let start = Instant::now();
-    let run_duration = Duration::from_secs(duration_secs);
+    let run_duration = Duration::from_secs(args.duration);
+    let inflight_max = args.inflight;
 
     let mut sent = 0u64;
     while start.elapsed() < run_duration {
@@ -103,17 +100,15 @@ fn run_bench<M: MpscChannel>(duration_secs: u64, inflight_max: usize, start_core
                 break;
             }
         }
-        let counter = Arc::clone(&completed_clone);
-        node0.poll(move |_: (), _: Payload| {
-            counter.fetch_add(1, Ordering::Relaxed);
+        node0.poll(|_: (), _: Payload| {
+            completed.fetch_add(1, Ordering::Relaxed);
         });
     }
 
     // Wait for remaining responses
     while completed.load(Ordering::Relaxed) < sent {
-        let counter = Arc::clone(&completed_clone);
-        node0.poll(move |_: (), _: Payload| {
-            counter.fetch_add(1, Ordering::Relaxed);
+        node0.poll(|_: (), _: Payload| {
+            completed.fetch_add(1, Ordering::Relaxed);
         });
         std::hint::spin_loop();
     }
@@ -128,25 +123,4 @@ fn run_bench<M: MpscChannel>(duration_secs: u64, inflight_max: usize, start_core
         "Completed: {}, Duration: {:?}, Throughput: {:.2} Mops/s",
         total, elapsed, mops
     );
-}
-
-fn main() {
-    let args = Args::parse();
-
-    println!(
-        "Running {:?} transport for {}s with inflight={}",
-        args.transport, args.duration, args.inflight
-    );
-
-    match args.transport {
-        TransportType::Onesided => {
-            run_bench::<mempc::OnesidedMpsc>(args.duration, args.inflight, args.start_core)
-        }
-        TransportType::FastForward => {
-            run_bench::<mempc::FastForwardMpsc>(args.duration, args.inflight, args.start_core)
-        }
-        TransportType::Lamport => {
-            run_bench::<mempc::LamportMpsc>(args.duration, args.inflight, args.start_core)
-        }
-    }
 }

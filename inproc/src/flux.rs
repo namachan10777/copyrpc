@@ -3,32 +3,30 @@
 //! Each node has one MPSC server and N-1 callers, providing zero-contention
 //! communication at the cost of O(N^2) memory usage.
 //!
-//! This module is generic over the MPSC channel implementation:
-//! - `OnesidedMpsc` (default): Producer-only write pattern
-//! - `FastForwardMpsc`: FastForward algorithm with validity flags
-//! - `LamportMpsc`: Batched index synchronization
+//! Uses `OnesidedMpsc` (producer-only write pattern) as the MPSC channel implementation.
 //!
 //! API:
 //! - `call(to, payload, user_data)` sends a request
-//! - `poll()` processes messages (responses invoke callback)
+//! - `poll(on_response)` processes messages (responses invoke callback)
 //! - `try_recv()` returns received requests via `RecvHandle`
 
-use std::marker::PhantomData;
-
 use mempc::CallerWithUserData;
-use mempc::{MpscChannel, MpscRecvRef, MpscServer, OnesidedMpsc, ReplyToken, Serial};
+use mempc::{MpscChannel, MpscServer, OnesidedMpsc, ReplyToken, Serial};
 
 use crate::SendError;
 
+type OnesidedServer<T> = <OnesidedMpsc as MpscChannel>::Server<T, T>;
+type OnesidedCaller<T> = <OnesidedMpsc as MpscChannel>::Caller<T, T>;
+
 /// Handle for a received request that allows replying.
-pub struct RecvHandle<'a, T: Serial + Send, U, M: MpscChannel = OnesidedMpsc> {
-    flux: &'a mut Flux<T, U, M>,
+pub struct RecvHandle<'a, T: Serial + Send, U> {
+    flux: &'a mut Flux<T, U>,
     from: usize,
     token: ReplyToken,
     data: T,
 }
 
-impl<'a, T: Serial + Send, U, M: MpscChannel> RecvHandle<'a, T, U, M> {
+impl<'a, T: Serial + Send, U> RecvHandle<'a, T, U> {
     /// Returns the sender's node ID.
     #[inline]
     pub fn from(&self) -> usize {
@@ -49,19 +47,16 @@ impl<'a, T: Serial + Send, U, M: MpscChannel> RecvHandle<'a, T, U, M> {
 }
 
 /// A node in a Flux network with callback-based response handling.
-///
-/// Generic over the MPSC channel implementation.
-pub struct Flux<T: Serial + Send, U, M: MpscChannel = OnesidedMpsc> {
+pub struct Flux<T: Serial + Send, U> {
     id: usize,
     num_nodes: usize,
-    server: M::Server<T, T>,
-    callers: Vec<CallerWithUserData<M::Caller<T, T>, T, T, U>>,
+    server: OnesidedServer<T>,
+    callers: Vec<CallerWithUserData<OnesidedCaller<T>, T, T, U>>,
     /// peer_ids[i] = peer node ID for callers[i]
     peer_ids: Vec<usize>,
-    _marker: PhantomData<M>,
 }
 
-impl<T: Serial + Send, U, M: MpscChannel> Flux<T, U, M> {
+impl<T: Serial + Send, U> Flux<T, U> {
     /// Returns this node's ID.
     #[inline]
     pub fn id(&self) -> usize {
@@ -118,12 +113,12 @@ impl<T: Serial + Send, U, M: MpscChannel> Flux<T, U, M> {
 
     /// Tries to receive the next request from the server.
     #[inline]
-    pub fn try_recv(&mut self) -> Option<RecvHandle<'_, T, U, M>> {
+    pub fn try_recv(&mut self) -> Option<RecvHandle<'_, T, U>> {
         let recv_ref = self.server.try_recv()?;
 
         // Copy data (T: Serial = Copy) and extract token
         let caller_id = recv_ref.caller_id();
-        let data = recv_ref.data();
+        let data = *recv_ref.data();
         let token = recv_ref.into_token();
 
         // Map caller_id to peer_id
@@ -153,7 +148,7 @@ impl<T: Serial + Send, U, M: MpscChannel> Flux<T, U, M> {
         let recv_ref = self.server.try_recv()?;
 
         let caller_id = recv_ref.caller_id();
-        let data = recv_ref.data();
+        let data = *recv_ref.data();
         let token = recv_ref.into_token();
 
         let from = self.peer_ids[caller_id];
@@ -171,7 +166,7 @@ impl<T: Serial + Send, U, M: MpscChannel> Flux<T, U, M> {
     }
 }
 
-/// Creates a Flux network with `n` nodes using the default MPSC channel (OnesidedMpsc).
+/// Creates a Flux network with `n` nodes using `OnesidedMpsc`.
 ///
 /// # Arguments
 /// * `n` - Number of nodes
@@ -184,32 +179,10 @@ pub fn create_flux<T, U>(
     n: usize,
     capacity: usize,
     inflight_max: usize,
-) -> Vec<Flux<T, U, OnesidedMpsc>>
+) -> Vec<Flux<T, U>>
 where
     T: Serial + Send,
     U: Send,
-{
-    create_flux_with::<T, U, OnesidedMpsc>(n, capacity, inflight_max)
-}
-
-/// Creates a Flux network with `n` nodes using the specified MPSC channel.
-///
-/// # Arguments
-/// * `n` - Number of nodes
-/// * `capacity` - Channel buffer capacity (will be rounded to power of 2)
-/// * `inflight_max` - Maximum inflight requests per channel (must be < capacity)
-///
-/// # Panics
-/// Panics if `n` is 0, `capacity` is 0, or `inflight_max >= capacity`.
-pub fn create_flux_with<T, U, M>(
-    n: usize,
-    capacity: usize,
-    inflight_max: usize,
-) -> Vec<Flux<T, U, M>>
-where
-    T: Serial + Send,
-    U: Send,
-    M: MpscChannel,
 {
     assert!(n > 0, "must have at least one node");
     assert!(capacity > 0, "capacity must be greater than 0");
@@ -222,10 +195,11 @@ where
     );
 
     // Create N MPSC channel groups (each group has n-1 callers and 1 server)
-    let mut groups: Vec<(Vec<Option<M::Caller<T, T>>>, Option<M::Server<T, T>>)> = (0..n)
+    let mut groups: Vec<(Vec<Option<OnesidedCaller<T>>>, Option<OnesidedServer<T>>)> = (0..n)
         .map(|_| {
-            let (callers, server) = M::create::<T, T>(n - 1, capacity, inflight_max);
-            let callers_opt: Vec<Option<M::Caller<T, T>>> = callers.into_iter().map(Some).collect();
+            let (callers, server) = OnesidedMpsc::create::<T, T>(n - 1, capacity, inflight_max);
+            let callers_opt: Vec<Option<OnesidedCaller<T>>> =
+                callers.into_iter().map(Some).collect();
             (callers_opt, Some(server))
         })
         .collect();
@@ -257,7 +231,7 @@ where
         }
 
         // Wrap each caller with CallerWithUserData
-        let callers: Vec<CallerWithUserData<M::Caller<T, T>, T, T, U>> = callers_raw
+        let callers: Vec<CallerWithUserData<OnesidedCaller<T>, T, T, U>> = callers_raw
             .into_iter()
             .map(|caller| CallerWithUserData::new(caller, actual_capacity))
             .collect();
@@ -268,7 +242,6 @@ where
             server,
             callers,
             peer_ids,
-            _marker: PhantomData,
         });
     }
 
@@ -278,7 +251,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mempc::{FastForwardMpsc, LamportMpsc};
 
     #[test]
     fn test_create_flux() {
@@ -643,67 +615,5 @@ mod tests {
 
         let responses = responses.borrow();
         assert_eq!(responses.len(), 2);
-    }
-
-    // Tests for different MPSC channel implementations
-
-    #[test]
-    fn test_fastforward_mpsc() {
-        use std::cell::RefCell;
-        use std::rc::Rc;
-
-        let responses: Rc<RefCell<Vec<(u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
-        let responses_clone = Rc::clone(&responses);
-        let mut on_resp = move |user_data, data| {
-            responses_clone.borrow_mut().push((user_data, data));
-        };
-
-        let mut nodes: Vec<Flux<u32, u32, FastForwardMpsc>> = create_flux_with(2, 16, 8);
-
-        nodes[0].call(1, 42, 100).unwrap();
-        nodes[0].poll(|_, _| {});
-
-        nodes[1].poll(|_, _| {});
-        let handle = nodes[1].try_recv().unwrap();
-        assert_eq!(handle.from(), 0);
-        assert_eq!(handle.data(), 42);
-        handle.reply(43);
-        nodes[1].poll(|_, _| {});
-
-        nodes[0].poll(&mut on_resp);
-
-        let responses = responses.borrow();
-        assert_eq!(responses.len(), 1);
-        assert_eq!(responses[0], (100, 43));
-    }
-
-    #[test]
-    fn test_lamport_mpsc() {
-        use std::cell::RefCell;
-        use std::rc::Rc;
-
-        let responses: Rc<RefCell<Vec<(u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
-        let responses_clone = Rc::clone(&responses);
-        let mut on_resp = move |user_data, data| {
-            responses_clone.borrow_mut().push((user_data, data));
-        };
-
-        let mut nodes: Vec<Flux<u32, u32, LamportMpsc>> = create_flux_with(2, 16, 8);
-
-        nodes[0].call(1, 42, 100).unwrap();
-        nodes[0].poll(|_, _| {});
-
-        nodes[1].poll(|_, _| {});
-        let handle = nodes[1].try_recv().unwrap();
-        assert_eq!(handle.from(), 0);
-        assert_eq!(handle.data(), 42);
-        handle.reply(43);
-        nodes[1].poll(|_, _| {});
-
-        nodes[0].poll(&mut on_resp);
-
-        let responses = responses.borrow();
-        assert_eq!(responses.len(), 1);
-        assert_eq!(responses[0], (100, 43));
     }
 }

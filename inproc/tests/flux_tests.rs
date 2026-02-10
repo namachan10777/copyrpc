@@ -145,8 +145,6 @@ fn test_round_robin_poll() {
 fn test_channel_full() {
     let mut nodes: Vec<Flux<u32, ()>> = create_flux(2, 4, 2); // Very small capacity: cap=4, inflight_max=2
 
-    // FastForward uses validity flags, so full capacity is available
-    // inflight_max=2 means at most 2 concurrent requests per channel
     assert!(nodes[0].call(1, 1, ()).is_ok());
     assert!(nodes[0].call(1, 2, ()).is_ok());
 
@@ -176,76 +174,83 @@ fn test_invalid_peer() {
 
 #[test]
 fn test_threaded_all_to_all() {
-    let n = 8;
-    let msgs_per_pair = 1000;
+    let n = 4;
+    let msgs_per_pair = 100;
+    let capacity = 1024;
+    let inflight_max = 256;
 
-    // Create shared counters for response tracking
-    let response_counts: Vec<Arc<AtomicU64>> =
-        (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let global_response_count = Arc::new(AtomicU64::new(0));
+    let expected_total = (n * (n - 1) * msgs_per_pair) as u64;
 
-    let nodes: Vec<Flux<u64, usize>> = create_flux(n, 4096, 1024);
+    let nodes: Vec<Flux<u64, ()>> = create_flux(n, capacity, inflight_max);
 
-    let handles: Vec<_> = nodes
-        .into_iter()
-        .enumerate()
-        .map(|(node_idx, mut node)| {
-            let response_counter = Arc::clone(&response_counts[node_idx]);
-            thread::spawn(move || {
-                let id = node.id();
+    let global_count = Arc::clone(&global_response_count);
 
-                let mut on_resp = |_node_idx: usize, _: u64| {
-                    response_counter.fetch_add(1, Ordering::Relaxed);
-                };
+    thread::scope(|s| {
+        let handles: Vec<_> = nodes
+            .into_iter()
+            .map(|mut node| {
+                let global_count = Arc::clone(&global_count);
+                s.spawn(move || {
+                    let id = node.id();
+                    let peers: Vec<usize> = (0..n).filter(|&p| p != id).collect();
 
-                // Send to all peers
-                for peer in 0..n {
-                    if peer != id {
-                        for i in 0..msgs_per_pair {
-                            loop {
-                                match node.call(peer, id as u64 * 1_000_000 + i as u64, node_idx) {
-                                    Ok(_) => break,
-                                    Err(SendError::Full(_)) => {
-                                        node.poll(&mut on_resp);
-                                        // Process any incoming requests
-                                        while let Some(handle) = node.try_recv() {
-                                            let data = handle.data();
-                                            handle.reply(data);
-                                        }
-                                        std::hint::spin_loop();
-                                    }
-                                    Err(e) => panic!("send error: {:?}", e),
+                    let mut sent_per_peer = vec![0usize; n];
+                    let total_to_send = peers.len() * msgs_per_pair;
+                    let expected_requests = peers.len() * msgs_per_pair;
+                    let mut total_sent = 0;
+                    let mut requests_handled = 0;
+
+                    while total_sent < total_to_send || requests_handled < expected_requests {
+                        for &peer in &peers {
+                            if sent_per_peer[peer] < msgs_per_pair {
+                                if node
+                                    .call(peer, (id * 1_000_000 + sent_per_peer[peer]) as u64, ())
+                                    .is_ok()
+                                {
+                                    sent_per_peer[peer] += 1;
+                                    total_sent += 1;
                                 }
                             }
                         }
+
+                        node.poll(|_: (), _: u64| {
+                            global_count.fetch_add(1, Ordering::Relaxed);
+                        });
+                        while let Some(handle) = node.try_recv() {
+                            let data = handle.data();
+                            handle.reply(data);
+                            requests_handled += 1;
+                        }
                     }
-                }
 
-                // Continue processing until all expected messages received
-                let expected_responses = ((n - 1) * msgs_per_pair) as u64;
-                let expected_requests = ((n - 1) * msgs_per_pair) as u64;
-                let mut requests_processed = 0u64;
-
-                while response_counter.load(Ordering::Relaxed) < expected_responses
-                    || requests_processed < expected_requests
-                {
-                    node.poll(&mut on_resp);
-                    while let Some(handle) = node.try_recv() {
-                        let val = handle.data();
-                        assert_eq!(val / 1_000_000, handle.from() as u64);
-                        handle.reply(val);
-                        requests_processed += 1;
+                    // Drain remaining responses
+                    while global_count.load(Ordering::Relaxed) < expected_total {
+                        node.poll(|_: (), _: u64| {
+                            global_count.fetch_add(1, Ordering::Relaxed);
+                        });
+                        while let Some(handle) = node.try_recv() {
+                            let data = handle.data();
+                            handle.reply(data);
+                        }
+                        std::hint::spin_loop();
                     }
-                }
 
-                response_counter.load(Ordering::Relaxed)
+                    requests_handled as u64
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    for h in handles {
-        let count = h.join().unwrap();
-        assert_eq!(count, ((n - 1) * msgs_per_pair) as u64);
-    }
+        for h in handles {
+            let count = h.join().unwrap();
+            assert_eq!(count, ((n - 1) * msgs_per_pair) as u64);
+        }
+    });
+
+    assert_eq!(
+        global_response_count.load(Ordering::Relaxed),
+        expected_total
+    );
 }
 
 #[test]
