@@ -26,9 +26,6 @@ struct EndpointConnectionInfo {
     recv_ring_rkey: u32,
     _padding2: u32,
     recv_ring_size: u64,
-    consumer_addr: u64,
-    consumer_rkey: u32,
-    _padding3: u32,
     initial_credit: u64,
 }
 
@@ -174,9 +171,6 @@ fn run_one_to_one(
             recv_ring_rkey: info.recv_ring_rkey,
             _padding2: 0,
             recv_ring_size: info.recv_ring_size,
-            consumer_addr: info.consumer_addr,
-            consumer_rkey: info.consumer_rkey,
-            _padding3: 0,
             initial_credit: info.initial_credit,
         });
 
@@ -203,8 +197,6 @@ fn run_one_to_one(
             recv_ring_addr: remote_ep.recv_ring_addr,
             recv_ring_rkey: remote_ep.recv_ring_rkey,
             recv_ring_size: remote_ep.recv_ring_size,
-            consumer_addr: remote_ep.consumer_addr,
-            consumer_rkey: remote_ep.consumer_rkey,
             initial_credit: remote_ep.initial_credit,
         };
         ep.connect(&remote, 0, ctx.port())
@@ -352,9 +344,6 @@ fn run_one_to_one_threaded(
                     recv_ring_rkey: info.recv_ring_rkey,
                     _padding2: 0,
                     recv_ring_size: info.recv_ring_size,
-                    consumer_addr: info.consumer_addr,
-                    consumer_rkey: info.consumer_rkey,
-                    _padding3: 0,
                     initial_credit: info.initial_credit,
                 });
                 endpoints.push(ep);
@@ -376,8 +365,6 @@ fn run_one_to_one_threaded(
                     recv_ring_addr: remote_ep.recv_ring_addr,
                     recv_ring_rkey: remote_ep.recv_ring_rkey,
                     recv_ring_size: remote_ep.recv_ring_size,
-                    consumer_addr: remote_ep.consumer_addr,
-                    consumer_rkey: remote_ep.consumer_rkey,
                     initial_credit: remote_ep.initial_credit,
                 };
                 ep.connect(&remote, 0, ctx.port())
@@ -818,9 +805,6 @@ fn run_multi_client(
                 recv_ring_rkey: info.recv_ring_rkey,
                 _padding2: 0,
                 recv_ring_size: info.recv_ring_size,
-                consumer_addr: info.consumer_addr,
-                consumer_rkey: info.consumer_rkey,
-                _padding3: 0,
                 initial_credit: info.initial_credit,
             });
             endpoints.push(ep);
@@ -839,8 +823,6 @@ fn run_multi_client(
                 recv_ring_addr: remote_ep.recv_ring_addr,
                 recv_ring_rkey: remote_ep.recv_ring_rkey,
                 recv_ring_size: remote_ep.recv_ring_size,
-                consumer_addr: remote_ep.consumer_addr,
-                consumer_rkey: remote_ep.consumer_rkey,
                 initial_credit: remote_ep.initial_credit,
             };
             endpoints[i]
@@ -907,9 +889,6 @@ fn run_multi_client(
             recv_ring_rkey: info.recv_ring_rkey,
             _padding2: 0,
             recv_ring_size: info.recv_ring_size,
-            consumer_addr: info.consumer_addr,
-            consumer_rkey: info.consumer_rkey,
-            _padding3: 0,
             initial_credit: info.initial_credit,
         };
 
@@ -923,8 +902,6 @@ fn run_multi_client(
             recv_ring_addr: remote_ep.recv_ring_addr,
             recv_ring_rkey: remote_ep.recv_ring_rkey,
             recv_ring_size: remote_ep.recv_ring_size,
-            consumer_addr: remote_ep.consumer_addr,
-            consumer_rkey: remote_ep.consumer_rkey,
             initial_credit: remote_ep.initial_credit,
         };
 

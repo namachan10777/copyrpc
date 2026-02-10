@@ -37,7 +37,6 @@ use std::io;
 use fastmap::FastMap;
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use slab::Slab;
 
@@ -57,7 +56,6 @@ use encoding::{
     is_response, padded_message_size, to_response_id,
 };
 use error::{Error, Result};
-use ring::RemoteConsumer;
 
 /// Default ring buffer size (1 MB).
 pub const DEFAULT_RING_SIZE: usize = 1 << 20;
@@ -115,10 +113,6 @@ pub struct RemoteEndpointInfo {
     pub recv_ring_rkey: u32,
     /// Remote receive ring buffer size.
     pub recv_ring_size: u64,
-    /// Remote consumer position MR address (for RDMA READ).
-    pub consumer_addr: u64,
-    /// Remote consumer position MR rkey (for RDMA READ).
-    pub consumer_rkey: u32,
     /// Initial credit (bytes) granted by remote for response reservation.
     pub initial_credit: u64,
 }
@@ -141,22 +135,11 @@ impl RemoteRingInfo {
     }
 }
 
-/// Remote consumer position MR information for RDMA READ.
-#[derive(Debug, Clone, Copy)]
-struct RemoteConsumerMr {
-    /// Remote consumer position address.
-    addr: u64,
-    /// Remote consumer position rkey.
-    rkey: u32,
-}
-
 /// SRQ entry for tracking receive completions.
 #[derive(Debug, Clone, Copy)]
 pub struct SrqEntry {
     /// QPN of the QP that posted this receive.
     pub qpn: u32,
-    /// Flag to distinguish READ completions from WRITE+IMM completions in send CQ.
-    pub is_read: bool,
 }
 
 /// Type alias for the SQ callback used in copyrpc.
@@ -165,7 +148,7 @@ type SqCqCallback = Box<dyn Fn(Cqe, SrqEntry)>;
 /// Type alias for the RC QP with SRQ used in copyrpc (for MonoCq).
 type CopyrpcQp = RcQpForMonoCqWithSrqAndSqCb<SrqEntry, SqCqCallback>;
 
-/// Buffer for send CQE completions (READ completion processing).
+/// Buffer for send CQE completions.
 /// Uses UnsafeCell to avoid RefCell overhead in the hot path.
 /// Safety: Single-threaded access guaranteed (Rc, not Send/Sync).
 struct SendCqeBuffer {
@@ -220,7 +203,7 @@ pub struct Context<U> {
     send_cq: Rc<mlx5::cq::Cq>,
     /// Receive completion queue (MonoCq for SRQ-based completion processing).
     recv_cq: Rc<MonoCq<CopyrpcQp>>,
-    /// CQE buffer for send completions (for READ completion processing).
+    /// CQE buffer for send completions.
     send_cqe_buffer: Rc<SendCqeBuffer>,
     /// Registered endpoints by QPN.
     endpoints: RefCell<FastMap<Rc<RefCell<EndpointInner<U>>>>>,
@@ -307,21 +290,13 @@ impl<U> ContextBuilder<U> {
 
         // Pre-post recv buffers to SRQ
         for _ in 0..srq_max_wr {
-            let _ = srq.post_recv(
-                SrqEntry {
-                    qpn: 0,
-                    is_read: false,
-                },
-                0,
-                0,
-                0,
-            );
+            let _ = srq.post_recv(SrqEntry { qpn: 0 }, 0, 0, 0);
         }
         srq.ring_doorbell();
 
         let send_cq = Rc::new(mlx5_ctx.create_cq(self.cq_size, &CqConfig::default())?);
 
-        // Create CQE buffer for send CQ (for READ completion processing)
+        // Create CQE buffer for send CQ
         let send_cqe_buffer = Rc::new(SendCqeBuffer::new());
 
         // Create MonoCq for recv (callback passed to poll at call site)
@@ -390,9 +365,8 @@ impl<U> Context<U> {
     ///    - Requests are pushed to recv_stack
     ///    - Responses invoke the on_response callback
     /// 2. Reposts recv buffers to SRQ
-    /// 3. Polls the send CQ to handle READ completions
+    /// 3. Polls the send CQ for SQ progress tracking
     /// 4. Flushes all endpoints' accumulated data
-    /// 5. Issues READ operations for endpoints that need consumer position updates
     pub fn poll(&self, mut on_response: impl FnMut(U, &[u8])) {
         // Split borrows to avoid self-reference in closure
         let recv_cq = &self.recv_cq;
@@ -433,22 +407,14 @@ impl<U> Context<U> {
             if posted < threshold {
                 let to_post = self.srq_max_wr - posted;
                 for _ in 0..to_post {
-                    let _ = self.srq.post_recv(
-                        SrqEntry {
-                            qpn: 0,
-                            is_read: false,
-                        },
-                        0,
-                        0,
-                        0,
-                    );
+                    let _ = self.srq.post_recv(SrqEntry { qpn: 0 }, 0, 0, 0);
                 }
                 self.srq.ring_doorbell();
                 self.srq_posted.set(self.srq_max_wr);
             }
         }
 
-        // 3. Poll send CQ for READ completions
+        // 3. Poll send CQ for SQ progress tracking
         loop {
             let count = self.send_cq.poll();
             if count == 0 {
@@ -457,63 +423,16 @@ impl<U> Context<U> {
         }
         self.send_cq.flush();
 
-        // 4. Process send CQEs (READ completions)
+        // Clear send CQE buffer (no READ completions to process)
         {
-            // Safety: Single-threaded access guaranteed by Rc (not Send/Sync).
             let entries = unsafe { &mut *self.send_cqe_buffer.entries.get() };
-            for (_cqe, entry) in entries.drain(..) {
-                // Only process READ completions (is_read=true)
-                // WRITE+IMM completions (is_read=false) are just for SQ progress tracking
-                if !entry.is_read {
-                    continue;
-                }
-
-                // entry.qpn identifies which endpoint's READ completed
-                if let Some(ep) = self.endpoints.borrow().get(entry.qpn) {
-                    let ep_ref = ep.borrow();
-                    if ep_ref.read_inflight.get() {
-                        // Read the consumer value from read_buffer
-                        let consumer_value = u64::from_le_bytes(*ep_ref.read_buffer);
-                        ep_ref.remote_consumer.update(consumer_value);
-                        ep_ref.read_inflight.set(false);
-                    }
-                }
-            }
+            entries.clear();
         }
 
-        // 5. Flush all endpoints and issue READ operations if needed
+        // 4. Flush all endpoints
         for (_, ep) in self.endpoints.borrow().iter() {
             let ep_ref = ep.borrow();
-
-            // Flush accumulated data
             let _ = ep_ref.flush();
-
-            // Issue READ if needed or forced, and not already in-flight
-            let needs = ep_ref.needs_read();
-            let force = ep_ref.force_read.get();
-            let inflight = ep_ref.read_inflight.get();
-
-            if !inflight
-                && (needs || force)
-                && let Some(remote_mr) = ep_ref.remote_consumer_mr.get()
-            {
-                let qp = ep_ref.qp.borrow();
-                if let Ok(ctx) = qp.emit_ctx() {
-                    let result = emit_wqe!(&ctx, read {
-                        flags: WqeFlags::empty(),
-                        remote_addr: remote_mr.addr,
-                        rkey: remote_mr.rkey,
-                        sge: { addr: ep_ref.read_buffer_mr.addr() as u64, len: 8, lkey: ep_ref.read_buffer_mr.lkey() },
-                        signaled: SrqEntry { qpn: ep_ref.qpn(), is_read: true },
-                    });
-
-                    if result.is_ok() {
-                        ep_ref.read_inflight.set(true);
-                        ep_ref.force_read.set(false);
-                        qp.ring_sq_doorbell_bf();
-                    }
-                }
-            }
         }
     }
 
@@ -568,7 +487,7 @@ impl<U> Context<U> {
         }
 
         // Read flow_metadata at current position
-        let (consumer_pos, credit_grant, message_count);
+        let (ring_credit_return, credit_grant, message_count);
         {
             let ep = endpoint.borrow();
             let pos = ep.last_recv_pos.get();
@@ -576,12 +495,13 @@ impl<U> Context<U> {
             let meta_offset = (pos & recv_ring_mask) as usize;
 
             unsafe {
-                (consumer_pos, credit_grant, message_count) =
+                (ring_credit_return, credit_grant, message_count) =
                     decode_flow_metadata(ep.recv_ring[meta_offset..].as_ptr());
             }
 
-            // Update flow control from metadata
-            ep.remote_consumer.update(consumer_pos);
+            // Update flow control from metadata (accumulate delta)
+            ep.remote_consumer_pos
+                .set(ep.remote_consumer_pos.get() + ring_credit_return);
             ep.peer_credit_balance
                 .set(ep.peer_credit_balance.get() + credit_grant);
 
@@ -598,7 +518,6 @@ impl<U> Context<U> {
             let remaining = recv_ring_len - offset;
             let new_pos = pos + remaining;
             ep.last_recv_pos.set(new_pos);
-            ep.consumer_position.store(new_pos, Ordering::Release);
             return;
         }
 
@@ -644,13 +563,6 @@ impl<U> Context<U> {
                 });
             }
         }
-
-        // Update consumer_position for RDMA READ by remote
-        {
-            let ep = endpoint.borrow();
-            let pos = ep.last_recv_pos.get();
-            ep.consumer_position.store(pos, Ordering::Release);
-        }
     }
 }
 
@@ -688,28 +600,16 @@ struct EndpointInner<U> {
     recv_ring_producer: Cell<u64>,
     /// Last received message position (consumer).
     last_recv_pos: Cell<u64>,
-    /// Remote consumer position (piggyback + RDMA READ updates).
-    remote_consumer: RemoteConsumer,
+    /// Last recv_pos at which we notified the peer via ring_credit_return.
+    last_notified_recv_pos: Cell<u64>,
+    /// Remote consumer position (accumulated from ring_credit_return piggybacks).
+    remote_consumer_pos: Cell<u64>,
     /// Counter for unsignaled WQEs (for periodic signaling).
     unsignaled_count: Cell<u32>,
     /// Pending calls waiting for responses. Slab index is used as call_id.
     pending_calls: RefCell<Slab<U>>,
     /// Flush start position (for WQE batching).
     flush_start_pos: Cell<u64>,
-    /// READ operation is in-flight.
-    read_inflight: Cell<bool>,
-    /// Force READ on next poll (set when RingFull occurs).
-    force_read: Cell<bool>,
-    /// Consumer position for RDMA READ (8-byte aligned).
-    consumer_position: Box<AtomicU64>,
-    /// Consumer position memory region.
-    consumer_position_mr: MemoryRegion,
-    /// Buffer for RDMA READ results.
-    read_buffer: Box<[u8; 8]>,
-    /// Read buffer memory region.
-    read_buffer_mr: MemoryRegion,
-    /// Remote consumer position MR information.
-    remote_consumer_mr: Cell<Option<RemoteConsumerMr>>,
     /// Response reservation (R): credits issued minus responses written (bytes).
     resp_reservation: Cell<u64>,
     /// Maximum response reservation (policy limit).
@@ -745,21 +645,6 @@ impl<U> EndpointInner<U> {
             unsafe { pd.register(send_ring.as_mut_ptr(), send_ring.len(), access_flags)? };
         let recv_ring_mr =
             unsafe { pd.register(recv_ring.as_mut_ptr(), recv_ring.len(), access_flags)? };
-
-        // Consumer position MR (for RDMA READ by remote)
-        let consumer_position = Box::new(AtomicU64::new(0));
-        let consumer_position_mr = unsafe {
-            pd.register(
-                consumer_position.as_ref() as *const AtomicU64 as *mut u8,
-                std::mem::size_of::<AtomicU64>(),
-                AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ,
-            )?
-        };
-
-        // Read buffer for RDMA READ results
-        let mut read_buffer = Box::new([0u8; 8]);
-        let read_buffer_mr =
-            unsafe { pd.register(read_buffer.as_mut_ptr(), 8, AccessFlags::LOCAL_WRITE)? };
 
         // Create QP with SRQ using MonoCq for recv
         let send_cqe_buffer_clone = send_cqe_buffer.clone();
@@ -797,17 +682,11 @@ impl<U> EndpointInner<U> {
             send_ring_producer: Cell::new(0),
             recv_ring_producer: Cell::new(0),
             last_recv_pos: Cell::new(0),
-            remote_consumer: RemoteConsumer::new(),
+            last_notified_recv_pos: Cell::new(0),
+            remote_consumer_pos: Cell::new(0),
             unsignaled_count: Cell::new(0),
             pending_calls: RefCell::new(Slab::new()),
             flush_start_pos: Cell::new(0),
-            read_inflight: Cell::new(false),
-            force_read: Cell::new(false),
-            consumer_position,
-            consumer_position_mr,
-            read_buffer,
-            read_buffer_mr,
-            remote_consumer_mr: Cell::new(None),
             resp_reservation: Cell::new(0),
             max_resp_reservation,
             peer_credit_balance: Cell::new(0),
@@ -831,8 +710,6 @@ impl<U> EndpointInner<U> {
             recv_ring_addr: self.recv_ring_mr.addr() as u64,
             recv_ring_rkey: self.recv_ring_mr.rkey(),
             recv_ring_size: self.recv_ring.len() as u64,
-            consumer_addr: self.consumer_position_mr.addr() as u64,
-            consumer_rkey: self.consumer_position_mr.rkey(),
             initial_credit: self
                 .max_resp_reservation
                 .min(self.send_ring.len() as u64 / 4),
@@ -894,10 +771,7 @@ impl<U> EndpointInner<U> {
                             rkey: remote_ring.rkey,
                             imm: imm,
                             inline: inline_data,
-                            signaled: SrqEntry {
-                                qpn,
-                                is_read: false
-                            },
+                            signaled: SrqEntry { qpn },
                         }
                     )
                     .map_err(|e| Error::Io(e.into()))?;
@@ -927,7 +801,7 @@ impl<U> EndpointInner<U> {
                         imm: imm,
                         inline: inline_data,
                         sge: { addr: self.send_ring_mr.addr() as u64 + sge_offset as u64, len: sge_len as u32, lkey: self.send_ring_mr.lkey() },
-                        signaled: SrqEntry { qpn, is_read: false },
+                        signaled: SrqEntry { qpn },
                     }).map_err(|e| Error::Io(e.into()))?;
                 } else {
                     emit_wqe!(&ctx, write_imm {
@@ -958,23 +832,6 @@ impl<U> EndpointInner<U> {
         self.emit_wqe()?;
         self.qp.borrow().ring_sq_doorbell_bf();
         Ok(())
-    }
-
-    /// Check if we need to issue a READ for remote consumer position.
-    fn needs_read(&self) -> bool {
-        let remote_ring = match self.remote_recv_ring.get() {
-            Some(r) => r,
-            None => return false,
-        };
-
-        let producer = self.send_ring_producer.get();
-        let consumer = self.remote_consumer.get();
-        let in_flight = producer.wrapping_sub(consumer);
-        let available = remote_ring.size.saturating_sub(in_flight);
-
-        // Request READ when available space drops below 25% of ring size
-        let threshold = remote_ring.size / 4;
-        available < threshold
     }
 
     /// Ensure a batch metadata placeholder exists at the current position.
@@ -1011,7 +868,8 @@ impl<U> EndpointInner<U> {
         let ring_size = self.send_ring.len() as u64;
         let meta_offset = (meta_pos & (ring_size - 1)) as usize;
 
-        let consumer_pos = self.last_recv_pos.get();
+        let ring_credit_return = self.last_recv_pos.get() - self.last_notified_recv_pos.get();
+        self.last_notified_recv_pos.set(self.last_recv_pos.get());
         let credit_grant = self.compute_credit_grant();
         let message_count = self.batch_message_count.get();
 
@@ -1021,7 +879,7 @@ impl<U> EndpointInner<U> {
 
         unsafe {
             let buf_ptr = self.send_ring.as_ptr().add(meta_offset) as *mut u8;
-            encode_flow_metadata(buf_ptr, consumer_pos, credit_grant, message_count);
+            encode_flow_metadata(buf_ptr, ring_credit_return, credit_grant, message_count);
         }
 
         self.meta_pos.set(None);
@@ -1040,14 +898,20 @@ impl<U> EndpointInner<U> {
 
         debug_assert!(remaining >= FLOW_METADATA_SIZE);
 
-        let consumer_pos = self.last_recv_pos.get();
+        let ring_credit_return = self.last_recv_pos.get() - self.last_notified_recv_pos.get();
+        self.last_notified_recv_pos.set(self.last_recv_pos.get());
         let credit_grant = self.compute_credit_grant();
         self.resp_reservation
             .set(self.resp_reservation.get() + credit_grant);
 
         unsafe {
             let buf_ptr = self.send_ring.as_ptr().add(offset) as *mut u8;
-            encode_flow_metadata(buf_ptr, consumer_pos, credit_grant, WRAP_MESSAGE_COUNT);
+            encode_flow_metadata(
+                buf_ptr,
+                ring_credit_return,
+                credit_grant,
+                WRAP_MESSAGE_COUNT,
+            );
         }
 
         self.send_ring_producer.set(producer + remaining as u64);
@@ -1065,7 +929,7 @@ impl<U> EndpointInner<U> {
         };
 
         let producer = self.send_ring_producer.get();
-        let consumer = self.remote_consumer.get();
+        let consumer = self.remote_consumer_pos.get();
         let in_flight = producer.saturating_sub(consumer);
         let current_r = self.resp_reservation.get();
 
@@ -1117,10 +981,6 @@ pub struct LocalEndpointInfo {
     pub recv_ring_rkey: u32,
     /// Local receive ring buffer size.
     pub recv_ring_size: u64,
-    /// Local consumer position MR address (for RDMA READ).
-    pub consumer_addr: u64,
-    /// Local consumer position MR rkey (for RDMA READ).
-    pub consumer_rkey: u32,
     /// Initial credit (bytes) for response reservation.
     pub initial_credit: u64,
 }
@@ -1159,12 +1019,6 @@ impl<U> Endpoint<U> {
             remote.recv_ring_size,
         )));
 
-        // Set remote consumer MR info for RDMA READ
-        inner.remote_consumer_mr.set(Some(RemoteConsumerMr {
-            addr: remote.consumer_addr,
-            rkey: remote.consumer_rkey,
-        }));
-
         // Initialize credit:
         // - resp_reservation = initial credit we promised (capped to ring_size/4)
         //   This ensures 2*R ≤ C/2, leaving at least half the ring for messages.
@@ -1181,17 +1035,16 @@ impl<U> Endpoint<U> {
             local_identifier: remote.local_identifier,
         };
 
-        // Use standard access flags for RDMA WRITE and READ
+        // Use standard access flags for RDMA WRITE only (no READ needed)
         let access_flags = mlx5_sys::ibv_access_flags_IBV_ACCESS_LOCAL_WRITE
-            | mlx5_sys::ibv_access_flags_IBV_ACCESS_REMOTE_WRITE
-            | mlx5_sys::ibv_access_flags_IBV_ACCESS_REMOTE_READ;
+            | mlx5_sys::ibv_access_flags_IBV_ACCESS_REMOTE_WRITE;
 
         inner.qp.borrow_mut().connect(
             &remote_qp_info,
             port,
             local_psn,
-            4, // max_rd_atomic
-            4, // max_dest_rd_atomic
+            0, // max_rd_atomic
+            0, // max_dest_rd_atomic
             access_flags,
         )?;
 
@@ -1254,16 +1107,15 @@ impl<U> Endpoint<U> {
         // Check available space with credit invariant:
         // (producer - consumer) + 2*R ≤ C  →  msg_size ≤ available - 2*R
         let producer = inner.send_ring_producer.get();
-        let consumer = inner.remote_consumer.get();
+        let consumer = inner.remote_consumer_pos.get();
         let available = remote_ring
             .size
             .saturating_sub(producer.saturating_sub(consumer));
         let reserved = 2 * inner.resp_reservation.get();
 
         if available < msg_size + reserved {
-            // No space: flush and set force_read flag to trigger RDMA READ
+            // No space: flush and return RingFull; caller should poll() and retry
             inner.flush().map_err(error::CallError::Other)?;
-            inner.force_read.set(true);
             return Err(error::CallError::RingFull(user_data));
         }
 

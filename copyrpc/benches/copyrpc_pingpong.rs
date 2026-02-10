@@ -48,8 +48,6 @@ struct EndpointConnectionInfo {
     recv_ring_addr: u64,
     recv_ring_rkey: u32,
     recv_ring_size: u64,
-    consumer_addr: u64,
-    consumer_rkey: u32,
     initial_credit: u64,
 }
 
@@ -156,8 +154,6 @@ fn setup_copyrpc_benchmark(config: &BenchConfig) -> Option<BenchmarkSetup> {
             recv_ring_addr: info.recv_ring_addr,
             recv_ring_rkey: info.recv_ring_rkey,
             recv_ring_size: info.recv_ring_size,
-            consumer_addr: info.consumer_addr,
-            consumer_rkey: info.consumer_rkey,
             initial_credit: info.initial_credit,
         });
 
@@ -213,8 +209,6 @@ fn setup_copyrpc_benchmark(config: &BenchConfig) -> Option<BenchmarkSetup> {
             recv_ring_addr: server_ep.recv_ring_addr,
             recv_ring_rkey: server_ep.recv_ring_rkey,
             recv_ring_size: server_ep.recv_ring_size,
-            consumer_addr: server_ep.consumer_addr,
-            consumer_rkey: server_ep.consumer_rkey,
             initial_credit: server_ep.initial_credit,
         };
 
@@ -291,8 +285,6 @@ fn server_thread_main(
             recv_ring_addr: info.recv_ring_addr,
             recv_ring_rkey: info.recv_ring_rkey,
             recv_ring_size: info.recv_ring_size,
-            consumer_addr: info.consumer_addr,
-            consumer_rkey: info.consumer_rkey,
             initial_credit: info.initial_credit,
         });
 
@@ -324,8 +316,6 @@ fn server_thread_main(
             recv_ring_addr: client_ep.recv_ring_addr,
             recv_ring_rkey: client_ep.recv_ring_rkey,
             recv_ring_size: client_ep.recv_ring_size,
-            consumer_addr: client_ep.consumer_addr,
-            consumer_rkey: client_ep.consumer_rkey,
             initial_credit: client_ep.initial_credit,
         };
 

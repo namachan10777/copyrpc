@@ -22,24 +22,10 @@ use crate::parquet_out;
 use crate::storage::ShardedStore;
 use crate::workload::AccessEntry;
 
-// === Thread-local response counter for client on_response callback ===
+// === Thread-local response counter for client poll callback ===
 
 thread_local! {
     static DIRECT_COMPLETED: RefCell<u64> = const { RefCell::new(0) };
-}
-
-type DirectClientOnResponse = fn((), &[u8]);
-type DirectClientCtx = copyrpc::Context<(), DirectClientOnResponse>;
-
-type DirectDaemonOnResponse = fn((), &[u8]);
-type DirectDaemonCtx = copyrpc::Context<(), DirectDaemonOnResponse>;
-
-fn on_direct_response(_: (), _data: &[u8]) {
-    DIRECT_COMPLETED.with(|c| *c.borrow_mut() += 1);
-}
-
-fn on_daemon_response_dummy(_: (), _data: &[u8]) {
-    // Daemon does not issue calls, so this should never be invoked.
 }
 
 // === Info exchange messages ===
@@ -134,7 +120,7 @@ pub fn run_copyrpc_direct(
             }
 
             // Create copyrpc context
-            let ctx: DirectDaemonCtx = copyrpc::ContextBuilder::new()
+            let ctx: copyrpc::Context<()> = copyrpc::ContextBuilder::new()
                 .device_index(device_index)
                 .port(port)
                 .srq_config(mlx5::srq::SrqConfig {
@@ -142,7 +128,6 @@ pub fn run_copyrpc_direct(
                     max_sge: 1,
                 })
                 .cq_size(4096)
-                .on_response(on_daemon_response_dummy as DirectDaemonOnResponse)
                 .build()
                 .expect("Failed to create copyrpc context for daemon");
 
@@ -169,8 +154,6 @@ pub fn run_copyrpc_direct(
                     info.recv_ring_addr,
                     info.recv_ring_rkey,
                     info.recv_ring_size,
-                    info.consumer_addr,
-                    info.consumer_rkey,
                     info.initial_credit,
                 ));
                 endpoints.push(ep);
@@ -197,8 +180,6 @@ pub fn run_copyrpc_direct(
                         recv_ring_addr: r.recv_ring_addr,
                         recv_ring_rkey: r.recv_ring_rkey,
                         recv_ring_size: r.recv_ring_size,
-                        consumer_addr: r.consumer_addr,
-                        consumer_rkey: r.consumer_rkey,
                         initial_credit: r.initial_credit,
                     },
                     0,
@@ -232,7 +213,7 @@ pub fn run_copyrpc_direct(
             }
 
             // Create copyrpc context
-            let ctx: DirectClientCtx = copyrpc::ContextBuilder::new()
+            let ctx: copyrpc::Context<()> = copyrpc::ContextBuilder::new()
                 .device_index(device_index)
                 .port(port)
                 .srq_config(mlx5::srq::SrqConfig {
@@ -240,7 +221,6 @@ pub fn run_copyrpc_direct(
                     max_sge: 1,
                 })
                 .cq_size(4096)
-                .on_response(on_direct_response as DirectClientOnResponse)
                 .build()
                 .expect("Failed to create copyrpc context for client");
 
@@ -267,8 +247,6 @@ pub fn run_copyrpc_direct(
                     info.recv_ring_addr,
                     info.recv_ring_rkey,
                     info.recv_ring_size,
-                    info.consumer_addr,
-                    info.consumer_rkey,
                     info.initial_credit,
                 ));
                 endpoints.push(ep);
@@ -295,8 +273,6 @@ pub fn run_copyrpc_direct(
                         recv_ring_addr: r.recv_ring_addr,
                         recv_ring_rkey: r.recv_ring_rkey,
                         recv_ring_size: r.recv_ring_size,
-                        consumer_addr: r.consumer_addr,
-                        consumer_rkey: r.consumer_rkey,
                         initial_credit: r.initial_credit,
                     },
                     0,
@@ -539,7 +515,7 @@ pub fn run_copyrpc_direct(
 // === Daemon event loop ===
 
 fn run_direct_daemon(
-    ctx: &DirectDaemonCtx,
+    ctx: &copyrpc::Context<()>,
     _endpoints: &[copyrpc::Endpoint<()>],
     store: &mut ShardedStore,
     daemon_id: usize,
@@ -549,7 +525,9 @@ fn run_direct_daemon(
     let num_daemons_u64 = num_daemons as u64;
 
     while !stop.load(Ordering::Relaxed) {
-        ctx.poll();
+        ctx.poll(|(), _data: &[u8]| {
+            // Daemon does not issue calls, so this should never be invoked.
+        });
 
         while let Some(handle) = ctx.recv() {
             let req = RemoteRequest::from_bytes(handle.data()).request;
@@ -566,7 +544,7 @@ fn run_direct_daemon(
                 match handle.reply(remote_resp.as_bytes()) {
                     Ok(()) => break,
                     Err(copyrpc::error::Error::RingFull) => {
-                        ctx.poll();
+                        ctx.poll(|(), _| {});
                         continue;
                     }
                     Err(_) => break,
@@ -580,7 +558,7 @@ fn run_direct_daemon(
 
 #[allow(clippy::too_many_arguments)]
 fn run_direct_client_loop(
-    ctx: &DirectClientCtx,
+    ctx: &copyrpc::Context<()>,
     endpoints: &[copyrpc::Endpoint<()>],
     pattern: &[AccessEntry],
     queue_depth: u32,
@@ -613,7 +591,9 @@ fn run_direct_client_loop(
                 copyrpc::error::CallError::RingFull(_)
                 | copyrpc::error::CallError::InsufficientCredit(_),
             ) => {
-                ctx.poll();
+                ctx.poll(|(), _| {
+                    DIRECT_COMPLETED.with(|c| *c.borrow_mut() += 1);
+                });
                 // Retry once
                 match endpoints[ep_idx].call(remote_req.as_bytes(), (), 0u64) {
                     Ok(_) => {
@@ -627,7 +607,9 @@ fn run_direct_client_loop(
     }
 
     while !stop_flag.load(Ordering::Relaxed) {
-        ctx.poll();
+        ctx.poll(|(), _| {
+            DIRECT_COMPLETED.with(|c| *c.borrow_mut() += 1);
+        });
 
         let total_completed = DIRECT_COMPLETED.with(|c| *c.borrow());
         let new = total_completed - completed_base;

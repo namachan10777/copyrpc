@@ -21,8 +21,6 @@ struct EndpointConnectionInfo {
     recv_ring_addr: u64,
     recv_ring_rkey: u32,
     recv_ring_size: u64,
-    consumer_addr: u64,
-    consumer_rkey: u32,
     initial_credit: u64,
 }
 
@@ -126,8 +124,6 @@ fn test_simple_pingpong() {
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -173,8 +169,6 @@ fn test_simple_pingpong() {
         recv_ring_addr: server_info.recv_ring_addr,
         recv_ring_rkey: server_info.recv_ring_rkey,
         recv_ring_size: server_info.recv_ring_size,
-        consumer_addr: server_info.consumer_addr,
-        consumer_rkey: server_info.consumer_rkey,
         initial_credit: server_info.initial_credit,
     };
 
@@ -265,8 +259,6 @@ fn server_thread(
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -286,8 +278,6 @@ fn server_thread(
         recv_ring_addr: client_info.recv_ring_addr,
         recv_ring_rkey: client_info.recv_ring_rkey,
         recv_ring_size: client_info.recv_ring_size,
-        consumer_addr: client_info.consumer_addr,
-        consumer_rkey: client_info.consumer_rkey,
         initial_credit: client_info.initial_credit,
     };
 
@@ -369,8 +359,6 @@ fn test_multi_endpoint_pingpong() {
             recv_ring_addr: info.recv_ring_addr,
             recv_ring_rkey: info.recv_ring_rkey,
             recv_ring_size: info.recv_ring_size,
-            consumer_addr: info.consumer_addr,
-            consumer_rkey: info.consumer_rkey,
             initial_credit: info.initial_credit,
         });
 
@@ -424,8 +412,6 @@ fn test_multi_endpoint_pingpong() {
             recv_ring_addr: server_ep.recv_ring_addr,
             recv_ring_rkey: server_ep.recv_ring_rkey,
             recv_ring_size: server_ep.recv_ring_size,
-            consumer_addr: server_ep.consumer_addr,
-            consumer_rkey: server_ep.consumer_rkey,
             initial_credit: server_ep.initial_credit,
         };
 
@@ -532,8 +518,6 @@ fn test_srq_exhaustion_pingpong() {
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -579,8 +563,6 @@ fn test_srq_exhaustion_pingpong() {
         recv_ring_addr: server_info.recv_ring_addr,
         recv_ring_rkey: server_info.recv_ring_rkey,
         recv_ring_size: server_info.recv_ring_size,
-        consumer_addr: server_info.consumer_addr,
-        consumer_rkey: server_info.consumer_rkey,
         initial_credit: server_info.initial_credit,
     };
 
@@ -672,8 +654,6 @@ fn srq_exhaustion_server_thread(
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -693,8 +673,6 @@ fn srq_exhaustion_server_thread(
         recv_ring_addr: client_info.recv_ring_addr,
         recv_ring_rkey: client_info.recv_ring_rkey,
         recv_ring_size: client_info.recv_ring_size,
-        consumer_addr: client_info.consumer_addr,
-        consumer_rkey: client_info.consumer_rkey,
         initial_credit: client_info.initial_credit,
     };
 
@@ -768,8 +746,6 @@ fn test_benchmark_style_pingpong() {
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -815,8 +791,6 @@ fn test_benchmark_style_pingpong() {
         recv_ring_addr: server_info.recv_ring_addr,
         recv_ring_rkey: server_info.recv_ring_rkey,
         recv_ring_size: server_info.recv_ring_size,
-        consumer_addr: server_info.consumer_addr,
-        consumer_rkey: server_info.consumer_rkey,
         initial_credit: server_info.initial_credit,
     };
 
@@ -942,8 +916,6 @@ fn benchmark_style_server_thread(
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -963,8 +935,6 @@ fn benchmark_style_server_thread(
         recv_ring_addr: client_info.recv_ring_addr,
         recv_ring_rkey: client_info.recv_ring_rkey,
         recv_ring_size: client_info.recv_ring_size,
-        consumer_addr: client_info.consumer_addr,
-        consumer_rkey: client_info.consumer_rkey,
         initial_credit: client_info.initial_credit,
     };
 
@@ -1042,8 +1012,6 @@ fn multi_endpoint_server_thread(
             recv_ring_addr: info.recv_ring_addr,
             recv_ring_rkey: info.recv_ring_rkey,
             recv_ring_size: info.recv_ring_size,
-            consumer_addr: info.consumer_addr,
-            consumer_rkey: info.consumer_rkey,
             initial_credit: info.initial_credit,
         });
 
@@ -1079,8 +1047,6 @@ fn multi_endpoint_server_thread(
             recv_ring_addr: client_ep.recv_ring_addr,
             recv_ring_rkey: client_ep.recv_ring_rkey,
             recv_ring_size: client_ep.recv_ring_size,
-            consumer_addr: client_ep.consumer_addr,
-            consumer_rkey: client_ep.consumer_rkey,
             initial_credit: client_ep.initial_credit,
         };
 
@@ -1162,8 +1128,6 @@ fn test_ring_wraparound() {
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -1208,8 +1172,6 @@ fn test_ring_wraparound() {
         recv_ring_addr: server_info.recv_ring_addr,
         recv_ring_rkey: server_info.recv_ring_rkey,
         recv_ring_size: server_info.recv_ring_size,
-        consumer_addr: server_info.consumer_addr,
-        consumer_rkey: server_info.consumer_rkey,
         initial_credit: server_info.initial_credit,
     };
 
@@ -1311,8 +1273,6 @@ fn wraparound_server_thread(
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -1332,8 +1292,6 @@ fn wraparound_server_thread(
         recv_ring_addr: client_info.recv_ring_addr,
         recv_ring_rkey: client_info.recv_ring_rkey,
         recv_ring_size: client_info.recv_ring_size,
-        consumer_addr: client_info.consumer_addr,
-        consumer_rkey: client_info.consumer_rkey,
         initial_credit: client_info.initial_credit,
     };
 
@@ -1408,8 +1366,6 @@ fn test_high_throughput_sustained() {
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -1453,8 +1409,6 @@ fn test_high_throughput_sustained() {
         recv_ring_addr: server_info.recv_ring_addr,
         recv_ring_rkey: server_info.recv_ring_rkey,
         recv_ring_size: server_info.recv_ring_size,
-        consumer_addr: server_info.consumer_addr,
-        consumer_rkey: server_info.consumer_rkey,
         initial_credit: server_info.initial_credit,
     };
 
@@ -1582,8 +1536,6 @@ fn high_throughput_server_thread(
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -1603,8 +1555,6 @@ fn high_throughput_server_thread(
         recv_ring_addr: client_info.recv_ring_addr,
         recv_ring_rkey: client_info.recv_ring_rkey,
         recv_ring_size: client_info.recv_ring_size,
-        consumer_addr: client_info.consumer_addr,
-        consumer_rkey: client_info.consumer_rkey,
         initial_credit: client_info.initial_credit,
     };
 
@@ -1677,8 +1627,6 @@ fn test_debug_small_iterations() {
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -1722,8 +1670,6 @@ fn test_debug_small_iterations() {
         recv_ring_addr: server_info.recv_ring_addr,
         recv_ring_rkey: server_info.recv_ring_rkey,
         recv_ring_size: server_info.recv_ring_size,
-        consumer_addr: server_info.consumer_addr,
-        consumer_rkey: server_info.consumer_rkey,
         initial_credit: server_info.initial_credit,
     };
 
@@ -1855,8 +1801,6 @@ fn debug_server_thread(
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -1876,8 +1820,6 @@ fn debug_server_thread(
         recv_ring_addr: client_info.recv_ring_addr,
         recv_ring_rkey: client_info.recv_ring_rkey,
         recv_ring_size: client_info.recv_ring_size,
-        consumer_addr: client_info.consumer_addr,
-        consumer_rkey: client_info.consumer_rkey,
         initial_credit: client_info.initial_credit,
     };
 
@@ -1959,8 +1901,6 @@ fn test_benchmark_pattern() {
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -2005,8 +1945,6 @@ fn test_benchmark_pattern() {
         recv_ring_addr: server_info.recv_ring_addr,
         recv_ring_rkey: server_info.recv_ring_rkey,
         recv_ring_size: server_info.recv_ring_size,
-        consumer_addr: server_info.consumer_addr,
-        consumer_rkey: server_info.consumer_rkey,
         initial_credit: server_info.initial_credit,
     };
 
@@ -2139,8 +2077,6 @@ fn benchmark_pattern_server(
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -2160,8 +2096,6 @@ fn benchmark_pattern_server(
         recv_ring_addr: client_info.recv_ring_addr,
         recv_ring_rkey: client_info.recv_ring_rkey,
         recv_ring_size: client_info.recv_ring_size,
-        consumer_addr: client_info.consumer_addr,
-        consumer_rkey: client_info.consumer_rkey,
         initial_credit: client_info.initial_credit,
     };
 
@@ -2250,8 +2184,6 @@ fn test_emit_wqe_boundary_split() {
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -2296,8 +2228,6 @@ fn test_emit_wqe_boundary_split() {
         recv_ring_addr: server_info.recv_ring_addr,
         recv_ring_rkey: server_info.recv_ring_rkey,
         recv_ring_size: server_info.recv_ring_size,
-        consumer_addr: server_info.consumer_addr,
-        consumer_rkey: server_info.consumer_rkey,
         initial_credit: server_info.initial_credit,
     };
 
@@ -2439,8 +2369,6 @@ fn emit_wqe_boundary_server_thread(
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -2460,8 +2388,6 @@ fn emit_wqe_boundary_server_thread(
         recv_ring_addr: client_info.recv_ring_addr,
         recv_ring_rkey: client_info.recv_ring_rkey,
         recv_ring_size: client_info.recv_ring_size,
-        consumer_addr: client_info.consumer_addr,
-        consumer_rkey: client_info.consumer_rkey,
         initial_credit: client_info.initial_credit,
     };
 
@@ -2556,8 +2482,6 @@ fn generic_server_thread(
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -2577,8 +2501,6 @@ fn generic_server_thread(
         recv_ring_addr: client_info.recv_ring_addr,
         recv_ring_rkey: client_info.recv_ring_rkey,
         recv_ring_size: client_info.recv_ring_size,
-        consumer_addr: client_info.consumer_addr,
-        consumer_rkey: client_info.consumer_rkey,
         initial_credit: client_info.initial_credit,
     };
 
@@ -2664,8 +2586,6 @@ fn test_credit_small_ring_large_response() {
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -2710,8 +2630,6 @@ fn test_credit_small_ring_large_response() {
         recv_ring_addr: server_info.recv_ring_addr,
         recv_ring_rkey: server_info.recv_ring_rkey,
         recv_ring_size: server_info.recv_ring_size,
-        consumer_addr: server_info.consumer_addr,
-        consumer_rkey: server_info.consumer_rkey,
         initial_credit: server_info.initial_credit,
     };
 
@@ -2803,8 +2721,6 @@ fn test_credit_mixed_sizes() {
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -2849,8 +2765,6 @@ fn test_credit_mixed_sizes() {
         recv_ring_addr: server_info.recv_ring_addr,
         recv_ring_rkey: server_info.recv_ring_rkey,
         recv_ring_size: server_info.recv_ring_size,
-        consumer_addr: server_info.consumer_addr,
-        consumer_rkey: server_info.consumer_rkey,
         initial_credit: server_info.initial_credit,
     };
 
@@ -2944,8 +2858,6 @@ fn test_credit_bidirectional_stress() {
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -3011,8 +2923,6 @@ fn test_credit_bidirectional_stress() {
             recv_ring_addr: info.recv_ring_addr,
             recv_ring_rkey: info.recv_ring_rkey,
             recv_ring_size: info.recv_ring_size,
-            consumer_addr: info.consumer_addr,
-            consumer_rkey: info.consumer_rkey,
             initial_credit: info.initial_credit,
         };
 
@@ -3032,8 +2942,6 @@ fn test_credit_bidirectional_stress() {
             recv_ring_addr: client_info.recv_ring_addr,
             recv_ring_rkey: client_info.recv_ring_rkey,
             recv_ring_size: client_info.recv_ring_size,
-            consumer_addr: client_info.consumer_addr,
-            consumer_rkey: client_info.consumer_rkey,
             initial_credit: client_info.initial_credit,
         };
 
@@ -3089,6 +2997,17 @@ fn test_credit_bidirectional_stress() {
             }
         }
 
+        // Drain remaining responses after stop flag
+        let drain_start = std::time::Instant::now();
+        while (server_completed_clone.load(Ordering::SeqCst) as usize) < CALLS_PER_SIDE
+            && drain_start.elapsed() < Duration::from_secs(5)
+        {
+            ctx.poll(&mut on_response);
+            while let Some(req) = ctx.recv() {
+                let _ = req.reply(&response_data);
+            }
+        }
+
         eprintln!(
             "Server: Exiting (sent {} calls, completed {})",
             sent,
@@ -3114,8 +3033,6 @@ fn test_credit_bidirectional_stress() {
         recv_ring_addr: server_info.recv_ring_addr,
         recv_ring_rkey: server_info.recv_ring_rkey,
         recv_ring_size: server_info.recv_ring_size,
-        consumer_addr: server_info.consumer_addr,
-        consumer_rkey: server_info.consumer_rkey,
         initial_credit: server_info.initial_credit,
     };
 
@@ -3189,6 +3106,17 @@ fn test_credit_bidirectional_stress() {
         client_completed.load(Ordering::SeqCst)
     );
 
+    // Keep polling and replying to flush remaining server-bound responses
+    let drain_start = std::time::Instant::now();
+    while drain_start.elapsed() < Duration::from_secs(5)
+        && (server_completed.load(Ordering::SeqCst) as usize) < CALLS_PER_SIDE
+    {
+        ctx.poll(&mut on_response);
+        while let Some(req) = ctx.recv() {
+            let _ = req.reply(&response_data);
+        }
+    }
+
     stop_flag.store(true, Ordering::SeqCst);
     handle.join().expect("Server thread panicked");
 
@@ -3253,8 +3181,6 @@ fn test_credit_deep_queue_tiny_ring() {
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -3299,8 +3225,6 @@ fn test_credit_deep_queue_tiny_ring() {
         recv_ring_addr: server_info.recv_ring_addr,
         recv_ring_rkey: server_info.recv_ring_rkey,
         recv_ring_size: server_info.recv_ring_size,
-        consumer_addr: server_info.consumer_addr,
-        consumer_rkey: server_info.consumer_rkey,
         initial_credit: server_info.initial_credit,
     };
 
@@ -3414,8 +3338,6 @@ fn test_credit_exhaustion_recovery() {
         recv_ring_addr: info.recv_ring_addr,
         recv_ring_rkey: info.recv_ring_rkey,
         recv_ring_size: info.recv_ring_size,
-        consumer_addr: info.consumer_addr,
-        consumer_rkey: info.consumer_rkey,
         initial_credit: info.initial_credit,
     };
 
@@ -3460,8 +3382,6 @@ fn test_credit_exhaustion_recovery() {
         recv_ring_addr: server_info.recv_ring_addr,
         recv_ring_rkey: server_info.recv_ring_rkey,
         recv_ring_size: server_info.recv_ring_size,
-        consumer_addr: server_info.consumer_addr,
-        consumer_rkey: server_info.consumer_rkey,
         initial_credit: server_info.initial_credit,
     };
 

@@ -4,7 +4,6 @@
 //! managing send and receive buffers with RDMA WRITE operations.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::encoding::{ALIGNMENT, padded_message_size};
 
@@ -286,58 +285,6 @@ impl RemoteRingInfo {
     }
 }
 
-/// Atomic consumer position for receiving piggyback updates.
-///
-/// This is used to track the remote endpoint's consumer position,
-/// which is received through piggyback fields in message headers.
-#[derive(Debug)]
-pub struct RemoteConsumer {
-    /// Last known remote consumer position.
-    consumer: AtomicU64,
-    /// Flag indicating if we've received at least one update.
-    initialized: Cell<bool>,
-}
-
-impl RemoteConsumer {
-    /// Create a new remote consumer tracker.
-    pub fn new() -> Self {
-        Self {
-            consumer: AtomicU64::new(0),
-            initialized: Cell::new(false),
-        }
-    }
-
-    /// Get the last known remote consumer position.
-    #[inline]
-    pub fn get(&self) -> u64 {
-        self.consumer.load(Ordering::Relaxed)
-    }
-
-    /// Check if we've received at least one consumer update.
-    #[inline]
-    pub fn is_initialized(&self) -> bool {
-        self.initialized.get()
-    }
-
-    /// Update the remote consumer position.
-    ///
-    /// Only updates if the new value is greater than the current value.
-    #[inline]
-    pub fn update(&self, new_consumer: u64) {
-        self.initialized.set(true);
-        let current = self.consumer.load(Ordering::Relaxed);
-        if new_consumer > current {
-            self.consumer.store(new_consumer, Ordering::Relaxed);
-        }
-    }
-}
-
-impl Default for RemoteConsumer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,23 +336,5 @@ mod tests {
 
         let slice = ring.slice_at(0, 8);
         assert_eq!(slice, &data);
-    }
-
-    #[test]
-    fn test_remote_consumer() {
-        let rc = RemoteConsumer::new();
-        assert!(!rc.is_initialized());
-        assert_eq!(rc.get(), 0);
-
-        rc.update(100);
-        assert!(rc.is_initialized());
-        assert_eq!(rc.get(), 100);
-
-        // Should not decrease
-        rc.update(50);
-        assert_eq!(rc.get(), 100);
-
-        rc.update(200);
-        assert_eq!(rc.get(), 200);
     }
 }

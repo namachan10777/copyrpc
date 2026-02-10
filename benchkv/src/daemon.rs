@@ -24,9 +24,6 @@ pub struct EndpointConnectionInfo {
     pub recv_ring_rkey: u32,
     _padding2: u32,
     pub recv_ring_size: u64,
-    pub consumer_addr: u64,
-    pub consumer_rkey: u32,
-    _padding3: u32,
     pub initial_credit: u64,
 }
 
@@ -41,8 +38,6 @@ impl EndpointConnectionInfo {
         recv_ring_addr: u64,
         recv_ring_rkey: u32,
         recv_ring_size: u64,
-        consumer_addr: u64,
-        consumer_rkey: u32,
         initial_credit: u64,
     ) -> Self {
         Self {
@@ -54,9 +49,6 @@ impl EndpointConnectionInfo {
             recv_ring_rkey,
             _padding2: 0,
             recv_ring_size,
-            consumer_addr,
-            consumer_rkey,
-            _padding3: 0,
             initial_credit,
         }
     }
@@ -165,8 +157,6 @@ pub fn run_daemon(
                 info.recv_ring_addr,
                 info.recv_ring_rkey,
                 info.recv_ring_size,
-                info.consumer_addr,
-                info.consumer_rkey,
                 info.initial_credit,
             ));
             copyrpc_endpoints.push(ep);
@@ -192,8 +182,6 @@ pub fn run_daemon(
                     recv_ring_addr: r.recv_ring_addr,
                     recv_ring_rkey: r.recv_ring_rkey,
                     recv_ring_size: r.recv_ring_size,
-                    consumer_addr: r.consumer_addr,
-                    consumer_rkey: r.consumer_rkey,
                     initial_credit: r.initial_credit,
                 },
                 0,

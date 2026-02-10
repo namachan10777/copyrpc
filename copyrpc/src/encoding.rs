@@ -117,7 +117,7 @@ pub fn padded_message_size(payload_len: u32) -> u64 {
 /// Encode flow control metadata into the buffer.
 ///
 /// Metadata layout (32 bytes):
-/// - offset 0-7: consumer_pos (u64 LE)
+/// - offset 0-7: ring_credit_return (u64 LE) — bytes consumed since last notification
 /// - offset 8-15: credit_grant (u64 LE)
 /// - offset 16-19: message_count (u32 LE)
 /// - offset 20-31: zero padding
@@ -127,12 +127,12 @@ pub fn padded_message_size(payload_len: u32) -> u64 {
 #[inline]
 pub unsafe fn encode_flow_metadata(
     buf: *mut u8,
-    consumer_pos: u64,
+    ring_credit_return: u64,
     credit_grant: u64,
     message_count: u32,
 ) {
     let ptr = buf as *mut u64;
-    std::ptr::write(ptr, consumer_pos.to_le());
+    std::ptr::write(ptr, ring_credit_return.to_le());
     std::ptr::write(ptr.add(1), credit_grant.to_le());
     let ptr32 = buf.add(16) as *mut u32;
     std::ptr::write(ptr32, message_count.to_le());
@@ -146,15 +146,15 @@ pub unsafe fn encode_flow_metadata(
 /// The buffer must have at least FLOW_METADATA_SIZE bytes of valid data.
 ///
 /// # Returns
-/// (consumer_pos, credit_grant, message_count)
+/// (ring_credit_return, credit_grant, message_count)
 #[inline]
 pub unsafe fn decode_flow_metadata(buf: *const u8) -> (u64, u64, u32) {
     let ptr = buf as *const u64;
-    let consumer_pos = u64::from_le(std::ptr::read(ptr));
+    let ring_credit_return = u64::from_le(std::ptr::read(ptr));
     let credit_grant = u64::from_le(std::ptr::read(ptr.add(1)));
     let ptr32 = buf.add(16) as *const u32;
     let message_count = u32::from_le(std::ptr::read(ptr32));
-    (consumer_pos, credit_grant, message_count)
+    (ring_credit_return, credit_grant, message_count)
 }
 
 #[cfg(test)]
@@ -217,8 +217,9 @@ mod tests {
         let mut buf = [0u8; FLOW_METADATA_SIZE];
         unsafe {
             encode_flow_metadata(buf.as_mut_ptr(), 12345, 67890, 42);
-            let (consumer_pos, credit_grant, message_count) = decode_flow_metadata(buf.as_ptr());
-            assert_eq!(consumer_pos, 12345);
+            let (ring_credit_return, credit_grant, message_count) =
+                decode_flow_metadata(buf.as_ptr());
+            assert_eq!(ring_credit_return, 12345);
             assert_eq!(credit_grant, 67890);
             assert_eq!(message_count, 42);
 
@@ -234,8 +235,9 @@ mod tests {
         let mut buf = [0u8; FLOW_METADATA_SIZE];
         unsafe {
             encode_flow_metadata(buf.as_mut_ptr(), 1000, 2000, WRAP_MESSAGE_COUNT);
-            let (consumer_pos, credit_grant, message_count) = decode_flow_metadata(buf.as_ptr());
-            assert_eq!(consumer_pos, 1000);
+            let (ring_credit_return, credit_grant, message_count) =
+                decode_flow_metadata(buf.as_ptr());
+            assert_eq!(ring_credit_return, 1000);
             assert_eq!(credit_grant, 2000);
             assert_eq!(message_count, WRAP_MESSAGE_COUNT);
             assert_eq!(message_count, u32::MAX);
@@ -251,13 +253,18 @@ mod tests {
             (0x1234_5678_9ABC_DEF0, 0xFEDC_BA98_7654_3210, 0x1234_5678),
         ];
 
-        for (consumer_pos, credit_grant, message_count) in test_cases {
+        for (ring_credit_return, credit_grant, message_count) in test_cases {
             let mut buf = [0u8; FLOW_METADATA_SIZE];
             unsafe {
-                encode_flow_metadata(buf.as_mut_ptr(), consumer_pos, credit_grant, message_count);
-                let (decoded_consumer_pos, decoded_credit_grant, decoded_message_count) =
+                encode_flow_metadata(
+                    buf.as_mut_ptr(),
+                    ring_credit_return,
+                    credit_grant,
+                    message_count,
+                );
+                let (decoded_ring_credit_return, decoded_credit_grant, decoded_message_count) =
                     decode_flow_metadata(buf.as_ptr());
-                assert_eq!(decoded_consumer_pos, consumer_pos);
+                assert_eq!(decoded_ring_credit_return, ring_credit_return);
                 assert_eq!(decoded_credit_grant, credit_grant);
                 assert_eq!(decoded_message_count, message_count);
             }
