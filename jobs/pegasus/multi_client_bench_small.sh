@@ -7,15 +7,17 @@
 #PBS -o /work/NBB/mnakano/ghq/github.com/namachan10777/copyrpc/jobs/pegasus/logs/%r.log
 #PBS -j o
 
-set -ux
+set -eux
 
 export LOGDIR="$WORKDIR/jobs/pegasus/logs/$(echo $PBS_JOBID | sed -E 's/^[^:]*:([0-9]+)\.nqsv$/\1/')"
 mkdir -p "$LOGDIR"
 
 cd "$WORKDIR"
 
-# Spack shared libs
-export LD_LIBRARY_PATH="$WORKDIR/spack/.spack-env/view/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# Environment
+module purge
+module load openmpi/5.0.7/gcc11.4.0-cuda12.8.1
+export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu
 
 # Build
 cargo build --release --bin rpc_bench
