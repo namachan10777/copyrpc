@@ -58,7 +58,7 @@ pub struct Response<T: Copy> {
 unsafe impl<T: crate::Serial> crate::Serial for Response<T> {}
 
 // ============================================================================
-// Response Ring (SPSC, per-caller)
+// SPSC Response Ring (shared by FetchAdd, SCQ, wCQ, etc.)
 // ============================================================================
 
 #[repr(C, align(64))]
@@ -110,16 +110,13 @@ impl<T> ResponseRing<T> {
         let slot = &self.buffer[pos & self.mask];
 
         if slot.valid.load(Ordering::Acquire) {
-            // Slot still occupied
             return false;
         }
 
-        // Write data
         unsafe {
             (*slot.data.get()).write((token, data));
         }
 
-        // Mark as valid
         slot.valid.store(true, Ordering::Release);
         self.write_pos.store(pos + 1, Ordering::Release);
         true
@@ -134,14 +131,16 @@ impl<T> ResponseRing<T> {
             return None;
         }
 
-        // Read data
         let data = unsafe { (*slot.data.get()).assume_init_read() };
 
-        // Mark as free
         slot.valid.store(false, Ordering::Release);
         self.read_pos.store(pos + 1, Ordering::Release);
 
         Some(data)
+    }
+
+    pub(crate) fn is_rx_alive(&self) -> bool {
+        self.rx_alive.load(Ordering::Relaxed)
     }
 
     pub(crate) fn disconnect_tx(&self) {
@@ -150,9 +149,5 @@ impl<T> ResponseRing<T> {
 
     pub(crate) fn disconnect_rx(&self) {
         self.rx_alive.store(false, Ordering::Release);
-    }
-
-    pub(crate) fn is_rx_alive(&self) -> bool {
-        self.rx_alive.load(Ordering::Relaxed)
     }
 }

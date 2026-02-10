@@ -16,8 +16,11 @@ pub mod lamport;
 pub mod lcrq;
 pub mod lprq;
 pub mod onesided;
+pub mod scq;
 pub mod serial;
 pub mod user_data;
+pub mod wcq;
+pub mod wcq_cas2;
 
 pub use common::Response;
 pub use onesided::{RawReceiver, RawSender, Slot};
@@ -126,3 +129,6 @@ pub use lamport::LamportMpsc;
 pub use lcrq::LcrqMpsc;
 pub use lprq::LprqMpsc;
 pub use onesided::OnesidedMpsc;
+pub use scq::ScqMpsc;
+pub use wcq::WcqMpsc;
+pub use wcq_cas2::WcqCas2Mpsc;

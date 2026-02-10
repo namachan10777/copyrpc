@@ -284,7 +284,7 @@ impl<Req: Serial, Resp: Serial> MpscServer<Req, Resp> for FetchAddServer<Req, Re
         let resp_ring = &self.resp_rings[token.caller_id];
         while !resp_ring.try_push(token.slot_token, resp) {
             if !resp_ring.is_rx_alive() {
-                return; // Client disconnected, drop response
+                return;
             }
             std::hint::spin_loop();
         }

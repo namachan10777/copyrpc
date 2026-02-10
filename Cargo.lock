@@ -1200,6 +1200,7 @@ checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 name = "mempc"
 version = "0.1.0"
 dependencies = [
+ "portable-atomic",
  "slab",
 ]
 
@@ -1493,6 +1494,12 @@ dependencies = [
  "libc",
  "nix",
 ]
+
+[[package]]
+name = "portable-atomic"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
 
 [[package]]
 name = "ppv-lite86"

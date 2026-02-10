@@ -13,8 +13,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use clap::{Parser, ValueEnum};
 use mempc::{
-    BbqMpsc, FastForwardMpsc, FetchAddMpsc, JiffyMpsc, LamportMpsc, LcrqMpsc, LprqMpsc,
-    MpscCaller, MpscChannel, MpscRecvRef, MpscServer, OnesidedMpsc, Serial,
+    BbqMpsc, FastForwardMpsc, FetchAddMpsc, JiffyMpsc, LamportMpsc, LcrqMpsc, LprqMpsc, MpscCaller,
+    MpscChannel, MpscRecvRef, MpscServer, OnesidedMpsc, ScqMpsc, Serial, WcqCas2Mpsc, WcqMpsc,
 };
 use parquet::arrow::ArrowWriter;
 
@@ -33,6 +33,9 @@ enum TransportType {
     FastForward,
     Lamport,
     FetchAdd,
+    Scq,
+    WcqCas2,
+    Wcq,
     Lcrq,
     Lprq,
     Bbq,
@@ -382,6 +385,51 @@ fn main() {
             args.runs,
             args.start_core,
             run_server_client::<FetchAddMpsc>,
+        ));
+    }
+
+    if matches!(args.transport, TransportType::Scq | TransportType::All) {
+        results.push(run_transport_benchmark(
+            "server_client",
+            "scq",
+            args.threads,
+            args.capacity,
+            args.duration,
+            args.inflight,
+            args.warmup,
+            args.runs,
+            args.start_core,
+            run_server_client::<ScqMpsc>,
+        ));
+    }
+
+    if matches!(args.transport, TransportType::WcqCas2 | TransportType::All) {
+        results.push(run_transport_benchmark(
+            "server_client",
+            "wcq_cas2",
+            args.threads,
+            args.capacity,
+            args.duration,
+            args.inflight,
+            args.warmup,
+            args.runs,
+            args.start_core,
+            run_server_client::<WcqCas2Mpsc>,
+        ));
+    }
+
+    if matches!(args.transport, TransportType::Wcq | TransportType::All) {
+        results.push(run_transport_benchmark(
+            "server_client",
+            "wcq",
+            args.threads,
+            args.capacity,
+            args.duration,
+            args.inflight,
+            args.warmup,
+            args.runs,
+            args.start_core,
+            run_server_client::<WcqMpsc>,
         ));
     }
 

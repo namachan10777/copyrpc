@@ -30,6 +30,9 @@ enum TransportType {
     FastForward,
     Lamport,
     FetchAdd,
+    Scq,
+    WcqCas2,
+    Wcq,
     Bbq,
     Jiffy,
     All,
@@ -395,6 +398,51 @@ fn main() {
             args.runs,
             args.start_core,
             run_flux_benchmark::<mempc::FetchAddMpsc>,
+        ));
+    }
+
+    if matches!(args.transport, TransportType::Scq | TransportType::All) {
+        results.push(run_transport_benchmark(
+            "flux",
+            "scq",
+            args.threads,
+            args.capacity,
+            args.duration,
+            args.inflight,
+            args.warmup,
+            args.runs,
+            args.start_core,
+            run_flux_benchmark::<mempc::ScqMpsc>,
+        ));
+    }
+
+    if matches!(args.transport, TransportType::WcqCas2 | TransportType::All) {
+        results.push(run_transport_benchmark(
+            "flux",
+            "wcq_cas2",
+            args.threads,
+            args.capacity,
+            args.duration,
+            args.inflight,
+            args.warmup,
+            args.runs,
+            args.start_core,
+            run_flux_benchmark::<mempc::WcqCas2Mpsc>,
+        ));
+    }
+
+    if matches!(args.transport, TransportType::Wcq | TransportType::All) {
+        results.push(run_transport_benchmark(
+            "flux",
+            "wcq",
+            args.threads,
+            args.capacity,
+            args.duration,
+            args.inflight,
+            args.warmup,
+            args.runs,
+            args.start_core,
+            run_flux_benchmark::<mempc::WcqMpsc>,
         ));
     }
 
