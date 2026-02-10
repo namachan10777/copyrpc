@@ -87,6 +87,7 @@ struct EndpointConnectionInfo {
     recv_ring_rkey: u32,
     _padding2: u32,
     recv_ring_size: u64,
+    initial_credit: u64,
 }
 
 const CONNECTION_INFO_SIZE: usize = std::mem::size_of::<EndpointConnectionInfo>();
@@ -292,6 +293,7 @@ fn run_benchmark_for_size(
             recv_ring_rkey: info.recv_ring_rkey,
             _padding2: 0,
             recv_ring_size: info.recv_ring_size,
+            initial_credit: info.initial_credit,
         });
 
         endpoints.push(ep);
@@ -333,6 +335,7 @@ fn run_benchmark_for_size(
             recv_ring_addr: remote_ep.recv_ring_addr,
             recv_ring_rkey: remote_ep.recv_ring_rkey,
             recv_ring_size: remote_ep.recv_ring_size,
+            initial_credit: remote_ep.initial_credit,
         };
         ep.connect(&remote, 0, ctx.port())?;
     }
@@ -412,7 +415,7 @@ fn run_client_pingpong(
     for ep in endpoints.iter() {
         for _ in 0..REQUESTS_PER_EP {
             if sent < iterations {
-                if ep.call(&request_data, ()).is_ok() {
+                if ep.call(&request_data, (), message_size as u64).is_ok() {
                     sent += 1;
                     inflight += 1;
                 }
@@ -439,7 +442,7 @@ fn run_client_pingpong(
             let ep_idx = (sent as usize) % num_endpoints;
             let ep = &endpoints[ep_idx];
 
-            if ep.call(&request_data, ()).is_ok() {
+            if ep.call(&request_data, (), message_size as u64).is_ok() {
                 sent += 1;
                 inflight += 1;
             } else {
