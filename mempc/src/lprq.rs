@@ -556,9 +556,6 @@ impl<Req: Serial, Resp: Serial> Drop for LprqServer<Req, Resp> {
         if !self.disconnected {
             self.disconnected = true;
             self.queue.disconnect_rx();
-            for ring in &self.resp_rings {
-                ring.disconnect_tx();
-            }
         }
         // Drain retire list
         let mut u8_retire_list: Vec<*mut u8> =

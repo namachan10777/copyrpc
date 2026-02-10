@@ -666,9 +666,6 @@ impl<Req: Serial, Resp: Serial> Drop for LcrqServer<Req, Resp> {
         if !self.disconnected {
             self.disconnected = true;
             self.queue.disconnect_rx();
-            for ring in &self.resp_rings {
-                ring.disconnect_tx();
-            }
             // Reclaim all remaining nodes.
             let freed = self.queue.hazard.drain_unprotected(&mut self.retire_list);
             for ptr in freed {

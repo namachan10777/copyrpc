@@ -72,7 +72,6 @@ pub(crate) struct ResponseRing<T> {
     write_pos: CachePadded<AtomicUsize>,
     read_pos: CachePadded<AtomicUsize>,
     mask: usize,
-    tx_alive: AtomicBool,
     rx_alive: AtomicBool,
 }
 
@@ -95,7 +94,6 @@ impl<T> ResponseRing<T> {
             write_pos: CachePadded::new(AtomicUsize::new(0)),
             read_pos: CachePadded::new(AtomicUsize::new(0)),
             mask: capacity - 1,
-            tx_alive: AtomicBool::new(true),
             rx_alive: AtomicBool::new(true),
         }
     }
@@ -141,10 +139,6 @@ impl<T> ResponseRing<T> {
 
     pub(crate) fn is_rx_alive(&self) -> bool {
         self.rx_alive.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn disconnect_tx(&self) {
-        self.tx_alive.store(false, Ordering::Release);
     }
 
     pub(crate) fn disconnect_rx(&self) {

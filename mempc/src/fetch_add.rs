@@ -296,9 +296,6 @@ impl<Req, Resp> Drop for FetchAddServer<Req, Resp> {
         if !self.disconnected {
             self.disconnected = true;
             self.req_ring.disconnect_rx();
-            for ring in &self.resp_rings {
-                ring.disconnect_tx();
-            }
         }
     }
 }

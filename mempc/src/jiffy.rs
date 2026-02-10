@@ -307,7 +307,6 @@ struct ResponseRing<T> {
     write_pos: CachePadded<AtomicUsize>,
     read_pos: CachePadded<AtomicUsize>,
     mask: usize,
-    tx_alive: AtomicBool,
     rx_alive: AtomicBool,
 }
 
@@ -329,7 +328,6 @@ impl<T> ResponseRing<T> {
             write_pos: CachePadded::new(AtomicUsize::new(0)),
             read_pos: CachePadded::new(AtomicUsize::new(0)),
             mask: capacity - 1,
-            tx_alive: AtomicBool::new(true),
             rx_alive: AtomicBool::new(true),
         }
     }
@@ -361,10 +359,6 @@ impl<T> ResponseRing<T> {
         slot.valid.store(false, Ordering::Release);
         self.read_pos.store(pos + 1, Ordering::Release);
         Some(data)
-    }
-
-    fn disconnect_tx(&self) {
-        self.tx_alive.store(false, Ordering::Release);
     }
 
     fn disconnect_rx(&self) {
@@ -534,9 +528,6 @@ impl<Req, Resp> Drop for JiffyServer<Req, Resp> {
         if !self.disconnected {
             self.disconnected = true;
             self.queue.rx_alive.store(false, Ordering::Release);
-            for ring in &self.resp_rings {
-                ring.disconnect_tx();
-            }
             // Buffer chain is freed by JiffyQueue::Drop when the last Arc is dropped.
         }
     }

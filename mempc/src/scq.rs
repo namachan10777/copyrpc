@@ -389,6 +389,7 @@ impl ScqRingInner {
 // Data Slot (holds request data + caller_id)
 // ============================================================================
 
+#[repr(C, align(64))]
 struct DataSlot<T> {
     caller_id: UnsafeCell<usize>,
     data: UnsafeCell<MaybeUninit<T>>,
@@ -643,9 +644,6 @@ impl<Req, Resp> Drop for ScqServer<Req, Resp> {
         if !self.disconnected {
             self.disconnected = true;
             self.req_ring.disconnect_rx();
-            for ring in &self.resp_rings {
-                ring.disconnect_tx();
-            }
         }
     }
 }

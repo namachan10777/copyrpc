@@ -62,7 +62,7 @@ impl<T> std::ops::DerefMut for CachePadded<T> {
 // BBQ Request Ring
 // ============================================================================
 
-#[repr(C)]
+#[repr(C, align(64))]
 struct BbqEntry<T> {
     caller_id: UnsafeCell<usize>,
     data: UnsafeCell<MaybeUninit<T>>,
@@ -232,7 +232,6 @@ struct ResponseRing<T> {
     write_pos: CachePadded<AtomicUsize>,
     read_pos: CachePadded<AtomicUsize>,
     mask: usize,
-    tx_alive: AtomicBool,
     rx_alive: AtomicBool,
 }
 
@@ -255,7 +254,6 @@ impl<T> ResponseRing<T> {
             write_pos: CachePadded::new(AtomicUsize::new(0)),
             read_pos: CachePadded::new(AtomicUsize::new(0)),
             mask: capacity - 1,
-            tx_alive: AtomicBool::new(true),
             rx_alive: AtomicBool::new(true),
         }
     }
@@ -295,10 +293,6 @@ impl<T> ResponseRing<T> {
         self.read_pos.store(pos + 1, Ordering::Release);
 
         Some(data)
-    }
-
-    fn disconnect_tx(&self) {
-        self.tx_alive.store(false, Ordering::Release);
     }
 
     fn disconnect_rx(&self) {
@@ -532,9 +526,6 @@ impl<Req, Resp> Drop for BbqServer<Req, Resp> {
         if !self.disconnected {
             self.disconnected = true;
             self.req_ring.disconnect_rx();
-            for ring in &self.resp_rings {
-                ring.disconnect_tx();
-            }
         }
     }
 }

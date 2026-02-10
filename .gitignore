@@ -33,6 +33,9 @@ target
 # Benchmark results
 inproc/bench_results/
 *.parquet
+bench_results/qd_compare/
+bench_results/qd_perf/
+bench_results/qd/
 
 # Job logs
 jobs/*/logs/
