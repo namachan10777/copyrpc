@@ -293,6 +293,7 @@ fn run_meta(
                 rank,
                 num_daemons,
                 key_range,
+                queue_depth,
                 server,
                 flux,
                 copyrpc_setup,

@@ -119,6 +119,7 @@ pub fn run_daemon(
     my_rank: u32,
     num_daemons: usize,
     key_range: u64,
+    queue_depth: u32,
     mut server: ipc::Server<Request, Response>,
     mut flux: DaemonFlux,
     copyrpc_setup: Option<CopyrpcSetup>,
@@ -239,6 +240,11 @@ pub fn run_daemon(
     let mut ipc_poll_skip = 0u32;
     const IPC_POLL_INTERVAL: u32 = 4;
 
+    // Per-client inflight tracking: skip polling clients at max QD
+    let max_clients = server.max_clients() as usize;
+    let mut inflight = vec![0u32; max_clients];
+    let mut skip = vec![false; max_clients];
+
     while !stop_flag.load(Ordering::Relaxed) {
         // === Phase 1: copyrpc poll + recv + drain ===
         // Process RDMA completions first so ipc replies go out before ipc poll,
@@ -285,7 +291,9 @@ pub fn run_daemon(
                 let mut r = r.borrow_mut();
                 copyrpc_resp_count = r.len() as u32;
                 for entry in r.drain(..) {
+                    let cid = entry.token.client_id().0 as usize;
                     server.reply(entry.token, entry.response);
+                    inflight[cid] -= 1;
                 }
             });
         }
@@ -295,11 +303,16 @@ pub fn run_daemon(
         // or we haven't polled in IPC_POLL_INTERVAL iterations (catch local traffic).
         ipc_poll_skip += 1;
         if copyrpc_resp_count > 0 || ipc_poll_skip >= IPC_POLL_INTERVAL {
-            server.poll();
+            for i in 0..max_clients {
+                skip[i] = inflight[i] >= queue_depth;
+            }
+            server.poll_with_skip(&skip);
             ipc_poll_skip = 0;
         }
 
         while let Some(handle) = server.recv() {
+            let cid = handle.client_id().0 as usize;
+            inflight[cid] += 1;
             let req = *handle.data();
             let target_rank = req.rank();
 
@@ -310,6 +323,7 @@ pub fn run_daemon(
                 );
                 let resp = handle_local(&mut store, &req);
                 handle.reply(resp);
+                inflight[cid] -= 1;
             } else {
                 let token = handle.into_token();
                 remote_queue.push((token, req, target_rank));
@@ -330,7 +344,9 @@ pub fn run_daemon(
                             ctx.poll();
                             COPYRPC_RESPONSES.with(|r| {
                                 for entry in r.borrow_mut().drain(..) {
+                                    let cid = entry.token.client_id().0 as usize;
                                     server.reply(entry.token, entry.response);
+                                    inflight[cid] -= 1;
                                 }
                             });
                             continue;

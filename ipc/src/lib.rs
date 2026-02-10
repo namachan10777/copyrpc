@@ -343,6 +343,11 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
         })
     }
 
+    /// Returns the maximum number of clients this server supports.
+    pub fn max_clients(&self) -> u32 {
+        self.max_clients
+    }
+
     /// Scan all client request rings. Returns total available request count.
     pub fn poll(&mut self) -> u32 {
         let mut count = 0u32;
@@ -359,6 +364,38 @@ impl<Req: Serial, Resp: Serial> Server<Req, Resp> {
             }
 
             // Multi-drain: count consecutive available slots
+            let avail = self.req_rxs[idx].count_available(self.ring_depth);
+            self.req_avail[idx] = avail;
+            count += avail;
+        }
+
+        self.scan_pos = scan;
+        self.recv_start = self.scan_pos;
+        self.recv_scan_pos = 0;
+        count
+    }
+
+    /// Scan client request rings, skipping clients where `skip[idx]` is true.
+    /// Skipped clients get `req_avail[idx] = 0` and are not polled.
+    pub fn poll_with_skip(&mut self, skip: &[bool]) -> u32 {
+        let mut count = 0u32;
+        let mut scan = self.scan_pos;
+
+        for _ in 0..self.max_clients {
+            let idx = scan as usize;
+            scan = (scan + 1) % self.max_clients;
+
+            if idx < skip.len() && skip[idx] {
+                self.req_avail[idx] = 0;
+                continue;
+            }
+
+            let alive = unsafe { &*self.control_ptrs[idx] };
+            if !alive.load(Ordering::Relaxed) {
+                self.req_avail[idx] = 0;
+                continue;
+            }
+
             let avail = self.req_rxs[idx].count_available(self.ring_depth);
             self.req_avail[idx] = avail;
             count += avail;
@@ -1012,6 +1049,46 @@ mod tests {
             let server = Server::<u64, u64>::create(&path, 4, 8, 0).unwrap();
             assert_eq!(server.extra_buffer_size(), 0);
             assert!(server.client_extra_buffer(ClientId(0)).is_none());
+        }
+    }
+
+    #[test]
+    fn test_poll_with_skip() {
+        let path = test_path();
+        unsafe {
+            let mut server = Server::<u64, u64>::create(&path, 4, 8, 0).unwrap();
+            let mut client0 =
+                Client::<u64, u64, (), _>::connect(&path, |(), _| {}).unwrap();
+            let mut client1 =
+                Client::<u64, u64, (), _>::connect(&path, |(), _| {}).unwrap();
+
+            // Send from both clients
+            client0.call(10, ()).unwrap();
+            client1.call(20, ()).unwrap();
+
+            // Poll with skip[0] = true → should only see client1's request
+            let skip = vec![true, false, false, false];
+            let count = server.poll_with_skip(&skip);
+            assert_eq!(count, 1);
+
+            let handle = server.recv().unwrap();
+            assert_eq!(*handle.data(), 20);
+            handle.reply(200);
+
+            // No more requests (client0 was skipped)
+            assert!(server.recv().is_none());
+
+            // Now poll without skip → should see client0's request
+            let count = server.poll();
+            assert_eq!(count, 1);
+
+            let handle = server.recv().unwrap();
+            assert_eq!(*handle.data(), 10);
+            handle.reply(100);
+
+            // Verify both clients get responses
+            assert_eq!(client0.poll().unwrap(), 1);
+            assert_eq!(client1.poll().unwrap(), 1);
         }
     }
 }
