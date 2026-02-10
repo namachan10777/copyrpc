@@ -13,8 +13,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use clap::{Parser, ValueEnum};
 use mempc::{
-    FastForwardMpsc, FetchAddMpsc, LamportMpsc, LcrqMpsc, LprqMpsc, MpscCaller, MpscChannel,
-    MpscRecvRef, MpscServer, OnesidedMpsc, Serial,
+    BbqMpsc, FastForwardMpsc, FetchAddMpsc, LamportMpsc, LcrqMpsc, LprqMpsc, MpscCaller,
+    MpscChannel, MpscRecvRef, MpscServer, OnesidedMpsc, Serial,
 };
 use parquet::arrow::ArrowWriter;
 
@@ -35,6 +35,7 @@ enum TransportType {
     FetchAdd,
     Lcrq,
     Lprq,
+    Bbq,
     All,
 }
 
@@ -410,6 +411,21 @@ fn main() {
             args.runs,
             args.start_core,
             run_server_client::<LprqMpsc>,
+        ));
+    }
+
+    if matches!(args.transport, TransportType::Bbq | TransportType::All) {
+        results.push(run_transport_benchmark(
+            "server_client",
+            "bbq",
+            args.threads,
+            args.capacity,
+            args.duration,
+            args.inflight,
+            args.warmup,
+            args.runs,
+            args.start_core,
+            run_server_client::<BbqMpsc>,
         ));
     }
 

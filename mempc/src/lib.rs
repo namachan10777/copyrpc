@@ -6,6 +6,7 @@
 //! - `lamport`: Batched index synchronization
 //! - `fetch_add`: Native lock-free MPSC via fetch_add
 
+pub mod bbq;
 pub mod common;
 pub mod fastforward;
 pub mod fetch_add;
@@ -116,6 +117,7 @@ pub trait MpscChannel: 'static + Send + Sync {
     ) -> (Vec<Self::Caller<Req, Resp>>, Self::Server<Req, Resp>);
 }
 
+pub use bbq::BbqMpsc;
 pub use fastforward::FastForwardMpsc;
 pub use fetch_add::FetchAddMpsc;
 pub use lamport::LamportMpsc;

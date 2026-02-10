@@ -62,6 +62,17 @@ cargo clippy
 mpirun --hostfile ./dev/omni.txt -np 2 hostname
 ```
 
+## mempc 実装上の注意
+
+### BBQ committed watermark
+BBQ論文 (USENIX ATC 2022) は `committed.fetch_add(1)` による独立コミットを提案しているが、本実装では sequential spin-wait を採用している。理由:
+
+- fetch_add commit は consumer 側で追加コストが必要（ブロック全体消費 or per-entry valid flag）
+- 少数 producer (< ~8) では sequential commit の方が高速（6.38 vs 0.10 Mops/s, n=4）
+- 主なボトルネックは BBQ request ring ではなく response ring の spin-wait（perf で 65%）
+
+BBQ の主要な性能貢献は (1) ブロック分割による producer-consumer キャッシュライン分離、(2) ブロック内 fetch_add による head CAS 頻度の削減 であり、これらは実装済み。
+
 ## 環境情報
 
 - マシン: fern04, Intel Xeon Gold 6530, 32コア

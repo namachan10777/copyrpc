@@ -30,6 +30,7 @@ enum TransportType {
     FastForward,
     Lamport,
     FetchAdd,
+    Bbq,
     All,
 }
 
@@ -393,6 +394,21 @@ fn main() {
             args.runs,
             args.start_core,
             run_flux_benchmark::<mempc::FetchAddMpsc>,
+        ));
+    }
+
+    if matches!(args.transport, TransportType::Bbq | TransportType::All) {
+        results.push(run_transport_benchmark(
+            "flux",
+            "bbq",
+            args.threads,
+            args.capacity,
+            args.duration,
+            args.inflight,
+            args.warmup,
+            args.runs,
+            args.start_core,
+            run_flux_benchmark::<mempc::BbqMpsc>,
         ));
     }
 
