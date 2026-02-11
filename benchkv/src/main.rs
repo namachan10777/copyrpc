@@ -1,6 +1,7 @@
 mod affinity;
 mod client;
 mod copyrpc_direct_backend;
+mod delegation_backend;
 mod daemon;
 mod erpc_backend;
 mod message;
@@ -108,6 +109,8 @@ enum SubCmd {
     UcxAm,
     /// copyrpc direct (no ipc/Flux) meta_put/meta_get benchmark
     CopyrpcDirect,
+    /// Delegation: clients submit remote requests via shared-memory MPSC to Daemon#0
+    Delegation,
 }
 
 fn main() {
@@ -146,6 +149,14 @@ fn main() {
             ucx_am_backend::run_ucx_am(&cli, &world, rank, size, num_daemons, num_clients)
         }
         SubCmd::CopyrpcDirect => copyrpc_direct_backend::run_copyrpc_direct(
+            &cli,
+            &world,
+            rank,
+            size,
+            num_daemons,
+            num_clients,
+        ),
+        SubCmd::Delegation => delegation_backend::run_delegation(
             &cli,
             &world,
             rank,
