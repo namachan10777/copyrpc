@@ -35,14 +35,14 @@ QD=1
 
 for NP in 48 64; do
   echo "=== meta NP=$NP ==="
-  timeout 120 mpirun ${NQSV_MPIOPTS:-} -np $NP --bind-to none "$BENCH" \
+  timeout 120 mpirun ${NQSV_MPIOPTS:-} -np $NP --map-by node --bind-to none "$BENCH" \
     -d $DURATION -r $RUNS --server-threads $SERVER_THREADS --client-threads $CLIENT_THREADS --queue-depth $QD \
     -o "$OUTDIR/meta_np${NP}.parquet" \
     meta \
     || echo "FAILED: meta NP=$NP"
 
   echo "=== copyrpc-direct NP=$NP ==="
-  timeout 120 mpirun ${NQSV_MPIOPTS:-} -np $NP --bind-to none "$BENCH" \
+  timeout 120 mpirun ${NQSV_MPIOPTS:-} -np $NP --map-by node --bind-to none "$BENCH" \
     -d $DURATION -r $RUNS --server-threads $SERVER_THREADS --client-threads $CLIENT_THREADS --queue-depth $QD \
     --ring-size 4096 \
     -o "$OUTDIR/copyrpc_direct_np${NP}.parquet" \
@@ -50,7 +50,7 @@ for NP in 48 64; do
     || echo "FAILED: copyrpc-direct NP=$NP"
 
   echo "=== ucx-am NP=$NP ==="
-  timeout 120 mpirun ${NQSV_MPIOPTS:-} -np $NP --bind-to none -x UCX_TLS=rc,self "$BENCH" \
+  timeout 120 mpirun ${NQSV_MPIOPTS:-} -np $NP --map-by node --bind-to none -x UCX_TLS=rc,self "$BENCH" \
     -d $DURATION -r $RUNS --server-threads $SERVER_THREADS --client-threads $CLIENT_THREADS --queue-depth $QD \
     -o "$OUTDIR/ucx_am_np${NP}.parquet" \
     ucx-am \
