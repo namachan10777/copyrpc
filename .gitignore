@@ -53,5 +53,8 @@ core.*
 # Backup files
 *.backup
 
+# Spack build cache
+.spack-env/
+
 # Job logs
 rpc_bench/logs/

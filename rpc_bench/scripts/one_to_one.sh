@@ -19,8 +19,12 @@ module purge
 module load openmpi/5.0.7/gcc11.4.0-cuda12.8.1
 export LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu
 
-# Build
-cargo build --release --bin rpc_bench
+# Build (skip on compute nodes without libclang; pre-build on login node)
+if command -v cargo &>/dev/null && [[ -f "$WORKDIR/target/release/rpc_bench" ]]; then
+  echo "Binary already exists, skipping build"
+else
+  cargo build --release --bin rpc_bench
+fi
 
 BENCH="$WORKDIR/target/release/rpc_bench"
 OUTDIR="$WORKDIR/rpc_bench/result/one_to_one"
@@ -38,7 +42,7 @@ for QD in 1 8 256; do
     for E in $ENDPOINTS; do
       if [[ $E -lt $T || $((E % T)) -ne 0 ]]; then continue; fi
       echo "=== copyrpc QD=$QD T=$T E=$E ==="
-      timeout 120 mpirun -np 2 "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
+      timeout 120 mpirun ${NQSV_MPIOPTS:-} -np 2 --bind-to none "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
         -o "$OUTDIR/copyrpc_qd${QD}_t${T}_e${E}.parquet" \
         --affinity-mode multinode --affinity-start 47 \
         copyrpc one-to-one -e $E -i $QD -t $T \
@@ -51,7 +55,7 @@ done
 for QD in 1 8 256; do
   for T in 1 2 4 8; do
     echo "=== erpc QD=$QD T=$T ==="
-    timeout 120 mpirun -np 2 "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
+    timeout 120 mpirun ${NQSV_MPIOPTS:-} -np 2 --bind-to none "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
       -o "$OUTDIR/erpc_qd${QD}_t${T}.parquet" \
       --affinity-mode multinode --affinity-start 47 \
       erpc one-to-one -i $QD -t $T \
@@ -63,7 +67,7 @@ done
 for QD in 1 8 256; do
   for T in 1 2 4 8; do
     echo "=== rc-send QD=$QD T=$T ==="
-    timeout 120 mpirun -np 2 "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
+    timeout 120 mpirun ${NQSV_MPIOPTS:-} -np 2 --bind-to none "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
       -o "$OUTDIR/rc_send_qd${QD}_t${T}.parquet" \
       --affinity-mode multinode --affinity-start 47 \
       rc-send one-to-one -i $QD -t $T \
@@ -74,7 +78,7 @@ done
 # ucx-am: QD (single-thread only)
 for QD in 1 8 256; do
   echo "=== ucx-am QD=$QD ==="
-  timeout 120 mpirun -np 2 "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
+  timeout 120 mpirun ${NQSV_MPIOPTS:-} -np 2 --bind-to none "$BENCH" -d $DURATION -r $RUNS -s $MSG_SIZE \
     -o "$OUTDIR/ucx_am_qd${QD}.parquet" \
     --affinity-mode multinode --affinity-start 47 \
     ucx-am one-to-one -i $QD \
