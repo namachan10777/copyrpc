@@ -193,4 +193,9 @@ impl PmemStore {
     pub fn region_len(&self) -> usize {
         self.region.len()
     }
+
+    /// Get the effective chunk size for a file (public accessor).
+    pub fn chunk_size_for(&self, path_hash: u64) -> usize {
+        self.effective_chunk_size(path_hash)
+    }
 }

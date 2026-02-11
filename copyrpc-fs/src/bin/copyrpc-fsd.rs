@@ -151,7 +151,13 @@ struct CopyrpcSetup {
 
 /// Pending operation tracking for copyrpc responses.
 enum PendingOp {
-    Write(ipc::RequestToken),
+    Write {
+        token: ipc::RequestToken,
+        path_hash: u64,
+        chunk_index: u32,
+        offset: u32,
+        len: u32,
+    },
     Read(ipc::RequestToken),
     Create(ipc::RequestToken),
     Stat(ipc::RequestToken),
@@ -161,11 +167,11 @@ enum PendingOp {
 impl PendingOp {
     fn into_token(self) -> ipc::RequestToken {
         match self {
-            PendingOp::Write(t)
-            | PendingOp::Read(t)
-            | PendingOp::Create(t)
-            | PendingOp::Stat(t)
-            | PendingOp::Unlink(t) => t,
+            PendingOp::Write { token, .. }
+            | PendingOp::Read(token)
+            | PendingOp::Create(token)
+            | PendingOp::Stat(token)
+            | PendingOp::Unlink(token) => token,
         }
     }
 }
@@ -186,6 +192,50 @@ fn extract_token_from_call_error(
 /// Per-client MR info for RDMA to/from client's extra buffer.
 struct ClientMrInfo {
     mr: mlx5::pd::MemoryRegion,
+}
+
+/// Kind of pending RDMA operation in the async recv handler.
+enum PendingRecvRdmaKind {
+    Write {
+        path_hash: u64,
+        chunk_index: u32,
+        offset: usize,
+        len: usize,
+    },
+    Read,
+}
+
+/// Helper: serialize RemoteResponse to bytes.
+fn remote_response_bytes(resp: &RemoteResponse) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            resp as *const RemoteResponse as *const u8,
+            std::mem::size_of::<RemoteResponse>(),
+        )
+    }
+}
+
+/// Helper: update file size in metadata if this daemon is the metadata owner.
+#[allow(clippy::too_many_arguments)]
+fn update_file_size(
+    file_metadata: &mut std::collections::HashMap<u64, copyrpc_fs::InodeHeader>,
+    store: &PmemStore,
+    path_hash: u64,
+    chunk_index: u32,
+    offset: u64,
+    len: u64,
+    my_global_id: usize,
+    total_daemons: usize,
+) {
+    if routing::route(path_hash, 0, total_daemons) == my_global_id {
+        let cs = store.chunk_size_for(path_hash) as u64;
+        let file_end = chunk_index as u64 * cs + offset + len;
+        if let Some(meta) = file_metadata.get_mut(&path_hash)
+            && file_end > meta.size
+        {
+            meta.size = file_end;
+        }
+    }
 }
 
 // =============================================================================
@@ -294,18 +344,35 @@ fn run_daemon(
     // --- Client MR registration table ---
     let mut client_mrs: Vec<Option<ClientMrInfo>> = Vec::new();
 
-    // --- Deferred responses (collected during RDMA wait inside recv handler) ---
-    let mut deferred_responses: Vec<(PendingOp, RemoteResponse)> = Vec::new();
+    // --- File metadata (in-memory, separate from PmemStore data) ---
+    let mut file_metadata: std::collections::HashMap<u64, copyrpc_fs::InodeHeader> =
+        std::collections::HashMap::new();
+
+    // --- Pre-allocate extra buffer pointers ---
+    let mut extra_buf_ptrs: Vec<Option<*mut u8>> = vec![None; max_clients as usize];
+
+    // --- Pending RDMA recv: holds RecvHandle for deferred reply after RDMA completion ---
+    struct PendingRecvRdma<'a> {
+        recv_handle: copyrpc::RecvHandle<'a, PendingOp>,
+        ep_idx: usize,
+        kind: PendingRecvRdmaKind,
+        resp: RemoteResponse,
+    }
 
     // --- Signal ready ---
     ready_barrier.wait();
+
+    // --- Stable borrow for RecvHandle storage across loop iterations ---
+    let copyrpc_ctx_ref = copyrpc_ctx.as_ref();
+
+    let mut pending_recv_rdma: Vec<PendingRecvRdma<'_>> = Vec::new();
 
     // --- Event loop ---
     let my_global_id = (my_rank as usize) * daemons_per_node + daemon_id;
 
     while !stop_flag.load(Ordering::Relaxed) {
         // Phase 1: copyrpc poll (process responses from remote daemons)
-        if let Some(ref ctx) = copyrpc_ctx {
+        if let Some(ctx) = copyrpc_ctx_ref {
             ctx.poll(|pending_op, resp_data| {
                 let resp: RemoteResponse = if resp_data.len()
                     >= std::mem::size_of::<RemoteResponse>()
@@ -316,9 +383,30 @@ fn run_daemon(
                 };
 
                 match pending_op {
-                    PendingOp::Write(token)
-                    | PendingOp::Create(token)
-                    | PendingOp::Unlink(token) => {
+                    PendingOp::Write {
+                        token,
+                        path_hash,
+                        chunk_index,
+                        offset,
+                        len,
+                    } => {
+                        if resp.status == 0 {
+                            update_file_size(
+                                &mut file_metadata,
+                                &store,
+                                path_hash,
+                                chunk_index,
+                                offset as u64,
+                                len as u64,
+                                my_global_id,
+                                total_daemons,
+                            );
+                            server.reply(token, FsResponse::Ok);
+                        } else {
+                            server.reply(token, FsResponse::Error { code: resp.status });
+                        }
+                    }
+                    PendingOp::Create(token) | PendingOp::Unlink(token) => {
                         if resp.status == 0 {
                             server.reply(token, FsResponse::Ok);
                         } else {
@@ -364,18 +452,45 @@ fn run_daemon(
                 }
             });
 
-            // Phase 1b: copyrpc recv (handle requests from remote daemons)
+            // Phase 1b: Check RDMA completions for deferred recv replies
+            pending_recv_rdma.retain_mut(|pending| {
+                if copyrpc_endpoints[pending.ep_idx].raw_rdma_pending() == 0 {
+                    // RDMA complete — commit write + update file size + reply
+                    if let PendingRecvRdmaKind::Write {
+                        path_hash,
+                        chunk_index,
+                        offset,
+                        len,
+                    } = pending.kind
+                    {
+                        store.commit_write(path_hash, chunk_index, offset, len);
+                        update_file_size(
+                            &mut file_metadata,
+                            &store,
+                            path_hash,
+                            chunk_index,
+                            offset as u64,
+                            len as u64,
+                            my_global_id,
+                            total_daemons,
+                        );
+                    }
+                    pending
+                        .recv_handle
+                        .reply(remote_response_bytes(&pending.resp))
+                        .ok();
+                    false // remove from Vec
+                } else {
+                    true // keep
+                }
+            });
+
+            // Phase 1c: copyrpc recv (handle requests from remote daemons)
             while let Some(req) = ctx.recv() {
                 let data = req.data();
                 if data.len() < std::mem::size_of::<RemoteRequest>() {
                     let resp = RemoteResponse { status: -1, len: 0 };
-                    let resp_bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            &resp as *const RemoteResponse as *const u8,
-                            std::mem::size_of::<RemoteResponse>(),
-                        )
-                    };
-                    req.reply(resp_bytes)
+                    req.reply(remote_response_bytes(&resp))
                         .unwrap_or_else(|e| eprintln!("reply error: {:?}", e));
                     continue;
                 }
@@ -383,12 +498,11 @@ fn run_daemon(
                 let remote_req: RemoteRequest =
                     unsafe { std::ptr::read_unaligned(data.as_ptr() as *const RemoteRequest) };
 
-                // Find the endpoint that received this request (for RDMA ops)
                 let ep_idx = qpn_to_ep_idx.get(&req.qpn()).copied();
 
-                let resp = match remote_req {
+                match remote_req {
                     RemoteRequest::Write(write_req) => {
-                        // Zero-copy: RDMA READ directly into pmem
+                        // Zero-copy: post RDMA READ into pmem, defer reply
                         if let (Some(idx), Some(mr)) = (ep_idx, &pmem_mr) {
                             let (dest_ptr, _cap) = store.prepare_write(
                                 write_req.path_hash,
@@ -406,42 +520,28 @@ fn run_daemon(
                                 )
                                 .unwrap_or_else(|e| eprintln!("RDMA READ error: {:?}", e));
 
-                            // Wait for RDMA completion (defer any RPC responses)
-                            while copyrpc_endpoints[idx].raw_rdma_pending() > 0 {
-                                ctx.poll(|pending_op, resp_data| {
-                                    let resp: RemoteResponse = if resp_data.len()
-                                        >= std::mem::size_of::<RemoteResponse>()
-                                    {
-                                        unsafe {
-                                            std::ptr::read_unaligned(
-                                                resp_data.as_ptr() as *const RemoteResponse
-                                            )
-                                        }
-                                    } else {
-                                        RemoteResponse { status: -1, len: 0 }
-                                    };
-                                    deferred_responses.push((pending_op, resp));
-                                });
-                            }
-
-                            // Commit: update valid_len + persist
-                            store.commit_write(
-                                write_req.path_hash,
-                                write_req.chunk_index,
-                                write_req.offset as usize,
-                                write_req.len as usize,
-                            );
-
-                            RemoteResponse {
-                                status: 0,
-                                len: write_req.len,
-                            }
+                            // Non-blocking: store pending and reply after completion
+                            pending_recv_rdma.push(PendingRecvRdma {
+                                recv_handle: req,
+                                ep_idx: idx,
+                                kind: PendingRecvRdmaKind::Write {
+                                    path_hash: write_req.path_hash,
+                                    chunk_index: write_req.chunk_index,
+                                    offset: write_req.offset as usize,
+                                    len: write_req.len as usize,
+                                },
+                                resp: RemoteResponse {
+                                    status: 0,
+                                    len: write_req.len,
+                                },
+                            });
                         } else {
-                            RemoteResponse { status: -1, len: 0 }
+                            let resp = RemoteResponse { status: -1, len: 0 };
+                            req.reply(remote_response_bytes(&resp)).ok();
                         }
                     }
                     RemoteRequest::Read(read_req) => {
-                        // Zero-copy: RDMA WRITE directly from pmem to client's shm
+                        // Zero-copy: post RDMA WRITE from pmem, defer reply
                         let (src_ptr, available) = store
                             .ptr_for_chunk_read(
                                 read_req.path_hash,
@@ -466,123 +566,75 @@ fn run_daemon(
                                 )
                                 .unwrap_or_else(|e| eprintln!("RDMA WRITE error: {:?}", e));
 
-                            // Wait for RDMA completion (defer any RPC responses)
-                            while copyrpc_endpoints[idx].raw_rdma_pending() > 0 {
-                                ctx.poll(|pending_op, resp_data| {
-                                    let resp: RemoteResponse = if resp_data.len()
-                                        >= std::mem::size_of::<RemoteResponse>()
-                                    {
-                                        unsafe {
-                                            std::ptr::read_unaligned(
-                                                resp_data.as_ptr() as *const RemoteResponse
-                                            )
-                                        }
-                                    } else {
-                                        RemoteResponse { status: -1, len: 0 }
-                                    };
-                                    deferred_responses.push((pending_op, resp));
-                                });
-                            }
-                        }
-
-                        RemoteResponse {
-                            status: 0,
-                            len: actual as u32,
+                            pending_recv_rdma.push(PendingRecvRdma {
+                                recv_handle: req,
+                                ep_idx: idx,
+                                kind: PendingRecvRdmaKind::Read,
+                                resp: RemoteResponse {
+                                    status: 0,
+                                    len: actual as u32,
+                                },
+                            });
+                        } else {
+                            let resp = RemoteResponse {
+                                status: 0,
+                                len: actual as u32,
+                            };
+                            req.reply(remote_response_bytes(&resp)).ok();
                         }
                     }
                     RemoteRequest::Create(create_req) => {
                         store.register_file(create_req.path_hash, create_req.chunk_size as usize);
-                        let header = copyrpc_fs::InodeHeader {
-                            mode: create_req.mode,
-                            chunk_size: create_req.chunk_size,
-                            ..Default::default()
-                        };
-                        let header_bytes = unsafe {
-                            std::slice::from_raw_parts(
-                                &header as *const copyrpc_fs::InodeHeader as *const u8,
-                                std::mem::size_of::<copyrpc_fs::InodeHeader>(),
-                            )
-                        };
-                        store.write(create_req.path_hash, 0, 0, header_bytes);
-                        RemoteResponse { status: 0, len: 0 }
+                        file_metadata.insert(
+                            create_req.path_hash,
+                            copyrpc_fs::InodeHeader {
+                                mode: create_req.mode,
+                                chunk_size: create_req.chunk_size,
+                                ..Default::default()
+                            },
+                        );
+                        let resp = RemoteResponse { status: 0, len: 0 };
+                        req.reply(remote_response_bytes(&resp)).ok();
                     }
                     RemoteRequest::Stat(stat_req) => {
-                        let mut header_buf =
-                            vec![0u8; std::mem::size_of::<copyrpc_fs::InodeHeader>()];
-                        let read = store.read(stat_req.path_hash, 0, 0, &mut header_buf);
-                        if read >= std::mem::size_of::<copyrpc_fs::InodeHeader>() {
-                            let header: copyrpc_fs::InodeHeader = unsafe {
-                                std::ptr::read_unaligned(
-                                    header_buf.as_ptr() as *const copyrpc_fs::InodeHeader
-                                )
-                            };
-                            let stat_resp =
-                                copyrpc_fs::message::RemoteStatResponse { status: 0, header };
-                            let resp_bytes = unsafe {
-                                std::slice::from_raw_parts(
-                                    &stat_resp as *const copyrpc_fs::message::RemoteStatResponse
-                                        as *const u8,
-                                    std::mem::size_of::<copyrpc_fs::message::RemoteStatResponse>(),
-                                )
-                            };
-                            req.reply(resp_bytes)
-                                .unwrap_or_else(|e| eprintln!("reply error: {:?}", e));
-                            continue;
-                        } else {
-                            let stat_resp = copyrpc_fs::message::RemoteStatResponse {
-                                status: -2, // NotFound
-                                header: copyrpc_fs::InodeHeader::default(),
-                            };
-                            let resp_bytes = unsafe {
-                                std::slice::from_raw_parts(
-                                    &stat_resp as *const copyrpc_fs::message::RemoteStatResponse
-                                        as *const u8,
-                                    std::mem::size_of::<copyrpc_fs::message::RemoteStatResponse>(),
-                                )
-                            };
-                            req.reply(resp_bytes)
-                                .unwrap_or_else(|e| eprintln!("reply error: {:?}", e));
-                            continue;
+                        match file_metadata.get(&stat_req.path_hash) {
+                            Some(header) => {
+                                let stat_resp = copyrpc_fs::message::RemoteStatResponse {
+                                    status: 0,
+                                    header: *header,
+                                };
+                                let resp_bytes = unsafe {
+                                    std::slice::from_raw_parts(
+                                        &stat_resp as *const copyrpc_fs::message::RemoteStatResponse
+                                            as *const u8,
+                                        std::mem::size_of::<copyrpc_fs::message::RemoteStatResponse>(
+                                        ),
+                                    )
+                                };
+                                req.reply(resp_bytes).ok();
+                            }
+                            None => {
+                                let stat_resp = copyrpc_fs::message::RemoteStatResponse {
+                                    status: -2, // NotFound
+                                    header: copyrpc_fs::InodeHeader::default(),
+                                };
+                                let resp_bytes = unsafe {
+                                    std::slice::from_raw_parts(
+                                        &stat_resp as *const copyrpc_fs::message::RemoteStatResponse
+                                            as *const u8,
+                                        std::mem::size_of::<copyrpc_fs::message::RemoteStatResponse>(
+                                        ),
+                                    )
+                                };
+                                req.reply(resp_bytes).ok();
+                            }
                         }
                     }
                     RemoteRequest::Unlink(unlink_req) => {
+                        file_metadata.remove(&unlink_req.path_hash);
                         store.remove(unlink_req.path_hash, 0);
-                        RemoteResponse { status: 0, len: 0 }
-                    }
-                };
-
-                let resp_bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        &resp as *const RemoteResponse as *const u8,
-                        std::mem::size_of::<RemoteResponse>(),
-                    )
-                };
-                req.reply(resp_bytes)
-                    .unwrap_or_else(|e| eprintln!("reply error: {:?}", e));
-            }
-
-            // Process deferred responses collected during RDMA waits
-            for (pending_op, resp) in deferred_responses.drain(..) {
-                match pending_op {
-                    PendingOp::Write(token)
-                    | PendingOp::Create(token)
-                    | PendingOp::Unlink(token) => {
-                        if resp.status == 0 {
-                            server.reply(token, FsResponse::Ok);
-                        } else {
-                            server.reply(token, FsResponse::Error { code: resp.status });
-                        }
-                    }
-                    PendingOp::Read(token) => {
-                        if resp.status == 0 {
-                            server.reply(token, FsResponse::ReadOk { len: resp.len });
-                        } else {
-                            server.reply(token, FsResponse::Error { code: resp.status });
-                        }
-                    }
-                    PendingOp::Stat(token) => {
-                        // Stat during RDMA wait — no header available from deferred
-                        server.reply(token, FsResponse::Error { code: resp.status });
+                        let resp = RemoteResponse { status: 0, len: 0 };
+                        req.reply(remote_response_bytes(&resp)).ok();
                     }
                 }
             }
@@ -591,12 +643,11 @@ fn run_daemon(
         // Phase 2: ipc poll + recv (handle local client requests)
         server.poll();
 
-        // Pre-cache extra buffer pointers and register MRs for new clients
-        // (must happen before recv loop because recv borrows server mutably)
+        // Update extra buffer pointers and register MRs for new clients
         let extra_buf_size = server.extra_buffer_size() as usize;
-        let extra_buf_ptrs: Vec<Option<*mut u8>> = (0..max_clients)
-            .map(|i| server.client_extra_buffer(ipc::ClientId(i)))
-            .collect();
+        for (i, slot) in extra_buf_ptrs.iter_mut().enumerate().take(max_clients as usize) {
+            *slot = server.client_extra_buffer(ipc::ClientId(i as u32));
+        }
         for (client_idx, ptr_opt) in extra_buf_ptrs.iter().enumerate() {
             while client_mrs.len() <= client_idx {
                 client_mrs.push(None);
@@ -604,7 +655,7 @@ fn run_daemon(
             if client_mrs[client_idx].is_none()
                 && let &Some(buf_ptr) = ptr_opt
                 && extra_buf_size > 0
-                && let Some(ref ctx) = copyrpc_ctx
+                && let Some(ctx) = copyrpc_ctx_ref
                 && let Ok(mr) = unsafe {
                     ctx.pd().register(
                         buf_ptr,
@@ -643,6 +694,16 @@ fn run_daemon(
                                 )
                             };
                             store.write(path_hash, chunk_index, offset as usize, data);
+                            update_file_size(
+                                &mut file_metadata,
+                                &store,
+                                path_hash,
+                                chunk_index,
+                                offset as u64,
+                                len as u64,
+                                my_global_id,
+                                total_daemons,
+                            );
                         }
                         ipc_req.reply(FsResponse::Ok);
                     } else {
@@ -674,7 +735,13 @@ fn run_daemon(
                             };
                             match copyrpc_endpoints[ep_idx].call(
                                 req_bytes,
-                                PendingOp::Write(token),
+                                PendingOp::Write {
+                                    token,
+                                    path_hash,
+                                    chunk_index,
+                                    offset,
+                                    len,
+                                },
                                 64,
                             ) {
                                 Ok(_) => {}
@@ -759,18 +826,13 @@ fn run_daemon(
                 FsRequest::Stat { path_hash, .. } => {
                     let target = routing::route(path_hash, 0, total_daemons);
                     if target == my_global_id {
-                        let mut header_buf =
-                            vec![0u8; std::mem::size_of::<copyrpc_fs::InodeHeader>()];
-                        let read = store.read(path_hash, 0, 0, &mut header_buf);
-                        if read >= std::mem::size_of::<copyrpc_fs::InodeHeader>() {
-                            let header: copyrpc_fs::InodeHeader = unsafe {
-                                std::ptr::read_unaligned(
-                                    header_buf.as_ptr() as *const copyrpc_fs::InodeHeader
-                                )
-                            };
-                            ipc_req.reply(FsResponse::StatOk { header });
-                        } else {
-                            ipc_req.reply(FsResponse::NotFound);
+                        match file_metadata.get(&path_hash) {
+                            Some(header) => {
+                                ipc_req.reply(FsResponse::StatOk { header: *header });
+                            }
+                            None => {
+                                ipc_req.reply(FsResponse::NotFound);
+                            }
                         }
                     } else {
                         let (target_node, _) = routing::global_to_local(target, daemons_per_node);
@@ -812,18 +874,14 @@ fn run_daemon(
                     let target = routing::route(path_hash, 0, total_daemons);
                     if target == my_global_id {
                         store.register_file(path_hash, cs as usize);
-                        let header = copyrpc_fs::InodeHeader {
-                            mode,
-                            chunk_size: cs,
-                            ..Default::default()
-                        };
-                        let header_bytes = unsafe {
-                            std::slice::from_raw_parts(
-                                &header as *const copyrpc_fs::InodeHeader as *const u8,
-                                std::mem::size_of::<copyrpc_fs::InodeHeader>(),
-                            )
-                        };
-                        store.write(path_hash, 0, 0, header_bytes);
+                        file_metadata.insert(
+                            path_hash,
+                            copyrpc_fs::InodeHeader {
+                                mode,
+                                chunk_size: cs,
+                                ..Default::default()
+                            },
+                        );
                         ipc_req.reply(FsResponse::Ok);
                     } else {
                         let (target_node, _) = routing::global_to_local(target, daemons_per_node);
@@ -861,6 +919,7 @@ fn run_daemon(
                 FsRequest::Unlink { path_hash, .. } => {
                     let target = routing::route(path_hash, 0, total_daemons);
                     if target == my_global_id {
+                        file_metadata.remove(&path_hash);
                         store.remove(path_hash, 0);
                         ipc_req.reply(FsResponse::Ok);
                     } else {
@@ -897,17 +956,13 @@ fn run_daemon(
                 } => {
                     let target = routing::route(path_hash, 0, total_daemons);
                     if target == my_global_id {
-                        let header = copyrpc_fs::InodeHeader {
-                            mode: mode | 0o040000, // S_IFDIR
-                            ..Default::default()
-                        };
-                        let header_bytes = unsafe {
-                            std::slice::from_raw_parts(
-                                &header as *const copyrpc_fs::InodeHeader as *const u8,
-                                std::mem::size_of::<copyrpc_fs::InodeHeader>(),
-                            )
-                        };
-                        store.write(path_hash, 0, 0, header_bytes);
+                        file_metadata.insert(
+                            path_hash,
+                            copyrpc_fs::InodeHeader {
+                                mode: mode | 0o040000, // S_IFDIR
+                                ..Default::default()
+                            },
+                        );
                         ipc_req.reply(FsResponse::Ok);
                     } else {
                         ipc_req.reply(FsResponse::Error { code: -38 }); // ENOSYS

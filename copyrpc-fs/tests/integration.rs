@@ -3,6 +3,7 @@
 //! Spawns a daemon thread (ipc::Server + PmemStore) and connects
 //! an FsClient to it, then exercises create/write/read/stat/unlink.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 
@@ -25,13 +26,18 @@ fn run_test_daemon(
 ) {
     ready.wait();
 
+    // File metadata (in-memory, separate from PmemStore data)
+    let mut file_metadata: HashMap<u64, copyrpc_fs::InodeHeader> = HashMap::new();
+
+    // Pre-allocate extra buffer pointers
+    let mut extra_buf_ptrs: Vec<Option<*mut u8>> = vec![None; MAX_CLIENTS as usize];
+
     while !stop.load(Ordering::Relaxed) {
         server.poll();
 
-        // Cache extra buffer pointers before recv loop
-        let extra_buf_ptrs: Vec<Option<*mut u8>> = (0..MAX_CLIENTS)
-            .map(|i| server.client_extra_buffer(ipc::ClientId(i)))
-            .collect();
+        for i in 0..MAX_CLIENTS as usize {
+            extra_buf_ptrs[i] = server.client_extra_buffer(ipc::ClientId(i as u32));
+        }
 
         while let Some(ipc_req) = server.recv() {
             let client_id = ipc_req.client_id();
@@ -50,6 +56,14 @@ fn run_test_daemon(
                             std::slice::from_raw_parts(buf_ptr.add(DATA_AREA_OFFSET), len as usize)
                         };
                         store.write(path_hash, chunk_index, offset as usize, data);
+                        // Update file size
+                        let cs = store.chunk_size_for(path_hash) as u64;
+                        let file_end = chunk_index as u64 * cs + offset as u64 + len as u64;
+                        if let Some(meta) = file_metadata.get_mut(&path_hash) {
+                            if file_end > meta.size {
+                                meta.size = file_end;
+                            }
+                        }
                     }
                     ipc_req.reply(FsResponse::Ok);
                 }
@@ -80,38 +94,29 @@ fn run_test_daemon(
                     chunk_size: cs,
                     ..
                 } => {
-                    let header = copyrpc_fs::InodeHeader {
-                        mode,
-                        chunk_size: cs,
-                        ..Default::default()
-                    };
-                    let header_bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            &header as *const copyrpc_fs::InodeHeader as *const u8,
-                            std::mem::size_of::<copyrpc_fs::InodeHeader>(),
-                        )
-                    };
                     store.register_file(path_hash, cs as usize);
-                    store.write(path_hash, 0, 0, header_bytes);
+                    file_metadata.insert(
+                        path_hash,
+                        copyrpc_fs::InodeHeader {
+                            mode,
+                            chunk_size: cs,
+                            ..Default::default()
+                        },
+                    );
                     ipc_req.reply(FsResponse::Ok);
                 }
 
-                FsRequest::Stat { path_hash, .. } => {
-                    let mut header_buf = vec![0u8; std::mem::size_of::<copyrpc_fs::InodeHeader>()];
-                    let read = store.read(path_hash, 0, 0, &mut header_buf);
-                    if read >= std::mem::size_of::<copyrpc_fs::InodeHeader>() {
-                        let header: copyrpc_fs::InodeHeader = unsafe {
-                            std::ptr::read_unaligned(
-                                header_buf.as_ptr() as *const copyrpc_fs::InodeHeader
-                            )
-                        };
-                        ipc_req.reply(FsResponse::StatOk { header });
-                    } else {
+                FsRequest::Stat { path_hash, .. } => match file_metadata.get(&path_hash) {
+                    Some(header) => {
+                        ipc_req.reply(FsResponse::StatOk { header: *header });
+                    }
+                    None => {
                         ipc_req.reply(FsResponse::NotFound);
                     }
-                }
+                },
 
                 FsRequest::Unlink { path_hash, .. } => {
+                    file_metadata.remove(&path_hash);
                     store.remove(path_hash, 0);
                     ipc_req.reply(FsResponse::Ok);
                 }
@@ -119,17 +124,13 @@ fn run_test_daemon(
                 FsRequest::Mkdir {
                     path_hash, mode, ..
                 } => {
-                    let header = copyrpc_fs::InodeHeader {
-                        mode: mode | 0o040000,
-                        ..Default::default()
-                    };
-                    let header_bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            &header as *const copyrpc_fs::InodeHeader as *const u8,
-                            std::mem::size_of::<copyrpc_fs::InodeHeader>(),
-                        )
-                    };
-                    store.write(path_hash, 0, 0, header_bytes);
+                    file_metadata.insert(
+                        path_hash,
+                        copyrpc_fs::InodeHeader {
+                            mode: mode | 0o040000, // S_IFDIR
+                            ..Default::default()
+                        },
+                    );
                     ipc_req.reply(FsResponse::Ok);
                 }
 
