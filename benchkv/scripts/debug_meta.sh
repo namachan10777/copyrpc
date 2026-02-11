@@ -44,4 +44,15 @@ for NP in 2 4 6 8; do
     || echo "FAILED: meta NP=$NP"
 done
 
-echo "=== Debug meta benchmarks completed ==="
+echo "=== copyrpc-direct comparison ==="
+for NP in 2 4 6 8; do
+  echo "=== copyrpc-direct NP=$NP ==="
+  timeout 60 mpirun --hostfile "$PBS_NODEFILE" -np $NP --map-by node --bind-to none "$BENCH" \
+    -d $DURATION -r $RUNS --server-threads $SERVER_THREADS --client-threads $CLIENT_THREADS --queue-depth $QD \
+    --ring-size 4096 \
+    -o "$OUTDIR/debug_direct_np${NP}.parquet" \
+    copyrpc-direct \
+    || echo "FAILED: copyrpc-direct NP=$NP"
+done
+
+echo "=== Debug benchmarks completed ==="

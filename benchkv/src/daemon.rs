@@ -215,10 +215,9 @@ pub fn run_daemon(
         Vec::new();
     let mut free_slots: Vec<usize> = Vec::new();
 
-    // Adaptive ipc poll: skip ipc poll when copyrpc had no responses
-    // (clients can't have new requests if no QD slots were freed).
-    let mut ipc_poll_skip = 0u32;
-    const IPC_POLL_INTERVAL: u32 = 4;
+    // IPC poll control: always poll to avoid latency spikes at high NP.
+    // Previous adaptive skip (IPC_POLL_INTERVAL=4) caused bistable throughput:
+    // low copyrpc_resp → skip IPC → lower throughput feedback loop.
 
     // Per-client inflight tracking: skip polling clients at max QD
     let max_clients = server.max_clients() as usize;
@@ -254,6 +253,17 @@ pub fn run_daemon(
     // Loop period distribution
     let mut loop_period_ns: Vec<u32> = Vec::with_capacity(1_000_000);
     let mut loop_prev_ts = perf_start;
+    // ctx.poll() duration + incoming server latency
+    let mut poll_duration_ns: Vec<u32> = Vec::with_capacity(1_000_000);
+    let mut incoming_reply_pending = false;
+    let mut incoming_reply_ts = perf_start;
+    let mut incoming_server_lat_ns: Vec<u32> = Vec::with_capacity(100_000);
+    // IPC turn-around: time from copyrpc response (server.reply) to next request pickup
+    let mut ipc_reply_at: Vec<std::time::Instant> = vec![perf_start; max_clients];
+    let mut ipc_reply_pending: Vec<bool> = vec![false; max_clients];
+    let mut ipc_turnaround_ns: Vec<u32> = Vec::with_capacity(1_000_000);
+    // Phase 2 timing
+    let mut phase2_duration_ns: Vec<u32> = Vec::with_capacity(1_000_000);
 
     while !stop_flag.load(Ordering::Relaxed) {
         perf_loop_count += 1;
@@ -270,6 +280,7 @@ pub fn run_daemon(
         // giving clients the best chance to submit new requests.
         let mut copyrpc_resp_count = 0u32;
         if let Some(ctx) = ctx_ref {
+            let poll_start = std::time::Instant::now();
             ctx.poll(|token: ipc::RequestToken, data: &[u8]| {
                 let resp = RemoteResponse::from_bytes(data).response;
                 let cid = token.client_id().0 as usize;
@@ -277,6 +288,9 @@ pub fn run_daemon(
                 inflight[cid] -= 1;
                 copyrpc_inflight_count -= 1;
                 copyrpc_resp_count += 1;
+                // IPC turn-around tracking
+                ipc_reply_at[cid] = std::time::Instant::now();
+                ipc_reply_pending[cid] = true;
                 // Latency sampling (local/remote split)
                 if lat_call_valid[cid] {
                     lat_call_valid[cid] = false;
@@ -297,6 +311,22 @@ pub fn run_daemon(
                     lat_flushed[cid] = false;
                 }
             });
+
+            // ctx.poll() duration + incoming server latency
+            {
+                let post_poll_ts = std::time::Instant::now();
+                if poll_duration_ns.len() < 1_000_000 {
+                    poll_duration_ns
+                        .push((post_poll_ts - poll_start).as_nanos() as u32);
+                }
+                if incoming_reply_pending {
+                    incoming_reply_pending = false;
+                    if incoming_server_lat_ns.len() < 100_000 {
+                        incoming_server_lat_ns
+                            .push((post_poll_ts - incoming_reply_ts).as_nanos() as u32);
+                    }
+                }
+            }
 
             perf_copyrpc_resp += copyrpc_resp_count as u64;
 
@@ -323,7 +353,11 @@ pub fn run_daemon(
                     let remote_resp = RemoteResponse { response: resp };
                     loop {
                         match recv_handle.reply(remote_resp.as_bytes()) {
-                            Ok(()) => break,
+                            Ok(()) => {
+                                incoming_reply_pending = true;
+                                incoming_reply_ts = std::time::Instant::now();
+                                break;
+                            }
                             Err(copyrpc::error::Error::RingFull) => {
                                 ctx.poll(|token: ipc::RequestToken, data: &[u8]| {
                                     let resp = RemoteResponse::from_bytes(data).response;
@@ -354,21 +388,27 @@ pub fn run_daemon(
         }
 
         // === Phase 2: ipc poll + recv + inline copyrpc send ===
-        // Poll ipc when: copyrpc just replied to clients (new QD capacity),
-        // or we haven't polled in IPC_POLL_INTERVAL iterations (catch local traffic).
-        ipc_poll_skip += 1;
-        if copyrpc_resp_count > 0 || ipc_poll_skip >= IPC_POLL_INTERVAL {
+        // Always poll IPC to minimize client turn-around latency.
+        let phase2_start = std::time::Instant::now();
+        {
             for i in 0..max_clients {
                 skip[i] = inflight[i] >= queue_depth;
             }
             server.poll_with_skip(&skip);
-            ipc_poll_skip = 0;
             perf_ipc_poll_count += 1;
         }
 
         while let Some(handle) = server.recv() {
             perf_ipc_req += 1;
             let cid = handle.client_id().0 as usize;
+            // IPC turn-around measurement
+            if ipc_reply_pending[cid] {
+                ipc_reply_pending[cid] = false;
+                if ipc_turnaround_ns.len() < 1_000_000 {
+                    ipc_turnaround_ns
+                        .push((std::time::Instant::now() - ipc_reply_at[cid]).as_nanos() as u32);
+                }
+            }
             inflight[cid] += 1;
             let req = *handle.data();
             let target_rank = req.rank();
@@ -435,6 +475,12 @@ pub fn run_daemon(
                     }
                 }
             }
+        }
+
+        // Phase 2 duration
+        if phase2_duration_ns.len() < 1_000_000 {
+            phase2_duration_ns
+                .push((std::time::Instant::now() - phase2_start).as_nanos() as u32);
         }
 
         // === QD sample point ===
@@ -593,6 +639,72 @@ pub fn run_daemon(
             loop_period_ns[n * 99 / 100],
             loop_period_ns[n.saturating_sub(1).min(n * 999 / 1000)],
             loop_period_ns[n - 1],
+        );
+    }
+
+    // Print ctx.poll() duration distribution
+    if !poll_duration_ns.is_empty() {
+        poll_duration_ns.sort_unstable();
+        let n = poll_duration_ns.len();
+        let avg = poll_duration_ns.iter().map(|&x| x as u64).sum::<u64>() / n as u64;
+        eprintln!(
+            "  daemon {} poll_dur: n={} avg={:.0}ns p50={:.0}ns p99={:.0}ns p999={:.0}ns max={:.0}ns",
+            daemon_id,
+            n,
+            avg,
+            poll_duration_ns[n / 2],
+            poll_duration_ns[n * 99 / 100],
+            poll_duration_ns[n.saturating_sub(1).min(n * 999 / 1000)],
+            poll_duration_ns[n - 1],
+        );
+    }
+
+    // Print incoming server latency (reply → next flush)
+    if !incoming_server_lat_ns.is_empty() {
+        incoming_server_lat_ns.sort_unstable();
+        let n = incoming_server_lat_ns.len();
+        let avg = incoming_server_lat_ns.iter().map(|&x| x as u64).sum::<u64>() / n as u64;
+        eprintln!(
+            "  daemon {} incoming_srv_lat: n={} avg={:.1}us p50={:.1}us p99={:.1}us max={:.1}us",
+            daemon_id,
+            n,
+            avg as f64 / 1000.0,
+            incoming_server_lat_ns[n / 2] as f64 / 1000.0,
+            incoming_server_lat_ns[n * 99 / 100] as f64 / 1000.0,
+            incoming_server_lat_ns[n - 1] as f64 / 1000.0,
+        );
+    }
+
+    // Print IPC turn-around latency
+    if !ipc_turnaround_ns.is_empty() {
+        ipc_turnaround_ns.sort_unstable();
+        let n = ipc_turnaround_ns.len();
+        let avg = ipc_turnaround_ns.iter().map(|&x| x as u64).sum::<u64>() / n as u64;
+        eprintln!(
+            "  daemon {} ipc_turnaround: n={} avg={:.1}us p50={:.1}us p99={:.1}us max={:.1}us",
+            daemon_id,
+            n,
+            avg as f64 / 1000.0,
+            ipc_turnaround_ns[n / 2] as f64 / 1000.0,
+            ipc_turnaround_ns[n * 99 / 100] as f64 / 1000.0,
+            ipc_turnaround_ns[n - 1] as f64 / 1000.0,
+        );
+    }
+
+    // Print Phase 2 duration
+    if !phase2_duration_ns.is_empty() {
+        phase2_duration_ns.sort_unstable();
+        let n = phase2_duration_ns.len();
+        let avg = phase2_duration_ns.iter().map(|&x| x as u64).sum::<u64>() / n as u64;
+        eprintln!(
+            "  daemon {} phase2_dur: n={} avg={:.0}ns p50={:.0}ns p99={:.0}ns p999={:.0}ns max={:.0}ns",
+            daemon_id,
+            n,
+            avg,
+            phase2_duration_ns[n / 2],
+            phase2_duration_ns[n * 99 / 100],
+            phase2_duration_ns[n.saturating_sub(1).min(n * 999 / 1000)],
+            phase2_duration_ns[n - 1],
         );
     }
 
