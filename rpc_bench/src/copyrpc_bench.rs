@@ -7,6 +7,7 @@ use mpi::collective::CommunicatorCollectives;
 use mpi::topology::Communicator;
 
 use copyrpc::{Context, ContextBuilder, Endpoint, EndpointConfig, RemoteEndpointInfo};
+use mlx5::device::DeviceList;
 use mlx5::srq::SrqConfig;
 
 use crate::epoch::EpochCollector;
@@ -272,7 +273,16 @@ fn run_one_to_one_threaded(
     let rank = world.rank();
     let is_client = rank == 0;
     let eps_per_thread = num_endpoints / num_threads;
-    let srq_max_wr = (16384usize).max(inflight_per_ep * eps_per_thread * 2) as u32;
+    let device_list = DeviceList::list().expect("Failed to list devices");
+    let device = device_list
+        .get(common.device_index)
+        .expect("Device not found");
+    let dev_ctx = device.open().expect("Failed to open device");
+    let dev_attr = dev_ctx.query_ibv_device().expect("Failed to query device");
+    let hw_max_srq_wr = dev_attr.max_srq_wr as u32;
+    let srq_max_wr =
+        ((16384usize).max(inflight_per_ep * eps_per_thread * 2) as u32).min(hw_max_srq_wr);
+    let cq_size = (srq_max_wr).max(eps_per_thread as u32 * 256).max(4096) as i32;
 
     // Phase 1: spawn workers, each creates RDMA resources and sends connection info back
     let (info_tx, info_rx) = std::sync::mpsc::channel::<(usize, Vec<EndpointConnectionInfo>)>();
@@ -300,6 +310,7 @@ fn run_one_to_one_threaded(
         let device_index = common.device_index;
         let port = common.port;
         let message_size = common.message_size;
+        let cq_size = cq_size;
 
         handles.push(std::thread::spawn(move || {
             crate::affinity::pin_thread_if_configured(
@@ -317,7 +328,7 @@ fn run_one_to_one_threaded(
                     max_wr: srq_max_wr,
                     max_sge: 1,
                 })
-                .cq_size(4096)
+                .cq_size(cq_size)
                 .build()
                 .expect("Failed to create copyrpc context");
 

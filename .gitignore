@@ -58,3 +58,4 @@ core.*
 
 # Job logs
 rpc_bench/logs/
+jobs/

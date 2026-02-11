@@ -65,16 +65,6 @@ fn run_one_to_one(
 
     let (context, worker) = unsafe { init_ucx() };
 
-    if is_client {
-        unsafe {
-            register_response_handler(worker);
-        }
-    } else {
-        unsafe {
-            register_request_handler(worker);
-        }
-    }
-
     let (local_addr, local_addr_len) = unsafe { get_worker_address(worker) };
     let local_bytes =
         unsafe { std::slice::from_raw_parts(local_addr as *const u8, local_addr_len) };
@@ -87,6 +77,16 @@ fn run_one_to_one(
     }
 
     let ep = unsafe { create_endpoint(worker, &remote_bytes) };
+
+    if is_client {
+        unsafe {
+            register_response_handler(worker);
+        }
+    } else {
+        unsafe {
+            register_request_handler(worker, ep);
+        }
+    }
 
     world.barrier();
 
@@ -225,10 +225,6 @@ fn run_multi_client(
     let (context, worker) = unsafe { init_ucx() };
 
     if rank == 0 {
-        unsafe {
-            register_request_handler(worker);
-        }
-
         let (local_addr, local_addr_len) = unsafe { get_worker_address(worker) };
         let local_bytes =
             unsafe { std::slice::from_raw_parts(local_addr as *const u8, local_addr_len) };
@@ -243,6 +239,11 @@ fn run_multi_client(
 
         unsafe {
             ucx_sys::ucp_worker_release_address(worker, local_addr);
+        }
+
+        // Register after endpoints are created; for multi-client reply_ep is used (multi-node)
+        unsafe {
+            register_request_handler(worker, ptr::null_mut());
         }
 
         world.barrier();
@@ -467,8 +468,11 @@ unsafe fn create_endpoint(worker: ucx_sys::ucp_worker_h, remote_addr: &[u8]) -> 
 unsafe extern "C" fn send_cb(
     request: *mut c_void,
     _status: ucx_sys::ucs_status_t,
-    _user_data: *mut c_void,
+    user_data: *mut c_void,
 ) {
+    if !user_data.is_null() {
+        drop(unsafe { Box::from_raw(user_data as *mut Vec<u8>) });
+    }
     unsafe { ucx_sys::ucp_request_free(request) };
 }
 
@@ -517,20 +521,39 @@ unsafe extern "C" fn response_handler(
 }
 
 unsafe extern "C" fn request_handler(
-    _arg: *mut c_void,
+    arg: *mut c_void,
     _header: *const c_void,
     _header_length: usize,
     data: *mut c_void,
     length: usize,
     param: *const ucx_sys::ucp_am_recv_param_t,
 ) -> ucx_sys::ucs_status_t {
-    let reply_ep = unsafe { (*param).reply_ep };
+    let recv_attr = unsafe { (*param).recv_attr };
+    let reply_ep =
+        if recv_attr & ucx_sys::ucp_am_recv_attr_t_UCP_AM_RECV_ATTR_FIELD_REPLY_EP as u64 != 0 {
+            unsafe { (*param).reply_ep }
+        } else {
+            // Fallback: use the endpoint passed via handler arg (e.g. shared-memory transport)
+            arg as ucx_sys::ucp_ep_h
+        };
+    if reply_ep.is_null() {
+        return ucx_sys::ucs_status_t_UCS_OK;
+    }
+
+    // Copy data to owned buffer — UCX may free `data` after we return UCS_OK,
+    // but ucp_am_send_nbx is async and may still reference it.
+    let mut reply_buf = vec![0u8; length];
+    unsafe { ptr::copy_nonoverlapping(data as *const u8, reply_buf.as_mut_ptr(), length) };
+    let buf_ptr = reply_buf.as_ptr() as *const c_void;
+    let owned = Box::into_raw(Box::new(reply_buf)) as *mut c_void;
 
     let send_params = ucx_sys::ucp_request_param_t {
-        op_attr_mask: ucx_sys::ucp_op_attr_t_UCP_OP_ATTR_FIELD_CALLBACK,
+        op_attr_mask: ucx_sys::ucp_op_attr_t_UCP_OP_ATTR_FIELD_CALLBACK
+            | ucx_sys::ucp_op_attr_t_UCP_OP_ATTR_FIELD_USER_DATA,
         cb: ucx_sys::ucp_request_param_t__bindgen_ty_1 {
             send: Some(send_cb),
         },
+        user_data: owned,
         ..unsafe { std::mem::zeroed() }
     };
 
@@ -540,14 +563,21 @@ unsafe extern "C" fn request_handler(
             AM_RESPONSE,
             ptr::null(),
             0,
-            data,
+            buf_ptr,
             length,
             &send_params,
         )
     };
 
     if ucs_ptr_is_err(status_ptr) {
+        // Free buffer on error
+        drop(unsafe { Box::from_raw(owned as *mut Vec<u8>) });
         return ucx_sys::ucs_status_t_UCS_ERR_NO_MEMORY;
+    }
+
+    if status_ptr.is_null() {
+        // Completed inline — callback not invoked, free buffer ourselves
+        drop(unsafe { Box::from_raw(owned as *mut Vec<u8>) });
     }
 
     ucx_sys::ucs_status_t_UCS_OK
@@ -569,15 +599,17 @@ unsafe fn register_response_handler(worker: ucx_sys::ucp_worker_h) {
     assert_eq!(status, ucx_sys::ucs_status_t_UCS_OK);
 }
 
-unsafe fn register_request_handler(worker: ucx_sys::ucp_worker_h) {
+unsafe fn register_request_handler(worker: ucx_sys::ucp_worker_h, fallback_ep: ucx_sys::ucp_ep_h) {
     let handler_param = ucx_sys::ucp_am_handler_param_t {
         field_mask: (ucx_sys::ucp_am_handler_param_field_UCP_AM_HANDLER_PARAM_FIELD_ID
             | ucx_sys::ucp_am_handler_param_field_UCP_AM_HANDLER_PARAM_FIELD_CB
-            | ucx_sys::ucp_am_handler_param_field_UCP_AM_HANDLER_PARAM_FIELD_FLAGS)
+            | ucx_sys::ucp_am_handler_param_field_UCP_AM_HANDLER_PARAM_FIELD_FLAGS
+            | ucx_sys::ucp_am_handler_param_field_UCP_AM_HANDLER_PARAM_FIELD_ARG)
             as u64,
         id: AM_REQUEST,
         cb: Some(request_handler),
         flags: ucx_sys::ucp_am_cb_flags_UCP_AM_FLAG_WHOLE_MSG,
+        arg: fallback_ep as *mut c_void,
         ..unsafe { std::mem::zeroed() }
     };
 

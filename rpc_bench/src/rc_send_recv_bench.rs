@@ -715,6 +715,8 @@ fn run_one_to_one_threaded(
 
             bar.wait(); // post-connect barrier
 
+            let signal_interval = (SIGNAL_INTERVAL as usize).min(inflight).max(1) as u32;
+
             // Run loop
             loop {
                 bar.wait(); // run start
@@ -735,7 +737,7 @@ fn run_one_to_one_threaded(
                         let qp_ref = qp.borrow();
                         let emit = qp_ref.emit_ctx().expect("emit_ctx failed");
                         *send_count += 1;
-                        if (*send_count).is_multiple_of(SIGNAL_INTERVAL) {
+                        if (*send_count).is_multiple_of(signal_interval) {
                             emit_wqe!(&emit, send {
                                 flags: WqeFlags::empty(),
                                 sge: { addr: send_addr(slot_idx), len: msg_size as u32, lkey: send_lkey },
@@ -890,7 +892,7 @@ fn run_one_to_one_threaded(
                             let qp_ref = qp.borrow();
                             let emit = qp_ref.emit_ctx().expect("emit_ctx failed");
                             send_count += 1;
-                            if send_count.is_multiple_of(SIGNAL_INTERVAL) {
+                            if send_count.is_multiple_of(signal_interval) {
                                 emit_wqe!(&emit, send {
                                     flags: WqeFlags::empty(),
                                     sge: { addr: send_addr(send_si), len: msg_size as u32, lkey: send_lkey },
