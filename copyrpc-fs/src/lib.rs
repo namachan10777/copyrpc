@@ -16,13 +16,15 @@
 //! - Zero-copy DMA: client shm buffers are MR-registered by daemon
 
 pub mod client;
+pub mod ffi;
 pub mod message;
 pub mod routing;
 pub mod store;
 
 pub use client::FsClient;
 pub use message::{
-    FsRequest, FsResponse, InodeHeader, RemoteReadReq, RemoteResponse, RemoteWriteReq,
+    FsRequest, FsResponse, InodeHeader, RemoteReadReq, RemoteRequest, RemoteResponse,
+    RemoteWriteReq,
 };
 pub use routing::{global_to_local, koyama_hash, route};
 pub use store::PmemStore;

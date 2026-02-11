@@ -11,7 +11,9 @@ use clap::Parser;
 use mpi::traits::*;
 
 use copyrpc::{ContextBuilder, EndpointConfig, RemoteEndpointInfo};
-use copyrpc_fs::message::{FsRequest, FsResponse, RemoteReadReq, RemoteResponse, RemoteWriteReq};
+use copyrpc_fs::message::{
+    FsRequest, FsResponse, RemoteReadReq, RemoteRequest, RemoteResponse, RemoteWriteReq,
+};
 use copyrpc_fs::routing;
 use copyrpc_fs::store::PmemStore;
 use mlx5::pd::AccessFlags;
@@ -167,7 +169,7 @@ fn run_daemon(
     my_rank: u32,
     total_daemons: usize,
     daemons_per_node: usize,
-    _chunk_size: usize,
+    chunk_size: usize,
     max_clients: u32,
     mut server: ipc::Server<FsRequest, FsResponse>,
     mut store: PmemStore,
@@ -243,8 +245,30 @@ fn run_daemon(
         copyrpc_ctx = Some(ctx);
     }
 
+    // --- QPN → endpoint_idx mapping (for recv handler) ---
+    let qpn_to_ep_idx: std::collections::HashMap<u32, usize> = copyrpc_endpoints
+        .iter()
+        .enumerate()
+        .map(|(i, ep)| (ep.qpn(), i))
+        .collect();
+
+    // --- RDMA temporary buffer + MR for recv handler ---
+    let mut rdma_buf: Vec<u8> = vec![0u8; chunk_size];
+    let rdma_buf_mr = copyrpc_ctx.as_ref().map(|ctx| unsafe {
+        ctx.pd()
+            .register(
+                rdma_buf.as_mut_ptr(),
+                rdma_buf.len(),
+                AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
+            )
+            .expect("Failed to register RDMA buffer MR")
+    });
+
     // --- Client MR registration table ---
     let mut client_mrs: Vec<Option<ClientMrInfo>> = Vec::new();
+
+    // --- Deferred responses (collected during RDMA wait inside recv handler) ---
+    let mut deferred_responses: Vec<(PendingOp, RemoteResponse)> = Vec::new();
 
     // --- Signal ready ---
     ready_barrier.wait();
@@ -285,15 +309,8 @@ fn run_daemon(
             // Phase 1b: copyrpc recv (handle requests from remote daemons)
             while let Some(req) = ctx.recv() {
                 let data = req.data();
-                if data.len() >= std::mem::size_of::<RemoteWriteReq>() {
-                    let write_req: RemoteWriteReq =
-                        unsafe { std::ptr::read_unaligned(data.as_ptr() as *const RemoteWriteReq) };
-                    // TODO: RDMA READ from client's shm → local pmem
-                    // For now, just acknowledge
-                    let resp = RemoteResponse {
-                        status: 0,
-                        len: write_req.len,
-                    };
+                if data.len() < std::mem::size_of::<RemoteRequest>() {
+                    let resp = RemoteResponse { status: -1, len: 0 };
                     let resp_bytes = unsafe {
                         std::slice::from_raw_parts(
                             &resp as *const RemoteResponse as *const u8,
@@ -302,6 +319,138 @@ fn run_daemon(
                     };
                     req.reply(resp_bytes)
                         .unwrap_or_else(|e| eprintln!("reply error: {:?}", e));
+                    continue;
+                }
+
+                let remote_req: RemoteRequest =
+                    unsafe { std::ptr::read_unaligned(data.as_ptr() as *const RemoteRequest) };
+
+                // Find the endpoint that received this request (for RDMA ops)
+                let ep_idx = qpn_to_ep_idx.get(&req.qpn()).copied();
+
+                let resp = match remote_req {
+                    RemoteRequest::Write(write_req) => {
+                        // RDMA READ from client's shm → local rdma_buf → pmem store
+                        if let (Some(idx), Some(mr)) = (ep_idx, &rdma_buf_mr) {
+                            copyrpc_endpoints[idx]
+                                .post_rdma_read(
+                                    write_req.client_addr,
+                                    write_req.client_rkey,
+                                    rdma_buf.as_ptr() as u64,
+                                    mr.lkey(),
+                                    write_req.len,
+                                )
+                                .unwrap_or_else(|e| eprintln!("RDMA READ error: {:?}", e));
+
+                            // Wait for RDMA completion (defer any RPC responses)
+                            while copyrpc_endpoints[idx].raw_rdma_pending() > 0 {
+                                ctx.poll(|pending_op, resp_data| {
+                                    let resp: RemoteResponse = if resp_data.len()
+                                        >= std::mem::size_of::<RemoteResponse>()
+                                    {
+                                        unsafe {
+                                            std::ptr::read_unaligned(
+                                                resp_data.as_ptr() as *const RemoteResponse
+                                            )
+                                        }
+                                    } else {
+                                        RemoteResponse { status: -1, len: 0 }
+                                    };
+                                    deferred_responses.push((pending_op, resp));
+                                });
+                            }
+
+                            // Write to local pmem store
+                            store.write(
+                                write_req.path_hash,
+                                write_req.chunk_index,
+                                write_req.offset as usize,
+                                &rdma_buf[..write_req.len as usize],
+                            );
+
+                            RemoteResponse {
+                                status: 0,
+                                len: write_req.len,
+                            }
+                        } else {
+                            RemoteResponse { status: -1, len: 0 }
+                        }
+                    }
+                    RemoteRequest::Read(read_req) => {
+                        // Read from local pmem store → rdma_buf → RDMA WRITE to client's shm
+                        let actual = store.read(
+                            read_req.path_hash,
+                            read_req.chunk_index,
+                            read_req.offset as usize,
+                            &mut rdma_buf[..read_req.len as usize],
+                        );
+
+                        if actual > 0
+                            && let (Some(idx), Some(mr)) = (ep_idx, &rdma_buf_mr)
+                        {
+                            copyrpc_endpoints[idx]
+                                .post_rdma_write(
+                                    read_req.client_addr,
+                                    read_req.client_rkey,
+                                    rdma_buf.as_ptr() as u64,
+                                    mr.lkey(),
+                                    actual as u32,
+                                )
+                                .unwrap_or_else(|e| eprintln!("RDMA WRITE error: {:?}", e));
+
+                            // Wait for RDMA completion (defer any RPC responses)
+                            while copyrpc_endpoints[idx].raw_rdma_pending() > 0 {
+                                ctx.poll(|pending_op, resp_data| {
+                                    let resp: RemoteResponse = if resp_data.len()
+                                        >= std::mem::size_of::<RemoteResponse>()
+                                    {
+                                        unsafe {
+                                            std::ptr::read_unaligned(
+                                                resp_data.as_ptr() as *const RemoteResponse
+                                            )
+                                        }
+                                    } else {
+                                        RemoteResponse { status: -1, len: 0 }
+                                    };
+                                    deferred_responses.push((pending_op, resp));
+                                });
+                            }
+                        }
+
+                        RemoteResponse {
+                            status: 0,
+                            len: actual as u32,
+                        }
+                    }
+                };
+
+                let resp_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        &resp as *const RemoteResponse as *const u8,
+                        std::mem::size_of::<RemoteResponse>(),
+                    )
+                };
+                req.reply(resp_bytes)
+                    .unwrap_or_else(|e| eprintln!("reply error: {:?}", e));
+            }
+
+            // Process deferred responses collected during RDMA waits
+            for (pending_op, resp) in deferred_responses.drain(..) {
+                match pending_op {
+                    PendingOp::Write(token) => {
+                        if resp.status == 0 {
+                            server.reply(token, FsResponse::Ok);
+                        } else {
+                            server.reply(token, FsResponse::Error { code: resp.status });
+                        }
+                    }
+                    PendingOp::Read(token) => {
+                        if resp.status == 0 {
+                            server.reply(token, FsResponse::ReadOk { len: resp.len });
+                        } else {
+                            server.reply(token, FsResponse::Error { code: resp.status });
+                        }
+                    }
                 }
             }
         }
@@ -375,7 +524,7 @@ fn run_daemon(
                                 continue;
                             };
 
-                            let remote_req = RemoteWriteReq {
+                            let remote_req = RemoteRequest::Write(RemoteWriteReq {
                                 path_hash,
                                 chunk_index,
                                 offset,
@@ -383,11 +532,11 @@ fn run_daemon(
                                 client_rkey: mr_info.mr.rkey(),
                                 client_addr: mr_info.mr.addr() as u64
                                     + copyrpc_fs::message::DATA_AREA_OFFSET as u64,
-                            };
+                            });
                             let req_bytes = unsafe {
                                 std::slice::from_raw_parts(
-                                    &remote_req as *const RemoteWriteReq as *const u8,
-                                    std::mem::size_of::<RemoteWriteReq>(),
+                                    &remote_req as *const RemoteRequest as *const u8,
+                                    std::mem::size_of::<RemoteRequest>(),
                                 )
                             };
                             match copyrpc_endpoints[ep_idx].call(
@@ -451,7 +600,7 @@ fn run_daemon(
                                 continue;
                             };
 
-                            let remote_req = RemoteReadReq {
+                            let remote_req = RemoteRequest::Read(RemoteReadReq {
                                 path_hash,
                                 chunk_index,
                                 offset,
@@ -459,11 +608,11 @@ fn run_daemon(
                                 client_rkey: mr_info.mr.rkey(),
                                 client_addr: mr_info.mr.addr() as u64
                                     + copyrpc_fs::message::DATA_AREA_OFFSET as u64,
-                            };
+                            });
                             let req_bytes = unsafe {
                                 std::slice::from_raw_parts(
-                                    &remote_req as *const RemoteReadReq as *const u8,
-                                    std::mem::size_of::<RemoteReadReq>(),
+                                    &remote_req as *const RemoteRequest as *const u8,
+                                    std::mem::size_of::<RemoteRequest>(),
                                 )
                             };
                             match copyrpc_endpoints[ep_idx].call(

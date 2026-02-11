@@ -114,6 +114,14 @@ pub struct RemoteReadReq {
     pub client_addr: u64,
 }
 
+/// Wrapper enum to distinguish Write vs Read in copyrpc payloads.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub enum RemoteRequest {
+    Write(RemoteWriteReq),
+    Read(RemoteReadReq),
+}
+
 /// copyrpc response (Remote Daemon → Daemon).
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]

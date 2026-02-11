@@ -3,6 +3,9 @@ name = "copyrpc-fs"
 version = "0.1.0"
 edition.workspace = true
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 ipc = { path = "../ipc" }
 copyrpc = { path = "../copyrpc" }
