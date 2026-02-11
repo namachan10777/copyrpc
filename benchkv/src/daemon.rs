@@ -232,7 +232,39 @@ pub fn run_daemon(
     // Buffer for nested ctx.poll() responses inside flux.poll() closure
     let mut nested_resp_buf: Vec<(ipc::RequestToken, Response)> = Vec::new();
 
+    // Performance counters
+    let perf_start = std::time::Instant::now();
+    let mut perf_loop_count: u64 = 0;
+    let mut perf_copyrpc_resp: u64 = 0;
+    let mut perf_incoming_req: u64 = 0;
+    let mut perf_ipc_req: u64 = 0;
+    let mut perf_local_req: u64 = 0;
+    let mut perf_ipc_poll_count: u64 = 0;
+
+    // Latency sampling: copyrpc round-trip per request
+    let mut lat_call_ts: Vec<std::time::Instant> = vec![perf_start; max_clients];
+    let mut lat_call_ep: Vec<u16> = vec![0; max_clients];
+    let mut lat_call_valid: Vec<bool> = vec![false; max_clients];
+    let mut lat_flush_ts: Vec<std::time::Instant> = vec![perf_start; max_clients];
+    let mut lat_flushed: Vec<bool> = vec![false; max_clients];
+    let mut lat_samples_ns: Vec<u64> = Vec::with_capacity(1_000_000);
+    let mut lat_samples_ep: Vec<u16> = Vec::with_capacity(1_000_000);
+    let mut lat_local_ns: Vec<u64> = Vec::with_capacity(1_000_000);
+    let mut lat_remote_ns: Vec<u64> = Vec::with_capacity(1_000_000);
+    // Loop period distribution
+    let mut loop_period_ns: Vec<u32> = Vec::with_capacity(1_000_000);
+    let mut loop_prev_ts = perf_start;
+
     while !stop_flag.load(Ordering::Relaxed) {
+        perf_loop_count += 1;
+        // Loop period measurement
+        {
+            let loop_now = std::time::Instant::now();
+            if loop_period_ns.len() < 1_000_000 {
+                loop_period_ns.push((loop_now - loop_prev_ts).as_nanos() as u32);
+            }
+            loop_prev_ts = loop_now;
+        }
         // === Phase 1: copyrpc poll + recv ===
         // Process RDMA completions first so ipc replies go out before ipc poll,
         // giving clients the best chance to submit new requests.
@@ -245,13 +277,46 @@ pub fn run_daemon(
                 inflight[cid] -= 1;
                 copyrpc_inflight_count -= 1;
                 copyrpc_resp_count += 1;
+                // Latency sampling (local/remote split)
+                if lat_call_valid[cid] {
+                    lat_call_valid[cid] = false;
+                    if lat_samples_ns.len() < 1_000_000 {
+                        let total_ns = lat_call_ts[cid].elapsed().as_nanos() as u64;
+                        lat_samples_ns.push(total_ns);
+                        lat_samples_ep.push(lat_call_ep[cid]);
+                        if lat_flushed[cid] {
+                            let local_ns =
+                                (lat_flush_ts[cid] - lat_call_ts[cid]).as_nanos() as u64;
+                            lat_local_ns.push(local_ns);
+                            lat_remote_ns.push(total_ns.saturating_sub(local_ns));
+                        } else {
+                            lat_local_ns.push(0);
+                            lat_remote_ns.push(total_ns);
+                        }
+                    }
+                    lat_flushed[cid] = false;
+                }
             });
+
+            perf_copyrpc_resp += copyrpc_resp_count as u64;
+
+            // Mark pending calls as flushed (ctx.poll step 4 did the flush)
+            {
+                let post_flush_ts = std::time::Instant::now();
+                for cid in 0..max_clients {
+                    if lat_call_valid[cid] && !lat_flushed[cid] {
+                        lat_flush_ts[cid] = post_flush_ts;
+                        lat_flushed[cid] = true;
+                    }
+                }
+            }
 
             // copyrpc recv (incoming requests from remote nodes)
             while let Some(recv_handle) = ctx.recv() {
                 let req = RemoteRequest::from_bytes(recv_handle.data()).request;
                 let target_daemon = ShardedStore::owner_of(req.key(), num_daemons_u64) as usize;
 
+                perf_incoming_req += 1;
                 if target_daemon == daemon_id {
                     // This daemon owns the key → handle locally
                     let resp = handle_local(&mut store, &req);
@@ -298,15 +363,18 @@ pub fn run_daemon(
             }
             server.poll_with_skip(&skip);
             ipc_poll_skip = 0;
+            perf_ipc_poll_count += 1;
         }
 
         while let Some(handle) = server.recv() {
+            perf_ipc_req += 1;
             let cid = handle.client_id().0 as usize;
             inflight[cid] += 1;
             let req = *handle.data();
             let target_rank = req.rank();
 
             if target_rank == my_rank {
+                perf_local_req += 1;
                 debug_assert_eq!(
                     ShardedStore::owner_of(req.key(), num_daemons_u64) as usize,
                     daemon_id
@@ -323,9 +391,14 @@ pub fn run_daemon(
                     match copyrpc_endpoints[ep_idx].call(remote_req.as_bytes(), pending, 0u64) {
                         Ok(_) => {
                             copyrpc_inflight_count += 1;
+                            lat_call_ts[cid] = std::time::Instant::now();
+                            lat_call_ep[cid] = ep_idx as u16;
+                            lat_call_valid[cid] = true;
+                            lat_flushed[cid] = false;
                             break;
                         }
-                        Err(copyrpc::error::CallError::RingFull(returned)) => {
+                        Err(copyrpc::error::CallError::RingFull(returned))
+                        | Err(copyrpc::error::CallError::InsufficientCredit(returned)) => {
                             pending = returned;
                             ctx.poll(|token: ipc::RequestToken, data: &[u8]| {
                                 let resp = RemoteResponse::from_bytes(data).response;
@@ -333,10 +406,32 @@ pub fn run_daemon(
                                 server.reply(token, resp);
                                 inflight[cid] -= 1;
                                 copyrpc_inflight_count -= 1;
+                                if lat_call_valid[cid] {
+                                    lat_call_valid[cid] = false;
+                                    if lat_samples_ns.len() < 1_000_000 {
+                                        let total_ns =
+                                            lat_call_ts[cid].elapsed().as_nanos() as u64;
+                                        lat_samples_ns.push(total_ns);
+                                        lat_samples_ep.push(lat_call_ep[cid]);
+                                        if lat_flushed[cid] {
+                                            let local_ns = (lat_flush_ts[cid]
+                                                - lat_call_ts[cid])
+                                                .as_nanos()
+                                                as u64;
+                                            lat_local_ns.push(local_ns);
+                                            lat_remote_ns
+                                                .push(total_ns.saturating_sub(local_ns));
+                                        } else {
+                                            lat_local_ns.push(0);
+                                            lat_remote_ns.push(total_ns);
+                                        }
+                                    }
+                                    lat_flushed[cid] = false;
+                                }
                             });
                             continue;
                         }
-                        Err(_) => break,
+                        Err(copyrpc::error::CallError::Other(_)) => break,
                     }
                 }
             }
@@ -395,6 +490,110 @@ pub fn run_daemon(
                 flux.reply(flux_token, DelegatePayload::Resp(resp));
             }
         }
+    }
+
+    // Print performance counters
+    let perf_elapsed = perf_start.elapsed().as_secs_f64();
+    if perf_elapsed > 0.1 {
+        eprintln!(
+            "  daemon {} perf: loop={:.2}MHz copyrpc_resp={:.2}M/s incoming={:.2}M/s ipc={:.2}M/s local={:.2}M/s ipc_poll={:.2}MHz loop_total={}",
+            daemon_id,
+            perf_loop_count as f64 / perf_elapsed / 1e6,
+            perf_copyrpc_resp as f64 / perf_elapsed / 1e6,
+            perf_incoming_req as f64 / perf_elapsed / 1e6,
+            perf_ipc_req as f64 / perf_elapsed / 1e6,
+            perf_local_req as f64 / perf_elapsed / 1e6,
+            perf_ipc_poll_count as f64 / perf_elapsed / 1e6,
+            perf_loop_count,
+        );
+    }
+
+    // Print copyrpc RTT latency distribution
+    if !lat_samples_ns.is_empty() {
+        lat_samples_ns.sort_unstable();
+        let n = lat_samples_ns.len();
+        let avg = lat_samples_ns.iter().sum::<u64>() / n as u64;
+        let p50 = lat_samples_ns[n / 2];
+        let p99 = lat_samples_ns[n * 99 / 100];
+        let p999 = lat_samples_ns[n.saturating_sub(1).min(n * 999 / 1000)];
+        let min = lat_samples_ns[0];
+        let max = lat_samples_ns[n - 1];
+        eprintln!(
+            "  daemon {} copyrpc_rtt: n={} avg={:.1}us p50={:.1}us p99={:.1}us p999={:.1}us min={:.1}us max={:.1}us",
+            daemon_id,
+            n,
+            avg as f64 / 1000.0,
+            p50 as f64 / 1000.0,
+            p99 as f64 / 1000.0,
+            p999 as f64 / 1000.0,
+            min as f64 / 1000.0,
+            max as f64 / 1000.0,
+        );
+
+        // Per-endpoint breakdown
+        let num_eps = my_remote_ranks.len();
+        if num_eps > 1 {
+            for ep in 0..num_eps {
+                let mut ep_lats: Vec<u64> = lat_samples_ns
+                    .iter()
+                    .zip(lat_samples_ep.iter())
+                    .filter(|&(_, &e)| e as usize == ep)
+                    .map(|(&ns, _)| ns)
+                    .collect();
+                if ep_lats.is_empty() {
+                    continue;
+                }
+                ep_lats.sort_unstable();
+                let en = ep_lats.len();
+                let eavg = ep_lats.iter().sum::<u64>() / en as u64;
+                let ep50 = ep_lats[en / 2];
+                let ep99 = ep_lats[en * 99 / 100];
+                eprintln!(
+                    "    ep[{}]→rank{}: n={} avg={:.1}us p50={:.1}us p99={:.1}us",
+                    ep,
+                    my_remote_ranks[ep],
+                    en,
+                    eavg as f64 / 1000.0,
+                    ep50 as f64 / 1000.0,
+                    ep99 as f64 / 1000.0,
+                );
+            }
+        }
+
+        // Local/Remote RTT split
+        if !lat_local_ns.is_empty() {
+            lat_local_ns.sort_unstable();
+            lat_remote_ns.sort_unstable();
+            let ln = lat_local_ns.len();
+            let rn = lat_remote_ns.len();
+            eprintln!(
+                "  daemon {} local_delay: p50={:.1}us p99={:.1}us max={:.1}us | remote_rtt: p50={:.1}us p99={:.1}us max={:.1}us",
+                daemon_id,
+                lat_local_ns[ln / 2] as f64 / 1000.0,
+                lat_local_ns[ln * 99 / 100] as f64 / 1000.0,
+                lat_local_ns[ln - 1] as f64 / 1000.0,
+                lat_remote_ns[rn / 2] as f64 / 1000.0,
+                lat_remote_ns[rn * 99 / 100] as f64 / 1000.0,
+                lat_remote_ns[rn - 1] as f64 / 1000.0,
+            );
+        }
+    }
+
+    // Print loop period distribution
+    if !loop_period_ns.is_empty() {
+        loop_period_ns.sort_unstable();
+        let n = loop_period_ns.len();
+        let avg = loop_period_ns.iter().map(|&x| x as u64).sum::<u64>() / n as u64;
+        eprintln!(
+            "  daemon {} loop_period: n={} avg={:.0}ns p50={:.0}ns p99={:.0}ns p999={:.0}ns max={:.0}ns",
+            daemon_id,
+            n,
+            avg,
+            loop_period_ns[n / 2],
+            loop_period_ns[n * 99 / 100],
+            loop_period_ns[n.saturating_sub(1).min(n * 999 / 1000)],
+            loop_period_ns[n - 1],
+        );
     }
 
     qd_collector.map_or_else(Vec::new, |c| c.into_samples())

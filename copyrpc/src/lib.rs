@@ -631,6 +631,8 @@ struct EndpointInner<U> {
     raw_rdma_posted: Cell<u32>,
     /// Number of raw RDMA completions received (shared with sq_callback via Rc<Cell>).
     raw_rdma_done: Rc<Cell<u32>>,
+    /// Whether any WQE has been posted since the last doorbell ring.
+    needs_doorbell: Cell<bool>,
 }
 
 impl<U> EndpointInner<U> {
@@ -714,6 +716,7 @@ impl<U> EndpointInner<U> {
             batch_message_count: Cell::new(0),
             raw_rdma_posted: Cell::new(0),
             raw_rdma_done,
+            needs_doorbell: Cell::new(false),
         }));
 
         // SRQ recv buffers are pre-posted in Context::build() and replenished in poll()
@@ -842,6 +845,7 @@ impl<U> EndpointInner<U> {
         }
 
         self.flush_start_pos.set(end);
+        self.needs_doorbell.set(true);
         Ok(true)
     }
 
@@ -862,7 +866,10 @@ impl<U> EndpointInner<U> {
     #[inline(always)]
     fn flush(&self) -> Result<()> {
         self.emit_wqe()?;
-        self.qp.borrow().ring_sq_doorbell_bf();
+        if self.needs_doorbell.get() {
+            self.qp.borrow().ring_sq_doorbell_bf();
+            self.needs_doorbell.set(false);
+        }
         Ok(())
     }
 

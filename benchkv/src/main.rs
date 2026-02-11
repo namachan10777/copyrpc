@@ -77,7 +77,7 @@ struct Cli {
     distribution: workload::KeyDistribution,
 
     /// copyrpc ring buffer size
-    #[arg(long, default_value = "1048576")]
+    #[arg(long, default_value = "4194304")]
     ring_size: usize,
 
     /// Output directory for queue-depth samples (CSV). Disabled if not set.
