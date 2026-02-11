@@ -175,11 +175,7 @@ impl<T: Serial + Send, U> Flux<T, U> {
 ///
 /// # Panics
 /// Panics if `n` is 0, `capacity` is 0, or `inflight_max >= capacity`.
-pub fn create_flux<T, U>(
-    n: usize,
-    capacity: usize,
-    inflight_max: usize,
-) -> Vec<Flux<T, U>>
+pub fn create_flux<T, U>(n: usize, capacity: usize, inflight_max: usize) -> Vec<Flux<T, U>>
 where
     T: Serial + Send,
     U: Send,
