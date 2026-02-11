@@ -1,8 +1,10 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use ipc::Client;
 
 use crate::message::{Request, Response};
+use crate::parquet_out::BatchRecord;
 use crate::workload::AccessEntry;
 
 fn make_request(entry: &AccessEntry) -> Request {
@@ -40,18 +42,15 @@ pub fn run_client(
     pattern: &[AccessEntry],
     queue_depth: u32,
     stop_flag: &AtomicBool,
-    completions: &AtomicU64,
-) {
+    batch_size: u32,
+    bench_start: Instant,
+) -> Vec<BatchRecord> {
     // Connect to all daemons
     let mut clients: Vec<Client<Request, Response, (), _>> = shm_paths
         .iter()
         .map(|path| {
-            unsafe {
-                Client::<Request, Response, (), _>::connect(path, |(), _resp| {
-                    completions.fetch_add(1, Ordering::Relaxed);
-                })
-            }
-            .expect("Client failed to connect")
+            unsafe { Client::<Request, Response, (), _>::connect(path, |(), _resp| {}) }
+                .expect("Client failed to connect")
         })
         .collect();
 
@@ -64,9 +63,12 @@ pub fn run_client(
         pattern_idx += 1;
         let daemon = target_daemon(entry, num_daemons, my_rank);
         if clients[daemon].call(make_request(entry), ()).is_err() {
-            return;
+            return Vec::new();
         }
     }
+
+    let mut records = Vec::new();
+    let mut completed_in_batch = 0u32;
 
     // Steady state: poll all daemons for completions, send replacements
     while !stop_flag.load(Ordering::Relaxed) {
@@ -74,7 +76,7 @@ pub fn run_client(
         for client in &mut clients {
             match client.poll() {
                 Ok(n) => total_n += n,
-                Err(_) => return,
+                Err(_) => return records,
             }
         }
         for _ in 0..total_n {
@@ -82,11 +84,22 @@ pub fn run_client(
             pattern_idx += 1;
             let daemon = target_daemon(entry, num_daemons, my_rank);
             if clients[daemon].call(make_request(entry), ()).is_err() {
-                return;
+                return records;
             }
         }
+
+        completed_in_batch += total_n;
+        while completed_in_batch >= batch_size {
+            completed_in_batch -= batch_size;
+            records.push(BatchRecord {
+                elapsed_ns: bench_start.elapsed().as_nanos() as u64,
+                batch_size,
+            });
+        }
+
         if total_n == 0 {
             std::hint::spin_loop();
         }
     }
+    records
 }

@@ -5,7 +5,7 @@
 //! Each daemon thread accepts sessions from all clients (local + remote).
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
@@ -15,10 +15,10 @@ use mpi::collective::CommunicatorCollectives;
 
 use crate::Cli;
 use crate::affinity;
-use crate::epoch::EpochCollector;
 use crate::message::{RemoteRequest, RemoteResponse, Request, Response};
 use crate::mpi_util;
 use crate::parquet_out;
+use crate::parquet_out::BatchRecord;
 use crate::storage::ShardedStore;
 use crate::workload::AccessEntry;
 
@@ -112,9 +112,6 @@ pub fn run_erpc(
 
     // Shared state
     let stop_flag = Arc::new(AtomicBool::new(false));
-    let completions: Vec<Arc<AtomicU64>> = (0..num_clients)
-        .map(|_| Arc::new(AtomicU64::new(0)))
-        .collect();
 
     // Barrier: all threads + main
     let ready_barrier = Arc::new(Barrier::new(total_threads + 1));
@@ -123,7 +120,8 @@ pub fn run_erpc(
     let port = cli.port;
     let key_range = cli.key_range;
 
-    let mut handles = Vec::with_capacity(total_threads);
+    let bench_start = Instant::now();
+    let mut daemon_handles = Vec::with_capacity(num_daemons);
     let mut peer_rxs_iter: Vec<_> = peer_rxs.into_iter().collect();
 
     // Spawn daemon threads (indices 0..num_daemons)
@@ -134,7 +132,7 @@ pub fn run_erpc(
         let barrier = ready_barrier.clone();
         let core = daemon_cores.get(d).copied();
 
-        handles.push(std::thread::spawn(move || {
+        daemon_handles.push(std::thread::spawn(move || {
             if let Some(core_id) = core {
                 affinity::pin_thread(core_id, &format!("erpc-daemon-{}", d));
             }
@@ -236,16 +234,20 @@ pub fn run_erpc(
     }
 
     // Spawn client threads (indices num_daemons..total_threads)
+    let mut client_handles: Vec<std::thread::JoinHandle<Vec<BatchRecord>>> =
+        Vec::with_capacity(num_clients);
+
     for c in 0..num_clients {
         let info_tx = info_tx.clone();
         let peer_rx = peer_rxs_iter.remove(0);
         let pattern = patterns[c].clone();
         let stop = stop_flag.clone();
         let barrier = ready_barrier.clone();
-        let comp = completions[c].clone();
+        let batch_size = cli.batch_size;
+        let bs = bench_start;
         let core = client_cores.get(c).copied();
 
-        handles.push(std::thread::spawn(move || {
+        client_handles.push(std::thread::spawn(move || {
             if let Some(core_id) = core {
                 affinity::pin_thread(core_id, &format!("erpc-client-{}", c));
             }
@@ -322,8 +324,9 @@ pub fn run_erpc(
                 num_daemons,
                 size as usize,
                 &stop,
-                &comp,
-            );
+                batch_size,
+                bs,
+            )
         }));
     }
     drop(info_tx);
@@ -389,77 +392,55 @@ pub fn run_erpc(
     world.barrier();
     ready_barrier.wait();
 
-    // Epoch sampling loop
-    let mut all_rows = Vec::new();
+    // Benchmark: run boundary loop
     let duration = Duration::from_secs(cli.duration);
-    let interval = Duration::from_millis(cli.interval_ms);
+    let mut run_boundaries = Vec::new();
 
     for run in 0..cli.runs {
-        for c in &completions {
-            c.store(0, Ordering::Release);
-        }
+        world.barrier();
+        let run_start_ns = bench_start.elapsed().as_nanos() as u64;
+        std::thread::sleep(duration);
+        let run_end_ns = bench_start.elapsed().as_nanos() as u64;
+        run_boundaries.push((run, run_start_ns, run_end_ns));
+    }
 
-        let mut collector = EpochCollector::new(interval);
-        let start = Instant::now();
+    // Stop
+    stop_flag.store(true, Ordering::Release);
 
-        while start.elapsed() < duration {
-            std::thread::sleep(Duration::from_millis(1));
-            let mut total_delta = 0u64;
-            for c in &completions {
-                total_delta += c.swap(0, Ordering::Relaxed);
-            }
-            if total_delta > 0 {
-                collector.record(total_delta);
-            }
-        }
+    for h in daemon_handles {
+        h.join().expect("Thread panicked");
+    }
 
-        collector.finish();
-        let steady = collector.steady_state(cli.trim);
-        let rows = parquet_out::rows_from_epochs(
-            "erpc",
-            steady,
-            rank,
-            num_daemons as u32,
-            num_clients as u32,
-            queue_depth,
-            cli.key_range,
-            run,
-        );
+    let client_batches: Vec<Vec<BatchRecord>> = client_handles
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .collect();
 
-        let avg_rps = if !steady.is_empty() {
-            let avg = rows.iter().map(|r| r.rps).sum::<f64>() / rows.len() as f64;
-            eprintln!(
-                "  rank {} run {}: avg {:.0} RPS ({} steady epochs)",
-                rank,
-                run + 1,
-                avg,
-                steady.len()
-            );
-            avg
-        } else {
-            0.0
-        };
+    // Log RPS per run
+    for &(run, start_ns, end_ns) in &run_boundaries {
+        let rps = parquet_out::compute_run_rps(&client_batches, start_ns, end_ns);
+        eprintln!("  rank {} run {}: {:.0} RPS", rank, run + 1, rps);
         let mut total_rps = 0.0f64;
         world.all_reduce_into(
-            &avg_rps,
+            &rps,
             &mut total_rps,
             mpi::collective::SystemOperation::sum(),
         );
         if rank == 0 {
             eprintln!("  total run {}: {:.0} RPS", run + 1, total_rps);
         }
-
-        all_rows.extend(rows);
     }
 
-    // Stop
-    stop_flag.store(true, Ordering::Release);
-
-    for h in handles {
-        h.join().expect("Thread panicked");
-    }
-
-    all_rows
+    parquet_out::rows_from_batches(
+        "erpc",
+        rank,
+        &client_batches,
+        &run_boundaries,
+        num_daemons as u32,
+        num_clients as u32,
+        queue_depth,
+        cli.key_range,
+    )
 }
 
 // === Helpers ===
@@ -503,14 +484,17 @@ fn run_erpc_client_loop(
     num_daemons: usize,
     num_ranks: usize,
     stop_flag: &AtomicBool,
-    completions: &AtomicU64,
-) {
+    batch_size: u32,
+    bench_start: Instant,
+) -> Vec<BatchRecord> {
     let pattern_len = pattern.len();
     let mut pattern_idx = 0usize;
 
     COMPLETED.with(|c| *c.borrow_mut() = 0);
     let mut sent = 0u64;
     let mut completed_base = 0u64;
+    let mut records = Vec::new();
+    let mut completed_in_batch = 0u32;
 
     // Initial fill
     for _ in 0..queue_depth {
@@ -538,7 +522,14 @@ fn run_erpc_client_loop(
         let new = total_completed - completed_base;
         if new > 0 {
             completed_base = total_completed;
-            completions.fetch_add(new, Ordering::Relaxed);
+            completed_in_batch += new as u32;
+            while completed_in_batch >= batch_size {
+                completed_in_batch -= batch_size;
+                records.push(BatchRecord {
+                    elapsed_ns: bench_start.elapsed().as_nanos() as u64,
+                    batch_size,
+                });
+            }
         }
 
         // Refill pipeline
@@ -570,6 +561,8 @@ fn run_erpc_client_loop(
             break;
         }
     }
+
+    records
 }
 
 /// Map access entry to session index.

@@ -2,7 +2,6 @@ mod affinity;
 mod client;
 mod copyrpc_direct_backend;
 mod daemon;
-mod epoch;
 mod erpc_backend;
 mod message;
 mod mpi_util;
@@ -13,7 +12,7 @@ mod ucx_am;
 mod ucx_am_backend;
 mod workload;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
@@ -22,7 +21,6 @@ use mpi::collective::CommunicatorCollectives;
 use mpi::topology::Communicator;
 
 use daemon::{CopyrpcSetup, DaemonFlux, EndpointConnectionInfo};
-use epoch::EpochCollector;
 use message::{DelegatePayload, Request, Response};
 
 #[derive(Parser, Debug)]
@@ -33,13 +31,9 @@ struct Cli {
     #[arg(short = 'd', long, default_value = "30")]
     duration: u64,
 
-    /// Epoch interval in milliseconds
-    #[arg(long, default_value = "1000")]
-    interval_ms: u64,
-
-    /// Epochs to trim from each end
-    #[arg(long, default_value = "3")]
-    trim: usize,
+    /// Batch size for measurement
+    #[arg(long, default_value = "100")]
+    batch_size: u32,
 
     /// Number of runs
     #[arg(short = 'r', long, default_value = "3")]
@@ -246,9 +240,6 @@ fn run_meta(
 
     // Shared state
     let stop_flag = Arc::new(AtomicBool::new(false));
-    let completions: Vec<Arc<AtomicU64>> = (0..num_clients)
-        .map(|_| Arc::new(AtomicU64::new(0)))
-        .collect();
 
     // Barrier: all daemon threads + main thread
     let ready_barrier = Arc::new(Barrier::new(num_daemons + 1));
@@ -391,13 +382,15 @@ fn run_meta(
     world.barrier();
 
     // Spawn client threads (each connects to ALL daemons)
+    let bench_start = Instant::now();
     let mut client_handles = Vec::with_capacity(num_clients);
     for c in 0..num_clients {
         let paths = shm_paths.clone();
         let pattern = patterns[c].clone();
         let stop = stop_flag.clone();
-        let comp = completions[c].clone();
         let core = client_cores.get(c).copied();
+        let batch_size = cli.batch_size;
+        let bs = bench_start;
 
         client_handles.push(std::thread::spawn(move || {
             if let Some(core_id) = core {
@@ -410,72 +403,22 @@ fn run_meta(
                 &pattern,
                 queue_depth,
                 &stop,
-                &comp,
-            );
+                batch_size,
+                bs,
+            )
         }));
     }
 
-    // Benchmark: epoch sampling loop
-    let mut all_rows = Vec::new();
+    // Benchmark: run boundary loop
     let duration = Duration::from_secs(cli.duration);
-    let interval = Duration::from_millis(cli.interval_ms);
+    let mut run_boundaries = Vec::new();
 
     for run in 0..cli.runs {
-        for c in &completions {
-            c.store(0, Ordering::Release);
-        }
-
-        let mut collector = EpochCollector::new(interval);
-        let start = Instant::now();
-
-        while start.elapsed() < duration {
-            std::thread::sleep(Duration::from_millis(1));
-            let mut total_delta = 0u64;
-            for c in &completions {
-                total_delta += c.swap(0, Ordering::Relaxed);
-            }
-            if total_delta > 0 {
-                collector.record(total_delta);
-            }
-        }
-
-        collector.finish();
-        let steady = collector.steady_state(cli.trim);
-        let rows = parquet_out::rows_from_epochs(
-            "meta",
-            steady,
-            rank,
-            num_daemons as u32,
-            num_clients as u32,
-            queue_depth,
-            cli.key_range,
-            run,
-        );
-
-        let avg_rps = if !steady.is_empty() {
-            let avg = rows.iter().map(|r| r.rps).sum::<f64>() / rows.len() as f64;
-            eprintln!(
-                "  rank {} run {}: avg {:.0} RPS ({} steady epochs)",
-                rank,
-                run + 1,
-                avg,
-                steady.len()
-            );
-            avg
-        } else {
-            0.0
-        };
-        let mut total_rps = 0.0f64;
-        world.all_reduce_into(
-            &avg_rps,
-            &mut total_rps,
-            mpi::collective::SystemOperation::sum(),
-        );
-        if rank == 0 {
-            eprintln!("  total run {}: {:.0} RPS", run + 1, total_rps);
-        }
-
-        all_rows.extend(rows);
+        world.barrier();
+        let run_start_ns = bench_start.elapsed().as_nanos() as u64;
+        std::thread::sleep(duration);
+        let run_end_ns = bench_start.elapsed().as_nanos() as u64;
+        run_boundaries.push((run, run_start_ns, run_end_ns));
     }
 
     // Stop
@@ -502,9 +445,35 @@ fn run_meta(
             }
         }
     }
-    for h in client_handles {
-        h.join().expect("Client thread panicked");
+
+    let client_batches: Vec<Vec<parquet_out::BatchRecord>> = client_handles
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .collect();
+
+    // Log RPS per run
+    for &(run, start_ns, end_ns) in &run_boundaries {
+        let rps = parquet_out::compute_run_rps(&client_batches, start_ns, end_ns);
+        eprintln!("  rank {} run {}: {:.0} RPS", rank, run + 1, rps);
+        let mut total_rps = 0.0f64;
+        world.all_reduce_into(
+            &rps,
+            &mut total_rps,
+            mpi::collective::SystemOperation::sum(),
+        );
+        if rank == 0 {
+            eprintln!("  total run {}: {:.0} RPS", run + 1, total_rps);
+        }
     }
 
-    all_rows
+    parquet_out::rows_from_batches(
+        "meta",
+        rank,
+        &client_batches,
+        &run_boundaries,
+        num_daemons as u32,
+        num_clients as u32,
+        queue_depth,
+        cli.key_range,
+    )
 }
