@@ -41,5 +41,17 @@ rpc_bench/result/
 # Python
 .venv/
 
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Core dumps
+core.*
+
+# Backup files
+*.backup
+
 # Job logs
 rpc_bench/logs/
