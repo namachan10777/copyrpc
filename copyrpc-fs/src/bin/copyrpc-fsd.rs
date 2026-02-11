@@ -12,7 +12,8 @@ use mpi::traits::*;
 
 use copyrpc::{ContextBuilder, EndpointConfig, RemoteEndpointInfo};
 use copyrpc_fs::message::{
-    FsRequest, FsResponse, RemoteReadReq, RemoteRequest, RemoteResponse, RemoteWriteReq,
+    FsRequest, FsResponse, RemoteCreateReq, RemoteReadReq, RemoteRequest, RemoteResponse,
+    RemoteStatReq, RemoteUnlinkReq, RemoteWriteReq,
 };
 use copyrpc_fs::routing;
 use copyrpc_fs::store::PmemStore;
@@ -152,6 +153,34 @@ struct CopyrpcSetup {
 enum PendingOp {
     Write(ipc::RequestToken),
     Read(ipc::RequestToken),
+    Create(ipc::RequestToken),
+    Stat(ipc::RequestToken),
+    Unlink(ipc::RequestToken),
+}
+
+impl PendingOp {
+    fn into_token(self) -> ipc::RequestToken {
+        match self {
+            PendingOp::Write(t)
+            | PendingOp::Read(t)
+            | PendingOp::Create(t)
+            | PendingOp::Stat(t)
+            | PendingOp::Unlink(t) => t,
+        }
+    }
+}
+
+fn extract_token_from_call_error(
+    e: copyrpc::error::CallError<PendingOp>,
+) -> Option<ipc::RequestToken> {
+    match e {
+        copyrpc::error::CallError::RingFull(op)
+        | copyrpc::error::CallError::InsufficientCredit(op) => Some(op.into_token()),
+        copyrpc::error::CallError::Other(e) => {
+            eprintln!("copyrpc call error: {:?}", e);
+            None
+        }
+    }
 }
 
 /// Per-client MR info for RDMA to/from client's extra buffer.
@@ -289,7 +318,9 @@ fn run_daemon(
                 };
 
                 match pending_op {
-                    PendingOp::Write(token) => {
+                    PendingOp::Write(token)
+                    | PendingOp::Create(token)
+                    | PendingOp::Unlink(token) => {
                         if resp.status == 0 {
                             server.reply(token, FsResponse::Ok);
                         } else {
@@ -301,6 +332,35 @@ fn run_daemon(
                             server.reply(token, FsResponse::ReadOk { len: resp.len });
                         } else {
                             server.reply(token, FsResponse::Error { code: resp.status });
+                        }
+                    }
+                    PendingOp::Stat(token) => {
+                        if resp_data.len()
+                            >= std::mem::size_of::<copyrpc_fs::message::RemoteStatResponse>()
+                        {
+                            let stat_resp: copyrpc_fs::message::RemoteStatResponse = unsafe {
+                                std::ptr::read_unaligned(resp_data.as_ptr()
+                                    as *const copyrpc_fs::message::RemoteStatResponse)
+                            };
+                            if stat_resp.status == 0 {
+                                server.reply(
+                                    token,
+                                    FsResponse::StatOk {
+                                        header: stat_resp.header,
+                                    },
+                                );
+                            } else if stat_resp.status == -2 {
+                                server.reply(token, FsResponse::NotFound);
+                            } else {
+                                server.reply(
+                                    token,
+                                    FsResponse::Error {
+                                        code: stat_resp.status,
+                                    },
+                                );
+                            }
+                        } else {
+                            server.reply(token, FsResponse::Error { code: -1 });
                         }
                     }
                 }
@@ -422,6 +482,64 @@ fn run_daemon(
                             len: actual as u32,
                         }
                     }
+                    RemoteRequest::Create(create_req) => {
+                        let header = copyrpc_fs::InodeHeader {
+                            mode: create_req.mode,
+                            chunk_size: create_req.chunk_size,
+                            ..Default::default()
+                        };
+                        let header_bytes = unsafe {
+                            std::slice::from_raw_parts(
+                                &header as *const copyrpc_fs::InodeHeader as *const u8,
+                                std::mem::size_of::<copyrpc_fs::InodeHeader>(),
+                            )
+                        };
+                        store.write(create_req.path_hash, 0, 0, header_bytes);
+                        RemoteResponse { status: 0, len: 0 }
+                    }
+                    RemoteRequest::Stat(stat_req) => {
+                        let mut header_buf =
+                            vec![0u8; std::mem::size_of::<copyrpc_fs::InodeHeader>()];
+                        let read = store.read(stat_req.path_hash, 0, 0, &mut header_buf);
+                        if read >= std::mem::size_of::<copyrpc_fs::InodeHeader>() {
+                            let header: copyrpc_fs::InodeHeader = unsafe {
+                                std::ptr::read_unaligned(
+                                    header_buf.as_ptr() as *const copyrpc_fs::InodeHeader
+                                )
+                            };
+                            let stat_resp =
+                                copyrpc_fs::message::RemoteStatResponse { status: 0, header };
+                            let resp_bytes = unsafe {
+                                std::slice::from_raw_parts(
+                                    &stat_resp as *const copyrpc_fs::message::RemoteStatResponse
+                                        as *const u8,
+                                    std::mem::size_of::<copyrpc_fs::message::RemoteStatResponse>(),
+                                )
+                            };
+                            req.reply(resp_bytes)
+                                .unwrap_or_else(|e| eprintln!("reply error: {:?}", e));
+                            continue;
+                        } else {
+                            let stat_resp = copyrpc_fs::message::RemoteStatResponse {
+                                status: -2, // NotFound
+                                header: copyrpc_fs::InodeHeader::default(),
+                            };
+                            let resp_bytes = unsafe {
+                                std::slice::from_raw_parts(
+                                    &stat_resp as *const copyrpc_fs::message::RemoteStatResponse
+                                        as *const u8,
+                                    std::mem::size_of::<copyrpc_fs::message::RemoteStatResponse>(),
+                                )
+                            };
+                            req.reply(resp_bytes)
+                                .unwrap_or_else(|e| eprintln!("reply error: {:?}", e));
+                            continue;
+                        }
+                    }
+                    RemoteRequest::Unlink(unlink_req) => {
+                        store.remove(unlink_req.path_hash, 0);
+                        RemoteResponse { status: 0, len: 0 }
+                    }
                 };
 
                 let resp_bytes = unsafe {
@@ -437,7 +555,9 @@ fn run_daemon(
             // Process deferred responses collected during RDMA waits
             for (pending_op, resp) in deferred_responses.drain(..) {
                 match pending_op {
-                    PendingOp::Write(token) => {
+                    PendingOp::Write(token)
+                    | PendingOp::Create(token)
+                    | PendingOp::Unlink(token) => {
                         if resp.status == 0 {
                             server.reply(token, FsResponse::Ok);
                         } else {
@@ -450,6 +570,10 @@ fn run_daemon(
                         } else {
                             server.reply(token, FsResponse::Error { code: resp.status });
                         }
+                    }
+                    PendingOp::Stat(token) => {
+                        // Stat during RDMA wait — no header available from deferred
+                        server.reply(token, FsResponse::Error { code: resp.status });
                     }
                 }
             }
@@ -546,19 +670,9 @@ fn run_daemon(
                             ) {
                                 Ok(_) => {}
                                 Err(e) => {
-                                    let t = match e {
-                                        copyrpc::error::CallError::RingFull(
-                                            PendingOp::Write(t) | PendingOp::Read(t),
-                                        )
-                                        | copyrpc::error::CallError::InsufficientCredit(
-                                            PendingOp::Write(t) | PendingOp::Read(t),
-                                        ) => t,
-                                        copyrpc::error::CallError::Other(e) => {
-                                            eprintln!("copyrpc call error: {:?}", e);
-                                            continue;
-                                        }
-                                    };
-                                    server.reply(t, FsResponse::Error { code: -11 });
+                                    if let Some(t) = extract_token_from_call_error(e) {
+                                        server.reply(t, FsResponse::Error { code: -11 });
+                                    }
                                 }
                             }
                         } else {
@@ -622,19 +736,9 @@ fn run_daemon(
                             ) {
                                 Ok(_) => {}
                                 Err(e) => {
-                                    let t = match e {
-                                        copyrpc::error::CallError::RingFull(
-                                            PendingOp::Write(t) | PendingOp::Read(t),
-                                        )
-                                        | copyrpc::error::CallError::InsufficientCredit(
-                                            PendingOp::Write(t) | PendingOp::Read(t),
-                                        ) => t,
-                                        copyrpc::error::CallError::Other(e) => {
-                                            eprintln!("copyrpc call error: {:?}", e);
-                                            continue;
-                                        }
-                                    };
-                                    server.reply(t, FsResponse::Error { code: -11 });
+                                    if let Some(t) = extract_token_from_call_error(e) {
+                                        server.reply(t, FsResponse::Error { code: -11 });
+                                    }
                                 }
                             }
                         } else {
@@ -660,7 +764,33 @@ fn run_daemon(
                             ipc_req.reply(FsResponse::NotFound);
                         }
                     } else {
-                        ipc_req.reply(FsResponse::Error { code: -38 }); // ENOSYS
+                        let (target_node, _) = routing::global_to_local(target, daemons_per_node);
+                        if let Some(&ep_idx) = remote_rank_to_ep_idx.get(&target_node) {
+                            let token = ipc_req.into_token();
+                            let remote_req = RemoteRequest::Stat(RemoteStatReq { path_hash });
+                            let req_bytes = unsafe {
+                                std::slice::from_raw_parts(
+                                    &remote_req as *const RemoteRequest as *const u8,
+                                    std::mem::size_of::<RemoteRequest>(),
+                                )
+                            };
+                            let resp_size =
+                                std::mem::size_of::<copyrpc_fs::message::RemoteStatResponse>();
+                            match copyrpc_endpoints[ep_idx].call(
+                                req_bytes,
+                                PendingOp::Stat(token),
+                                resp_size as u64,
+                            ) {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    if let Some(t) = extract_token_from_call_error(e) {
+                                        server.reply(t, FsResponse::Error { code: -11 });
+                                    }
+                                }
+                            }
+                        } else {
+                            ipc_req.reply(FsResponse::Error { code: -2 });
+                        }
                     }
                 }
 
@@ -686,7 +816,35 @@ fn run_daemon(
                         store.write(path_hash, 0, 0, header_bytes);
                         ipc_req.reply(FsResponse::Ok);
                     } else {
-                        ipc_req.reply(FsResponse::Error { code: -38 });
+                        let (target_node, _) = routing::global_to_local(target, daemons_per_node);
+                        if let Some(&ep_idx) = remote_rank_to_ep_idx.get(&target_node) {
+                            let token = ipc_req.into_token();
+                            let remote_req = RemoteRequest::Create(RemoteCreateReq {
+                                path_hash,
+                                mode,
+                                chunk_size: cs,
+                            });
+                            let req_bytes = unsafe {
+                                std::slice::from_raw_parts(
+                                    &remote_req as *const RemoteRequest as *const u8,
+                                    std::mem::size_of::<RemoteRequest>(),
+                                )
+                            };
+                            match copyrpc_endpoints[ep_idx].call(
+                                req_bytes,
+                                PendingOp::Create(token),
+                                64,
+                            ) {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    if let Some(t) = extract_token_from_call_error(e) {
+                                        server.reply(t, FsResponse::Error { code: -11 });
+                                    }
+                                }
+                            }
+                        } else {
+                            ipc_req.reply(FsResponse::Error { code: -2 });
+                        }
                     }
                 }
 
@@ -696,7 +854,31 @@ fn run_daemon(
                         store.remove(path_hash, 0);
                         ipc_req.reply(FsResponse::Ok);
                     } else {
-                        ipc_req.reply(FsResponse::Error { code: -38 });
+                        let (target_node, _) = routing::global_to_local(target, daemons_per_node);
+                        if let Some(&ep_idx) = remote_rank_to_ep_idx.get(&target_node) {
+                            let token = ipc_req.into_token();
+                            let remote_req = RemoteRequest::Unlink(RemoteUnlinkReq { path_hash });
+                            let req_bytes = unsafe {
+                                std::slice::from_raw_parts(
+                                    &remote_req as *const RemoteRequest as *const u8,
+                                    std::mem::size_of::<RemoteRequest>(),
+                                )
+                            };
+                            match copyrpc_endpoints[ep_idx].call(
+                                req_bytes,
+                                PendingOp::Unlink(token),
+                                64,
+                            ) {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    if let Some(t) = extract_token_from_call_error(e) {
+                                        server.reply(t, FsResponse::Error { code: -11 });
+                                    }
+                                }
+                            }
+                        } else {
+                            ipc_req.reply(FsResponse::Error { code: -2 });
+                        }
                     }
                 }
 
@@ -718,7 +900,7 @@ fn run_daemon(
                         store.write(path_hash, 0, 0, header_bytes);
                         ipc_req.reply(FsResponse::Ok);
                     } else {
-                        ipc_req.reply(FsResponse::Error { code: -38 });
+                        ipc_req.reply(FsResponse::Error { code: -38 }); // ENOSYS
                     }
                 }
 

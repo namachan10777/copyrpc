@@ -23,8 +23,8 @@ pub mod store;
 
 pub use client::FsClient;
 pub use message::{
-    FsRequest, FsResponse, InodeHeader, RemoteReadReq, RemoteRequest, RemoteResponse,
-    RemoteWriteReq,
+    FsRequest, FsResponse, InodeHeader, RemoteCreateReq, RemoteReadReq, RemoteRequest,
+    RemoteResponse, RemoteStatReq, RemoteUnlinkReq, RemoteWriteReq,
 };
 pub use routing::{global_to_local, koyama_hash, route};
 pub use store::PmemStore;

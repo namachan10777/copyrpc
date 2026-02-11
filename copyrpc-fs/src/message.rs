@@ -114,12 +114,38 @@ pub struct RemoteReadReq {
     pub client_addr: u64,
 }
 
-/// Wrapper enum to distinguish Write vs Read in copyrpc payloads.
+/// copyrpc payload: Remote CREATE request.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct RemoteCreateReq {
+    pub path_hash: u64,
+    pub mode: u32,
+    pub chunk_size: u32,
+}
+
+/// copyrpc payload: Remote STAT request.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct RemoteStatReq {
+    pub path_hash: u64,
+}
+
+/// copyrpc payload: Remote UNLINK request.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct RemoteUnlinkReq {
+    pub path_hash: u64,
+}
+
+/// Wrapper enum for all copyrpc request types.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub enum RemoteRequest {
     Write(RemoteWriteReq),
     Read(RemoteReadReq),
+    Create(RemoteCreateReq),
+    Stat(RemoteStatReq),
+    Unlink(RemoteUnlinkReq),
 }
 
 /// copyrpc response (Remote Daemon → Daemon).
@@ -128,4 +154,12 @@ pub enum RemoteRequest {
 pub struct RemoteResponse {
     pub status: i32,
     pub len: u32,
+}
+
+/// copyrpc stat response (includes inode header).
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct RemoteStatResponse {
+    pub status: i32,
+    pub header: InodeHeader,
 }
