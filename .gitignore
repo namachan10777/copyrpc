@@ -37,6 +37,7 @@ bench_results/
 mempc_bench/result/
 mempc_bench/dist/
 rpc_bench/result/
+benchkv/result/
 
 # Python
 .venv/
@@ -58,4 +59,5 @@ core.*
 
 # Job logs
 rpc_bench/logs/
+benchkv/logs/
 jobs/
