@@ -171,7 +171,7 @@ impl SendCqeBuffer {
 /// Internal struct for received messages stored in recv_stack.
 struct RecvMessage<U> {
     /// Endpoint that received this message.
-    endpoint: Rc<RefCell<EndpointInner<U>>>,
+    endpoint: Rc<UnsafeCell<EndpointInner<U>>>,
     /// QPN of the endpoint.
     qpn: u32,
     /// Call ID from the message header.
@@ -206,13 +206,13 @@ pub struct Context<U> {
     /// CQE buffer for send completions.
     send_cqe_buffer: Rc<SendCqeBuffer>,
     /// Registered endpoints by QPN.
-    endpoints: RefCell<FastMap<Rc<RefCell<EndpointInner<U>>>>>,
+    endpoints: UnsafeCell<FastMap<Rc<UnsafeCell<EndpointInner<U>>>>>,
     /// Port number (for connection establishment).
     port: u8,
     /// Local LID.
     lid: u16,
     /// Received messages stack.
-    recv_stack: RefCell<Vec<RecvMessage<U>>>,
+    recv_stack: UnsafeCell<Vec<RecvMessage<U>>>,
     /// Marker for U.
     _marker: PhantomData<U>,
 }
@@ -311,10 +311,10 @@ impl<U> ContextBuilder<U> {
             send_cq,
             recv_cq,
             send_cqe_buffer,
-            endpoints: RefCell::new(FastMap::new()),
+            endpoints: UnsafeCell::new(FastMap::new()),
             port: self.port,
             lid,
-            recv_stack: RefCell::new(Vec::new()),
+            recv_stack: UnsafeCell::new(Vec::new()),
             _marker: PhantomData,
         })
     }
@@ -348,9 +348,9 @@ impl<U> Context<U> {
             config,
         )?;
 
-        let qpn = inner.borrow().qpn();
+        let qpn = unsafe { &*inner.get() }.qpn();
 
-        self.endpoints.borrow_mut().insert(qpn, inner.clone());
+        unsafe { &mut *self.endpoints.get() }.insert(qpn, inner.clone());
 
         Ok(Endpoint {
             inner,
@@ -430,8 +430,8 @@ impl<U> Context<U> {
         }
 
         // 4. Flush all endpoints
-        for (_, ep) in self.endpoints.borrow().iter() {
-            let ep_ref = ep.borrow();
+        for (_, ep) in unsafe { &*self.endpoints.get() }.iter() {
+            let ep_ref = unsafe { &*ep.get() };
             let _ = ep_ref.flush();
         }
     }
@@ -441,8 +441,8 @@ impl<U> Context<U> {
     /// Call poll() first to populate the recv_stack.
     /// Returns `None` if no request is available.
     pub fn recv(&self) -> Option<RecvHandle<'_, U>> {
-        self.recv_stack.borrow_mut().pop().map(|msg| {
-            let data_ptr = msg.endpoint.borrow().recv_ring.as_ptr();
+        unsafe { &mut *self.recv_stack.get() }.pop().map(|msg| {
+            let data_ptr = unsafe { &*msg.endpoint.get() }.recv_ring.as_ptr();
             let data_ptr = unsafe { data_ptr.add(msg.data_offset) };
             RecvHandle {
                 _lifetime: PhantomData,
@@ -466,11 +466,11 @@ impl<U> Context<U> {
     fn process_cqe_static(
         cqe: Cqe,
         qpn: u32,
-        endpoints: &RefCell<FastMap<Rc<RefCell<EndpointInner<U>>>>>,
+        endpoints: &UnsafeCell<FastMap<Rc<UnsafeCell<EndpointInner<U>>>>>,
         on_response: &mut impl FnMut(U, &[u8]),
-        recv_stack: &RefCell<Vec<RecvMessage<U>>>,
+        recv_stack: &UnsafeCell<Vec<RecvMessage<U>>>,
     ) {
-        let endpoints = endpoints.borrow();
+        let endpoints = unsafe { &*endpoints.get() };
         let endpoint = match endpoints.get(qpn) {
             Some(ep) => ep,
             None => return,
@@ -481,7 +481,7 @@ impl<U> Context<U> {
 
         // Update recv_ring_producer
         {
-            let ep = endpoint.borrow();
+            let ep = unsafe { &*endpoint.get() };
             let new_producer = ep.recv_ring_producer.get() + delta;
             ep.recv_ring_producer.set(new_producer);
         }
@@ -489,7 +489,7 @@ impl<U> Context<U> {
         // Read flow_metadata at current position
         let (ring_credit_return, credit_grant, message_count);
         {
-            let ep = endpoint.borrow();
+            let ep = unsafe { &*endpoint.get() };
             let pos = ep.last_recv_pos.get();
             let recv_ring_mask = ep.recv_ring.len() as u64 - 1;
             let meta_offset = (pos & recv_ring_mask) as usize;
@@ -511,7 +511,7 @@ impl<U> Context<U> {
 
         if message_count == WRAP_MESSAGE_COUNT {
             // Wrap: skip to next ring cycle
-            let ep = endpoint.borrow();
+            let ep = unsafe { &*endpoint.get() };
             let pos = ep.last_recv_pos.get();
             let recv_ring_len = ep.recv_ring.len() as u64;
             let offset = pos & (recv_ring_len - 1);
@@ -523,7 +523,7 @@ impl<U> Context<U> {
 
         // Process exactly message_count messages
         for _ in 0..message_count {
-            let ep = endpoint.borrow();
+            let ep = unsafe { &*endpoint.get() };
             let pos = ep.last_recv_pos.get();
             let recv_ring_mask = ep.recv_ring.len() as u64 - 1;
             let header_offset = (pos & recv_ring_mask) as usize;
@@ -538,10 +538,8 @@ impl<U> Context<U> {
             if is_response(call_id) {
                 // Response - invoke callback
                 let original_call_id = from_response_id(call_id);
-                let user_data = ep
-                    .pending_calls
-                    .borrow_mut()
-                    .try_remove(original_call_id as usize);
+                let user_data =
+                    unsafe { &mut *ep.pending_calls.get() }.try_remove(original_call_id as usize);
 
                 if let Some(user_data) = user_data {
                     let data_offset = header_offset + HEADER_SIZE;
@@ -551,9 +549,8 @@ impl<U> Context<U> {
             } else {
                 // Request - piggyback is response_allowance_blocks
                 let response_allowance = piggyback as u64 * ALIGNMENT;
-                drop(ep);
 
-                recv_stack.borrow_mut().push(RecvMessage {
+                unsafe { &mut *recv_stack.get() }.push(RecvMessage {
                     endpoint: endpoint.clone(),
                     qpn,
                     call_id,
@@ -607,7 +604,7 @@ struct EndpointInner<U> {
     /// Counter for unsignaled WQEs (for periodic signaling).
     unsignaled_count: Cell<u32>,
     /// Pending calls waiting for responses. Slab index is used as call_id.
-    pending_calls: RefCell<Slab<U>>,
+    pending_calls: UnsafeCell<Slab<U>>,
     /// Flush start position (for WQE batching).
     flush_start_pos: Cell<u64>,
     /// Response reservation (R): credits issued minus responses written (bytes).
@@ -631,7 +628,7 @@ impl<U> EndpointInner<U> {
         recv_cq: &Rc<MonoCq<CopyrpcQp>>,
         send_cqe_buffer: &Rc<SendCqeBuffer>,
         config: &EndpointConfig,
-    ) -> io::Result<Rc<RefCell<Self>>> {
+    ) -> io::Result<Rc<UnsafeCell<Self>>> {
         // Allocate ring buffers
         let send_ring_size = config.send_ring_size.next_power_of_two();
         let recv_ring_size = config.recv_ring_size.next_power_of_two();
@@ -672,7 +669,7 @@ impl<U> EndpointInner<U> {
             .max_resp_reservation
             .min(config.send_ring_size as u64 / 4);
 
-        let inner = Rc::new(RefCell::new(Self {
+        let inner = Rc::new(UnsafeCell::new(Self {
             qp,
             send_ring,
             send_ring_mr,
@@ -685,7 +682,7 @@ impl<U> EndpointInner<U> {
             last_notified_recv_pos: Cell::new(0),
             remote_consumer_pos: Cell::new(0),
             unsignaled_count: Cell::new(0),
-            pending_calls: RefCell::new(Slab::new()),
+            pending_calls: UnsafeCell::new(Slab::new()),
             flush_start_pos: Cell::new(0),
             resp_reservation: Cell::new(0),
             max_resp_reservation,
@@ -967,8 +964,7 @@ impl<U> EndpointInner<U> {
         if self.batch_message_count.get() > 0 {
             self.fill_metadata();
             self.emit_raw()?;
-            self.flush_start_pos
-                .set(self.send_ring_producer.get());
+            self.flush_start_pos.set(self.send_ring_producer.get());
             self.prepare_next_batch();
         }
         self.emit_wrap()?;
@@ -993,19 +989,19 @@ pub struct LocalEndpointInfo {
 
 /// An RPC endpoint representing a connection to a remote peer.
 pub struct Endpoint<U> {
-    inner: Rc<RefCell<EndpointInner<U>>>,
+    inner: Rc<UnsafeCell<EndpointInner<U>>>,
     _marker: PhantomData<U>,
 }
 
 impl<U> Endpoint<U> {
     /// Get the QP number.
     pub fn qpn(&self) -> u32 {
-        self.inner.borrow().qpn()
+        unsafe { &*self.inner.get() }.qpn()
     }
 
     /// Get local endpoint info for connection establishment.
     pub fn local_info(&self, ctx_lid: u16, ctx_port: u8) -> (LocalEndpointInfo, u16, u8) {
-        let info = self.inner.borrow().local_info();
+        let info = unsafe { &*self.inner.get() }.local_info();
         (info, ctx_lid, ctx_port)
     }
 
@@ -1016,7 +1012,7 @@ impl<U> Endpoint<U> {
         local_psn: u32,
         port: u8,
     ) -> io::Result<()> {
-        let inner = self.inner.borrow();
+        let inner = unsafe { &*self.inner.get() };
 
         // Set remote ring info
         inner.remote_recv_ring.set(Some(RemoteRingInfo::new(
@@ -1076,7 +1072,7 @@ impl<U> Endpoint<U> {
         user_data: U,
         response_allowance: u64,
     ) -> std::result::Result<u32, error::CallError<U>> {
-        let inner = self.inner.borrow();
+        let inner = unsafe { &*self.inner.get() };
 
         let remote_ring = inner
             .remote_recv_ring
@@ -1120,7 +1116,7 @@ impl<U> Endpoint<U> {
         }
 
         // Allocate call ID from slab (index is the call_id)
-        let call_id = inner.pending_calls.borrow_mut().insert(user_data) as u32;
+        let call_id = unsafe { &mut *inner.pending_calls.get() }.insert(user_data) as u32;
 
         // Write message with response_allowance in piggyback field (as ALIGNMENT blocks)
         let send_offset = (producer & (inner.send_ring.len() as u64 - 1)) as usize;
@@ -1155,7 +1151,7 @@ impl<U> Endpoint<U> {
 /// Handle to a received RPC request.
 pub struct RecvHandle<'a, U> {
     _lifetime: PhantomData<&'a Context<U>>,
-    endpoint: Rc<RefCell<EndpointInner<U>>>,
+    endpoint: Rc<UnsafeCell<EndpointInner<U>>>,
     qpn: u32,
     call_id: u32,
     data_ptr: *const u8,
@@ -1188,7 +1184,7 @@ impl<U> RecvHandle<'_, U> {
     /// The credit-based invariant guarantees this will always have space
     /// (reply cannot fail with RingFull under normal operation).
     pub fn reply(&self, data: &[u8]) -> Result<()> {
-        let inner = self.endpoint.borrow();
+        let inner = unsafe { &*self.endpoint.get() };
 
         inner
             .remote_recv_ring
