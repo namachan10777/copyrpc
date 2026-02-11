@@ -23,27 +23,46 @@ pub struct PmemStore {
     chunk_table: HashMap<(u64, u32), ChunkLocation>,
     /// Next free offset for allocation (bump allocator).
     next_offset: usize,
-    /// Maximum bytes per chunk.
-    chunk_capacity: usize,
+    /// Per-file chunk capacity (path_hash → chunk_size).
+    file_chunk_size: HashMap<u64, usize>,
+    /// Maximum (default) chunk capacity.
+    max_chunk_capacity: usize,
 }
 
 impl PmemStore {
     /// Create a new PmemStore backed by the given pmem region.
     ///
-    /// `chunk_capacity` is the maximum size of each chunk in bytes.
-    pub fn new(region: Box<dyn PmemRegion + Send>, chunk_capacity: usize) -> Self {
+    /// `max_chunk_capacity` is the default/maximum chunk size in bytes.
+    pub fn new(region: Box<dyn PmemRegion + Send>, max_chunk_capacity: usize) -> Self {
         Self {
             region,
             chunk_table: HashMap::new(),
             next_offset: 0,
-            chunk_capacity,
+            file_chunk_size: HashMap::new(),
+            max_chunk_capacity,
         }
     }
 
-    /// Ensure a chunk exists, allocating if necessary.
-    /// Returns a mutable pointer to the chunk data at the given offset.
-    fn ensure_chunk(&mut self, path_hash: u64, chunk_idx: u32) -> &mut ChunkLocation {
-        let capacity = self.chunk_capacity;
+    /// Register a file's chunk size. Must be called before writing data chunks.
+    pub fn register_file(&mut self, path_hash: u64, chunk_size: usize) {
+        self.file_chunk_size.insert(path_hash, chunk_size);
+    }
+
+    /// Get the effective chunk capacity for a file.
+    fn effective_chunk_size(&self, path_hash: u64) -> usize {
+        self.file_chunk_size
+            .get(&path_hash)
+            .copied()
+            .unwrap_or(self.max_chunk_capacity)
+    }
+
+    /// Ensure a chunk exists, allocating `capacity` bytes if necessary.
+    fn ensure_chunk(
+        &mut self,
+        path_hash: u64,
+        chunk_idx: u32,
+        capacity: usize,
+    ) -> &mut ChunkLocation {
         let region_len = self.region.len();
         let next_offset = &mut self.next_offset;
 
@@ -62,10 +81,11 @@ impl PmemStore {
 
     /// Write data to a chunk at the given offset within the chunk.
     pub fn write(&mut self, path_hash: u64, chunk_idx: u32, offset: usize, data: &[u8]) {
+        let capacity = self.effective_chunk_size(path_hash);
         let end = offset + data.len();
-        assert!(end <= self.chunk_capacity, "write exceeds chunk capacity");
+        assert!(end <= capacity, "write exceeds chunk capacity");
 
-        let chunk = self.ensure_chunk(path_hash, chunk_idx);
+        let chunk = self.ensure_chunk(path_hash, chunk_idx, capacity);
         let chunk_offset = chunk.offset;
 
         if end > chunk.valid_len {
@@ -104,23 +124,63 @@ impl PmemStore {
 
     /// Remove a chunk. Returns true if it existed.
     pub fn remove(&mut self, path_hash: u64, chunk_idx: u32) -> bool {
+        if chunk_idx == 0 {
+            self.file_chunk_size.remove(&path_hash);
+        }
         self.chunk_table.remove(&(path_hash, chunk_idx)).is_some()
     }
 
-    /// Get a raw pointer and valid length for a chunk region.
-    /// Used for RDMA operations (register + DMA).
-    pub fn ptr_for_chunk(
+    /// Prepare a chunk region for zero-copy RDMA write.
+    ///
+    /// Ensures the chunk is allocated and returns a mutable pointer to the
+    /// destination at `offset` within the chunk, plus the remaining capacity.
+    /// After RDMA completes, call `commit_write()` to update valid_len and persist.
+    pub fn prepare_write(
+        &mut self,
+        path_hash: u64,
+        chunk_idx: u32,
+        offset: usize,
+    ) -> (*mut u8, usize) {
+        let capacity = self.effective_chunk_size(path_hash);
+        assert!(offset <= capacity);
+
+        let chunk = self.ensure_chunk(path_hash, chunk_idx, capacity);
+        let chunk_offset = chunk.offset;
+
+        let ptr = unsafe { self.region.as_ptr().add(chunk_offset + offset) };
+        (ptr, capacity - offset)
+    }
+
+    /// Commit a zero-copy write: update valid_len and persist the written region.
+    pub fn commit_write(&mut self, path_hash: u64, chunk_idx: u32, offset: usize, len: usize) {
+        let chunk = self
+            .chunk_table
+            .get_mut(&(path_hash, chunk_idx))
+            .expect("commit_write: chunk must exist");
+        let end = offset + len;
+        if end > chunk.valid_len {
+            chunk.valid_len = end;
+        }
+        let ptr = unsafe { self.region.as_ptr().add(chunk.offset + offset) };
+        unsafe {
+            pmem::persist(ptr, len);
+        }
+    }
+
+    /// Get a mutable pointer and available length for reading from a chunk.
+    /// Used for zero-copy RDMA WRITE from pmem to remote client.
+    pub fn ptr_for_chunk_read(
         &self,
         path_hash: u64,
         chunk_idx: u32,
         offset: usize,
-    ) -> Option<(*const u8, usize)> {
+    ) -> Option<(*mut u8, usize)> {
         let chunk = self.chunk_table.get(&(path_hash, chunk_idx))?;
         if offset >= chunk.valid_len {
-            return Some((std::ptr::null(), 0));
+            return Some((std::ptr::null_mut(), 0));
         }
         let available = chunk.valid_len - offset;
-        let ptr = unsafe { self.region.as_ptr().add(chunk.offset + offset) as *const u8 };
+        let ptr = unsafe { self.region.as_ptr().add(chunk.offset + offset) };
         Some((ptr, available))
     }
 

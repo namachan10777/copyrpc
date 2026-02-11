@@ -30,8 +30,8 @@ struct Cli {
     #[arg(long, default_value_t = 1)]
     daemons_per_node: usize,
 
-    /// Chunk size in bytes (default 1 MiB).
-    #[arg(long, default_value_t = 1 << 20)]
+    /// Maximum chunk size in bytes (default 4 MiB).
+    #[arg(long, default_value_t = 4 << 20)]
     chunk_size: usize,
 
     /// Pmem backing path (DevDax e.g. /dev/dax0.0, or regular file).
@@ -55,8 +55,8 @@ struct Cli {
     #[arg(long, default_value_t = 8)]
     queue_depth: u32,
 
-    /// IPC extra buffer size per client (for path + data transfer).
-    #[arg(long, default_value_t = 1 << 20)]
+    /// IPC extra buffer size per client (must be >= chunk_size + 4096).
+    #[arg(long, default_value_t = (4 << 20) + 4096)]
     extra_buffer_size: u32,
 
     /// RDMA device index.
@@ -198,7 +198,6 @@ fn run_daemon(
     my_rank: u32,
     total_daemons: usize,
     daemons_per_node: usize,
-    chunk_size: usize,
     max_clients: u32,
     mut server: ipc::Server<FsRequest, FsResponse>,
     mut store: PmemStore,
@@ -281,16 +280,15 @@ fn run_daemon(
         .map(|(i, ep)| (ep.qpn(), i))
         .collect();
 
-    // --- RDMA temporary buffer + MR for recv handler ---
-    let mut rdma_buf: Vec<u8> = vec![0u8; chunk_size];
-    let rdma_buf_mr = copyrpc_ctx.as_ref().map(|ctx| unsafe {
+    // --- Register pmem region as MR for zero-copy RDMA ---
+    let pmem_mr = copyrpc_ctx.as_ref().map(|ctx| unsafe {
         ctx.pd()
             .register(
-                rdma_buf.as_mut_ptr(),
-                rdma_buf.len(),
+                store.region_ptr(),
+                store.region_len(),
                 AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
             )
-            .expect("Failed to register RDMA buffer MR")
+            .expect("Failed to register pmem region MR")
     });
 
     // --- Client MR registration table ---
@@ -390,13 +388,19 @@ fn run_daemon(
 
                 let resp = match remote_req {
                     RemoteRequest::Write(write_req) => {
-                        // RDMA READ from client's shm → local rdma_buf → pmem store
-                        if let (Some(idx), Some(mr)) = (ep_idx, &rdma_buf_mr) {
+                        // Zero-copy: RDMA READ directly into pmem
+                        if let (Some(idx), Some(mr)) = (ep_idx, &pmem_mr) {
+                            let (dest_ptr, _cap) = store.prepare_write(
+                                write_req.path_hash,
+                                write_req.chunk_index,
+                                write_req.offset as usize,
+                            );
+
                             copyrpc_endpoints[idx]
                                 .post_rdma_read(
                                     write_req.client_addr,
                                     write_req.client_rkey,
-                                    rdma_buf.as_ptr() as u64,
+                                    dest_ptr as u64,
                                     mr.lkey(),
                                     write_req.len,
                                 )
@@ -420,12 +424,12 @@ fn run_daemon(
                                 });
                             }
 
-                            // Write to local pmem store
-                            store.write(
+                            // Commit: update valid_len + persist
+                            store.commit_write(
                                 write_req.path_hash,
                                 write_req.chunk_index,
                                 write_req.offset as usize,
-                                &rdma_buf[..write_req.len as usize],
+                                write_req.len as usize,
                             );
 
                             RemoteResponse {
@@ -437,22 +441,26 @@ fn run_daemon(
                         }
                     }
                     RemoteRequest::Read(read_req) => {
-                        // Read from local pmem store → rdma_buf → RDMA WRITE to client's shm
-                        let actual = store.read(
-                            read_req.path_hash,
-                            read_req.chunk_index,
-                            read_req.offset as usize,
-                            &mut rdma_buf[..read_req.len as usize],
-                        );
+                        // Zero-copy: RDMA WRITE directly from pmem to client's shm
+                        let (src_ptr, available) = store
+                            .ptr_for_chunk_read(
+                                read_req.path_hash,
+                                read_req.chunk_index,
+                                read_req.offset as usize,
+                            )
+                            .unwrap_or((std::ptr::null_mut(), 0));
+
+                        let actual = available.min(read_req.len as usize);
 
                         if actual > 0
-                            && let (Some(idx), Some(mr)) = (ep_idx, &rdma_buf_mr)
+                            && !src_ptr.is_null()
+                            && let (Some(idx), Some(mr)) = (ep_idx, &pmem_mr)
                         {
                             copyrpc_endpoints[idx]
                                 .post_rdma_write(
                                     read_req.client_addr,
                                     read_req.client_rkey,
-                                    rdma_buf.as_ptr() as u64,
+                                    src_ptr as u64,
                                     mr.lkey(),
                                     actual as u32,
                                 )
@@ -483,6 +491,7 @@ fn run_daemon(
                         }
                     }
                     RemoteRequest::Create(create_req) => {
+                        store.register_file(create_req.path_hash, create_req.chunk_size as usize);
                         let header = copyrpc_fs::InodeHeader {
                             mode: create_req.mode,
                             chunk_size: create_req.chunk_size,
@@ -802,6 +811,7 @@ fn run_daemon(
                 } => {
                     let target = routing::route(path_hash, 0, total_daemons);
                     if target == my_global_id {
+                        store.register_file(path_hash, cs as usize);
                         let header = copyrpc_fs::InodeHeader {
                             mode,
                             chunk_size: cs,
@@ -930,6 +940,21 @@ fn main() {
     let num_daemons = cli.daemons_per_node;
     let total_daemons = num_daemons * size as usize;
 
+    // Validate: extra_buffer_size must hold at least one full chunk + path area
+    let data_capacity = cli.extra_buffer_size as usize - copyrpc_fs::message::DATA_AREA_OFFSET;
+    if data_capacity < cli.chunk_size {
+        eprintln!(
+            "FATAL: extra_buffer_size ({}) - PATH_AREA ({}) = {} < chunk_size ({}). \
+             Increase --extra-buffer-size to at least {}.",
+            cli.extra_buffer_size,
+            copyrpc_fs::message::DATA_AREA_OFFSET,
+            data_capacity,
+            cli.chunk_size,
+            cli.chunk_size + copyrpc_fs::message::DATA_AREA_OFFSET,
+        );
+        std::process::exit(1);
+    }
+
     eprintln!(
         "rank {}/{}: {} daemons/node, {} total",
         rank, size, num_daemons, total_daemons
@@ -1021,7 +1046,6 @@ fn main() {
         let copyrpc_setup = copyrpc_setups[d].take();
         let stop = stop_flag.clone();
         let barrier = ready_barrier.clone();
-        let chunk_size = cli.chunk_size;
         let dpn = cli.daemons_per_node;
 
         let mc = cli.max_clients;
@@ -1031,7 +1055,6 @@ fn main() {
                 rank,
                 total_daemons,
                 dpn,
-                chunk_size,
                 mc,
                 server,
                 store,

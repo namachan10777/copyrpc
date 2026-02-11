@@ -91,6 +91,7 @@ fn run_test_daemon(
                             std::mem::size_of::<copyrpc_fs::InodeHeader>(),
                         )
                     };
+                    store.register_file(path_hash, cs as usize);
                     store.write(path_hash, 0, 0, header_bytes);
                     ipc_req.reply(FsResponse::Ok);
                 }
