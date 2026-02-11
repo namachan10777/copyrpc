@@ -9,6 +9,13 @@
 
 set -eux
 
+# Only run on job 0 (NQS/V runs the script on every allocated node)
+JOB_IDX=${PBS_JOBID%%:*}
+if [ "$JOB_IDX" != "0" ]; then
+  echo "Skipping on job $JOB_IDX (mpirun dispatched from job 0)"
+  exit 0
+fi
+
 export LOGDIR="$WORKDIR/benchkv/logs/$(echo $PBS_JOBID | sed -E 's/^[^:]*:([0-9]+)\.nqsv$/\1/')"
 mkdir -p "$LOGDIR"
 
