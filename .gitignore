@@ -35,6 +35,7 @@ inproc/bench_results/
 bench_results/
 *.parquet
 mempc_bench/result/
+mempc_bench/dist/
 rpc_bench/result/
 
 # Python
