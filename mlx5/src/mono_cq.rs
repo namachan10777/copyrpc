@@ -340,7 +340,7 @@ where
     }
 
     /// Find queue by QPN using direct indexing.
-    #[inline]
+    #[inline(always)]
     fn find_queue(&self, qpn: u32) -> Option<Rc<RefCell<Q>>> {
         self.queues
             .borrow()
@@ -356,7 +356,7 @@ where
     /// at the call site without storing it in the struct.
     ///
     /// Returns the number of completions processed.
-    #[inline]
+    #[inline(always)]
     pub fn poll(&self, mut callback: impl FnMut(Cqe, Q::Entry)) -> usize {
         // First CQE: no prefetch
         let Some(cqe) = self.try_next_cqe(false) else {
@@ -374,7 +374,7 @@ where
     }
 
     /// Dispatch a CQE to the appropriate queue and callback.
-    #[inline]
+    #[inline(always)]
     fn dispatch_cqe(&self, cqe: Cqe, callback: &mut impl FnMut(Cqe, Q::Entry)) {
         if let Some(queue) = self.find_queue(cqe.qp_num) {
             let qp = queue.borrow();
@@ -431,7 +431,7 @@ where
     /// This method handles both regular CQEs and compressed CQEs. When a compressed
     /// CQE is encountered, it expands the mini CQE array and returns each mini CQE
     /// as a full Cqe on subsequent calls.
-    #[inline]
+    #[inline(always)]
     fn try_next_cqe(&self, prefetch_next: bool) -> Option<Cqe> {
         let state = &self.state;
 
@@ -446,7 +446,7 @@ where
 
     /// Fast path for non-compression mode.
     /// Minimizes overhead for the common case where CQE compression is disabled.
-    #[inline]
+    #[inline(always)]
     fn try_next_cqe_simple(&self, prefetch_next: bool) -> Option<Cqe> {
         let state = &self.state;
         let ci = state.ci.get();

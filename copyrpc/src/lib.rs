@@ -616,8 +616,8 @@ struct EndpointInner<U> {
     max_resp_reservation: u64,
     /// Credit balance from peer (bytes of request we can send).
     peer_credit_balance: Cell<u64>,
-    /// Current batch metadata position (virtual), None if no batch open.
-    meta_pos: Cell<Option<u64>>,
+    /// Current batch metadata position (virtual). Always valid after connect().
+    meta_pos: Cell<u64>,
     /// Number of messages in the current batch.
     batch_message_count: Cell<u32>,
 }
@@ -690,7 +690,7 @@ impl<U> EndpointInner<U> {
             resp_reservation: Cell::new(0),
             max_resp_reservation,
             peer_credit_balance: Cell::new(0),
-            meta_pos: Cell::new(None),
+            meta_pos: Cell::new(0),
             batch_message_count: Cell::new(0),
         }));
 
@@ -723,13 +723,10 @@ impl<U> EndpointInner<U> {
     /// stay within a single ring cycle.
     ///
     /// Returns Ok(true) if WQE was emitted, Ok(false) if nothing to emit.
+    /// Low-level: emit WQE from flush_start_pos to send_ring_producer.
+    /// Does NOT fill metadata or prepare next batch.
     #[inline(always)]
-    fn emit_wqe(&self) -> Result<bool> {
-        // Finalize batch metadata if open
-        if self.meta_pos.get().is_some() {
-            self.fill_metadata();
-        }
-
+    fn emit_raw(&self) -> Result<bool> {
         let remote_ring = self
             .remote_recv_ring
             .get()
@@ -826,6 +823,19 @@ impl<U> EndpointInner<U> {
         Ok(true)
     }
 
+    /// Emit current message batch: fill metadata, emit WQE, prepare next batch.
+    /// Returns Ok(false) if no messages to emit.
+    #[inline(always)]
+    fn emit_wqe(&self) -> Result<bool> {
+        if self.batch_message_count.get() == 0 {
+            return Ok(false);
+        }
+        self.fill_metadata();
+        self.emit_raw()?;
+        self.prepare_next_batch();
+        Ok(true)
+    }
+
     /// Emit WQE and ring doorbell.
     #[inline(always)]
     fn flush(&self) -> Result<()> {
@@ -834,37 +844,21 @@ impl<U> EndpointInner<U> {
         Ok(())
     }
 
-    /// Ensure a batch metadata placeholder exists at the current position.
-    /// If no batch is open, writes a 32B placeholder and advances producer.
-    fn ensure_metadata(&self) {
-        if self.meta_pos.get().is_some() {
-            return;
-        }
-
+    /// Prepare the next batch: reserve metadata space and reset batch state.
+    /// Called after emit_wqe/emit_wrap and during connect().
+    #[inline(always)]
+    fn prepare_next_batch(&self) {
         let producer = self.send_ring_producer.get();
-        let ring_size = self.send_ring.len() as u64;
-        let offset = (producer & (ring_size - 1)) as usize;
-
-        // Write placeholder flow_metadata (zeros)
-        unsafe {
-            let buf_ptr = self.send_ring.as_ptr().add(offset) as *mut u8;
-            std::ptr::write_bytes(buf_ptr, 0, FLOW_METADATA_SIZE);
-        }
-
-        self.meta_pos.set(Some(producer));
+        self.meta_pos.set(producer);
         self.batch_message_count.set(0);
         self.send_ring_producer
             .set(producer + FLOW_METADATA_SIZE as u64);
     }
 
     /// Fill the current batch's flow_metadata with final values.
-    /// Called before emit_wqe to finalize the batch header.
+    #[inline(always)]
     fn fill_metadata(&self) {
-        let meta_pos = match self.meta_pos.get() {
-            Some(pos) => pos,
-            None => return,
-        };
-
+        let meta_pos = self.meta_pos.get();
         let ring_size = self.send_ring.len() as u64;
         let meta_offset = (meta_pos & (ring_size - 1)) as usize;
 
@@ -881,19 +875,19 @@ impl<U> EndpointInner<U> {
             let buf_ptr = self.send_ring.as_ptr().add(meta_offset) as *mut u8;
             encode_flow_metadata(buf_ptr, ring_credit_return, credit_grant, message_count);
         }
-
-        self.meta_pos.set(None);
-        self.batch_message_count.set(0);
     }
 
-    /// Emit a wrap flow_metadata at the current position and advance producer
-    /// past the ring boundary. Must be called when meta_pos is None.
+    /// Emit a wrap flow_metadata and advance producer past the ring boundary.
+    /// Reclaims the pre-placed metadata placeholder, writes wrap metadata there,
+    /// then prepares the next batch at the start of the new ring cycle.
+    #[inline(always)]
     fn emit_wrap(&self) -> Result<()> {
-        debug_assert!(self.meta_pos.get().is_none());
+        // Reclaim the pre-placed metadata placeholder
+        let meta_pos = self.meta_pos.get();
+        self.send_ring_producer.set(meta_pos);
 
-        let producer = self.send_ring_producer.get();
         let ring_size = self.send_ring.len() as u64;
-        let offset = (producer & (ring_size - 1)) as usize;
+        let offset = (meta_pos & (ring_size - 1)) as usize;
         let remaining = ring_size as usize - offset;
 
         debug_assert!(remaining >= FLOW_METADATA_SIZE);
@@ -914,14 +908,16 @@ impl<U> EndpointInner<U> {
             );
         }
 
-        self.send_ring_producer.set(producer + remaining as u64);
-        self.emit_wqe()?;
+        self.send_ring_producer.set(meta_pos + remaining as u64);
+        self.emit_raw()?;
+        self.prepare_next_batch();
 
         Ok(())
     }
 
     /// Compute the credit grant for the current batch.
     /// Returns bytes of credit to grant to the peer.
+    #[inline(always)]
     fn compute_credit_grant(&self) -> u64 {
         let remote_ring = match self.remote_recv_ring.get() {
             Some(r) => r,
@@ -948,22 +944,32 @@ impl<U> EndpointInner<U> {
 
     /// Handle wrap-around if the next write of `total_size` bytes doesn't fit
     /// in the current ring cycle. Closes the current batch if open, emits wrap.
+    ///
+    /// The check is based on the entire batch span from `meta_pos` (where the
+    /// pre-placed metadata lives) to `producer + total_size`. This ensures the
+    /// batch (metadata + messages) stays contiguous within one ring cycle.
+    #[inline(always)]
     fn handle_wrap_if_needed(&self, total_size: u64) -> Result<bool> {
         let producer = self.send_ring_producer.get();
         let ring_size = self.send_ring.len() as u64;
-        let offset = (producer & (ring_size - 1)) as usize;
+        let meta_offset = self.meta_pos.get() & (ring_size - 1);
+        let batch_span = (producer - self.meta_pos.get()) + total_size;
 
-        // Use strict `<` to force a wrap when the write would exactly reach the
+        // Use strict `<` to force a wrap when the batch would exactly reach the
         // ring boundary. Otherwise the next write in the same batch would start at
         // offset 0, causing the batch SGE to span the ring boundary.
-        if offset as u64 + total_size < ring_size {
+        if meta_offset + batch_span < ring_size {
             return Ok(false);
         }
 
-        // Close current batch if open
-        if self.meta_pos.get().is_some() {
+        // Close current batch if it has messages, then prepare_next_batch
+        // so that emit_wrap reclaims the NEWLY placed metadata (not the old one).
+        if self.batch_message_count.get() > 0 {
             self.fill_metadata();
-            self.emit_wqe()?;
+            self.emit_raw()?;
+            self.flush_start_pos
+                .set(self.send_ring_producer.get());
+            self.prepare_next_batch();
         }
         self.emit_wrap()?;
         Ok(true)
@@ -1048,6 +1054,9 @@ impl<U> Endpoint<U> {
             access_flags,
         )?;
 
+        // Prepare the first batch metadata placeholder
+        inner.prepare_next_batch();
+
         Ok(())
     }
 
@@ -1090,19 +1099,10 @@ impl<U> Endpoint<U> {
         // Calculate message size
         let msg_size = padded_message_size(data.len() as u32);
 
-        // Handle wrap-around: check if metadata + message fits in current ring cycle
-        let needs_meta = inner.meta_pos.get().is_none();
-        let total_size = if needs_meta {
-            FLOW_METADATA_SIZE as u64 + msg_size
-        } else {
-            msg_size
-        };
+        // Handle wrap-around: metadata is already pre-placed by prepare_next_batch
         inner
-            .handle_wrap_if_needed(total_size)
+            .handle_wrap_if_needed(msg_size)
             .map_err(error::CallError::Other)?;
-
-        // Ensure batch metadata exists
-        inner.ensure_metadata();
 
         // Check available space with credit invariant:
         // (producer - consumer) + 2*R ≤ C  →  msg_size ≤ available - 2*R
@@ -1198,17 +1198,8 @@ impl<U> RecvHandle<'_, U> {
         // Calculate message size
         let msg_size = padded_message_size(data.len() as u32);
 
-        // Handle wrap-around
-        let needs_meta = inner.meta_pos.get().is_none();
-        let total_size = if needs_meta {
-            FLOW_METADATA_SIZE as u64 + msg_size
-        } else {
-            msg_size
-        };
-        inner.handle_wrap_if_needed(total_size)?;
-
-        // Ensure batch metadata exists
-        inner.ensure_metadata();
+        // Handle wrap-around: metadata is already pre-placed by prepare_next_batch
+        inner.handle_wrap_if_needed(msg_size)?;
 
         // Deduct response reservation (R_i from the original request)
         let resp_res = inner.resp_reservation.get();
