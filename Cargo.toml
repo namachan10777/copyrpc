@@ -1,5 +1,5 @@
 [workspace]
-members = ["mlx5", "mlx5_sys", "ibverbs_sys", "copyrpc", "fastmap", "erpc", "scalerpc", "inproc", "ipc", "mempc", "mempc_bench", "rpc_bench", "benchkv", "ucx_sys", "pmem"]
+members = ["mlx5", "mlx5_sys", "ibverbs_sys", "copyrpc", "fastmap", "erpc", "scalerpc", "inproc", "ipc", "mempc", "mempc_bench", "rpc_bench", "benchkv", "ucx_sys", "pmem", "copyrpc-fs"]
 resolver = "3"
 
 [workspace.package]

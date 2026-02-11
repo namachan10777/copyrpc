@@ -40,6 +40,11 @@ use std::rc::Rc;
 
 use slab::Slab;
 
+/// Sentinel QPN value used to identify raw RDMA (READ/WRITE) completions
+/// in the SQ callback. Any SrqEntry with this QPN is treated as a raw RDMA
+/// completion rather than a normal send completion.
+const RAW_RDMA_SENTINEL_QPN: u32 = u32::MAX;
+
 use mlx5::cq::{CqConfig, Cqe};
 use mlx5::device::Context as Mlx5Context;
 use mlx5::emit_wqe;
@@ -324,6 +329,11 @@ impl<U> Context<U> {
     /// Create a new context builder.
     pub fn builder() -> ContextBuilder<U> {
         ContextBuilder::new()
+    }
+
+    /// Get a reference to the protection domain.
+    pub fn pd(&self) -> &Pd {
+        &self.pd
     }
 
     /// Get the local LID.
@@ -617,6 +627,10 @@ struct EndpointInner<U> {
     meta_pos: Cell<u64>,
     /// Number of messages in the current batch.
     batch_message_count: Cell<u32>,
+    /// Number of raw RDMA READ/WRITE operations posted (monotonically increasing).
+    raw_rdma_posted: Cell<u32>,
+    /// Number of raw RDMA completions received (shared with sq_callback via Rc<Cell>).
+    raw_rdma_done: Rc<Cell<u32>>,
 }
 
 impl<U> EndpointInner<U> {
@@ -643,6 +657,10 @@ impl<U> EndpointInner<U> {
         let recv_ring_mr =
             unsafe { pd.register(recv_ring.as_mut_ptr(), recv_ring.len(), access_flags)? };
 
+        // Create per-endpoint raw RDMA completion counter
+        let raw_rdma_done = Rc::new(Cell::new(0u32));
+        let raw_rdma_done_clone = raw_rdma_done.clone();
+
         // Create QP with SRQ using MonoCq for recv
         let send_cqe_buffer_clone = send_cqe_buffer.clone();
         let sq_callback: SqCqCallback = Box::new(move |cqe, entry| {
@@ -654,6 +672,11 @@ impl<U> EndpointInner<U> {
                     "[send_cq ERROR] qpn={}, opcode={:?}, syndrome={}",
                     entry.qpn, cqe.opcode, cqe.syndrome
                 );
+                return;
+            }
+            // Detect raw RDMA (READ/WRITE) completions by sentinel QPN
+            if entry.qpn == RAW_RDMA_SENTINEL_QPN {
+                raw_rdma_done_clone.set(raw_rdma_done_clone.get() + 1);
                 return;
             }
             send_cqe_buffer_clone.push(cqe, entry);
@@ -689,6 +712,8 @@ impl<U> EndpointInner<U> {
             peer_credit_balance: Cell::new(0),
             meta_pos: Cell::new(0),
             batch_message_count: Cell::new(0),
+            raw_rdma_posted: Cell::new(0),
+            raw_rdma_done,
         }));
 
         // SRQ recv buffers are pre-posted in Context::build() and replenished in poll()
@@ -1006,11 +1031,29 @@ impl<U> Endpoint<U> {
     }
 
     /// Connect to a remote endpoint.
+    ///
+    /// If `enable_raw_rdma` is true, the QP is configured to support
+    /// RDMA READ/WRITE operations (sets max_rd_atomic=16, max_dest_rd_atomic=16,
+    /// and adds REMOTE_READ access flag). Both sides must use the same setting.
     pub fn connect(
         &mut self,
         remote: &RemoteEndpointInfo,
         local_psn: u32,
         port: u8,
+    ) -> io::Result<()> {
+        self.connect_ex(remote, local_psn, port, false)
+    }
+
+    /// Connect to a remote endpoint with raw RDMA READ/WRITE support.
+    ///
+    /// When `enable_raw_rdma` is true, the QP is configured with
+    /// max_rd_atomic=16, max_dest_rd_atomic=16, and REMOTE_READ access.
+    pub fn connect_ex(
+        &mut self,
+        remote: &RemoteEndpointInfo,
+        local_psn: u32,
+        port: u8,
+        enable_raw_rdma: bool,
     ) -> io::Result<()> {
         let inner = unsafe { &*self.inner.get() };
 
@@ -1037,16 +1080,22 @@ impl<U> Endpoint<U> {
             local_identifier: remote.local_identifier,
         };
 
-        // Use standard access flags for RDMA WRITE only (no READ needed)
-        let access_flags = mlx5_sys::ibv_access_flags_IBV_ACCESS_LOCAL_WRITE
+        let mut access_flags = mlx5_sys::ibv_access_flags_IBV_ACCESS_LOCAL_WRITE
             | mlx5_sys::ibv_access_flags_IBV_ACCESS_REMOTE_WRITE;
+
+        let (max_rd_atomic, max_dest_rd_atomic) = if enable_raw_rdma {
+            access_flags |= mlx5_sys::ibv_access_flags_IBV_ACCESS_REMOTE_READ;
+            (16, 16)
+        } else {
+            (0, 0)
+        };
 
         inner.qp.borrow_mut().connect(
             &remote_qp_info,
             port,
             local_psn,
-            0, // max_rd_atomic
-            0, // max_dest_rd_atomic
+            max_rd_atomic,
+            max_dest_rd_atomic,
             access_flags,
         )?;
 
@@ -1054,6 +1103,91 @@ impl<U> Endpoint<U> {
         inner.prepare_next_batch();
 
         Ok(())
+    }
+
+    /// Post an RDMA READ operation.
+    ///
+    /// Reads `len` bytes from remote memory at `remote_addr`/`remote_rkey`
+    /// into local memory at `local_addr`/`local_lkey`.
+    /// The operation is always signaled. Check completion with `raw_rdma_pending()`.
+    ///
+    /// Requires `connect_ex(..., enable_raw_rdma=true)`.
+    pub fn post_rdma_read(
+        &self,
+        remote_addr: u64,
+        remote_rkey: u32,
+        local_addr: u64,
+        local_lkey: u32,
+        len: u32,
+    ) -> io::Result<()> {
+        let inner = unsafe { &*self.inner.get() };
+        inner.raw_rdma_posted.set(inner.raw_rdma_posted.get() + 1);
+
+        {
+            let qp = inner.qp.borrow();
+            let ctx = qp.emit_ctx()?;
+            emit_wqe!(
+                &ctx,
+                read {
+                    flags: WqeFlags::empty(),
+                    remote_addr: remote_addr,
+                    rkey: remote_rkey,
+                    sge: { addr: local_addr, len: len, lkey: local_lkey },
+                    signaled: SrqEntry { qpn: RAW_RDMA_SENTINEL_QPN },
+                }
+            )?;
+            qp.ring_sq_doorbell_bf();
+        }
+
+        Ok(())
+    }
+
+    /// Post an RDMA WRITE operation.
+    ///
+    /// Writes `len` bytes from local memory at `local_addr`/`local_lkey`
+    /// to remote memory at `remote_addr`/`remote_rkey`.
+    /// The operation is always signaled. Check completion with `raw_rdma_pending()`.
+    ///
+    /// Requires `connect_ex(..., enable_raw_rdma=true)`.
+    pub fn post_rdma_write(
+        &self,
+        remote_addr: u64,
+        remote_rkey: u32,
+        local_addr: u64,
+        local_lkey: u32,
+        len: u32,
+    ) -> io::Result<()> {
+        let inner = unsafe { &*self.inner.get() };
+        inner.raw_rdma_posted.set(inner.raw_rdma_posted.get() + 1);
+
+        {
+            let qp = inner.qp.borrow();
+            let ctx = qp.emit_ctx()?;
+            emit_wqe!(
+                &ctx,
+                write {
+                    flags: WqeFlags::empty(),
+                    remote_addr: remote_addr,
+                    rkey: remote_rkey,
+                    sge: { addr: local_addr, len: len, lkey: local_lkey },
+                    signaled: SrqEntry { qpn: RAW_RDMA_SENTINEL_QPN },
+                }
+            )?;
+            qp.ring_sq_doorbell_bf();
+        }
+
+        Ok(())
+    }
+
+    /// Returns the number of outstanding raw RDMA READ/WRITE operations.
+    ///
+    /// Call `Context::poll()` to process completions and update this counter.
+    pub fn raw_rdma_pending(&self) -> u32 {
+        let inner = unsafe { &*self.inner.get() };
+        inner
+            .raw_rdma_posted
+            .get()
+            .wrapping_sub(inner.raw_rdma_done.get())
     }
 
     /// Send an RPC call (async).
