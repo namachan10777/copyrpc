@@ -96,7 +96,7 @@ PVFSやLustreに代表される設計は，大規模チェックポイントの�
 このギャップは，機械学習やデータ解析ワークロードに見られる小粒度I/Oやメタデータ集中アクセスで特に顕在化し，共有ストレージ単体では安定した低遅延処理が難しくなる\cite{brinkmannAdHocFile2020}．
 
 こうした背景から，計算ノード上のNVMe SSDや永続メモリをジョブ実行中に束ねる中間層として，バーストバッファおよびad-hocファイルシステムが発展してきた\cite{brinkmannAdHocFile2020}．
-\begin{figure}[t]
+\begin{figure}[tp]
 	\centering
 	\includegraphics[width=0.95\linewidth]{handmade-figures/pfs-and-adhocfs.drawio.pdf}
 	\caption{並列ファイルシステムとad-hocファイルシステムの構成比較}
@@ -126,6 +126,14 @@ RDMAは，CPU介在を抑えつつ低遅延・高帯域のデータ転送を実�
 実装上は，送信キュー（SQ）と受信キュー（RQ）を対にしたQueue Pair（QP）に対してWork Request（WR）を投稿し，
 NICがこれをWork Queue Element（WQE）として処理する．
 完了通知はCompletion Queue（CQ）に集約され，アプリケーションはCQをポーリングして通信進行を把握する．
+この関係を図\ref{fig:rdma-sq-rq}に示す．
+
+\begin{figure}[tp]
+	\centering
+	\includegraphics[width=0.95\linewidth]{handmade-figures/RDMA-SQ-and-RQ.drawio.pdf}
+	\caption{RDMAにおけるSQ，RQ，QPの関係}
+	\label{fig:rdma-sq-rq}
+\end{figure}
 
 通信開始時，ホストはSQ上にWQEを配置した後，doorbellレジスタへのMMIO書き込みでNICへ新規WQEの存在を通知する．
 このdoorbell発行は固定コストを持つため，複数リクエストをまとめて投稿するdoorbell batchingや，ペイロードのinline化によってPCIeトランザクションを削減する設計が有効である\cite{kalia2016DesignGuidelinesHigh}．
@@ -142,7 +150,7 @@ DC（Dynamically Connected）は，通信時に接続先を動的に切り替え
 内部的にはRC系の接続状態管理に依存しており，状態管理コストを根本的に消すものではない．
 そのため，DCはRCのスケーラビリティ問題を緩和する有力な手段ではあるが，完全な解決策としては扱えない点に注意が必要である．
 
-\begin{table}[t]
+\begin{table}[tp]
 	\caption{RDMAトランスポートの比較（スケーラビリティ観点）}
 	\label{tab:rdma-transports}
 	\centering
