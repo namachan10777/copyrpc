@@ -112,12 +112,12 @@ enum SubCmd {
     CopyrpcDirect,
     /// Delegation: clients submit remote requests via shared-memory MPSC to Daemon#0
     Delegation {
-        /// Adaptive poll budget max (0 = disabled)
-        #[arg(long, default_value = "0")]
-        budget_max: u32,
-        /// RTT estimate in microseconds for adaptive budget controller
-        #[arg(long, default_value = "6.0")]
-        budget_rtt_us: f64,
+        /// Recv coalescing RTT estimate [us] (0 = disabled)
+        #[arg(long, default_value = "0.0")]
+        coalesce_rtt_us: f64,
+        /// Reply batch hold time [us] (0 = disabled, adaptive batching)
+        #[arg(long, default_value = "0.0")]
+        batch_hold_us: f64,
     },
 }
 
@@ -165,8 +165,8 @@ fn main() {
             num_clients,
         ),
         SubCmd::Delegation {
-            budget_max,
-            budget_rtt_us,
+            coalesce_rtt_us,
+            batch_hold_us,
         } => delegation_backend::run_delegation(
             &cli,
             &world,
@@ -174,8 +174,8 @@ fn main() {
             size,
             num_daemons,
             num_clients,
-            *budget_max,
-            *budget_rtt_us,
+            *coalesce_rtt_us,
+            *batch_hold_us,
         ),
     };
 

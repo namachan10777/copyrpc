@@ -39,6 +39,7 @@ fn handle_local(store: &mut ShardedStore, req: &Request) -> Response {
 #[allow(clippy::too_many_arguments)]
 fn run_daemon_0(
     my_rank: u32,
+    size: u32,
     num_daemons: usize,
     key_range: u64,
     queue_depth: u32,
@@ -49,7 +50,8 @@ fn run_daemon_0(
     stop_flag: &AtomicBool,
     ready_barrier: &Barrier,
     qd_sample_interval: Option<u32>,
-    budget_config: Option<crate::adaptive_budget::AdaptiveBudgetConfig>,
+    coalesce_rtt_ns: u64,
+    batch_hold_ns: u64,
 ) -> Vec<crate::qd_sample::QdSample> {
     let mut store = ShardedStore::new(key_range, num_daemons as u64, 0);
 
@@ -160,9 +162,15 @@ fn run_daemon_0(
     let mut qd_collector =
         qd_sample_interval.map(|interval| crate::qd_sample::QdCollector::new(interval, 500_000));
 
-    // Adaptive poll budget controller
-    let mut budget_ctl = budget_config.map(crate::adaptive_budget::AdaptiveBudgetCtl::new);
-    let mut budget_last_active_diag: Option<(f64, f64, f64, u32)> = None;
+    // Recv coalescing: track previous loop's response count
+    let mut prev_resp_count = 0u32;
+
+    // Reply batching: hold CQE responses and flush as a batch.
+    // Adaptive: only hold when previous batch was small (collapsed state).
+    let batch_target = size as usize; // need >= N responses per batch for healthy state
+    let mut reply_hold_buf: Vec<(u32, u32, Response)> = Vec::with_capacity(64);
+    let mut reply_hold_ts: Option<std::time::Instant> = None;
+    let mut batch_hold_active = batch_hold_ns > 0; // start in hold mode, switch off when healthy
 
     // Performance instrumentation
     let perf_start = std::time::Instant::now();
@@ -195,11 +203,11 @@ fn run_daemon_0(
 
         let mut copyrpc_resp_count = 0u32;
 
-        // === Adaptive extra CQ poll (recv-only, no flush) ===
-        let extra_budget = budget_ctl.as_ref().map_or(0, |ctl| ctl.budget());
-        if extra_budget > 0 {
+        // === Recv coalescing: wait for CQEs when previous loop was empty ===
+        if coalesce_rtt_ns > 0 && prev_resp_count == 0 && outstanding > 0 {
             if let Some(ctx) = ctx_ref {
-                for _ in 0..extra_budget {
+                let deadline = loop_now + std::time::Duration::from_nanos(coalesce_rtt_ns);
+                loop {
                     let n = ctx.poll_recv_only(|token: DelegToken, data: &[u8]| {
                         let resp = RemoteResponse::from_bytes(data).response;
                         deleg_server.reply(token.client_id, token.resp_slot_idx, resp);
@@ -209,6 +217,10 @@ fn run_daemon_0(
                     if n > 0 {
                         break;
                     }
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::hint::spin_loop();
                 }
             }
         }
@@ -218,7 +230,14 @@ fn run_daemon_0(
         if let Some(ctx) = ctx_ref {
             ctx.poll(|token: DelegToken, data: &[u8]| {
                 let resp = RemoteResponse::from_bytes(data).response;
-                deleg_server.reply(token.client_id, token.resp_slot_idx, resp);
+                if batch_hold_active {
+                    reply_hold_buf.push((token.client_id, token.resp_slot_idx, resp));
+                    if reply_hold_ts.is_none() {
+                        reply_hold_ts = Some(std::time::Instant::now());
+                    }
+                } else {
+                    deleg_server.reply(token.client_id, token.resp_slot_idx, resp);
+                }
                 copyrpc_resp_count += 1;
                 outstanding -= 1;
             });
@@ -432,14 +451,26 @@ fn run_daemon_0(
             );
         }
 
-        // Adaptive budget update
-        if let Some(ref mut ctl) = budget_ctl {
-            let loop_ns = loop_now.elapsed().as_nanos() as u64;
-            ctl.update(copyrpc_resp_count, loop_ns);
-            if copyrpc_resp_count > 0 {
-                budget_last_active_diag = Some(ctl.diagnostics());
+        // === Reply batch flush ===
+        if !reply_hold_buf.is_empty() {
+            let should_flush = reply_hold_buf.len() >= batch_target
+                || reply_hold_ts.map_or(false, |t| t.elapsed().as_nanos() as u64 >= batch_hold_ns)
+                || outstanding == 0;
+            if should_flush {
+                let flushed = reply_hold_buf.len();
+                for (cid, slot, resp) in reply_hold_buf.drain(..) {
+                    deleg_server.reply(cid, slot, resp);
+                }
+                reply_hold_ts = None;
+                // Adaptive: if batch was healthy, disable hold for next cycle
+                batch_hold_active = batch_hold_ns > 0 && (flushed as usize) < batch_target;
             }
+        } else if batch_hold_ns > 0 && copyrpc_resp_count == 0 {
+            // No responses this loop; ensure hold is active for next CQE arrival
+            batch_hold_active = true;
         }
+
+        prev_resp_count = copyrpc_resp_count;
 
         // Sampled timing
         if let (Some(ta), Some(td), Some(te), Some(tf)) = (ta, td, te, tf) {
@@ -452,20 +483,6 @@ fn run_daemon_0(
                 step_g_ns.push((tg - tf).as_nanos() as u32);
             }
         }
-    }
-
-    // Adaptive budget diagnostics
-    if let Some(ctl) = budget_ctl {
-        let (b, e, l, u) = budget_last_active_diag.unwrap_or_else(|| ctl.diagnostics());
-        let avg_batch = if perf_loop_count > 0 {
-            perf_copyrpc_resp as f64 / perf_loop_count as f64
-        } else {
-            0.0
-        };
-        eprintln!(
-            "[daemon0] adaptive_budget: u={} b_ema={:.2} e_ema={:.2} loop_ema={:.1}us avg_batch={:.2}",
-            u, b, e, l, avg_batch
-        );
     }
 
     // === Performance output ===
@@ -787,8 +804,8 @@ pub fn run_delegation(
     size: u32,
     num_daemons: usize,
     num_clients: usize,
-    budget_max: u32,
-    budget_rtt_us: f64,
+    coalesce_rtt_us: f64,
+    batch_hold_us: f64,
 ) -> Vec<parquet_out::BenchRow> {
     let queue_depth = cli.queue_depth;
 
@@ -908,15 +925,8 @@ pub fn run_delegation(
 
     // Spawn daemon threads
     let qd_interval = cli.qd_sample_dir.as_ref().map(|_| cli.qd_sample_interval);
-    let budget_cfg = if budget_max > 0 {
-        Some(crate::adaptive_budget::AdaptiveBudgetConfig {
-            u_max: budget_max,
-            rtt_estimate_us: budget_rtt_us,
-            ..Default::default()
-        })
-    } else {
-        None
-    };
+    let coalesce_rtt_ns = (coalesce_rtt_us * 1000.0) as u64;
+    let batch_hold_ns = (batch_hold_us * 1000.0) as u64;
     let mut daemon0_handle: Option<std::thread::JoinHandle<Vec<crate::qd_sample::QdSample>>> = None;
     let mut worker_handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(num_daemons);
 
@@ -933,14 +943,13 @@ pub fn run_delegation(
             let deleg_srv = deleg_server.take().unwrap();
             let setup = copyrpc_setup_for_d0.take();
             let qd_int = qd_interval;
-            let b_cfg = budget_cfg.clone();
-
             daemon0_handle = Some(std::thread::spawn(move || {
                 if let Some(core_id) = core {
                     affinity::pin_thread(core_id, "daemon-0");
                 }
                 run_daemon_0(
                     rank,
+                    size,
                     num_daemons,
                     key_range,
                     queue_depth,
@@ -951,7 +960,8 @@ pub fn run_delegation(
                     &stop,
                     &barrier,
                     qd_int,
-                    b_cfg,
+                    coalesce_rtt_ns,
+                    batch_hold_ns,
                 )
             }));
         } else {
