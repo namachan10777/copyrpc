@@ -162,6 +162,7 @@ fn run_daemon_0(
 
     // Adaptive poll budget controller
     let mut budget_ctl = budget_config.map(crate::adaptive_budget::AdaptiveBudgetCtl::new);
+    let mut budget_last_active_diag: Option<(f64, f64, f64, u32)> = None;
 
     // Performance instrumentation
     let perf_start = std::time::Instant::now();
@@ -435,6 +436,9 @@ fn run_daemon_0(
         if let Some(ref mut ctl) = budget_ctl {
             let loop_ns = loop_now.elapsed().as_nanos() as u64;
             ctl.update(copyrpc_resp_count, loop_ns);
+            if copyrpc_resp_count > 0 {
+                budget_last_active_diag = Some(ctl.diagnostics());
+            }
         }
 
         // Sampled timing
@@ -452,10 +456,15 @@ fn run_daemon_0(
 
     // Adaptive budget diagnostics
     if let Some(ctl) = budget_ctl {
-        let (b, e, l, u) = ctl.diagnostics();
+        let (b, e, l, u) = budget_last_active_diag.unwrap_or_else(|| ctl.diagnostics());
+        let avg_batch = if perf_loop_count > 0 {
+            perf_copyrpc_resp as f64 / perf_loop_count as f64
+        } else {
+            0.0
+        };
         eprintln!(
-            "[daemon0] adaptive_budget: final u={} b_ema={:.2} e_ema={:.2} loop_ema={:.1}us",
-            u, b, e, l
+            "[daemon0] adaptive_budget: u={} b_ema={:.2} e_ema={:.2} loop_ema={:.1}us avg_batch={:.2}",
+            u, b, e, l, avg_batch
         );
     }
 
