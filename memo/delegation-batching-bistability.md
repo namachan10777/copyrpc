@@ -203,3 +203,140 @@ daemon を複数スレッドに分割し、各スレッドが担当 EP のサブ
 
 busy-poll ではなく、CQ completion channel (eventfd) を使い、CQE が到着してから処理する方式。
 CQE 蓄積の必要性を根本的に排除するが、イベント通知のレイテンシが追加される。
+
+## 制御系としての実装案 (自己同定付き Adaptive Poll Budget)
+
+### 状態・観測・制御入力
+
+- 制御入力: `u = effective_poll_budget` (追加 poll 回数)
+- 観測:
+  - `b_k`: ループ k の CQE batch size
+  - `e_k`: ループ k が空振り (`b_k == 0`) なら 1, それ以外 0
+  - `t_k`: ループ時間 [us]
+  - `rtt_k`: RTT 推定値 [us] (`call_ts` と completion から EWMA)
+- 正規化指標:
+  - `rho_k = t_k / rtt_k` (ループ時間 / RTT)
+
+`rho_k < 1` が長く続くと CQE 蓄積が不足し、低均衡へ崩壊しやすい。
+
+### 制御目標
+
+- 一次目標: `rho_k` を `rho_low..rho_high` の範囲に維持 (`0.8..1.2` 目安)
+- 二次目標: 空振り率 `E` を抑える (`E < 0.7` 目安)
+- 最小化目標: 不要な待機 (`u`) を減らし、NP=16 など高多様性ケースで headroom を確保
+
+### オンライン自己同定 (起動時 warmup)
+
+1. `u=0` で短時間測定し、`B0, E0, R0` を得る
+2. `u=u_probe` (例 8) で短時間測定し、`B1, E1` を得る
+3. 感度推定:
+   - `dB_du = (B1 - B0) / u_probe`
+   - `dE_du = (E1 - E0) / u_probe`
+4. ゲイン自動設定:
+   - `step_up = clamp(round(2 / max(dB_du, eps)), 1, 8)`
+   - `step_down = max(step_up * 2, 2)`
+   - `u_max = clamp(round(2.5 * R0), 8, 64)`
+
+これにより NP/QD ごとの手動調整を減らす。
+
+### 疑似コード
+
+```rust
+struct AdaptiveBudgetCtl {
+    // filtered metrics
+    b_ema: f64,      // cqe batch EWMA
+    e_ema: f64,      // empty-loop ratio EWMA
+    rtt_ema_us: f64, // RTT EWMA
+    loop_ema_us: f64,
+
+    // control
+    u: u32,          // effective poll budget
+    u_max: u32,
+    step_up: u32,
+    step_down: u32,
+
+    // hysteresis counters
+    low_cnt: u32,
+    high_cnt: u32,
+    hold_cnt: u32,
+
+    // thresholds
+    rho_low: f64,    // e.g. 0.8
+    rho_high: f64,   // e.g. 1.2
+    e_high: f64,     // e.g. 0.75
+    e_low: f64,      // e.g. 0.40
+    low_need: u32,   // e.g. 64 loops
+    high_need: u32,  // e.g. 128 loops
+    hold_min: u32,   // e.g. 32 loops
+}
+
+fn daemon_loop(mut ctl: AdaptiveBudgetCtl) {
+    loop {
+        // Step A: CQ poll (u + 1 回まで追加 poll)
+        let mut cqe = 0u32;
+        for _ in 0..=ctl.u {
+            cqe += ctx.poll_once();
+            if cqe > 0 {
+                break; // CQE が来たら通常処理へ
+            }
+        }
+
+        // Step B..: existing pipeline
+        process_deleg_requests();
+        drain_call_backlog();
+        ctx.flush_endpoints();
+        process_flux_and_ipc();
+
+        // Step C: update metrics
+        let loop_us = last_loop_elapsed_us();
+        let rtt_us = sample_rtt_ewma_us(); // if unavailable, keep previous
+        ctl.b_ema = ewma(ctl.b_ema, cqe as f64, 0.05);
+        ctl.e_ema = ewma(ctl.e_ema, if cqe == 0 { 1.0 } else { 0.0 }, 0.05);
+        ctl.loop_ema_us = ewma(ctl.loop_ema_us, loop_us, 0.05);
+        ctl.rtt_ema_us = ewma(ctl.rtt_ema_us, rtt_us, 0.02);
+        let rho = ctl.loop_ema_us / ctl.rtt_ema_us.max(0.5);
+
+        // Step D: hysteresis + rate-limited adaptation
+        if ctl.hold_cnt > 0 {
+            ctl.hold_cnt -= 1;
+            continue;
+        }
+
+        let low_cond = rho < ctl.rho_low || ctl.e_ema > ctl.e_high;
+        let high_cond = rho > ctl.rho_high && ctl.e_ema < ctl.e_low;
+
+        if low_cond {
+            ctl.low_cnt += 1;
+            ctl.high_cnt = 0;
+            if ctl.low_cnt >= ctl.low_need {
+                ctl.u = (ctl.u + ctl.step_up).min(ctl.u_max);
+                ctl.low_cnt = 0;
+                ctl.hold_cnt = ctl.hold_min;
+            }
+        } else if high_cond {
+            ctl.high_cnt += 1;
+            ctl.low_cnt = 0;
+            if ctl.high_cnt >= ctl.high_need {
+                ctl.u = ctl.u.saturating_sub(ctl.step_down);
+                ctl.high_cnt = 0;
+                ctl.hold_cnt = ctl.hold_min;
+            }
+        } else {
+            ctl.low_cnt = 0;
+            ctl.high_cnt = 0;
+        }
+
+        // Step E: collapse recovery
+        if ctl.b_ema < 1.0 && ctl.e_ema > 0.9 {
+            ctl.u = (ctl.u + ctl.step_up * 2).min(ctl.u_max);
+            ctl.hold_cnt = ctl.hold_min;
+        }
+    }
+}
+```
+
+### 期待される挙動
+
+- NP=8 崩壊ケース: `rho < 1`, `e_ema` 上昇を検知し `u` を自動増加、低均衡から回復
+- NP=16 高均衡ケース: `rho > 1`, `e_ema` 低位なら `u` を自動縮小、不要待機を削減
+- QD 変化時: warmup 同定と緩やかな再同定で追従し、固定 `poll_budget` より頑健
