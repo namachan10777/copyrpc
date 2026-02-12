@@ -96,7 +96,7 @@ PVFSやLustreに代表される設計は，大規模チェックポイントの�
 このギャップは，機械学習やデータ解析ワークロードに見られる小粒度I/Oやメタデータ集中アクセスで特に顕在化し，共有ストレージ単体では安定した低遅延処理が難しくなる\cite{brinkmannAdHocFile2020}．
 
 こうした背景から，計算ノード上のNVMe SSDや永続メモリをジョブ実行中に束ねる中間層として，バーストバッファおよびad-hocファイルシステムが発展してきた\cite{brinkmannAdHocFile2020}．
-\begin{figure}[tp]
+\begin{figure}[t]
 	\centering
 	\includegraphics[width=0.95\linewidth]{handmade-figures/pfs-and-adhocfs.drawio.pdf}
 	\caption{並列ファイルシステムとad-hocファイルシステムの構成比較}
@@ -128,7 +128,7 @@ NICがこれをWork Queue Element（WQE）として処理する．
 完了通知はCompletion Queue（CQ）に集約され，アプリケーションはCQをポーリングして通信進行を把握する．
 この関係を図\ref{fig:rdma-sq-rq}に示す．
 
-\begin{figure}[tp]
+\begin{figure}[t]
 	\centering
 	\includegraphics[width=0.95\linewidth]{handmade-figures/RDMA-SQ-and-RQ.drawio.pdf}
 	\caption{RDMAにおけるSQ，RQ，QPの関係}
@@ -150,7 +150,7 @@ DC（Dynamically Connected）は，通信時に接続先を動的に切り替え
 内部的にはRC系の接続状態管理に依存しており，状態管理コストを根本的に消すものではない．
 そのため，DCはRCのスケーラビリティ問題を緩和する有力な手段ではあるが，完全な解決策としては扱えない点に注意が必要である．
 
-\begin{table}[tp]
+\begin{table}[t]
 	\caption{RDMAトランスポートの比較（スケーラビリティ観点）}
 	\label{tab:rdma-transports}
 	\centering
@@ -167,18 +167,35 @@ DC（Dynamically Connected）は，通信時に接続先を動的に切り替え
 
 \section{関連研究}
 
-\subsection{eRPC, ScaleRPC, ...} % あともう一個くらいソフトウェアによるRPCスケーラビリティ研究を出す
+\subsection{FaRM，eRPC，ScaleRPC}
 
-% これらの研究はスケーラビリティ向上は達成している
-% 一方で，これらの研究はクライアントがフルの通信用Infiniband/RoCEリソースを持つ
-% クライアントは別に高機能な通信を行うわけではないので，メモリオーバーヘッドがある．
-% QPとかのメモリ使用量を概算して記述する　
-% ScaleRPCではスケーラビリティが問題として，RCを減らそうとしているが，ad-hoc filesystemでは全てのノードにDaemonも展開されている
-% そのため，サーバ側の問題を解消しても同居するクライアントが性能問題を引き起こす(ここは要考察)．
-% しかしScaleRPCは計算ノードへのDaemon展開は想定していないから，ScaleRPCが悪いというかad-hoc filesystemと噛み合わないだけ
-% eRPCはUDなのでかなりマシ．NICリソースによる性能低下は起きない
-% でも，ad-hoc filesystemとかでは，大メッセージの通信が必要なのでやっぱりRCがほしい
-%
+ソフトウェアによるRDMA RPCのスケーラビリティ改善は，主に「接続状態の扱い」「受信処理の検出コスト」「メモリ階層競合の抑制」という3つの観点で進展してきた．
+FaRMはone-sided RDMA read/writeを中核に据え，RDMA writeベースのメッセージングをリングバッファとポーリングで実装した\cite{dragojevicFaRMFastRemote2014}．
+同研究は高い性能を示す一方で，チャネル数増加に伴うポーリング負荷と，接続増加に伴うNIC上のQueue Pair状態キャッシュ不足を報告しており，
+対策として(1)接続粒度をthread-to-threadからthread-to-nodeへ粗粒化し，(2)NUMAを意識したQP共有を導入して状態量を削減している\cite{dragojevicFaRMFastRemote2014}．
+すなわちFaRMのアプローチは，RCベースの高速性を維持しつつ，接続の束ね方をソフトウェアで最適化する方向である．
+これに対し本研究は，スレッド単位ではなくノード内の複数プロセス単位で通信を集約する点で異なる．
+
+eRPCは，接続状態をNICに保持するRC系設計そのものをスケーラビリティ制約と捉え，packet I/O（UDP/UD相当）を用いてNIC管理状態を削減する設計を採る\cite{kalia2019DatacenterRPCsCan}．
+論文中では，RDMA接続数が増えるとNIC SRAM上の接続状態キャッシュ制約により性能が低下することを示し，eRPCでは接続状態をCPU側で管理することで大規模接続時の性能維持を図っている\cite{kalia2019DatacenterRPCsCan}．
+加えて，event loopによるdispatch処理，session creditによるエンドツーエンドフロー制御，zero-copy送受信を組み合わせることで，
+汎用RPCとしての機能性と高スループットを両立している\cite{kalia2019DatacenterRPCsCan}．
+UD系アプローチで性能が伸びる主要因は，(1)NIC側の接続状態保持を削減できること，(2)受信検出をCQベースで定数時間化しやすいこと，(3)接続切替に伴うNICキャッシュミスを避けやすいことである\cite{kalia2019DatacenterRPCsCan}．
+一方で，信頼性制御や再送制御，および大きなデータ転送時のバッファ管理をソフトウェア側で担う必要があり，ワークロードによっては設計複雑性が増す．
+
+ScaleRPCは，RCを維持したままスケーラビリティを高めるため，接続を時間分割で扱うconnection groupingと，
+物理メッセージプールを論理的に多重化するvirtualized mappingを提案している\cite{chenScalableRDMARPC2019}．
+前者は同時にアクティブ化する接続群を制限してNICキャッシュのスラッシングを抑え，後者はメッセージバッファ共有によってCPU最終段キャッシュ競合とメモリ使用量を削減する\cite{chenScalableRDMARPC2019}．
+さらに，優先度ベースのスケジューリングとwarmup機構によりグループ切替オーバーヘッドを隠蔽し，RCの利点を保ちながら大規模接続への適応を図っている\cite{chenScalableRDMARPC2019}．
+
+これら3研究は，いずれもソフトウェアでの工夫によりRDMA RPCのスケーラビリティを改善しているが，設計思想は異なる．
+FaRMとScaleRPCはRCを前提に接続状態管理の効率化を狙うのに対し，eRPCはNIC接続状態依存を減らす方向で拡張性を確保する．
+また，これらの多くはデータセンター内KVS/DB系ワークロードを主対象としており，要求メッセージが小さく制御可能である前提が強い．
+HPC向けad-hocファイルシステムでは，計算ノード内でクライアントとストレージデーモンが同居し，大量同時アクセスと大きなデータ転送が混在するため，
+サーバ側だけでなくクライアント側を含む通信資源管理が重要になる．
+FaRMの最適化単位はスレッド中心であり，eRPCは汎用性を重視する代わりにone-sided操作前提のデータ転送管理を直接提供しないため，
+HPCストレージ向け実装では追加の設計判断が必要となる．
+本研究はad-hocファイルシステムを想定し，RCの機能を利用しつつノード内集約で接続状態とメモリ消費を削減する点で，RC維持型アプローチをHPCストレージ文脈に適用する位置づけとなる．
 
 \subsection{mRPC}
 
