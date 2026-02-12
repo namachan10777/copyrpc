@@ -22,7 +22,7 @@ mod inline {
     pub fn open_mlx5_device() -> Option<Context> {
         let device_list = DeviceList::list().ok()?;
         for device in device_list.iter() {
-            if let Ok(ctx) = device.open() {
+            if let Ok(ctx) = device.open_devx() {
                 return Some(ctx);
             }
         }

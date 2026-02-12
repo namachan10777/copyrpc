@@ -2,9 +2,11 @@
 //!
 //! This module provides access to mlx5 RDMA devices via the mlx5dv API.
 
+use std::cell::OnceCell;
 use std::rc::Rc;
 use std::{io, mem::MaybeUninit, ops::Deref, ptr::NonNull};
 
+use crate::devx::DevxUar;
 use crate::types::{Gid, LinkLayer, PciAtomicCaps};
 
 /// An RDMA device.
@@ -74,12 +76,19 @@ impl Deref for DeviceList {
 /// Internal context structure holding the raw ibv_context pointer.
 ///
 /// This is wrapped in Rc to ensure proper resource lifetime management.
+/// Drop order: devx_uar first, then ctx (ibv_close_device).
 pub(crate) struct ContextInner {
+    /// Shared DevX UAR for all resources. Lazily allocated on first use.
+    /// Must be dropped before ctx.
+    devx_uar: OnceCell<DevxUar>,
     ctx: NonNull<mlx5_sys::ibv_context>,
 }
 
 impl Drop for ContextInner {
     fn drop(&mut self) {
+        // devx_uar is dropped automatically before this runs (field order).
+        // We explicitly drop it here to make the ordering clear.
+        self.devx_uar.take();
         unsafe {
             mlx5_sys::ibv_close_device(self.ctx.as_ptr());
         }
@@ -109,7 +118,32 @@ impl Device {
             let mut attr: mlx5_sys::mlx5dv_context_attr = std::mem::zeroed();
             let ctx = mlx5_sys::mlx5dv_open_device(self.device.as_ptr(), &mut attr);
             NonNull::new(ctx).map_or(Err(io::Error::last_os_error()), |ctx| {
-                Ok(Context(Rc::new(ContextInner { ctx })))
+                Ok(Context(Rc::new(ContextInner {
+                    devx_uar: OnceCell::new(),
+                    ctx,
+                })))
+            })
+        }
+    }
+
+    /// Open the device with DevX support enabled.
+    ///
+    /// DevX mode allows direct PRM command submission via
+    /// `mlx5dv_devx_obj_create`/`modify`/`destroy`, bypassing the verbs layer.
+    ///
+    /// # Errors
+    /// Returns an error if the device cannot be opened or DevX is not supported.
+    pub fn open_devx(&self) -> io::Result<Context> {
+        unsafe {
+            let mut attr: mlx5_sys::mlx5dv_context_attr = std::mem::zeroed();
+            attr.flags =
+                mlx5_sys::mlx5dv_context_attr_flags_MLX5DV_CONTEXT_FLAGS_DEVX;
+            let ctx = mlx5_sys::mlx5dv_open_device(self.device.as_ptr(), &mut attr);
+            NonNull::new(ctx).map_or(Err(io::Error::last_os_error()), |ctx| {
+                Ok(Context(Rc::new(ContextInner {
+                    devx_uar: OnceCell::new(),
+                    ctx,
+                })))
             })
         }
     }
@@ -117,8 +151,21 @@ impl Device {
 
 impl Context {
     /// Get the raw ibv_context pointer.
-    pub(crate) fn as_ptr(&self) -> *mut mlx5_sys::ibv_context {
+    pub fn as_ptr(&self) -> *mut mlx5_sys::ibv_context {
         self.0.ctx.as_ptr()
+    }
+
+    /// Get the shared DevX UAR, allocating it on first use.
+    ///
+    /// All DevX resources (CQ, QP, SRQ) share a single UAR for doorbells.
+    pub(crate) fn devx_uar(&self) -> io::Result<&DevxUar> {
+        if let Some(uar) = self.0.devx_uar.get() {
+            return Ok(uar);
+        }
+        let uar = self.alloc_uar()?;
+        // Another call might have raced, but that's fine — we just leak the extra.
+        let _ = self.0.devx_uar.set(uar);
+        Ok(self.0.devx_uar.get().unwrap())
     }
 
     /// Query standard ibverbs device attributes.

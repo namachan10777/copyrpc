@@ -613,7 +613,7 @@ fn test_tm_tag_via_verbs_api() {
     let timeout = 5000;
     let mut found = false;
     for _ in 0..timeout {
-        let ret = unsafe { mlx5_sys::ibv_poll_cq_ex(cq.as_ptr(), 1, wc.as_mut_ptr()) };
+        let ret = unsafe { mlx5_sys::ibv_poll_cq_ex(std::ptr::null_mut(), 1, wc.as_mut_ptr()) };
         if ret > 0 {
             let wc = unsafe { wc.assume_init() };
             println!(
@@ -671,7 +671,7 @@ fn test_tm_tag_via_verbs_api() {
     let mut wc2: MaybeUninit<mlx5_sys::ibv_wc> = MaybeUninit::zeroed();
     let mut found2 = false;
     for _ in 0..timeout {
-        let ret = unsafe { mlx5_sys::ibv_poll_cq_ex(cq.as_ptr(), 1, wc2.as_mut_ptr()) };
+        let ret = unsafe { mlx5_sys::ibv_poll_cq_ex(std::ptr::null_mut(), 1, wc2.as_mut_ptr()) };
         if ret > 0 {
             let wc = unsafe { wc2.assume_init() };
             println!(

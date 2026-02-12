@@ -30,14 +30,16 @@
 //! ```
 
 use std::cell::{Cell, RefCell, UnsafeCell};
-use std::ptr::NonNull;
 use std::rc::{Rc, Weak};
-use std::{io, mem::MaybeUninit};
+use std::io;
 
 use crate::cq::{
-    CqConfig, CqModeration, Cqe, CqeCompressionFormat, CqeOpcode, CqeSize, MiniCqeIterator,
+    CqConfig, Cqe, CqeOpcode, CqeSize, MiniCqeIterator,
 };
 use crate::device::Context;
+use crate::devx::{DevxObj, DevxUmem};
+use crate::prm;
+use crate::qp::AlignedBuf;
 use fastmap::FastMap;
 
 // =============================================================================
@@ -84,6 +86,8 @@ struct MonoCqState {
     cqe_size: u32,
     /// Doorbell record pointer
     dbrec: *mut u32,
+    /// CQ number (from HW)
+    cqn: u32,
     /// Consumer index
     ci: Cell<u32>,
     /// Pending mini CQE iterator for compressed CQE expansion.
@@ -125,7 +129,12 @@ pub struct MonoCq<Q>
 where
     Q: CompletionSource,
 {
-    cq: NonNull<mlx5_sys::ibv_cq>,
+    /// DevX CQ object. Must be dropped before _umem.
+    _devx_obj: DevxObj,
+    /// Registered UMEM for the CQ buffer. Must be dropped after _devx_obj.
+    _umem: DevxUmem,
+    /// Backing memory for CQE data and doorbell record.
+    _cq_buf: AlignedBuf,
     state: MonoCqState,
     /// Registered queues for completion dispatch.
     /// Uses FastMap for O(1) lookup without hash computation.
@@ -134,44 +143,41 @@ where
     _ctx: Context,
 }
 
-impl<Q> Drop for MonoCq<Q>
-where
-    Q: CompletionSource,
-{
-    fn drop(&mut self) {
-        unsafe {
-            mlx5_sys::ibv_destroy_cq(self.cq.as_ptr());
-        }
-    }
-}
+// Drop is automatic - DevxObj handles CQ destruction
 
 impl Context {
-    /// Create a Monomorphic Completion Queue with inlined callback dispatch.
+    /// Create a Monomorphic Completion Queue with inlined callback dispatch via DevX.
     ///
     /// The callback is passed to `poll()` at the call site, enabling the
     /// compiler to inline the callback code via monomorphization.
     ///
     /// # Arguments
-    /// * `cqe` - Minimum number of CQ entries (actual may be larger)
+    /// * `num_cqes` - Number of CQEs (will be rounded up to the nearest power of 2).
     /// * `config` - CQ configuration options (CQE size, compression, etc.)
     ///
     /// # Type Parameters
     /// * `Q` - Queue type implementing `CompletionSource`
     ///
-    /// # CQE Compression
-    /// When `config.compression_format` is Some:
-    /// - CQE compression is only valid for RX (responder side) completions
-    /// - Using compression for TX CQs will cause undefined behavior
-    /// - Owner checking uses signature field (offset 62) with 0xff mask
-    /// - Compressed CQEs (format=3) are expanded via MiniCqeIterator
-    /// - Note: Actual compressed CQEs may only be generated with Strided RQ (MPRQ)
-    ///
     /// # Errors
     /// Returns an error if the CQ cannot be created.
-    pub fn create_mono_cq<Q>(&self, cqe: i32, config: &CqConfig) -> io::Result<MonoCq<Q>>
+    pub fn create_mono_cq<Q>(
+        &self,
+        num_cqes: i32,
+        config: &CqConfig,
+    ) -> io::Result<MonoCq<Q>>
     where
         Q: CompletionSource,
     {
+        let log_cq_size = (num_cqes.max(2) as u32).next_power_of_two().trailing_zeros();
+        let config = CqConfig {
+            log_cq_size,
+            ..config.clone()
+        };
+        let layout = config.buffer_layout();
+        let cq_buf = AlignedBuf::new(layout.total_size);
+        let buf = cq_buf.as_ptr();
+        let buf_len = cq_buf.len();
+
         // Check device support for CQE compression if requested
         if config.compression_format.is_some() {
             let mlx5_attr = self.query_mlx5_device()?;
@@ -185,121 +191,136 @@ impl Context {
             }
         }
 
+        let uar = self.devx_uar()?;
+        let eqn = self.query_eqn(0)?;
+
+        // SAFETY: buf points to cq_buf's allocation which is page-aligned and large enough.
+        let umem = unsafe { self.register_umem(buf, buf_len, 7) }?; // LOCAL_WRITE | REMOTE_WRITE | REMOTE_READ
+
+        let cqe_cnt = 1u32 << config.log_cq_size;
+        let cqe_size = config.cqe_size as u32;
+
+        // Build CREATE_CQ PRM command (no PAS needed with UMEM mode)
+        let cmd_in_size = prm::CREATE_CQ_IN_BASE_SIZE;
+        let mut cmd_in = vec![0u8; cmd_in_size];
+        let mut cmd_out = vec![0u8; prm::CREATE_CQ_OUT_SIZE];
+
+        let umem_id = umem.umem_id();
+
+        // Command header
+        prm::prm_set(
+            &mut cmd_in,
+            prm::CREATE_CQ_IN_OPCODE.0,
+            prm::CREATE_CQ_IN_OPCODE.1,
+            prm::MLX5_CMD_OP_CREATE_CQ,
+        );
+
+        // CQ UMEM fields (buffer memory)
+        prm::prm_set(
+            &mut cmd_in,
+            prm::CREATE_CQ_IN_CQ_UMEM_VALID.0,
+            prm::CREATE_CQ_IN_CQ_UMEM_VALID.1,
+            1,
+        );
+        prm::prm_set(
+            &mut cmd_in,
+            prm::CREATE_CQ_IN_CQ_UMEM_ID.0,
+            prm::CREATE_CQ_IN_CQ_UMEM_ID.1,
+            umem_id,
+        );
+        prm::prm_set64(&mut cmd_in, prm::CREATE_CQ_IN_CQ_UMEM_OFFSET, 0);
+
+        // CQC fields
+        let c = prm::CREATE_CQ_IN_CQC_OFF;
+
+        // CQE size: 0=64B, 1=128B
+        let cqe_sz_val = match config.cqe_size {
+            CqeSize::Size64 => 0u32,
+            CqeSize::Size128 => 1,
+        };
+        prm::prm_set(&mut cmd_in, c + prm::CQC_CQE_SZ.0, prm::CQC_CQE_SZ.1, cqe_sz_val);
+        prm::prm_set(
+            &mut cmd_in,
+            c + prm::CQC_LOG_CQ_SIZE.0,
+            prm::CQC_LOG_CQ_SIZE.1,
+            config.log_cq_size,
+        );
+        prm::prm_set(
+            &mut cmd_in,
+            c + prm::CQC_UAR_PAGE.0,
+            prm::CQC_UAR_PAGE.1,
+            uar.page_id(),
+        );
+        prm::prm_set(&mut cmd_in, c + prm::CQC_C_EQN.0, prm::CQC_C_EQN.1, eqn);
+        prm::prm_set(
+            &mut cmd_in,
+            c + prm::CQC_LOG_PAGE_SIZE.0,
+            prm::CQC_LOG_PAGE_SIZE.1,
+            0, // use smallest page size (implicit)
+        );
+
+        // DBR UMEM fields (doorbell record memory)
+        prm::prm_set(
+            &mut cmd_in,
+            c + prm::CQC_DBR_UMEM_VALID.0,
+            prm::CQC_DBR_UMEM_VALID.1,
+            1,
+        );
+        prm::prm_set(
+            &mut cmd_in,
+            c + prm::CQC_DBR_UMEM_ID.0,
+            prm::CQC_DBR_UMEM_ID.1,
+            umem_id,
+        );
+        prm::prm_set64(
+            &mut cmd_in,
+            c + prm::CQC_DBR_ADDR,
+            layout.dbrec_offset as u64,
+        );
+
+        // Create the CQ via DevX
+        let devx_obj = self.devx_obj_create(&cmd_in, &mut cmd_out)?;
+        let cqn = prm::prm_get(&cmd_out, prm::CREATE_CQ_OUT_CQN.0, prm::CREATE_CQ_OUT_CQN.1);
+
+        // Initialize all CQEs to HW ownership (UCX-style).
+        // When CQE compression is enabled, ownership is tracked via signature field (offset 62).
+        // When disabled, ownership is tracked via op_own field (offset 63, bit 0).
+        const OP_OWN_INVALID: u8 = 0xf1; // opcode=INVALID(0xf), owner=1
+        const SIGNATURE_INVALID: u8 = 0xff; // Initial signature for compression mode
+        let cqe64_offset: usize = if cqe_size == 128 { 64 } else { 0 };
         unsafe {
-            let mut attr: mlx5_sys::ibv_cq_init_attr_ex = MaybeUninit::zeroed().assume_init();
-            attr.cqe = cqe as u32;
-            attr.cq_context = std::ptr::null_mut();
-            attr.channel = std::ptr::null_mut();
-            attr.comp_vector = 0;
-            attr.wc_flags = 0;
-            attr.comp_mask = 0;
-            attr.flags = 0;
-
-            let compression_format = config.compression_format;
-            let use_custom_cqe_size = config.cqe_size != CqeSize::Size64;
-
-            let (cq_ex, cqe_compression) = if compression_format.is_some() || use_custom_cqe_size {
-                // Use mlx5dv_create_cq for MLX5-specific features
-                let mut mlx5_attr: mlx5_sys::mlx5dv_cq_init_attr =
-                    MaybeUninit::zeroed().assume_init();
-
-                // Set CQE size
-                mlx5_attr.comp_mask =
-                    mlx5_sys::mlx5dv_cq_init_attr_mask_MLX5DV_CQ_INIT_ATTR_MASK_CQE_SIZE as u64;
-                mlx5_attr.cqe_size = config.cqe_size as u16;
-
-                // Enable compression if requested
-                // Note: CQE compression formats (HASH, CSUM, etc.) are responder-side only.
-                // DO NOT use this for TX (send) CQs - it will cause hangs.
-                if let Some(format) = compression_format {
-                    mlx5_attr.comp_mask |=
-                        mlx5_sys::mlx5dv_cq_init_attr_mask_MLX5DV_CQ_INIT_ATTR_MASK_COMPRESSED_CQE
-                            as u64;
-                    mlx5_attr.cqe_comp_res_format = match format {
-                        CqeCompressionFormat::Hash => {
-                            mlx5_sys::mlx5dv_cqe_comp_res_format_MLX5DV_CQE_RES_FORMAT_HASH as u8
-                        }
-                        CqeCompressionFormat::Csum => {
-                            mlx5_sys::mlx5dv_cqe_comp_res_format_MLX5DV_CQE_RES_FORMAT_CSUM as u8
-                        }
-                        CqeCompressionFormat::CsumStridx => {
-                            mlx5_sys::mlx5dv_cqe_comp_res_format_MLX5DV_CQE_RES_FORMAT_CSUM_STRIDX
-                                as u8
-                        }
-                    };
-                }
-
-                let cq_ex = mlx5_sys::mlx5dv_create_cq(self.as_ptr(), &mut attr, &mut mlx5_attr);
-
-                if cq_ex.is_null() {
-                    return Err(io::Error::last_os_error());
-                }
-                (cq_ex, compression_format.is_some())
-            } else {
-                // Standard CQ without compression or custom CQE size
-                (
-                    mlx5_sys::ibv_create_cq_ex_ex(self.as_ptr(), &mut attr),
-                    false,
-                )
-            };
-
-            if cq_ex.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-
-            let cq_ptr = cq_ex as *mut mlx5_sys::ibv_cq;
-
-            // Initialize direct verbs access
-            let mut dv_cq: MaybeUninit<mlx5_sys::mlx5dv_cq> = MaybeUninit::zeroed();
-            let mut obj: MaybeUninit<mlx5_sys::mlx5dv_obj> = MaybeUninit::zeroed();
-
-            let obj_ptr = obj.as_mut_ptr();
-            (*obj_ptr).cq.in_ = cq_ptr;
-            (*obj_ptr).cq.out = dv_cq.as_mut_ptr();
-
-            let ret =
-                mlx5_sys::mlx5dv_init_obj(obj_ptr, mlx5_sys::mlx5dv_obj_type_MLX5DV_OBJ_CQ as u64);
-            if ret != 0 {
-                mlx5_sys::ibv_destroy_cq(cq_ptr);
-                return Err(io::Error::from_raw_os_error(-ret));
-            }
-
-            let dv_cq = dv_cq.assume_init();
-
-            // Initialize all CQEs to look like they are in HW ownership (UCX-style).
-            // When CQE compression is enabled, ownership is tracked via signature field (offset 62).
-            // When disabled, ownership is tracked via op_own field (offset 63, bit 0).
-            const OP_OWN_INVALID: u8 = 0xf1; // opcode=INVALID(0xf), owner=1
-            const SIGNATURE_INVALID: u8 = 0xff; // Initial signature for compression mode
-            let buf = dv_cq.buf as *mut u8;
-            let cqe64_offset: usize = if dv_cq.cqe_size == 128 { 64 } else { 0 };
-            for i in 0..dv_cq.cqe_cnt {
-                let cqe_ptr = buf.add((i as usize) * (dv_cq.cqe_size as usize));
+            for i in 0..cqe_cnt {
+                let cqe_ptr = buf.add((i as usize) * (cqe_size as usize));
                 let cqe64_ptr = cqe_ptr.add(cqe64_offset);
                 let signature_ptr = cqe64_ptr.add(62);
                 let op_own_ptr = cqe64_ptr.add(63);
                 std::ptr::write_volatile(signature_ptr, SIGNATURE_INVALID);
                 std::ptr::write_volatile(op_own_ptr, OP_OWN_INVALID);
             }
-
-            Ok(MonoCq {
-                cq: NonNull::new(cq_ptr).unwrap(),
-                state: MonoCqState {
-                    buf: dv_cq.buf as *mut u8,
-                    cqe_cnt: dv_cq.cqe_cnt,
-                    cqe_cnt_log2: dv_cq.cqe_cnt.trailing_zeros(),
-                    cqe_size: dv_cq.cqe_size,
-                    dbrec: dv_cq.dbrec,
-                    ci: Cell::new(0),
-                    pending_mini_cqes: UnsafeCell::new(None),
-                    title_opcode: Cell::new(CqeOpcode::Req),
-                    cqe_compression,
-                    compressed_cqe_count: Cell::new(0),
-                },
-                queues: RefCell::new(FastMap::new()),
-                _ctx: self.clone(),
-            })
         }
+
+        let dbrec = unsafe { buf.add(layout.dbrec_offset) as *mut u32 };
+
+        Ok(MonoCq {
+            _devx_obj: devx_obj,
+            _umem: umem,
+            _cq_buf: cq_buf,
+            state: MonoCqState {
+                buf,
+                cqe_cnt,
+                cqe_cnt_log2: cqe_cnt.trailing_zeros(),
+                cqe_size,
+                dbrec,
+                cqn,
+                ci: Cell::new(0),
+                pending_mini_cqes: UnsafeCell::new(None),
+                title_opcode: Cell::new(CqeOpcode::Req),
+                cqe_compression: config.compression_format.is_some(),
+                compressed_cqe_count: Cell::new(0),
+            },
+            queues: RefCell::new(FastMap::new()),
+            _ctx: self.clone(),
+        })
     }
 }
 
@@ -307,9 +328,11 @@ impl<Q> MonoCq<Q>
 where
     Q: CompletionSource,
 {
-    /// Get the raw ibv_cq pointer.
-    pub fn as_ptr(&self) -> *mut mlx5_sys::ibv_cq {
-        self.cq.as_ptr()
+    /// Get the CQ number (CQN).
+    ///
+    /// Used for DevX QP creation where cqn_snd/cqn_rcv must be set in the QPC.
+    pub fn cqn(&self) -> u32 {
+        self.state.cqn
     }
 
     /// Check if CQE compression is enabled for this CQ.
@@ -394,35 +417,6 @@ where
                 self.state.dbrec,
                 (self.state.ci.get() & 0x00FF_FFFF).to_be(),
             );
-        }
-    }
-
-    /// Set CQ moderation parameters.
-    ///
-    /// Moderation reduces interrupt overhead by batching completions.
-    /// The CQ will generate an interrupt when either threshold is reached:
-    /// - `cq_count` CQEs have been generated, or
-    /// - `cq_period` microseconds have elapsed since the first CQE
-    ///
-    /// # Arguments
-    /// * `moderation` - Moderation settings (count and period thresholds)
-    ///
-    /// # Errors
-    /// Returns an error if the moderation settings cannot be applied.
-    pub fn set_moderation(&self, moderation: CqModeration) -> io::Result<()> {
-        unsafe {
-            let mut attr: mlx5_sys::ibv_modify_cq_attr = MaybeUninit::zeroed().assume_init();
-            // IBV_CQ_ATTR_MODERATE = 1 (from libibverbs)
-            const IBV_CQ_ATTR_MODERATE: u32 = 1;
-            attr.attr_mask = IBV_CQ_ATTR_MODERATE;
-            attr.moderate.cq_count = moderation.cq_count;
-            attr.moderate.cq_period = moderation.cq_period;
-
-            let ret = mlx5_sys::ibv_modify_cq_ex(self.cq.as_ptr(), &mut attr);
-            if ret != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
         }
     }
 

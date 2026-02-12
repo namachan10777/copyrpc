@@ -6,21 +6,23 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
-use std::{io, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
+use std::{io, marker::PhantomData};
 
 use crate::BuildResult;
 use crate::CompletionTarget;
 use crate::builder_common::{MaybeMonoCqRegister, register_with_send_cq};
 use crate::cq::{Cq, Cqe};
 use crate::device::Context;
+use crate::devx::{DevxObj, DevxUmem};
 use crate::mono_cq::CompletionSource;
 use crate::mono_cq::MonoCq;
 use crate::pd::Pd;
-use crate::qp::QpInfo;
+use crate::prm;
+use crate::qp::AlignedBuf;
 use crate::srq::Srq;
 use crate::transport::IbRemoteDctInfo;
 use crate::wqe::{
-    InfiniBand, OrderedWqeTable, RoCE,
+    InfiniBand, OrderedWqeTable, RoCE, WQEBB_SIZE,
     emit::{DciEmitContext, SendQueueState},
 };
 
@@ -87,7 +89,7 @@ pub type DciRoCE<Entry, OnComplete> = Dci<Entry, RoCE, OrderedWqeTable<Entry>, O
 /// DC Initiator (DCI).
 ///
 /// Used for sending RDMA operations to DCTs.
-/// Created using mlx5dv_create_qp with DC type.
+/// Created using DevX PRM CREATE_QP with DC type.
 ///
 /// Type parameter `Entry` is the entry type stored in the WQE table for tracking
 /// in-flight operations. When a completion arrives, the associated entry is
@@ -96,7 +98,10 @@ pub type DciRoCE<Entry, OnComplete> = Dci<Entry, RoCE, OrderedWqeTable<Entry>, O
 /// Type parameter `TableType` determines sparse vs dense table behavior.
 /// Type parameter `OnComplete` is the completion callback type.
 pub struct Dci<Entry, Transport, TableType, OnComplete> {
-    qp: NonNull<mlx5_sys::ibv_qp>,
+    _devx_obj: DevxObj,
+    _umem: DevxUmem,
+    _wq_buf: AlignedBuf,
+    qpn: u32,
     state: Cell<DcQpState>,
     sq: Option<DciSendQueueState<Entry, TableType>>,
     callback: OnComplete,
@@ -106,6 +111,130 @@ pub struct Dci<Entry, Transport, TableType, OnComplete> {
     _pd: Pd,
     /// Phantom data for transport type parameter
     _transport: PhantomData<Transport>,
+}
+
+// =============================================================================
+// DCI DevX creation
+// =============================================================================
+
+/// Resources created by DevX DCI creation.
+struct DciResources {
+    devx_obj: DevxObj,
+    umem: DevxUmem,
+    wq_buf: AlignedBuf,
+    qpn: u32,
+    sq_buf: *mut u8,
+    dbrec: *mut u32,
+    bf_reg: *mut u8,
+    bf_size: u32,
+    log_sq_size: u32,
+}
+
+/// Create a DCI via DevX PRM CREATE_QP command.
+///
+/// # Safety
+/// The caller must ensure `ctx`, `pd` are valid and the context was opened with DevX.
+unsafe fn create_devx_dci(
+    ctx: &Context,
+    pd: &Pd,
+    send_cqn: u32,
+    config: &DciConfig,
+) -> io::Result<DciResources> {
+    // DCI is SQ-only (no RQ). Layout: [SQ | DBREC]
+    let log_sq_size = if config.max_send_wr == 0 {
+        0
+    } else {
+        (config.max_send_wr as usize).next_power_of_two().trailing_zeros()
+    };
+    let sq_size = (1usize << log_sq_size) * WQEBB_SIZE;
+    let dbrec_offset = (sq_size + 63) & !63;
+    let total_size = (dbrec_offset + 64 + 4095) & !4095;
+
+    let wq_buf = AlignedBuf::new(total_size);
+    let umem = ctx.register_umem(wq_buf.as_ptr(), total_size, 7)?;
+    let uar = ctx.devx_uar()?;
+
+    // Build CREATE_QP PRM command (no PAS needed with UMEM mode)
+    let cmd_in_size = prm::CREATE_QP_IN_BASE_SIZE;
+    let mut cmd_in = vec![0u8; cmd_in_size];
+    let mut cmd_out = vec![0u8; prm::CREATE_QP_OUT_SIZE];
+
+    let umem_id = umem.umem_id();
+
+    prm::prm_set(
+        &mut cmd_in,
+        prm::CREATE_QP_IN_OPCODE.0,
+        prm::CREATE_QP_IN_OPCODE.1,
+        prm::MLX5_CMD_OP_CREATE_QP,
+    );
+
+    // WQ UMEM fields
+    prm::prm_set(
+        &mut cmd_in,
+        prm::CREATE_QP_IN_WQ_UMEM_VALID.0,
+        prm::CREATE_QP_IN_WQ_UMEM_VALID.1,
+        1,
+    );
+    prm::prm_set(
+        &mut cmd_in,
+        prm::CREATE_QP_IN_WQ_UMEM_ID.0,
+        prm::CREATE_QP_IN_WQ_UMEM_ID.1,
+        umem_id,
+    );
+    prm::prm_set64(&mut cmd_in, prm::CREATE_QP_IN_WQ_UMEM_OFFSET, 0);
+
+    let q = prm::CREATE_QP_IN_QPC_OFF;
+    prm::prm_set(&mut cmd_in, q + prm::QPC_ST.0, prm::QPC_ST.1, prm::QP_ST_DCI);
+    prm::prm_set(&mut cmd_in, q + prm::QPC_PD.0, prm::QPC_PD.1, pd.pdn());
+    prm::prm_set(&mut cmd_in, q + prm::QPC_UAR_PAGE.0, prm::QPC_UAR_PAGE.1, uar.page_id());
+    prm::prm_set(&mut cmd_in, q + prm::QPC_LOG_SQ_SIZE.0, prm::QPC_LOG_SQ_SIZE.1, log_sq_size);
+    prm::prm_set(&mut cmd_in, q + prm::QPC_LOG_RQ_SIZE.0, prm::QPC_LOG_RQ_SIZE.1, 0); // No RQ
+    prm::prm_set(&mut cmd_in, q + prm::QPC_NO_SQ.0, prm::QPC_NO_SQ.1, 0); // Has SQ
+    prm::prm_set(&mut cmd_in, q + prm::QPC_LOG_MSG_MAX.0, prm::QPC_LOG_MSG_MAX.1, 30);
+    prm::prm_set(&mut cmd_in, q + prm::QPC_CQN_SND.0, prm::QPC_CQN_SND.1, send_cqn);
+    prm::prm_set(&mut cmd_in, q + prm::QPC_CQN_RCV.0, prm::QPC_CQN_RCV.1, send_cqn);
+
+    // DBR UMEM fields
+    prm::prm_set(&mut cmd_in, q + prm::QPC_DBR_UMEM_VALID.0, prm::QPC_DBR_UMEM_VALID.1, 1);
+    prm::prm_set(&mut cmd_in, q + prm::QPC_DBR_UMEM_ID.0, prm::QPC_DBR_UMEM_ID.1, umem_id);
+    prm::prm_set64(
+        &mut cmd_in,
+        q + prm::QPC_DBR_ADDR,
+        dbrec_offset as u64,
+    );
+
+    // Debug: dump CREATE_QP PRM command for DCI
+    eprintln!("=== DCI CREATE_QP PRM command ({} bytes) ===", cmd_in.len());
+    eprintln!("  sq_size={}, dbrec_offset={}, total={}", sq_size, dbrec_offset, total_size);
+    eprintln!("  log_sq={}, umem_id={}, uar_page={}, pd={}", log_sq_size, umem_id, uar.page_id(), pd.pdn());
+    eprintln!("  send_cqn={}", send_cqn);
+    for i in (0..cmd_in.len()).step_by(16) {
+        let end = (i + 16).min(cmd_in.len());
+        let hex: Vec<String> = cmd_in[i..end].iter().map(|b| format!("{:02x}", b)).collect();
+        if hex.iter().any(|s| s != "00") {
+            eprintln!("  {:04x}: {}", i, hex.join(" "));
+        }
+    }
+
+    let devx_obj = ctx.devx_obj_create(&cmd_in, &mut cmd_out)?;
+    let qpn = prm::prm_get(&cmd_out, prm::CREATE_QP_OUT_QPN.0, prm::CREATE_QP_OUT_QPN.1);
+
+    eprintln!("  DCI QPN: 0x{:x}", qpn);
+
+    let sq_buf = wq_buf.as_ptr();
+    let dbrec = wq_buf.as_ptr().add(dbrec_offset) as *mut u32;
+
+    Ok(DciResources {
+        devx_obj,
+        umem,
+        wq_buf,
+        qpn,
+        sq_buf,
+        dbrec,
+        bf_reg: uar.reg_addr(),
+        bf_size: 256,
+        log_sq_size,
+    })
 }
 
 // =============================================================================
@@ -122,7 +251,7 @@ pub struct DciBuilder<'a, Entry, T, CqState, OnComplete, SqMono = ()> {
     ctx: &'a Context,
     pd: &'a Pd,
     config: DciConfig,
-    send_cq_ptr: *mut mlx5_sys::ibv_cq,
+    send_cqn: u32,
     send_cq_weak: Option<Weak<Cq>>,
     callback: OnComplete,
     sq_mono_cq_ref: SqMono,
@@ -147,7 +276,7 @@ impl Context {
             ctx: self,
             pd,
             config: config.clone(),
-            send_cq_ptr: std::ptr::null_mut(),
+            send_cqn: 0,
             send_cq_weak: None,
             callback: (),
             sq_mono_cq_ref: (),
@@ -170,7 +299,7 @@ impl<'a, Entry, T> DciBuilder<'a, Entry, T, NoCq, (), ()> {
             ctx: self.ctx,
             pd: self.pd,
             config: self.config,
-            send_cq_ptr: cq.as_ptr(),
+            send_cqn: cq.cqn(),
             send_cq_weak: Some(Rc::downgrade(&cq)),
             callback,
             sq_mono_cq_ref: (),
@@ -190,7 +319,7 @@ impl<'a, Entry, T> DciBuilder<'a, Entry, T, NoCq, (), ()> {
             ctx: self.ctx,
             pd: self.pd,
             config: self.config,
-            send_cq_ptr: mono_cq.as_ptr(),
+            send_cqn: mono_cq.cqn(),
             send_cq_weak: None, // MonoCq doesn't need CQ registration
             callback: (),
             sq_mono_cq_ref: Rc::clone(mono_cq),
@@ -206,7 +335,7 @@ impl<'a, Entry, T> DciBuilder<'a, Entry, T, NoCq, (), ()> {
             ctx: self.ctx,
             pd: self.pd,
             config: self.config,
-            send_cq_ptr: self.send_cq_ptr,
+            send_cqn: self.send_cqn,
             send_cq_weak: self.send_cq_weak,
             callback: self.callback,
             sq_mono_cq_ref: self.sq_mono_cq_ref,
@@ -223,50 +352,39 @@ where
     /// Build the DCI with normal CQ.
     pub fn build(self) -> BuildResult<DciWithTable<Entry, OnComplete>> {
         unsafe {
-            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
-            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_DRIVER;
-            qp_attr.send_cq = self.send_cq_ptr;
-            qp_attr.recv_cq = self.send_cq_ptr;
-            qp_attr.cap.max_send_wr = self.config.max_send_wr;
-            qp_attr.cap.max_recv_wr = 0;
-            qp_attr.cap.max_send_sge = self.config.max_send_sge;
-            qp_attr.cap.max_recv_sge = 0;
-            qp_attr.cap.max_inline_data = self.config.max_inline_data;
-            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
-            qp_attr.pd = self.pd.as_ptr();
+            let res = create_devx_dci(self.ctx, self.pd, self.send_cqn, &self.config)?;
 
-            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
-            mlx5_attr.comp_mask =
-                mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_DC as u64;
-            mlx5_attr.dc_init_attr.dc_type = mlx5_sys::mlx5dv_dc_type_MLX5DV_DCTYPE_DCI;
-            mlx5_attr
-                .dc_init_attr
-                .__bindgen_anon_1
-                .dci_streams
-                .log_num_concurent = 0;
-            mlx5_attr
-                .dc_init_attr
-                .__bindgen_anon_1
-                .dci_streams
-                .log_num_errored = 0;
+            let wqe_cnt = 1u16 << res.log_sq_size;
+            let sq = Some(DciSendQueueState {
+                buf: res.sq_buf,
+                wqe_cnt,
+                sqn: res.qpn, // SQN = QPN for DCI
+                pi: Cell::new(0),
+                ci: Cell::new(0),
+                last_wqe: Cell::new(None),
+                dbrec: res.dbrec,
+                bf_reg: res.bf_reg,
+                bf_size: res.bf_size,
+                bf_offset: Cell::new(0),
+                table: OrderedWqeTable::new(wqe_cnt),
+                _marker: PhantomData,
+            });
 
-            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
-            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
-
-            let mut result = Dci {
-                qp,
+            let result = Dci {
+                _devx_obj: res.devx_obj,
+                _umem: res.umem,
+                _wq_buf: res.wq_buf,
+                qpn: res.qpn,
                 state: Cell::new(DcQpState::Reset),
-                sq: None,
+                sq,
                 callback: self.callback,
                 send_cq: self.send_cq_weak.clone().unwrap_or_default(),
                 _pd: self.pd.clone(),
                 _transport: PhantomData,
             };
 
-            DciWithTable::<Entry, OnComplete>::init_direct_access_internal(&mut result)?;
-
             let dci_rc = Rc::new(RefCell::new(result));
-            let qpn = dci_rc.borrow().qpn();
+            let qpn = dci_rc.borrow().qpn;
 
             // Register with CQ if using normal Cq
             register_with_send_cq(qpn, &self.send_cq_weak, &dci_rc);
@@ -287,47 +405,36 @@ where
     /// Build the DCI for MonoCq.
     pub fn build(self) -> BuildResult<DciForMonoCq<Entry>> {
         unsafe {
-            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
-            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_DRIVER;
-            qp_attr.send_cq = self.send_cq_ptr;
-            qp_attr.recv_cq = self.send_cq_ptr;
-            qp_attr.cap.max_send_wr = self.config.max_send_wr;
-            qp_attr.cap.max_recv_wr = 0;
-            qp_attr.cap.max_send_sge = self.config.max_send_sge;
-            qp_attr.cap.max_recv_sge = 0;
-            qp_attr.cap.max_inline_data = self.config.max_inline_data;
-            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
-            qp_attr.pd = self.pd.as_ptr();
+            let res = create_devx_dci(self.ctx, self.pd, self.send_cqn, &self.config)?;
 
-            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
-            mlx5_attr.comp_mask =
-                mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_DC as u64;
-            mlx5_attr.dc_init_attr.dc_type = mlx5_sys::mlx5dv_dc_type_MLX5DV_DCTYPE_DCI;
-            mlx5_attr
-                .dc_init_attr
-                .__bindgen_anon_1
-                .dci_streams
-                .log_num_concurent = 0;
-            mlx5_attr
-                .dc_init_attr
-                .__bindgen_anon_1
-                .dci_streams
-                .log_num_errored = 0;
+            let wqe_cnt = 1u16 << res.log_sq_size;
+            let sq = Some(DciSendQueueState {
+                buf: res.sq_buf,
+                wqe_cnt,
+                sqn: res.qpn, // SQN = QPN for DCI
+                pi: Cell::new(0),
+                ci: Cell::new(0),
+                last_wqe: Cell::new(None),
+                dbrec: res.dbrec,
+                bf_reg: res.bf_reg,
+                bf_size: res.bf_size,
+                bf_offset: Cell::new(0),
+                table: OrderedWqeTable::new(wqe_cnt),
+                _marker: PhantomData,
+            });
 
-            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
-            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
-
-            let mut result = Dci {
-                qp,
+            let result = Dci {
+                _devx_obj: res.devx_obj,
+                _umem: res.umem,
+                _wq_buf: res.wq_buf,
+                qpn: res.qpn,
                 state: Cell::new(DcQpState::Reset),
-                sq: None,
+                sq,
                 callback: (),
                 send_cq: Weak::new(),
                 _pd: self.pd.clone(),
                 _transport: PhantomData,
             };
-
-            DciForMonoCq::<Entry>::init_direct_access_internal(&mut result)?;
 
             let qp_rc = Rc::new(RefCell::new(result));
             self.sq_mono_cq_ref.maybe_register(&qp_rc);
@@ -342,62 +449,21 @@ impl<Entry, Transport, TableType, OnComplete> Drop
     fn drop(&mut self) {
         // Unregister from CQ before destroying QP
         if let Some(cq) = self.send_cq.upgrade() {
-            cq.unregister_queue(self.qpn());
+            cq.unregister_queue(self.qpn);
         }
-        unsafe {
-            mlx5_sys::ibv_destroy_qp(self.qp.as_ptr());
-        }
+        // DevxObj handles QP destruction
     }
 }
 
 impl<Entry, Transport, TableType, OnComplete> Dci<Entry, Transport, TableType, OnComplete> {
     /// Get the QP number.
     pub fn qpn(&self) -> u32 {
-        unsafe { (*self.qp.as_ptr()).qp_num }
+        self.qpn
     }
 
     /// Get the current QP state.
     pub fn state(&self) -> DcQpState {
         self.state.get()
-    }
-
-    /// Get mlx5-specific QP information for direct WQE access.
-    fn query_info(&self) -> io::Result<QpInfo> {
-        unsafe {
-            let mut dv_qp: MaybeUninit<mlx5_sys::mlx5dv_qp> = MaybeUninit::zeroed();
-            let mut obj: MaybeUninit<mlx5_sys::mlx5dv_obj> = MaybeUninit::zeroed();
-
-            let dv_qp_ptr = dv_qp.as_mut_ptr();
-            (*dv_qp_ptr).comp_mask =
-                mlx5_sys::mlx5dv_qp_comp_mask_MLX5DV_QP_MASK_RAW_QP_HANDLES as u64;
-
-            let obj_ptr = obj.as_mut_ptr();
-            (*obj_ptr).qp.in_ = self.qp.as_ptr();
-            (*obj_ptr).qp.out = dv_qp_ptr;
-
-            let ret =
-                mlx5_sys::mlx5dv_init_obj(obj_ptr, mlx5_sys::mlx5dv_obj_type_MLX5DV_OBJ_QP as u64);
-            if ret != 0 {
-                return Err(io::Error::from_raw_os_error(-ret));
-            }
-
-            let dv_qp = dv_qp.assume_init();
-            let qp_num = (*self.qp.as_ptr()).qp_num;
-            let sqn = if dv_qp.sqn != 0 { dv_qp.sqn } else { qp_num };
-
-            Ok(QpInfo {
-                dbrec: dv_qp.dbrec,
-                sq_buf: dv_qp.sq.buf as *mut u8,
-                sq_wqe_cnt: dv_qp.sq.wqe_cnt,
-                sq_stride: dv_qp.sq.stride,
-                rq_buf: dv_qp.rq.buf as *mut u8,
-                rq_wqe_cnt: dv_qp.rq.wqe_cnt,
-                rq_stride: dv_qp.rq.stride,
-                bf_reg: dv_qp.bf.reg as *mut u8,
-                bf_size: dv_qp.bf.size,
-                sqn,
-            })
-        }
     }
 
     /// Transition DCI from RESET to INIT.
@@ -409,21 +475,22 @@ impl<Entry, Transport, TableType, OnComplete> Dci<Entry, Transport, TableType, O
             ));
         }
 
-        unsafe {
-            let mut attr: mlx5_sys::ibv_qp_attr = MaybeUninit::zeroed().assume_init();
-            attr.qp_state = mlx5_sys::ibv_qp_state_IBV_QPS_INIT;
-            attr.pkey_index = 0;
-            attr.port_num = port;
+        let mut cmd_in = vec![0u8; prm::MODIFY_QP_IN_SIZE];
+        let mut cmd_out = vec![0u8; prm::MODIFY_QP_OUT_SIZE];
 
-            let mask = mlx5_sys::ibv_qp_attr_mask_IBV_QP_STATE
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_PKEY_INDEX
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_PORT;
+        prm::prm_set(&mut cmd_in, prm::MODIFY_QP_IN_OPCODE.0, prm::MODIFY_QP_IN_OPCODE.1, prm::MLX5_CMD_OP_RST2INIT_QP);
+        prm::prm_set(&mut cmd_in, prm::MODIFY_QP_IN_QPN.0, prm::MODIFY_QP_IN_QPN.1, self.qpn);
 
-            let ret = mlx5_sys::ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask as i32);
-            if ret != 0 {
-                return Err(io::Error::from_raw_os_error(ret));
-            }
-        }
+        let q = prm::MODIFY_QP_IN_QPC_OFF;
+        let ads = q + prm::QPC_PRI_ADS;
+
+        // PM state = migrated (required by FW)
+        prm::prm_set(&mut cmd_in, q + prm::QPC_PM_STATE.0, prm::QPC_PM_STATE.1, 2);
+        // Primary address path: port
+        prm::prm_set(&mut cmd_in, ads + prm::ADS_VHCA_PORT_NUM.0, prm::ADS_VHCA_PORT_NUM.1, port as u32);
+
+        let ret = self._devx_obj.modify(&cmd_in, &mut cmd_out);
+        prm::check_prm_result(ret, &cmd_out, "RST2INIT_QP")?;
 
         self.state.set(DcQpState::Init);
         Ok(())
@@ -438,21 +505,20 @@ impl<Entry, Transport, TableType, OnComplete> Dci<Entry, Transport, TableType, O
             ));
         }
 
-        unsafe {
-            let mut attr: mlx5_sys::ibv_qp_attr = MaybeUninit::zeroed().assume_init();
-            attr.qp_state = mlx5_sys::ibv_qp_state_IBV_QPS_RTR;
-            attr.path_mtu = mlx5_sys::ibv_mtu_IBV_MTU_4096;
-            attr.ah_attr.port_num = port;
+        let mut cmd_in = vec![0u8; prm::MODIFY_QP_IN_SIZE];
+        let mut cmd_out = vec![0u8; prm::MODIFY_QP_OUT_SIZE];
 
-            let mask = mlx5_sys::ibv_qp_attr_mask_IBV_QP_STATE
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_PATH_MTU
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_AV;
+        prm::prm_set(&mut cmd_in, prm::MODIFY_QP_IN_OPCODE.0, prm::MODIFY_QP_IN_OPCODE.1, prm::MLX5_CMD_OP_INIT2RTR_QP);
+        prm::prm_set(&mut cmd_in, prm::MODIFY_QP_IN_QPN.0, prm::MODIFY_QP_IN_QPN.1, self.qpn);
 
-            let ret = mlx5_sys::ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask as i32);
-            if ret != 0 {
-                return Err(io::Error::from_raw_os_error(ret));
-            }
-        }
+        let q = prm::MODIFY_QP_IN_QPC_OFF;
+        let ads = q + prm::QPC_PRI_ADS;
+
+        prm::prm_set(&mut cmd_in, q + prm::QPC_MTU.0, prm::QPC_MTU.1, 5); // MTU 4096
+        prm::prm_set(&mut cmd_in, ads + prm::ADS_VHCA_PORT_NUM.0, prm::ADS_VHCA_PORT_NUM.1, port as u32);
+
+        let ret = self._devx_obj.modify(&cmd_in, &mut cmd_out);
+        prm::check_prm_result(ret, &cmd_out, "INIT2RTR_QP")?;
 
         self.state.set(DcQpState::Rtr);
         Ok(())
@@ -467,27 +533,28 @@ impl<Entry, Transport, TableType, OnComplete> Dci<Entry, Transport, TableType, O
             ));
         }
 
-        unsafe {
-            let mut attr: mlx5_sys::ibv_qp_attr = MaybeUninit::zeroed().assume_init();
-            attr.qp_state = mlx5_sys::ibv_qp_state_IBV_QPS_RTS;
-            attr.timeout = 14;
-            attr.retry_cnt = 7;
-            attr.rnr_retry = 7;
-            attr.sq_psn = local_psn;
-            attr.max_rd_atomic = max_rd_atomic;
+        let mut cmd_in = vec![0u8; prm::MODIFY_QP_IN_SIZE];
+        let mut cmd_out = vec![0u8; prm::MODIFY_QP_OUT_SIZE];
 
-            let mask = mlx5_sys::ibv_qp_attr_mask_IBV_QP_STATE
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_TIMEOUT
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_RETRY_CNT
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_RNR_RETRY
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_SQ_PSN
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_MAX_QP_RD_ATOMIC;
+        prm::prm_set(&mut cmd_in, prm::MODIFY_QP_IN_OPCODE.0, prm::MODIFY_QP_IN_OPCODE.1, prm::MLX5_CMD_OP_RTR2RTS_QP);
+        prm::prm_set(&mut cmd_in, prm::MODIFY_QP_IN_QPN.0, prm::MODIFY_QP_IN_QPN.1, self.qpn);
 
-            let ret = mlx5_sys::ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask as i32);
-            if ret != 0 {
-                return Err(io::Error::from_raw_os_error(ret));
-            }
-        }
+        let q = prm::MODIFY_QP_IN_QPC_OFF;
+        let ads = q + prm::QPC_PRI_ADS;
+
+        let log_sra = if max_rd_atomic > 0 {
+            (max_rd_atomic as u32).next_power_of_two().trailing_zeros()
+        } else {
+            0
+        };
+        prm::prm_set(&mut cmd_in, q + prm::QPC_LOG_SRA_MAX.0, prm::QPC_LOG_SRA_MAX.1, log_sra);
+        prm::prm_set(&mut cmd_in, q + prm::QPC_RETRY_COUNT.0, prm::QPC_RETRY_COUNT.1, 7);
+        prm::prm_set(&mut cmd_in, q + prm::QPC_RNR_RETRY.0, prm::QPC_RNR_RETRY.1, 7);
+        prm::prm_set(&mut cmd_in, q + prm::QPC_NEXT_SEND_PSN.0, prm::QPC_NEXT_SEND_PSN.1, local_psn);
+        prm::prm_set(&mut cmd_in, ads + prm::ADS_ACK_TIMEOUT.0, prm::ADS_ACK_TIMEOUT.1, 14);
+
+        let ret = self._devx_obj.modify(&cmd_in, &mut cmd_out);
+        prm::check_prm_result(ret, &cmd_out, "RTR2RTS_QP")?;
 
         self.state.set(DcQpState::Rts);
         Ok(())
@@ -541,33 +608,6 @@ impl<Entry, OnComplete> DciWithTable<Entry, OnComplete> {
 }
 
 impl<Entry, OnComplete> DciWithTable<Entry, OnComplete> {
-    /// Initialize direct queue access (internal implementation).
-    fn init_direct_access_internal(&mut self) -> io::Result<()> {
-        if self.sq.is_some() {
-            return Ok(()); // Already initialized
-        }
-
-        let info = self.query_info()?;
-        let wqe_cnt = info.sq_wqe_cnt as u16;
-
-        self.sq = Some(DciSendQueueState {
-            buf: info.sq_buf,
-            wqe_cnt,
-            sqn: info.sqn,
-            pi: Cell::new(0),
-            ci: Cell::new(0),
-            last_wqe: Cell::new(None),
-            dbrec: info.dbrec,
-            bf_reg: info.bf_reg,
-            bf_size: info.bf_size,
-            bf_offset: Cell::new(0),
-            table: OrderedWqeTable::new(wqe_cnt),
-            _marker: PhantomData,
-        });
-
-        Ok(())
-    }
-
     /// Activate DCI (transition to RTS).
     /// Direct queue access is auto-initialized at creation time.
     pub fn activate(&mut self, port: u8, local_psn: u32, max_rd_atomic: u8) -> io::Result<()> {
@@ -623,18 +663,116 @@ impl<Entry> CompletionSource for DciForMonoCq<Entry> {
 /// DC Target (DCT).
 ///
 /// Receives RDMA operations from DCIs via an SRQ.
-/// Created using mlx5dv_create_qp with DC type.
+/// Created using DevX PRM CREATE_QP with DC type.
 ///
 /// Type parameter `T` is the entry type stored in the SRQ for tracking
 /// in-flight receives.
 pub struct Dct<T> {
-    qp: NonNull<mlx5_sys::ibv_qp>,
+    _devx_obj: DevxObj,
+    _umem: DevxUmem,
+    _wq_buf: AlignedBuf,
+    dctn: u32,
     dc_key: u64,
     state: DcQpState,
     /// Keep the PD alive while this DCT exists.
     _pd: Pd,
     /// SRQ for receive processing.
     srq: Srq<T>,
+}
+
+// =============================================================================
+// DCT DevX creation
+// =============================================================================
+
+/// Resources created by DevX DCT creation.
+struct DctResources {
+    devx_obj: DevxObj,
+    umem: DevxUmem,
+    wq_buf: AlignedBuf,
+    qpn: u32,
+}
+
+/// Create a DCT via DevX PRM CREATE_QP command.
+///
+/// # Safety
+/// The caller must ensure `ctx`, `pd` are valid and the context was opened with DevX.
+unsafe fn create_devx_dct(
+    ctx: &Context,
+    pd: &Pd,
+    recv_cqn: u32,
+    srqn: u32,
+    config: &DctConfig,
+) -> io::Result<DctResources> {
+    // DCT has no SQ/RQ buffers, only DBREC (minimal buffer)
+    let dbrec_offset = 0usize;
+    let total_size = 4096; // One page for DBREC
+
+    let wq_buf = AlignedBuf::new(total_size);
+    let umem = ctx.register_umem(wq_buf.as_ptr(), total_size, 7)?;
+    let uar = ctx.devx_uar()?;
+
+    // Build CREATE_QP PRM command (no PAS needed with UMEM mode)
+    let cmd_in_size = prm::CREATE_QP_IN_BASE_SIZE;
+    let mut cmd_in = vec![0u8; cmd_in_size];
+    let mut cmd_out = vec![0u8; prm::CREATE_QP_OUT_SIZE];
+
+    let umem_id = umem.umem_id();
+
+    prm::prm_set(
+        &mut cmd_in,
+        prm::CREATE_QP_IN_OPCODE.0,
+        prm::CREATE_QP_IN_OPCODE.1,
+        prm::MLX5_CMD_OP_CREATE_QP,
+    );
+
+    // WQ UMEM fields
+    prm::prm_set(
+        &mut cmd_in,
+        prm::CREATE_QP_IN_WQ_UMEM_VALID.0,
+        prm::CREATE_QP_IN_WQ_UMEM_VALID.1,
+        1,
+    );
+    prm::prm_set(
+        &mut cmd_in,
+        prm::CREATE_QP_IN_WQ_UMEM_ID.0,
+        prm::CREATE_QP_IN_WQ_UMEM_ID.1,
+        umem_id,
+    );
+    prm::prm_set64(&mut cmd_in, prm::CREATE_QP_IN_WQ_UMEM_OFFSET, 0);
+
+    let q = prm::CREATE_QP_IN_QPC_OFF;
+    prm::prm_set(&mut cmd_in, q + prm::QPC_ST.0, prm::QPC_ST.1, prm::QP_ST_DCR);
+    prm::prm_set(&mut cmd_in, q + prm::QPC_PD.0, prm::QPC_PD.1, pd.pdn());
+    prm::prm_set(&mut cmd_in, q + prm::QPC_UAR_PAGE.0, prm::QPC_UAR_PAGE.1, uar.page_id());
+    prm::prm_set(&mut cmd_in, q + prm::QPC_LOG_SQ_SIZE.0, prm::QPC_LOG_SQ_SIZE.1, 0);
+    prm::prm_set(&mut cmd_in, q + prm::QPC_LOG_RQ_SIZE.0, prm::QPC_LOG_RQ_SIZE.1, 0);
+    prm::prm_set(&mut cmd_in, q + prm::QPC_NO_SQ.0, prm::QPC_NO_SQ.1, 1); // No SQ
+    prm::prm_set(&mut cmd_in, q + prm::QPC_CQN_SND.0, prm::QPC_CQN_SND.1, recv_cqn);
+    prm::prm_set(&mut cmd_in, q + prm::QPC_CQN_RCV.0, prm::QPC_CQN_RCV.1, recv_cqn);
+    prm::prm_set(&mut cmd_in, q + prm::QPC_RQ_TYPE.0, prm::QPC_RQ_TYPE.1, 1); // SRQ
+    prm::prm_set(&mut cmd_in, q + prm::QPC_SRQN_RMPN_XRQN.0, prm::QPC_SRQN_RMPN_XRQN.1, srqn);
+
+    // DC access key (64-bit)
+    prm::prm_set64(&mut cmd_in, q + prm::QPC_DC_ACCESS_KEY, config.dc_key);
+
+    // DBR UMEM fields
+    prm::prm_set(&mut cmd_in, q + prm::QPC_DBR_UMEM_VALID.0, prm::QPC_DBR_UMEM_VALID.1, 1);
+    prm::prm_set(&mut cmd_in, q + prm::QPC_DBR_UMEM_ID.0, prm::QPC_DBR_UMEM_ID.1, umem_id);
+    prm::prm_set64(
+        &mut cmd_in,
+        q + prm::QPC_DBR_ADDR,
+        dbrec_offset as u64,
+    );
+
+    let devx_obj = ctx.devx_obj_create(&cmd_in, &mut cmd_out)?;
+    let qpn = prm::prm_get(&cmd_out, prm::CREATE_QP_OUT_QPN.0, prm::CREATE_QP_OUT_QPN.1);
+
+    Ok(DctResources {
+        devx_obj,
+        umem,
+        wq_buf,
+        qpn,
+    })
 }
 
 // =============================================================================
@@ -647,7 +785,7 @@ pub struct DctBuilder<'a, Entry, CqState> {
     pd: &'a Pd,
     srq: &'a Srq<Entry>,
     config: DctConfig,
-    recv_cq_ptr: *mut mlx5_sys::ibv_cq,
+    recv_cqn: u32,
     _marker: PhantomData<CqState>,
 }
 
@@ -671,7 +809,7 @@ impl Context {
             pd,
             srq,
             config: config.clone(),
-            recv_cq_ptr: std::ptr::null_mut(),
+            recv_cqn: 0,
             _marker: PhantomData,
         }
     }
@@ -685,7 +823,7 @@ impl<'a, Entry> DctBuilder<'a, Entry, NoCq> {
             pd: self.pd,
             srq: self.srq,
             config: self.config,
-            recv_cq_ptr: cq.as_ptr(),
+            recv_cqn: cq.cqn(),
             _marker: PhantomData,
         }
     }
@@ -700,7 +838,7 @@ impl<'a, Entry> DctBuilder<'a, Entry, NoCq> {
             pd: self.pd,
             srq: self.srq,
             config: self.config,
-            recv_cq_ptr: mono_cq.as_ptr(),
+            recv_cqn: mono_cq.cqn(),
             _marker: PhantomData,
         }
     }
@@ -709,32 +847,18 @@ impl<'a, Entry> DctBuilder<'a, Entry, NoCq> {
 impl<'a, Entry> DctBuilder<'a, Entry, CqSet> {
     /// Build the DCT.
     pub fn build(self) -> io::Result<Dct<Entry>> {
+        let srqn = self.srq.srq_number()?;
         unsafe {
-            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
-            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_DRIVER;
-            qp_attr.send_cq = self.recv_cq_ptr;
-            qp_attr.recv_cq = self.recv_cq_ptr;
-            qp_attr.srq = self.srq.as_ptr();
-            qp_attr.cap.max_recv_wr = 0;
-            qp_attr.cap.max_recv_sge = 0;
-            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
-            qp_attr.pd = self.pd.as_ptr();
-
-            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
-            mlx5_attr.comp_mask =
-                mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_DC as u64;
-            mlx5_attr.dc_init_attr.dc_type = mlx5_sys::mlx5dv_dc_type_MLX5DV_DCTYPE_DCT;
-            mlx5_attr.dc_init_attr.__bindgen_anon_1.dct_access_key = self.config.dc_key;
-
-            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
-            NonNull::new(qp).map_or(Err(io::Error::last_os_error()), |qp| {
-                Ok(Dct {
-                    qp,
-                    dc_key: self.config.dc_key,
-                    state: DcQpState::Reset,
-                    _pd: self.pd.clone(),
-                    srq: self.srq.clone(),
-                })
+            let res = create_devx_dct(self.ctx, self.pd, self.recv_cqn, srqn, &self.config)?;
+            Ok(Dct {
+                _devx_obj: res.devx_obj,
+                _umem: res.umem,
+                _wq_buf: res.wq_buf,
+                dctn: res.qpn,
+                dc_key: self.config.dc_key,
+                state: DcQpState::Reset,
+                _pd: self.pd.clone(),
+                srq: self.srq.clone(),
             })
         }
     }
@@ -742,16 +866,14 @@ impl<'a, Entry> DctBuilder<'a, Entry, CqSet> {
 
 impl<T> Drop for Dct<T> {
     fn drop(&mut self) {
-        unsafe {
-            mlx5_sys::ibv_destroy_qp(self.qp.as_ptr());
-        }
+        // DevxObj handles QP destruction
     }
 }
 
 impl<T> Dct<T> {
     /// Get the DCT number.
     pub fn dctn(&self) -> u32 {
-        unsafe { (*self.qp.as_ptr()).qp_num }
+        self.dctn
     }
 
     /// Get the DC key.
@@ -773,23 +895,33 @@ impl<T> Dct<T> {
             ));
         }
 
-        unsafe {
-            let mut attr: mlx5_sys::ibv_qp_attr = MaybeUninit::zeroed().assume_init();
-            attr.qp_state = mlx5_sys::ibv_qp_state_IBV_QPS_INIT;
-            attr.pkey_index = 0;
-            attr.port_num = port;
-            attr.qp_access_flags = access_flags;
+        let mut cmd_in = vec![0u8; prm::MODIFY_QP_IN_SIZE];
+        let mut cmd_out = vec![0u8; prm::MODIFY_QP_OUT_SIZE];
 
-            let mask = mlx5_sys::ibv_qp_attr_mask_IBV_QP_STATE
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_PKEY_INDEX
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_PORT
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_ACCESS_FLAGS;
+        prm::prm_set(&mut cmd_in, prm::MODIFY_QP_IN_OPCODE.0, prm::MODIFY_QP_IN_OPCODE.1, prm::MLX5_CMD_OP_RST2INIT_QP);
+        prm::prm_set(&mut cmd_in, prm::MODIFY_QP_IN_QPN.0, prm::MODIFY_QP_IN_QPN.1, self.dctn);
 
-            let ret = mlx5_sys::ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask as i32);
-            if ret != 0 {
-                return Err(io::Error::from_raw_os_error(ret));
-            }
+        let q = prm::MODIFY_QP_IN_QPC_OFF;
+        let ads = q + prm::QPC_PRI_ADS;
+
+        // PM state = migrated (required by FW)
+        prm::prm_set(&mut cmd_in, q + prm::QPC_PM_STATE.0, prm::QPC_PM_STATE.1, 2);
+        // Primary address path: port
+        prm::prm_set(&mut cmd_in, ads + prm::ADS_VHCA_PORT_NUM.0, prm::ADS_VHCA_PORT_NUM.1, port as u32);
+
+        // Access flags: RRE, RWE, RAE
+        if access_flags & 1 != 0 {
+            prm::prm_set(&mut cmd_in, q + prm::QPC_RRE.0, prm::QPC_RRE.1, 1);
         }
+        if access_flags & 2 != 0 {
+            prm::prm_set(&mut cmd_in, q + prm::QPC_RWE.0, prm::QPC_RWE.1, 1);
+        }
+        if access_flags & 4 != 0 {
+            prm::prm_set(&mut cmd_in, q + prm::QPC_RAE.0, prm::QPC_RAE.1, 1);
+        }
+
+        let ret = self._devx_obj.modify(&cmd_in, &mut cmd_out);
+        prm::check_prm_result(ret, &cmd_out, "RST2INIT_QP")?;
 
         self.state = DcQpState::Init;
         Ok(())
@@ -806,23 +938,21 @@ impl<T> Dct<T> {
             ));
         }
 
-        unsafe {
-            let mut attr: mlx5_sys::ibv_qp_attr = MaybeUninit::zeroed().assume_init();
-            attr.qp_state = mlx5_sys::ibv_qp_state_IBV_QPS_RTR;
-            attr.path_mtu = mlx5_sys::ibv_mtu_IBV_MTU_4096;
-            attr.min_rnr_timer = min_rnr_timer;
-            attr.ah_attr.port_num = port;
+        let mut cmd_in = vec![0u8; prm::MODIFY_QP_IN_SIZE];
+        let mut cmd_out = vec![0u8; prm::MODIFY_QP_OUT_SIZE];
 
-            let mask = mlx5_sys::ibv_qp_attr_mask_IBV_QP_STATE
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_PATH_MTU
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_MIN_RNR_TIMER
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_AV;
+        prm::prm_set(&mut cmd_in, prm::MODIFY_QP_IN_OPCODE.0, prm::MODIFY_QP_IN_OPCODE.1, prm::MLX5_CMD_OP_INIT2RTR_QP);
+        prm::prm_set(&mut cmd_in, prm::MODIFY_QP_IN_QPN.0, prm::MODIFY_QP_IN_QPN.1, self.dctn);
 
-            let ret = mlx5_sys::ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask as i32);
-            if ret != 0 {
-                return Err(io::Error::from_raw_os_error(ret));
-            }
-        }
+        let q = prm::MODIFY_QP_IN_QPC_OFF;
+        let ads = q + prm::QPC_PRI_ADS;
+
+        prm::prm_set(&mut cmd_in, q + prm::QPC_MTU.0, prm::QPC_MTU.1, 5); // MTU 4096
+        prm::prm_set(&mut cmd_in, q + prm::QPC_MIN_RNR_NAK.0, prm::QPC_MIN_RNR_NAK.1, min_rnr_timer as u32);
+        prm::prm_set(&mut cmd_in, ads + prm::ADS_VHCA_PORT_NUM.0, prm::ADS_VHCA_PORT_NUM.1, port as u32);
+
+        let ret = self._devx_obj.modify(&cmd_in, &mut cmd_out);
+        prm::check_prm_result(ret, &cmd_out, "INIT2RTR_QP")?;
 
         self.state = DcQpState::Rtr;
         Ok(())

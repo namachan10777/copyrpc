@@ -118,6 +118,7 @@ pub trait SqState {
         mmio_flush_writes!();
 
         unsafe {
+            // MLX5 PRM DBR: dbrec[0]=RCV, dbrec[1]=SND
             std::ptr::write_volatile(self.dbrec().add(1), (self.pi().get() as u32).to_be());
         }
 
@@ -279,6 +280,7 @@ impl<'a, Q: SqState> BlueframeBatch<'a, Q> {
 
         // Update doorbell record
         unsafe {
+            // MLX5 PRM DBR: dbrec[1]=SND
             std::ptr::write_volatile(self.qp.dbrec().add(1), (self.qp.pi().get() as u32).to_be());
         }
 
@@ -340,7 +342,7 @@ pub(crate) unsafe fn bf_copy_and_toggle(
     }
 }
 
-/// SQ BlueFlame batch finish: update dbrec[1] with PI, then copy buffer to BF register.
+/// SQ BlueFlame batch finish: update dbrec[1] (SND counter) with PI, then copy buffer to BF register.
 ///
 /// Common finish logic for all SQ BlueFlame batch types (RC, DCI, UD).
 ///
@@ -361,6 +363,7 @@ pub(crate) unsafe fn bf_finish_sq(
 ) {
     mmio_flush_writes!();
 
+    // MLX5 PRM DBR: dbrec[1]=SND counter
     std::ptr::write_volatile(dbrec.add(1), (pi as u32).to_be());
 
     udma_to_device_barrier!();
@@ -368,7 +371,7 @@ pub(crate) unsafe fn bf_finish_sq(
     bf_copy_and_toggle(bf_reg, bf_size, bf_offset, buffer, data_len);
 }
 
-/// RQ BlueFlame batch finish: update dbrec[0] with PI (as u32), then copy buffer to BF register.
+/// RQ BlueFlame batch finish: update dbrec[0] (RCV counter) with PI, then copy buffer to BF register.
 ///
 /// Common finish logic for all RQ BlueFlame batch types.
 ///
@@ -388,6 +391,7 @@ pub(crate) unsafe fn bf_finish_rq(
 ) {
     mmio_flush_writes!();
 
+    // MLX5 PRM DBR: dbrec[0]=RCV counter
     std::ptr::write_volatile(dbrec, pi.to_be());
 
     udma_to_device_barrier!();
@@ -456,6 +460,7 @@ impl<Entry, TableType> SendQueueState<Entry, TableType> {
         mmio_flush_writes!();
 
         unsafe {
+            // MLX5 PRM DBR: dbrec[1]=SND counter
             std::ptr::write_volatile(self.dbrec.add(1), (self.pi.get() as u32).to_be());
         }
 
@@ -477,6 +482,7 @@ impl<Entry, TableType> SendQueueState<Entry, TableType> {
         mmio_flush_writes!();
 
         unsafe {
+            // MLX5 PRM DBR: dbrec[1]=SND counter
             std::ptr::write_volatile(self.dbrec.add(1), (self.pi.get() as u32).to_be());
         }
 

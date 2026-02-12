@@ -355,7 +355,7 @@ impl Context {
         attr.attr.max_sge = config.max_sge;
         attr.srq_type = mlx5_sys::ibv_srq_type_IBV_SRQT_TM;
         attr.pd = pd.as_ptr();
-        attr.cq = cq.as_ptr();
+        attr.cq = cq.as_ibv_cq_ptr();
         attr.tm_cap.max_num_tags = config.max_num_tags;
         attr.tm_cap.max_ops = config.max_ops;
         attr.comp_mask = mlx5_sys::ibv_srq_init_attr_mask_IBV_SRQ_INIT_ATTR_TYPE

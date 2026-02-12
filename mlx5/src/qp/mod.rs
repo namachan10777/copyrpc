@@ -3,16 +3,19 @@
 //! Queue Pairs are the fundamental communication endpoints in RDMA.
 //! This module provides RC (Reliable Connection) QP creation using mlx5dv_create_qp.
 
+use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
-use std::{io, mem::MaybeUninit, ptr::NonNull};
+use std::io;
 
 use crate::BuildResult;
 use crate::CompletionTarget;
 use crate::builder_common::{MaybeMonoCqRegister, register_with_cqs, register_with_send_cq};
 use crate::cq::{Cq, Cqe};
 use crate::device::Context;
+use crate::devx::{DevxObj, DevxUmem};
 use crate::pd::Pd;
+use crate::prm;
 use crate::srq::Srq;
 use crate::transport::{IbRemoteQpInfo, RoCERemoteQpInfo};
 use crate::wqe::{
@@ -69,30 +72,227 @@ pub enum QpState {
     Error,
 }
 
-/// QP internal info obtained from mlx5dv_init_obj.
-#[derive(Debug)]
-pub(crate) struct QpInfo {
-    /// Doorbell record pointer.
-    pub(crate) dbrec: *mut u32,
-    /// Send Queue buffer pointer.
-    pub(crate) sq_buf: *mut u8,
-    /// Send Queue WQE count.
-    pub(crate) sq_wqe_cnt: u32,
-    /// Send Queue stride (bytes per WQE slot).
-    #[allow(dead_code)]
-    pub(crate) sq_stride: u32,
-    /// Receive Queue buffer pointer.
-    pub(crate) rq_buf: *mut u8,
-    /// Receive Queue WQE count.
-    pub(crate) rq_wqe_cnt: u32,
-    /// Receive Queue stride.
-    pub(crate) rq_stride: u32,
-    /// BlueFlame register pointer.
-    pub(crate) bf_reg: *mut u8,
-    /// BlueFlame size.
-    pub(crate) bf_size: u32,
-    /// Send Queue Number.
-    pub(crate) sqn: u32,
+/// Page-aligned buffer (RAII).
+pub(crate) struct AlignedBuf {
+    ptr: *mut u8,
+    layout: Layout,
+}
+
+impl AlignedBuf {
+    pub(crate) fn new(size: usize) -> Self {
+        let layout = Layout::from_size_align(size, 4096).unwrap();
+        let ptr = unsafe { alloc_zeroed(layout) };
+        assert!(!ptr.is_null(), "alloc_zeroed failed");
+        Self { ptr, layout }
+    }
+
+    pub(crate) fn as_ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.layout.size()
+    }
+}
+
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        unsafe { dealloc(self.ptr, self.layout) }
+    }
+}
+
+/// QP buffer layout computed from config.
+///
+/// PRM-mandated layout: RQ at offset 0, SQ at offset rq_size.
+/// (rdma-core: qp->rq.offset = 0; qp->sq.offset = rq_size)
+pub(crate) struct QpBufferLayout {
+    pub(crate) total_size: usize,
+    pub(crate) sq_size: usize,
+    pub(crate) rq_size: usize,
+    pub(crate) rq_stride: usize,
+    pub(crate) dbrec_offset: usize,
+    pub(crate) log_sq_size: u32,
+    pub(crate) log_rq_size: u32,
+    pub(crate) log_rq_stride: u32,
+}
+
+impl RcQpConfig {
+    /// Compute buffer layout for DevX QP creation.
+    pub(crate) fn buffer_layout(&self, use_srq: bool) -> QpBufferLayout {
+        let log_sq_size = if self.max_send_wr == 0 {
+            0
+        } else {
+            (self.max_send_wr as usize).next_power_of_two().trailing_zeros()
+        };
+        let sq_size = (1usize << log_sq_size) * WQEBB_SIZE;
+
+        let (rq_size, rq_stride, log_rq_size, log_rq_stride) = if use_srq {
+            (0, 0, 0, 0)
+        } else {
+            let sge_count = (self.max_recv_sge as usize).max(1);
+            let stride = (sge_count * DATA_SEG_SIZE).next_power_of_two();
+            let log_stride = (stride / 16).trailing_zeros();
+            let log_rq = if self.max_recv_wr == 0 {
+                0
+            } else {
+                (self.max_recv_wr as usize).next_power_of_two().trailing_zeros()
+            };
+            let rq_sz = (1usize << log_rq) * stride;
+            (rq_sz, stride, log_rq, log_stride)
+        };
+
+        let dbrec_offset = (sq_size + rq_size + 63) & !63;
+        let total_size = (dbrec_offset + 64 + 4095) & !4095;
+
+        QpBufferLayout {
+            total_size,
+            sq_size,
+            rq_size,
+            rq_stride,
+            dbrec_offset,
+            log_sq_size,
+            log_rq_size,
+            log_rq_stride,
+        }
+    }
+}
+
+/// Resources created by DevX QP creation.
+struct DevxQpResources {
+    devx_obj: DevxObj,
+    umem: DevxUmem,
+    wq_buf: AlignedBuf,
+    dbr_umem: DevxUmem,
+    dbr_buf: AlignedBuf,
+    qpn: u32,
+    layout: QpBufferLayout,
+    bf_reg: *mut u8,
+    bf_size: u32,
+    dbrec: *mut u32,
+    sq_buf: *mut u8,
+    rq_buf: *mut u8,
+}
+
+/// Create an RC QP via DevX PRM CREATE_QP command.
+///
+/// Matches rdma-core's dr_devx_create_qp pattern:
+/// - Separate DBREC UMEM (DBREC at offset 0)
+/// - wq_umem_id without wq_umem_valid flag
+/// - dbr_umem_id without dbr_umem_valid flag
+/// - pm_state=3 in CREATE_QP
+///
+/// Buffer layout: WQ UMEM = [RQ | SQ], DBREC UMEM = [dbrec[0..1]]
+///
+/// # Safety
+/// The caller must ensure `ctx`, `pd` are valid and the context was opened with DevX.
+unsafe fn create_devx_rc_qp(
+    ctx: &Context,
+    pd: &Pd,
+    send_cqn: u32,
+    recv_cqn: u32,
+    config: &RcQpConfig,
+    srqn: Option<u32>,
+) -> io::Result<DevxQpResources> {
+    let layout = config.buffer_layout(srqn.is_some());
+
+    // WQ buffer: [RQ | SQ] (no DBREC — separate UMEM)
+    let wq_size = layout.sq_size + layout.rq_size;
+    let wq_buf = AlignedBuf::new(if wq_size > 0 { wq_size } else { 4096 });
+    let umem = ctx.register_umem(wq_buf.as_ptr(), wq_buf.len(), 7)?;
+    let wq_umem_id = umem.umem_id();
+
+    // Separate DBREC buffer (page-aligned, DBREC at offset 0)
+    let dbr_buf = AlignedBuf::new(4096);
+    let dbr_umem = ctx.register_umem(dbr_buf.as_ptr(), dbr_buf.len(), 7)?;
+    let dbr_umem_id = dbr_umem.umem_id();
+
+    let uar = ctx.devx_uar()?;
+
+    // Build CREATE_QP PRM command (matching rdma-core dr_devx_create_qp)
+    let cmd_in_size = prm::CREATE_QP_IN_BASE_SIZE;
+    let mut cmd_in = vec![0u8; cmd_in_size];
+    let mut cmd_out = vec![0u8; prm::CREATE_QP_OUT_SIZE];
+
+    prm::prm_set(
+        &mut cmd_in,
+        prm::CREATE_QP_IN_OPCODE.0,
+        prm::CREATE_QP_IN_OPCODE.1,
+        prm::MLX5_CMD_OP_CREATE_QP,
+    );
+
+    // WQ UMEM: only set wq_umem_id (NO wq_umem_valid, NO wq_umem_offset)
+    // This matches rdma-core's dr_devx_create_qp pattern exactly.
+    prm::prm_set(
+        &mut cmd_in,
+        prm::CREATE_QP_IN_WQ_UMEM_ID.0,
+        prm::CREATE_QP_IN_WQ_UMEM_ID.1,
+        wq_umem_id,
+    );
+
+    let q = prm::CREATE_QP_IN_QPC_OFF;
+    prm::prm_set(&mut cmd_in, q + prm::QPC_ST.0, prm::QPC_ST.1, prm::QP_ST_RC);
+    // pm_state = MIGRATED (3) in CREATE_QP (matching rdma-core)
+    prm::prm_set(&mut cmd_in, q + prm::QPC_PM_STATE.0, prm::QPC_PM_STATE.1, 3);
+    prm::prm_set(&mut cmd_in, q + prm::QPC_PD.0, prm::QPC_PD.1, pd.pdn());
+    prm::prm_set(&mut cmd_in, q + prm::QPC_UAR_PAGE.0, prm::QPC_UAR_PAGE.1, uar.page_id());
+    prm::prm_set(&mut cmd_in, q + prm::QPC_LOG_SQ_SIZE.0, prm::QPC_LOG_SQ_SIZE.1, layout.log_sq_size);
+    prm::prm_set(&mut cmd_in, q + prm::QPC_LOG_RQ_SIZE.0, prm::QPC_LOG_RQ_SIZE.1, layout.log_rq_size);
+    prm::prm_set(&mut cmd_in, q + prm::QPC_LOG_RQ_STRIDE.0, prm::QPC_LOG_RQ_STRIDE.1, layout.log_rq_stride);
+    // NOTE: log_msg_max NOT set (rdma-core dr_devx doesn't set it)
+    prm::prm_set(&mut cmd_in, q + prm::QPC_CQN_SND.0, prm::QPC_CQN_SND.1, send_cqn);
+    prm::prm_set(&mut cmd_in, q + prm::QPC_CQN_RCV.0, prm::QPC_CQN_RCV.1, recv_cqn);
+
+    // DBR UMEM: separate UMEM, DBREC at offset 0
+    // Only set dbr_umem_id (NO dbr_umem_valid, NO dbr_addr)
+    prm::prm_set(&mut cmd_in, q + prm::QPC_DBR_UMEM_ID.0, prm::QPC_DBR_UMEM_ID.1, dbr_umem_id);
+
+    // SRQ
+    if let Some(srqn) = srqn {
+        prm::prm_set(&mut cmd_in, q + prm::QPC_RQ_TYPE.0, prm::QPC_RQ_TYPE.1, 1);
+        prm::prm_set(&mut cmd_in, q + prm::QPC_SRQN_RMPN_XRQN.0, prm::QPC_SRQN_RMPN_XRQN.1, srqn);
+    }
+
+    // Debug: dump CREATE_QP PRM command
+    eprintln!("=== RC QP CREATE_QP PRM command ({} bytes) ===", cmd_in.len());
+    eprintln!("  layout: sq_size={}, rq_size={}, rq_stride={}, dbrec_offset={}, total={}",
+        layout.sq_size, layout.rq_size, layout.rq_stride, layout.dbrec_offset, layout.total_size);
+    eprintln!("  log: sq={}, rq={}, rq_stride={}", layout.log_sq_size, layout.log_rq_size, layout.log_rq_stride);
+    eprintln!("  wq_umem_id={}, dbr_umem_id={}, uar_page={}, pd={}", wq_umem_id, dbr_umem_id, uar.page_id(), pd.pdn());
+    eprintln!("  send_cqn={}, recv_cqn={}", send_cqn, recv_cqn);
+    for i in (0..cmd_in.len()).step_by(16) {
+        let end = (i + 16).min(cmd_in.len());
+        let hex: Vec<String> = cmd_in[i..end].iter().map(|b| format!("{:02x}", b)).collect();
+        if hex.iter().any(|s| s != "00") {
+            eprintln!("  {:04x}: {}", i, hex.join(" "));
+        }
+    }
+
+    let devx_obj = ctx.devx_obj_create(&cmd_in, &mut cmd_out)?;
+    let qpn = prm::prm_get(&cmd_out, prm::CREATE_QP_OUT_QPN.0, prm::CREATE_QP_OUT_QPN.1);
+
+    eprintln!("  QPN: 0x{:x}", qpn);
+    eprintln!("  wq_buf ptr: {:p}, rq_size offset: 0x{:x}", wq_buf.as_ptr(), layout.rq_size);
+
+    // PRM layout: RQ at offset 0, SQ at offset rq_size
+    let rq_buf = wq_buf.as_ptr();
+    let sq_buf = wq_buf.as_ptr().add(layout.rq_size);
+    // DBREC at offset 0 in separate buffer (dbrec[0]=RCV, dbrec[1]=SND)
+    let dbrec = dbr_buf.as_ptr() as *mut u32;
+
+    Ok(DevxQpResources {
+        devx_obj,
+        umem,
+        wq_buf,
+        dbr_umem,
+        dbr_buf,
+        qpn,
+        layout,
+        bf_reg: uar.reg_addr(),
+        bf_size: 256,
+        dbrec,
+        sq_buf,
+        rq_buf,
+    })
 }
 
 // =============================================================================
@@ -187,29 +387,18 @@ impl<Entry> ReceiveQueueState<Entry> {
         self.pi.set(self.pi.get().wrapping_add(count));
     }
 
-    /// Ring the doorbell with minimum 8-byte BlueFlame write.
+    /// Ring the RQ doorbell (DBREC-only, no BF write).
     ///
-    /// Updates DBREC and writes minimum 8 bytes to BlueFlame register.
-    /// The NIC fetches remaining WQE data via DMA.
-    /// Also resets pending WQE tracking.
+    /// Updates DBREC[0] (RQ doorbell record) to notify the NIC of new RQ WQEs.
+    /// RQ does not use BlueFlame writes (BF is SQ-only).
     #[inline]
     fn ring_doorbell(&self) {
         mmio_flush_writes!();
         unsafe {
+            // MLX5 PRM: dbrec[0] = RCV counter
             std::ptr::write_volatile(self.dbrec, (self.pi.get() as u32).to_be());
         }
         udma_to_device_barrier!();
-
-        // Minimum 8-byte BF write (first 8 bytes of last WQE)
-        let bf_offset = self.bf_offset.get();
-        let bf = unsafe { self.bf_reg.add(bf_offset as usize) as *mut u64 };
-        let last_wqe = self.get_wqe_ptr(self.pi.get().wrapping_sub(1));
-        unsafe {
-            std::ptr::write_volatile(bf, *(last_wqe as *const u64));
-        }
-
-        mmio_flush_writes!();
-        self.bf_offset.set(bf_offset ^ self.bf_size);
 
         // Reset pending tracking
         self.pending_wqe_count.set(0);
@@ -229,6 +418,7 @@ impl<Entry> ReceiveQueueState<Entry> {
 
         mmio_flush_writes!();
         unsafe {
+            // MLX5 PRM: dbrec[0] = RCV counter
             std::ptr::write_volatile(self.dbrec, (self.pi.get() as u32).to_be());
         }
         udma_to_device_barrier!();
@@ -404,7 +594,18 @@ pub type RcQpRoCEWithSrqHandle<SqEntry, RqEntry, OnSqComplete, OnRqComplete> =
 /// - `OnSqComplete`: SQ completion callback type
 /// - `OnRqComplete`: RQ completion callback type
 pub struct RcQp<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> {
-    qp: NonNull<mlx5_sys::ibv_qp>,
+    /// DevX QP object. Must be dropped before UMEMs.
+    _devx_obj: DevxObj,
+    /// Registered UMEM for SQ/RQ buffers. Must be dropped after _devx_obj.
+    _umem: DevxUmem,
+    /// Page-aligned WQ buffer. Must be dropped after _umem.
+    _wq_buf: AlignedBuf,
+    /// Registered UMEM for DBREC. Must be dropped after _devx_obj.
+    _dbr_umem: DevxUmem,
+    /// Page-aligned DBREC buffer. Must be dropped after _dbr_umem.
+    _dbr_buf: AlignedBuf,
+    /// QP number (from HW).
+    qpn: u32,
     state: Cell<QpState>,
     sq: Option<SendQueueState<SqEntry, TableType>>,
     rq: Rq,
@@ -425,15 +626,13 @@ impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete> Dro
 {
     fn drop(&mut self) {
         let qpn = self.qpn();
-        // Unregister from both CQs before destroying QP
+        // Unregister from both CQs before destroying QP.
+        // DevxObj destruction is automatic via field drop order.
         if let Some(cq) = self.send_cq.upgrade() {
             cq.unregister_queue(qpn);
         }
         if let Some(cq) = self.recv_cq.upgrade() {
             cq.unregister_queue(qpn);
-        }
-        unsafe {
-            mlx5_sys::ibv_destroy_qp(self.qp.as_ptr());
         }
     }
 }
@@ -443,7 +642,7 @@ impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete>
 {
     /// Get the QP number.
     pub fn qpn(&self) -> u32 {
-        unsafe { (*self.qp.as_ptr()).qp_num }
+        self.qpn
     }
 
     /// Get the current QP state.
@@ -451,46 +650,7 @@ impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete>
         self.state.get()
     }
 
-    /// Get mlx5-specific QP information for direct WQE access.
-    fn query_info(&self) -> io::Result<QpInfo> {
-        unsafe {
-            let mut dv_qp: MaybeUninit<mlx5_sys::mlx5dv_qp> = MaybeUninit::zeroed();
-            let mut obj: MaybeUninit<mlx5_sys::mlx5dv_obj> = MaybeUninit::zeroed();
-
-            let dv_qp_ptr = dv_qp.as_mut_ptr();
-            (*dv_qp_ptr).comp_mask =
-                mlx5_sys::mlx5dv_qp_comp_mask_MLX5DV_QP_MASK_RAW_QP_HANDLES as u64;
-
-            let obj_ptr = obj.as_mut_ptr();
-            (*obj_ptr).qp.in_ = self.qp.as_ptr();
-            (*obj_ptr).qp.out = dv_qp_ptr;
-
-            let ret =
-                mlx5_sys::mlx5dv_init_obj(obj_ptr, mlx5_sys::mlx5dv_obj_type_MLX5DV_OBJ_QP as u64);
-            if ret != 0 {
-                return Err(io::Error::from_raw_os_error(-ret));
-            }
-
-            let dv_qp = dv_qp.assume_init();
-            let qp_num = (*self.qp.as_ptr()).qp_num;
-            let sqn = if dv_qp.sqn != 0 { dv_qp.sqn } else { qp_num };
-
-            Ok(QpInfo {
-                dbrec: dv_qp.dbrec,
-                sq_buf: dv_qp.sq.buf as *mut u8,
-                sq_wqe_cnt: dv_qp.sq.wqe_cnt,
-                sq_stride: dv_qp.sq.stride,
-                rq_buf: dv_qp.rq.buf as *mut u8,
-                rq_wqe_cnt: dv_qp.rq.wqe_cnt,
-                rq_stride: dv_qp.rq.stride,
-                bf_reg: dv_qp.bf.reg as *mut u8,
-                bf_size: dv_qp.bf.size,
-                sqn,
-            })
-        }
-    }
-
-    /// Transition QP from RESET to INIT.
+    /// Transition QP from RESET to INIT via DevX PRM.
     pub fn modify_to_init(&mut self, port: u8, access_flags: u32) -> io::Result<()> {
         if self.state.get() != QpState::Reset {
             return Err(io::Error::new(
@@ -499,29 +659,45 @@ impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete>
             ));
         }
 
-        unsafe {
-            let mut attr: mlx5_sys::ibv_qp_attr = MaybeUninit::zeroed().assume_init();
-            attr.qp_state = mlx5_sys::ibv_qp_state_IBV_QPS_INIT;
-            attr.pkey_index = 0;
-            attr.port_num = port;
-            attr.qp_access_flags = access_flags;
+        let mut cmd_in = vec![0u8; prm::MODIFY_QP_IN_SIZE];
+        let mut cmd_out = vec![0u8; prm::MODIFY_QP_OUT_SIZE];
 
-            let mask = mlx5_sys::ibv_qp_attr_mask_IBV_QP_STATE
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_PKEY_INDEX
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_PORT
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_ACCESS_FLAGS;
+        prm::prm_set(&mut cmd_in, prm::MODIFY_QP_IN_OPCODE.0, prm::MODIFY_QP_IN_OPCODE.1, prm::MLX5_CMD_OP_RST2INIT_QP);
+        prm::prm_set(&mut cmd_in, prm::MODIFY_QP_IN_QPN.0, prm::MODIFY_QP_IN_QPN.1, self.qpn);
 
-            let ret = mlx5_sys::ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask as i32);
-            if ret != 0 {
-                return Err(io::Error::from_raw_os_error(ret));
-            }
+        let q = prm::MODIFY_QP_IN_QPC_OFF;
+        let ads = q + prm::QPC_PRI_ADS;
+
+        // PM state = migrated (required by FW)
+        prm::prm_set(&mut cmd_in, q + prm::QPC_PM_STATE.0, prm::QPC_PM_STATE.1, 3);
+        // Primary address path: port
+        prm::prm_set(&mut cmd_in, ads + prm::ADS_VHCA_PORT_NUM.0, prm::ADS_VHCA_PORT_NUM.1, port as u32);
+        // Access flags
+        if access_flags & mlx5_sys::ibv_access_flags_IBV_ACCESS_REMOTE_READ != 0 {
+            prm::prm_set(&mut cmd_in, q + prm::QPC_RRE.0, prm::QPC_RRE.1, 1);
         }
+        if access_flags & mlx5_sys::ibv_access_flags_IBV_ACCESS_REMOTE_WRITE != 0 {
+            prm::prm_set(&mut cmd_in, q + prm::QPC_RWE.0, prm::QPC_RWE.1, 1);
+        }
+        if access_flags & mlx5_sys::ibv_access_flags_IBV_ACCESS_REMOTE_ATOMIC != 0 {
+            prm::prm_set(&mut cmd_in, q + prm::QPC_RAE.0, prm::QPC_RAE.1, 1);
+            // FW requires atomic_mode when RAE changes (syndrome 0x69efe)
+            prm::prm_set(
+                &mut cmd_in,
+                q + prm::QPC_ATOMIC_MODE.0,
+                prm::QPC_ATOMIC_MODE.1,
+                1, // UP_TO_8_BYTES (standard IB 64-bit atomics)
+            );
+        }
+
+        let ret = self._devx_obj.modify(&cmd_in, &mut cmd_out);
+        prm::check_prm_result(ret, &cmd_out, "RST2INIT")?;
 
         self.state.set(QpState::Init);
         Ok(())
     }
 
-    /// Transition QP from RTR to RTS (Ready to Send).
+    /// Transition QP from RTR to RTS (Ready to Send) via DevX PRM.
     pub fn modify_to_rts(&mut self, local_psn: u32, max_rd_atomic: u8) -> io::Result<()> {
         if self.state.get() != QpState::Rtr {
             return Err(io::Error::new(
@@ -530,48 +706,44 @@ impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete>
             ));
         }
 
-        unsafe {
-            let mut attr: mlx5_sys::ibv_qp_attr = MaybeUninit::zeroed().assume_init();
-            attr.qp_state = mlx5_sys::ibv_qp_state_IBV_QPS_RTS;
-            attr.timeout = 14;
-            attr.retry_cnt = 7;
-            attr.rnr_retry = 7;
-            attr.sq_psn = local_psn;
-            attr.max_rd_atomic = max_rd_atomic;
+        let mut cmd_in = vec![0u8; prm::MODIFY_QP_IN_SIZE];
+        let mut cmd_out = vec![0u8; prm::MODIFY_QP_OUT_SIZE];
 
-            let mask = mlx5_sys::ibv_qp_attr_mask_IBV_QP_STATE
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_TIMEOUT
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_RETRY_CNT
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_RNR_RETRY
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_SQ_PSN
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_MAX_QP_RD_ATOMIC;
+        prm::prm_set(&mut cmd_in, prm::MODIFY_QP_IN_OPCODE.0, prm::MODIFY_QP_IN_OPCODE.1, prm::MLX5_CMD_OP_RTR2RTS_QP);
+        prm::prm_set(&mut cmd_in, prm::MODIFY_QP_IN_QPN.0, prm::MODIFY_QP_IN_QPN.1, self.qpn);
 
-            let ret = mlx5_sys::ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask as i32);
-            if ret != 0 {
-                return Err(io::Error::from_raw_os_error(ret));
-            }
-        }
+        let q = prm::MODIFY_QP_IN_QPC_OFF;
+        let ads = q + prm::QPC_PRI_ADS;
+
+        // log2(max_rd_atomic), clamped
+        let log_sra = if max_rd_atomic > 0 { (max_rd_atomic as u32).next_power_of_two().trailing_zeros() } else { 0 };
+        prm::prm_set(&mut cmd_in, q + prm::QPC_LOG_SRA_MAX.0, prm::QPC_LOG_SRA_MAX.1, log_sra);
+        prm::prm_set(&mut cmd_in, q + prm::QPC_RETRY_COUNT.0, prm::QPC_RETRY_COUNT.1, 7);
+        prm::prm_set(&mut cmd_in, q + prm::QPC_RNR_RETRY.0, prm::QPC_RNR_RETRY.1, 7);
+        prm::prm_set(&mut cmd_in, q + prm::QPC_NEXT_SEND_PSN.0, prm::QPC_NEXT_SEND_PSN.1, local_psn);
+        // ack_timeout in primary address path
+        prm::prm_set(&mut cmd_in, ads + prm::ADS_ACK_TIMEOUT.0, prm::ADS_ACK_TIMEOUT.1, 14);
+
+        let ret = self._devx_obj.modify(&cmd_in, &mut cmd_out);
+        prm::check_prm_result(ret, &cmd_out, "RTR2RTS")?;
 
         self.state.set(QpState::Rts);
         Ok(())
     }
 
-    /// Transition QP to ERROR state.
+    /// Transition QP to ERROR state via DevX PRM.
     ///
     /// This cleanly tears down the connection and flushes any pending work requests.
     /// Useful before destroying a QP to avoid crashes when the remote QP is already gone.
     pub fn modify_to_error(&self) -> io::Result<()> {
-        unsafe {
-            let mut attr: mlx5_sys::ibv_qp_attr = MaybeUninit::zeroed().assume_init();
-            attr.qp_state = mlx5_sys::ibv_qp_state_IBV_QPS_ERR;
+        let mut cmd_in = vec![0u8; prm::MODIFY_QP_IN_SIZE];
+        let mut cmd_out = vec![0u8; prm::MODIFY_QP_OUT_SIZE];
 
-            let mask = mlx5_sys::ibv_qp_attr_mask_IBV_QP_STATE;
+        prm::prm_set(&mut cmd_in, prm::MODIFY_QP_IN_OPCODE.0, prm::MODIFY_QP_IN_OPCODE.1, prm::MLX5_CMD_OP_2ERR_QP);
+        prm::prm_set(&mut cmd_in, prm::MODIFY_QP_IN_QPN.0, prm::MODIFY_QP_IN_QPN.1, self.qpn);
 
-            let ret = mlx5_sys::ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask as i32);
-            if ret != 0 {
-                return Err(io::Error::from_raw_os_error(ret));
-            }
-        }
+        let ret = self._devx_obj.modify(&cmd_in, &mut cmd_out);
+        prm::check_prm_result(ret, &cmd_out, "2ERR")?;
 
         self.state.set(QpState::Error);
         Ok(())
@@ -608,7 +780,7 @@ impl<SqEntry, RqEntry, Transport, TableType, Rq, OnSqComplete, OnRqComplete>
 impl<SqEntry, RqEntry, TableType, Rq, OnSqComplete, OnRqComplete>
     RcQp<SqEntry, RqEntry, InfiniBand, TableType, Rq, OnSqComplete, OnRqComplete>
 {
-    /// Transition QP from INIT to RTR (Ready to Receive).
+    /// Transition QP from INIT to RTR (Ready to Receive) via DevX PRM.
     ///
     /// Uses LID-based addressing for InfiniBand fabric.
     pub fn modify_to_rtr(
@@ -624,33 +796,32 @@ impl<SqEntry, RqEntry, TableType, Rq, OnSqComplete, OnRqComplete>
             ));
         }
 
-        unsafe {
-            let mut attr: mlx5_sys::ibv_qp_attr = MaybeUninit::zeroed().assume_init();
-            attr.qp_state = mlx5_sys::ibv_qp_state_IBV_QPS_RTR;
-            attr.path_mtu = mlx5_sys::ibv_mtu_IBV_MTU_4096;
-            attr.dest_qp_num = remote.qp_number;
-            attr.rq_psn = remote.packet_sequence_number;
-            attr.max_dest_rd_atomic = max_dest_rd_atomic;
-            attr.min_rnr_timer = 12;
-            attr.ah_attr.dlid = remote.local_identifier;
-            attr.ah_attr.sl = 0;
-            attr.ah_attr.src_path_bits = 0;
-            attr.ah_attr.is_global = 0;
-            attr.ah_attr.port_num = port;
+        let mut cmd_in = vec![0u8; prm::MODIFY_QP_IN_SIZE];
+        let mut cmd_out = vec![0u8; prm::MODIFY_QP_OUT_SIZE];
 
-            let mask = mlx5_sys::ibv_qp_attr_mask_IBV_QP_STATE
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_AV
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_PATH_MTU
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_DEST_QPN
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_RQ_PSN
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_MAX_DEST_RD_ATOMIC
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_MIN_RNR_TIMER;
+        prm::prm_set(&mut cmd_in, prm::MODIFY_QP_IN_OPCODE.0, prm::MODIFY_QP_IN_OPCODE.1, prm::MLX5_CMD_OP_INIT2RTR_QP);
+        prm::prm_set(&mut cmd_in, prm::MODIFY_QP_IN_QPN.0, prm::MODIFY_QP_IN_QPN.1, self.qpn);
 
-            let ret = mlx5_sys::ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask as i32);
-            if ret != 0 {
-                return Err(io::Error::from_raw_os_error(ret));
-            }
-        }
+        let q = prm::MODIFY_QP_IN_QPC_OFF;
+        prm::prm_set(&mut cmd_in, q + prm::QPC_MTU.0, prm::QPC_MTU.1, 5); // MTU 4096
+        prm::prm_set(&mut cmd_in, q + prm::QPC_REMOTE_QPN.0, prm::QPC_REMOTE_QPN.1, remote.qp_number);
+        prm::prm_set(&mut cmd_in, q + prm::QPC_NEXT_RCV_PSN.0, prm::QPC_NEXT_RCV_PSN.1, remote.packet_sequence_number);
+
+        let log_rra = if max_dest_rd_atomic > 0 {
+            (max_dest_rd_atomic as u32).next_power_of_two().trailing_zeros()
+        } else {
+            0
+        };
+        prm::prm_set(&mut cmd_in, q + prm::QPC_LOG_RRA_MAX.0, prm::QPC_LOG_RRA_MAX.1, log_rra);
+        prm::prm_set(&mut cmd_in, q + prm::QPC_MIN_RNR_NAK.0, prm::QPC_MIN_RNR_NAK.1, 12);
+
+        // Primary address path
+        let ads = q + prm::QPC_PRI_ADS;
+        prm::prm_set(&mut cmd_in, ads + prm::ADS_RLID.0, prm::ADS_RLID.1, remote.local_identifier as u32);
+        prm::prm_set(&mut cmd_in, ads + prm::ADS_VHCA_PORT_NUM.0, prm::ADS_VHCA_PORT_NUM.1, port as u32);
+
+        let ret = self._devx_obj.modify(&cmd_in, &mut cmd_out);
+        prm::check_prm_result(ret, &cmd_out, "INIT2RTR")?;
 
         self.state.set(QpState::Rtr);
         Ok(())
@@ -679,7 +850,7 @@ impl<SqEntry, RqEntry, TableType, Rq, OnSqComplete, OnRqComplete>
 impl<SqEntry, RqEntry, TableType, Rq, OnSqComplete, OnRqComplete>
     RcQp<SqEntry, RqEntry, RoCE, TableType, Rq, OnSqComplete, OnRqComplete>
 {
-    /// Transition QP from INIT to RTR (Ready to Receive).
+    /// Transition QP from INIT to RTR (Ready to Receive) via DevX PRM.
     ///
     /// Uses GID-based addressing for RoCE (RDMA over Converged Ethernet).
     ///
@@ -697,44 +868,44 @@ impl<SqEntry, RqEntry, TableType, Rq, OnSqComplete, OnRqComplete>
             ));
         }
 
-        unsafe {
-            let mut attr: mlx5_sys::ibv_qp_attr = MaybeUninit::zeroed().assume_init();
-            attr.qp_state = mlx5_sys::ibv_qp_state_IBV_QPS_RTR;
-            attr.path_mtu = mlx5_sys::ibv_mtu_IBV_MTU_4096;
-            attr.dest_qp_num = remote.qp_number;
-            attr.rq_psn = remote.packet_sequence_number;
-            attr.max_dest_rd_atomic = max_dest_rd_atomic;
-            attr.min_rnr_timer = 12;
+        let mut cmd_in = vec![0u8; prm::MODIFY_QP_IN_SIZE];
+        let mut cmd_out = vec![0u8; prm::MODIFY_QP_OUT_SIZE];
 
-            // RoCE: use GRH (Global Route Header)
-            attr.ah_attr.is_global = 1;
-            attr.ah_attr.port_num = port;
-            attr.ah_attr.dlid = 0; // Not used for RoCE
+        prm::prm_set(&mut cmd_in, prm::MODIFY_QP_IN_OPCODE.0, prm::MODIFY_QP_IN_OPCODE.1, prm::MLX5_CMD_OP_INIT2RTR_QP);
+        prm::prm_set(&mut cmd_in, prm::MODIFY_QP_IN_QPN.0, prm::MODIFY_QP_IN_QPN.1, self.qpn);
 
-            // GRH configuration
-            attr.ah_attr.grh.dgid.raw = remote.grh.dgid.raw;
-            attr.ah_attr.grh.sgid_index = remote.grh.sgid_index;
-            attr.ah_attr.grh.flow_label = remote.grh.flow_label;
-            attr.ah_attr.grh.traffic_class = remote.grh.traffic_class;
-            attr.ah_attr.grh.hop_limit = remote.grh.hop_limit;
+        let q = prm::MODIFY_QP_IN_QPC_OFF;
+        prm::prm_set(&mut cmd_in, q + prm::QPC_MTU.0, prm::QPC_MTU.1, 5); // MTU 4096
+        prm::prm_set(&mut cmd_in, q + prm::QPC_REMOTE_QPN.0, prm::QPC_REMOTE_QPN.1, remote.qp_number);
+        prm::prm_set(&mut cmd_in, q + prm::QPC_NEXT_RCV_PSN.0, prm::QPC_NEXT_RCV_PSN.1, remote.packet_sequence_number);
 
-            // Service level and source path bits
-            attr.ah_attr.sl = 0;
-            attr.ah_attr.src_path_bits = 0;
+        let log_rra = if max_dest_rd_atomic > 0 {
+            (max_dest_rd_atomic as u32).next_power_of_two().trailing_zeros()
+        } else {
+            0
+        };
+        prm::prm_set(&mut cmd_in, q + prm::QPC_LOG_RRA_MAX.0, prm::QPC_LOG_RRA_MAX.1, log_rra);
+        prm::prm_set(&mut cmd_in, q + prm::QPC_MIN_RNR_NAK.0, prm::QPC_MIN_RNR_NAK.1, 12);
 
-            let mask = mlx5_sys::ibv_qp_attr_mask_IBV_QP_STATE
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_AV
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_PATH_MTU
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_DEST_QPN
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_RQ_PSN
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_MAX_DEST_RD_ATOMIC
-                | mlx5_sys::ibv_qp_attr_mask_IBV_QP_MIN_RNR_TIMER;
+        // Primary address path with GRH for RoCE
+        let ads = q + prm::QPC_PRI_ADS;
+        prm::prm_set(&mut cmd_in, ads + prm::ADS_GRH.0, prm::ADS_GRH.1, 1);
+        prm::prm_set(&mut cmd_in, ads + prm::ADS_VHCA_PORT_NUM.0, prm::ADS_VHCA_PORT_NUM.1, port as u32);
+        prm::prm_set(&mut cmd_in, ads + prm::ADS_SRC_ADDR_INDEX.0, prm::ADS_SRC_ADDR_INDEX.1, remote.grh.sgid_index as u32);
+        prm::prm_set(&mut cmd_in, ads + prm::ADS_HOP_LIMIT.0, prm::ADS_HOP_LIMIT.1, remote.grh.hop_limit as u32);
+        prm::prm_set(&mut cmd_in, ads + prm::ADS_TCLASS.0, prm::ADS_TCLASS.1, remote.grh.traffic_class as u32);
+        prm::prm_set(&mut cmd_in, ads + prm::ADS_FLOW_LABEL.0, prm::ADS_FLOW_LABEL.1, remote.grh.flow_label);
 
-            let ret = mlx5_sys::ibv_modify_qp(self.qp.as_ptr(), &mut attr, mask as i32);
-            if ret != 0 {
-                return Err(io::Error::from_raw_os_error(ret));
-            }
+        // RGID (128-bit destination GID)
+        let rgid_off = ads + prm::ADS_RGID_RIP;
+        let gid = &remote.grh.dgid.raw;
+        for i in 0..4 {
+            let val = u32::from_be_bytes([gid[i * 4], gid[i * 4 + 1], gid[i * 4 + 2], gid[i * 4 + 3]]);
+            prm::prm_set(&mut cmd_in, rgid_off + i * 32, 32, val);
         }
+
+        let ret = self._devx_obj.modify(&cmd_in, &mut cmd_out);
+        prm::check_prm_result(ret, &cmd_out, "INIT2RTR")?;
 
         self.state.set(QpState::Rtr);
         Ok(())
@@ -761,167 +932,8 @@ impl<SqEntry, RqEntry, TableType, Rq, OnSqComplete, OnRqComplete>
     }
 }
 
-impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
-    RcQpIb<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
-{
-    /// Initialize direct queue access (internal implementation).
-    fn init_direct_access_internal(&mut self) -> io::Result<()> {
-        if self.sq.is_some() {
-            return Ok(()); // Already initialized
-        }
-
-        let info = self.query_info()?;
-        let wqe_cnt = info.sq_wqe_cnt as u16;
-
-        self.sq = Some(SendQueueState {
-            buf: info.sq_buf,
-            wqe_cnt,
-            sqn: info.sqn,
-            pi: Cell::new(0),
-            ci: Cell::new(0),
-            last_wqe: Cell::new(None),
-            dbrec: info.dbrec,
-            bf_reg: info.bf_reg,
-            bf_size: info.bf_size,
-            bf_offset: Cell::new(0),
-            table: OrderedWqeTable::new(wqe_cnt),
-            _marker: std::marker::PhantomData,
-        });
-
-        let rq_wqe_cnt = info.rq_wqe_cnt;
-        self.rq = OwnedRq::new(Some(ReceiveQueueState {
-            buf: info.rq_buf,
-            wqe_cnt: rq_wqe_cnt,
-            stride: info.rq_stride,
-            pi: Cell::new(0),
-            ci: Cell::new(0),
-            dbrec: info.dbrec,
-            bf_reg: info.bf_reg,
-            bf_size: info.bf_size,
-            bf_offset: Cell::new(0),
-            pending_start_ptr: Cell::new(None),
-            pending_wqe_count: Cell::new(0),
-            table: (0..rq_wqe_cnt).map(|_| Cell::new(None)).collect(),
-        }));
-
-        Ok(())
-    }
-}
-
-impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
-    RcQpIbWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
-{
-    /// Initialize direct queue access for SRQ variant (SQ only).
-    fn init_direct_access_internal(&mut self) -> io::Result<()> {
-        if self.sq.is_some() {
-            return Ok(()); // Already initialized
-        }
-
-        let info = self.query_info()?;
-        let wqe_cnt = info.sq_wqe_cnt as u16;
-
-        self.sq = Some(SendQueueState {
-            buf: info.sq_buf,
-            wqe_cnt,
-            sqn: info.sqn,
-            pi: Cell::new(0),
-            ci: Cell::new(0),
-            last_wqe: Cell::new(None),
-            dbrec: info.dbrec,
-            bf_reg: info.bf_reg,
-            bf_size: info.bf_size,
-            bf_offset: Cell::new(0),
-            table: OrderedWqeTable::new(wqe_cnt),
-            _marker: std::marker::PhantomData,
-        });
-
-        // Note: RQ is not initialized for SRQ variant - SRQ handles receives
-        Ok(())
-    }
-}
-
-// =============================================================================
-// RoCE init_direct_access_internal implementations
-// =============================================================================
-
-impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
-    RcQpRoCE<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
-{
-    /// Initialize direct queue access for RoCE (same as IB).
-    fn init_direct_access_internal(&mut self) -> io::Result<()> {
-        if self.sq.is_some() {
-            return Ok(()); // Already initialized
-        }
-
-        let info = self.query_info()?;
-        let wqe_cnt = info.sq_wqe_cnt as u16;
-
-        self.sq = Some(SendQueueState {
-            buf: info.sq_buf,
-            wqe_cnt,
-            sqn: info.sqn,
-            pi: Cell::new(0),
-            ci: Cell::new(0),
-            last_wqe: Cell::new(None),
-            dbrec: info.dbrec,
-            bf_reg: info.bf_reg,
-            bf_size: info.bf_size,
-            bf_offset: Cell::new(0),
-            table: OrderedWqeTable::new(wqe_cnt),
-            _marker: std::marker::PhantomData,
-        });
-
-        let rq_wqe_cnt = info.rq_wqe_cnt;
-        self.rq = OwnedRq::new(Some(ReceiveQueueState {
-            buf: info.rq_buf,
-            wqe_cnt: rq_wqe_cnt,
-            stride: info.rq_stride,
-            pi: Cell::new(0),
-            ci: Cell::new(0),
-            dbrec: info.dbrec,
-            bf_reg: info.bf_reg,
-            bf_size: info.bf_size,
-            bf_offset: Cell::new(0),
-            pending_start_ptr: Cell::new(None),
-            pending_wqe_count: Cell::new(0),
-            table: (0..rq_wqe_cnt).map(|_| Cell::new(None)).collect(),
-        }));
-
-        Ok(())
-    }
-}
-
-impl<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
-    RcQpRoCEWithSrq<SqEntry, RqEntry, OnSqComplete, OnRqComplete>
-{
-    /// Initialize direct queue access for RoCE with SRQ (SQ only).
-    fn init_direct_access_internal(&mut self) -> io::Result<()> {
-        if self.sq.is_some() {
-            return Ok(()); // Already initialized
-        }
-
-        let info = self.query_info()?;
-        let wqe_cnt = info.sq_wqe_cnt as u16;
-
-        self.sq = Some(SendQueueState {
-            buf: info.sq_buf,
-            wqe_cnt,
-            sqn: info.sqn,
-            pi: Cell::new(0),
-            ci: Cell::new(0),
-            last_wqe: Cell::new(None),
-            dbrec: info.dbrec,
-            bf_reg: info.bf_reg,
-            bf_size: info.bf_size,
-            bf_offset: Cell::new(0),
-            table: OrderedWqeTable::new(wqe_cnt),
-            _marker: std::marker::PhantomData,
-        });
-
-        // Note: RQ is not initialized for SRQ variant - SRQ handles receives
-        Ok(())
-    }
-}
+// init_direct_access_internal removed: SQ/RQ state is now initialized directly
+// in build() from the DevX buffer layout.
 
 // =============================================================================
 // CompletionTarget impl for RcQp with OwnedRq
@@ -1527,9 +1539,9 @@ pub struct RcQpBuilder<
     pd: &'a Pd,
     config: RcQpConfig,
 
-    // CQ pointers (set via sq_cq/sq_mono_cq/rq_cq/rq_mono_cq)
-    send_cq_ptr: *mut mlx5_sys::ibv_cq,
-    recv_cq_ptr: *mut mlx5_sys::ibv_cq,
+    // CQ numbers (set via sq_cq/sq_mono_cq/rq_cq/rq_mono_cq)
+    send_cqn: u32,
+    recv_cqn: u32,
 
     // Weak references to normal CQs for registration (None for MonoCq)
     send_cq_weak: Option<Weak<Cq>>,
@@ -1596,8 +1608,8 @@ impl Context {
             ctx: self,
             pd,
             config: config.clone(),
-            send_cq_ptr: std::ptr::null_mut(),
-            recv_cq_ptr: std::ptr::null_mut(),
+            send_cqn: 0,
+            recv_cqn: 0,
             send_cq_weak: None,
             recv_cq_weak: None,
             sq_callback: (),
@@ -1630,8 +1642,8 @@ impl<'a, SqEntry, RqEntry, T, Rq, RqCqState, OnRq, RqMono>
             ctx: self.ctx,
             pd: self.pd,
             config: self.config,
-            send_cq_ptr: cq.as_ptr(),
-            recv_cq_ptr: self.recv_cq_ptr,
+            send_cqn: cq.cqn(),
+            recv_cqn: self.recv_cqn,
             send_cq_weak: Some(Rc::downgrade(&cq)),
             recv_cq_weak: self.recv_cq_weak,
             sq_callback: callback,
@@ -1667,8 +1679,8 @@ impl<'a, SqEntry, RqEntry, T, Rq, RqCqState, OnRq, RqMono>
             ctx: self.ctx,
             pd: self.pd,
             config: self.config,
-            send_cq_ptr: mono_cq.as_ptr(),
-            recv_cq_ptr: self.recv_cq_ptr,
+            send_cqn: mono_cq.cqn(),
+            recv_cqn: self.recv_cqn,
             send_cq_weak: None, // MonoCq doesn't need CQ registration
             recv_cq_weak: self.recv_cq_weak,
             sq_callback: (),
@@ -1701,8 +1713,8 @@ impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, OnSq, SqMono>
             ctx: self.ctx,
             pd: self.pd,
             config: self.config,
-            send_cq_ptr: self.send_cq_ptr,
-            recv_cq_ptr: cq.as_ptr(),
+            send_cqn: self.send_cqn,
+            recv_cqn: cq.cqn(),
             send_cq_weak: self.send_cq_weak,
             recv_cq_weak: Some(Rc::downgrade(&cq)),
             sq_callback: self.sq_callback,
@@ -1738,8 +1750,8 @@ impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, OnSq, SqMono>
             ctx: self.ctx,
             pd: self.pd,
             config: self.config,
-            send_cq_ptr: self.send_cq_ptr,
-            recv_cq_ptr: mono_cq.as_ptr(),
+            send_cqn: self.send_cqn,
+            recv_cqn: mono_cq.cqn(),
             send_cq_weak: self.send_cq_weak,
             recv_cq_weak: None, // MonoCq doesn't need CQ registration
             sq_callback: self.sq_callback,
@@ -1770,8 +1782,8 @@ impl<'a, SqEntry, RqEntry, T, Rq, SqCqState, RqCqState, OnSq, OnRq, SqMono, RqMo
             ctx: self.ctx,
             pd: self.pd,
             config: self.config,
-            send_cq_ptr: self.send_cq_ptr,
-            recv_cq_ptr: self.recv_cq_ptr,
+            send_cqn: self.send_cqn,
+            recv_cqn: self.recv_cqn,
             send_cq_weak: self.send_cq_weak,
             recv_cq_weak: self.recv_cq_weak,
             sq_callback: self.sq_callback,
@@ -1823,8 +1835,8 @@ impl<'a, SqEntry, RqEntry, T, SqCqState, RqCqState, OnSq, OnRq, SqMono, RqMono>
             ctx: self.ctx,
             pd: self.pd,
             config: self.config,
-            send_cq_ptr: self.send_cq_ptr,
-            recv_cq_ptr: self.recv_cq_ptr,
+            send_cqn: self.send_cqn,
+            recv_cqn: self.recv_cqn,
             send_cq_weak: self.send_cq_weak,
             recv_cq_weak: self.recv_cq_weak,
             sq_callback: self.sq_callback,
@@ -1835,6 +1847,46 @@ impl<'a, SqEntry, RqEntry, T, SqCqState, RqCqState, OnSq, OnRq, SqMono, RqMono>
             _marker: std::marker::PhantomData,
         }
     }
+}
+
+// =============================================================================
+// Build helper: create SQ state from DevX QP resources
+// =============================================================================
+
+fn make_sq_state<SqEntry>(res: &DevxQpResources) -> Option<SendQueueState<SqEntry, OrderedWqeTable<SqEntry>>> {
+    let wqe_cnt = 1u16 << res.layout.log_sq_size;
+    Some(SendQueueState {
+        buf: res.sq_buf,
+        wqe_cnt,
+        sqn: res.qpn, // SQN = QPN for RC QP
+        pi: Cell::new(0),
+        ci: Cell::new(0),
+        last_wqe: Cell::new(None),
+        dbrec: res.dbrec,
+        bf_reg: res.bf_reg,
+        bf_size: res.bf_size,
+        bf_offset: Cell::new(0),
+        table: OrderedWqeTable::new(wqe_cnt),
+        _marker: std::marker::PhantomData,
+    })
+}
+
+fn make_rq_state<RqEntry>(res: &DevxQpResources) -> OwnedRq<RqEntry> {
+    let rq_wqe_cnt = 1u32 << res.layout.log_rq_size;
+    OwnedRq::new(Some(ReceiveQueueState {
+        buf: res.rq_buf,
+        wqe_cnt: rq_wqe_cnt,
+        stride: res.layout.rq_stride as u32,
+        pi: Cell::new(0),
+        ci: Cell::new(0),
+        dbrec: res.dbrec,
+        bf_reg: res.bf_reg,
+        bf_size: res.bf_size,
+        bf_offset: Cell::new(0),
+        pending_start_ptr: Cell::new(None),
+        pending_wqe_count: Cell::new(0),
+        table: (0..rq_wqe_cnt).map(|_| Cell::new(None)).collect(),
+    }))
 }
 
 // =============================================================================
@@ -1861,44 +1913,27 @@ where
     OnSq: Fn(Cqe, SqEntry) + 'static,
     OnRq: Fn(Cqe, RqEntry) + 'static,
 {
-    /// Build the RC QP.
-    ///
-    /// Only available when both SQ and RQ CQs are configured.
+    /// Build the RC QP via DevX.
     pub fn build(self) -> BuildResult<RcQpIb<SqEntry, RqEntry, OnSq, OnRq>> {
         unsafe {
-            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
-            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
-            qp_attr.send_cq = self.send_cq_ptr;
-            qp_attr.recv_cq = self.recv_cq_ptr;
-            qp_attr.cap.max_send_wr = self.config.max_send_wr;
-            qp_attr.cap.max_recv_wr = self.config.max_recv_wr;
-            qp_attr.cap.max_send_sge = self.config.max_send_sge;
-            qp_attr.cap.max_recv_sge = self.config.max_recv_sge;
-            qp_attr.cap.max_inline_data = self.config.max_inline_data;
-            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
-            qp_attr.pd = self.pd.as_ptr();
+            let res = create_devx_rc_qp(self.ctx, self.pd, self.send_cqn, self.recv_cqn, &self.config, None)?;
 
-            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
-            if !self.config.enable_scatter_to_cqe {
-                mlx5_attr.comp_mask =
-                    mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS
-                        as u64;
-                mlx5_attr.create_flags =
-                    mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
-            }
-
-            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
-            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
-
-            // Clone weak references before moving into RcQp
             let send_cq_for_register = self.send_cq_weak.clone();
             let recv_cq_for_register = self.recv_cq_weak.clone();
 
-            let mut result = RcQp {
-                qp,
+            let sq = make_sq_state(&res);
+            let rq = make_rq_state(&res);
+
+            let result = RcQp {
+                _devx_obj: res.devx_obj,
+                _umem: res.umem,
+                _wq_buf: res.wq_buf,
+                _dbr_umem: res.dbr_umem,
+                _dbr_buf: res.dbr_buf,
+                qpn: res.qpn,
                 state: Cell::new(QpState::Reset),
-                sq: None,
-                rq: OwnedRq::new(None),
+                sq,
+                rq,
                 sq_callback: self.sq_callback,
                 rq_callback: self.rq_callback,
                 send_cq: self.send_cq_weak.unwrap_or_default(),
@@ -1907,12 +1942,8 @@ where
                 _marker: std::marker::PhantomData,
             };
 
-            RcQpIb::<SqEntry, RqEntry, OnSq, OnRq>::init_direct_access_internal(&mut result)?;
-
             let qp_rc = Rc::new(RefCell::new(result));
             let qpn = qp_rc.borrow().qpn();
-
-            // Register with CQs if using normal Cq
             register_with_cqs(qpn, &send_cq_for_register, &recv_cq_for_register, &qp_rc);
 
             Ok(qp_rc)
@@ -1944,52 +1975,33 @@ where
     OnSq: Fn(Cqe, SqEntry) + 'static,
     OnRq: Fn(Cqe, RqEntry) + 'static,
 {
-    /// Build the RC QP with SRQ.
-    ///
-    /// Only available when both SQ and RQ CQs are configured.
+    /// Build the RC QP with SRQ via DevX.
     pub fn build(self) -> BuildResult<RcQpIbWithSrq<SqEntry, RqEntry, OnSq, OnRq>> {
         let srq = self
             .srq
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "SRQ not set"))?;
 
+        let srqn = srq.srq_number()?;
+
         unsafe {
-            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
-            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
-            qp_attr.send_cq = self.send_cq_ptr;
-            qp_attr.recv_cq = self.recv_cq_ptr;
-            qp_attr.srq = srq.as_ptr();
-            qp_attr.cap.max_send_wr = self.config.max_send_wr;
-            qp_attr.cap.max_recv_wr = 0; // RQ disabled when using SRQ
-            qp_attr.cap.max_send_sge = self.config.max_send_sge;
-            qp_attr.cap.max_recv_sge = 0; // RQ disabled when using SRQ
-            qp_attr.cap.max_inline_data = self.config.max_inline_data;
-            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
-            qp_attr.pd = self.pd.as_ptr();
+            let res = create_devx_rc_qp(self.ctx, self.pd, self.send_cqn, self.recv_cqn, &self.config, Some(srqn))?;
 
-            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
-            if !self.config.enable_scatter_to_cqe {
-                mlx5_attr.comp_mask =
-                    mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS
-                        as u64;
-                mlx5_attr.create_flags =
-                    mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
-            }
-
-            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
-            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
-
-            // Clone the inner Srq from Rc<Srq<RqEntry>>
             let srq_inner: Srq<RqEntry> = (**srq).clone();
-
-            // Clone weak references before moving into RcQp
             let send_cq_for_register = self.send_cq_weak.clone();
             let recv_cq_for_register = self.recv_cq_weak.clone();
 
-            let mut result = RcQp {
-                qp,
+            let sq = make_sq_state(&res);
+
+            let result = RcQp {
+                _devx_obj: res.devx_obj,
+                _umem: res.umem,
+                _wq_buf: res.wq_buf,
+                _dbr_umem: res.dbr_umem,
+                _dbr_buf: res.dbr_buf,
+                qpn: res.qpn,
                 state: Cell::new(QpState::Reset),
-                sq: None,
+                sq,
                 rq: SharedRq::new(srq_inner),
                 sq_callback: self.sq_callback,
                 rq_callback: self.rq_callback,
@@ -1999,14 +2011,8 @@ where
                 _marker: std::marker::PhantomData,
             };
 
-            RcQpIbWithSrq::<SqEntry, RqEntry, OnSq, OnRq>::init_direct_access_internal(
-                &mut result,
-            )?;
-
             let qp_rc = Rc::new(RefCell::new(result));
             let qpn = qp_rc.borrow().qpn();
-
-            // Register with CQs if using normal Cq
             register_with_cqs(qpn, &send_cq_for_register, &recv_cq_for_register, &qp_rc);
 
             Ok(qp_rc)
@@ -2025,73 +2031,45 @@ where
     OnSq: Fn(Cqe, Entry) + 'static,
     RqMono: MaybeMonoCqRegister<RcQpForMonoCqWithSrqAndSqCb<Entry, OnSq>>,
 {
-    /// Build the RC QP with SRQ using MonoCq for recv.
-    ///
-    /// This variant is for when RQ uses MonoCq (callback on CQ side, not QP).
-    /// Only available when SQ uses normal CQ with callback and RQ uses MonoCq.
-    /// The SQ callback will be invoked for SQ completions (e.g., RDMA READ).
+    /// Build the RC QP with SRQ using MonoCq for recv via DevX.
     pub fn build(self) -> BuildResult<RcQpForMonoCqWithSrqAndSqCb<Entry, OnSq>> {
         let srq = self
             .srq
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "SRQ not set"))?;
 
+        let srqn = srq.srq_number()?;
         let sq_callback = self.sq_callback;
 
         unsafe {
-            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
-            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
-            qp_attr.send_cq = self.send_cq_ptr;
-            qp_attr.recv_cq = self.recv_cq_ptr;
-            qp_attr.srq = srq.as_ptr();
-            qp_attr.cap.max_send_wr = self.config.max_send_wr;
-            qp_attr.cap.max_recv_wr = 0; // RQ disabled when using SRQ
-            qp_attr.cap.max_send_sge = self.config.max_send_sge;
-            qp_attr.cap.max_recv_sge = 0; // RQ disabled when using SRQ
-            qp_attr.cap.max_inline_data = self.config.max_inline_data;
-            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
-            qp_attr.pd = self.pd.as_ptr();
+            let res = create_devx_rc_qp(self.ctx, self.pd, self.send_cqn, self.recv_cqn, &self.config, Some(srqn))?;
 
-            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
-            if !self.config.enable_scatter_to_cqe {
-                mlx5_attr.comp_mask =
-                    mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS
-                        as u64;
-                mlx5_attr.create_flags =
-                    mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
-            }
-
-            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
-            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
-
-            // Clone the inner Srq from Rc<Srq<Entry>>
             let srq_inner: Srq<Entry> = (**srq).clone();
-
-            // Clone weak reference for CQ registration before moving into RcQp
             let send_cq_for_register = self.send_cq_weak.clone();
 
-            let mut result = RcQp {
-                qp,
+            let sq = make_sq_state(&res);
+
+            let result = RcQp {
+                _devx_obj: res.devx_obj,
+                _umem: res.umem,
+                _wq_buf: res.wq_buf,
+                _dbr_umem: res.dbr_umem,
+                _dbr_buf: res.dbr_buf,
+                qpn: res.qpn,
                 state: Cell::new(QpState::Reset),
-                sq: None,
+                sq,
                 rq: SharedRq::new(srq_inner),
                 sq_callback,
                 rq_callback: (),
                 send_cq: self.send_cq_weak.unwrap_or_default(),
-                recv_cq: Weak::new(), // MonoCq doesn't need CQ registration
+                recv_cq: Weak::new(),
                 _pd: self.pd.clone(),
                 _marker: std::marker::PhantomData,
             };
 
-            RcQpForMonoCqWithSrqAndSqCb::<Entry, OnSq>::init_direct_access_internal(&mut result)?;
-
             let qp_rc = Rc::new(RefCell::new(result));
             let qpn = qp_rc.borrow().qpn();
-
-            // Register with send CQ for SQ completion processing
             register_with_send_cq(qpn, &send_cq_for_register, &qp_rc);
-
-            // Auto-register with recv MonoCq
             self.rq_mono_cq_ref.maybe_register(&qp_rc);
 
             Ok(qp_rc)
@@ -2111,46 +2089,29 @@ where
     OnSq: Fn(Cqe, SqEntry) + 'static,
     OnRq: Fn(Cqe, RqEntry) + 'static,
 {
-    /// Build the RC QP for RoCE.
-    ///
-    /// Only available when both SQ and RQ CQs are configured.
+    /// Build the RC QP for RoCE via DevX.
     ///
     /// # NOTE: RoCE support is untested (IB-only hardware environment)
     pub fn build(self) -> BuildResult<RcQpRoCE<SqEntry, RqEntry, OnSq, OnRq>> {
         unsafe {
-            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
-            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
-            qp_attr.send_cq = self.send_cq_ptr;
-            qp_attr.recv_cq = self.recv_cq_ptr;
-            qp_attr.cap.max_send_wr = self.config.max_send_wr;
-            qp_attr.cap.max_recv_wr = self.config.max_recv_wr;
-            qp_attr.cap.max_send_sge = self.config.max_send_sge;
-            qp_attr.cap.max_recv_sge = self.config.max_recv_sge;
-            qp_attr.cap.max_inline_data = self.config.max_inline_data;
-            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
-            qp_attr.pd = self.pd.as_ptr();
+            let res = create_devx_rc_qp(self.ctx, self.pd, self.send_cqn, self.recv_cqn, &self.config, None)?;
 
-            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
-            if !self.config.enable_scatter_to_cqe {
-                mlx5_attr.comp_mask =
-                    mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS
-                        as u64;
-                mlx5_attr.create_flags =
-                    mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
-            }
-
-            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
-            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
-
-            // Clone weak references before moving into RcQp
             let send_cq_for_register = self.send_cq_weak.clone();
             let recv_cq_for_register = self.recv_cq_weak.clone();
 
-            let mut result = RcQp {
-                qp,
+            let sq = make_sq_state(&res);
+            let rq = make_rq_state(&res);
+
+            let result = RcQp {
+                _devx_obj: res.devx_obj,
+                _umem: res.umem,
+                _wq_buf: res.wq_buf,
+                _dbr_umem: res.dbr_umem,
+                _dbr_buf: res.dbr_buf,
+                qpn: res.qpn,
                 state: Cell::new(QpState::Reset),
-                sq: None,
-                rq: OwnedRq::new(None),
+                sq,
+                rq,
                 sq_callback: self.sq_callback,
                 rq_callback: self.rq_callback,
                 send_cq: self.send_cq_weak.unwrap_or_default(),
@@ -2159,13 +2120,8 @@ where
                 _marker: std::marker::PhantomData,
             };
 
-            // Initialize direct access for RoCE (same as IB)
-            RcQpRoCE::<SqEntry, RqEntry, OnSq, OnRq>::init_direct_access_internal(&mut result)?;
-
             let qp_rc = Rc::new(RefCell::new(result));
             let qpn = qp_rc.borrow().qpn();
-
-            // Register with CQs if using normal Cq
             register_with_cqs(qpn, &send_cq_for_register, &recv_cq_for_register, &qp_rc);
 
             Ok(qp_rc)
@@ -2185,9 +2141,7 @@ where
     OnSq: Fn(Cqe, SqEntry) + 'static,
     OnRq: Fn(Cqe, RqEntry) + 'static,
 {
-    /// Build the RC QP with SRQ for RoCE.
-    ///
-    /// Only available when both SQ and RQ CQs are configured.
+    /// Build the RC QP with SRQ for RoCE via DevX.
     ///
     /// # NOTE: RoCE support is untested (IB-only hardware environment)
     pub fn build(self) -> BuildResult<RcQpRoCEWithSrq<SqEntry, RqEntry, OnSq, OnRq>> {
@@ -2196,42 +2150,26 @@ where
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "SRQ not set"))?;
 
+        let srqn = srq.srq_number()?;
+
         unsafe {
-            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
-            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
-            qp_attr.send_cq = self.send_cq_ptr;
-            qp_attr.recv_cq = self.recv_cq_ptr;
-            qp_attr.srq = srq.as_ptr();
-            qp_attr.cap.max_send_wr = self.config.max_send_wr;
-            qp_attr.cap.max_recv_wr = 0;
-            qp_attr.cap.max_send_sge = self.config.max_send_sge;
-            qp_attr.cap.max_recv_sge = 0;
-            qp_attr.cap.max_inline_data = self.config.max_inline_data;
-            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
-            qp_attr.pd = self.pd.as_ptr();
-
-            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
-            if !self.config.enable_scatter_to_cqe {
-                mlx5_attr.comp_mask =
-                    mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS
-                        as u64;
-                mlx5_attr.create_flags =
-                    mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
-            }
-
-            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
-            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
+            let res = create_devx_rc_qp(self.ctx, self.pd, self.send_cqn, self.recv_cqn, &self.config, Some(srqn))?;
 
             let srq_inner: Srq<RqEntry> = (**srq).clone();
-
-            // Clone weak references before moving into RcQp
             let send_cq_for_register = self.send_cq_weak.clone();
             let recv_cq_for_register = self.recv_cq_weak.clone();
 
-            let mut result = RcQp {
-                qp,
+            let sq = make_sq_state(&res);
+
+            let result = RcQp {
+                _devx_obj: res.devx_obj,
+                _umem: res.umem,
+                _wq_buf: res.wq_buf,
+                _dbr_umem: res.dbr_umem,
+                _dbr_buf: res.dbr_buf,
+                qpn: res.qpn,
                 state: Cell::new(QpState::Reset),
-                sq: None,
+                sq,
                 rq: SharedRq::new(srq_inner),
                 sq_callback: self.sq_callback,
                 rq_callback: self.rq_callback,
@@ -2241,13 +2179,8 @@ where
                 _marker: std::marker::PhantomData,
             };
 
-            RcQpRoCEWithSrq::<SqEntry, RqEntry, OnSq, OnRq>::init_direct_access_internal(
-                &mut result,
-            )?;
-
             let qp_rc = Rc::new(RefCell::new(result));
             let qpn = qp_rc.borrow().qpn();
-
             register_with_cqs(qpn, &send_cq_for_register, &recv_cq_for_register, &qp_rc);
 
             Ok(qp_rc)
@@ -2266,54 +2199,33 @@ where
     SqMono: MaybeMonoCqRegister<RcQpForMonoCq<Entry>>,
     RqMono: MaybeMonoCqRegister<RcQpForMonoCq<Entry>>,
 {
-    /// Build the RC QP for use with MonoCq.
-    ///
-    /// When using MonoCq, callbacks are stored in the MonoCq, not in the RcQp.
-    /// This method is available when both SQ and RQ use MonoCq.
+    /// Build the RC QP for use with MonoCq via DevX.
     pub fn build(self) -> BuildResult<RcQpForMonoCq<Entry>> {
         unsafe {
-            let mut qp_attr: mlx5_sys::ibv_qp_init_attr_ex = MaybeUninit::zeroed().assume_init();
-            qp_attr.qp_type = mlx5_sys::ibv_qp_type_IBV_QPT_RC;
-            qp_attr.send_cq = self.send_cq_ptr;
-            qp_attr.recv_cq = self.recv_cq_ptr;
-            qp_attr.cap.max_send_wr = self.config.max_send_wr;
-            qp_attr.cap.max_recv_wr = self.config.max_recv_wr;
-            qp_attr.cap.max_send_sge = self.config.max_send_sge;
-            qp_attr.cap.max_recv_sge = self.config.max_recv_sge;
-            qp_attr.cap.max_inline_data = self.config.max_inline_data;
-            qp_attr.comp_mask = mlx5_sys::ibv_qp_init_attr_mask_IBV_QP_INIT_ATTR_PD;
-            qp_attr.pd = self.pd.as_ptr();
+            let res = create_devx_rc_qp(self.ctx, self.pd, self.send_cqn, self.recv_cqn, &self.config, None)?;
 
-            let mut mlx5_attr: mlx5_sys::mlx5dv_qp_init_attr = MaybeUninit::zeroed().assume_init();
-            if !self.config.enable_scatter_to_cqe {
-                mlx5_attr.comp_mask =
-                    mlx5_sys::mlx5dv_qp_init_attr_mask_MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS
-                        as u64;
-                mlx5_attr.create_flags =
-                    mlx5_sys::mlx5dv_qp_create_flags_MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE;
-            }
+            let sq = make_sq_state(&res);
+            let rq = make_rq_state(&res);
 
-            let qp = mlx5_sys::mlx5dv_create_qp(self.ctx.as_ptr(), &mut qp_attr, &mut mlx5_attr);
-            let qp = NonNull::new(qp).ok_or_else(io::Error::last_os_error)?;
-
-            let mut result = RcQp {
-                qp,
+            let result = RcQp {
+                _devx_obj: res.devx_obj,
+                _umem: res.umem,
+                _wq_buf: res.wq_buf,
+                _dbr_umem: res.dbr_umem,
+                _dbr_buf: res.dbr_buf,
+                qpn: res.qpn,
                 state: Cell::new(QpState::Reset),
-                sq: None,
-                rq: OwnedRq::new(None),
+                sq,
+                rq,
                 sq_callback: (),
                 rq_callback: (),
-                send_cq: Weak::new(), // MonoCq doesn't use Cq registration
+                send_cq: Weak::new(),
                 recv_cq: Weak::new(),
                 _pd: self.pd.clone(),
                 _marker: std::marker::PhantomData,
             };
 
-            RcQpIb::<Entry, Entry, (), ()>::init_direct_access_internal(&mut result)?;
-
             let qp_rc = Rc::new(RefCell::new(result));
-
-            // Auto-register with MonoCqs
             self.sq_mono_cq_ref.maybe_register(&qp_rc);
             self.rq_mono_cq_ref.maybe_register(&qp_rc);
 

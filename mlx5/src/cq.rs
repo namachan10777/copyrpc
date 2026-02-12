@@ -7,10 +7,13 @@ use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::rc::{Rc, Weak};
-use std::{io, mem::MaybeUninit, ptr::NonNull};
+use std::io;
 
 use crate::CompletionTarget;
 use crate::device::Context;
+use crate::devx::{DevxObj, DevxUmem};
+use crate::prm;
+use crate::qp::AlignedBuf;
 
 // =============================================================================
 // CQ Configuration Types
@@ -43,10 +46,12 @@ pub enum CqeCompressionFormat {
 }
 
 /// CQ creation configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CqConfig {
     /// CQE size (64 or 128 bytes)
     pub cqe_size: CqeSize,
+    /// log2 of the number of CQEs. Must be >= 1.
+    pub log_cq_size: u32,
     /// CQE compression format for RX (receive) completions.
     ///
     /// Set to `Some(format)` to enable CQE compression with the specified format.
@@ -58,6 +63,47 @@ pub struct CqConfig {
     ///
     /// Requires `MLX5DV_CONTEXT_FLAGS_CQE_128B_COMP` device capability.
     pub compression_format: Option<CqeCompressionFormat>,
+}
+
+impl Default for CqConfig {
+    fn default() -> Self {
+        Self {
+            cqe_size: CqeSize::Size64,
+            log_cq_size: 6, // 64 CQEs
+            compression_format: None,
+        }
+    }
+}
+
+/// Buffer layout for a DevX CQ.
+///
+/// Use [`CqConfig::buffer_layout()`] to compute the layout,
+/// then allocate a page-aligned buffer of `total_size` bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct CqBufferLayout {
+    /// Total buffer size (page-aligned).
+    pub total_size: usize,
+    /// CQE buffer size in bytes.
+    pub cqe_buf_size: usize,
+    /// Byte offset of the doorbell record within the buffer (64-byte aligned).
+    pub dbrec_offset: usize,
+}
+
+impl CqConfig {
+    /// Compute the buffer layout for this CQ configuration.
+    pub fn buffer_layout(&self) -> CqBufferLayout {
+        let cqe_cnt = 1usize << self.log_cq_size;
+        let cqe_buf_size = cqe_cnt * (self.cqe_size as usize);
+        // DBREC follows CQE buffer, 64-byte aligned
+        let dbrec_offset = (cqe_buf_size + 63) & !63;
+        // Total size: page-aligned
+        let total_size = (dbrec_offset + 64 + 4095) & !4095;
+        CqBufferLayout {
+            total_size,
+            cqe_buf_size,
+            dbrec_offset,
+        }
+    }
 }
 
 /// CQ moderation settings for interrupt coalescing.
@@ -528,6 +574,8 @@ pub(crate) struct CqState {
     cqe_size: u32,
     /// Doorbell record pointer
     dbrec: *mut u32,
+    /// CQ number (from HW)
+    cqn: u32,
     /// Consumer index
     ci: Cell<u32>,
     /// Pending mini CQE iterator for compressed CQE expansion.
@@ -553,9 +601,16 @@ type CachedQueue = Option<(u32, Rc<RefCell<dyn CompletionTarget>>)>;
 ///
 /// Used to receive completion notifications for send and receive operations.
 /// Multiple QPs can share the same CQ.
+///
+/// Created via DevX PRM commands with user-provided memory buffers.
 pub struct Cq {
-    cq: NonNull<mlx5_sys::ibv_cq>,
-    /// Direct verbs state for CQE polling (always initialized).
+    /// DevX CQ object. Must be dropped before _umem.
+    _devx_obj: DevxObj,
+    /// Registered UMEM for the CQ buffer. Must be dropped after _devx_obj.
+    _umem: DevxUmem,
+    /// Backing memory for CQE data and doorbell record.
+    _cq_buf: AlignedBuf,
+    /// Direct verbs state for CQE polling.
     state: CqState,
     /// Registered queues for completion dispatch.
     queues: RefCell<QueueMap>,
@@ -570,105 +625,174 @@ pub struct Cq {
 }
 
 impl Context {
-    /// Create a Completion Queue.
-    ///
-    /// Uses `mlx5dv_create_cq` to enable MLX5-specific features like CQE size.
+    /// Create a Completion Queue via DevX with internally allocated memory.
     ///
     /// # Arguments
-    /// * `cqe` - Minimum number of CQ entries (actual may be larger)
-    /// * `config` - CQ configuration options
+    /// * `num_cqes` - Number of CQEs (will be rounded up to the nearest power of 2).
+    /// * `config` - CQ configuration options (CQE size, compression, etc.)
     ///
     /// # Errors
     /// Returns an error if the CQ cannot be created.
-    pub fn create_cq(&self, cqe: i32, config: &CqConfig) -> io::Result<Cq> {
+    pub fn create_cq(
+        &self,
+        num_cqes: i32,
+        config: &CqConfig,
+    ) -> io::Result<Cq> {
+        let log_cq_size = (num_cqes.max(2) as u32).next_power_of_two().trailing_zeros();
+        let config = CqConfig {
+            log_cq_size,
+            ..config.clone()
+        };
+        let layout = config.buffer_layout();
+        let cq_buf = AlignedBuf::new(layout.total_size);
+        let buf = cq_buf.as_ptr();
+        let buf_len = cq_buf.len();
+
+        let uar = self.devx_uar()?;
+        let eqn = self.query_eqn(0)?;
+
+        // SAFETY: buf points to cq_buf's allocation which is page-aligned and large enough.
+        // The buffer lives as long as the Cq struct since _cq_buf is stored in it.
+        let umem = unsafe { self.register_umem(buf, buf_len, 7) }?; // LOCAL_WRITE | REMOTE_WRITE | REMOTE_READ
+
+        let cqe_cnt = 1u32 << config.log_cq_size;
+        let cqe_size = config.cqe_size as u32;
+
+        // Build CREATE_CQ PRM command (no PAS needed with UMEM mode)
+        let cmd_in_size = prm::CREATE_CQ_IN_BASE_SIZE;
+        let mut cmd_in = vec![0u8; cmd_in_size];
+        let mut cmd_out = vec![0u8; prm::CREATE_CQ_OUT_SIZE];
+
+        let umem_id = umem.umem_id();
+
+        // Command header
+        prm::prm_set(
+            &mut cmd_in,
+            prm::CREATE_CQ_IN_OPCODE.0,
+            prm::CREATE_CQ_IN_OPCODE.1,
+            prm::MLX5_CMD_OP_CREATE_CQ,
+        );
+
+        // CQ UMEM fields (buffer memory)
+        prm::prm_set(
+            &mut cmd_in,
+            prm::CREATE_CQ_IN_CQ_UMEM_VALID.0,
+            prm::CREATE_CQ_IN_CQ_UMEM_VALID.1,
+            1,
+        );
+        prm::prm_set(
+            &mut cmd_in,
+            prm::CREATE_CQ_IN_CQ_UMEM_ID.0,
+            prm::CREATE_CQ_IN_CQ_UMEM_ID.1,
+            umem_id,
+        );
+        prm::prm_set64(&mut cmd_in, prm::CREATE_CQ_IN_CQ_UMEM_OFFSET, 0);
+
+        // CQC fields
+        let c = prm::CREATE_CQ_IN_CQC_OFF;
+
+        // CQE size: 0=64B, 1=128B
+        let cqe_sz_val = match config.cqe_size {
+            CqeSize::Size64 => 0u32,
+            CqeSize::Size128 => 1,
+        };
+        prm::prm_set(&mut cmd_in, c + prm::CQC_CQE_SZ.0, prm::CQC_CQE_SZ.1, cqe_sz_val);
+        prm::prm_set(
+            &mut cmd_in,
+            c + prm::CQC_LOG_CQ_SIZE.0,
+            prm::CQC_LOG_CQ_SIZE.1,
+            config.log_cq_size,
+        );
+        prm::prm_set(
+            &mut cmd_in,
+            c + prm::CQC_UAR_PAGE.0,
+            prm::CQC_UAR_PAGE.1,
+            uar.page_id(),
+        );
+        prm::prm_set(&mut cmd_in, c + prm::CQC_C_EQN.0, prm::CQC_C_EQN.1, eqn);
+        prm::prm_set(
+            &mut cmd_in,
+            c + prm::CQC_LOG_PAGE_SIZE.0,
+            prm::CQC_LOG_PAGE_SIZE.1,
+            0, // use smallest page size (implicit)
+        );
+
+        // DBR UMEM fields (doorbell record memory)
+        prm::prm_set(
+            &mut cmd_in,
+            c + prm::CQC_DBR_UMEM_VALID.0,
+            prm::CQC_DBR_UMEM_VALID.1,
+            1,
+        );
+        prm::prm_set(
+            &mut cmd_in,
+            c + prm::CQC_DBR_UMEM_ID.0,
+            prm::CQC_DBR_UMEM_ID.1,
+            umem_id,
+        );
+        prm::prm_set64(
+            &mut cmd_in,
+            c + prm::CQC_DBR_ADDR,
+            layout.dbrec_offset as u64,
+        );
+
+        // Create the CQ via DevX
+        let devx_obj = self.devx_obj_create(&cmd_in, &mut cmd_out)?;
+        let cqn = prm::prm_get(&cmd_out, prm::CREATE_CQ_OUT_CQN.0, prm::CREATE_CQ_OUT_CQN.1);
+
+        // Initialize all CQEs to HW ownership (UCX-style).
+        // op_own byte: opcode[7:4] | reserved[3:1] | owner[0]
+        // Set opcode = 0xf (INVALID) and owner = 1.
+        const OP_OWN_INVALID: u8 = 0xf1;
+        let cqe64_offset: usize = if cqe_size == 128 { 64 } else { 0 };
         unsafe {
-            let mut attr: mlx5_sys::ibv_cq_init_attr_ex = MaybeUninit::zeroed().assume_init();
-            attr.cqe = cqe as u32;
-            attr.cq_context = std::ptr::null_mut();
-            attr.channel = std::ptr::null_mut();
-            attr.comp_vector = 0;
-            attr.wc_flags = 0;
-            attr.comp_mask = 0;
-            attr.flags = 0;
-
-            let mut mlx5_attr: mlx5_sys::mlx5dv_cq_init_attr = MaybeUninit::zeroed().assume_init();
-            mlx5_attr.comp_mask =
-                mlx5_sys::mlx5dv_cq_init_attr_mask_MLX5DV_CQ_INIT_ATTR_MASK_CQE_SIZE as u64;
-            mlx5_attr.cqe_size = config.cqe_size as u16;
-
-            let cq_ex = mlx5_sys::mlx5dv_create_cq(self.as_ptr(), &mut attr, &mut mlx5_attr);
-            if cq_ex.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-
-            // ibv_cq_ex can be cast to ibv_cq (first fields are identical)
-            let cq_ptr = cq_ex as *mut mlx5_sys::ibv_cq;
-
-            // Initialize direct verbs access immediately
-            let mut dv_cq: MaybeUninit<mlx5_sys::mlx5dv_cq> = MaybeUninit::zeroed();
-            let mut obj: MaybeUninit<mlx5_sys::mlx5dv_obj> = MaybeUninit::zeroed();
-
-            let obj_ptr = obj.as_mut_ptr();
-            (*obj_ptr).cq.in_ = cq_ptr;
-            (*obj_ptr).cq.out = dv_cq.as_mut_ptr();
-
-            let ret =
-                mlx5_sys::mlx5dv_init_obj(obj_ptr, mlx5_sys::mlx5dv_obj_type_MLX5DV_OBJ_CQ as u64);
-            if ret != 0 {
-                mlx5_sys::ibv_destroy_cq(cq_ptr);
-                return Err(io::Error::from_raw_os_error(-ret));
-            }
-
-            let dv_cq = dv_cq.assume_init();
-
-            // Initialize all CQEs to look like they are in HW ownership (UCX-style).
-            // op_own byte layout: opcode[7:4] | reserved[3:1] | owner[0]
-            // Set opcode = 0xf (INVALID) and owner = 1.
-            //
-            // For 128-byte CQEs, the CQE64 structure is in the second half (offset 64-127).
-            // For 64-byte CQEs, it's at the beginning.
-            const OP_OWN_INVALID: u8 = 0xf1; // opcode=INVALID(0xf), owner=1
-            let buf = dv_cq.buf as *mut u8;
-            let cqe64_offset: usize = if dv_cq.cqe_size == 128 { 64 } else { 0 };
-            for i in 0..dv_cq.cqe_cnt {
-                let cqe_ptr = buf.add((i as usize) * (dv_cq.cqe_size as usize));
+            for i in 0..cqe_cnt {
+                let cqe_ptr = buf.add((i as usize) * (cqe_size as usize));
                 let cqe64_ptr = cqe_ptr.add(cqe64_offset);
                 let op_own_ptr = cqe64_ptr.add(63);
                 std::ptr::write_volatile(op_own_ptr, OP_OWN_INVALID);
             }
-
-            Ok(Cq {
-                cq: NonNull::new(cq_ptr).unwrap(),
-                state: CqState {
-                    buf: dv_cq.buf as *mut u8,
-                    cqe_cnt: dv_cq.cqe_cnt,
-                    cqe_cnt_log2: dv_cq.cqe_cnt.trailing_zeros(),
-                    cqe_size: dv_cq.cqe_size,
-                    dbrec: dv_cq.dbrec,
-                    ci: Cell::new(0),
-                    pending_mini_cqes: UnsafeCell::new(None),
-                    title_opcode: Cell::new(CqeOpcode::Req),
-                },
-                queues: RefCell::new(HashMap::with_hasher(BuildHasherDefault::default())),
-                last_queue_cache: UnsafeCell::new(None),
-                _ctx: self.clone(),
-            })
         }
-    }
-}
 
-impl Drop for Cq {
-    fn drop(&mut self) {
-        unsafe {
-            mlx5_sys::ibv_destroy_cq(self.cq.as_ptr());
-        }
+        let dbrec = unsafe { buf.add(layout.dbrec_offset) as *mut u32 };
+
+        // SAFETY: buf points to cq_buf's allocation, which is page-aligned and
+        // will remain valid for the CQ's lifetime since _cq_buf is stored in the Cq struct.
+        Ok(Cq {
+            _devx_obj: devx_obj,
+            _umem: umem,
+            _cq_buf: cq_buf,
+            state: CqState {
+                buf,
+                cqe_cnt,
+                cqe_cnt_log2: cqe_cnt.trailing_zeros(),
+                cqe_size,
+                dbrec,
+                cqn,
+                ci: Cell::new(0),
+                pending_mini_cqes: UnsafeCell::new(None),
+                title_opcode: Cell::new(CqeOpcode::Req),
+            },
+            queues: RefCell::new(HashMap::with_hasher(BuildHasherDefault::default())),
+            last_queue_cache: UnsafeCell::new(None),
+            _ctx: self.clone(),
+        })
     }
 }
 
 impl Cq {
-    /// Get the raw ibv_cq pointer.
-    pub fn as_ptr(&self) -> *mut mlx5_sys::ibv_cq {
-        self.cq.as_ptr()
+    /// Get the CQ number (CQN).
+    ///
+    /// Used for DevX QP creation where cqn_snd/cqn_rcv must be set in the QPC.
+    pub fn cqn(&self) -> u32 {
+        self.state.cqn
+    }
+
+    /// Legacy ibv_cq pointer for verbs-based resource creation.
+    /// Returns null since this CQ was created via DevX and has no ibv_cq backing.
+    /// TM SRQ creation will fail at runtime when using a DevX CQ.
+    pub(crate) fn as_ibv_cq_ptr(&self) -> *mut mlx5_sys::ibv_cq {
+        std::ptr::null_mut()
     }
 
     /// Register a queue for completion dispatch.
@@ -765,34 +889,8 @@ impl Cq {
         }
     }
 
-    /// Set CQ moderation parameters.
-    ///
-    /// Moderation reduces interrupt overhead by batching completions.
-    /// The CQ will generate an interrupt when either threshold is reached:
-    /// - `cq_count` CQEs have been generated, or
-    /// - `cq_period` microseconds have elapsed since the first CQE
-    ///
-    /// # Arguments
-    /// * `moderation` - Moderation settings (count and period thresholds)
-    ///
-    /// # Errors
-    /// Returns an error if the moderation settings cannot be applied.
-    pub fn set_moderation(&self, moderation: CqModeration) -> io::Result<()> {
-        unsafe {
-            let mut attr: mlx5_sys::ibv_modify_cq_attr = MaybeUninit::zeroed().assume_init();
-            // IBV_CQ_ATTR_MODERATE = 1 (from libibverbs)
-            const IBV_CQ_ATTR_MODERATE: u32 = 1;
-            attr.attr_mask = IBV_CQ_ATTR_MODERATE;
-            attr.moderate.cq_count = moderation.cq_count;
-            attr.moderate.cq_period = moderation.cq_period;
-
-            let ret = mlx5_sys::ibv_modify_cq_ex(self.cq.as_ptr(), &mut attr);
-            if ret != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        }
-    }
+    // Note: CQ moderation (set_moderation) has been removed in the DevX conversion.
+    // If needed, it can be re-added using PRM MODIFY_CQ command.
 
     /// Try to get the next CQE.
     ///

@@ -34,10 +34,10 @@ fn test_mono_cq_creation() {
             .expect("Failed to create MonoCq"),
     );
 
-    // Verify as_ptr returns non-null
+    // Verify CQN is non-zero (CQ was created successfully)
     assert!(
-        !mono_cq.as_ptr().is_null(),
-        "MonoCq as_ptr should not be null"
+        mono_cq.cqn() != 0,
+        "MonoCq cqn should not be zero"
     );
 
     println!("MonoCq creation test passed!");

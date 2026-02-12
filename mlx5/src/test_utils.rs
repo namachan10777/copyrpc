@@ -11,12 +11,12 @@ use crate::types::PortAttr;
 /// Page size for aligned allocations.
 pub const PAGE_SIZE: usize = 4096;
 
-/// Find an available mlx5 device and open it.
+/// Find an available mlx5 device and open it with DevX support.
 pub fn open_mlx5_device() -> Option<Context> {
     let device_list = DeviceList::list().ok()?;
 
     for device in device_list.iter() {
-        if let Ok(ctx) = device.open() {
+        if let Ok(ctx) = device.open_devx() {
             return Some(ctx);
         }
     }

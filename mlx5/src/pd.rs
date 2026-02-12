@@ -123,8 +123,30 @@ impl Context {
 
 impl Pd {
     /// Get the raw ibv_pd pointer.
-    pub(crate) fn as_ptr(&self) -> *mut mlx5_sys::ibv_pd {
+    pub fn as_ptr(&self) -> *mut mlx5_sys::ibv_pd {
         self.0.pd.as_ptr()
+    }
+
+    /// Get the firmware PD number (PDN) for use in DevX QPC fields.
+    ///
+    /// Note: This is the firmware-internal PDN obtained via mlx5dv_init_obj,
+    /// NOT the verbs handle (`ibv_pd.handle`).
+    pub fn pdn(&self) -> u32 {
+        unsafe {
+            let mut dv_pd: std::mem::MaybeUninit<mlx5_sys::mlx5dv_pd> =
+                std::mem::MaybeUninit::zeroed();
+            let mut obj: std::mem::MaybeUninit<mlx5_sys::mlx5dv_obj> =
+                std::mem::MaybeUninit::zeroed();
+            let obj_ptr = obj.as_mut_ptr();
+            (*obj_ptr).pd.in_ = self.0.pd.as_ptr();
+            (*obj_ptr).pd.out = dv_pd.as_mut_ptr();
+            let ret = mlx5_sys::mlx5dv_init_obj(
+                obj_ptr,
+                mlx5_sys::mlx5dv_obj_type_MLX5DV_OBJ_PD as u64,
+            );
+            assert_eq!(ret, 0, "mlx5dv_init_obj(PD) failed");
+            dv_pd.assume_init().pdn
+        }
     }
 }
 
