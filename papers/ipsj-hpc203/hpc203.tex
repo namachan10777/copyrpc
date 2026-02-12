@@ -254,6 +254,49 @@ RPCを管理対象のシステムサービスとして提供するアーキテ�
 ノード内プロセス数が増えてもノード外通信状態量の増加を抑えられる．
 結果として，Fat-node環境で問題となる接続状態メモリと通信制御オーバーヘッドの増大を緩和する．
 
+\subsubsection{QP状態メモリの理論見積り}
+
+提案方式の効果を定量化するため，接続管理に起因するメモリ使用量を理論的に見積もる．
+ここで，ノード数を$N$，ノード当たりクライアントプロセス数を$P$，
+ノード外RDMA送信を担当するデーモン側実体数を$D$とする．
+また，1接続当たりのQP関連状態メモリを$m_{\mathrm{qp}}$ [Byte]，
+UCX worker/endpoint等の管理状態を接続当たり$m_{\mathrm{ctl}}$ [Byte]とおく．
+
+ノード当たりの総通信メモリは概念的に，
+\begin{equation}
+M_{\mathrm{total}} = M_{\mathrm{common}} + M_{\mathrm{conn}} + M_{\mathrm{buf}}
+\end{equation}
+と分解できる．
+ここで$M_{\mathrm{common}}$はノード共通の固定コスト，$M_{\mathrm{conn}}$は接続管理コスト，
+$M_{\mathrm{buf}}$はクライアント固有のリクエスト/レスポンス用バッファである．
+提案方式とUCXの比較では，$M_{\mathrm{buf}}$は双方で必要となるため差分は主に$M_{\mathrm{conn}}$で生じる．
+
+UCXベースラインではクライアントが個別に通信コンテキストを持つため，接続管理コストは
+\begin{equation}
+M_{\mathrm{conn}}^{\mathrm{ucx}} = \alpha P (N-1)(m_{\mathrm{qp}} + m_{\mathrm{ctl}})
+\end{equation}
+で表せる．
+ここで$\alpha$は接続粒度を表し，1プロセスがリモート各ノードに1接続を持つ場合は$\alpha=1$，
+プロセス間全接続に近い構成では$\alpha=P$となる．
+
+提案方式ではノード外接続をデーモンに集約するため，接続管理コストは
+\begin{equation}
+M_{\mathrm{conn}}^{\mathrm{prop}} = D (N-1)(m_{\mathrm{qp}} + m_{\mathrm{ctl}})
+\end{equation}
+となる．
+したがって改善率は
+\begin{equation}
+\frac{M_{\mathrm{conn}}^{\mathrm{ucx}}}{M_{\mathrm{conn}}^{\mathrm{prop}}}=\frac{\alpha P}{D}
+\end{equation}
+で与えられ，クライアント数$P$の増加に対して，提案方式は$D$で頭打ちの増加に抑えられる．
+
+例えば$N=256$，$P=64$，$D=8$，$m_{\mathrm{qp}}=16$KiBとすると，
+$\alpha=1$でもQP関連状態だけで$M_{\mathrm{conn}}^{\mathrm{ucx}}\approx255$MiB，$M_{\mathrm{conn}}^{\mathrm{prop}}\approx32$MiBとなり，
+約8倍の削減となる．
+さらに$\alpha=P$に近い構成では削減率は約512倍となる．
+この削減は，単なるメモリ容量削減だけでなく，NICが保持・参照する接続状態の総量を減らし，
+接続状態キャッシュ競合の緩和につながる点に意義がある．
+
 \subsection{RDMA通信プロトコル}
 
 \begin{figure*}[t]
