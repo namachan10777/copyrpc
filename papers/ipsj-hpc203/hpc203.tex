@@ -271,24 +271,8 @@ RPCを管理対象のシステムサービスとして提供するアーキテ�
 受信側は集約された受信CQをポーリングし，1つのCQEをトリガとしてバッチ内の複数メッセージを処理する．
 これにより，通知処理はメッセージ単位ではなくバッチ単位へ償却される．
 
-本稿で用いる送信バッファの論理フォーマットを表\ref{tab:send-buffer-format}に示す．
-
-\begin{table}[t]
-	\caption{送信バッファの論理フォーマット}
-	\label{tab:send-buffer-format}
-	\centering
-	\begin{tabular}{p{0.27\linewidth}|p{0.63\linewidth}}
-		\hline
-		領域/項目 & 役割 \\
-		\hline
-		Slot Header & call\_id，generation，状態（Empty/ReqReady/RespReady），要求長，応答長を保持する固定長メタデータ \\
-		Data Area & 要求または応答の可変長ペイロード本体 \\
-		Producer Position & クライアント側が書き込み完了として公開した末尾位置 \\
-		Consumer Position & デーモン側が送信済み/解放済みとして進めた位置 \\
-		Generation Counter & リング折返し時の世代識別子（同一オフセット再利用時の取り違え防止） \\
-		\hline
-	\end{tabular}
-\end{table}
+送信バッファは，slot header（call\_id，generation，状態，要求長/応答長）とpayloadからなるスロット列として管理する．
+この論理フォーマットと可視化手順は図\ref{fig:message-write-protocol}で合わせて示す．
 
 \subsubsection{フロー制御}
 
@@ -305,11 +289,21 @@ RPCを管理対象のシステムサービスとして提供するアーキテ�
 
 複数プロセスが同一送信バッファへ同時に書き込むため，書き込み領域の調停と公開順序の保証が必要になる．
 本方式では「領域確保」と「公開」を分離した2段階プロトコルを採る．
+全体の流れは図\ref{fig:message-write-protocol}に示す．
 
-第1段階では，クライアントが原子的なtail更新で書き込み区間を確保する．
+\begin{figure}[t]
+	\centering
+	\includegraphics[width=0.95\linewidth]{handmade-figures/message-write.drawio.pdf}
+	\caption{複数クライアントによるメッセージ協調書き込み}
+	\label{fig:message-write-protocol}
+\end{figure}
+
+第1段階では，クライアントが原子的なfetch\_addでproducer位置を前進させ，書き込み区間を確保する．
 この時点では他プロセスから当該スロットは不可視である．
-第2段階で，クライアントはSlot HeaderとData Areaを書き込み，最後に状態ビットを公開状態へ遷移させる．
-デーモンは公開済み状態のスロットのみを対象に送信範囲を確定し，WQEを生成する．
+第2段階で，クライアントはslot header（call\_id，generation，要求長/応答長）とpayloadを書き込み，
+最後にstateをReqReadyへ更新して可視化する．
+この更新順序により，DaemonはReqReadyを観測した時点で当該スロットの内容を一貫して参照できる．
+Daemonは前回処理したconsumer位置から順にslot headerのstateを確認し，ReqReadyの連続区間を送信範囲としてWQEを生成する．
 
 このとき重要なのは，デーモンがPayload内容を見て要求を抽出しない点である．
 デーモンはSlot Headerの境界情報と状態遷移のみを用いて送信可能区間を決定する．
