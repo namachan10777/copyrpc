@@ -446,6 +446,84 @@ impl<U> Context<U> {
         }
     }
 
+    /// poll() with per-step timing instrumentation.
+    /// Returns (step1_ns, step2_ns, step3_ns, step4_ns, recv_count).
+    pub fn poll_timed(&self, mut on_response: impl FnMut(U, &[u8])) -> (u32, u32, u32, u32, u32) {
+        let recv_cq = &self.recv_cq;
+        let endpoints = &self.endpoints;
+        let recv_stack = &self.recv_stack;
+
+        let t0 = std::time::Instant::now();
+
+        // 1. Poll recv CQ
+        let mut recv_count = 0u32;
+        loop {
+            let count = recv_cq.poll(|cqe, _entry| {
+                if cqe.opcode == mlx5::cq::CqeOpcode::ReqErr
+                    || cqe.opcode == mlx5::cq::CqeOpcode::RespErr
+                {
+                    return;
+                }
+                Self::process_cqe_static(cqe, cqe.qp_num, endpoints, &mut on_response, recv_stack);
+            });
+            if count == 0 {
+                break;
+            }
+            recv_count += count as u32;
+        }
+
+        let t1 = std::time::Instant::now();
+
+        // 2. Flush recv CQ + SRQ repost
+        if recv_count > 0 {
+            recv_cq.flush();
+            let posted = self.srq_posted.get().saturating_sub(recv_count);
+            self.srq_posted.set(posted);
+            let threshold = self.srq_max_wr * 2 / 3;
+            if posted < threshold {
+                let to_post = self.srq_max_wr - posted;
+                for _ in 0..to_post {
+                    let _ = self.srq.post_recv(SrqEntry { qpn: 0 }, 0, 0, 0);
+                }
+                self.srq.ring_doorbell();
+                self.srq_posted.set(self.srq_max_wr);
+            }
+        }
+
+        let t2 = std::time::Instant::now();
+
+        // 3. Poll send CQ
+        loop {
+            let count = self.send_cq.poll();
+            if count == 0 {
+                break;
+            }
+        }
+        self.send_cq.flush();
+        {
+            let entries = unsafe { &mut *self.send_cqe_buffer.entries.get() };
+            entries.clear();
+        }
+
+        let t3 = std::time::Instant::now();
+
+        // 4. Flush all endpoints
+        for (_, ep) in unsafe { &*self.endpoints.get() }.iter() {
+            let ep_ref = unsafe { &*ep.get() };
+            let _ = ep_ref.flush();
+        }
+
+        let t4 = std::time::Instant::now();
+
+        (
+            (t1 - t0).as_nanos() as u32,
+            (t2 - t1).as_nanos() as u32,
+            (t3 - t2).as_nanos() as u32,
+            (t4 - t3).as_nanos() as u32,
+            recv_count,
+        )
+    }
+
     /// Get the next received request from the stack.
     ///
     /// Call poll() first to populate the recv_stack.

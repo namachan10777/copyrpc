@@ -14,7 +14,7 @@ use mpi::collective::CommunicatorCollectives;
 
 use crate::Cli;
 use crate::affinity;
-use crate::daemon::EndpointConnectionInfo;
+use crate::daemon::{EndpointConnectionInfo, auto_adjust_ring_size};
 use crate::message::{RemoteRequest, RemoteResponse, Request, Response};
 use crate::mpi_util;
 use crate::parquet_out;
@@ -96,7 +96,8 @@ pub fn run_copyrpc_direct(
     let key_range = cli.key_range;
     let device_index = cli.device_index;
     let port = cli.port;
-    let ring_size = cli.ring_size;
+    // Auto-adjust ring_size: each endpoint handles queue_depth inflight calls
+    let ring_size = auto_adjust_ring_size(cli.ring_size, queue_depth as usize, rank);
 
     let bench_start = Instant::now();
     let mut daemon_handles = Vec::with_capacity(num_daemons);

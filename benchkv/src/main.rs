@@ -1,8 +1,8 @@
 mod affinity;
 mod client;
 mod copyrpc_direct_backend;
-mod delegation_backend;
 mod daemon;
+mod delegation_backend;
 mod erpc_backend;
 mod message;
 mod mpi_util;
@@ -88,6 +88,10 @@ struct Cli {
     #[arg(long, default_value = "1024")]
     qd_sample_interval: u32,
 
+    /// Daemon poll budget: max inner poll iterations in Phase 1 (delegation only)
+    #[arg(long, default_value = "16")]
+    poll_budget: u32,
+
     #[command(subcommand)]
     subcommand: SubCmd,
 }
@@ -156,14 +160,9 @@ fn main() {
             num_daemons,
             num_clients,
         ),
-        SubCmd::Delegation => delegation_backend::run_delegation(
-            &cli,
-            &world,
-            rank,
-            size,
-            num_daemons,
-            num_clients,
-        ),
+        SubCmd::Delegation => {
+            delegation_backend::run_delegation(&cli, &world, rank, size, num_daemons, num_clients)
+        }
     };
 
     // Rank 0: write parquet

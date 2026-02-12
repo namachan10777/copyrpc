@@ -645,7 +645,11 @@ fn run_daemon(
 
         // Update extra buffer pointers and register MRs for new clients
         let extra_buf_size = server.extra_buffer_size() as usize;
-        for (i, slot) in extra_buf_ptrs.iter_mut().enumerate().take(max_clients as usize) {
+        for (i, slot) in extra_buf_ptrs
+            .iter_mut()
+            .enumerate()
+            .take(max_clients as usize)
+        {
             *slot = server.client_extra_buffer(ipc::ClientId(i as u32));
         }
         for (client_idx, ptr_opt) in extra_buf_ptrs.iter().enumerate() {

@@ -4,14 +4,14 @@ use std::time::{Duration, Instant};
 
 use mpi::collective::CommunicatorCollectives;
 
+use crate::Cli;
 use crate::affinity;
-use crate::daemon::{CopyrpcSetup, DaemonFlux, EndpointConnectionInfo};
+use crate::daemon::{CopyrpcSetup, DaemonFlux, EndpointConnectionInfo, auto_adjust_ring_size};
 use crate::message::*;
 use crate::mpi_util;
 use crate::parquet_out;
 use crate::storage::ShardedStore;
 use crate::workload;
-use crate::Cli;
 
 /// copyrpc user_data for delegation: identifies the delegationrpc response slot.
 #[derive(Clone, Copy)]
@@ -41,6 +41,7 @@ fn run_daemon_0(
     num_daemons: usize,
     key_range: u64,
     queue_depth: u32,
+    poll_budget: u32,
     mut ipc_server: ipc::Server<Request, Response>,
     mut deleg_server: delegationrpc::Server<Request, Response>,
     mut flux: DaemonFlux,
@@ -147,40 +148,102 @@ fn run_daemon_0(
     let mut ipc_inflight = vec![0u32; max_ipc_clients];
     let mut ipc_skip = vec![false; max_ipc_clients];
 
-    // Buffer for nested ctx.poll() responses inside flux.poll() closure
-    let mut nested_resp_buf: Vec<(DelegToken, Response)> = Vec::new();
+    // Backlog for copyrpc recv_handle.reply() when send ring is full
+    let mut reply_backlog: Vec<(copyrpc::RecvHandle<'_, DelegToken>, Vec<u8>)> = Vec::new();
+    // Backlog for copyrpc endpoint.call() when ring full / insufficient credit
+    let mut call_backlog: Vec<(usize, RemoteRequest, DelegToken)> = Vec::new();
+
+    // Performance instrumentation
+    let perf_start = std::time::Instant::now();
+    let mut perf_loop_count: u64 = 0;
+    let mut perf_copyrpc_resp: u64 = 0;
+    let mut perf_deleg_req: u64 = 0;
+    let mut perf_incoming_req: u64 = 0;
+    let mut perf_ipc_req: u64 = 0;
+
+    let cap = 1_000_000usize;
+    let mut loop_period_ns: Vec<u32> = Vec::with_capacity(cap);
+    let mut phase1_ns: Vec<u32> = Vec::with_capacity(cap);
+    let mut phase1_poll_ns: Vec<u32> = Vec::with_capacity(cap);
+    let mut phase1_recv_ns: Vec<u32> = Vec::with_capacity(cap);
+    let mut poll_s1_ns: Vec<u32> = Vec::with_capacity(cap);
+    let mut poll_s2_ns: Vec<u32> = Vec::with_capacity(cap);
+    let mut poll_s3_ns: Vec<u32> = Vec::with_capacity(cap);
+    let mut poll_s4_ns: Vec<u32> = Vec::with_capacity(cap);
+    let mut phase2_ns: Vec<u32> = Vec::with_capacity(cap);
+    let mut phase3_ns: Vec<u32> = Vec::with_capacity(cap);
+    let mut phase4_ns: Vec<u32> = Vec::with_capacity(cap);
+    let mut perf_copyrpc_incoming: u64 = 0;
+    let mut loop_prev_ts = perf_start;
 
     while !stop_flag.load(Ordering::Relaxed) {
+        perf_loop_count += 1;
+        let loop_now = std::time::Instant::now();
+        if loop_period_ns.len() < cap {
+            loop_period_ns.push((loop_now - loop_prev_ts).as_nanos() as u32);
+        }
+        loop_prev_ts = loop_now;
+
         // === Phase 1: copyrpc poll (RDMA completions → delegationrpc response slots) ===
+        let p1_start = std::time::Instant::now();
+        let mut copyrpc_resp_count = 0u32;
+        let mut copyrpc_incoming_count = 0u32;
+        let mut p1_recv_start = p1_start;
         if let Some(ctx) = ctx_ref {
-            ctx.poll(|token: DelegToken, data: &[u8]| {
-                let resp = RemoteResponse::from_bytes(data).response;
-                deleg_server.reply(token.client_id, token.resp_slot_idx, resp);
+            let (mut last_s1, mut last_s2, mut last_s3, mut last_s4) = (0u32, 0u32, 0u32, 0u32);
+            for _spin in 0..poll_budget {
+                let (s1, s2, s3, s4, _rc) = ctx.poll_timed(|token: DelegToken, data: &[u8]| {
+                    let resp = RemoteResponse::from_bytes(data).response;
+                    deleg_server.reply(token.client_id, token.resp_slot_idx, resp);
+                    copyrpc_resp_count += 1;
+                });
+                last_s1 = s1;
+                last_s2 = s2;
+                last_s3 = s3;
+                last_s4 = s4;
+                if copyrpc_resp_count >= poll_budget {
+                    break;
+                }
+            }
+
+            if poll_s1_ns.len() < cap {
+                poll_s1_ns.push(last_s1);
+                poll_s2_ns.push(last_s2);
+                poll_s3_ns.push(last_s3);
+                poll_s4_ns.push(last_s4);
+            }
+            if phase1_poll_ns.len() < cap {
+                phase1_poll_ns.push((std::time::Instant::now() - p1_start).as_nanos() as u32);
+            }
+
+            // Drain reply backlog (recv_handle.reply retries from previous loop)
+            reply_backlog.retain_mut(|(handle, data)| match handle.reply(data) {
+                Ok(()) => false,
+                Err(copyrpc::error::Error::RingFull) => true,
+                Err(e) => {
+                    eprintln!("[daemon0] reply backlog error: {e}");
+                    false
+                }
             });
 
             // copyrpc recv (incoming requests from remote nodes)
+            p1_recv_start = std::time::Instant::now();
             while let Some(recv_handle) = ctx.recv() {
+                copyrpc_incoming_count += 1;
                 let req = RemoteRequest::from_bytes(recv_handle.data()).request;
                 let target_daemon = ShardedStore::owner_of(req.key(), num_daemons_u64) as usize;
 
                 if target_daemon == 0 {
                     let resp = handle_local(&mut store, &req);
                     let remote_resp = RemoteResponse { response: resp };
-                    loop {
-                        match recv_handle.reply(remote_resp.as_bytes()) {
-                            Ok(()) => break,
-                            Err(copyrpc::error::Error::RingFull) => {
-                                ctx.poll(|token: DelegToken, data: &[u8]| {
-                                    let resp = RemoteResponse::from_bytes(data).response;
-                                    deleg_server.reply(
-                                        token.client_id,
-                                        token.resp_slot_idx,
-                                        resp,
-                                    );
-                                });
-                                continue;
-                            }
-                            Err(_) => break,
+                    match recv_handle.reply(remote_resp.as_bytes()) {
+                        Ok(()) => {}
+                        Err(copyrpc::error::Error::RingFull) => {
+                            reply_backlog.push((recv_handle, remote_resp.as_bytes().to_vec()));
+                            continue; // recv_handle moved; skip to next ctx.recv()
+                        }
+                        Err(e) => {
+                            eprintln!("[daemon0] Phase1 reply error: {e}");
                         }
                     }
                 } else {
@@ -193,29 +256,54 @@ fn run_daemon_0(
                         pending_copyrpc_handles.push(Some(recv_handle));
                         i
                     };
-                    let _ = flux.call(target_daemon, DelegatePayload::Req(req), idx);
+                    if let Err(e) = flux.call(target_daemon, DelegatePayload::Req(req), idx) {
+                        eprintln!("[daemon0] Flux call error: {e:?}");
+                        // Reclaim slot; recv_handle is dropped (SRQ buffer freed)
+                        pending_copyrpc_handles[idx].take();
+                        free_slots.push(idx);
+                    }
                 }
             }
         }
 
+        perf_copyrpc_resp += copyrpc_resp_count as u64;
+        perf_copyrpc_incoming += copyrpc_incoming_count as u64;
+        if phase1_recv_ns.len() < cap {
+            phase1_recv_ns.push((std::time::Instant::now() - p1_recv_start).as_nanos() as u32);
+        }
+        if phase1_ns.len() < cap {
+            phase1_ns.push((std::time::Instant::now() - p1_start).as_nanos() as u32);
+        }
+
         // === Phase 2: delegationrpc poll (client remote submissions → copyrpc send) ===
+        let p2_start = std::time::Instant::now();
+        let mut deleg_req_count = 0u32;
+
+        // Drain call backlog (endpoint.call retries from previous loop)
+        call_backlog.retain_mut(|(ep_idx, req, token)| {
+            match copyrpc_endpoints[*ep_idx].call(req.as_bytes(), *token, 0u64) {
+                Ok(_) => false,
+                Err(copyrpc::error::CallError::RingFull(t))
+                | Err(copyrpc::error::CallError::InsufficientCredit(t)) => {
+                    *token = t;
+                    true
+                }
+                Err(copyrpc::error::CallError::Other(e)) => {
+                    eprintln!("[daemon0] call backlog fatal: {e}");
+                    false
+                }
+            }
+        });
+
         deleg_server.poll();
         while let Some(entry) = deleg_server.recv() {
             let target_rank = entry.payload.rank();
 
+            deleg_req_count += 1;
             if target_rank == my_rank {
-                // Shouldn't normally happen, but handle gracefully
-                let target_daemon = ShardedStore::owner_of(entry.payload.key(), num_daemons_u64) as usize;
-                if target_daemon == 0 {
-                    let resp = handle_local(&mut store, &entry.payload);
-                    deleg_server.reply(entry.client_id, entry.resp_slot_idx, resp);
-                } else {
-                    // Can't easily forward via Flux here since we don't have copyrpc recv handles.
-                    // Just handle locally (wrong shard but functionally ok for benchmark).
-                    let resp = handle_local(&mut store, &entry.payload);
-                    deleg_server.reply(entry.client_id, entry.resp_slot_idx, resp);
-                }
-            } else if let Some(ctx) = ctx_ref {
+                let resp = handle_local(&mut store, &entry.payload);
+                deleg_server.reply(entry.client_id, entry.resp_slot_idx, resp);
+            } else if let Some(_ctx) = ctx_ref {
                 let token = DelegToken {
                     client_id: entry.client_id,
                     resp_slot_idx: entry.resp_slot_idx,
@@ -224,35 +312,38 @@ fn run_daemon_0(
                     request: entry.payload,
                 };
                 let ep_idx = rank_to_ep_index(target_rank);
-                let mut pending_token = token;
-                loop {
-                    match copyrpc_endpoints[ep_idx].call(
-                        remote_req.as_bytes(),
-                        pending_token,
-                        0u64,
-                    ) {
-                        Ok(_) => break,
-                        Err(copyrpc::error::CallError::RingFull(returned)) => {
-                            pending_token = returned;
-                            ctx.poll(|t: DelegToken, data: &[u8]| {
-                                let resp = RemoteResponse::from_bytes(data).response;
-                                deleg_server.reply(t.client_id, t.resp_slot_idx, resp);
-                            });
-                            continue;
-                        }
-                        Err(_) => break,
+                match copyrpc_endpoints[ep_idx].call(remote_req.as_bytes(), token, 0u64) {
+                    Ok(_) => {}
+                    Err(copyrpc::error::CallError::RingFull(returned))
+                    | Err(copyrpc::error::CallError::InsufficientCredit(returned)) => {
+                        call_backlog.push((ep_idx, remote_req, returned));
+                    }
+                    Err(copyrpc::error::CallError::Other(e)) => {
+                        eprintln!("[daemon0] Phase2 call fatal: {e}");
+                        // token consumed by Other — use backup to respond to client
+                        deleg_server.reply(
+                            entry.client_id,
+                            entry.resp_slot_idx,
+                            Response::MetaGetNotFound,
+                        );
                     }
                 }
             }
         }
         deleg_server.advance_tail();
+        perf_deleg_req += deleg_req_count as u64;
+        if phase2_ns.len() < cap {
+            phase2_ns.push((std::time::Instant::now() - p2_start).as_nanos() as u32);
+        }
 
         // === Phase 3: ipc poll (local requests for daemon#0's shard) ===
+        let p3_start = std::time::Instant::now();
         for i in 0..max_ipc_clients {
             ipc_skip[i] = ipc_inflight[i] >= queue_depth;
         }
         ipc_server.poll_with_skip(&ipc_skip);
 
+        let mut ipc_req_count = 0u32;
         while let Some(handle) = ipc_server.recv() {
             let cid = handle.client_id().0 as usize;
             ipc_inflight[cid] += 1;
@@ -265,37 +356,36 @@ fn run_daemon_0(
             let resp = handle_local(&mut store, &req);
             handle.reply(resp);
             ipc_inflight[cid] -= 1;
+            ipc_req_count += 1;
+        }
+        perf_ipc_req += ipc_req_count as u64;
+        if phase3_ns.len() < cap {
+            phase3_ns.push((std::time::Instant::now() - p3_start).as_nanos() as u32);
         }
 
         // === Phase 4: Flux poll + recv ===
+        let p4_start = std::time::Instant::now();
         flux.poll(|pending_idx: usize, data: DelegatePayload| {
             if let DelegatePayload::Resp(resp) = data
                 && let Some(recv_handle) = pending_copyrpc_handles[pending_idx].take()
             {
                 free_slots.push(pending_idx);
                 let remote_resp = RemoteResponse { response: resp };
-                if let Some(ctx) = ctx_ref {
-                    loop {
-                        match recv_handle.reply(remote_resp.as_bytes()) {
-                            Ok(()) => break,
-                            Err(copyrpc::error::Error::RingFull) => {
-                                ctx.poll(|token: DelegToken, data: &[u8]| {
-                                    let r = RemoteResponse::from_bytes(data).response;
-                                    nested_resp_buf.push((token, r));
-                                });
-                                continue;
-                            }
-                            Err(_) => break,
+                if ctx_ref.is_some() {
+                    match recv_handle.reply(remote_resp.as_bytes()) {
+                        Ok(()) => {}
+                        Err(copyrpc::error::Error::RingFull) => {
+                            reply_backlog.push((recv_handle, remote_resp.as_bytes().to_vec()));
+                        }
+                        Err(e) => {
+                            eprintln!("[daemon0] Phase4 reply error: {e}");
                         }
                     }
                 }
             }
         });
 
-        for (token, resp) in nested_resp_buf.drain(..) {
-            deleg_server.reply(token.client_id, token.resp_slot_idx, resp);
-        }
-
+        let mut incoming_req_count = 0u32;
         while let Some((_from, flux_token, payload)) = flux.try_recv_raw() {
             if let DelegatePayload::Req(req) = payload {
                 debug_assert_eq!(
@@ -304,8 +394,112 @@ fn run_daemon_0(
                 );
                 let resp = handle_local(&mut store, &req);
                 flux.reply(flux_token, DelegatePayload::Resp(resp));
+                incoming_req_count += 1;
             }
         }
+        perf_incoming_req += incoming_req_count as u64;
+        if phase4_ns.len() < cap {
+            phase4_ns.push((std::time::Instant::now() - p4_start).as_nanos() as u32);
+        }
+    }
+
+    // === Performance output ===
+    let elapsed = perf_start.elapsed().as_secs_f64();
+    let n = loop_period_ns.len();
+    if n > 0 {
+        let median = |v: &mut Vec<u32>| -> u32 {
+            v.sort_unstable();
+            v[v.len() / 2]
+        };
+        let avg = |v: &[u32]| -> f64 { v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64 };
+
+        let mut lp = loop_period_ns;
+        let mut p1 = phase1_ns;
+        let mut p1p = phase1_poll_ns;
+        let mut p1r = phase1_recv_ns;
+        let mut p2 = phase2_ns;
+        let mut p3 = phase3_ns;
+        let mut p4 = phase4_ns;
+
+        eprintln!(
+            "[deleg-daemon0] rank={} loops={} elapsed={:.2}s",
+            my_rank, perf_loop_count, elapsed
+        );
+        eprintln!(
+            "  loop_period: median={}ns avg={:.0}ns freq={:.3}MHz",
+            median(&mut lp),
+            avg(&lp),
+            perf_loop_count as f64 / elapsed / 1e6
+        );
+        eprintln!(
+            "  phase1(total):     median={}ns avg={:.0}ns",
+            median(&mut p1),
+            avg(&p1)
+        );
+        eprintln!(
+            "  phase1(ctx.poll):  median={}ns avg={:.0}ns",
+            median(&mut p1p),
+            avg(&p1p)
+        );
+        let mut s1 = poll_s1_ns;
+        let mut s2 = poll_s2_ns;
+        let mut s3 = poll_s3_ns;
+        let mut s4 = poll_s4_ns;
+        eprintln!(
+            "    poll.recv_cq:  median={}ns avg={:.0}ns",
+            median(&mut s1),
+            avg(&s1)
+        );
+        eprintln!(
+            "    poll.srq:      median={}ns avg={:.0}ns",
+            median(&mut s2),
+            avg(&s2)
+        );
+        eprintln!(
+            "    poll.send_cq:  median={}ns avg={:.0}ns",
+            median(&mut s3),
+            avg(&s3)
+        );
+        eprintln!(
+            "    poll.ep_flush: median={}ns avg={:.0}ns",
+            median(&mut s4),
+            avg(&s4)
+        );
+        eprintln!(
+            "  phase1(ctx.recv):  median={}ns avg={:.0}ns",
+            median(&mut p1r),
+            avg(&p1r)
+        );
+        eprintln!(
+            "  phase2(deleg):     median={}ns avg={:.0}ns",
+            median(&mut p2),
+            avg(&p2)
+        );
+        eprintln!(
+            "  phase3(ipc):       median={}ns avg={:.0}ns",
+            median(&mut p3),
+            avg(&p3)
+        );
+        eprintln!(
+            "  phase4(flux):      median={}ns avg={:.0}ns",
+            median(&mut p4),
+            avg(&p4)
+        );
+        eprintln!(
+            "  copyrpc_resp={} copyrpc_incoming={} deleg_req={} ipc_req={} flux_incoming={}",
+            perf_copyrpc_resp,
+            perf_copyrpc_incoming,
+            perf_deleg_req,
+            perf_ipc_req,
+            perf_incoming_req
+        );
+        eprintln!(
+            "  per_loop: resp={:.2} incoming={:.2} deleg={:.2} ipc={:.2}",
+            perf_copyrpc_resp as f64 / perf_loop_count as f64,
+            perf_copyrpc_incoming as f64 / perf_loop_count as f64,
+            perf_deleg_req as f64 / perf_loop_count as f64,
+            perf_ipc_req as f64 / perf_loop_count as f64
+        );
     }
 }
 
@@ -368,6 +562,11 @@ fn run_daemon_worker(
 }
 
 /// Client for delegation backend: ipc (local) + delegationrpc (remote).
+///
+/// Each client independently manages its own walltime:
+/// 1. Warmup: measure throughput with small batch
+/// 2. Calculate adaptive check interval (~500ms worth of completions)
+/// 3. Main loop: check walltime every interval or every 1s (fallback)
 #[allow(clippy::too_many_arguments)]
 fn run_delegation_client(
     ipc_paths: &[String],
@@ -376,7 +575,7 @@ fn run_delegation_client(
     my_rank: u32,
     pattern: &[crate::workload::AccessEntry],
     queue_depth: u32,
-    stop_flag: &AtomicBool,
+    duration: Duration,
     batch_size: u32,
     bench_start: Instant,
 ) -> Vec<parquet_out::BatchRecord> {
@@ -392,7 +591,6 @@ fn run_delegation_client(
         unsafe { delegationrpc::Client::<Request, Response>::connect(deleg_path) }
             .expect("delegationrpc client connect failed");
 
-    let pattern_len = pattern.len();
     let mut pattern_idx = 0usize;
 
     fn make_request(entry: &crate::workload::AccessEntry) -> Request {
@@ -410,51 +608,108 @@ fn run_delegation_client(
         }
     }
 
-    // Initial fill
-    for _ in 0..queue_depth {
-        let entry = &pattern[pattern_idx % pattern_len];
-        pattern_idx += 1;
+    // Helper: poll all transports and return total completions
+    let poll_all = |ipc_clients: &mut [ipc::Client<Request, Response, (), _>],
+                    deleg_client: &mut delegationrpc::Client<Request, Response>|
+     -> Result<u32, ()> {
+        let mut total_n = 0u32;
+        for c in ipc_clients.iter_mut() {
+            match c.poll() {
+                Ok(n) => total_n += n,
+                Err(_) => return Err(()),
+            }
+        }
+        total_n += deleg_client.poll(|_, _| {});
+        Ok(total_n)
+    };
+
+    // Helper: refill one request
+    let refill_one = |ipc_clients: &mut [ipc::Client<Request, Response, (), _>],
+                      deleg_client: &mut delegationrpc::Client<Request, Response>,
+                      pattern: &[crate::workload::AccessEntry],
+                      pattern_idx: &mut usize,
+                      my_rank: u32,
+                      num_daemons: usize|
+     -> bool {
+        let entry = &pattern[*pattern_idx % pattern.len()];
+        *pattern_idx += 1;
         if entry.rank == my_rank {
             let daemon = (entry.key % num_daemons as u64) as usize;
-            if ipc_clients[daemon].call(make_request(entry), ()).is_err() {
-                return Vec::new();
-            }
-        } else if deleg_client.call(make_request(entry)).is_err() {
+            ipc_clients[daemon].call(make_request(entry), ()).is_ok()
+        } else {
+            deleg_client.call(make_request(entry)).is_ok()
+        }
+    };
+
+    // Initial fill
+    for _ in 0..queue_depth {
+        if !refill_one(
+            &mut ipc_clients,
+            &mut deleg_client,
+            pattern,
+            &mut pattern_idx,
+            my_rank,
+            num_daemons,
+        ) {
             return Vec::new();
         }
     }
 
-    let mut records = Vec::new();
-    let mut completed_in_batch = 0u32;
-
-    while !stop_flag.load(Ordering::Relaxed) {
-        let mut total_n = 0u32;
-
-        // Poll ipc clients
-        for c in &mut ipc_clients {
-            match c.poll() {
-                Ok(n) => total_n += n,
-                Err(_) => return records,
+    // ---- Warmup: measure throughput ----
+    let warmup_target = 1000u32;
+    let warmup_start = Instant::now();
+    let mut warmup_completed = 0u32;
+    while warmup_completed < warmup_target {
+        let total_n = match poll_all(&mut ipc_clients, &mut deleg_client) {
+            Ok(n) => n,
+            Err(()) => return Vec::new(),
+        };
+        for _ in 0..total_n {
+            if !refill_one(
+                &mut ipc_clients,
+                &mut deleg_client,
+                pattern,
+                &mut pattern_idx,
+                my_rank,
+                num_daemons,
+            ) {
+                return Vec::new();
             }
         }
+        warmup_completed += total_n;
+    }
+    let warmup_dur = warmup_start.elapsed().as_secs_f64();
+    let throughput = warmup_completed as f64 / warmup_dur;
+    let adaptive_check_interval = (throughput * 0.5).max(100.0) as u32;
 
-        // Poll delegationrpc client
-        total_n += deleg_client.poll(|_, _| {});
+    // ---- Main loop: walltime-based termination ----
+    let deadline = bench_start + duration;
+    let mut records = Vec::new();
+    let mut completed_in_batch = 0u32;
+    let mut completed_since_check = 0u32;
+    let mut last_time_check = Instant::now();
+
+    loop {
+        let total_n = match poll_all(&mut ipc_clients, &mut deleg_client) {
+            Ok(n) => n,
+            Err(()) => return records,
+        };
 
         // Refill
         for _ in 0..total_n {
-            let entry = &pattern[pattern_idx % pattern_len];
-            pattern_idx += 1;
-            if entry.rank == my_rank {
-                let daemon = (entry.key % num_daemons as u64) as usize;
-                if ipc_clients[daemon].call(make_request(entry), ()).is_err() {
-                    return records;
-                }
-            } else if deleg_client.call(make_request(entry)).is_err() {
+            if !refill_one(
+                &mut ipc_clients,
+                &mut deleg_client,
+                pattern,
+                &mut pattern_idx,
+                my_rank,
+                num_daemons,
+            ) {
                 return records;
             }
         }
 
+        // Record batches
         completed_in_batch += total_n;
         while completed_in_batch >= batch_size {
             completed_in_batch -= batch_size;
@@ -462,6 +717,18 @@ fn run_delegation_client(
                 elapsed_ns: bench_start.elapsed().as_nanos() as u64,
                 batch_size,
             });
+        }
+
+        // Walltime check: every adaptive_check_interval completions OR every 1s
+        completed_since_check += total_n;
+        if completed_since_check >= adaptive_check_interval
+            || last_time_check.elapsed() >= Duration::from_secs(1)
+        {
+            completed_since_check = 0;
+            last_time_check = Instant::now();
+            if Instant::now() >= deadline {
+                break;
+            }
         }
 
         if total_n == 0 {
@@ -537,7 +804,9 @@ pub fn run_delegation(
 
     // Create delegationrpc server (one, for Daemon#0, remote requests)
     let deleg_path = format!("/benchkv_deleg_ring_{}", rank);
-    let deleg_ring_depth = 1024u32.next_power_of_two(); // shared ring capacity
+    let deleg_ring_depth = (num_clients as u32 * queue_depth)
+        .max(1024)
+        .next_power_of_two();
     let deleg_resp_depth = queue_depth.next_power_of_two(); // per-client response slots
     let mut deleg_server: Option<delegationrpc::Server<Request, Response>> = Some(
         unsafe {
@@ -578,12 +847,19 @@ pub fn run_delegation(
         let (remote_tx, remote_rx) = std::sync::mpsc::channel();
         copyrpc_local_rx = Some(local_rx);
         copyrpc_remote_tx = Some(remote_tx);
+
+        // Auto-adjust ring_size: each remote endpoint needs enough credit for
+        // ceil(num_clients * queue_depth / size) inflight calls
+        let inflight_per_ep =
+            (num_clients * queue_depth as usize + size as usize - 1) / size as usize;
+        let ring_size = auto_adjust_ring_size(cli.ring_size, inflight_per_ep, rank);
+
         copyrpc_setup_for_d0 = Some(CopyrpcSetup {
             local_info_tx: local_tx,
             remote_info_rx: remote_rx,
             device_index: cli.device_index,
             port: cli.port,
-            ring_size: cli.ring_size,
+            ring_size,
             my_remote_ranks: all_remote_ranks,
         });
     } else {
@@ -594,6 +870,7 @@ pub fn run_delegation(
     // Spawn daemon threads
     let mut daemon_handles = Vec::with_capacity(num_daemons);
 
+    let poll_budget = cli.poll_budget;
     for d in 0..num_daemons {
         let ipc_srv = ipc_servers[d].take().unwrap();
         let flux = flux_nodes[d].take().unwrap();
@@ -616,6 +893,7 @@ pub fn run_delegation(
                     num_daemons,
                     key_range,
                     queue_depth,
+                    poll_budget,
                     ipc_srv,
                     deleg_srv,
                     flux,
@@ -651,8 +929,9 @@ pub fn run_delegation(
         let remote_tx = copyrpc_remote_tx.unwrap();
 
         // Daemon#0 sends all endpoint infos ordered by remote ranks (0..size, excluding self)
-        let local_infos: Vec<EndpointConnectionInfo> =
-            local_rx.recv().expect("Failed to receive daemon#0 local info");
+        let local_infos: Vec<EndpointConnectionInfo> = local_rx
+            .recv()
+            .expect("Failed to receive daemon#0 local info");
 
         let all_remote_ranks: Vec<u32> = (0..size).filter(|&r| r != rank).collect();
 
@@ -675,18 +954,19 @@ pub fn run_delegation(
     std::thread::sleep(Duration::from_millis(10));
     world.barrier();
 
-    // Spawn client threads
+    // Spawn client threads (walltime-based: each client self-terminates after duration)
     let bench_start = Instant::now();
+    let total_duration = Duration::from_secs(cli.duration * cli.runs as u64);
     let mut client_handles = Vec::with_capacity(num_clients);
     for c in 0..num_clients {
         let ipc_ps = ipc_paths.clone();
         let deleg_p = deleg_path.clone();
         let pattern = patterns[c].clone();
-        let stop = stop_flag.clone();
         let core = client_cores.get(c).copied();
         let batch_size = cli.batch_size;
         let bs = bench_start;
         let nd = num_daemons;
+        let dur = total_duration;
 
         client_handles.push(std::thread::spawn(move || {
             if let Some(core_id) = core {
@@ -699,36 +979,34 @@ pub fn run_delegation(
                 rank,
                 &pattern,
                 queue_depth,
-                &stop,
+                dur,
                 batch_size,
                 bs,
             )
         }));
     }
 
-    // Benchmark: run boundary loop
-    let duration = Duration::from_secs(cli.duration);
-    let mut run_boundaries = Vec::new();
+    // Wait for all clients to self-terminate (no MPI barrier during measurement)
+    let client_batches: Vec<Vec<parquet_out::BatchRecord>> = client_handles
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .collect();
 
-    for run in 0..cli.runs {
-        world.barrier();
-        let run_start_ns = bench_start.elapsed().as_nanos() as u64;
-        std::thread::sleep(duration);
-        let run_end_ns = bench_start.elapsed().as_nanos() as u64;
-        run_boundaries.push((run, run_start_ns, run_end_ns));
-    }
-
-    // Stop
+    // Stop daemons (clients already stopped)
     stop_flag.store(true, Ordering::Release);
 
     for h in daemon_handles {
         h.join().expect("Daemon thread panicked");
     }
 
-    let client_batches: Vec<Vec<parquet_out::BatchRecord>> = client_handles
-        .into_iter()
-        .map(|h| h.join().unwrap())
-        .collect();
+    // Run boundaries: derive from known duration (no MPI barrier needed)
+    let run_duration_ns = cli.duration * 1_000_000_000;
+    let mut run_boundaries = Vec::new();
+    for run in 0..cli.runs {
+        let run_start_ns = run as u64 * run_duration_ns;
+        let run_end_ns = (run as u64 + 1) * run_duration_ns;
+        run_boundaries.push((run, run_start_ns, run_end_ns));
+    }
 
     // Log RPS per run
     for &(run, start_ns, end_ns) in &run_boundaries {

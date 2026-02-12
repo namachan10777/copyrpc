@@ -89,6 +89,31 @@ fn handle_local(store: &mut ShardedStore, req: &Request) -> Response {
     }
 }
 
+// === copyrpc ring size auto-adjustment ===
+
+/// Compute minimum copyrpc ring_size to avoid credit starvation.
+///
+/// Each inflight copyrpc call costs 64 bytes of credit
+/// (padded_message_size(0) + FLOW_METADATA_SIZE = 32 + 32).
+/// Initial credit = ring_size / 4, so:
+///   min_ring_size = next_power_of_two(4 * inflight_per_endpoint * 64)
+pub fn auto_adjust_ring_size(
+    cli_ring_size: usize,
+    inflight_per_endpoint: usize,
+    rank: u32,
+) -> usize {
+    const CREDIT_PER_CALL: usize = 64;
+    let min_ring = (4 * inflight_per_endpoint * CREDIT_PER_CALL).next_power_of_two();
+    let ring_size = cli_ring_size.max(min_ring);
+    if ring_size != cli_ring_size {
+        eprintln!(
+            "[rank {rank}] copyrpc ring_size auto-adjusted: {cli_ring_size} -> {ring_size} \
+             (inflight/ep={inflight_per_endpoint})"
+        );
+    }
+    ring_size
+}
+
 // === copyrpc setup ===
 
 pub struct CopyrpcSetup {
@@ -299,8 +324,7 @@ pub fn run_daemon(
                         lat_samples_ns.push(total_ns);
                         lat_samples_ep.push(lat_call_ep[cid]);
                         if lat_flushed[cid] {
-                            let local_ns =
-                                (lat_flush_ts[cid] - lat_call_ts[cid]).as_nanos() as u64;
+                            let local_ns = (lat_flush_ts[cid] - lat_call_ts[cid]).as_nanos() as u64;
                             lat_local_ns.push(local_ns);
                             lat_remote_ns.push(total_ns.saturating_sub(local_ns));
                         } else {
@@ -316,8 +340,7 @@ pub fn run_daemon(
             {
                 let post_poll_ts = std::time::Instant::now();
                 if poll_duration_ns.len() < 1_000_000 {
-                    poll_duration_ns
-                        .push((post_poll_ts - poll_start).as_nanos() as u32);
+                    poll_duration_ns.push((post_poll_ts - poll_start).as_nanos() as u32);
                 }
                 if incoming_reply_pending {
                     incoming_reply_pending = false;
@@ -449,18 +472,15 @@ pub fn run_daemon(
                                 if lat_call_valid[cid] {
                                     lat_call_valid[cid] = false;
                                     if lat_samples_ns.len() < 1_000_000 {
-                                        let total_ns =
-                                            lat_call_ts[cid].elapsed().as_nanos() as u64;
+                                        let total_ns = lat_call_ts[cid].elapsed().as_nanos() as u64;
                                         lat_samples_ns.push(total_ns);
                                         lat_samples_ep.push(lat_call_ep[cid]);
                                         if lat_flushed[cid] {
-                                            let local_ns = (lat_flush_ts[cid]
-                                                - lat_call_ts[cid])
+                                            let local_ns = (lat_flush_ts[cid] - lat_call_ts[cid])
                                                 .as_nanos()
                                                 as u64;
                                             lat_local_ns.push(local_ns);
-                                            lat_remote_ns
-                                                .push(total_ns.saturating_sub(local_ns));
+                                            lat_remote_ns.push(total_ns.saturating_sub(local_ns));
                                         } else {
                                             lat_local_ns.push(0);
                                             lat_remote_ns.push(total_ns);
@@ -479,8 +499,7 @@ pub fn run_daemon(
 
         // Phase 2 duration
         if phase2_duration_ns.len() < 1_000_000 {
-            phase2_duration_ns
-                .push((std::time::Instant::now() - phase2_start).as_nanos() as u32);
+            phase2_duration_ns.push((std::time::Instant::now() - phase2_start).as_nanos() as u32);
         }
 
         // === QD sample point ===
@@ -663,7 +682,11 @@ pub fn run_daemon(
     if !incoming_server_lat_ns.is_empty() {
         incoming_server_lat_ns.sort_unstable();
         let n = incoming_server_lat_ns.len();
-        let avg = incoming_server_lat_ns.iter().map(|&x| x as u64).sum::<u64>() / n as u64;
+        let avg = incoming_server_lat_ns
+            .iter()
+            .map(|&x| x as u64)
+            .sum::<u64>()
+            / n as u64;
         eprintln!(
             "  daemon {} incoming_srv_lat: n={} avg={:.1}us p50={:.1}us p99={:.1}us max={:.1}us",
             daemon_id,
