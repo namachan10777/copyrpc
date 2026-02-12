@@ -8,6 +8,7 @@ copyrpc = { path = "../copyrpc" }
 inproc = { path = "../inproc" }
 ipc = { path = "../ipc" }
 mlx5 = { path = "../mlx5" }
+fastmap = { path = "../fastmap" }
 mpi.workspace = true
 clap.workspace = true
 parquet.workspace = true

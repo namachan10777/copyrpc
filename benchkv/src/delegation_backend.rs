@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
+use fastmap::FastMap;
 use mpi::collective::CommunicatorCollectives;
 
 use crate::Cli;
@@ -130,12 +131,10 @@ fn run_daemon_0(
     ready_barrier.wait();
 
     let ctx_ref = copyrpc_ctx.as_ref();
-    let rank_to_ep_index = |target_rank: u32| -> usize {
-        my_remote_ranks
-            .iter()
-            .position(|&r| r == target_rank)
-            .expect("target_rank not in my_remote_ranks")
-    };
+    let mut rank_to_ep_index = FastMap::new();
+    for (ep_idx, &remote_rank) in my_remote_ranks.iter().enumerate() {
+        rank_to_ep_index.insert(remote_rank, ep_idx);
+    }
 
     let num_daemons_u64 = num_daemons as u64;
 
@@ -311,7 +310,9 @@ fn run_daemon_0(
                 let remote_req = RemoteRequest {
                     request: entry.payload,
                 };
-                let ep_idx = rank_to_ep_index(target_rank);
+                let ep_idx = *rank_to_ep_index
+                    .get(target_rank)
+                    .expect("target_rank not in my_remote_ranks");
                 match copyrpc_endpoints[ep_idx].call(remote_req.as_bytes(), token, 0u64) {
                     Ok(_) => {}
                     Err(copyrpc::error::CallError::RingFull(returned))
