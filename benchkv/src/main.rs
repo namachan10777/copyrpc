@@ -1,4 +1,3 @@
-mod adaptive_budget;
 mod affinity;
 mod client;
 mod copyrpc_direct_backend;
@@ -116,7 +115,7 @@ enum SubCmd {
         #[arg(long, default_value = "0.0")]
         coalesce_rtt_us: f64,
         /// Reply batch hold time [us] (0 = disabled, adaptive batching)
-        #[arg(long, default_value = "0.0")]
+        #[arg(long, default_value = "10.0")]
         batch_hold_us: f64,
     },
 }

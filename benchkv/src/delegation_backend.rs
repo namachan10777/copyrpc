@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use fastmap::FastMap;
 use mpi::collective::CommunicatorCollectives;
@@ -169,37 +169,11 @@ fn run_daemon_0(
     // Adaptive: only hold when previous batch was small (collapsed state).
     let batch_target = size as usize; // need >= N responses per batch for healthy state
     let mut reply_hold_buf: Vec<(u32, u32, Response)> = Vec::with_capacity(64);
-    let mut reply_hold_ts: Option<std::time::Instant> = None;
+    let mut reply_hold_ts: Option<fastant::Instant> = None;
     let mut batch_hold_active = batch_hold_ns > 0; // start in hold mode, switch off when healthy
 
-    // Performance instrumentation
-    let perf_start = std::time::Instant::now();
-    let mut perf_loop_count: u64 = 0;
-    let mut perf_copyrpc_resp: u64 = 0;
-    let mut perf_deleg_req: u64 = 0;
-    let mut perf_incoming_req: u64 = 0;
-    let mut perf_ipc_req: u64 = 0;
-    let mut perf_copyrpc_incoming: u64 = 0;
-
-    // Sampled timing: collect every 64th loop to reduce overhead
-    let sample_interval = 64u64;
-    let cap = 500_000usize;
-    let mut loop_period_ns: Vec<u32> = Vec::with_capacity(cap);
-    let mut step_a_ns: Vec<u32> = Vec::with_capacity(cap); // copyrpc poll + recv
-    let mut step_d_ns: Vec<u32> = Vec::with_capacity(cap); // deleg drain + call
-    let mut step_e_ns: Vec<u32> = Vec::with_capacity(cap); // flush_endpoints
-    let mut step_f_ns: Vec<u32> = Vec::with_capacity(cap); // ipc
-    let mut step_g_ns: Vec<u32> = Vec::with_capacity(cap); // flux
-    let mut loop_prev_ts = perf_start;
-
     while !stop_flag.load(Ordering::Relaxed) {
-        perf_loop_count += 1;
-        let sampling = perf_loop_count % sample_interval == 0;
-        let loop_now = std::time::Instant::now();
-        if sampling && loop_period_ns.len() < cap {
-            loop_period_ns.push((loop_now - loop_prev_ts).as_nanos() as u32);
-        }
-        loop_prev_ts = loop_now;
+        let loop_now = fastant::Instant::now();
 
         let mut copyrpc_resp_count = 0u32;
 
@@ -217,7 +191,7 @@ fn run_daemon_0(
                     if n > 0 {
                         break;
                     }
-                    if std::time::Instant::now() >= deadline {
+                    if fastant::Instant::now() >= deadline {
                         break;
                     }
                     std::hint::spin_loop();
@@ -226,14 +200,13 @@ fn run_daemon_0(
         }
 
         // === Step A: copyrpc poll (drain CQ + flush pending from previous iteration) ===
-        let mut copyrpc_incoming_count = 0u32;
         if let Some(ctx) = ctx_ref {
             ctx.poll(|token: DelegToken, data: &[u8]| {
                 let resp = RemoteResponse::from_bytes(data).response;
                 if batch_hold_active {
                     reply_hold_buf.push((token.client_id, token.resp_slot_idx, resp));
                     if reply_hold_ts.is_none() {
-                        reply_hold_ts = Some(std::time::Instant::now());
+                        reply_hold_ts = Some(fastant::Instant::now());
                     }
                 } else {
                     deleg_server.reply(token.client_id, token.resp_slot_idx, resp);
@@ -254,7 +227,6 @@ fn run_daemon_0(
 
             // === Step C: copyrpc recv (incoming requests from remote nodes) ===
             while let Some(recv_handle) = ctx.recv() {
-                copyrpc_incoming_count += 1;
                 let req = RemoteRequest::from_bytes(recv_handle.data()).request;
                 let target_daemon = ShardedStore::owner_of(req.key(), num_daemons_u64) as usize;
 
@@ -290,16 +262,7 @@ fn run_daemon_0(
             }
         }
 
-        perf_copyrpc_resp += copyrpc_resp_count as u64;
-        perf_copyrpc_incoming += copyrpc_incoming_count as u64;
-        let ta = if sampling {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
         // === Step D: Delegation ring drain → copyrpc call ===
-        let mut deleg_req_count = 0u32;
 
         // Drain call backlog (endpoint.call retries from previous loop)
         call_backlog.retain_mut(|(ep_idx, req, token)| {
@@ -324,7 +287,6 @@ fn run_daemon_0(
         while let Some(entry) = deleg_server.recv() {
             let target_rank = entry.payload.rank();
 
-            deleg_req_count += 1;
             if target_rank == my_rank {
                 let resp = handle_local(&mut store, &entry.payload);
                 deleg_server.reply(entry.client_id, entry.resp_slot_idx, resp);
@@ -359,22 +321,11 @@ fn run_daemon_0(
             }
         }
         deleg_server.advance_tail();
-        perf_deleg_req += deleg_req_count as u64;
-        let td = if sampling {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
 
         // === Step E: Immediate flush — transmit calls from Step D NOW ===
         if let Some(ctx) = ctx_ref {
             ctx.flush_endpoints();
         }
-        let te = if sampling {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
 
         // === Step F: IPC poll (local requests for daemon#0's shard) ===
         for i in 0..max_ipc_clients {
@@ -382,7 +333,6 @@ fn run_daemon_0(
         }
         ipc_server.poll_with_skip(&ipc_skip);
 
-        let mut ipc_req_count = 0u32;
         while let Some(handle) = ipc_server.recv() {
             let cid = handle.client_id().0 as usize;
             ipc_inflight[cid] += 1;
@@ -395,14 +345,7 @@ fn run_daemon_0(
             let resp = handle_local(&mut store, &req);
             handle.reply(resp);
             ipc_inflight[cid] -= 1;
-            ipc_req_count += 1;
         }
-        perf_ipc_req += ipc_req_count as u64;
-        let tf = if sampling {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
 
         // === Step G: Flux poll + recv ===
         flux.poll(|pending_idx: usize, data: DelegatePayload| {
@@ -425,7 +368,6 @@ fn run_daemon_0(
             }
         });
 
-        let mut incoming_req_count = 0u32;
         while let Some((_from, flux_token, payload)) = flux.try_recv_raw() {
             if let DelegatePayload::Req(req) = payload {
                 debug_assert_eq!(
@@ -434,10 +376,8 @@ fn run_daemon_0(
                 );
                 let resp = handle_local(&mut store, &req);
                 flux.reply(flux_token, DelegatePayload::Resp(resp));
-                incoming_req_count += 1;
             }
         }
-        perf_incoming_req += incoming_req_count as u64;
 
         // QD sampling: outstanding time-series
         // CSV columns: copyrpc_inflight=outstanding, flux_pending=call_backlog,
@@ -471,87 +411,6 @@ fn run_daemon_0(
         }
 
         prev_resp_count = copyrpc_resp_count;
-
-        // Sampled timing
-        if let (Some(ta), Some(td), Some(te), Some(tf)) = (ta, td, te, tf) {
-            let tg = std::time::Instant::now();
-            if step_a_ns.len() < cap {
-                step_a_ns.push((ta - loop_now).as_nanos() as u32);
-                step_d_ns.push((td - ta).as_nanos() as u32);
-                step_e_ns.push((te - td).as_nanos() as u32);
-                step_f_ns.push((tf - te).as_nanos() as u32);
-                step_g_ns.push((tg - tf).as_nanos() as u32);
-            }
-        }
-    }
-
-    // === Performance output ===
-    let elapsed = perf_start.elapsed().as_secs_f64();
-    let n = loop_period_ns.len();
-    if n > 0 {
-        let median = |v: &mut Vec<u32>| -> u32 {
-            v.sort_unstable();
-            v[v.len() / 2]
-        };
-        let avg = |v: &[u32]| -> f64 { v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64 };
-
-        let mut lp = loop_period_ns;
-        let mut sa = step_a_ns;
-        let mut sd = step_d_ns;
-        let mut se = step_e_ns;
-        let mut sf = step_f_ns;
-        let mut sg = step_g_ns;
-
-        eprintln!(
-            "[deleg-daemon0] rank={} loops={} elapsed={:.2}s",
-            my_rank, perf_loop_count, elapsed
-        );
-        eprintln!(
-            "  loop_period: median={}ns avg={:.0}ns freq={:.3}MHz",
-            median(&mut lp),
-            avg(&lp),
-            perf_loop_count as f64 / elapsed / 1e6
-        );
-        eprintln!(
-            "  step_a(poll+recv): median={}ns avg={:.0}ns",
-            median(&mut sa),
-            avg(&sa)
-        );
-        eprintln!(
-            "  step_d(deleg+call): median={}ns avg={:.0}ns",
-            median(&mut sd),
-            avg(&sd)
-        );
-        eprintln!(
-            "  step_e(flush):     median={}ns avg={:.0}ns",
-            median(&mut se),
-            avg(&se)
-        );
-        eprintln!(
-            "  step_f(ipc):       median={}ns avg={:.0}ns",
-            median(&mut sf),
-            avg(&sf)
-        );
-        eprintln!(
-            "  step_g(flux):      median={}ns avg={:.0}ns",
-            median(&mut sg),
-            avg(&sg)
-        );
-        eprintln!(
-            "  copyrpc_resp={} copyrpc_incoming={} deleg_req={} ipc_req={} flux_incoming={}",
-            perf_copyrpc_resp,
-            perf_copyrpc_incoming,
-            perf_deleg_req,
-            perf_ipc_req,
-            perf_incoming_req
-        );
-        eprintln!(
-            "  per_loop: resp={:.2} incoming={:.2} deleg={:.2} ipc={:.2}",
-            perf_copyrpc_resp as f64 / perf_loop_count as f64,
-            perf_copyrpc_incoming as f64 / perf_loop_count as f64,
-            perf_deleg_req as f64 / perf_loop_count as f64,
-            perf_ipc_req as f64 / perf_loop_count as f64
-        );
     }
 
     qd_collector.map_or_else(Vec::new, |c| c.into_samples())
@@ -631,7 +490,7 @@ fn run_delegation_client(
     queue_depth: u32,
     duration: Duration,
     batch_size: u32,
-    bench_start: Instant,
+    bench_start: fastant::Instant,
 ) -> Vec<parquet_out::BatchRecord> {
     let mut ipc_clients: Vec<ipc::Client<Request, Response, (), _>> = ipc_paths
         .iter()
@@ -711,7 +570,7 @@ fn run_delegation_client(
 
     // ---- Warmup: measure throughput ----
     let warmup_target = 1000u32;
-    let warmup_start = Instant::now();
+    let warmup_start = fastant::Instant::now();
     let mut warmup_completed = 0u32;
     while warmup_completed < warmup_target {
         let total_n = match poll_all(&mut ipc_clients, &mut deleg_client) {
@@ -741,7 +600,7 @@ fn run_delegation_client(
     let mut records = Vec::new();
     let mut completed_in_batch = 0u32;
     let mut completed_since_check = 0u32;
-    let mut last_time_check = Instant::now();
+    let mut last_time_check = fastant::Instant::now();
 
     loop {
         let total_n = match poll_all(&mut ipc_clients, &mut deleg_client) {
@@ -779,8 +638,8 @@ fn run_delegation_client(
             || last_time_check.elapsed() >= Duration::from_secs(1)
         {
             completed_since_check = 0;
-            last_time_check = Instant::now();
-            if Instant::now() >= deadline {
+            last_time_check = fastant::Instant::now();
+            if fastant::Instant::now() >= deadline {
                 break;
             }
         }
@@ -1017,7 +876,7 @@ pub fn run_delegation(
     world.barrier();
 
     // Spawn client threads (walltime-based: each client self-terminates after duration)
-    let bench_start = Instant::now();
+    let bench_start = fastant::Instant::now();
     let total_duration = Duration::from_secs(cli.duration * cli.runs as u64);
     let mut client_handles = Vec::with_capacity(num_clients);
     for c in 0..num_clients {

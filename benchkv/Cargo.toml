@@ -16,6 +16,7 @@ arrow.workspace = true
 libc.workspace = true
 anyhow.workspace = true
 delegationrpc = { path = "../delegationrpc" }
+fastant.workspace = true
 erpc = { path = "../erpc" }
 ucx_sys = { path = "../ucx_sys" }
 gethostname = "1"
