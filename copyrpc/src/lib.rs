@@ -424,7 +424,68 @@ impl<U> Context<U> {
             }
         }
 
-        // 3. Poll send CQ for SQ progress tracking
+        // 3+4. Poll send CQ + flush all endpoints
+        self.flush_endpoints();
+    }
+
+    /// Poll recv CQ only (no send CQ drain, no flush_endpoints).
+    ///
+    /// Drains the recv CQ and reposts SRQ buffers. Does NOT flush endpoints.
+    /// Returns the number of recv CQEs processed.
+    ///
+    /// Use this for adaptive poll budget: call `poll_recv_only()` multiple times
+    /// to wait for CQEs to arrive, then call `poll()` or `flush_endpoints()` once.
+    pub fn poll_recv_only(&self, mut on_response: impl FnMut(U, &[u8])) -> u32 {
+        let recv_cq = &self.recv_cq;
+        let endpoints = &self.endpoints;
+        let recv_stack = &self.recv_stack;
+
+        let mut recv_count = 0u32;
+        loop {
+            let count = recv_cq.poll(|cqe, _entry| {
+                if cqe.opcode == mlx5::cq::CqeOpcode::ReqErr
+                    || cqe.opcode == mlx5::cq::CqeOpcode::RespErr
+                {
+                    eprintln!(
+                        "[recv_cq ERROR] qpn={}, opcode={:?}, syndrome={}",
+                        cqe.qp_num, cqe.opcode, cqe.syndrome
+                    );
+                    return;
+                }
+                Self::process_cqe_static(cqe, cqe.qp_num, endpoints, &mut on_response, recv_stack);
+            });
+            if count == 0 {
+                break;
+            }
+            recv_count += count as u32;
+        }
+
+        if recv_count > 0 {
+            recv_cq.flush();
+
+            let posted = self.srq_posted.get().saturating_sub(recv_count);
+            self.srq_posted.set(posted);
+
+            let threshold = self.srq_max_wr * 2 / 3;
+            if posted < threshold {
+                let to_post = self.srq_max_wr - posted;
+                for _ in 0..to_post {
+                    let _ = self.srq.post_recv(SrqEntry { qpn: 0 }, 0, 0, 0);
+                }
+                self.srq.ring_doorbell();
+                self.srq_posted.set(self.srq_max_wr);
+            }
+        }
+
+        recv_count
+    }
+
+    /// Flush pending sends: drain send CQ (advance SQ head) + flush all endpoints (post WQEs).
+    ///
+    /// Call this after `endpoint.call()` / `recv_handle.reply()` to transmit immediately
+    /// without waiting for the next `poll()`.
+    pub fn flush_endpoints(&self) {
+        // Poll send CQ for SQ progress tracking
         loop {
             let count = self.send_cq.poll();
             if count == 0 {
@@ -439,7 +500,7 @@ impl<U> Context<U> {
             entries.clear();
         }
 
-        // 4. Flush all endpoints
+        // Flush all endpoints (post pending WQEs + ring doorbells)
         for (_, ep) in unsafe { &*self.endpoints.get() }.iter() {
             let ep_ref = unsafe { &*ep.get() };
             let _ = ep_ref.flush();
@@ -492,34 +553,16 @@ impl<U> Context<U> {
 
         let t2 = std::time::Instant::now();
 
-        // 3. Poll send CQ
-        loop {
-            let count = self.send_cq.poll();
-            if count == 0 {
-                break;
-            }
-        }
-        self.send_cq.flush();
-        {
-            let entries = unsafe { &mut *self.send_cqe_buffer.entries.get() };
-            entries.clear();
-        }
+        // 3+4. Poll send CQ + flush all endpoints
+        self.flush_endpoints();
 
         let t3 = std::time::Instant::now();
-
-        // 4. Flush all endpoints
-        for (_, ep) in unsafe { &*self.endpoints.get() }.iter() {
-            let ep_ref = unsafe { &*ep.get() };
-            let _ = ep_ref.flush();
-        }
-
-        let t4 = std::time::Instant::now();
 
         (
             (t1 - t0).as_nanos() as u32,
             (t2 - t1).as_nanos() as u32,
             (t3 - t2).as_nanos() as u32,
-            (t4 - t3).as_nanos() as u32,
+            0u32, // step 3+4 are now combined in flush_endpoints
             recv_count,
         )
     }

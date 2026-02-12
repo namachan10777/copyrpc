@@ -42,14 +42,15 @@ fn run_daemon_0(
     num_daemons: usize,
     key_range: u64,
     queue_depth: u32,
-    poll_budget: u32,
     mut ipc_server: ipc::Server<Request, Response>,
     mut deleg_server: delegationrpc::Server<Request, Response>,
     mut flux: DaemonFlux,
     copyrpc_setup: Option<CopyrpcSetup>,
     stop_flag: &AtomicBool,
     ready_barrier: &Barrier,
-) {
+    qd_sample_interval: Option<u32>,
+    budget_config: Option<crate::adaptive_budget::AdaptiveBudgetConfig>,
+) -> Vec<crate::qd_sample::QdSample> {
     let mut store = ShardedStore::new(key_range, num_daemons as u64, 0);
 
     // Setup copyrpc — Daemon#0 gets ALL remote rank endpoints
@@ -152,6 +153,16 @@ fn run_daemon_0(
     // Backlog for copyrpc endpoint.call() when ring full / insufficient credit
     let mut call_backlog: Vec<(usize, RemoteRequest, DelegToken)> = Vec::new();
 
+    // Outstanding copyrpc calls counter (++ on call success, -- on response CQE)
+    let mut outstanding: u64 = 0;
+
+    // QD sampling (outstanding time-series)
+    let mut qd_collector =
+        qd_sample_interval.map(|interval| crate::qd_sample::QdCollector::new(interval, 500_000));
+
+    // Adaptive poll budget controller
+    let mut budget_ctl = budget_config.map(crate::adaptive_budget::AdaptiveBudgetCtl::new);
+
     // Performance instrumentation
     let perf_start = std::time::Instant::now();
     let mut perf_loop_count: u64 = 0;
@@ -159,63 +170,59 @@ fn run_daemon_0(
     let mut perf_deleg_req: u64 = 0;
     let mut perf_incoming_req: u64 = 0;
     let mut perf_ipc_req: u64 = 0;
-
-    let cap = 1_000_000usize;
-    let mut loop_period_ns: Vec<u32> = Vec::with_capacity(cap);
-    let mut phase1_ns: Vec<u32> = Vec::with_capacity(cap);
-    let mut phase1_poll_ns: Vec<u32> = Vec::with_capacity(cap);
-    let mut phase1_recv_ns: Vec<u32> = Vec::with_capacity(cap);
-    let mut poll_s1_ns: Vec<u32> = Vec::with_capacity(cap);
-    let mut poll_s2_ns: Vec<u32> = Vec::with_capacity(cap);
-    let mut poll_s3_ns: Vec<u32> = Vec::with_capacity(cap);
-    let mut poll_s4_ns: Vec<u32> = Vec::with_capacity(cap);
-    let mut phase2_ns: Vec<u32> = Vec::with_capacity(cap);
-    let mut phase3_ns: Vec<u32> = Vec::with_capacity(cap);
-    let mut phase4_ns: Vec<u32> = Vec::with_capacity(cap);
     let mut perf_copyrpc_incoming: u64 = 0;
+
+    // Sampled timing: collect every 64th loop to reduce overhead
+    let sample_interval = 64u64;
+    let cap = 500_000usize;
+    let mut loop_period_ns: Vec<u32> = Vec::with_capacity(cap);
+    let mut step_a_ns: Vec<u32> = Vec::with_capacity(cap); // copyrpc poll + recv
+    let mut step_d_ns: Vec<u32> = Vec::with_capacity(cap); // deleg drain + call
+    let mut step_e_ns: Vec<u32> = Vec::with_capacity(cap); // flush_endpoints
+    let mut step_f_ns: Vec<u32> = Vec::with_capacity(cap); // ipc
+    let mut step_g_ns: Vec<u32> = Vec::with_capacity(cap); // flux
     let mut loop_prev_ts = perf_start;
 
     while !stop_flag.load(Ordering::Relaxed) {
         perf_loop_count += 1;
+        let sampling = perf_loop_count % sample_interval == 0;
         let loop_now = std::time::Instant::now();
-        if loop_period_ns.len() < cap {
+        if sampling && loop_period_ns.len() < cap {
             loop_period_ns.push((loop_now - loop_prev_ts).as_nanos() as u32);
         }
         loop_prev_ts = loop_now;
 
-        // === Phase 1: copyrpc poll (RDMA completions → delegationrpc response slots) ===
-        let p1_start = std::time::Instant::now();
         let mut copyrpc_resp_count = 0u32;
-        let mut copyrpc_incoming_count = 0u32;
-        let mut p1_recv_start = p1_start;
-        if let Some(ctx) = ctx_ref {
-            let (mut last_s1, mut last_s2, mut last_s3, mut last_s4) = (0u32, 0u32, 0u32, 0u32);
-            for _spin in 0..poll_budget {
-                let (s1, s2, s3, s4, _rc) = ctx.poll_timed(|token: DelegToken, data: &[u8]| {
-                    let resp = RemoteResponse::from_bytes(data).response;
-                    deleg_server.reply(token.client_id, token.resp_slot_idx, resp);
-                    copyrpc_resp_count += 1;
-                });
-                last_s1 = s1;
-                last_s2 = s2;
-                last_s3 = s3;
-                last_s4 = s4;
-                if copyrpc_resp_count >= poll_budget {
-                    break;
+
+        // === Adaptive extra CQ poll (recv-only, no flush) ===
+        let extra_budget = budget_ctl.as_ref().map_or(0, |ctl| ctl.budget());
+        if extra_budget > 0 {
+            if let Some(ctx) = ctx_ref {
+                for _ in 0..extra_budget {
+                    let n = ctx.poll_recv_only(|token: DelegToken, data: &[u8]| {
+                        let resp = RemoteResponse::from_bytes(data).response;
+                        deleg_server.reply(token.client_id, token.resp_slot_idx, resp);
+                        copyrpc_resp_count += 1;
+                        outstanding -= 1;
+                    });
+                    if n > 0 {
+                        break;
+                    }
                 }
             }
+        }
 
-            if poll_s1_ns.len() < cap {
-                poll_s1_ns.push(last_s1);
-                poll_s2_ns.push(last_s2);
-                poll_s3_ns.push(last_s3);
-                poll_s4_ns.push(last_s4);
-            }
-            if phase1_poll_ns.len() < cap {
-                phase1_poll_ns.push((std::time::Instant::now() - p1_start).as_nanos() as u32);
-            }
+        // === Step A: copyrpc poll (drain CQ + flush pending from previous iteration) ===
+        let mut copyrpc_incoming_count = 0u32;
+        if let Some(ctx) = ctx_ref {
+            ctx.poll(|token: DelegToken, data: &[u8]| {
+                let resp = RemoteResponse::from_bytes(data).response;
+                deleg_server.reply(token.client_id, token.resp_slot_idx, resp);
+                copyrpc_resp_count += 1;
+                outstanding -= 1;
+            });
 
-            // Drain reply backlog (recv_handle.reply retries from previous loop)
+            // === Step B: Reply backlog drain ===
             reply_backlog.retain_mut(|(handle, data)| match handle.reply(data) {
                 Ok(()) => false,
                 Err(copyrpc::error::Error::RingFull) => true,
@@ -225,8 +232,7 @@ fn run_daemon_0(
                 }
             });
 
-            // copyrpc recv (incoming requests from remote nodes)
-            p1_recv_start = std::time::Instant::now();
+            // === Step C: copyrpc recv (incoming requests from remote nodes) ===
             while let Some(recv_handle) = ctx.recv() {
                 copyrpc_incoming_count += 1;
                 let req = RemoteRequest::from_bytes(recv_handle.data()).request;
@@ -239,10 +245,10 @@ fn run_daemon_0(
                         Ok(()) => {}
                         Err(copyrpc::error::Error::RingFull) => {
                             reply_backlog.push((recv_handle, remote_resp.as_bytes().to_vec()));
-                            continue; // recv_handle moved; skip to next ctx.recv()
+                            continue;
                         }
                         Err(e) => {
-                            eprintln!("[daemon0] Phase1 reply error: {e}");
+                            eprintln!("[daemon0] recv reply error: {e}");
                         }
                     }
                 } else {
@@ -257,7 +263,6 @@ fn run_daemon_0(
                     };
                     if let Err(e) = flux.call(target_daemon, DelegatePayload::Req(req), idx) {
                         eprintln!("[daemon0] Flux call error: {e:?}");
-                        // Reclaim slot; recv_handle is dropped (SRQ buffer freed)
                         pending_copyrpc_handles[idx].take();
                         free_slots.push(idx);
                     }
@@ -267,21 +272,22 @@ fn run_daemon_0(
 
         perf_copyrpc_resp += copyrpc_resp_count as u64;
         perf_copyrpc_incoming += copyrpc_incoming_count as u64;
-        if phase1_recv_ns.len() < cap {
-            phase1_recv_ns.push((std::time::Instant::now() - p1_recv_start).as_nanos() as u32);
-        }
-        if phase1_ns.len() < cap {
-            phase1_ns.push((std::time::Instant::now() - p1_start).as_nanos() as u32);
-        }
+        let ta = if sampling {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
-        // === Phase 2: delegationrpc poll (client remote submissions → copyrpc send) ===
-        let p2_start = std::time::Instant::now();
+        // === Step D: Delegation ring drain → copyrpc call ===
         let mut deleg_req_count = 0u32;
 
         // Drain call backlog (endpoint.call retries from previous loop)
         call_backlog.retain_mut(|(ep_idx, req, token)| {
             match copyrpc_endpoints[*ep_idx].call(req.as_bytes(), *token, 0u64) {
-                Ok(_) => false,
+                Ok(_) => {
+                    outstanding += 1;
+                    false
+                }
                 Err(copyrpc::error::CallError::RingFull(t))
                 | Err(copyrpc::error::CallError::InsufficientCredit(t)) => {
                     *token = t;
@@ -314,14 +320,15 @@ fn run_daemon_0(
                     .get(target_rank)
                     .expect("target_rank not in my_remote_ranks");
                 match copyrpc_endpoints[ep_idx].call(remote_req.as_bytes(), token, 0u64) {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        outstanding += 1;
+                    }
                     Err(copyrpc::error::CallError::RingFull(returned))
                     | Err(copyrpc::error::CallError::InsufficientCredit(returned)) => {
                         call_backlog.push((ep_idx, remote_req, returned));
                     }
                     Err(copyrpc::error::CallError::Other(e)) => {
-                        eprintln!("[daemon0] Phase2 call fatal: {e}");
-                        // token consumed by Other — use backup to respond to client
+                        eprintln!("[daemon0] call fatal: {e}");
                         deleg_server.reply(
                             entry.client_id,
                             entry.resp_slot_idx,
@@ -333,12 +340,23 @@ fn run_daemon_0(
         }
         deleg_server.advance_tail();
         perf_deleg_req += deleg_req_count as u64;
-        if phase2_ns.len() < cap {
-            phase2_ns.push((std::time::Instant::now() - p2_start).as_nanos() as u32);
-        }
+        let td = if sampling {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
-        // === Phase 3: ipc poll (local requests for daemon#0's shard) ===
-        let p3_start = std::time::Instant::now();
+        // === Step E: Immediate flush — transmit calls from Step D NOW ===
+        if let Some(ctx) = ctx_ref {
+            ctx.flush_endpoints();
+        }
+        let te = if sampling {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
+        // === Step F: IPC poll (local requests for daemon#0's shard) ===
         for i in 0..max_ipc_clients {
             ipc_skip[i] = ipc_inflight[i] >= queue_depth;
         }
@@ -360,12 +378,13 @@ fn run_daemon_0(
             ipc_req_count += 1;
         }
         perf_ipc_req += ipc_req_count as u64;
-        if phase3_ns.len() < cap {
-            phase3_ns.push((std::time::Instant::now() - p3_start).as_nanos() as u32);
-        }
+        let tf = if sampling {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
-        // === Phase 4: Flux poll + recv ===
-        let p4_start = std::time::Instant::now();
+        // === Step G: Flux poll + recv ===
         flux.poll(|pending_idx: usize, data: DelegatePayload| {
             if let DelegatePayload::Resp(resp) = data
                 && let Some(recv_handle) = pending_copyrpc_handles[pending_idx].take()
@@ -379,7 +398,7 @@ fn run_daemon_0(
                             reply_backlog.push((recv_handle, remote_resp.as_bytes().to_vec()));
                         }
                         Err(e) => {
-                            eprintln!("[daemon0] Phase4 reply error: {e}");
+                            eprintln!("[daemon0] flux reply error: {e}");
                         }
                     }
                 }
@@ -399,9 +418,45 @@ fn run_daemon_0(
             }
         }
         perf_incoming_req += incoming_req_count as u64;
-        if phase4_ns.len() < cap {
-            phase4_ns.push((std::time::Instant::now() - p4_start).as_nanos() as u32);
+
+        // QD sampling: outstanding time-series
+        // CSV columns: copyrpc_inflight=outstanding, flux_pending=call_backlog,
+        //              ipc_inflight=reply_backlog, extra=CQE_batch_size
+        if let Some(ref mut c) = qd_collector {
+            c.tick(
+                outstanding as u32,
+                call_backlog.len() as u32,
+                reply_backlog.len() as u32,
+                copyrpc_resp_count,
+            );
         }
+
+        // Adaptive budget update
+        if let Some(ref mut ctl) = budget_ctl {
+            let loop_ns = loop_now.elapsed().as_nanos() as u64;
+            ctl.update(copyrpc_resp_count, loop_ns);
+        }
+
+        // Sampled timing
+        if let (Some(ta), Some(td), Some(te), Some(tf)) = (ta, td, te, tf) {
+            let tg = std::time::Instant::now();
+            if step_a_ns.len() < cap {
+                step_a_ns.push((ta - loop_now).as_nanos() as u32);
+                step_d_ns.push((td - ta).as_nanos() as u32);
+                step_e_ns.push((te - td).as_nanos() as u32);
+                step_f_ns.push((tf - te).as_nanos() as u32);
+                step_g_ns.push((tg - tf).as_nanos() as u32);
+            }
+        }
+    }
+
+    // Adaptive budget diagnostics
+    if let Some(ctl) = budget_ctl {
+        let (b, e, l, u) = ctl.diagnostics();
+        eprintln!(
+            "[daemon0] adaptive_budget: final u={} b_ema={:.2} e_ema={:.2} loop_ema={:.1}us",
+            u, b, e, l
+        );
     }
 
     // === Performance output ===
@@ -415,12 +470,11 @@ fn run_daemon_0(
         let avg = |v: &[u32]| -> f64 { v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64 };
 
         let mut lp = loop_period_ns;
-        let mut p1 = phase1_ns;
-        let mut p1p = phase1_poll_ns;
-        let mut p1r = phase1_recv_ns;
-        let mut p2 = phase2_ns;
-        let mut p3 = phase3_ns;
-        let mut p4 = phase4_ns;
+        let mut sa = step_a_ns;
+        let mut sd = step_d_ns;
+        let mut se = step_e_ns;
+        let mut sf = step_f_ns;
+        let mut sg = step_g_ns;
 
         eprintln!(
             "[deleg-daemon0] rank={} loops={} elapsed={:.2}s",
@@ -433,58 +487,29 @@ fn run_daemon_0(
             perf_loop_count as f64 / elapsed / 1e6
         );
         eprintln!(
-            "  phase1(total):     median={}ns avg={:.0}ns",
-            median(&mut p1),
-            avg(&p1)
+            "  step_a(poll+recv): median={}ns avg={:.0}ns",
+            median(&mut sa),
+            avg(&sa)
         );
         eprintln!(
-            "  phase1(ctx.poll):  median={}ns avg={:.0}ns",
-            median(&mut p1p),
-            avg(&p1p)
-        );
-        let mut s1 = poll_s1_ns;
-        let mut s2 = poll_s2_ns;
-        let mut s3 = poll_s3_ns;
-        let mut s4 = poll_s4_ns;
-        eprintln!(
-            "    poll.recv_cq:  median={}ns avg={:.0}ns",
-            median(&mut s1),
-            avg(&s1)
+            "  step_d(deleg+call): median={}ns avg={:.0}ns",
+            median(&mut sd),
+            avg(&sd)
         );
         eprintln!(
-            "    poll.srq:      median={}ns avg={:.0}ns",
-            median(&mut s2),
-            avg(&s2)
+            "  step_e(flush):     median={}ns avg={:.0}ns",
+            median(&mut se),
+            avg(&se)
         );
         eprintln!(
-            "    poll.send_cq:  median={}ns avg={:.0}ns",
-            median(&mut s3),
-            avg(&s3)
+            "  step_f(ipc):       median={}ns avg={:.0}ns",
+            median(&mut sf),
+            avg(&sf)
         );
         eprintln!(
-            "    poll.ep_flush: median={}ns avg={:.0}ns",
-            median(&mut s4),
-            avg(&s4)
-        );
-        eprintln!(
-            "  phase1(ctx.recv):  median={}ns avg={:.0}ns",
-            median(&mut p1r),
-            avg(&p1r)
-        );
-        eprintln!(
-            "  phase2(deleg):     median={}ns avg={:.0}ns",
-            median(&mut p2),
-            avg(&p2)
-        );
-        eprintln!(
-            "  phase3(ipc):       median={}ns avg={:.0}ns",
-            median(&mut p3),
-            avg(&p3)
-        );
-        eprintln!(
-            "  phase4(flux):      median={}ns avg={:.0}ns",
-            median(&mut p4),
-            avg(&p4)
+            "  step_g(flux):      median={}ns avg={:.0}ns",
+            median(&mut sg),
+            avg(&sg)
         );
         eprintln!(
             "  copyrpc_resp={} copyrpc_incoming={} deleg_req={} ipc_req={} flux_incoming={}",
@@ -502,6 +527,8 @@ fn run_daemon_0(
             perf_ipc_req as f64 / perf_loop_count as f64
         );
     }
+
+    qd_collector.map_or_else(Vec::new, |c| c.into_samples())
 }
 
 /// Daemon #1..K: ipc (local requests) + Flux (forwarded from Daemon#0).
@@ -751,6 +778,8 @@ pub fn run_delegation(
     size: u32,
     num_daemons: usize,
     num_clients: usize,
+    budget_max: u32,
+    budget_rtt_us: f64,
 ) -> Vec<parquet_out::BenchRow> {
     let queue_depth = cli.queue_depth;
 
@@ -869,9 +898,19 @@ pub fn run_delegation(
     }
 
     // Spawn daemon threads
-    let mut daemon_handles = Vec::with_capacity(num_daemons);
+    let qd_interval = cli.qd_sample_dir.as_ref().map(|_| cli.qd_sample_interval);
+    let budget_cfg = if budget_max > 0 {
+        Some(crate::adaptive_budget::AdaptiveBudgetConfig {
+            u_max: budget_max,
+            rtt_estimate_us: budget_rtt_us,
+            ..Default::default()
+        })
+    } else {
+        None
+    };
+    let mut daemon0_handle: Option<std::thread::JoinHandle<Vec<crate::qd_sample::QdSample>>> = None;
+    let mut worker_handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(num_daemons);
 
-    let poll_budget = cli.poll_budget;
     for d in 0..num_daemons {
         let ipc_srv = ipc_servers[d].take().unwrap();
         let flux = flux_nodes[d].take().unwrap();
@@ -884,8 +923,10 @@ pub fn run_delegation(
             // Daemon#0: delegationrpc + copyrpc + Flux + ipc
             let deleg_srv = deleg_server.take().unwrap();
             let setup = copyrpc_setup_for_d0.take();
+            let qd_int = qd_interval;
+            let b_cfg = budget_cfg.clone();
 
-            daemon_handles.push(std::thread::spawn(move || {
+            daemon0_handle = Some(std::thread::spawn(move || {
                 if let Some(core_id) = core {
                     affinity::pin_thread(core_id, "daemon-0");
                 }
@@ -894,18 +935,19 @@ pub fn run_delegation(
                     num_daemons,
                     key_range,
                     queue_depth,
-                    poll_budget,
                     ipc_srv,
                     deleg_srv,
                     flux,
                     setup,
                     &stop,
                     &barrier,
-                );
+                    qd_int,
+                    b_cfg,
+                )
             }));
         } else {
             // Daemon#1..K: ipc + Flux only
-            daemon_handles.push(std::thread::spawn(move || {
+            worker_handles.push(std::thread::spawn(move || {
                 if let Some(core_id) = core {
                     affinity::pin_thread(core_id, &format!("daemon-{}", d));
                 }
@@ -996,8 +1038,31 @@ pub fn run_delegation(
     // Stop daemons (clients already stopped)
     stop_flag.store(true, Ordering::Release);
 
-    for h in daemon_handles {
-        h.join().expect("Daemon thread panicked");
+    let d0_samples = daemon0_handle
+        .unwrap()
+        .join()
+        .expect("Daemon#0 thread panicked");
+    for h in worker_handles {
+        h.join().expect("Worker daemon thread panicked");
+    }
+
+    // Write QD samples CSV if requested
+    if let Some(ref dir) = cli.qd_sample_dir {
+        std::fs::create_dir_all(dir).ok();
+        let path = format!("{}/deleg_qd_rank{}_d0.csv", dir, rank);
+        if let Err(e) = crate::qd_sample::write_csv(&path, &d0_samples) {
+            eprintln!(
+                "  rank {} daemon 0: failed to write QD samples: {}",
+                rank, e
+            );
+        } else {
+            eprintln!(
+                "  rank {} daemon 0: {} QD samples -> {}",
+                rank,
+                d0_samples.len(),
+                path
+            );
+        }
     }
 
     // Run boundaries: derive from known duration (no MPI barrier needed)

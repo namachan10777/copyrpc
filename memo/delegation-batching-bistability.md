@@ -340,3 +340,148 @@ fn daemon_loop(mut ctl: AdaptiveBudgetCtl) {
 - NP=8 崩壊ケース: `rho < 1`, `e_ema` 上昇を検知し `u` を自動増加、低均衡から回復
 - NP=16 高均衡ケース: `rho > 1`, `e_ema` 低位なら `u` を自動縮小、不要待機を削減
 - QD 変化時: warmup 同定と緩やかな再同定で追従し、固定 `poll_budget` より頑健
+
+## 関連研究メモ (引用候補)
+
+### 1. Batching / Livelock / Polling 安定化
+
+1. Jeffrey C. Mogul, K. K. Ramakrishnan, "Eliminating Receive Livelock in an Interrupt-driven Kernel", USENIX ATC 1996.
+   - 受信処理の崩壊と budget/制御導入による安定化という点で最も近い。
+   - URL: https://www.usenix.org/conference/usenix-1996-annual-technical-conference/eliminating-receive-livelock-interrupt-driven
+
+2. Adam Belay et al., "IX: A Protected Dataplane Operating System for High Throughput and Low Latency", OSDI 2014.
+   - 低レイテンシと高スループットの両立に bounded batching を使う設計。
+   - URL: https://www.usenix.org/conference/osdi14/technical-sessions/presentation/belay
+
+3. Eunyoung Jeong et al., "mTCP: a Highly Scalable User-level TCP Stack for Multicore Systems", NSDI 2014.
+   - user-space network stackにおける batch/event 集約の効果。
+   - URL: https://www.usenix.org/conference/nsdi14/technical-sessions/presentation/jeong
+
+4. Luigi Rizzo, "netmap: A Novel Framework for Fast Packet I/O", USENIX ATC 2012.
+   - batching で固定コストを償却する設計原理の引用先として有用。
+   - URL: https://www.usenix.org/conference/atc12/technical-sessions/presentation/rizzo
+
+### 2. 制御理論ベースの通信最適化 (AQM / 遅延制御)
+
+1. RFC 8289, "The CoDel Active Queue Management Algorithm", 2018.
+   - しきい値・ヒステリシス型制御の実運用仕様。
+   - URL: https://www.rfc-editor.org/rfc/rfc8289.html
+
+2. RFC 8033, "PIE: A Lightweight Control Scheme to Address the Bufferbloat Problem", 2017.
+   - PI制御を通信キュー制御へ適用した実装指向の標準文書。
+   - URL: https://www.rfc-editor.org/rfc/rfc8033.html
+
+3. C. V. Hollot et al., "On Designing Improved Controllers for AQM Routers Supporting TCP Flows", INFOCOM 2001.
+   - AQMの古典的PI制御設計。
+   - URL: https://dblp.org/rec/conf/infocom/HollotMTG01a.html
+
+4. R. Pan et al., "PIE: A Lightweight Control Scheme to Address the Bufferbloat Problem", IEEE HPSR 2013.
+   - PIEの元論文。
+   - URL: https://dblp.org/rec/conf/hpsr/PanNPPSBV13.html
+
+### 3. RDMA/Datacenter congestion control (遅延・フィードバック)
+
+1. Radhika Mittal et al., "TIMELY: RTT-based Congestion Control for the Datacenter", SIGCOMM 2015.
+   - RTTフィードバック制御。`rho = T_loop / RTT` 型指標の妥当性議論に使いやすい。
+   - URL: https://research.google/pubs/timely-rtt-based-congestion-control-for-the-datacenter/
+
+2. Yibo Zhu et al., "Congestion Control for Large-Scale RDMA Deployments (DCQCN)", SIGCOMM 2015.
+   - RDMA向け制御則と大規模運用知見。
+   - URL: https://www.microsoft.com/en-us/research/publication/congestion-control-for-large-scale-rdma-deployments/
+
+3. Mohan Kumar et al., "Swift: Delay is Simple and Effective for Congestion Control in the Datacenter", SIGCOMM 2020.
+   - 遅延目標に基づく実用制御の代表例。
+   - URL: https://research.google/pubs/swift-delay-is-simple-and-effective-for-congestion-control-in-the-datacenter/
+
+4. Anirudh Arun, Hari Balakrishnan, "Copa: Practical Delay-Based Congestion Control", NSDI 2018.
+   - delayベース制御の理論と実装。
+   - URL: https://www.usenix.org/conference/nsdi18/presentation/arun
+
+5. Mo Dong et al., "PCC Vivace: Online-Learning Congestion Control", NSDI 2018.
+   - オンライン最適化制御の比較対象として有用。
+   - URL: https://www.usenix.org/conference/nsdi18/presentation/dong
+
+6. Neal Cardwell et al., "BBR: Congestion-Based Congestion Control", ACM Queue 2016.
+   - モデルベース状態推定 + 制御入力という枠組みの引用先。
+   - URL: https://research.google/pubs/bbr-congestion-based-congestion-control-2/
+
+### 4. 双安定/しきい値系の理論参照
+
+1. Gagan Malhotra et al., "A feedback fluid queue with two congestion control thresholds", Mathematical Methods of Operations Research 2009.
+   - 2しきい値フィードバック系の安定性解析。双安定記述の理論背景に使える。
+   - URL: https://doi.org/10.1007/s00186-008-0235-8
+
+### このメモでの使い分け案
+
+- 「現象説明 (batching崩壊, livelock-like)」: Mogul+Ramakrishnan, IX, mTCP, netmap
+- 「制御則の妥当性 (adaptive budget, hysteresis, PI/AIMD)」: CoDel, PIE, Hollot, Pan
+- 「RTT/遅延を状態量として使う根拠」: TIMELY, Swift, Copa
+- 「RDMA系文脈」: DCQCN
+- 「双安定/閾値系の理論裏付け」: Malhotra et al.
+
+## 実装状況と検証引き継ぎ
+
+### 実装済み (未 push → このコミットで push)
+
+1. **`copyrpc/src/lib.rs`**: `Context::poll_recv_only()` 追加
+   - recv CQ drain + SRQ repost のみ、flush なし
+   - adaptive extra poll 用。u32 (CQE 数) を返す
+
+2. **`benchkv/src/adaptive_budget.rs`**: 新規モジュール
+   - `AdaptiveBudgetConfig`: 13 パラメータ、`Default` 実装
+   - `AdaptiveBudgetCtl`: 3-phase (Warmup1→Warmup2→Active)
+   - EWMA + ヒステリシス + 崩壊緊急回復
+
+3. **`benchkv/src/delegation_backend.rs`**: コントローラ統合
+   - `run_daemon_0()` に `budget_config: Option<AdaptiveBudgetConfig>` 引数追加
+   - ループ先頭: adaptive extra poll (`poll_recv_only` を最大 `u` 回)
+   - ループ末尾: `ctl.update(copyrpc_resp_count, loop_ns)`
+   - ループ後: 診断ログ出力
+   - `run_delegation()` に `budget_max: u32`, `budget_rtt_us: f64` 引数追加
+
+4. **`benchkv/src/main.rs`**: CLI 引数追加
+   - `delegation --budget-max N` (default 0 = 無効)
+   - `delegation --budget-rtt-us F` (default 6.0)
+
+### 検証方法 (ローカル 2 ノード)
+
+```bash
+# ビルド
+cargo build --release --package benchkv
+
+# 2ノードで adaptive budget テスト
+mpirun --hostfile /dev/omni.txt -np 2 --map-by node --bind-to none \
+  target/release/benchkv -d 10 -r 1 \
+  --server-threads 1 --client-threads 46 --queue-depth 32 \
+  --qd-sample-dir /tmp/qd_adaptive --qd-sample-interval 1 \
+  delegation --budget-max 32
+
+# budget なし (対照群)
+mpirun --hostfile /dev/omni.txt -np 2 --map-by node --bind-to none \
+  target/release/benchkv -d 10 -r 1 \
+  --server-threads 1 --client-threads 46 --queue-depth 32 \
+  --qd-sample-dir /tmp/qd_nobudget --qd-sample-interval 1 \
+  delegation --budget-max 0
+```
+
+### 確認ポイント
+
+1. **コンパイル通過**: `cargo clippy --package copyrpc --package benchkv` で新規 warning なし
+2. **budget-max=0 での回帰なし**: 引数なしで既存動作と同等
+3. **診断ログ**: stderr に `[daemon0] adaptive_budget: final u=... b_ema=... e_ema=... loop_ema=...` が出る
+4. **QD サンプル CSV**: `copyrpc_inflight` (outstanding), `extra` (CQE batch) の時系列確認
+5. **NP=2 では adaptive budget の効果は限定的** (EP=1 のため)。主な検証対象は NP≥8
+
+### 未投入のクラスタジョブ
+
+- PBS ジョブ 568222 (`adaptive_budget_16n.sh`) をクラスタに投入済み (開始予定 05:51 JST)
+  - NP=8 no budget (対照群)
+  - NP=8 budget=32 (崩壊防止テスト)
+  - NP=16 budget=32 (高均衡維持テスト)
+  - NP=2 budget=32 (sanity check)
+
+### 既知の注意点
+
+- `delegation_backend.rs` には前セッションの flush_endpoints() + interleave 変更も含まれている (poll_budget なし状態)
+- NP=2 は EP=1 なのでバッチング崩壊は起きにくい。adaptive budget の本来のテストは NP≥8 が必要
+- warmup は 5000 loops × 2 phase = 10000 loops。NP=2 だと ~1ms で完了するため影響は小さい

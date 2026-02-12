@@ -1,3 +1,4 @@
+mod adaptive_budget;
 mod affinity;
 mod client;
 mod copyrpc_direct_backend;
@@ -88,10 +89,6 @@ struct Cli {
     #[arg(long, default_value = "1024")]
     qd_sample_interval: u32,
 
-    /// Daemon poll budget: max inner poll iterations in Phase 1 (delegation only)
-    #[arg(long, default_value = "16")]
-    poll_budget: u32,
-
     #[command(subcommand)]
     subcommand: SubCmd,
 }
@@ -114,7 +111,14 @@ enum SubCmd {
     /// copyrpc direct (no ipc/Flux) meta_put/meta_get benchmark
     CopyrpcDirect,
     /// Delegation: clients submit remote requests via shared-memory MPSC to Daemon#0
-    Delegation,
+    Delegation {
+        /// Adaptive poll budget max (0 = disabled)
+        #[arg(long, default_value = "0")]
+        budget_max: u32,
+        /// RTT estimate in microseconds for adaptive budget controller
+        #[arg(long, default_value = "6.0")]
+        budget_rtt_us: f64,
+    },
 }
 
 fn main() {
@@ -160,9 +164,19 @@ fn main() {
             num_daemons,
             num_clients,
         ),
-        SubCmd::Delegation => {
-            delegation_backend::run_delegation(&cli, &world, rank, size, num_daemons, num_clients)
-        }
+        SubCmd::Delegation {
+            budget_max,
+            budget_rtt_us,
+        } => delegation_backend::run_delegation(
+            &cli,
+            &world,
+            rank,
+            size,
+            num_daemons,
+            num_clients,
+            *budget_max,
+            *budget_rtt_us,
+        ),
     };
 
     // Rank 0: write parquet
