@@ -17,3 +17,5 @@
 
 # Output
 *.pdf
+!handmade-figures/
+!handmade-figures/*.pdf

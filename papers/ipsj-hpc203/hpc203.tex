@@ -9,7 +9,7 @@
 %\documentclass[submit,techrep]{ipsj}
 \documentclass[submit,techrep,noauthor]{ipsj}
 
-\usepackage[dvips]{graphicx}
+\usepackage[dvipdfmx]{graphicx}
 \usepackage{latexsym}
 \usepackage{url}
 
@@ -90,7 +90,72 @@ HPCで広く用いられるInfinibandネットワークでは，
 
 \subsection{並列ファイルシステムの発展とad-hocファイルシステム}
 
+並列ファイルシステムは，メタデータ管理とデータ管理を分離し，データを複数ストレージノードに分散配置して並列帯域を引き出す構成を基本として発展してきた．
+PVFSやLustreに代表される設計は，大規模チェックポイントのような大容量I/Oで高い実効帯域を達成し，HPCの標準的な永続ストレージ層として定着している\cite{carnsPVFSParallelFile2000}．
+しかし，計算性能の向上に対してストレージ性能の伸びは相対的に遅く，計算とI/Oの性能ギャップが継続的に拡大していることが指摘されている\cite{tatebeGfarmBBGfarm2020}．
+このギャップは，機械学習やデータ解析ワークロードに見られる小粒度I/Oやメタデータ集中アクセスで特に顕在化し，共有ストレージ単体では安定した低遅延処理が難しくなる\cite{brinkmannAdHocFile2020}．
+
+こうした背景から，計算ノード上のNVMe SSDや永続メモリをジョブ実行中に束ねる中間層として，バーストバッファおよびad-hocファイルシステムが発展してきた\cite{brinkmannAdHocFile2020}．
+\begin{figure}[t]
+	\centering
+	\includegraphics[width=0.95\linewidth]{handmade-figures/pfs-and-adhocfs.drawio.pdf}
+	\caption{並列ファイルシステムとad-hocファイルシステムの構成比較}
+	\label{fig:pfs-adhocfs-overview}
+\end{figure}
+建部らのGfarm/BBは，ノードローカルストレージを用いる一時的オンデマンドファイルシステムとして，ジョブ開始前に高速構築し，ジョブ終了時に破棄する運用を前提としている\cite{tatebeGfarmBBGfarm2020}．
+同研究は，この層で重視すべき要件を「永続性や冗長性よりもアクセス性能とメタデータ性能」と定義し，RDMAやファイル記述子受け渡しを活用した高速化で有効性を示している\cite{tatebeGfarmBBGfarm2020}．
+
+また，CHFSはad-hocファイルシステムを永続メモリ向けに再設計し，専用メタデータサーバを置かず，一貫性ハッシュを用いた分散Key-Value Store上にファイルシステム機能を直接構築することで，
+ノード数増加時のメタデータ性能とデータアクセス性能の両方を改善している\cite{tatebeCHFSParallelConsistent2022}．
+CHFSが示す設計上の要点は，(1)集中管理点の排除，(2)逐次実行パスの削減，(3)ノードローカル媒体の特性に合わせた軽量データ構造であり，
+ad-hocファイルシステムのスケーラビリティを議論する上で重要な指針となる\cite{tatebeCHFSParallelConsistent2022}．
+さらに，GekkoFS，BurstFS，UnifyFS，DeltaFSに代表される研究も，ワークロード特性に応じてメタデータ管理方式や同期モデルを見直すことで，従来PFSのボトルネックを補完する方向を示している\cite{vefGekkoFSTemporaryDistributed2018,wangBurstFSDistributedBurst2016,brimUnifyFSUserlevelShared2023,zhengDeltaFSExascaleFile2015,zhengDeltaFSScalableNogroundtruth2021}．
+杉原らのMPI-IO研究が示すように，既存アプリケーション互換性を維持したままI/O経路の局所性を高める工夫も，引き続き実用上重要である\cite{sugiharaDesignLocalityawareMPIIO2020}．
+
+以上を踏まえると，ad-hocファイルシステムに求められる要件は次の3点に整理できる．
+\begin{enumerate}
+	\item 既存HPCアプリケーションを活かすためのPOSIX互換インターフェース，またはそれに準ずる透過性
+	\item ノード内外で大量に発生する小粒度リクエストを処理するための高いメタデータ性能と低遅延通信
+	\item 計算用資源を圧迫しない実装，特に計算ノードメモリ消費を抑えた通信基盤
+\end{enumerate}
+本研究は，このうち3点目の通信資源効率に焦点を当て，ad-hocファイルシステムの実用スケールでボトルネックとなる接続状態とメモリ消費の問題を扱う．
+
 \subsection{RDMA通信}
+
+RDMAは，CPU介在を抑えつつ低遅延・高帯域のデータ転送を実現する通信機構である．
+実装上は，送信キュー（SQ）と受信キュー（RQ）を対にしたQueue Pair（QP）に対してWork Request（WR）を投稿し，
+NICがこれをWork Queue Element（WQE）として処理する．
+完了通知はCompletion Queue（CQ）に集約され，アプリケーションはCQをポーリングして通信進行を把握する．
+
+通信開始時，ホストはSQ上にWQEを配置した後，doorbellレジスタへのMMIO書き込みでNICへ新規WQEの存在を通知する．
+このdoorbell発行は固定コストを持つため，複数リクエストをまとめて投稿するdoorbell batchingや，ペイロードのinline化によってPCIeトランザクションを削減する設計が有効である\cite{kalia2016DesignGuidelinesHigh}．
+また，WQEを毎回完了通知付きで発行するとCQ処理負荷が増えるため，実運用ではsignaled/unsignaledを組み合わせて制御するのが一般的である\cite{kalia2016DesignGuidelinesHigh}．
+
+RDMAのトランスポートにはRC（Reliable Connection）やUD（Unreliable Datagram）などがある．
+RCは信頼性と順序性を提供し，大きなデータ転送や厳密なフロー制御が必要なミドルウェア実装と親和性が高い一方，接続状態の管理コストが課題となる\cite{chenScalableRDMARPC2019,kong2023UnderstandingRDMAMicroarchitecture}．
+本研究が対象とするad-hocファイルシステムのような環境では，大量の小粒度制御メッセージとデータ転送が混在するため，
+RCの利点を活かしつつ接続数とメモリ消費を抑えるアーキテクチャが必要となる．
+
+RC，UD，DCの特徴を，スケーラビリティの観点で整理すると表\ref{tab:rdma-transports}のようになる．
+UD（Unreliable Datagram）は接続状態を持たないため接続数起因の状態量増大を避けやすいが，信頼性や順序制御をソフトウェア側で補う必要がある．
+DC（Dynamically Connected）は，通信時に接続先を動的に切り替えて見かけ上の接続数を削減できるが，
+内部的にはRC系の接続状態管理に依存しており，状態管理コストを根本的に消すものではない．
+そのため，DCはRCのスケーラビリティ問題を緩和する有力な手段ではあるが，完全な解決策としては扱えない点に注意が必要である．
+
+\begin{table}[t]
+	\caption{RDMAトランスポートの比較（スケーラビリティ観点）}
+	\label{tab:rdma-transports}
+	\centering
+	\begin{tabular}{l|p{0.22\linewidth}|p{0.24\linewidth}|p{0.26\linewidth}}
+		\hline
+		方式 & 主な利点 & 主な制約 & スケーラビリティ上の論点 \\
+		\hline
+		RC & 信頼性・順序性・one-sided通信が利用可能 & 接続ごとの状態をNIC/メモリに保持 & 接続数増加で状態量とキャッシュ競合が増えやすい  \\ \hline
+		UD & 接続レスで状態量を抑えやすい & 信頼性・順序制御・再送をソフトウェアで実装 & 大規模化しやすい一方，ミドルウェア設計負担が増加  \\ \hline
+		DC & 見かけ上の接続数を圧縮しやすい & 実装複雑性と切替コスト，機能依存性 & RC状態管理の緩和は可能だが根本解消ではない  \\
+		\hline
+	\end{tabular}
+\end{table}
 
 \section{関連研究}
 
