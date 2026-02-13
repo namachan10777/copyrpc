@@ -1016,3 +1016,77 @@ unsafe fn decode_batch_header(buf: *const u8) -> (u64, u64, u32) {
     let message_count = u32::from_le(std::ptr::read(ptr32));
     (delta, ring_credit_return, message_count)
 }
+
+/// A pre-bound receive poller that stores a callback for reuse across poll iterations.
+///
+/// This avoids reconstructing the closure environment on every call to `poll_recv_counted`.
+/// The callback `F` is monomorphized and can be inlined by the compiler.
+pub struct RecvPoller<U: Copy, F: FnMut(U, &[u8])> {
+    ctx: *const Context<U>,
+    callback: F,
+}
+
+impl<U: Copy> Context<U> {
+    /// Create a [`RecvPoller`] that stores the given callback for repeated polling.
+    ///
+    /// # Safety
+    ///
+    /// The returned `RecvPoller` holds a raw pointer to this `Context`.
+    /// The caller must ensure that `self` outlives the returned `RecvPoller`.
+    pub fn recv_poller<F: FnMut(U, &[u8])>(&self, callback: F) -> RecvPoller<U, F> {
+        RecvPoller {
+            ctx: self as *const _,
+            callback,
+        }
+    }
+}
+
+impl<U: Copy, F: FnMut(U, &[u8])> RecvPoller<U, F> {
+    #[inline(always)]
+    pub fn poll(&mut self) -> u32 {
+        let ctx = unsafe { &*self.ctx };
+        if !ctx.recv_cq.has_pending_cqe() {
+            return 0;
+        }
+
+        let endpoints = &ctx.endpoints;
+        let recv_stack = &ctx.recv_stack;
+        let callback = &mut self.callback;
+        let mut recv_count = 0u32;
+
+        loop {
+            let count = ctx.recv_cq.poll_raw(|cqe| {
+                if cqe.opcode == CqeOpcode::ReqErr || cqe.opcode == CqeOpcode::RespErr {
+                    eprintln!(
+                        "[dc recv_cq ERROR] qpn={}, opcode={:?}, syndrome={}",
+                        cqe.qp_num, cqe.opcode, cqe.syndrome
+                    );
+                    return;
+                }
+                Context::<U>::process_cqe_static(cqe.imm, endpoints, callback, recv_stack);
+            });
+            if count == 0 {
+                break;
+            }
+            recv_count += count as u32;
+        }
+
+        if recv_count > 0 {
+            ctx.recv_cq.flush();
+
+            let posted = ctx.srq_posted.get().saturating_sub(recv_count);
+            ctx.srq_posted.set(posted);
+
+            let threshold = ctx.srq_max_wr * 2 / 3;
+            if posted < threshold {
+                let to_post = ctx.srq_max_wr - posted;
+                for _ in 0..to_post {
+                    let _ = ctx.srq.post_recv(SrqEntry, 0, 0, 0);
+                }
+                ctx.srq.ring_doorbell();
+                ctx.srq_posted.set(ctx.srq_max_wr);
+            }
+        }
+        recv_count
+    }
+}

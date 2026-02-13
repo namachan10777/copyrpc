@@ -346,6 +346,32 @@ pub fn run_daemon(
     let mut sampled_res_write = 0u32;
     let mut loop_samples: Vec<LoopSample> = Vec::with_capacity(500_000);
 
+    // Build RecvPoller once before the loop to avoid per-iteration closure construction.
+    // Raw pointers are used to capture daemon state without conflicting with Phase 2 borrows.
+    let mut recv_poller = ctx_ref.map(|ctx| {
+        let connected_ptr = std::ptr::addr_of!(connected);
+        let slot_ptrs_ptr = std::ptr::addr_of!(slot_ptrs);
+        let inflight_ptr = std::ptr::addr_of_mut!(inflight);
+        let in_preparing_ptr = std::ptr::addr_of_mut!(in_preparing);
+        let preparing_queue_ptr = std::ptr::addr_of_mut!(preparing_queue);
+        let copyrpc_inflight_count_ptr = std::ptr::addr_of_mut!(copyrpc_inflight_count);
+
+        ctx.recv_poller(move |slot_idx: usize, data: &[u8]| unsafe {
+            if slot_idx >= max_clients || !(&*connected_ptr)[slot_idx] {
+                return;
+            }
+            let resp = RemoteResponse::from_bytes(data).response;
+            slot_complete((&*slot_ptrs_ptr)[slot_idx], resp);
+
+            (&mut *inflight_ptr)[slot_idx] = false;
+            if !(&*in_preparing_ptr)[slot_idx] {
+                (&mut *in_preparing_ptr)[slot_idx] = true;
+                (*preparing_queue_ptr).push_back(slot_idx);
+            }
+            *copyrpc_inflight_count_ptr = (*copyrpc_inflight_count_ptr).saturating_sub(1);
+        })
+    });
+
     while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
         let mut loop_cqe_recv = 0u32;
         let mut loop_req_write = 0u32;
@@ -374,27 +400,21 @@ pub fn run_daemon(
             }
         }
 
+        // Prefetch the first preparing slot so the cache line arrives during Phase 1.
+        if let Some(&first) = preparing_queue.front() {
+            unsafe {
+                std::arch::x86_64::_mm_prefetch(
+                    slot_ptrs[first] as *const i8,
+                    std::arch::x86_64::_MM_HINT_T0,
+                );
+            }
+        }
+
         // Phase 1: process copyrpc completions and incoming remote requests.
+        if let Some(poller) = recv_poller.as_mut() {
+            loop_cqe_recv = loop_cqe_recv.saturating_add(poller.poll());
+        }
         if let Some(ctx) = ctx_ref {
-            loop_cqe_recv = loop_cqe_recv.saturating_add(ctx.poll_recv_counted(
-                |slot_idx: usize, data: &[u8]| {
-                    if slot_idx >= max_clients || !connected[slot_idx] {
-                        return;
-                    }
-                    let resp = RemoteResponse::from_bytes(data).response;
-                    unsafe { slot_complete(slot_ptrs[slot_idx], resp) };
-
-                    if inflight[slot_idx] {
-                        inflight[slot_idx] = false;
-                    }
-                    if !in_preparing[slot_idx] {
-                        in_preparing[slot_idx] = true;
-                        preparing_queue.push_back(slot_idx);
-                    }
-                    copyrpc_inflight_count = copyrpc_inflight_count.saturating_sub(1);
-                },
-            ));
-
             while let Some(recv_handle) = ctx.recv() {
                 let req = RemoteRequest::from_bytes(recv_handle.data()).request;
                 let target_daemon = ShardedStore::owner_of(req.key(), num_daemons_u64) as usize;
