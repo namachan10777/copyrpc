@@ -1,7 +1,7 @@
 DOCKER_IMAGE = ipsj-latex
 DOCKER_RUN = docker run --rm -v $(PWD):/workdir $(DOCKER_IMAGE)
 
-.PHONY: all build docker-build clean watch fix-punctuation
+.PHONY: all build docker-build clean watch fix-punctuation figures
 
 all: build
 
@@ -13,8 +13,12 @@ fix-punctuation:
 docker-build:
 	docker build -t $(DOCKER_IMAGE) .
 
+# Generate figures from benchmark results
+figures:
+	uv run plot.py
+
 # Build PDF using Docker (pLaTeX + dvipdfmx)
-build: fix-punctuation docker-build
+build: fix-punctuation figures docker-build
 	$(DOCKER_RUN) latexmk hpc203.tex
 
 # Watch for changes and rebuild
