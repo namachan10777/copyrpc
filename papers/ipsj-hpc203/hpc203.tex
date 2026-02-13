@@ -208,7 +208,7 @@ NICがこれをWork Queue Element（WQE）として処理する．
 このIPCキューは，クライアントごとのSPSCキューを束ねた構成であり，受け手はデーモンである．
 すなわち，要求データ領域はクライアントのみが書き込み，デーモンは読み取り専用とする一方，
 完了状態領域はデーモンのみが書き込み，クライアントは読み取り専用とする．
-各方向の進行位置（producer/consumer）も単一書き手となるよう役割を固定し，
+各方向の進行位置（\texttt{producer}/\texttt{consumer}）も単一書き手となるよう役割を固定し，
 可視化は「payload/header書き込み後に状態フラグを更新する」順序で行う．
 これにより，ノード内通信でもcompare-and-swap中心の多者競合を避けつつ，
 ポーリングのみで要求到着と完了を判定できる．
@@ -284,7 +284,7 @@ $\alpha=1$でもQP関連状態だけで$M_{\mathrm{conn}}^{\mathrm{ucx}}\approx2
 受信側は集約された受信CQをポーリングし，1つのCQEをトリガとしてバッチ内の複数メッセージを処理する．
 これにより，通知処理はメッセージ単位ではなくバッチ単位へ償却される．
 
-送信バッファは，slot header（call\_id，generation，状態，要求長/応答長）とpayloadからなるスロット列として管理する．
+送信バッファは，\texttt{slot header}（\texttt{call\_id}，\texttt{generation}，状態，要求長/応答長）とpayloadからなるスロット列として管理する．
 この論理フォーマットと可視化手順は図\ref{fig:message-write-protocol}で合わせて示す．
 
 \subsubsection{フロー制御}
@@ -317,12 +317,12 @@ $\alpha=1$でもQP関連状態だけで$M_{\mathrm{conn}}^{\mathrm{ucx}}\approx2
 	\label{fig:message-write-protocol}
 \end{figure}
 
-第1段階では，クライアントが原子的なfetch\_addでproducer位置を前進させ，書き込み区間を確保する．
+第1段階では，クライアントが原子的な\texttt{fetch\_add}で\texttt{producer}位置を前進させ，書き込み区間を確保する．
 この時点では他プロセスから当該スロットは不可視である．
-第2段階で，クライアントはslot header（call\_id，generation，要求長/応答長）とpayloadを書き込み，
-最後にstateをReqReadyへ更新して可視化する．
-この更新順序により，デーモンはReqReadyを観測した時点で当該スロットの内容を一貫して参照できる．
-デーモンは前回処理したconsumer位置から順にslot headerのstateを確認し，ReqReadyの連続区間を送信範囲としてWQEを生成する．
+第2段階で，クライアントは\texttt{slot header}（\texttt{call\_id}，\texttt{generation}，要求長/応答長）とpayloadを書き込み，
+最後に\texttt{state}を\texttt{ReqReady}へ更新して可視化する．
+この更新順序により，デーモンは\texttt{ReqReady}を観測した時点で当該スロットの内容を一貫して参照できる．
+デーモンは前回処理した\texttt{consumer}位置から順に\texttt{slot header}の\texttt{state}を確認し，\texttt{ReqReady}の連続区間を送信範囲としてWQEを生成する．
 
 このとき重要なのは，デーモンがPayload内容を見て要求を抽出しない点である．
 デーモンはSlot Headerの境界情報と状態遷移のみを用いて送信可能区間を決定する．
@@ -331,8 +331,8 @@ $\alpha=1$でもQP関連状態だけで$M_{\mathrm{conn}}^{\mathrm{ucx}}\approx2
 ローカル完結要求は専用IPCキューへ投入されるため，この送信バッファ調停はリモート送信対象の要求にのみ適用される．
 すなわち，ノード内delegationの競合制御とノード間RDMA送信の競合制御を分離し，それぞれ最小限の同期機構で実装する．
 
-リング折返し時はgeneration counterを更新して同一オフセット再利用を識別し，
-応答書き戻し時にもcall\_idと世代を照合することで，古い要求との取り違えを防ぐ．
+リング折返し時は\texttt{generation counter}を更新して同一オフセット再利用を識別し，
+応答書き戻し時にも\texttt{call\_id}と世代を照合することで，古い要求との取り違えを防ぐ．
 
 \subsubsection{Adaptive Batch Hold制御}
 
