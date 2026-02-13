@@ -1,7 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use std::cell::{Cell, RefCell, UnsafeCell};
-use std::collections::VecDeque;
 use std::io;
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -27,8 +26,16 @@ use mlx5::wqe::emit::DcAvIb;
 /// Batch metadata size in bytes.
 pub const BATCH_HEADER_SIZE: usize = 32;
 
-/// Maximum bytes that can be inlined in a write_imm WQE (inline-only, no SGE).
-const MAX_INLINE_ONLY: usize = 220;
+/// Maximum bytes that can be inlined in a DCI write_imm WQE (inline-only, no SGE).
+///
+/// DCI WRITE_IMM WQE layout (IB):
+/// - ctrl: 16B
+/// - address vector: 48B
+/// - rdma seg: 16B
+/// - inline seg: padded to 16B, includes 4B inline header
+///
+/// We cap total WQE to 256B, so inline_padded <= 176 and inline payload <= 172.
+const MAX_INLINE_ONLY: usize = 172;
 
 /// Default ring buffer size (1 MB).
 pub const DEFAULT_RING_SIZE: usize = 1 << 20;
@@ -108,6 +115,71 @@ struct RecvMessage<U> {
     data_len: usize,
 }
 
+const DIRTY_NONE: u32 = u32::MAX;
+
+struct DirtyEndpointList {
+    head: u32,
+    tail: u32,
+    next: Vec<u32>,
+    in_list: Vec<bool>,
+}
+
+impl DirtyEndpointList {
+    fn new() -> Self {
+        Self {
+            head: DIRTY_NONE,
+            tail: DIRTY_NONE,
+            next: Vec::new(),
+            in_list: Vec::new(),
+        }
+    }
+
+    fn ensure_slot(&mut self, endpoint_id: u32) {
+        let idx = endpoint_id as usize;
+        if idx >= self.next.len() {
+            self.next.resize(idx + 1, DIRTY_NONE);
+            self.in_list.resize(idx + 1, false);
+        }
+    }
+
+    fn push_back(&mut self, endpoint_id: u32) {
+        self.ensure_slot(endpoint_id);
+        let idx = endpoint_id as usize;
+        if self.in_list[idx] {
+            return;
+        }
+        self.in_list[idx] = true;
+        self.next[idx] = DIRTY_NONE;
+        if self.tail == DIRTY_NONE {
+            self.head = endpoint_id;
+            self.tail = endpoint_id;
+            return;
+        }
+        let tail_idx = self.tail as usize;
+        self.next[tail_idx] = endpoint_id;
+        self.tail = endpoint_id;
+    }
+
+    fn pop_front(&mut self) -> Option<u32> {
+        if self.head == DIRTY_NONE {
+            return None;
+        }
+        let endpoint_id = self.head;
+        let idx = endpoint_id as usize;
+        self.head = self.next[idx];
+        if self.head == DIRTY_NONE {
+            self.tail = DIRTY_NONE;
+        }
+        self.next[idx] = DIRTY_NONE;
+        self.in_list[idx] = false;
+        Some(endpoint_id)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.head == DIRTY_NONE
+    }
+}
+
 pub struct Context<U> {
     pd: Pd,
     srq: Rc<Srq<SrqEntry>>,
@@ -118,8 +190,7 @@ pub struct Context<U> {
     dci: Rc<RefCell<DciQp>>,
     dct: Dct<SrqEntry>,
     endpoints: UnsafeCell<FastMap<Rc<UnsafeCell<EndpointInner<U>>>>>,
-    dirty_endpoints: UnsafeCell<VecDeque<u32>>,
-    dirty_set: UnsafeCell<FastMap<()>>,
+    dirty_endpoints: UnsafeCell<DirtyEndpointList>,
     recv_stack: UnsafeCell<Vec<RecvMessage<U>>>,
     next_endpoint_id: Cell<u32>,
     port: u8,
@@ -246,8 +317,7 @@ impl<U> ContextBuilder<U> {
             dci,
             dct,
             endpoints: UnsafeCell::new(FastMap::new()),
-            dirty_endpoints: UnsafeCell::new(VecDeque::new()),
-            dirty_set: UnsafeCell::new(FastMap::new()),
+            dirty_endpoints: UnsafeCell::new(DirtyEndpointList::new()),
             recv_stack: UnsafeCell::new(Vec::new()),
             next_endpoint_id: Cell::new(1),
             port: self.port,
@@ -262,11 +332,6 @@ impl<U> Context<U> {
     fn mark_endpoint_dirty(&self, ep: &Rc<UnsafeCell<EndpointInner<U>>>) {
         let ep_ref = unsafe { &*ep.get() };
         let endpoint_id = ep_ref.endpoint_id;
-        let dirty_set = unsafe { &mut *self.dirty_set.get() };
-        if dirty_set.contains_key(endpoint_id) {
-            return;
-        }
-        dirty_set.insert(endpoint_id, ());
         unsafe { &mut *self.dirty_endpoints.get() }.push_back(endpoint_id);
     }
 
@@ -300,7 +365,7 @@ impl<U> Context<U> {
         })
     }
 
-    pub fn poll(&self, mut on_response: impl FnMut(U, &[u8])) {
+    pub fn poll_recv(&self, mut on_response: impl FnMut(U, &[u8])) {
         let mut recv_count = 0u32;
         let endpoints = &self.endpoints;
         let recv_stack = &self.recv_stack;
@@ -340,8 +405,15 @@ impl<U> Context<U> {
                 self.srq_posted.set(self.srq_max_wr);
             }
         }
+    }
 
+    pub fn poll(&self, on_response: impl FnMut(U, &[u8])) {
+        self.poll_recv(on_response);
         self.flush_endpoints();
+    }
+
+    pub fn has_dirty_endpoints(&self) -> bool {
+        !unsafe { &*self.dirty_endpoints.get() }.is_empty()
     }
 
     pub fn flush_endpoints(&self) {
@@ -363,7 +435,6 @@ impl<U> Context<U> {
                 let Some(endpoint_id) = endpoint_id else {
                     break;
                 };
-                unsafe { &mut *self.dirty_set.get() }.remove(endpoint_id);
                 let ep = {
                     let endpoints = unsafe { &*self.endpoints.get() };
                     endpoints.get(endpoint_id).cloned()
@@ -377,11 +448,7 @@ impl<U> Context<U> {
                         emitted |= was_emitted;
                     }
                     Err(Error::RingFull) => {
-                        let dirty_set = unsafe { &mut *self.dirty_set.get() };
-                        if !dirty_set.contains_key(endpoint_id) {
-                            dirty_set.insert(endpoint_id, ());
-                            unsafe { &mut *self.dirty_endpoints.get() }.push_back(endpoint_id);
-                        }
+                        unsafe { &mut *self.dirty_endpoints.get() }.push_back(endpoint_id);
                         // SQ/credit pressure: retry next flush cycle.
                         break;
                     }
@@ -567,6 +634,15 @@ impl<U> EndpointInner<U> {
     }
 
     #[inline(always)]
+    fn would_exceed_inline_limit_if_append(&self, msg_size: u64) -> bool {
+        let pending_delta = self
+            .send_ring_producer
+            .get()
+            .saturating_sub(self.flush_start_pos.get());
+        pending_delta.saturating_add(msg_size) > MAX_INLINE_ONLY as u64
+    }
+
+    #[inline(always)]
     fn prepare_next_batch(&self) {
         let producer = self.send_ring_producer.get();
         self.meta_pos.set(producer);
@@ -744,8 +820,7 @@ impl<U> Endpoint<U> {
             .ok_or(error::CallError::Other(Error::RemoteConsumerUnknown))?;
 
         let msg_size = padded_message_size(data.len() as u32);
-
-        if inner.batch_message_count.get() > 0 {
+        if inner.would_exceed_inline_limit_if_append(msg_size) {
             ctx.mark_endpoint_dirty(&self.inner);
             return Err(error::CallError::RingFull(user_data));
         }
@@ -818,8 +893,7 @@ impl<U> RecvHandle<'_, U> {
             .ok_or(Error::RemoteConsumerUnknown)?;
 
         let msg_size = padded_message_size(data.len() as u32);
-
-        if inner.batch_message_count.get() > 0 {
+        if inner.would_exceed_inline_limit_if_append(msg_size) {
             self.ctx.mark_endpoint_dirty(&self.endpoint);
             return Err(Error::RingFull);
         }

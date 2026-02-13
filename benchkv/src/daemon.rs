@@ -365,7 +365,7 @@ pub fn run_daemon(
 
         // Phase 1: process copyrpc completions and incoming remote requests.
         if let Some(ctx) = ctx_ref {
-            ctx.poll(|slot_idx: usize, data: &[u8]| {
+            ctx.poll_recv(|slot_idx: usize, data: &[u8]| {
                 if slot_idx >= max_clients || !connected[slot_idx] {
                     return;
                 }
@@ -503,12 +503,6 @@ pub fn run_daemon(
             }
         }
 
-        if remote_enqueued > 0 {
-            if let Some(ctx) = ctx_ref {
-                ctx.flush_endpoints();
-            }
-        }
-
         // Phase 3: Flux processing
         let mut ready_flux_responses: Vec<(usize, Response)> = Vec::new();
         flux.poll(|pending_idx: usize, data: DelegatePayload| {
@@ -553,6 +547,13 @@ pub fn run_daemon(
                 );
                 let resp = handle_local(&mut store, &req);
                 flux.reply(flux_token, DelegatePayload::Resp(resp));
+            }
+        }
+
+        // Flush only endpoints that were dirtied by call/reply in this loop.
+        if let Some(ctx) = ctx_ref {
+            if ctx.has_dirty_endpoints() {
+                ctx.flush_endpoints();
             }
         }
 
