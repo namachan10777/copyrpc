@@ -20,5 +20,9 @@
 !handmade-figures/
 !handmade-figures/*.pdf
 
+# Generated figures
+!figures/*.svg
+figures/*.csv
+
 # macOS
 .DS_Store
