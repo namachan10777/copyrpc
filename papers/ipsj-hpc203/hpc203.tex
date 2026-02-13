@@ -117,7 +117,45 @@ ad-hocファイルシステムのスケーラビリティを議論する上で�
 \subsection{RDMA通信}
 
 RDMAは，CPU介在を抑えつつ低遅延・高帯域のデータ転送を実現する通信機構である．
-実装上は，送信キュー（SQ）と受信キュー（RQ）を対にしたQueue Pair（QP）に対してWork Request（WR）を投稿し，
+いくつかの接続形態が存在し，主として利用されるのはReliable Connection（RC），Unreliable Datagram（UD），Dynamically Connected（DC）である．
+それぞれの特性を\ref{tab:rdma-transports}にまとめる．
+
+最も広く用いられているのはRCである．
+操作に対して一定の順序制御と自動的な再送制御があり，通信管理コストをNICにオフロード可能である．
+また，WRITE，READ，ATOMICといった対向のCPUの動作なしにメモリ操作を行うことが可能であり，
+特に大容量データを扱うことの多いストレージミドルウェアでは非常に効率的である．
+ただし，通信相手に事前にRC接続を張る必要があり，この時の接続情報がNICキャッシュに乗り切らない場合Cache slashingが発生して性能低下が起きることが報告されている \cite{chenScalableRDMARPC2019}．
+
+UDは単一の接続ハンドラのみで多数の相手と通信可能であり，高いスケーラビリティを有している一方で，
+順序保証・再送保証なしのSEND/RECVしか使えず信頼性の高い通信をするにはソフトウェアによる制御が必要となる．
+特に，READ/WRITEのようなハードウェアオフロード可能な大容量通信が存在しないため，
+特にファイルシステムや行列計算では避けられる傾向にある．
+
+以上二つが標準的なibverbsにおける接続形態だが，NVIDIAの独自拡張としてDCが存在している．
+これはRCの接続・切断・再接続をNICハードウェアが極めて高速かつ効率的に行う機構に近く，
+通信がまばらであったり，特定の相手との通信に時間的に偏る場合はRCと同等の性能を発揮することが可能である．
+また，自動的に通信を切ってリソースを抑えるため，1万ノード以上の規模でも任意のノードとの高速な通信を可能にしつつもメモリ使用量を抑えることが可能である．
+ただし，複数の相手との同時通信を行う場合，単一の接続ハンドラではRC以上の性能低下が起きることから，
+管理コストをハードウェアにオフロード出来る機構としては有用なもののスループットを単独で解決することは難しい．
+
+\begin{table}[t]
+	\caption{RDMAトランスポートの比較（スケーラビリティ観点）}
+	\label{tab:rdma-transports}
+	\centering
+	\begin{tabular}{l|p{0.22\linewidth}|p{0.24\linewidth}|p{0.26\linewidth}}
+		\hline
+		方式 & 主な利点 & 主な制約 & スケーラビリティ上の論点 \\
+		\hline
+		RC & 信頼性・順序性・one-sided通信が利用可能 & 接続ごとに状態をNIC/メモリに保持 & 接続数増加で状態量とキャッシュ競合が増えやすい  \\ \hline
+		UD & 接続数に対してスケール & 低信頼性・順序制御がない・通信命令あたり上限が小さい・one-sided通信は不可能 & 良好なものの，大容量データ転送には向かない．CPU負荷が増大  \\ \hline
+		DC & 信頼性・順序性・one-sided通信が利用可能・接続数に対してメモリがスケール & NVIDIA系NICのみ & リソース消費は抑えやすいが，多数接続・高負荷時はRCと同様に性能低下  \\
+		\hline
+	\end{tabular}
+\end{table}
+
+このRDMA通信はキュー操作としてユーザランドから扱うこととなる．
+
+実装上は，送信キュー（SQ）と受信キュー（RQ）を対にしたQueue Pair（QP）に対してSEND，RECV，WRITEなどの種別のWork Request（WR）を投稿し，
 NICがこれをWork Queue Element（WQE）として処理する．
 完了通知はCompletion Queue（CQ）に集約され，アプリケーションはCQをポーリングして通信進行を把握する．
 この関係を図\ref{fig:rdma-sq-rq}に示す．
@@ -131,36 +169,12 @@ NICがこれをWork Queue Element（WQE）として処理する．
 
 通信開始時，ホストはSQ上にWQEを配置した後，doorbellレジスタへのMMIO書き込みでNICへ新規WQEの存在を通知する．
 このdoorbell発行は固定コストを持つため，複数リクエストをまとめて投稿するdoorbell batchingや，ペイロードのinline化によってPCIeトランザクションを削減する設計が有効である\cite{kalia2016DesignGuidelinesHigh}．
-また，WQEを毎回完了通知付きで発行するとCQ処理負荷が増えるため，実運用ではsignaled/unsignaledを組み合わせて制御するのが一般的である\cite{kalia2016DesignGuidelinesHigh}．
+また，WQEを毎回完了通知付きで発行するとCQ処理負荷が増えるため，実運用では完了時にCQEを発生させないunsignaledを組み合わせて制御するのが一般的である\cite{kalia2016DesignGuidelinesHigh}．
 同様に，受信側でもCQポーリング1回ごとに，CQヘッド確認，完了エントリ（CQE）の取り出し，ローカルキュー更新などの固定コストが発生する．
-そのため，1回のポーリングで処理できるCQE数が小さい状態では，この固定コストの償却が不十分となり，スループットが低下しやすい．
-本稿でいうbatching崩壊は，まさにこの受信側の固定コスト償却が崩れる現象を指す．
+特に，単一コアでは小メッセージ通信ではNIC処理性能よりもCPUおよびNICとのメモリ同期コストが律速となることから，
+可能な限りPCIeトランザクションとCPUでのキャッシュミスを抑えるため，
+バッチ化して多数のリクエストを同時に扱うべきである．
 
-RDMAのトランスポートにはRC（Reliable Connection）やUD（Unreliable Datagram）などがある．
-RCは信頼性と順序性を提供し，大きなデータ転送や厳密なフロー制御が必要なミドルウェア実装と親和性が高い一方，接続状態の管理コストが課題となる\cite{chenScalableRDMARPC2019,kong2023UnderstandingRDMAMicroarchitecture}．
-本研究が対象とするad-hocファイルシステムのような環境では，大量の小粒度制御メッセージとデータ転送が混在するため，
-RCの利点を活かしつつ接続数とメモリ消費を抑えるアーキテクチャが必要となる．
-
-RC，UD，DCの特徴を，スケーラビリティの観点で整理すると表\ref{tab:rdma-transports}のようになる．
-UD（Unreliable Datagram）は接続状態を持たないため接続数起因の状態量増大を避けやすいが，信頼性や順序制御をソフトウェア側で補う必要がある．
-DC（Dynamically Connected）は，通信時に接続先を動的に切り替えて見かけ上の接続数を削減できるが，
-内部的にはRC系の接続状態管理に依存しており，状態管理コストを根本的に消すものではない．
-そのため，DCはRCのスケーラビリティ問題を緩和する有力な手段ではあるが，完全な解決策としては扱えない点に注意が必要である．
-
-\begin{table}[t]
-	\caption{RDMAトランスポートの比較（スケーラビリティ観点）}
-	\label{tab:rdma-transports}
-	\centering
-	\begin{tabular}{l|p{0.22\linewidth}|p{0.24\linewidth}|p{0.26\linewidth}}
-		\hline
-		方式 & 主な利点 & 主な制約 & スケーラビリティ上の論点 \\
-		\hline
-		RC & 信頼性・順序性・one-sided通信が利用可能 & 接続ごとの状態をNIC/メモリに保持 & 接続数増加で状態量とキャッシュ競合が増えやすい  \\ \hline
-		UD & 接続レスで状態量を抑えやすい & 信頼性・順序制御・再送をソフトウェアで実装 & 大規模化しやすい一方，ミドルウェア設計負担が増加  \\ \hline
-		DC & 見かけ上の接続数を圧縮しやすい & 実装複雑性と切替コスト，機能依存性 & RC状態管理の緩和は可能だが根本解消ではない  \\
-		\hline
-	\end{tabular}
-\end{table}
 
 \section{関連研究}
 \label{sec:related-work}
