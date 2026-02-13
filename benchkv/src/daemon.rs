@@ -2,6 +2,8 @@ use std::collections::VecDeque;
 use std::ptr;
 use std::sync::atomic::AtomicBool;
 
+use fastmap::FastMap;
+
 use crate::message::*;
 use crate::qd_sample::{QdCollector, QdSample};
 use crate::storage::ShardedStore;
@@ -306,12 +308,10 @@ pub fn run_daemon(
 
     let ctx_ref = copyrpc_ctx.as_deref();
 
-    let rank_to_ep_index = |target_rank: u32| -> usize {
-        my_remote_ranks
-            .iter()
-            .position(|&r| r == target_rank)
-            .expect("target_rank not in my_remote_ranks")
-    };
+    let mut rank_to_ep_index: FastMap<usize> = FastMap::new();
+    for (i, &rank) in my_remote_ranks.iter().enumerate() {
+        rank_to_ep_index.insert(rank, i);
+    }
 
     let num_daemons_u64 = num_daemons as u64;
 
@@ -327,17 +327,10 @@ pub fn run_daemon(
     let mut in_preparing = vec![false; max_clients];
     let mut inflight = vec![false; max_clients];
     let mut preparing_queue: VecDeque<usize> = VecDeque::with_capacity(max_clients);
-    let mut inflights_stack: Vec<usize> = Vec::with_capacity(max_clients);
-
     let mut copyrpc_inflight_count: u32 = 0;
 
     // QD sampling
     let mut qd_collector = qd_sample_interval.map(|iv| QdCollector::new(iv, 500_000));
-
-    // Adaptive batching knobs
-    const POLL_BUDGET: usize = 16;
-    const MIN_BATCH_REQS: usize = 8;
-    const MAX_BATCH_WAIT_POLLS: usize = 16;
 
     while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
         // Discover newly connected clients and add their fixed slots to preparing.
@@ -374,9 +367,6 @@ pub fn run_daemon(
 
                 if inflight[slot_idx] {
                     inflight[slot_idx] = false;
-                    if let Some(pos) = inflights_stack.iter().position(|&x| x == slot_idx) {
-                        inflights_stack.swap_remove(pos);
-                    }
                 }
                 if !in_preparing[slot_idx] {
                     in_preparing[slot_idx] = true;
@@ -416,23 +406,8 @@ pub fn run_daemon(
         }
 
         // Phase 2: poll preparing slots and enqueue remote requests in batches.
-        let mut scans = 0usize;
-        let mut remote_enqueued = 0usize;
-        let mut extra_wait_polls = 0usize;
-
-        while scans < POLL_BUDGET
-            || (remote_enqueued > 0
-                && remote_enqueued < MIN_BATCH_REQS
-                && extra_wait_polls < MAX_BATCH_WAIT_POLLS)
-        {
-            let Some(slot_idx) = preparing_queue.pop_front() else {
-                break;
-            };
+        while let Some(slot_idx) = preparing_queue.pop_front() {
             in_preparing[slot_idx] = false;
-            scans += 1;
-            if scans >= POLL_BUDGET && remote_enqueued > 0 && remote_enqueued < MIN_BATCH_REQS {
-                extra_wait_polls += 1;
-            }
 
             if !connected[slot_idx] {
                 continue;
@@ -474,13 +449,13 @@ pub fn run_daemon(
             };
 
             let remote_req = RemoteRequest { request: req };
-            let ep_idx = rank_to_ep_index(target_rank);
+            let ep_idx = *rank_to_ep_index
+                .get(target_rank)
+                .expect("target_rank not in my_remote_ranks");
             match copyrpc_endpoints[ep_idx].call(remote_req.as_bytes(), slot_idx, 0) {
                 Ok(_) => {
                     inflight[slot_idx] = true;
-                    inflights_stack.push(slot_idx);
                     copyrpc_inflight_count += 1;
-                    remote_enqueued += 1;
                 }
                 Err(copyrpc::error::CallError::RingFull(_))
                 | Err(copyrpc::error::CallError::InsufficientCredit(_)) => {
@@ -503,50 +478,52 @@ pub fn run_daemon(
             }
         }
 
-        // Phase 3: Flux processing
-        let mut ready_flux_responses: Vec<(usize, Response)> = Vec::new();
-        flux.poll(|pending_idx: usize, data: DelegatePayload| {
-            if let DelegatePayload::Resp(resp) = data {
-                ready_flux_responses.push((pending_idx, resp));
-            }
-        });
+        // Phase 3: Flux processing (only needed with multiple daemons per node).
+        if num_daemons > 1 {
+            let mut ready_flux_responses: Vec<(usize, Response)> = Vec::new();
+            flux.poll(|pending_idx: usize, data: DelegatePayload| {
+                if let DelegatePayload::Resp(resp) = data {
+                    ready_flux_responses.push((pending_idx, resp));
+                }
+            });
 
-        for (pending_idx, resp) in ready_flux_responses.drain(..) {
-            let Some(recv_handle) = pending_copyrpc_handles[pending_idx].as_ref() else {
-                continue;
-            };
-            let remote_resp = RemoteResponse { response: resp };
-            let mut done = false;
-            loop {
-                match recv_handle.reply(remote_resp.as_bytes()) {
-                    Ok(()) => {
-                        done = true;
-                        break;
-                    }
-                    Err(copyrpc::error::Error::RingFull) => {
-                        if let Some(ctx) = ctx_ref {
-                            ctx.flush_endpoints();
-                        } else {
+            for (pending_idx, resp) in ready_flux_responses.drain(..) {
+                let Some(recv_handle) = pending_copyrpc_handles[pending_idx].as_ref() else {
+                    continue;
+                };
+                let remote_resp = RemoteResponse { response: resp };
+                let mut done = false;
+                loop {
+                    match recv_handle.reply(remote_resp.as_bytes()) {
+                        Ok(()) => {
+                            done = true;
                             break;
                         }
+                        Err(copyrpc::error::Error::RingFull) => {
+                            if let Some(ctx) = ctx_ref {
+                                ctx.flush_endpoints();
+                            } else {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
+                }
+                if done {
+                    pending_copyrpc_handles[pending_idx] = None;
+                    free_slots.push(pending_idx);
                 }
             }
-            if done {
-                pending_copyrpc_handles[pending_idx] = None;
-                free_slots.push(pending_idx);
-            }
-        }
 
-        while let Some((_from, flux_token, payload)) = flux.try_recv_raw() {
-            if let DelegatePayload::Req(req) = payload {
-                debug_assert_eq!(
-                    ShardedStore::owner_of(req.key(), num_daemons_u64) as usize,
-                    daemon_id
-                );
-                let resp = handle_local(&mut store, &req);
-                flux.reply(flux_token, DelegatePayload::Resp(resp));
+            while let Some((_from, flux_token, payload)) = flux.try_recv_raw() {
+                if let DelegatePayload::Req(req) = payload {
+                    debug_assert_eq!(
+                        ShardedStore::owner_of(req.key(), num_daemons_u64) as usize,
+                        daemon_id
+                    );
+                    let resp = handle_local(&mut store, &req);
+                    flux.reply(flux_token, DelegatePayload::Resp(resp));
+                }
             }
         }
 
@@ -561,13 +538,9 @@ pub fn run_daemon(
             c.tick(
                 copyrpc_inflight_count,
                 flux.pending_count() as u32,
-                inflights_stack.len() as u32,
+                copyrpc_inflight_count,
                 preparing_queue.len() as u32,
             );
-        }
-
-        if remote_enqueued == 0 && scans == 0 {
-            std::hint::spin_loop();
         }
     }
 

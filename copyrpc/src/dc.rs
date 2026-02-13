@@ -26,17 +26,6 @@ use mlx5::wqe::emit::DcAvIb;
 /// Batch metadata size in bytes.
 pub const BATCH_HEADER_SIZE: usize = 32;
 
-/// Maximum bytes that can be inlined in a DCI write_imm WQE (inline-only, no SGE).
-///
-/// DCI WRITE_IMM WQE layout (IB):
-/// - ctrl: 16B
-/// - address vector: 48B
-/// - rdma seg: 16B
-/// - inline seg: padded to 16B, includes 4B inline header
-///
-/// We cap total WQE to 256B, so inline_padded <= 176 and inline payload <= 172.
-const MAX_INLINE_ONLY: usize = 172;
-
 /// Default ring buffer size (1 MB).
 pub const DEFAULT_RING_SIZE: usize = 1 << 20;
 
@@ -116,6 +105,7 @@ struct RecvMessage<U> {
 }
 
 const DIRTY_NONE: u32 = u32::MAX;
+const SIGNAL_INTERVAL_MASK: u32 = 0x7; // Signal every 8th WQE.
 
 struct DirtyEndpointList {
     head: u32,
@@ -191,6 +181,7 @@ pub struct Context<U> {
     dct: Dct<SrqEntry>,
     endpoints: UnsafeCell<FastMap<Rc<UnsafeCell<EndpointInner<U>>>>>,
     dirty_endpoints: UnsafeCell<DirtyEndpointList>,
+    pending_send_cqes: Cell<u32>,
     recv_stack: UnsafeCell<Vec<RecvMessage<U>>>,
     next_endpoint_id: Cell<u32>,
     port: u8,
@@ -318,6 +309,7 @@ impl<U> ContextBuilder<U> {
             dct,
             endpoints: UnsafeCell::new(FastMap::new()),
             dirty_endpoints: UnsafeCell::new(DirtyEndpointList::new()),
+            pending_send_cqes: Cell::new(0),
             recv_stack: UnsafeCell::new(Vec::new()),
             next_endpoint_id: Cell::new(1),
             port: self.port,
@@ -417,15 +409,27 @@ impl<U> Context<U> {
     }
 
     pub fn flush_endpoints(&self) {
-        loop {
-            let count = self.send_cq.poll();
-            if count == 0 {
-                break;
+        let mut polled_send_cqes = 0u32;
+        if self.pending_send_cqes.get() > 0 {
+            loop {
+                let count = self.send_cq.poll();
+                if count == 0 {
+                    break;
+                }
+                polled_send_cqes = polled_send_cqes.saturating_add(count as u32);
+            }
+            if polled_send_cqes > 0 {
+                self.send_cq.flush();
+                self.pending_send_cqes.set(
+                    self.pending_send_cqes
+                        .get()
+                        .saturating_sub(polled_send_cqes),
+                );
             }
         }
-        self.send_cq.flush();
 
         let mut emitted = false;
+        let mut newly_signaled = 0u32;
 
         {
             let mut dci = self.dci.borrow_mut();
@@ -446,17 +450,28 @@ impl<U> Context<U> {
                 match ep_ref.emit_pending(&mut dci) {
                     Ok(was_emitted) => {
                         emitted |= was_emitted;
+                        newly_signaled =
+                            newly_signaled.saturating_add(ep_ref.take_newly_signaled_count());
                     }
                     Err(Error::RingFull) => {
+                        newly_signaled =
+                            newly_signaled.saturating_add(ep_ref.take_newly_signaled_count());
                         unsafe { &mut *self.dirty_endpoints.get() }.push_back(endpoint_id);
                         // SQ/credit pressure: retry next flush cycle.
                         break;
                     }
                     Err(_) => {
+                        newly_signaled =
+                            newly_signaled.saturating_add(ep_ref.take_newly_signaled_count());
                         // Drop this flush attempt; next call/reply will enqueue again.
                     }
                 }
             }
+        }
+
+        if newly_signaled > 0 {
+            self.pending_send_cqes
+                .set(self.pending_send_cqes.get().saturating_add(newly_signaled));
         }
 
         if emitted {
@@ -560,6 +575,7 @@ impl<U> Context<U> {
 struct EndpointInner<U> {
     endpoint_id: u32,
     send_ring: Box<[u8]>,
+    send_ring_mr: MemoryRegion,
     recv_ring: Box<[u8]>,
     recv_ring_mr: MemoryRegion,
     remote_recv_ring: Cell<Option<RemoteRingInfo>>,
@@ -575,6 +591,8 @@ struct EndpointInner<U> {
     meta_pos: Cell<u64>,
     batch_message_count: Cell<u32>,
     wrap_pending: Cell<bool>,
+    unsignaled_count: Cell<u32>,
+    newly_signaled_count: Cell<u32>,
 }
 
 impl<U> EndpointInner<U> {
@@ -582,16 +600,20 @@ impl<U> EndpointInner<U> {
         let send_ring_size = config.send_ring_size.next_power_of_two();
         let recv_ring_size = config.recv_ring_size.next_power_of_two();
 
-        let send_ring = vec![0u8; send_ring_size].into_boxed_slice();
+        let mut send_ring = vec![0u8; send_ring_size].into_boxed_slice();
         let mut recv_ring = vec![0u8; recv_ring_size].into_boxed_slice();
 
-        let access_flags = AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE;
+        let send_access_flags = AccessFlags::LOCAL_WRITE;
+        let recv_access_flags = AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE;
+        let send_ring_mr =
+            unsafe { pd.register(send_ring.as_mut_ptr(), send_ring.len(), send_access_flags)? };
         let recv_ring_mr =
-            unsafe { pd.register(recv_ring.as_mut_ptr(), recv_ring.len(), access_flags)? };
+            unsafe { pd.register(recv_ring.as_mut_ptr(), recv_ring.len(), recv_access_flags)? };
 
         let inner = Rc::new(UnsafeCell::new(Self {
             endpoint_id,
             send_ring,
+            send_ring_mr,
             recv_ring,
             recv_ring_mr,
             remote_recv_ring: Cell::new(None),
@@ -607,6 +629,8 @@ impl<U> EndpointInner<U> {
             meta_pos: Cell::new(0),
             batch_message_count: Cell::new(0),
             wrap_pending: Cell::new(false),
+            unsignaled_count: Cell::new(0),
+            newly_signaled_count: Cell::new(0),
         }));
 
         Ok(inner)
@@ -631,15 +655,6 @@ impl<U> EndpointInner<U> {
         let ring_size = self.send_ring.len() as u64;
         let offset = producer & (ring_size - 1);
         offset + msg_size < ring_size
-    }
-
-    #[inline(always)]
-    fn would_exceed_inline_limit_if_append(&self, msg_size: u64) -> bool {
-        let pending_delta = self
-            .send_ring_producer
-            .get()
-            .saturating_sub(self.flush_start_pos.get());
-        pending_delta.saturating_add(msg_size) > MAX_INLINE_ONLY as u64
     }
 
     #[inline(always)]
@@ -691,33 +706,67 @@ impl<U> EndpointInner<U> {
         let remote_addr = remote_ring.addr + remote_offset;
         let imm = self.remote_endpoint_id.get();
 
-        let delta_usize = delta as usize;
-        if delta_usize > MAX_INLINE_ONLY {
+        let delta_u32 = match u32::try_from(delta) {
+            Ok(v) => v,
+            Err(_) => return Err(Error::RingFull),
+        };
+        if delta_u32 == 0 {
             return Err(Error::RingFull);
         }
 
-        let inline_data = &self.send_ring[start_offset..start_offset + delta_usize];
+        let local_addr = self.send_ring_mr.addr() as u64 + start_offset as u64;
         let emit_ctx = dci.emit_ctx().map_err(Error::Io)?;
         let av = DcAvIb::new(remote_dct.dc_key, remote_dct.dctn, remote_dct.dlid);
-        emit_dci_wqe!(
-            &emit_ctx,
-            write_imm {
-                av: av,
-                flags: WqeFlags::empty(),
-                remote_addr: remote_addr,
-                rkey: remote_ring.rkey,
-                inline: inline_data,
-                imm: imm,
-                signaled: self.endpoint_id,
-            }
-        )
-        .map_err(|e| match e {
-            SubmissionError::SqFull => Error::RingFull,
-            _ => Error::Io(io::Error::other(e)),
-        })?;
+        let next_count = self.unsignaled_count.get().wrapping_add(1);
+        let should_signal = (next_count & SIGNAL_INTERVAL_MASK) == 0;
+        if should_signal {
+            emit_dci_wqe!(
+                &emit_ctx,
+                write_imm {
+                    av: av,
+                    flags: WqeFlags::empty(),
+                    remote_addr: remote_addr,
+                    rkey: remote_ring.rkey,
+                    sge: { addr: local_addr, len: delta_u32, lkey: self.send_ring_mr.lkey() },
+                    imm: imm,
+                    signaled: self.endpoint_id,
+                }
+            )
+            .map_err(|e| match e {
+                SubmissionError::SqFull => Error::RingFull,
+                _ => Error::Io(io::Error::other(e)),
+            })?;
+            self.unsignaled_count.set(0);
+            self.newly_signaled_count
+                .set(self.newly_signaled_count.get().saturating_add(1));
+        } else {
+            emit_dci_wqe!(
+                &emit_ctx,
+                write_imm {
+                    av: av,
+                    flags: WqeFlags::empty(),
+                    remote_addr: remote_addr,
+                    rkey: remote_ring.rkey,
+                    sge: { addr: local_addr, len: delta_u32, lkey: self.send_ring_mr.lkey() },
+                    imm: imm,
+                }
+            )
+            .map_err(|e| match e {
+                SubmissionError::SqFull => Error::RingFull,
+                _ => Error::Io(io::Error::other(e)),
+            })?;
+            self.unsignaled_count.set(next_count);
+        }
 
         self.flush_start_pos.set(end);
         Ok(true)
+    }
+
+    #[inline(always)]
+    fn take_newly_signaled_count(&self) -> u32 {
+        let v = self.newly_signaled_count.get();
+        self.newly_signaled_count.set(0);
+        v
     }
 
     #[inline(always)]
@@ -820,10 +869,6 @@ impl<U> Endpoint<U> {
             .ok_or(error::CallError::Other(Error::RemoteConsumerUnknown))?;
 
         let msg_size = padded_message_size(data.len() as u32);
-        if inner.would_exceed_inline_limit_if_append(msg_size) {
-            ctx.mark_endpoint_dirty(&self.inner);
-            return Err(error::CallError::RingFull(user_data));
-        }
 
         if !inner.has_cycle_room_for(msg_size) {
             inner.wrap_pending.set(true);
@@ -893,10 +938,6 @@ impl<U> RecvHandle<'_, U> {
             .ok_or(Error::RemoteConsumerUnknown)?;
 
         let msg_size = padded_message_size(data.len() as u32);
-        if inner.would_exceed_inline_limit_if_append(msg_size) {
-            self.ctx.mark_endpoint_dirty(&self.endpoint);
-            return Err(Error::RingFull);
-        }
 
         if !inner.has_cycle_room_for(msg_size) {
             inner.wrap_pending.set(true);
