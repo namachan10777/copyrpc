@@ -54,6 +54,21 @@
   file = {/Users/mnakano/Zotero/storage/GGPLX6VY/Baker et al. - 1991 - Measurements of a distributed file system.pdf}
 }
 
+@inproceedings{balaji2009MPIMillionProcessors,
+  title = {{{MPI}} on a {{Million Processors}}},
+  booktitle = {Proceedings of the 16th {{European PVM}}/{{MPI Users}}' {{Group Meeting}} on {{Recent Advances}} in {{Parallel Virtual Machine}} and {{Message Passing Interface}}},
+  author = {Balaji, Pavan and Buntinas, Darius and Goodell, David and Gropp, William and Kumar, Sameer and Lusk, Ewing and Thakur, Rajeev and Tr{\"a}ff, Jesper Larsson},
+  year = 2009,
+  month = sep,
+  pages = {20--30},
+  publisher = {Springer-Verlag},
+  address = {Berlin, Heidelberg},
+  doi = {10.1007/978-3-642-03770-2_9},
+  urldate = {2026-02-12},
+  abstract = {Petascale machines with close to a million processors will soon be available. Although MPI is the dominant programming model today, some researchers and users wonder (and perhaps even doubt) whether MPI will scale to such large processor counts. In this paper, we examine this issue of how scalable is MPI. We first examine the MPI specification itself and discuss areas with scalability concerns and how they can be overcome. We then investigate issues that an MPI implementation must address to be scalable. We ran some experiments to measure MPI memory consumption at scale on up to 131,072 processes or 80\% of the IBM Blue Gene/P system at Argonne National Laboratory. Based on the results, we tuned the MPI implementation to reduce its memory footprint. We also discuss issues in application algorithmic scalability to large process counts and features of MPI that enable the use of other techniques to overcome scalability limitations in applications.},
+  isbn = {978-3-642-03769-6}
+}
+
 @article{beaverFindingNeedleHaystack,
   title = {Finding a Needle in {{Haystack}}: {{Facebook}}'s Photo Storage},
   author = {Beaver, Doug and Kumar, Sanjeev and Li, Harry C and Sobel, Jason and Vajgel, Peter},
@@ -1511,6 +1526,21 @@
   abstract = {Massive storage systems typically replicate and partition data over many potentially-faulty components to provide both reliability and scalability. Yet many commerciallydeployed systems, especially those designed for interactive use by customers, sacrifice stronger consistency properties in the desire for greater availability and higher throughput.},
   langid = {english},
   file = {/Users/mnakano/Zotero/storage/WPIQSYW3/Terrace and Freedman - Object Storage on CRAQ.pdf}
+}
+
+@article{thakur2005OptimizationCollectiveCommunication,
+  title = {Optimization of {{Collective Communication Operations}} in {{MPICH}}},
+  author = {Thakur, Rajeev and Rabenseifner, Rolf and Gropp, William},
+  year = 2005,
+  month = feb,
+  journal = {Int. J. High Perform. Comput. Appl.},
+  volume = {19},
+  number = {1},
+  pages = {49--66},
+  issn = {1094-3420},
+  doi = {10.1177/1094342005051521},
+  urldate = {2026-02-13},
+  abstract = {We describe our work on improving the performance of collective communication operations in MPICH for clusters connected by switched networks. For each collective operation, we use multiple algorithms depending on the message size, with the goal of minimizing latency for short messages and minimizing bandwidth use for long messages. Although we have implemented new algorithms for all MPI Message Passing Interface collective operations, because of limited space we describe only the algorithms for allgather, broadcast, all-to-all, reduce-scatter, reduce, and allreduce. Performance results on a Myrinet-connected Linux cluster and an IBM SP indicate that, in all cases, the new algorithms significantly outperform the old algorithms used in MPICH on the Myrinet cluster, and, in many cases, they outperform the algorithms used in IBM's MPI on the SP. We also explore in further detail the optimization of two of the most commonly used collective operations, allreduce and reduce, particularly for long messages and nonpower-of-two numbers of processes. The optimized algorithms for these operations perform several times better than the native algorithms on a Myrinet cluster, IBM SP, and Cray T3E. Our results indicate that to achieve the best performance for a collective communication operation, one needs to use a number of different algorithms and select the right algorithm for a particular message size and number of processes.}
 }
 
 @article{usmanDataLocalityHigh2023,
