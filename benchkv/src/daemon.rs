@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::ptr;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
@@ -331,8 +332,9 @@ pub fn run_daemon(
     let mut slot_ptrs: Vec<*mut ClientSlot> = vec![ptr::null_mut(); max_clients];
     let mut connected = vec![false; max_clients];
     let mut connected_count = 0usize;
+    let mut in_preparing = vec![false; max_clients];
     let mut inflight = vec![false; max_clients];
-    let mut scan_start: usize = 0;
+    let mut preparing_queue: VecDeque<usize> = VecDeque::with_capacity(max_clients);
     let mut copyrpc_inflight_count: u32 = 0;
 
     // QD sampling
@@ -364,6 +366,10 @@ pub fn run_daemon(
                     connected[cid] = true;
                     connected_count += 1;
                     unsafe { slot_init(slot_ptrs[cid]) };
+                    if !inflight[cid] && !in_preparing[cid] {
+                        in_preparing[cid] = true;
+                        preparing_queue.push_back(cid);
+                    }
                 }
             }
         }
@@ -378,7 +384,13 @@ pub fn run_daemon(
                     let resp = RemoteResponse::from_bytes(data).response;
                     unsafe { slot_complete(slot_ptrs[slot_idx], resp) };
 
-                    inflight[slot_idx] = false;
+                    if inflight[slot_idx] {
+                        inflight[slot_idx] = false;
+                    }
+                    if !in_preparing[slot_idx] {
+                        in_preparing[slot_idx] = true;
+                        preparing_queue.push_back(slot_idx);
+                    }
                     copyrpc_inflight_count = copyrpc_inflight_count.saturating_sub(1);
                 },
             ));
@@ -416,16 +428,20 @@ pub fn run_daemon(
             }
         }
 
-        // Phase 2: direct round-robin scan of client slots.
-        let mut ring_full_hit = false;
-        for i in 0..max_clients {
-            let cid = (scan_start + i) % max_clients;
-            if !connected[cid] || inflight[cid] {
+        // Phase 2: poll preparing slots and enqueue remote requests in batches.
+        while let Some(slot_idx) = preparing_queue.pop_front() {
+            in_preparing[slot_idx] = false;
+
+            if !connected[slot_idx] {
                 continue;
             }
 
-            let slot_ptr = slot_ptrs[cid];
+            let slot_ptr = slot_ptrs[slot_idx];
             let Some(req) = (unsafe { slot_try_take_ready(slot_ptr) }) else {
+                if !inflight[slot_idx] && !in_preparing[slot_idx] {
+                    in_preparing[slot_idx] = true;
+                    preparing_queue.push_back(slot_idx);
+                }
                 continue;
             };
 
@@ -437,12 +453,21 @@ pub fn run_daemon(
                 );
                 let resp = handle_local(&mut store, &req);
                 unsafe { slot_complete(slot_ptr, resp) };
+
+                if !in_preparing[slot_idx] {
+                    in_preparing[slot_idx] = true;
+                    preparing_queue.push_back(slot_idx);
+                }
                 continue;
             }
 
             let Some(ctx) = ctx_ref else {
                 let resp = fallback_response(&req);
                 unsafe { slot_complete(slot_ptr, resp) };
+                if !in_preparing[slot_idx] {
+                    in_preparing[slot_idx] = true;
+                    preparing_queue.push_back(slot_idx);
+                }
                 continue;
             };
 
@@ -450,27 +475,31 @@ pub fn run_daemon(
             let ep_idx = *rank_to_ep_index
                 .get(target_rank)
                 .expect("target_rank not in my_remote_ranks");
-            match copyrpc_endpoints[ep_idx].call(remote_req.as_bytes(), cid, 0) {
+            match copyrpc_endpoints[ep_idx].call(remote_req.as_bytes(), slot_idx, 0) {
                 Ok(_) => {
-                    inflight[cid] = true;
+                    inflight[slot_idx] = true;
                     copyrpc_inflight_count += 1;
                     loop_req_write = loop_req_write.saturating_add(1);
                 }
                 Err(copyrpc::error::CallError::RingFull(_))
                 | Err(copyrpc::error::CallError::InsufficientCredit(_)) => {
                     unsafe { slot_restore_ready(slot_ptr) };
+                    if !in_preparing[slot_idx] {
+                        in_preparing[slot_idx] = true;
+                        preparing_queue.push_back(slot_idx);
+                    }
                     ctx.flush_endpoints();
-                    ring_full_hit = true;
                     break;
                 }
                 Err(copyrpc::error::CallError::Other(_)) => {
                     let resp = fallback_response(&req);
                     unsafe { slot_complete(slot_ptr, resp) };
+                    if !in_preparing[slot_idx] {
+                        in_preparing[slot_idx] = true;
+                        preparing_queue.push_back(slot_idx);
+                    }
                 }
             }
-        }
-        if !ring_full_hit && max_clients > 0 {
-            scan_start = (scan_start + 1) % max_clients;
         }
 
         // Phase 3: Flux processing (only needed with multiple daemons per node).
@@ -535,7 +564,7 @@ pub fn run_daemon(
                 copyrpc_inflight_count,
                 flux.pending_count() as u32,
                 copyrpc_inflight_count,
-                0,
+                preparing_queue.len() as u32,
             );
         }
 
