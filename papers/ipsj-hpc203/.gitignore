@@ -21,7 +21,8 @@
 !handmade-figures/*.pdf
 
 # Generated figures
-!figures/*.svg
+!figures/
+!figures/*.pdf
 figures/*.csv
 
 # macOS

@@ -195,11 +195,11 @@ def plot_benchkv_throughput(df_rps: pl.DataFrame):
         lo_field="miops_lo",
         hi_field="miops_hi",
     )
-    chart.save(str(OUT_DIR / "benchkv_throughput.svg"))
+    chart.save(str(OUT_DIR / "benchkv_throughput.pdf"))
 
     csv_df = summary.select(["backend", "np", "mean_miops", "std_miops"])
     csv_df.write_csv(OUT_DIR / "benchkv_throughput.csv")
-    print(f"  -> benchkv_throughput.svg / .csv")
+    print(f"  -> benchkv_throughput.pdf / .csv")
 
 
 def plot_benchkv_batch_hold(df_rps: pl.DataFrame):
@@ -237,11 +237,11 @@ def plot_benchkv_batch_hold(df_rps: pl.DataFrame):
         lo_field="miops_lo",
         hi_field="miops_hi",
     )
-    chart.save(str(OUT_DIR / "benchkv_batch_hold.svg"))
+    chart.save(str(OUT_DIR / "benchkv_batch_hold.pdf"))
 
     csv_df = summary.select(["variant", "np", "mean_miops", "std_miops"])
     csv_df.write_csv(OUT_DIR / "benchkv_batch_hold.csv")
-    print(f"  -> benchkv_batch_hold.svg / .csv")
+    print(f"  -> benchkv_batch_hold.pdf / .csv")
 
 
 def plot_rpc_bench_throughput(df: pl.DataFrame):
@@ -280,11 +280,11 @@ def plot_rpc_bench_throughput(df: pl.DataFrame):
         .properties(width=400, height=280)
         .configure_axis(labelFontSize=12, titleFontSize=13)
     )
-    chart.save(str(OUT_DIR / "rpc_bench_throughput.svg"))
+    chart.save(str(OUT_DIR / "rpc_bench_throughput.pdf"))
 
     csv_df = med.select(["label", "endpoints", "median_mrps"])
     csv_df.write_csv(OUT_DIR / "rpc_bench_throughput.csv")
-    print(f"  -> rpc_bench_throughput.svg / .csv")
+    print(f"  -> rpc_bench_throughput.pdf / .csv")
 
 
 def main():
