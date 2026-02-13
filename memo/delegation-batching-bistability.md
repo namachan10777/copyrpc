@@ -419,69 +419,80 @@ fn daemon_loop(mut ctl: AdaptiveBudgetCtl) {
 - 「RDMA系文脈」: DCQCN
 - 「双安定/閾値系の理論裏付け」: Malhotra et al.
 
-## 実装状況と検証引き継ぎ
+## 実装済みの緩和策
 
-### 実装済み (未 push → このコミットで push)
+### 1. Reply Batch-Hold (固定値、`--batch-hold-us`)
 
-1. **`copyrpc/src/lib.rs`**: `Context::poll_recv_only()` 追加
-   - recv CQ drain + SRQ repost のみ、flush なし
-   - adaptive extra poll 用。u32 (CQE 数) を返す
+CQE 応答をバッファし、count ≥ NP またはタイムアウトで一括 flush。
+adaptive toggle: バッチが健全 (flushed ≥ batch_target) なら hold を自動無効化。
 
-2. **`benchkv/src/adaptive_budget.rs`**: 新規モジュール
-   - `AdaptiveBudgetConfig`: 13 パラメータ、`Default` 実装
-   - `AdaptiveBudgetCtl`: 3-phase (Warmup1→Warmup2→Active)
-   - EWMA + ヒステリシス + 崩壊緊急回復
+**結果** (QD=1, fixed batch-hold=10μs vs no-hold):
 
-3. **`benchkv/src/delegation_backend.rs`**: コントローラ統合
-   - `run_daemon_0()` に `budget_config: Option<AdaptiveBudgetConfig>` 引数追加
-   - ループ先頭: adaptive extra poll (`poll_recv_only` を最大 `u` 回)
-   - ループ末尾: `ctl.update(copyrpc_resp_count, loop_ns)`
-   - ループ後: 診断ログ出力
-   - `run_delegation()` に `budget_max: u32`, `budget_rtt_us: f64` 引数追加
+| NP | fixed hold | no-hold | 改善 | copyrpc-direct | ucx-am |
+|----|-----------|---------|------|--------|--------|
+| 2  | 14.85M | 13.79M | +8% | 2.75M | 3.53M |
+| 4  | 21.08M | 21.72M | -3% | 6.59M | 6.62M |
+| 8  | 11.17M | 8.16M | **+37%** | 13.55M | 12.51M |
+| 16 | 20.01M | 14.38M | **+39%** | 26.31M | 10.15M |
+| 32 | 31.69M | 27.24M | +16% | 54.27M | 9.61M |
 
-4. **`benchkv/src/main.rs`**: CLI 引数追加
-   - `delegation --budget-max N` (default 0 = 無効)
-   - `delegation --budget-rtt-us F` (default 6.0)
+- NP=8 で delegation < ucx-am/direct: collapse 完全には解消されず
+- NP≥16 で delegation > ucx-am (ucx-am がスケールしない)
 
-### 検証方法 (ローカル 2 ノード)
+### 2. 動的 Hold: RTT-based (`--hold-rtt-multiplier`, 失敗)
 
-```bash
-# ビルド
-cargo build --release --package benchkv
+Step E flush → Step A first CQE の遅延を EWMA で計測し、hold_ns = rtt × multiplier。
 
-# 2ノードで adaptive budget テスト
-mpirun --hostfile /dev/omni.txt -np 2 --map-by node --bind-to none \
-  target/release/benchkv -d 10 -r 1 \
-  --server-threads 1 --client-threads 46 --queue-depth 32 \
-  --qd-sample-dir /tmp/qd_adaptive --qd-sample-interval 1 \
-  delegation --budget-max 32
+**結果 (NP=8)**: m=1.0→8.72M, m=1.5→9.16M, m=2.0→9.45M (fixed 11.17M に大敗)
 
-# budget なし (対照群)
-mpirun --hostfile /dev/omni.txt -np 2 --map-by node --bind-to none \
-  target/release/benchkv -d 10 -r 1 \
-  --server-threads 1 --client-threads 46 --queue-depth 32 \
-  --qd-sample-dir /tmp/qd_nobudget --qd-sample-interval 1 \
-  delegation --budget-max 0
+**失敗原因**: RTT (~3-5μs) は「1往復の遅延」を測る。batch collapse 解消に必要なのは
+「N-1ノードの応答が揃うまでの時間」で、これは response arrival spread に依存し RTT より長い。
+multiplier を上げれば追いつくが、それでは RTT 計測の意味がない。
+
+### 3. 動的 Hold: Arrival-Rate Feedback (`--adaptive-hold`, 有望)
+
+flush 時に直接観測可能な特徴量で hold_ns を自己調整:
+
+```
+rate = flushed_count / hold_duration   (responses/ns)
+hold_ns = batch_target / rate_ewma     (直接計算)
 ```
 
-### 確認ポイント
+EWMA 平滑化 (α=0.125): `rate_ewma = 0.875 * rate_ewma + 0.125 * sample`
+clamp: 0.5μs ≤ hold ≤ 100μs。初期値は `--batch-hold-us`。
 
-1. **コンパイル通過**: `cargo clippy --package copyrpc --package benchkv` で新規 warning なし
-2. **budget-max=0 での回帰なし**: 引数なしで既存動作と同等
-3. **診断ログ**: stderr に `[daemon0] adaptive_budget: final u=... b_ema=... e_ema=... loop_ema=...` が出る
-4. **QD サンプル CSV**: `copyrpc_inflight` (outstanding), `extra` (CQE batch) の時系列確認
-5. **NP=2 では adaptive budget の効果は限定的** (EP=1 のため)。主な検証対象は NP≥8
+**自己修正メカニズム**:
+- hold 短すぎ → flushed < target → rate 低 → hold 増加
+- hold 十分 → flushed ≥ target → rate 高 → hold 減少 (無駄な待ち削減)
+- NP=2,4 (健全) → rate 非常に高 → hold ≈ 0 (自動無効化)
+- NP=8+ (崩壊) → rate 低 → hold 自動増加
 
-### 未投入のクラスタジョブ
+**NP sweep 結果** (job 568288):
 
-- PBS ジョブ 568222 (`adaptive_budget_16n.sh`) をクラスタに投入済み (開始予定 05:51 JST)
-  - NP=8 no budget (対照群)
-  - NP=8 budget=32 (崩壊防止テスト)
-  - NP=16 budget=32 (高均衡維持テスト)
-  - NP=2 budget=32 (sanity check)
+| NP | Adaptive | Fixed 10μs | Diff | No-hold |
+|----|----------|-----------|------|---------|
+| 2  | 14.73M   | 14.67M    | +0.4% | 13.76M |
+| 4  | 20.91M   | 21.43M    | -2.5% | 21.87M |
+| 8  | 11.11M   | 10.64M    | **+4.4%** | 8.18M |
+| 16 | 19.49M   | 20.15M    | -3.3% | 14.71M |
+| 32 | 38.93M   | 31.30M    | **+24.4%** | 27.08M |
 
-### 既知の注意点
+- NP=32: arrival rate が高く、固定 10μs は長すぎる → adaptive が最適 hold を発見 (+24.4%)
+- NP=8: modest improvement (+4.4%)、RTT方式 (-22%) と比べ大幅改善
+- NP=2,4: ノイズ範囲内 (batch collapse なし)
+- NP=16: -3.3% の微減、hold 調整が NP=16 の複雑な dynamics に追いつかない可能性
 
-- `delegation_backend.rs` には前セッションの flush_endpoints() + interleave 変更も含まれている (poll_budget なし状態)
-- NP=2 は EP=1 なのでバッチング崩壊は起きにくい。adaptive budget の本来のテストは NP≥8 が必要
-- warmup は 5000 loops × 2 phase = 10000 loops。NP=2 だと ~1ms で完了するため影響は小さい
+## 試行して失敗したアプローチ
+
+1. **Adaptive poll_budget** (制御系としての実装): 上記「制御系としての実装案」参照。
+   コードは実装したが adaptive_budget.rs モジュールごと削除。batch-hold の方が単純で効果的。
+
+2. **Send-side batching**: flush_endpoints() を遅延して RDMA 送信をバッチ化。
+   +1.6% (NP=8)。応答がすぐ返るため burst 維持不可。
+
+3. **Recv coalescing** (`--coalesce-rtt-us`): ループ先頭で CQE を待つ。
+   QD=1 のパイプラインが stall (因果結合)。
+
+4. **IPC poll skip**: step_f をアイドル時スキップ。NP=2,4 で IPC starvation。
+
+5. **RTT-based hold**: 上記参照。RTT は応答バラつきの proxy として不適切。

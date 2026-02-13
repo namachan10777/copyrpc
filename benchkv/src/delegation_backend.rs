@@ -14,6 +14,24 @@ use crate::parquet_out;
 use crate::storage::ShardedStore;
 use crate::workload;
 
+fn delegation_shm_tag() -> String {
+    let raw = std::env::var("PBS_JOBID")
+        .or_else(|_| std::env::var("SLURM_JOB_ID"))
+        .or_else(|_| std::env::var("JOB_ID"))
+        .unwrap_or_else(|_| "nojid".to_string());
+    let mut tag = String::with_capacity(raw.len() + 16);
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() {
+            tag.push(c);
+        } else {
+            tag.push('_');
+        }
+    }
+    tag.push('_');
+    tag.push_str(&std::process::id().to_string());
+    tag
+}
+
 /// copyrpc user_data for delegation: identifies the delegationrpc response slot.
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -51,7 +69,8 @@ fn run_daemon_0(
     ready_barrier: &Barrier,
     qd_sample_interval: Option<u32>,
     coalesce_rtt_ns: u64,
-    batch_hold_ns: u64,
+    mut batch_hold_ns: u64,
+    adaptive_hold: bool,
 ) -> Vec<crate::qd_sample::QdSample> {
     let mut store = ShardedStore::new(key_range, num_daemons as u64, 0);
 
@@ -171,6 +190,28 @@ fn run_daemon_0(
     let mut reply_hold_buf: Vec<(u32, u32, Response)> = Vec::with_capacity(64);
     let mut reply_hold_ts: Option<fastant::Instant> = None;
     let mut batch_hold_active = batch_hold_ns > 0; // start in hold mode, switch off when healthy
+
+    // Arrival-rate feedback for adaptive batch-hold time.
+    //
+    // Problem: At NP>=7, CQE responses fragment into sub-bursts that are too small
+    // to sustain the batch pipeline (batch collapse / bistability). A fixed hold time
+    // (e.g. 10μs) helps but is suboptimal across different NP values.
+    //
+    // Algorithm: On each flush, measure the observed arrival rate:
+    //   rate = flushed_count / hold_duration   [responses/ns]
+    // Then compute the optimal hold time to collect batch_target responses:
+    //   hold_ns = batch_target / rate_ewma
+    //
+    // The rate is smoothed with EWMA (α=0.125, Jacobson TCP-style) to filter noise.
+    // hold_ns is clamped to [0.5μs, 100μs] to prevent pathological values.
+    //
+    // Self-correcting properties:
+    //   - hold too short → flushed < target → rate low → hold increases
+    //   - hold sufficient → flushed ≥ target → rate high → hold decreases
+    //   - NP=2,4 (healthy batch) → rate very high → hold ≈ 0 (auto-disabled)
+    //   - NP=8+ (collapsed) → rate low → hold auto-increases
+    let mut arrival_rate_ewma: f64 = 0.0; // responses per nanosecond
+    let mut arrival_rate_initialized = false;
 
     while !stop_flag.load(Ordering::Relaxed) {
         let loop_now = fastant::Instant::now();
@@ -398,6 +439,29 @@ fn run_daemon_0(
                 || outstanding == 0;
             if should_flush {
                 let flushed = reply_hold_buf.len();
+
+                // Arrival-rate feedback: measure rate = flushed/duration,
+                // then set hold_ns = batch_target / rate_ewma.
+                // See comment at variable declaration for full algorithm description.
+                if adaptive_hold {
+                    if let Some(ts) = reply_hold_ts {
+                        let dur_ns = ts.elapsed().as_nanos() as f64;
+                        if dur_ns > 0.0 {
+                            let rate = flushed as f64 / dur_ns;
+                            if !arrival_rate_initialized {
+                                arrival_rate_ewma = rate;
+                                arrival_rate_initialized = true;
+                            } else {
+                                arrival_rate_ewma = 0.875 * arrival_rate_ewma + 0.125 * rate;
+                            }
+                            if arrival_rate_ewma > 0.0 {
+                                let optimal = (batch_target as f64 / arrival_rate_ewma) as u64;
+                                batch_hold_ns = optimal.clamp(500, 100_000);
+                            }
+                        }
+                    }
+                }
+
                 for (cid, slot, resp) in reply_hold_buf.drain(..) {
                     deleg_server.reply(cid, slot, resp);
                 }
@@ -665,6 +729,7 @@ pub fn run_delegation(
     num_clients: usize,
     coalesce_rtt_us: f64,
     batch_hold_us: f64,
+    adaptive_hold: bool,
 ) -> Vec<parquet_out::BenchRow> {
     let queue_depth = cli.queue_depth;
 
@@ -695,8 +760,9 @@ pub fn run_delegation(
         .collect();
 
     // Create ipc servers (one per daemon, for local requests)
+    let shm_tag = delegation_shm_tag();
     let ipc_paths: Vec<String> = (0..num_daemons)
-        .map(|d| format!("/benchkv_deleg_ipc_{}_{}", rank, d))
+        .map(|d| format!("/benchkv_deleg_ipc_{}_{}_{}", shm_tag, rank, d))
         .collect();
 
     let max_clients_per_daemon = num_clients as u32;
@@ -718,7 +784,7 @@ pub fn run_delegation(
         .collect();
 
     // Create delegationrpc server (one, for Daemon#0, remote requests)
-    let deleg_path = format!("/benchkv_deleg_ring_{}", rank);
+    let deleg_path = format!("/benchkv_deleg_ring_{}_{}", shm_tag, rank);
     let deleg_ring_depth = (num_clients as u32 * queue_depth)
         .max(1024)
         .next_power_of_two();
@@ -821,6 +887,7 @@ pub fn run_delegation(
                     qd_int,
                     coalesce_rtt_ns,
                     batch_hold_ns,
+                    adaptive_hold,
                 )
             }));
         } else {

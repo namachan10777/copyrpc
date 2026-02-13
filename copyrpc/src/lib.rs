@@ -32,6 +32,7 @@ pub mod error;
 pub mod ring;
 
 use std::cell::{Cell, RefCell, UnsafeCell};
+use std::collections::VecDeque;
 use std::io;
 
 use fastmap::FastMap;
@@ -212,6 +213,8 @@ pub struct Context<U> {
     send_cqe_buffer: Rc<SendCqeBuffer>,
     /// Registered endpoints by QPN.
     endpoints: UnsafeCell<FastMap<Rc<UnsafeCell<EndpointInner<U>>>>>,
+    /// Endpoints that have pending send work.
+    dirty_endpoints: UnsafeCell<VecDeque<Rc<UnsafeCell<EndpointInner<U>>>>>,
     /// Port number (for connection establishment).
     port: u8,
     /// Local LID.
@@ -317,6 +320,7 @@ impl<U> ContextBuilder<U> {
             recv_cq,
             send_cqe_buffer,
             endpoints: UnsafeCell::new(FastMap::new()),
+            dirty_endpoints: UnsafeCell::new(VecDeque::new()),
             port: self.port,
             lid,
             recv_stack: UnsafeCell::new(Vec::new()),
@@ -326,6 +330,16 @@ impl<U> ContextBuilder<U> {
 }
 
 impl<U> Context<U> {
+    #[inline(always)]
+    fn mark_endpoint_dirty(&self, ep: &Rc<UnsafeCell<EndpointInner<U>>>) {
+        let ep_ref = unsafe { &*ep.get() };
+        if ep_ref.is_dirty.get() {
+            return;
+        }
+        ep_ref.is_dirty.set(true);
+        unsafe { &mut *self.dirty_endpoints.get() }.push_back(ep.clone());
+    }
+
     /// Create a new context builder.
     pub fn builder() -> ContextBuilder<U> {
         ContextBuilder::new()
@@ -364,6 +378,7 @@ impl<U> Context<U> {
 
         Ok(Endpoint {
             inner,
+            ctx: self as *const Context<U>,
             _marker: PhantomData,
         })
     }
@@ -500,10 +515,22 @@ impl<U> Context<U> {
             entries.clear();
         }
 
-        // Flush all endpoints (post pending WQEs + ring doorbells)
-        for (_, ep) in unsafe { &*self.endpoints.get() }.iter() {
+        // Flush dirty endpoints only.
+        loop {
+            let ep = unsafe { &mut *self.dirty_endpoints.get() }.pop_front();
+            let Some(ep) = ep else {
+                break;
+            };
             let ep_ref = unsafe { &*ep.get() };
-            let _ = ep_ref.flush();
+            if ep_ref.flush().is_err() {
+                ep_ref.is_dirty.set(false);
+                continue;
+            }
+            if ep_ref.has_pending_send() {
+                unsafe { &mut *self.dirty_endpoints.get() }.push_back(ep);
+            } else {
+                ep_ref.is_dirty.set(false);
+            }
         }
     }
 
@@ -577,6 +604,7 @@ impl<U> Context<U> {
             let data_ptr = unsafe { data_ptr.add(msg.data_offset) };
             RecvHandle {
                 _lifetime: PhantomData,
+                ctx: self,
                 endpoint: msg.endpoint,
                 qpn: msg.qpn,
                 call_id: msg.call_id,
@@ -754,6 +782,8 @@ struct EndpointInner<U> {
     raw_rdma_done: Rc<Cell<u32>>,
     /// Whether any WQE has been posted since the last doorbell ring.
     needs_doorbell: Cell<bool>,
+    /// Whether this endpoint is currently in Context's dirty queue.
+    is_dirty: Cell<bool>,
 }
 
 impl<U> EndpointInner<U> {
@@ -838,6 +868,7 @@ impl<U> EndpointInner<U> {
             raw_rdma_posted: Cell::new(0),
             raw_rdma_done,
             needs_doorbell: Cell::new(false),
+            is_dirty: Cell::new(false),
         }));
 
         // SRQ recv buffers are pre-posted in Context::build() and replenished in poll()
@@ -994,6 +1025,11 @@ impl<U> EndpointInner<U> {
         Ok(())
     }
 
+    #[inline(always)]
+    fn has_pending_send(&self) -> bool {
+        self.batch_message_count.get() > 0 || self.needs_doorbell.get()
+    }
+
     /// Prepare the next batch: reserve metadata space and reset batch state.
     /// Called after emit_wqe/emit_wrap and during connect().
     #[inline(always)]
@@ -1143,6 +1179,7 @@ pub struct LocalEndpointInfo {
 /// An RPC endpoint representing a connection to a remote peer.
 pub struct Endpoint<U> {
     inner: Rc<UnsafeCell<EndpointInner<U>>>,
+    ctx: *const Context<U>,
     _marker: PhantomData<U>,
 }
 
@@ -1400,6 +1437,7 @@ impl<U> Endpoint<U> {
         inner
             .batch_message_count
             .set(inner.batch_message_count.get() + 1);
+        unsafe { &*self.ctx }.mark_endpoint_dirty(&self.inner);
 
         // Deduct credit
         inner
@@ -1413,6 +1451,7 @@ impl<U> Endpoint<U> {
 /// Handle to a received RPC request.
 pub struct RecvHandle<'a, U> {
     _lifetime: PhantomData<&'a Context<U>>,
+    ctx: &'a Context<U>,
     endpoint: Rc<UnsafeCell<EndpointInner<U>>>,
     qpn: u32,
     call_id: u32,
@@ -1482,6 +1521,7 @@ impl<U> RecvHandle<'_, U> {
         inner
             .batch_message_count
             .set(inner.batch_message_count.get() + 1);
+        self.ctx.mark_endpoint_dirty(&self.endpoint);
 
         Ok(())
     }

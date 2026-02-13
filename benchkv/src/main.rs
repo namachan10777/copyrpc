@@ -114,9 +114,12 @@ enum SubCmd {
         /// Recv coalescing RTT estimate [us] (0 = disabled)
         #[arg(long, default_value = "0.0")]
         coalesce_rtt_us: f64,
-        /// Reply batch hold time [us] (0 = disabled, adaptive batching)
+        /// Reply batch hold time [us] (0 = disabled, initial value for adaptive)
         #[arg(long, default_value = "10.0")]
         batch_hold_us: f64,
+        /// Enable arrival-rate feedback to dynamically adjust hold time
+        #[arg(long, default_value = "true")]
+        adaptive_hold: bool,
     },
 }
 
@@ -166,6 +169,7 @@ fn main() {
         SubCmd::Delegation {
             coalesce_rtt_us,
             batch_hold_us,
+            adaptive_hold,
         } => delegation_backend::run_delegation(
             &cli,
             &world,
@@ -175,6 +179,7 @@ fn main() {
             num_clients,
             *coalesce_rtt_us,
             *batch_hold_us,
+            *adaptive_hold,
         ),
     };
 
