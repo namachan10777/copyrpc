@@ -80,16 +80,13 @@ HPCで広く用いられるInfinibandネットワークでは，
 とりわけメモリ消費増大は，HPCノードでOOM killerによる強制終了を誘発し，計算用メモリを直接圧迫するため深刻である．
 この課題に対し，POSIX共有メモリを用いたノード内通信によってコネクションを集約し，従来のHPC向けRPCより少ないリソースでノード間通信を実現するアーキテクチャを提案する．
 さらに，提案アーキテクチャによって検証用Key-Valueストアを実装して，設計の有効性を検証する．
-本稿の貢献は以下の通りである．
-
-\begin{enumerate}
-	\item 共有メモリを用いた通信集約アーキテクチャ
-	\item 共有メモリ上に集約されたリクエスト転送を目的としたRPCの設計とフローコントロール
-	\item リクエスト代行におけるバッチング崩壊問題と，その対処のための制御アルゴリズム
-	\item ベンチマーク用Key-Value Storeによる性能比較
-\end{enumerate}
+本稿の構成は以下の通りである．
+まず，背景節（\ref{sec:background}）でad-hocファイルシステムとRDMA通信における課題を整理する．
+次に，関連研究節（\ref{sec:related-work}）を述べ，設計節（\ref{sec:design}）で提案アーキテクチャと通信プロトコルを示す．
+実験節（\ref{sec:evaluation}）でbenchkvによる評価結果を示し，おわりに（\ref{sec:conclusion}）で結論と今後の課題を述べる．
 
 \section{背景}
+\label{sec:background}
 
 \subsection{並列ファイルシステムの発展とad-hocファイルシステム}
 
@@ -172,6 +169,7 @@ DC（Dynamically Connected）は，通信時に接続先を動的に切り替え
 \end{table}
 
 \section{関連研究}
+\label{sec:related-work}
 
 \subsection{FaRM，eRPC，ScaleRPC}
 
@@ -234,6 +232,7 @@ RPCを管理対象のシステムサービスとして提供するアーキテ�
 接続状態とメモリ消費を抑えて大規模実行時の通信スケーラビリティを確保することを主目的とする．
 
 \section{設計}
+\label{sec:design}
 
 \subsection{アーキテクチャ}
 
@@ -442,6 +441,7 @@ T_{\mathrm{hold}} \leftarrow \frac{B_{\mathrm{target}}}{\hat{\lambda}}
 本制御が必要となる現象の説明と有効性の評価は，実験結果（\ref{fig:benchkv-batch-hold}）で述べる．
 
 \section{実験}
+\label{sec:evaluation}
 
 \subsection{実験環境}
 
@@ -522,6 +522,7 @@ no batch holdに対してbatch hold（10$\mu$s）は，2ノードで13.97から1
 小バッチ状態への遷移を防ぐバッチング制御を導入する必要がある．
 
 \section{おわりに}
+\label{sec:conclusion}
 
 本稿では，Fat-node環境を対象として，ノード内共有メモリによる要求委譲と
 デーモンへのノード外通信集約を組み合わせたRPC基盤を設計・実装した．
