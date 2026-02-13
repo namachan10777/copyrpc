@@ -36,7 +36,7 @@
 提案方式は，クライアントごとに接続を持つ構成に比べて接続管理状態を削減できるため，通信資源使用効率の改善可能性を示す．
 一方で，単純な中継構成では中規模条件でバッチング崩壊が発生し，性能劣化が大きいことも確認した．
 この課題に対して，低Queue Depth時の到着率に応じて保持時間を動的調整するAdaptive Batch Hold制御を導入した．
-benchkv評価では，提案方式は2ノードおよび4ノードでUCXおよびdirect connectionを上回る一方，32ノードでは両方式を下回った．ただし同条件でAdaptive Batch Holdはno batch hold比で最大1.44倍の改善を示した．
+ベンチマーク用Key-Value Store実装での評価では，提案方式は2ノードおよび4ノードでUCXおよびdirect connectionを上回る一方，32ノードでは両方式を下回った．ただし同条件でAdaptive Batch Holdはno batch hold比で最大1.44倍の改善を示した．
 \end{abstract}
 
 \maketitle
@@ -446,8 +446,8 @@ RPCを管理対象のシステムサービスとして提供するアーキテ�
 
 \subsection{実験手法}
 
-提案手法の効果は，通信ライブラリ単体ではなく，ベンチマーク用Key-Value Storeであるbenchkvを用いたend-to-end測定で評価する．
-benchkvは，keyをrank idとユーザキーの組で管理する単純なKVSであり，アプリケーションロジックの複雑さを抑えて通信層の影響を観測することを目的とする．
+提案手法の効果は，通信ライブラリ単体ではなく，ベンチマーク用Key-Value Store実装を用いたend-to-end測定で評価する．
+ベンチマーク用Key-Value Store実装は，keyをrank idとユーザキーの組で管理する単純なKVSであり，アプリケーションロジックの複雑さを抑えて通信層の影響を観測することを目的とする．
 クライアント要求は設計節で述べた共有メモリ経由でデーモンに委譲され，デーモンがRDMA通信を実行する．
 
 アクセスパターンはYCSB-likeなread/write混合負荷として定義する．
@@ -479,12 +479,12 @@ direct connectionは，提案方式と同じRPC実装を使いながら，ノー
 
 \begin{figure}[t]
 	\centering
-	\includegraphics[width=0.95\linewidth]{figures/benchkv_throughput.pdf}
-	\caption{benchkvにおけるノード数に対する総スループット（MIOPS）}
-	\label{fig:benchkv-throughput}
+	\includegraphics[width=0.95\linewidth]{figures/kvs_benchmark_throughput.pdf}
+	\caption{ベンチマーク用Key-Value Store実装におけるノード数に対する総スループット（MIOPS）}
+	\label{fig:kvs-benchmark-throughput}
 \end{figure}
 
-図\ref{fig:benchkv-throughput}に，benchkvの総スループットを示す．
+図\ref{fig:kvs-benchmark-throughput}に，ベンチマーク用Key-Value Store実装の総スループットを示す．
 ノード数2および4では，提案方式（proxied connection）がそれぞれ14.9 MIOPS，21.1 MIOPSとなり，
 direct connection（2.83，7.37 MIOPS）およびUCX（3.38，6.73 MIOPS）を上回った．
 
@@ -503,15 +503,15 @@ direct connection（2.83，7.37 MIOPS）およびUCX（3.38，6.73 MIOPS）を�
 
 \begin{figure}[t]
 	\centering
-	\includegraphics[width=0.95\linewidth]{figures/benchkv_batch_hold.pdf}
-	\caption{Adaptive Batch Hold有無の比較（benchkv総スループット）}
-	\label{fig:benchkv-batch-hold}
+	\includegraphics[width=0.95\linewidth]{figures/kvs_benchmark_batch_hold.pdf}
+	\caption{Adaptive Batch Hold有無の比較（ベンチマーク用Key-Value Store実装の総スループット）}
+	\label{fig:kvs-benchmark-batch-hold}
 \end{figure}
 
 \begin{table}[t]
 	\centering
 	\caption{Adaptive Batch Hold有無の比較（MIOPS）}
-	\label{tab:benchkv-batch-hold}
+	\label{tab:kvs-benchmark-batch-hold}
 	\begin{tabular}{c|c|c|c}
 		\hline
 		ノード数 & no batch hold & batch hold（10$\mu$s） & 改善率 \\
@@ -525,7 +525,7 @@ direct connection（2.83，7.37 MIOPS）およびUCX（3.38，6.73 MIOPS）を�
 	\end{tabular}
 \end{table}
 
-図\ref{fig:benchkv-batch-hold}および表\ref{tab:benchkv-batch-hold}に，提案方式におけるAdaptive Batch Holdの有無を比較した結果を示す．
+図\ref{fig:kvs-benchmark-batch-hold}および表\ref{tab:kvs-benchmark-batch-hold}に，提案方式におけるAdaptive Batch Holdの有無を比較した結果を示す．
 no batch holdに対してbatch holdは，2ノードで13.97から14.86 MIOPS（1.06倍），
 8ノードで8.26から11.18 MIOPS（1.35倍），16ノードで14.86から19.63 MIOPS（1.32倍），
 32ノードで27.25から39.24 MIOPS（1.44倍）へ改善した．
