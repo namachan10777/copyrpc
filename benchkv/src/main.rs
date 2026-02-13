@@ -456,11 +456,11 @@ fn run_meta(
     stop_flag.store(true, Ordering::Release);
 
     for (d, h) in daemon_handles.into_iter().enumerate() {
-        let samples = h.join().expect("Daemon thread panicked");
+        let daemon_samples = h.join().expect("Daemon thread panicked");
         if let Some(ref dir) = cli.qd_sample_dir {
             std::fs::create_dir_all(dir).ok();
             let path = format!("{}/qd_rank{}_d{}.csv", dir, rank, d);
-            if let Err(e) = qd_sample::write_csv(&path, &samples) {
+            if let Err(e) = qd_sample::write_csv(&path, &daemon_samples.qd_samples) {
                 eprintln!(
                     "  rank {} daemon {}: failed to write QD samples: {}",
                     rank, d, e
@@ -470,8 +470,24 @@ fn run_meta(
                     "  rank {} daemon {}: {} QD samples -> {}",
                     rank,
                     d,
-                    samples.len(),
+                    daemon_samples.qd_samples.len(),
                     path
+                );
+            }
+
+            let loop_path = format!("{}/loop_rank{}_d{}.csv", dir, rank, d);
+            if let Err(e) = qd_sample::write_loop_csv(&loop_path, &daemon_samples.loop_samples) {
+                eprintln!(
+                    "  rank {} daemon {}: failed to write loop samples: {}",
+                    rank, d, e
+                );
+            } else {
+                eprintln!(
+                    "  rank {} daemon {}: {} loop samples -> {}",
+                    rank,
+                    d,
+                    daemon_samples.loop_samples.len(),
+                    loop_path
                 );
             }
         }

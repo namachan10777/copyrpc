@@ -88,9 +88,7 @@ pub fn get_available_cores(device_index: usize) -> Vec<usize> {
     all_cores.sort_unstable();
     all_cores.dedup();
 
-    let preferred_cores = preferred_node
-        .and_then(read_node_cores)
-        .unwrap_or_default();
+    let preferred_cores = preferred_node.and_then(read_node_cores).unwrap_or_default();
     let preferred_set: std::collections::HashSet<usize> = preferred_cores.into_iter().collect();
 
     let mut ordered = Vec::with_capacity(all_cores.len());

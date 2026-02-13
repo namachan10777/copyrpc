@@ -1,11 +1,12 @@
 use std::collections::VecDeque;
 use std::ptr;
 use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 use fastmap::FastMap;
 
 use crate::message::*;
-use crate::qd_sample::{QdCollector, QdSample};
+use crate::qd_sample::{LoopSample, QdCollector, QdSample};
 use crate::storage::ShardedStore;
 
 // === Type aliases ===
@@ -202,6 +203,11 @@ pub struct CopyrpcSetup {
 
 // === Main daemon entry point ===
 
+pub struct DaemonSamples {
+    pub qd_samples: Vec<QdSample>,
+    pub loop_samples: Vec<LoopSample>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_daemon(
     daemon_id: usize,
@@ -215,7 +221,9 @@ pub fn run_daemon(
     stop_flag: &AtomicBool,
     ready_barrier: &std::sync::Barrier,
     qd_sample_interval: Option<u32>,
-) -> Vec<QdSample> {
+) -> DaemonSamples {
+    const LOOP_SAMPLE_EVERY: u32 = 1024;
+
     let mut store = ShardedStore::new(key_range, num_daemons as u64, daemon_id as u64);
     let server = server;
 
@@ -331,8 +339,18 @@ pub fn run_daemon(
 
     // QD sampling
     let mut qd_collector = qd_sample_interval.map(|iv| QdCollector::new(iv, 500_000));
+    let mut loop_sample_countdown = LOOP_SAMPLE_EVERY;
+    let loop_sample_start = Instant::now();
+    let mut sampled_cqe_recv = 0u32;
+    let mut sampled_req_write = 0u32;
+    let mut sampled_res_write = 0u32;
+    let mut loop_samples: Vec<LoopSample> = Vec::with_capacity(500_000);
 
     while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut loop_cqe_recv = 0u32;
+        let mut loop_req_write = 0u32;
+        let mut loop_res_write = 0u32;
+
         // Discover newly connected clients and add their fixed slots to preparing.
         if connected_count < max_clients {
             for cid in 0..max_clients {
@@ -358,22 +376,24 @@ pub fn run_daemon(
 
         // Phase 1: process copyrpc completions and incoming remote requests.
         if let Some(ctx) = ctx_ref {
-            ctx.poll_recv(|slot_idx: usize, data: &[u8]| {
-                if slot_idx >= max_clients || !connected[slot_idx] {
-                    return;
-                }
-                let resp = RemoteResponse::from_bytes(data).response;
-                unsafe { slot_complete(slot_ptrs[slot_idx], resp) };
+            loop_cqe_recv = loop_cqe_recv.saturating_add(ctx.poll_recv_counted(
+                |slot_idx: usize, data: &[u8]| {
+                    if slot_idx >= max_clients || !connected[slot_idx] {
+                        return;
+                    }
+                    let resp = RemoteResponse::from_bytes(data).response;
+                    unsafe { slot_complete(slot_ptrs[slot_idx], resp) };
 
-                if inflight[slot_idx] {
-                    inflight[slot_idx] = false;
-                }
-                if !in_preparing[slot_idx] {
-                    in_preparing[slot_idx] = true;
-                    preparing_queue.push_back(slot_idx);
-                }
-                copyrpc_inflight_count = copyrpc_inflight_count.saturating_sub(1);
-            });
+                    if inflight[slot_idx] {
+                        inflight[slot_idx] = false;
+                    }
+                    if !in_preparing[slot_idx] {
+                        in_preparing[slot_idx] = true;
+                        preparing_queue.push_back(slot_idx);
+                    }
+                    copyrpc_inflight_count = copyrpc_inflight_count.saturating_sub(1);
+                },
+            ));
 
             while let Some(recv_handle) = ctx.recv() {
                 let req = RemoteRequest::from_bytes(recv_handle.data()).request;
@@ -384,7 +404,10 @@ pub fn run_daemon(
                     let remote_resp = RemoteResponse { response: resp };
                     loop {
                         match recv_handle.reply(remote_resp.as_bytes()) {
-                            Ok(()) => break,
+                            Ok(()) => {
+                                loop_res_write = loop_res_write.saturating_add(1);
+                                break;
+                            }
                             Err(copyrpc::error::Error::RingFull) => {
                                 ctx.flush_endpoints();
                             }
@@ -456,6 +479,7 @@ pub fn run_daemon(
                 Ok(_) => {
                     inflight[slot_idx] = true;
                     copyrpc_inflight_count += 1;
+                    loop_req_write = loop_req_write.saturating_add(1);
                 }
                 Err(copyrpc::error::CallError::RingFull(_))
                 | Err(copyrpc::error::CallError::InsufficientCredit(_)) => {
@@ -497,6 +521,7 @@ pub fn run_daemon(
                     match recv_handle.reply(remote_resp.as_bytes()) {
                         Ok(()) => {
                             done = true;
+                            loop_res_write = loop_res_write.saturating_add(1);
                             break;
                         }
                         Err(copyrpc::error::Error::RingFull) => {
@@ -542,7 +567,30 @@ pub fn run_daemon(
                 preparing_queue.len() as u32,
             );
         }
+
+        sampled_cqe_recv = sampled_cqe_recv.saturating_add(loop_cqe_recv);
+        sampled_req_write = sampled_req_write.saturating_add(loop_req_write);
+        sampled_res_write = sampled_res_write.saturating_add(loop_res_write);
+        loop_sample_countdown -= 1;
+        if loop_sample_countdown == 0 {
+            let req_res_write_total = sampled_req_write.saturating_add(sampled_res_write);
+            loop_samples.push(LoopSample {
+                elapsed_us: loop_sample_start.elapsed().as_micros() as u64,
+                loops: LOOP_SAMPLE_EVERY,
+                cqe_recv: sampled_cqe_recv,
+                req_write: sampled_req_write,
+                res_write: sampled_res_write,
+                req_res_write_total,
+            });
+            sampled_cqe_recv = 0;
+            sampled_req_write = 0;
+            sampled_res_write = 0;
+            loop_sample_countdown = LOOP_SAMPLE_EVERY;
+        }
     }
 
-    qd_collector.map_or_else(Vec::new, |c| c.into_samples())
+    DaemonSamples {
+        qd_samples: qd_collector.map_or_else(Vec::new, |c| c.into_samples()),
+        loop_samples,
+    }
 }

@@ -9,8 +9,7 @@ use fastmap::FastMap;
 use slab::Slab;
 
 use crate::encoding::{
-    HEADER_SIZE, WRAP_MESSAGE_COUNT, decode_header, encode_header, from_response_id, is_response,
-    padded_message_size, to_response_id,
+    ALIGNMENT, WRAP_MESSAGE_COUNT, from_response_id, is_response, to_response_id,
 };
 use crate::error::{self, Error, Result};
 
@@ -25,6 +24,30 @@ use mlx5::wqe::emit::DcAvIb;
 
 /// Batch metadata size in bytes.
 pub const BATCH_HEADER_SIZE: usize = 32;
+
+/// DC-specific message header size (call_id + payload_len, no piggyback).
+const DC_HEADER_SIZE: usize = 8;
+
+#[inline(always)]
+fn dc_padded_message_size(payload_len: u32) -> u64 {
+    let total = DC_HEADER_SIZE as u64 + payload_len as u64;
+    (total + ALIGNMENT - 1) & !(ALIGNMENT - 1)
+}
+
+#[inline(always)]
+unsafe fn dc_encode_header(buf: *mut u8, call_id: u32, payload_len: u32) {
+    let ptr = buf as *mut u32;
+    std::ptr::write(ptr, call_id.to_le());
+    std::ptr::write(ptr.add(1), payload_len.to_le());
+}
+
+#[inline(always)]
+unsafe fn dc_decode_header(buf: *const u8) -> (u32, u32) {
+    let ptr = buf as *const u32;
+    let call_id = u32::from_le(std::ptr::read(ptr));
+    let payload_len = u32::from_le(std::ptr::read(ptr.add(1)));
+    (call_id, payload_len)
+}
 
 /// Default ring buffer size (1 MB).
 pub const DEFAULT_RING_SIZE: usize = 1 << 20;
@@ -97,7 +120,7 @@ type SqCqCallback = Box<dyn Fn(Cqe, u32)>;
 type DciQp = DciWithTable<u32, SqCqCallback>;
 
 struct RecvMessage<U> {
-    endpoint: Rc<UnsafeCell<EndpointInner<U>>>,
+    endpoint: *const UnsafeCell<EndpointInner<U>>,
     endpoint_id: u32,
     call_id: u32,
     data_offset: usize,
@@ -179,7 +202,7 @@ pub struct Context<U> {
     recv_cq: Rc<Cq>,
     dci: Rc<RefCell<DciQp>>,
     dct: Dct<SrqEntry>,
-    endpoints: UnsafeCell<FastMap<Rc<UnsafeCell<EndpointInner<U>>>>>,
+    endpoints: UnsafeCell<FastMap<Box<UnsafeCell<EndpointInner<U>>>>>,
     dirty_endpoints: UnsafeCell<DirtyEndpointList>,
     pending_send_cqes: Cell<u32>,
     recv_stack: UnsafeCell<Vec<RecvMessage<U>>>,
@@ -321,9 +344,7 @@ impl<U> ContextBuilder<U> {
 
 impl<U> Context<U> {
     #[inline(always)]
-    fn mark_endpoint_dirty(&self, ep: &Rc<UnsafeCell<EndpointInner<U>>>) {
-        let ep_ref = unsafe { &*ep.get() };
-        let endpoint_id = ep_ref.endpoint_id;
+    fn mark_endpoint_dirty(&self, endpoint_id: u32) {
         unsafe { &mut *self.dirty_endpoints.get() }.push_back(endpoint_id);
     }
 
@@ -348,16 +369,17 @@ impl<U> Context<U> {
         self.next_endpoint_id.set(endpoint_id + 1);
 
         let inner = EndpointInner::new(&self.pd, config, endpoint_id)?;
-        unsafe { &mut *self.endpoints.get() }.insert(endpoint_id, inner.clone());
+        let inner_ptr: *const UnsafeCell<EndpointInner<U>> = &*inner;
+        unsafe { &mut *self.endpoints.get() }.insert(endpoint_id, inner);
 
         Ok(Endpoint {
-            inner,
+            inner: inner_ptr,
             ctx: self as *const Context<U>,
             _marker: PhantomData,
         })
     }
 
-    pub fn poll_recv(&self, mut on_response: impl FnMut(U, &[u8])) {
+    pub fn poll_recv_counted(&self, mut on_response: impl FnMut(U, &[u8])) -> u32 {
         let mut recv_count = 0u32;
         let endpoints = &self.endpoints;
         let recv_stack = &self.recv_stack;
@@ -397,6 +419,11 @@ impl<U> Context<U> {
                 self.srq_posted.set(self.srq_max_wr);
             }
         }
+        recv_count
+    }
+
+    pub fn poll_recv(&self, on_response: impl FnMut(U, &[u8])) {
+        let _ = self.poll_recv_counted(on_response);
     }
 
     pub fn poll(&self, on_response: impl FnMut(U, &[u8])) {
@@ -439,14 +466,14 @@ impl<U> Context<U> {
                 let Some(endpoint_id) = endpoint_id else {
                     break;
                 };
-                let ep = {
+                let ep_ptr = {
                     let endpoints = unsafe { &*self.endpoints.get() };
-                    endpoints.get(endpoint_id).cloned()
+                    match endpoints.get(endpoint_id) {
+                        Some(ep) => ep.get(),
+                        None => continue,
+                    }
                 };
-                let Some(ep) = ep else {
-                    continue;
-                };
-                let ep_ref = unsafe { &*ep.get() };
+                let ep_ref = unsafe { &*ep_ptr };
                 match ep_ref.emit_pending(&mut dci) {
                     Ok(was_emitted) => {
                         emitted |= was_emitted;
@@ -481,7 +508,7 @@ impl<U> Context<U> {
 
     pub fn recv(&self) -> Option<RecvHandle<'_, U>> {
         unsafe { &mut *self.recv_stack.get() }.pop().map(|msg| {
-            let data_ptr = unsafe { &*msg.endpoint.get() }.recv_ring.as_ptr();
+            let data_ptr = unsafe { &*(*msg.endpoint).get() }.recv_ring.as_ptr();
             let data_ptr = unsafe { data_ptr.add(msg.data_offset) };
             RecvHandle {
                 _lifetime: PhantomData,
@@ -498,19 +525,19 @@ impl<U> Context<U> {
     #[inline(always)]
     fn process_cqe_static(
         endpoint_id: u32,
-        endpoints: &UnsafeCell<FastMap<Rc<UnsafeCell<EndpointInner<U>>>>>,
+        endpoints: &UnsafeCell<FastMap<Box<UnsafeCell<EndpointInner<U>>>>>,
         on_response: &mut impl FnMut(U, &[u8]),
         recv_stack: &UnsafeCell<Vec<RecvMessage<U>>>,
     ) {
         let endpoints = unsafe { &*endpoints.get() };
         let endpoint = match endpoints.get(endpoint_id) {
-            Some(ep) => ep,
+            Some(ep) => &**ep as *const UnsafeCell<EndpointInner<U>>,
             None => return,
         };
 
         let (delta, ring_credit_return, message_count);
         {
-            let ep = unsafe { &*endpoint.get() };
+            let ep = unsafe { &*(*endpoint).get() };
             let pos = ep.last_recv_pos.get();
             let recv_ring_mask = ep.recv_ring.len() as u64 - 1;
             let meta_offset = (pos & recv_ring_mask) as usize;
@@ -528,7 +555,7 @@ impl<U> Context<U> {
         }
 
         if message_count == WRAP_MESSAGE_COUNT {
-            let ep = unsafe { &*endpoint.get() };
+            let ep = unsafe { &*(*endpoint).get() };
             let pos = ep.last_recv_pos.get();
             let recv_ring_len = ep.recv_ring.len() as u64;
             let offset = pos & (recv_ring_len - 1);
@@ -538,15 +565,15 @@ impl<U> Context<U> {
         }
 
         for _ in 0..message_count {
-            let ep = unsafe { &*endpoint.get() };
+            let ep = unsafe { &*(*endpoint).get() };
             let pos = ep.last_recv_pos.get();
             let recv_ring_mask = ep.recv_ring.len() as u64 - 1;
             let header_offset = (pos & recv_ring_mask) as usize;
 
-            let (call_id, _piggyback, payload_len) =
-                unsafe { decode_header(ep.recv_ring[header_offset..].as_ptr()) };
+            let (call_id, payload_len) =
+                unsafe { dc_decode_header(ep.recv_ring[header_offset..].as_ptr()) };
 
-            let msg_size = padded_message_size(payload_len);
+            let msg_size = dc_padded_message_size(payload_len);
             ep.last_recv_pos.set(pos + msg_size);
 
             if is_response(call_id) {
@@ -555,16 +582,16 @@ impl<U> Context<U> {
                     unsafe { &mut *ep.pending_calls.get() }.try_remove(original_call_id as usize);
 
                 if let Some(user_data) = user_data {
-                    let data_offset = header_offset + HEADER_SIZE;
+                    let data_offset = header_offset + DC_HEADER_SIZE;
                     let data_slice = &ep.recv_ring[data_offset..data_offset + payload_len as usize];
                     on_response(user_data, data_slice);
                 }
             } else {
                 unsafe { &mut *recv_stack.get() }.push(RecvMessage {
-                    endpoint: endpoint.clone(),
+                    endpoint,
                     endpoint_id,
                     call_id,
-                    data_offset: header_offset + HEADER_SIZE,
+                    data_offset: header_offset + DC_HEADER_SIZE,
                     data_len: payload_len as usize,
                 });
             }
@@ -596,7 +623,11 @@ struct EndpointInner<U> {
 }
 
 impl<U> EndpointInner<U> {
-    fn new(pd: &Pd, config: &EndpointConfig, endpoint_id: u32) -> io::Result<Rc<UnsafeCell<Self>>> {
+    fn new(
+        pd: &Pd,
+        config: &EndpointConfig,
+        endpoint_id: u32,
+    ) -> io::Result<Box<UnsafeCell<Self>>> {
         let send_ring_size = config.send_ring_size.next_power_of_two();
         let recv_ring_size = config.recv_ring_size.next_power_of_two();
 
@@ -610,7 +641,7 @@ impl<U> EndpointInner<U> {
         let recv_ring_mr =
             unsafe { pd.register(recv_ring.as_mut_ptr(), recv_ring.len(), recv_access_flags)? };
 
-        let inner = Rc::new(UnsafeCell::new(Self {
+        let inner = Box::new(UnsafeCell::new(Self {
             endpoint_id,
             send_ring,
             send_ring_mr,
@@ -666,23 +697,9 @@ impl<U> EndpointInner<U> {
             .set(producer + BATCH_HEADER_SIZE as u64);
     }
 
+    /// Emit the current batch: batch header as inline DS, messages via SGE.
     #[inline(always)]
-    fn fill_metadata_with(&self, message_count: u32) {
-        let meta_pos = self.meta_pos.get();
-        let ring_size = self.send_ring.len() as u64;
-        let meta_offset = (meta_pos & (ring_size - 1)) as usize;
-
-        let ring_credit_return = self.last_recv_pos.get() - self.last_notified_recv_pos.get();
-        self.last_notified_recv_pos.set(self.last_recv_pos.get());
-
-        unsafe {
-            let buf_ptr = self.send_ring.as_ptr().add(meta_offset) as *mut u8;
-            encode_batch_header(buf_ptr, 0, ring_credit_return, message_count);
-        }
-    }
-
-    #[inline(always)]
-    fn emit_raw(&self, dci: &mut DciQp) -> Result<bool> {
+    fn emit_batch(&self, dci: &mut DciQp, message_count: u32) -> Result<()> {
         let remote_ring = self
             .remote_recv_ring
             .get()
@@ -691,30 +708,32 @@ impl<U> EndpointInner<U> {
 
         let start = self.flush_start_pos.get();
         let end = self.send_ring_producer.get();
-        if start == end {
-            return Ok(false);
-        }
-
         let delta = end - start;
-        let start_offset = (start & (self.send_ring.len() as u64 - 1)) as usize;
 
+        // Build batch header on stack (never written to send ring).
+        let ring_credit_return = self.last_recv_pos.get() - self.last_notified_recv_pos.get();
+        self.last_notified_recv_pos.set(self.last_recv_pos.get());
+        let mut batch_header_buf = [0u8; BATCH_HEADER_SIZE];
         unsafe {
-            patch_batch_delta(self.send_ring[start_offset..].as_ptr() as *mut u8, delta);
+            encode_batch_header(
+                batch_header_buf.as_mut_ptr(),
+                delta,
+                ring_credit_return,
+                message_count,
+            );
         }
+
+        // SGE covers messages only (skip the 32B reserved header space in send ring).
+        let ring_mask = self.send_ring.len() as u64 - 1;
+        let start_offset = (start & ring_mask) as usize;
+        let msg_start_offset = start_offset + BATCH_HEADER_SIZE;
+        let msg_len = (delta - BATCH_HEADER_SIZE as u64) as u32;
 
         let remote_offset = start & (remote_ring.size - 1);
         let remote_addr = remote_ring.addr + remote_offset;
         let imm = self.remote_endpoint_id.get();
+        let local_addr = self.send_ring_mr.addr() as u64 + msg_start_offset as u64;
 
-        let delta_u32 = match u32::try_from(delta) {
-            Ok(v) => v,
-            Err(_) => return Err(Error::RingFull),
-        };
-        if delta_u32 == 0 {
-            return Err(Error::RingFull);
-        }
-
-        let local_addr = self.send_ring_mr.addr() as u64 + start_offset as u64;
         let emit_ctx = dci.emit_ctx().map_err(Error::Io)?;
         let av = DcAvIb::new(remote_dct.dc_key, remote_dct.dctn, remote_dct.dlid);
         let next_count = self.unsignaled_count.get().wrapping_add(1);
@@ -727,7 +746,8 @@ impl<U> EndpointInner<U> {
                     flags: WqeFlags::empty(),
                     remote_addr: remote_addr,
                     rkey: remote_ring.rkey,
-                    sge: { addr: local_addr, len: delta_u32, lkey: self.send_ring_mr.lkey() },
+                    inline: batch_header_buf.as_slice(),
+                    sge: { addr: local_addr, len: msg_len, lkey: self.send_ring_mr.lkey() },
                     imm: imm,
                     signaled: self.endpoint_id,
                 }
@@ -747,7 +767,8 @@ impl<U> EndpointInner<U> {
                     flags: WqeFlags::empty(),
                     remote_addr: remote_addr,
                     rkey: remote_ring.rkey,
-                    sge: { addr: local_addr, len: delta_u32, lkey: self.send_ring_mr.lkey() },
+                    inline: batch_header_buf.as_slice(),
+                    sge: { addr: local_addr, len: msg_len, lkey: self.send_ring_mr.lkey() },
                     imm: imm,
                 }
             )
@@ -759,7 +780,7 @@ impl<U> EndpointInner<U> {
         }
 
         self.flush_start_pos.set(end);
-        Ok(true)
+        Ok(())
     }
 
     #[inline(always)]
@@ -772,7 +793,7 @@ impl<U> EndpointInner<U> {
     #[inline(always)]
     fn emit_wrap(&self, dci: &mut DciQp) -> Result<()> {
         let meta_pos = self.meta_pos.get();
-        self.send_ring_producer.set(meta_pos);
+        self.send_ring_producer.set(meta_pos); // reclaim reserved header space
 
         let ring_size = self.send_ring.len() as u64;
         let offset = (meta_pos & (ring_size - 1)) as usize;
@@ -780,10 +801,9 @@ impl<U> EndpointInner<U> {
 
         debug_assert!(remaining >= BATCH_HEADER_SIZE);
 
-        self.fill_metadata_with(WRAP_MESSAGE_COUNT);
         self.send_ring_producer.set(meta_pos + remaining as u64);
 
-        self.emit_raw(dci)?;
+        self.emit_batch(dci, WRAP_MESSAGE_COUNT)?;
         self.prepare_next_batch();
         Ok(())
     }
@@ -793,8 +813,7 @@ impl<U> EndpointInner<U> {
         let mut emitted = false;
 
         if self.batch_message_count.get() > 0 {
-            self.fill_metadata_with(self.batch_message_count.get());
-            self.emit_raw(dci)?;
+            self.emit_batch(dci, self.batch_message_count.get())?;
             self.prepare_next_batch();
             emitted = true;
         }
@@ -810,19 +829,19 @@ impl<U> EndpointInner<U> {
 }
 
 pub struct Endpoint<U> {
-    inner: Rc<UnsafeCell<EndpointInner<U>>>,
+    inner: *const UnsafeCell<EndpointInner<U>>,
     ctx: *const Context<U>,
     _marker: PhantomData<U>,
 }
 
 impl<U> Endpoint<U> {
     pub fn endpoint_id(&self) -> u32 {
-        unsafe { &*self.inner.get() }.endpoint_id
+        unsafe { &*(*self.inner).get() }.endpoint_id
     }
 
     pub fn local_info(&self, ctx_lid: u16, _ctx_port: u8) -> (LocalEndpointInfo, u16, u8) {
         let ctx = unsafe { &*self.ctx };
-        let info = unsafe { &*self.inner.get() }.local_info(&ctx.dct, ctx_lid);
+        let info = unsafe { &*(*self.inner).get() }.local_info(&ctx.dct, ctx_lid);
         (info, ctx_lid, ctx.port)
     }
 
@@ -832,7 +851,7 @@ impl<U> Endpoint<U> {
         _local_psn: u32,
         _port: u8,
     ) -> io::Result<()> {
-        let inner = unsafe { &*self.inner.get() };
+        let inner = unsafe { &*(*self.inner).get() };
 
         inner.remote_recv_ring.set(Some(RemoteRingInfo {
             addr: remote.recv_ring_addr,
@@ -860,7 +879,7 @@ impl<U> Endpoint<U> {
         user_data: U,
         _response_allowance: u64,
     ) -> std::result::Result<u32, error::CallError<U>> {
-        let inner = unsafe { &*self.inner.get() };
+        let inner = unsafe { &*(*self.inner).get() };
         let ctx = unsafe { &*self.ctx };
 
         let remote_ring = inner
@@ -868,11 +887,11 @@ impl<U> Endpoint<U> {
             .get()
             .ok_or(error::CallError::Other(Error::RemoteConsumerUnknown))?;
 
-        let msg_size = padded_message_size(data.len() as u32);
+        let msg_size = dc_padded_message_size(data.len() as u32);
 
         if !inner.has_cycle_room_for(msg_size) {
             inner.wrap_pending.set(true);
-            ctx.mark_endpoint_dirty(&self.inner);
+            ctx.mark_endpoint_dirty(inner.endpoint_id);
             return Err(error::CallError::RingFull(user_data));
         }
 
@@ -890,8 +909,8 @@ impl<U> Endpoint<U> {
 
         unsafe {
             let buf_ptr = inner.send_ring.as_ptr().add(send_offset) as *mut u8;
-            encode_header(buf_ptr, call_id, 0, data.len() as u32);
-            std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr.add(HEADER_SIZE), data.len());
+            dc_encode_header(buf_ptr, call_id, data.len() as u32);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr.add(DC_HEADER_SIZE), data.len());
         }
 
         inner.send_ring_producer.set(producer + msg_size);
@@ -899,7 +918,7 @@ impl<U> Endpoint<U> {
             .batch_message_count
             .set(inner.batch_message_count.get() + 1);
 
-        ctx.mark_endpoint_dirty(&self.inner);
+        ctx.mark_endpoint_dirty(inner.endpoint_id);
 
         Ok(call_id)
     }
@@ -908,7 +927,7 @@ impl<U> Endpoint<U> {
 pub struct RecvHandle<'a, U> {
     _lifetime: PhantomData<&'a Context<U>>,
     ctx: &'a Context<U>,
-    endpoint: Rc<UnsafeCell<EndpointInner<U>>>,
+    endpoint: *const UnsafeCell<EndpointInner<U>>,
     endpoint_id: u32,
     call_id: u32,
     data_ptr: *const u8,
@@ -930,18 +949,18 @@ impl<U> RecvHandle<'_, U> {
     }
 
     pub fn reply(&self, data: &[u8]) -> Result<()> {
-        let inner = unsafe { &*self.endpoint.get() };
+        let inner = unsafe { &*(*self.endpoint).get() };
 
         let remote_ring = inner
             .remote_recv_ring
             .get()
             .ok_or(Error::RemoteConsumerUnknown)?;
 
-        let msg_size = padded_message_size(data.len() as u32);
+        let msg_size = dc_padded_message_size(data.len() as u32);
 
         if !inner.has_cycle_room_for(msg_size) {
             inner.wrap_pending.set(true);
-            self.ctx.mark_endpoint_dirty(&self.endpoint);
+            self.ctx.mark_endpoint_dirty(inner.endpoint_id);
             return Err(Error::RingFull);
         }
 
@@ -958,8 +977,8 @@ impl<U> RecvHandle<'_, U> {
 
         unsafe {
             let buf_ptr = inner.send_ring.as_ptr().add(send_offset) as *mut u8;
-            encode_header(buf_ptr, response_call_id, 0, data.len() as u32);
-            std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr.add(HEADER_SIZE), data.len());
+            dc_encode_header(buf_ptr, response_call_id, data.len() as u32);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr.add(DC_HEADER_SIZE), data.len());
         }
 
         inner.send_ring_producer.set(producer + msg_size);
@@ -967,7 +986,7 @@ impl<U> RecvHandle<'_, U> {
             .batch_message_count
             .set(inner.batch_message_count.get() + 1);
 
-        self.ctx.mark_endpoint_dirty(&self.endpoint);
+        self.ctx.mark_endpoint_dirty(inner.endpoint_id);
 
         Ok(())
     }
@@ -986,11 +1005,6 @@ unsafe fn encode_batch_header(
     let ptr32 = buf.add(16) as *mut u32;
     std::ptr::write(ptr32, message_count.to_le());
     std::ptr::write_bytes(buf.add(20), 0, 12);
-}
-
-#[inline]
-unsafe fn patch_batch_delta(buf: *mut u8, delta: u64) {
-    std::ptr::write(buf as *mut u64, delta.to_le());
 }
 
 #[inline]
