@@ -449,7 +449,12 @@ pub fn run_daemon(
         }
 
         // Phase 2: poll preparing slots and enqueue remote requests in batches.
-        while let Some(slot_idx) = preparing_queue.pop_front() {
+        // Limit iterations to avoid infinite spin when all requests are local.
+        let phase2_limit = max_clients.max(1024);
+        for _ in 0..phase2_limit {
+            let Some(slot_idx) = preparing_queue.pop_front() else {
+                break;
+            };
             in_preparing[slot_idx] = false;
 
             if !connected[slot_idx] {
