@@ -750,6 +750,27 @@ impl Cq {
         count
     }
 
+    /// Poll for completions without queue dispatch.
+    ///
+    /// This is useful for consumers (such as DCT/SRQ paths) that need direct
+    /// access to CQEs keyed by immediate data rather than QPN registration.
+    ///
+    /// Returns the number of completions processed.
+    #[inline]
+    pub fn poll_raw(&self, mut callback: impl FnMut(Cqe)) -> usize {
+        let Some(cqe) = self.try_next_cqe(false) else {
+            return 0;
+        };
+        callback(cqe);
+
+        let mut count = 1;
+        while let Some(cqe) = self.try_next_cqe(true) {
+            callback(cqe);
+            count += 1;
+        }
+        count
+    }
+
     /// Update the CQ doorbell record.
     ///
     /// Call this after processing completions to acknowledge them to the hardware.

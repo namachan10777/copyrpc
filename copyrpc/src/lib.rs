@@ -27,6 +27,7 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
+pub mod dc;
 pub mod encoding;
 pub mod error;
 pub mod ring;

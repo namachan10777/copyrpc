@@ -3,7 +3,10 @@ use std::time::Instant;
 
 use ipc::Client;
 
-use crate::message::{Request, Response};
+use crate::message::{
+    ClientSlot, Request, Response, slot_from_extra, slot_init, slot_mark_empty, slot_submit,
+    slot_try_read_done,
+};
 use crate::parquet_out::BatchRecord;
 use crate::workload::AccessEntry;
 
@@ -45,8 +48,10 @@ pub fn run_client(
     batch_size: u32,
     bench_start: Instant,
 ) -> Vec<BatchRecord> {
-    // Connect to all daemons
-    let mut clients: Vec<Client<Request, Response, (), _>> = shm_paths
+    assert_eq!(queue_depth, 1, "meta path requires --queue-depth=1");
+
+    // Connect to all daemons.
+    let clients: Vec<Client<Request, Response, (), _>> = shm_paths
         .iter()
         .map(|path| {
             unsafe { Client::<Request, Response, (), _>::connect(path, |(), _resp| {}) }
@@ -54,41 +59,50 @@ pub fn run_client(
         })
         .collect();
 
+    let mut slots: Vec<*mut ClientSlot> = clients
+        .iter()
+        .map(|c| unsafe { slot_from_extra(c.extra_buffer()) })
+        .collect();
+
+    for slot in &mut slots {
+        unsafe { slot_init(*slot) };
+    }
+
     let pattern_len = pattern.len();
     let mut pattern_idx = 0usize;
-
-    // Initial fill: pipeline queue_depth requests across daemons
-    for _ in 0..queue_depth {
-        let entry = &pattern[pattern_idx % pattern_len];
-        pattern_idx += 1;
-        let daemon = target_daemon(entry, num_daemons, my_rank);
-        if clients[daemon].call(make_request(entry), ()).is_err() {
-            return Vec::new();
-        }
-    }
+    let mut seq = 1u32;
 
     let mut records = Vec::new();
     let mut completed_in_batch = 0u32;
 
-    // Steady state: poll all daemons for completions, send replacements
     while !stop_flag.load(Ordering::Relaxed) {
-        let mut total_n = 0u32;
-        for client in &mut clients {
-            match client.poll() {
-                Ok(n) => total_n += n,
-                Err(_) => return records,
-            }
-        }
-        for _ in 0..total_n {
-            let entry = &pattern[pattern_idx % pattern_len];
-            pattern_idx += 1;
-            let daemon = target_daemon(entry, num_daemons, my_rank);
-            if clients[daemon].call(make_request(entry), ()).is_err() {
+        let entry = &pattern[pattern_idx % pattern_len];
+        pattern_idx += 1;
+        let daemon = target_daemon(entry, num_daemons, my_rank);
+        let slot = slots[daemon];
+
+        let req = make_request(entry);
+        while !unsafe { slot_submit(slot, req, seq) } {
+            if stop_flag.load(Ordering::Relaxed) {
                 return records;
             }
+            std::hint::spin_loop();
         }
 
-        completed_in_batch += total_n;
+        loop {
+            if stop_flag.load(Ordering::Relaxed) {
+                return records;
+            }
+            if unsafe { slot_try_read_done(slot, seq) }.is_some() {
+                unsafe { slot_mark_empty(slot) };
+                break;
+            }
+            std::hint::spin_loop();
+        }
+
+        seq = seq.wrapping_add(1);
+        completed_in_batch += 1;
+
         while completed_in_batch >= batch_size {
             completed_in_batch -= batch_size;
             records.push(BatchRecord {
@@ -96,10 +110,7 @@ pub fn run_client(
                 batch_size,
             });
         }
-
-        if total_n == 0 {
-            std::hint::spin_loop();
-        }
     }
+
     records
 }

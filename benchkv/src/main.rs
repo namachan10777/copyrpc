@@ -21,7 +21,7 @@ use clap::Parser;
 use mpi::collective::CommunicatorCollectives;
 use mpi::topology::Communicator;
 
-use daemon::{CopyrpcSetup, DaemonFlux, EndpointConnectionInfo};
+use daemon::{CopyrpcDcSetup, DaemonFlux, DcEndpointConnectionInfo};
 use message::{DelegatePayload, Request, Response};
 
 #[derive(Parser, Debug)]
@@ -203,6 +203,9 @@ fn run_meta(
     num_clients: usize,
 ) -> Vec<parquet_out::BenchRow> {
     let queue_depth = cli.queue_depth;
+    if queue_depth != 1 {
+        panic!("meta mode requires --queue-depth=1 (got {})", queue_depth);
+    }
 
     // CPU affinity
     let available_cores = affinity::get_available_cores(cli.device_index);
@@ -246,7 +249,7 @@ fn run_meta(
                         path,
                         max_clients_per_daemon,
                         queue_depth,
-                        0,
+                        message::CLIENT_SLOT_SIZE as u32,
                     )
                 }
                 .expect("Failed to create ipc server"),
@@ -288,7 +291,7 @@ fn run_meta(
             let (remote_tx, remote_rx) = std::sync::mpsc::channel();
             local_rxs.push(local_rx);
             remote_txs.push(remote_tx);
-            setups.push(Some(CopyrpcSetup {
+            setups.push(Some(CopyrpcDcSetup {
                 local_info_tx: local_tx,
                 remote_info_rx: remote_rx,
                 device_index: cli.device_index,
@@ -349,7 +352,7 @@ fn run_meta(
     if size > 1 {
         // 1. Collect local endpoint infos from all daemons
         //    Each daemon sends infos ordered by its my_remote_ranks list
-        let daemon_local_infos: Vec<Vec<EndpointConnectionInfo>> = copyrpc_local_rxs
+        let daemon_local_infos: Vec<Vec<DcEndpointConnectionInfo>> = copyrpc_local_rxs
             .iter()
             .map(|rx| rx.recv().expect("Failed to receive daemon local info"))
             .collect();
@@ -364,7 +367,7 @@ fn run_meta(
             .collect();
 
         // 2. Per-daemon accumulator for remote infos
-        let mut daemon_remote_infos: Vec<Vec<EndpointConnectionInfo>> = (0..num_daemons)
+        let mut daemon_remote_infos: Vec<Vec<DcEndpointConnectionInfo>> = (0..num_daemons)
             .map(|d| Vec::with_capacity(daemon_remote_ranks[d].len()))
             .collect();
 
@@ -391,7 +394,7 @@ fn run_meta(
             // The received info belongs to the remote daemon that handles our rank:
             // remote daemon = rank % num_daemons (on peer_rank's node)
             // But we need to give it to the local daemon that owns the connection: local_daemon
-            let remote_info = EndpointConnectionInfo::from_bytes(&recv_bytes);
+            let remote_info = DcEndpointConnectionInfo::from_bytes(&recv_bytes);
             daemon_remote_infos[local_daemon].push(remote_info);
         }
 
