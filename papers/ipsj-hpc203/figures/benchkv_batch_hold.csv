@@ -1,0 +1,11 @@
+variant,np,mean_miops,std_miops
+no batch hold,2,13.968507823230016,
+batch hold (10µs),2,15.089249658543666,
+no batch hold,4,22.106298422726493,
+batch hold (10µs),4,21.419841048495535,
+no batch hold,8,8.260392955796512,
+batch hold (10µs),8,11.305941766867141,
+no batch hold,16,14.861255585841288,
+batch hold (10µs),16,20.81164613149205,
+no batch hold,32,27.251379477457935,
+batch hold (10µs),32,32.52734448958359,
