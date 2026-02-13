@@ -1,7 +1,7 @@
 //! NUMA-aware CPU affinity for benchkv.
 //!
 //! Detects the NUMA node of the mlx5 device and assigns daemon/client threads
-//! to cores on that node, skipping cores 0 and 1 (reserved for IRQ handling).
+//! with soft affinity priority across NUMA nodes.
 
 use std::fs;
 
@@ -33,31 +33,98 @@ fn parse_cpulist(s: &str) -> Vec<usize> {
         }
     }
     cores.sort();
+    cores.dedup();
     cores
 }
 
-/// Get available cores for the given RDMA device, excluding cores 0 and 1.
+fn read_node_cores(node: usize) -> Option<Vec<usize>> {
+    let path = format!("/sys/devices/system/node/node{}/cpulist", node);
+    fs::read_to_string(path).ok().map(|s| parse_cpulist(&s))
+}
+
+fn list_numa_nodes() -> Vec<usize> {
+    let mut nodes = Vec::new();
+    if let Ok(entries) = fs::read_dir("/sys/devices/system/node") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(num) = name
+                .strip_prefix("node")
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                nodes.push(num);
+            }
+        }
+    }
+    nodes.sort_unstable();
+    nodes
+}
+
+fn online_cores() -> Vec<usize> {
+    if let Ok(s) = fs::read_to_string("/sys/devices/system/cpu/online") {
+        return parse_cpulist(&s);
+    }
+    let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) as usize };
+    (0..n).collect()
+}
+
+/// Get available cores for the given RDMA device with soft affinity priority:
+/// 1) cores on device NUMA node excluding 0,1
+/// 2) cores on other NUMA nodes excluding 0,1
+/// 3) cores 0,1 on device NUMA node
+/// 4) cores 0,1 on other NUMA nodes
 pub fn get_available_cores(device_index: usize) -> Vec<usize> {
-    // Try to detect NUMA node from mlx5 device
-    let numa_node = detect_numa_node(device_index);
+    let preferred_node = detect_numa_node(device_index);
 
-    let cores = match numa_node {
-        Some(node) => {
-            let path = format!("/sys/devices/system/node/node{}/cpulist", node);
-            fs::read_to_string(&path)
-                .ok()
-                .map(|s| parse_cpulist(&s))
-                .unwrap_or_default()
+    let mut all_cores = Vec::new();
+    for node in list_numa_nodes() {
+        if let Some(mut v) = read_node_cores(node) {
+            all_cores.append(&mut v);
         }
-        None => {
-            // Fallback: use all online cores
-            let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) as usize };
-            (0..n).collect()
-        }
-    };
+    }
+    if all_cores.is_empty() {
+        all_cores = online_cores();
+    }
+    all_cores.sort_unstable();
+    all_cores.dedup();
 
-    // Exclude cores 0 and 1 (IRQ handling)
-    cores.into_iter().filter(|&c| c >= 2).collect()
+    let preferred_cores = preferred_node
+        .and_then(read_node_cores)
+        .unwrap_or_default();
+    let preferred_set: std::collections::HashSet<usize> = preferred_cores.into_iter().collect();
+
+    let mut ordered = Vec::with_capacity(all_cores.len());
+
+    ordered.extend(
+        all_cores
+            .iter()
+            .copied()
+            .filter(|c| *c >= 2 && preferred_set.contains(c)),
+    );
+    ordered.extend(
+        all_cores
+            .iter()
+            .copied()
+            .filter(|c| *c >= 2 && !preferred_set.contains(c)),
+    );
+    ordered.extend(
+        all_cores
+            .iter()
+            .copied()
+            .filter(|c| *c < 2 && preferred_set.contains(c)),
+    );
+    ordered.extend(
+        all_cores
+            .iter()
+            .copied()
+            .filter(|c| *c < 2 && !preferred_set.contains(c)),
+    );
+
+    if ordered.is_empty() {
+        online_cores()
+    } else {
+        ordered
+    }
 }
 
 fn detect_numa_node(device_index: usize) -> Option<usize> {
@@ -73,21 +140,17 @@ fn detect_numa_node(device_index: usize) -> Option<usize> {
 }
 
 /// Assign cores to threads: daemon threads first, then client threads.
-/// `ranks_on_node` and `rank_on_node` partition cores across co-located ranks.
+/// Rank-local partitioning is intentionally disabled for benchmark stability.
 /// Returns (daemon_cores, client_cores).
 pub fn assign_cores(
     available: &[usize],
     num_daemons: usize,
     num_clients: usize,
-    ranks_on_node: u32,
-    rank_on_node: u32,
+    _ranks_on_node: u32,
+    _rank_on_node: u32,
 ) -> (Vec<usize>, Vec<usize>) {
     let total_needed = num_daemons + num_clients;
-
-    // Partition available cores evenly across ranks on this node
-    let per_rank = available.len() / ranks_on_node as usize;
-    let offset = rank_on_node as usize * per_rank;
-    let my_cores = &available[offset..offset + per_rank];
+    let my_cores = available;
 
     let daemon_cores: Vec<usize> = my_cores.iter().take(num_daemons).copied().collect();
     let client_cores: Vec<usize> = my_cores
@@ -99,10 +162,9 @@ pub fn assign_cores(
 
     if daemon_cores.len() + client_cores.len() < total_needed {
         eprintln!(
-            "Warning: only {} cores available for {} threads (rank_on_node={})",
+            "Warning: only {} cores available for {} threads",
             my_cores.len(),
-            total_needed,
-            rank_on_node
+            total_needed
         );
     }
 

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::ptr;
 use std::sync::atomic::AtomicBool;
 
@@ -322,9 +323,10 @@ pub fn run_daemon(
     let max_clients = server.max_clients() as usize;
     let mut slot_ptrs: Vec<*mut ClientSlot> = vec![ptr::null_mut(); max_clients];
     let mut connected = vec![false; max_clients];
+    let mut connected_count = 0usize;
     let mut in_preparing = vec![false; max_clients];
     let mut inflight = vec![false; max_clients];
-    let mut preparing_stack: Vec<usize> = Vec::with_capacity(max_clients);
+    let mut preparing_queue: VecDeque<usize> = VecDeque::with_capacity(max_clients);
     let mut inflights_stack: Vec<usize> = Vec::with_capacity(max_clients);
 
     let mut copyrpc_inflight_count: u32 = 0;
@@ -335,25 +337,28 @@ pub fn run_daemon(
     // Adaptive batching knobs
     const POLL_BUDGET: usize = 16;
     const MIN_BATCH_REQS: usize = 8;
-    const MAX_BATCH_WAIT_NS: u64 = 3_000;
+    const MAX_BATCH_WAIT_POLLS: usize = 16;
 
     while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
         // Discover newly connected clients and add their fixed slots to preparing.
-        for cid in 0..max_clients {
-            if connected[cid] {
-                continue;
-            }
-            let client_id = ipc::ClientId(cid as u32);
-            if !server.is_client_connected(client_id) {
-                continue;
-            }
-            if let Some(ptr) = server.client_extra_buffer(client_id) {
-                slot_ptrs[cid] = unsafe { slot_from_extra(ptr) };
-                connected[cid] = true;
-                unsafe { slot_init(slot_ptrs[cid]) };
-                if !inflight[cid] && !in_preparing[cid] {
-                    in_preparing[cid] = true;
-                    preparing_stack.push(cid);
+        if connected_count < max_clients {
+            for cid in 0..max_clients {
+                if connected[cid] {
+                    continue;
+                }
+                let client_id = ipc::ClientId(cid as u32);
+                if !server.is_client_connected(client_id) {
+                    continue;
+                }
+                if let Some(ptr) = server.client_extra_buffer(client_id) {
+                    slot_ptrs[cid] = unsafe { slot_from_extra(ptr) };
+                    connected[cid] = true;
+                    connected_count += 1;
+                    unsafe { slot_init(slot_ptrs[cid]) };
+                    if !inflight[cid] && !in_preparing[cid] {
+                        in_preparing[cid] = true;
+                        preparing_queue.push_back(cid);
+                    }
                 }
             }
         }
@@ -375,7 +380,7 @@ pub fn run_daemon(
                 }
                 if !in_preparing[slot_idx] {
                     in_preparing[slot_idx] = true;
-                    preparing_stack.push(slot_idx);
+                    preparing_queue.push_back(slot_idx);
                 }
                 copyrpc_inflight_count = copyrpc_inflight_count.saturating_sub(1);
             });
@@ -413,18 +418,21 @@ pub fn run_daemon(
         // Phase 2: poll preparing slots and enqueue remote requests in batches.
         let mut scans = 0usize;
         let mut remote_enqueued = 0usize;
-        let start = std::time::Instant::now();
+        let mut extra_wait_polls = 0usize;
 
         while scans < POLL_BUDGET
             || (remote_enqueued > 0
                 && remote_enqueued < MIN_BATCH_REQS
-                && start.elapsed().as_nanos() < MAX_BATCH_WAIT_NS as u128)
+                && extra_wait_polls < MAX_BATCH_WAIT_POLLS)
         {
-            let Some(slot_idx) = preparing_stack.pop() else {
+            let Some(slot_idx) = preparing_queue.pop_front() else {
                 break;
             };
             in_preparing[slot_idx] = false;
             scans += 1;
+            if scans >= POLL_BUDGET && remote_enqueued > 0 && remote_enqueued < MIN_BATCH_REQS {
+                extra_wait_polls += 1;
+            }
 
             if !connected[slot_idx] {
                 continue;
@@ -434,7 +442,7 @@ pub fn run_daemon(
             let Some(req) = (unsafe { slot_try_take_ready(slot_ptr) }) else {
                 if !inflight[slot_idx] && !in_preparing[slot_idx] {
                     in_preparing[slot_idx] = true;
-                    preparing_stack.push(slot_idx);
+                    preparing_queue.push_back(slot_idx);
                 }
                 continue;
             };
@@ -450,7 +458,7 @@ pub fn run_daemon(
 
                 if !in_preparing[slot_idx] {
                     in_preparing[slot_idx] = true;
-                    preparing_stack.push(slot_idx);
+                    preparing_queue.push_back(slot_idx);
                 }
                 continue;
             }
@@ -460,7 +468,7 @@ pub fn run_daemon(
                 unsafe { slot_complete(slot_ptr, resp) };
                 if !in_preparing[slot_idx] {
                     in_preparing[slot_idx] = true;
-                    preparing_stack.push(slot_idx);
+                    preparing_queue.push_back(slot_idx);
                 }
                 continue;
             };
@@ -479,7 +487,7 @@ pub fn run_daemon(
                     unsafe { slot_restore_ready(slot_ptr) };
                     if !in_preparing[slot_idx] {
                         in_preparing[slot_idx] = true;
-                        preparing_stack.push(slot_idx);
+                        preparing_queue.push_back(slot_idx);
                     }
                     ctx.flush_endpoints();
                     break;
@@ -489,7 +497,7 @@ pub fn run_daemon(
                     unsafe { slot_complete(slot_ptr, resp) };
                     if !in_preparing[slot_idx] {
                         in_preparing[slot_idx] = true;
-                        preparing_stack.push(slot_idx);
+                        preparing_queue.push_back(slot_idx);
                     }
                 }
             }
@@ -553,7 +561,7 @@ pub fn run_daemon(
                 copyrpc_inflight_count,
                 flux.pending_count() as u32,
                 inflights_stack.len() as u32,
-                preparing_stack.len() as u32,
+                preparing_queue.len() as u32,
             );
         }
 
