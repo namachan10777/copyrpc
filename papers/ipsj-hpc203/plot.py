@@ -27,7 +27,7 @@ def compute_benchkv_rps(df: pl.DataFrame, trim_frac: float = 0.2) -> pl.DataFram
     batches whose elapsed_ns falls within the middle (1 - 2*trim_frac)
     portion of that window.
     """
-    group_cols = ["mode", "np", "batch_hold_us", "run_index"]
+    group_cols = ["source_file", "mode", "np", "batch_hold_us", "run_index"]
     stream_cols = group_cols + ["rank", "client_id"]
 
     df = df.sort(stream_cols + ["batch_index"])
@@ -160,9 +160,9 @@ def make_line_chart(
 
 def plot_benchkv_throughput(df_rps: pl.DataFrame):
     """Chart 1: node count vs total RPS (UCX / direct / proxied)."""
-    # delegation: batch_hold_us == 0 only; others: batch_hold_us is null
+    # delegation: batch_hold_us == 10.0 is adaptive (the main algorithm)
     df = df_rps.filter(
-        (pl.col("mode") != "delegation") | (pl.col("batch_hold_us") == 0.0)
+        (pl.col("mode") != "delegation") | (pl.col("batch_hold_us") == 10.0)
     )
     summary = aggregate_benchkv_total_rps(df, ["mode", "np"])
 
@@ -203,8 +203,11 @@ def plot_benchkv_throughput(df_rps: pl.DataFrame):
 
 
 def plot_benchkv_batch_hold(df_rps: pl.DataFrame):
-    """Chart 2: delegation batch hold comparison."""
-    df = df_rps.filter(pl.col("mode") == "delegation")
+    """Chart 2: delegation batch hold comparison (paper_deleg_* data)."""
+    df = df_rps.filter(
+        (pl.col("mode") == "delegation")
+        & (pl.col("source_file").str.starts_with("paper_deleg_"))
+    )
     summary = aggregate_benchkv_total_rps(df, ["mode", "np", "batch_hold_us"])
 
     summary = summary.with_columns(
