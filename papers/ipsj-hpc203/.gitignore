@@ -19,3 +19,6 @@
 *.pdf
 !handmade-figures/
 !handmade-figures/*.pdf
+
+# macOS
+.DS_Store
