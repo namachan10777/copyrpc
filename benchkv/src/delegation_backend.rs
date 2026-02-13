@@ -1034,6 +1034,9 @@ pub fn run_delegation(
         }
     }
 
+    let peak_process_rss_kb =
+        crate::memstat::report_peak_process_memory(world, rank, "delegation");
+
     parquet_out::rows_from_batches(
         "delegation",
         rank,
@@ -1043,5 +1046,6 @@ pub fn run_delegation(
         num_clients as u32,
         queue_depth,
         cli.key_range,
+        peak_process_rss_kb,
     )
 }

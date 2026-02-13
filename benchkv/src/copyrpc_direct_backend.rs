@@ -481,6 +481,9 @@ pub fn run_copyrpc_direct(
         }
     }
 
+    let peak_process_rss_kb =
+        crate::memstat::report_peak_process_memory(world, rank, "copyrpc_direct");
+
     parquet_out::rows_from_batches(
         "copyrpc_direct",
         rank,
@@ -490,6 +493,7 @@ pub fn run_copyrpc_direct(
         num_clients as u32,
         queue_depth,
         cli.key_range,
+        peak_process_rss_kb,
     )
 }
 

@@ -431,6 +431,8 @@ pub fn run_erpc(
         }
     }
 
+    let peak_process_rss_kb = crate::memstat::report_peak_process_memory(world, rank, "erpc");
+
     parquet_out::rows_from_batches(
         "erpc",
         rank,
@@ -440,6 +442,7 @@ pub fn run_erpc(
         num_clients as u32,
         queue_depth,
         cli.key_range,
+        peak_process_rss_kb,
     )
 }
 

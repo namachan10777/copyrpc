@@ -5,6 +5,7 @@ mod daemon;
 mod delegation_backend;
 mod erpc_backend;
 mod message;
+mod memstat;
 mod mpi_util;
 mod parquet_out;
 mod qd_sample;
@@ -494,6 +495,8 @@ fn run_meta(
         }
     }
 
+    let peak_process_rss_kb = memstat::report_peak_process_memory(world, rank, "meta");
+
     parquet_out::rows_from_batches(
         "meta",
         rank,
@@ -503,5 +506,6 @@ fn run_meta(
         num_clients as u32,
         queue_depth,
         cli.key_range,
+        peak_process_rss_kb,
     )
 }

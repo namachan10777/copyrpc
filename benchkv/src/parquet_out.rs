@@ -23,6 +23,7 @@ pub struct BenchRow {
     pub client_threads: u32,
     pub queue_depth: u32,
     pub key_range: u64,
+    pub peak_process_rss_kb: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -35,6 +36,7 @@ pub fn rows_from_batches(
     client_threads: u32,
     queue_depth: u32,
     key_range: u64,
+    peak_process_rss_kb: u64,
 ) -> Vec<BenchRow> {
     let mut rows = Vec::new();
     for (client_id, batches) in client_batches.iter().enumerate() {
@@ -54,6 +56,7 @@ pub fn rows_from_batches(
                         client_threads,
                         queue_depth,
                         key_range,
+                        peak_process_rss_kb,
                     });
                     batch_index += 1;
                 }
@@ -97,6 +100,7 @@ pub fn write_parquet(path: &str, rows: &[BenchRow]) -> Result<(), Box<dyn std::e
         Field::new("client_threads", DataType::UInt32, false),
         Field::new("queue_depth", DataType::UInt32, false),
         Field::new("key_range", DataType::UInt64, false),
+        Field::new("peak_process_rss_kb", DataType::UInt64, false),
     ]));
 
     let batch = RecordBatch::try_new(
@@ -134,6 +138,11 @@ pub fn write_parquet(path: &str, rows: &[BenchRow]) -> Result<(), Box<dyn std::e
             )) as ArrayRef,
             Arc::new(UInt64Array::from(
                 rows.iter().map(|r| r.key_range).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(UInt64Array::from(
+                rows.iter()
+                    .map(|r| r.peak_process_rss_kb)
+                    .collect::<Vec<_>>(),
             )) as ArrayRef,
         ],
     )?;

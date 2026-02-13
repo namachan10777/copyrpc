@@ -449,6 +449,8 @@ pub fn run_ucx_am(
         }
     }
 
+    let peak_process_rss_kb = crate::memstat::report_peak_process_memory(world, rank, "ucx_am");
+
     parquet_out::rows_from_batches(
         "ucx_am",
         rank,
@@ -458,6 +460,7 @@ pub fn run_ucx_am(
         num_clients as u32,
         queue_depth,
         cli.key_range,
+        peak_process_rss_kb,
     )
 }
 
