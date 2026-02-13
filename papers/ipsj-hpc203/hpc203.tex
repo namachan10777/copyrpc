@@ -22,18 +22,21 @@
 
 \title{LocustaRPC: 次世代リーダーシップマシンのための\\スケーラブルなRPC基盤}
 
-\etitle{LocustaRPC: A Scalable RPC Framework\\for Next-Generation Leadership Machines}
-
-\affiliate{UT}{筑波大学}
+\affiliate{UT}{筑波大学大学院}
 \affiliate{CCS}{筑波大学計算科学研究センター}
 \affiliate{FUJITSU}{富士通株式会社}
 
-\author{中野 将生}{Masaki Nakano}{UT}
+\author{中野 将生}{Masaki Nakano}{UT}[mnakano@hpcs.cs.tsukuba.ac.jp]
 \author{前田 宗則}{Munenori Maeda}{CCS,FUJITSU}[maeda.munenori@fujitsu.com]
-\author{建部 修見}{Osamu Tatebe}{CCS}
+\author{建部 修見}{Osamu Tatebe}{CCS}[tatebe@cs.tsukuba.ac.jp]
 
 \begin{abstract}
-HPCマシンにおける性能向上は，アクセラレータ
+リーダーシップクラスのHPCマシンでは，総プロセス数が極めて多いことからad-hocファイルシステムのようなミドルウェアにおいて，通信接続状態の増大が性能低下とメモリ消費増大を同時に引き起こす．
+本稿では，ノード内プロセスのRPC要求を共有メモリ経由でデーモンへ委譲し，ノード外RDMA通信を集約するRPC基盤LocustaRPCを提案する．
+提案方式は，クライアントごとに接続を持つ構成に比べて接続管理状態を削減できるため，通信資源使用効率の改善可能性を示す．
+一方で，単純な中継構成では中規模条件でバッチング崩壊が発生し，性能劣化が大きいことも確認した．
+この課題に対して，低Queue Depth時の到着率に応じて保持時間を動的調整するAdaptive Batch Hold制御を導入した．
+benchkv評価では，提案方式は2ノードおよび4ノードでUCXおよびdirect connectionを上回るスループットを示し，32ノード条件ではAdaptive Batch Holdによりno batch hold比で最大1.44倍の改善を得た．
 \end{abstract}
 
 \maketitle
@@ -200,6 +203,17 @@ FaRMの最適化単位はスレッド中心であり，eRPCは汎用性を重視
 HPCストレージ向け実装では追加の設計判断が必要となる．
 本研究はad-hocファイルシステムを想定し，RCの機能を利用しつつノード内集約で接続状態とメモリ消費を削減する点で，RC維持型アプローチをHPCストレージ文脈に適用する位置づけとなる．
 
+\subsection{Flock}
+
+Flockは，RCの信頼性と機能を維持したまま高fan-in/fan-out環境での接続スケーラビリティを高めるため，
+接続ハンドル抽象による接続多重化と，部分共有モデルに基づくスレッド間接続共有を提案している\cite{monga2021BirdsFeatherFlock}．
+同研究は，従来の「接続共有は性能を劣化させる」という見方に対し，
+coalescingベース同期と送受信スケジューリングを組み合わせることで，同期オーバーヘッドを抑えつつ公平な接続利用を達成できることを示した\cite{monga2021BirdsFeatherFlock}．
+この設計は，RCを前提に接続管理コストを実装レベルで下げる点でScaleRPCと同方向の課題意識を持つが，
+主にスレッド間での接続共有と負荷制御に焦点がある．
+これに対し本研究は，ノード内の複数プロセスからノード外通信終端をデーモンへ集約することで，
+プロセス数増加時の状態量をアーキテクチャレベルで抑制する点に特徴がある．
+
 \subsection{mRPC}
 
 mRPCは，従来の「アプリ内RPCライブラリ＋サイドカー」構成における重複した(アン)マーシャリングを問題設定とし，
@@ -305,7 +319,7 @@ $\alpha=1$でもQP関連状態だけで$M_{\mathrm{conn}}^{\mathrm{ucx}}\approx2
 \begin{figure*}[t]
 	\centering
 	\includegraphics[width=0.95\textwidth]{handmade-figures/copyrpc.pdf}
-	\caption{copyrpcの基本通信フロー}
+	\caption{LocustaRPCの基本通信フロー}
 	\label{fig:copyrpc-overview}
 \end{figure*}
 
@@ -355,8 +369,8 @@ $\alpha=1$でもQP関連状態だけで$M_{\mathrm{conn}}^{\mathrm{ucx}}\approx2
 この時点では他プロセスから当該スロットは不可視である．
 第2段階で，クライアントはslot header（call\_id，generation，要求長/応答長）とpayloadを書き込み，
 最後にstateをReqReadyへ更新して可視化する．
-この更新順序により，DaemonはReqReadyを観測した時点で当該スロットの内容を一貫して参照できる．
-Daemonは前回処理したconsumer位置から順にslot headerのstateを確認し，ReqReadyの連続区間を送信範囲としてWQEを生成する．
+この更新順序により，デーモンはReqReadyを観測した時点で当該スロットの内容を一貫して参照できる．
+デーモンは前回処理したconsumer位置から順にslot headerのstateを確認し，ReqReadyの連続区間を送信範囲としてWQEを生成する．
 
 このとき重要なのは，デーモンがPayload内容を見て要求を抽出しない点である．
 デーモンはSlot Headerの境界情報と状態遷移のみを用いて送信可能区間を決定する．
@@ -370,7 +384,7 @@ Daemonは前回処理したconsumer位置から順にslot headerのstateを確�
 
 \subsubsection{Adaptive Batch Hold制御}
 
-本設計では，Daemonがcopyrpcから受信した応答をクライアントへ返す段階に
+本設計では，デーモンがLocustaRPCから受信した応答をクライアントへ返す段階に
 Adaptive Batch Hold制御を導入する．
 この制御は，応答を短時間保持してまとめて返すための保持時間$T_{\mathrm{hold}}$を動的に調整する．
 本稿では，イベントループ1回あたりの到着リクエスト数の分布により，
@@ -396,7 +410,7 @@ $\mu<1$の領域では空ループや小バッチループが増加し，固定�
 および到着率推定$\hat{\lambda}$で表す．
 本実装では$B_{\mathrm{target}}=N_{\mathrm{rank}}$とする．
 
-copyrpc応答到着時は保持キューへ追加し，保持キューが非空のとき，
+LocustaRPC応答到着時は保持キューへ追加し，保持キューが非空のとき，
 次の条件のいずれかでフラッシュする．
 \begin{equation}
 B \geq B_{\mathrm{target}}
@@ -425,7 +439,7 @@ T_{\mathrm{hold}} \leftarrow \frac{B_{\mathrm{target}}}{\hat{\lambda}}
 この更新則により，到着率が低いと$T_{\mathrm{hold}}$は増加し，到着率が高いと$T_{\mathrm{hold}}$は減少する．
 すなわち，低バッチ状態では保持時間を長くしてバッチ形成を促進し，
 高バッチ状態では保持時間を短くして待ち時間を抑える適応制御になる．
-本制御が必要となる現象の説明と有効性の評価は，実験結果（\ref{fig:benchkv-throughput}）で述べる．
+本制御が必要となる現象の説明と有効性の評価は，実験結果（\ref{fig:benchkv-batch-hold}）で述べる．
 
 \section{実験}
 
@@ -450,8 +464,7 @@ PUTは同一キー集合に対する更新として扱い，測定中にキー�
 read/write比率は，実験で使用した50/50（read ratio=0.5）の1条件を用いる．
 この条件でノード内クライアントプロセス数を変化させ，提案アーキテクチャの主眼である
 ノード内プロセス増加時の通信資源効率と性能スケーラビリティを検証する．
-評価指標はスループット（IOPS）とレイテンシ（少なくともp50，p99）とし，
-通信資源効率についてはノード当たりの通信状態量とメモリ消費量を併せて記録する．
+評価指標はスループット（IOPS）を用いる．
 
 また，提案方式の有効性を明確化するため，比較対象にはUCXを用いる．
 UCXベースラインでは，各クライアントプロセスが個別にUCX通信コンテキスト（worker/endpoint）を保持し，
@@ -459,7 +472,7 @@ UCXベースラインでは，各クライアントプロセスが個別にUCX�
 UCXは通信相手の配置に応じてトランスポートを自動選択するため，
 同一ノード内通信は共有メモリ系トランスポートが使われ，リモートノードとの通信はRDMAトランスポートが選択される．
 本評価ではこのUCXの標準的な通信モデルをそのまま用い，ノード内集約デーモンを介した提案方式と比較する．
-これにより，クライアント数増加に対する通信状態量とメモリ消費，およびエンドツーエンド性能への影響を同一条件で比較する．
+これにより，クライアント数増加に対するエンドツーエンド性能への影響を同一条件で比較する．
 さらに，分析用ベースラインとしてdirect connectionも用いる．
 direct connectionは，提案方式と同じRPC実装を使いながら，ノード内集約を行わず，
 各クライアントがリモートノードへ直接通信する構成にしたものである．
@@ -473,6 +486,13 @@ direct connectionは，提案方式と同じRPC実装を使いながら，ノー
 	\includegraphics[width=0.95\linewidth]{figures/benchkv_throughput.pdf}
 	\caption{benchkvにおけるノード数に対する総スループット（MIOPS）}
 	\label{fig:benchkv-throughput}
+\end{figure}
+
+\begin{figure}[t]
+	\centering
+	\includegraphics[width=0.95\linewidth]{figures/benchkv_batch_hold.pdf}
+	\caption{Adaptive Batch Hold有無の比較（benchkv総スループット）}
+	\label{fig:benchkv-batch-hold}
 \end{figure}
 
 図\ref{fig:benchkv-throughput}に，benchkvの総スループットを示す．
@@ -489,6 +509,13 @@ direct connection（2.83，7.37 MIOPS）およびUCX（3.38，6.73 MIOPS）を�
 この正のフィードバックにより，スループットが低い状態へ収束する．
 ノード数32ではUCXが66.5 MIOPS，direct connectionが62.7 MIOPS，提案方式が39.2 MIOPSであった．
 
+図\ref{fig:benchkv-batch-hold}に，提案方式におけるAdaptive Batch Holdの有無を比較した結果を示す．
+no batch holdに対してbatch hold（10$\mu$s）は，2ノードで13.97から14.86 MIOPS（1.06倍），
+8ノードで8.26から11.18 MIOPS（1.35倍），16ノードで14.86から19.63 MIOPS（1.32倍），
+32ノードで27.25から39.24 MIOPS（1.44倍）へ改善した．
+4ノードでは22.11から21.10 MIOPSへわずかに低下したが，
+全体として中大規模条件では保持時間制御により低バッチ状態への収束を抑制できることが分かる．
+
 以上より，提案方式はローカル要求比率が高い条件で高い有効性を示す一方，
 中規模条件ではbatching維持機構の設計が性能を左右することが分かる．
 したがって今後の最適化では，デーモン側並列度の拡張に加えて，
@@ -502,7 +529,7 @@ direct connection（2.83，7.37 MIOPS）およびUCX（3.38，6.73 MIOPS）を�
 提案方式がノード当たり通信状態量を大きく削減できることを示した．
 この結果は，通信リソース消費を抑えたいHPC向けミドルウェアに対して，提案方式が有効であることを示す．
 
-また，関連研究であるFaRM，ScaleRPC，Flock等の既存RDMA RPCが主に接続管理やトランスポート最適化を議論してきたのに対し，
+また，関連研究であるFaRM，eRPC，ScaleRPC，Flock等の既存RDMA RPCが主に接続管理やトランスポート最適化を議論してきたのに対し，
 本研究はノード内プロセス群の通信をデーモンへ集約することでスケーラビリティを改善するという，
 異なる設計軸を提示した．
 特に，POSIXを前提とするad-hocファイルシステムのようにアクセス先の事前制約が難しい条件で，
@@ -519,7 +546,7 @@ Adaptive Batch Holdによりこの崩壊を一定程度緩和できることは�
 
 今後の課題は次の2点である．
 \begin{enumerate}
-	\item DCを用いてSQおよび送受信キューの管理を一本化し，提案方式を通常のDC通信にIPCキュー操作コストが加わるモデルへ近づけ，性能低下をIPC由来の固定オーバヘッドへ限定すること
+		\item DCを用いてSQおよび送受信キューの管理を一本化し，提案方式を通常のDC通信にIPCキュー操作コストが加わるモデルへ近づけ，性能低下をIPC由来の固定オーバーヘッドへ限定すること
 	\item 簡易なKVSベンチマークに留まらず，実際のad-hocファイルシステム上で評価し，より大規模なノード数におけるスケーラビリティを検証すること
 \end{enumerate}
 これらを通じて，POSIX志向ワークロードにおいても安定して高性能を維持できる通信基盤を目指す．
