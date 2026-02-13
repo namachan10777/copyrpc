@@ -368,6 +368,52 @@ Daemonは前回処理したconsumer位置から順にslot headerのstateを確�
 リング折返し時はgeneration counterを更新して同一オフセット再利用を識別し，
 応答書き戻し時にもcall\_idと世代を照合することで，古い要求との取り違えを防ぐ．
 
+\subsubsection{Adaptive Batch Hold制御}
+
+本設計では，Daemonがcopyrpcから受信した応答をクライアントへ返す段階に
+Adaptive Batch Hold制御を導入する．
+この制御は，応答を短時間保持してまとめて返すための保持時間$T_{\mathrm{hold}}$を動的に調整する．
+本稿では，イベントループ1回あたりの到着リクエスト数の分布により，
+低バッチ状態と高バッチ状態の双方へ遷移しうる双安定性が生じると捉える．
+低バッチ状態ではローカル処理の固定コスト（CQポーリング，IPC到達点チェック，送信可能範囲チェック）が相対的に支配的になるため，
+到着率に応じて保持時間を適応的に更新する．
+
+制御状態は，保持キュー長$B$，保持開始からの経過時間$\Delta t$，
+目標バッチサイズ$B_{\mathrm{target}}$，保持時間$T_{\mathrm{hold}}$，
+および到着率推定$\hat{\lambda}$で表す．
+本実装では$B_{\mathrm{target}}=N_{\mathrm{rank}}$とする．
+
+copyrpc応答到着時は保持キューへ追加し，保持キューが非空のとき，
+次の条件のいずれかでフラッシュする．
+\begin{equation}
+B \geq B_{\mathrm{target}}
+\;\;\vee\;\;
+\Delta t \geq T_{\mathrm{hold}}
+\;\;\vee\;\;
+outstanding = 0
+\end{equation}
+ここで$outstanding$は未完了のリモート要求数である．
+
+フラッシュ時には，実フラッシュサイズ$B_{\mathrm{flush}}$と保持時間$\Delta t_{\mathrm{flush}}$から
+観測到着率$\lambda_{\mathrm{obs}}$を求める．
+\begin{equation}
+\lambda_{\mathrm{obs}} = \frac{B_{\mathrm{flush}}}{\Delta t_{\mathrm{flush}}}
+\end{equation}
+この到着率はEWMAで平滑化する（実装では係数$0.125$）．
+\begin{equation}
+\hat{\lambda}_{k+1} = 0.875\hat{\lambda}_{k} + 0.125\lambda_{\mathrm{obs}}
+\end{equation}
+次の保持時間は「目標バッチを形成するのに必要な時間」として
+\begin{equation}
+T_{\mathrm{hold}} \leftarrow \frac{B_{\mathrm{target}}}{\hat{\lambda}}
+\end{equation}
+で更新し，実装上は$[0.5\mu s,100\mu s]$へクランプする．
+
+この更新則により，到着率が低いと$T_{\mathrm{hold}}$は増加し，到着率が高いと$T_{\mathrm{hold}}$は減少する．
+すなわち，低バッチ状態では保持時間を長くしてバッチ形成を促進し，
+高バッチ状態では保持時間を短くして待ち時間を抑える適応制御になる．
+本制御が必要となる現象の説明と有効性の評価は，実験結果（\ref{fig:benchkv-throughput}）で述べる．
+
 \section{実験}
 
 \subsection{実験環境}
