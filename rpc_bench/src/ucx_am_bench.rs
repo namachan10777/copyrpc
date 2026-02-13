@@ -618,7 +618,9 @@ unsafe fn register_request_handler(worker: ucx_sys::ucp_worker_h, fallback_ep: u
 }
 
 fn ucs_ptr_is_err(ptr: ucx_sys::ucs_status_ptr_t) -> bool {
-    (ptr as usize) >= (ucx_sys::ucs_status_t_UCS_ERR_LAST as usize).wrapping_neg()
+    // UCX error pointers are small negative integers cast to void*,
+    // i.e. addresses in the range [usize::MAX - 99, usize::MAX].
+    (ptr as usize) >= (usize::MAX - 99)
 }
 
 fn ucs_ptr_is_ptr(ptr: ucx_sys::ucs_status_ptr_t) -> bool {
