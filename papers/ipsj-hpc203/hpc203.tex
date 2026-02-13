@@ -264,9 +264,9 @@ $\alpha=1$でもQP関連状態だけで$M_{\mathrm{conn}}^{\mathrm{ucx}}\approx2
 
 \begin{figure*}[t]
 	\centering
-	\includegraphics[width=0.95\textwidth]{handmade-figures/copyrpc.pdf}
+	\includegraphics[width=0.95\textwidth]{handmade-figures/LocustaRPC.pdf}
 	\caption{LocustaRPCの基本通信フロー}
-	\label{fig:copyrpc-overview}
+	\label{fig:LocustaRPC-overview}
 \end{figure*}
 
 \subsubsection{転送と通知}
@@ -292,11 +292,17 @@ $\alpha=1$でもQP関連状態だけで$M_{\mathrm{conn}}^{\mathrm{ucx}}\approx2
 本方式では，送信バッファの進行位置を管理することで受信バッファ利用量も同期的に制御されるため，
 送信側の管理だけで受信側バッファが自然にあふれない構成になる．
 すなわち，送信可能範囲は対向の受信済み位置により制約され，この範囲を超える書き込みは行わない．
+通常時のconsumed位置共有は，要求・応答バッチに付与するflow metadataのpiggybackで行い，
+相互のReq/Res送信に合わせてリング使用状況を通知する．
 
 ただし，この制御だけではデッドロックが起こりうる．
-典型例は，双方が大きなResponseを書き戻そうとして，互いに相手側の空きを待つ状態で停止する場合である．
-この停止を避けるため，本方式では対向のconsumed位置をRDMA READで直接取得する．
-送信側は待機中にこのREADを発行して最新の空き情報を取得し，進行位置を前進させることで相互待ちを解消する．
+典型例は，responseサイズがrequestサイズを上回る条件で，双方がリング上限まで要求を詰めた結果，
+応答書き戻しの空きが不足し，相互に応答送信待ちとなる場合である．
+この停止を避けるため，本方式では，ローカル送信リングに新規書き込みできなくなった時点で，
+対向のconsumed位置をRDMA READで直接取得する．
+これにより，piggyback更新が遅れている場合でも最新の空き情報を能動的に回収できる．
+さらに受信側は，イベントループが進行する限りResponseが一時的に滞留してもReq処理を止めない．
+このため対向のconsumedは前進し続け，最終的に相互待ちが解消されてデッドロックを回避できる．
 
 \subsubsection{送信バッファ書き込み調停}
 

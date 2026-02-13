@@ -15,7 +15,7 @@ RDMA NICは十分に高速なので、NICの基本（DCでAV切り替えると�
 - 1ノードに1デーモンプロセス（複数スレッドあり）
 - clientは全てのノード内Daemonと接続し、適切な中継Daemonへリクエストを配送する
 - Connectionはrank id mod デーモンスレッド数でシャーディングされている
-- client → (ipc) → daemon → (inproc: daemon内delegation) → daemon thread → (copyrpc: ノード間) → remote daemon
+- client → (ipc) → daemon → (inproc: daemon内delegation) → daemon thread → (LocustaRPC: ノード間) → remote daemon
 
 ## 構成要素
 
@@ -27,10 +27,10 @@ RDMA NICは十分に高速なので、NICの基本（DCでAV切り替えると�
 - inproc
   - daemon内delegation
   - 性能評価: 中QD(8とか32くらい）、daemonワーカースレッド同士の全対全ベンチマークによって性能評価。多数のSOTA実装との比較（学術論文中心、後で補足）
-- copyrpc
+- LocustaRPC
   - daemon/daemonのノード間通信を行う
   - RDMA Write with Immediateでのバッファ転送が主体。送信リングに書いてから送るため1回コピーが入る
-  - end-to-endのクレジットベース フロー制御でハングを起こさない（copyrpcクレート内で実装）
+  - end-to-endのクレジットベース フロー制御でハングを起こさない（LocustaRPCクレート内で実装）
   - バッファリングと一括転送により、SQ/RQのWQE消費を減らして、WQE枯渇によるRNR retryを回避
   - 受信完了検知: 受信バッファ上のフラグをポーリングする設計（memory polling）が多いが、本実装ではCQポーリングによるイベント集約で多数QPでの効率化を狙う。memory pollingが速いという主張にはibverbsラッパのオーバーヘッドが影響している可能性が大きく、直接mlx5デバイスを叩けばCQポーリングは十分高速
   - UCXとの比較、naive send/recvとの比較。（間に合えば memory pollingとの比較）
@@ -46,7 +46,7 @@ RDMA NICは十分に高速なので、NICの基本（DCでAV切り替えると�
   - HITM（`perf c2c`で計測）: どのくらいキャッシュコヒーレンシプロトコルが走ってどのくらい他の操作に影響する？
   - Store bufferの節約: spsc実装の違いにより書き込み量が変わるため分析可能
 - RPC性能評価
-  - raw send recvとUCXとcopyrpcで勝負
+  - raw send recvとUCXとLocustaRPCで勝負
 - 統合評価
   - IPCとかのキャッシュ関連パラメータとIOPSの評価
   - YCSB like benchmark: read/write比率を変えて比較（50%/50%, 10%/90%, 90%/10%など）
@@ -81,5 +81,5 @@ RDMA NICは十分に高速なので、NICの基本（DCでAV切り替えると�
 
 - [ ] inproc/ipcのSOTA比較対象の具体的な論文リストを補足
 - [ ] YCSBベンチマークの詳細設計を補足
-- [ ] copyrpcのクレジットベースフロー制御の実装詳細を実コードから確認・記載
+- [ ] LocustaRPCのクレジットベースフロー制御の実装詳細を実コードから確認・記載
 - [ ] CLDEMOTEのNUMA跨ぎでの評価が必要か検討

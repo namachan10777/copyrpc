@@ -4,7 +4,7 @@
 - `handmade-figures/pfs-and-adhocfs.drawio.pdf`
 - `handmade-figures/RDMA-SQ-and-RQ.drawio.pdf`
 - `handmade-figures/in-node-architecture.drawio.pdf`
-- `handmade-figures/copyrpc.pdf`
+- `handmade-figures/LocustaRPC.pdf`
 - `handmade-figures/message-write.drawio.pdf`
 
 ## 1. 重複（番号/表現）
@@ -23,7 +23,7 @@
 ### `handmade-figures/in-node-architecture.drawio.pdf`
 - `send/revc bufffer` -> `send/recv buffer`
 
-### `handmade-figures/copyrpc.pdf`
+### `handmade-figures/LocustaRPC.pdf`
 - `issue resuest` -> `issue request`
 
 ## 3. 表記揺れ
@@ -50,7 +50,7 @@
 - `stateチェック` / `state可視化` の和英混在
   - 対応: `state check` / `publish state` などどちらかに統一
 
-### `handmade-figures/copyrpc.pdf`
+### `handmade-figures/LocustaRPC.pdf`
 - `remain length` と `length` の関係が曖昧
   - 対応: `remaining length` に統一し，通常長は `length`
 
