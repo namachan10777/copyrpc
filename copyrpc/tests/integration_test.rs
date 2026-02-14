@@ -3499,3 +3499,553 @@ fn test_credit_exhaustion_recovery() {
         MIN_COMPLETED
     );
 }
+
+// =============================================================================
+// DC Transport: Bidirectional Stress Test
+// =============================================================================
+
+/// Connection info for DC transport endpoints.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+struct DcConnectionInfo {
+    dct_number: u32,
+    local_identifier: u16,
+    _padding: u16,
+    dc_key: u64,
+    recv_ring_addr: u64,
+    recv_ring_rkey: u32,
+    endpoint_id: u32,
+    recv_ring_size: u64,
+    initial_credit: u64,
+}
+
+/// Minimal DC bidirectional test: both sides send calls AND reply to incoming requests.
+/// Reproduces the benchkv 2-rank hang where DC transport freezes after ~17K operations.
+#[test]
+fn test_dc_bidirectional_stress() {
+    use copyrpc::dc;
+    use mlx5::dc::DciConfig;
+
+    const RING_SIZE: usize = 4 * 1024 * 1024; // 4 MB (same as benchkv default)
+    const CALLS_PER_SIDE: usize = 50_000;
+    const QUEUE_DEPTH: usize = 4;
+
+    let client_completed = Arc::new(AtomicU32::new(0));
+    let client_completed_cb = client_completed.clone();
+
+    let (server_info_tx, server_info_rx) = mpsc::channel::<DcConnectionInfo>();
+    let (client_info_tx, client_info_rx) = mpsc::channel::<DcConnectionInfo>();
+    let server_ready = Arc::new(AtomicU32::new(0));
+    let server_ready_clone = server_ready.clone();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let server_stop = stop_flag.clone();
+    let server_completed = Arc::new(AtomicU32::new(0));
+    let server_completed_clone = server_completed.clone();
+
+    // Server thread
+    let handle: JoinHandle<()> = thread::spawn(move || {
+        let server_completed_for_cb = server_completed_clone.clone();
+        let mut on_response = move |_user_data: u32, _data: &[u8]| {
+            server_completed_for_cb.fetch_add(1, Ordering::SeqCst);
+        };
+
+        let ctx: dc::Context<u32> = dc::ContextBuilder::new()
+            .device_index(0)
+            .port(1)
+            .dci_config(DciConfig {
+                max_send_wr: 256,
+                max_send_sge: 1,
+                max_inline_data: 256,
+            })
+            .srq_config(SrqConfig {
+                max_wr: 4096,
+                max_sge: 1,
+            })
+            .cq_size(2048)
+            .build()
+            .expect("Server: Failed to create dc context");
+
+        let ep_config = dc::EndpointConfig {
+            send_ring_size: RING_SIZE,
+            recv_ring_size: RING_SIZE,
+        };
+        let mut ep = ctx
+            .create_endpoint(&ep_config)
+            .expect("Server: Failed to create endpoint");
+
+        let (info, lid, _) = ep.local_info(ctx.lid(), ctx.port());
+        server_info_tx
+            .send(DcConnectionInfo {
+                dct_number: info.dct_number,
+                local_identifier: lid,
+                dc_key: info.dc_key,
+                recv_ring_addr: info.recv_ring_addr,
+                recv_ring_rkey: info.recv_ring_rkey,
+                endpoint_id: info.endpoint_id,
+                recv_ring_size: info.recv_ring_size,
+                initial_credit: info.initial_credit,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let client_info = client_info_rx.recv().unwrap();
+        ep.connect(
+            &dc::RemoteEndpointInfo {
+                dct_number: client_info.dct_number,
+                dc_key: client_info.dc_key,
+                local_identifier: client_info.local_identifier,
+                recv_ring_addr: client_info.recv_ring_addr,
+                recv_ring_rkey: client_info.recv_ring_rkey,
+                recv_ring_size: client_info.recv_ring_size,
+                initial_credit: client_info.initial_credit,
+                endpoint_id: client_info.endpoint_id,
+            },
+            0,
+            ctx.port(),
+        )
+        .expect("Server: Failed to connect");
+
+        server_ready_clone.store(1, Ordering::Release);
+
+        let request_data = vec![0u8; 24];
+        let response_data = vec![0u8; 16];
+        let mut sent: usize = 0;
+
+        while !server_stop.load(Ordering::Relaxed) {
+            ctx.poll(&mut on_response);
+
+            while let Some(req) = ctx.recv() {
+                loop {
+                    match req.reply(&response_data) {
+                        Ok(()) => break,
+                        Err(copyrpc::error::Error::RingFull) => {
+                            ctx.poll(&mut on_response);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+
+            let completed = server_completed_clone.load(Ordering::SeqCst) as usize;
+            let mut inflight = sent.saturating_sub(completed);
+            while inflight < QUEUE_DEPTH && sent < CALLS_PER_SIDE {
+                match ep.call(&request_data, sent as u32, 0) {
+                    Ok(_) => {
+                        sent += 1;
+                        inflight += 1;
+                    }
+                    Err(
+                        copyrpc::error::CallError::RingFull(_)
+                        | copyrpc::error::CallError::InsufficientCredit(_),
+                    ) => break,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // Drain
+        let drain_start = std::time::Instant::now();
+        while (server_completed_clone.load(Ordering::SeqCst) as usize) < CALLS_PER_SIDE
+            && drain_start.elapsed() < Duration::from_secs(5)
+        {
+            ctx.poll(&mut on_response);
+            while let Some(req) = ctx.recv() {
+                let _ = req.reply(&response_data);
+            }
+        }
+        eprintln!(
+            "Server: sent={}, completed={}",
+            sent,
+            server_completed_clone.load(Ordering::SeqCst)
+        );
+    });
+
+    // Client side
+    let ctx: dc::Context<u32> = dc::ContextBuilder::new()
+        .device_index(0)
+        .port(1)
+        .dci_config(DciConfig {
+            max_send_wr: 256,
+            max_send_sge: 1,
+            max_inline_data: 256,
+        })
+        .srq_config(SrqConfig {
+            max_wr: 4096,
+            max_sge: 1,
+        })
+        .cq_size(2048)
+        .build()
+        .expect("Client: Failed to create dc context");
+
+    let ep_config = dc::EndpointConfig {
+        send_ring_size: RING_SIZE,
+        recv_ring_size: RING_SIZE,
+    };
+    let mut ep = ctx
+        .create_endpoint(&ep_config)
+        .expect("Client: Failed to create endpoint");
+
+    let (info, lid, _) = ep.local_info(ctx.lid(), ctx.port());
+    client_info_tx
+        .send(DcConnectionInfo {
+            dct_number: info.dct_number,
+            local_identifier: lid,
+            dc_key: info.dc_key,
+            recv_ring_addr: info.recv_ring_addr,
+            recv_ring_rkey: info.recv_ring_rkey,
+            endpoint_id: info.endpoint_id,
+            recv_ring_size: info.recv_ring_size,
+            initial_credit: info.initial_credit,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let server_info = server_info_rx.recv().unwrap();
+    while server_ready.load(Ordering::Acquire) == 0 {
+        std::hint::spin_loop();
+    }
+
+    ep.connect(
+        &dc::RemoteEndpointInfo {
+            dct_number: server_info.dct_number,
+            dc_key: server_info.dc_key,
+            local_identifier: server_info.local_identifier,
+            recv_ring_addr: server_info.recv_ring_addr,
+            recv_ring_rkey: server_info.recv_ring_rkey,
+            recv_ring_size: server_info.recv_ring_size,
+            initial_credit: server_info.initial_credit,
+            endpoint_id: server_info.endpoint_id,
+        },
+        0,
+        ctx.port(),
+    )
+    .expect("Client: Failed to connect");
+
+    let mut on_response = move |_user_data: u32, _data: &[u8]| {
+        client_completed_cb.fetch_add(1, Ordering::SeqCst);
+    };
+
+    let request_data = vec![0u8; 24];
+    let response_data = vec![0u8; 16];
+    let mut sent: usize = 0;
+    let timeout = Duration::from_secs(30);
+    let start = std::time::Instant::now();
+
+    while sent < CALLS_PER_SIDE
+        || (client_completed.load(Ordering::SeqCst) as usize) < CALLS_PER_SIDE
+    {
+        if start.elapsed() > timeout {
+            let cc = client_completed.load(Ordering::SeqCst) as usize;
+            let sc = server_completed.load(Ordering::SeqCst) as usize;
+            stop_flag.store(true, Ordering::SeqCst);
+            let _ = handle.join();
+            panic!(
+                "DC bidir TIMEOUT: client sent={} completed={}, server completed={}",
+                sent, cc, sc
+            );
+        }
+
+        ctx.poll(&mut on_response);
+
+        while let Some(req) = ctx.recv() {
+            loop {
+                match req.reply(&response_data) {
+                    Ok(()) => break,
+                    Err(copyrpc::error::Error::RingFull) => {
+                        ctx.poll(&mut on_response);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        let completed = client_completed.load(Ordering::SeqCst) as usize;
+        let mut inflight = sent.saturating_sub(completed);
+        while inflight < QUEUE_DEPTH && sent < CALLS_PER_SIDE {
+            match ep.call(&request_data, sent as u32, 0) {
+                Ok(_) => {
+                    sent += 1;
+                    inflight += 1;
+                }
+                Err(
+                    copyrpc::error::CallError::RingFull(_)
+                    | copyrpc::error::CallError::InsufficientCredit(_),
+                ) => break,
+                Err(_) => break,
+            }
+        }
+    }
+
+    // Drain server side
+    let drain_start = std::time::Instant::now();
+    while (server_completed.load(Ordering::SeqCst) as usize) < CALLS_PER_SIDE
+        && drain_start.elapsed() < Duration::from_secs(5)
+    {
+        ctx.poll(&mut on_response);
+        while let Some(req) = ctx.recv() {
+            let _ = req.reply(&response_data);
+        }
+    }
+
+    stop_flag.store(true, Ordering::SeqCst);
+    handle.join().expect("Server thread panicked");
+
+    let cc = client_completed.load(Ordering::SeqCst) as usize;
+    let sc = server_completed.load(Ordering::SeqCst) as usize;
+    eprintln!(
+        "DC bidir: client sent={} completed={}, server completed={}",
+        sent, cc, sc
+    );
+
+    assert_eq!(cc, CALLS_PER_SIDE, "Client did not receive all responses");
+    assert_eq!(sc, CALLS_PER_SIDE, "Server did not receive all responses");
+}
+
+/// DC bidirectional with tiny ring — forces many wraps and credit pressure.
+#[test]
+fn test_dc_bidirectional_tiny_ring() {
+    use copyrpc::dc;
+    use mlx5::dc::DciConfig;
+
+    const RING_SIZE: usize = 8192; // 8 KB — wraps every ~128 messages
+    const CALLS_PER_SIDE: usize = 10_000;
+    const QUEUE_DEPTH: usize = 2;
+
+    let client_completed = Arc::new(AtomicU32::new(0));
+    let client_completed_cb = client_completed.clone();
+
+    let (server_info_tx, server_info_rx) = mpsc::channel::<DcConnectionInfo>();
+    let (client_info_tx, client_info_rx) = mpsc::channel::<DcConnectionInfo>();
+    let server_ready = Arc::new(AtomicU32::new(0));
+    let server_ready_clone = server_ready.clone();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let server_stop = stop_flag.clone();
+    let server_completed = Arc::new(AtomicU32::new(0));
+    let server_completed_clone = server_completed.clone();
+
+    let handle: JoinHandle<()> = thread::spawn(move || {
+        let server_completed_for_cb = server_completed_clone.clone();
+        let mut on_response = move |_user_data: u32, _data: &[u8]| {
+            server_completed_for_cb.fetch_add(1, Ordering::SeqCst);
+        };
+
+        let ctx: dc::Context<u32> = dc::ContextBuilder::new()
+            .device_index(0)
+            .port(1)
+            .dci_config(DciConfig {
+                max_send_wr: 256,
+                max_send_sge: 1,
+                max_inline_data: 256,
+            })
+            .srq_config(SrqConfig {
+                max_wr: 4096,
+                max_sge: 1,
+            })
+            .cq_size(2048)
+            .build()
+            .expect("Server dc ctx");
+
+        let ep_config = dc::EndpointConfig {
+            send_ring_size: RING_SIZE,
+            recv_ring_size: RING_SIZE,
+        };
+        let mut ep = ctx.create_endpoint(&ep_config).expect("Server ep");
+        let (info, lid, _) = ep.local_info(ctx.lid(), ctx.port());
+        server_info_tx
+            .send(DcConnectionInfo {
+                dct_number: info.dct_number,
+                local_identifier: lid,
+                dc_key: info.dc_key,
+                recv_ring_addr: info.recv_ring_addr,
+                recv_ring_rkey: info.recv_ring_rkey,
+                endpoint_id: info.endpoint_id,
+                recv_ring_size: info.recv_ring_size,
+                initial_credit: info.initial_credit,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let ci = client_info_rx.recv().unwrap();
+        ep.connect(
+            &dc::RemoteEndpointInfo {
+                dct_number: ci.dct_number,
+                dc_key: ci.dc_key,
+                local_identifier: ci.local_identifier,
+                recv_ring_addr: ci.recv_ring_addr,
+                recv_ring_rkey: ci.recv_ring_rkey,
+                recv_ring_size: ci.recv_ring_size,
+                initial_credit: ci.initial_credit,
+                endpoint_id: ci.endpoint_id,
+            },
+            0,
+            ctx.port(),
+        )
+        .expect("Server connect");
+        server_ready_clone.store(1, Ordering::Release);
+
+        let req_data = vec![0u8; 24];
+        let resp_data = vec![0u8; 16];
+        let mut sent: usize = 0;
+        while !server_stop.load(Ordering::Relaxed) {
+            ctx.poll(&mut on_response);
+            while let Some(req) = ctx.recv() {
+                loop {
+                    match req.reply(&resp_data) {
+                        Ok(()) => break,
+                        Err(copyrpc::error::Error::RingFull) => ctx.poll(&mut on_response),
+                        Err(_) => break,
+                    }
+                }
+            }
+            let completed = server_completed_clone.load(Ordering::SeqCst) as usize;
+            let mut inflight = sent.saturating_sub(completed);
+            while inflight < QUEUE_DEPTH && sent < CALLS_PER_SIDE {
+                match ep.call(&req_data, sent as u32, 0) {
+                    Ok(_) => {
+                        sent += 1;
+                        inflight += 1;
+                    }
+                    Err(
+                        copyrpc::error::CallError::RingFull(_)
+                        | copyrpc::error::CallError::InsufficientCredit(_),
+                    ) => break,
+                    Err(_) => break,
+                }
+            }
+        }
+        let drain_start = std::time::Instant::now();
+        while (server_completed_clone.load(Ordering::SeqCst) as usize) < CALLS_PER_SIDE
+            && drain_start.elapsed() < Duration::from_secs(5)
+        {
+            ctx.poll(&mut on_response);
+            while let Some(req) = ctx.recv() {
+                let _ = req.reply(&resp_data);
+            }
+        }
+        if (server_completed_clone.load(Ordering::SeqCst) as usize) < CALLS_PER_SIDE {
+            ctx.dump_credit_state("SERVER-DRAIN-TIMEOUT");
+        }
+    });
+
+    let ctx: dc::Context<u32> = dc::ContextBuilder::new()
+        .device_index(0)
+        .port(1)
+        .dci_config(DciConfig {
+            max_send_wr: 256,
+            max_send_sge: 1,
+            max_inline_data: 256,
+        })
+        .srq_config(SrqConfig {
+            max_wr: 4096,
+            max_sge: 1,
+        })
+        .cq_size(2048)
+        .build()
+        .expect("Client dc ctx");
+
+    let ep_config = dc::EndpointConfig {
+        send_ring_size: RING_SIZE,
+        recv_ring_size: RING_SIZE,
+    };
+    let mut ep = ctx.create_endpoint(&ep_config).expect("Client ep");
+    let (info, lid, _) = ep.local_info(ctx.lid(), ctx.port());
+    client_info_tx
+        .send(DcConnectionInfo {
+            dct_number: info.dct_number,
+            local_identifier: lid,
+            dc_key: info.dc_key,
+            recv_ring_addr: info.recv_ring_addr,
+            recv_ring_rkey: info.recv_ring_rkey,
+            endpoint_id: info.endpoint_id,
+            recv_ring_size: info.recv_ring_size,
+            initial_credit: info.initial_credit,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let si = server_info_rx.recv().unwrap();
+    while server_ready.load(Ordering::Acquire) == 0 {
+        std::hint::spin_loop();
+    }
+    ep.connect(
+        &dc::RemoteEndpointInfo {
+            dct_number: si.dct_number,
+            dc_key: si.dc_key,
+            local_identifier: si.local_identifier,
+            recv_ring_addr: si.recv_ring_addr,
+            recv_ring_rkey: si.recv_ring_rkey,
+            recv_ring_size: si.recv_ring_size,
+            initial_credit: si.initial_credit,
+            endpoint_id: si.endpoint_id,
+        },
+        0,
+        ctx.port(),
+    )
+    .expect("Client connect");
+
+    let mut on_response = move |_: u32, _: &[u8]| {
+        client_completed_cb.fetch_add(1, Ordering::SeqCst);
+    };
+    let req_data = vec![0u8; 24];
+    let resp_data = vec![0u8; 16];
+    let mut sent: usize = 0;
+    let timeout = Duration::from_secs(30);
+    let start = std::time::Instant::now();
+
+    while sent < CALLS_PER_SIDE
+        || (client_completed.load(Ordering::SeqCst) as usize) < CALLS_PER_SIDE
+    {
+        if start.elapsed() > timeout {
+            let cc = client_completed.load(Ordering::SeqCst) as usize;
+            let sc = server_completed.load(Ordering::SeqCst) as usize;
+            ctx.dump_credit_state("CLIENT-TIMEOUT");
+            stop_flag.store(true, Ordering::SeqCst);
+            let _ = handle.join();
+            panic!(
+                "DC tiny-ring TIMEOUT: client sent={sent} completed={cc}, server completed={sc}"
+            );
+        }
+        ctx.poll(&mut on_response);
+        while let Some(req) = ctx.recv() {
+            loop {
+                match req.reply(&resp_data) {
+                    Ok(()) => break,
+                    Err(copyrpc::error::Error::RingFull) => ctx.poll(&mut on_response),
+                    Err(_) => break,
+                }
+            }
+        }
+        let completed = client_completed.load(Ordering::SeqCst) as usize;
+        let mut inflight = sent.saturating_sub(completed);
+        while inflight < QUEUE_DEPTH && sent < CALLS_PER_SIDE {
+            match ep.call(&req_data, sent as u32, 0) {
+                Ok(_) => {
+                    sent += 1;
+                    inflight += 1;
+                }
+                Err(
+                    copyrpc::error::CallError::RingFull(_)
+                    | copyrpc::error::CallError::InsufficientCredit(_),
+                ) => break,
+                Err(_) => break,
+            }
+        }
+    }
+
+    let drain_start = std::time::Instant::now();
+    while (server_completed.load(Ordering::SeqCst) as usize) < CALLS_PER_SIDE
+        && drain_start.elapsed() < Duration::from_secs(5)
+    {
+        ctx.poll(&mut on_response);
+        while let Some(req) = ctx.recv() {
+            let _ = req.reply(&resp_data);
+        }
+    }
+
+    stop_flag.store(true, Ordering::SeqCst);
+    handle.join().expect("Server panicked");
+    let cc = client_completed.load(Ordering::SeqCst) as usize;
+    let sc = server_completed.load(Ordering::SeqCst) as usize;
+    assert_eq!(cc, CALLS_PER_SIDE, "Client incomplete");
+    assert_eq!(sc, CALLS_PER_SIDE, "Server incomplete");
+}

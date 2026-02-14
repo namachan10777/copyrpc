@@ -9,6 +9,8 @@ mod memstat;
 mod mpi_util;
 mod parquet_out;
 mod qd_sample;
+mod shm;
+mod slot;
 mod storage;
 mod ucx_am;
 mod ucx_am_backend;
@@ -23,11 +25,11 @@ use mpi::collective::CommunicatorCollectives;
 use mpi::topology::Communicator;
 
 use daemon::{CopyrpcDcSetup, DaemonFlux, DcEndpointConnectionInfo};
-use message::{DelegatePayload, Request, Response};
+use message::DelegatePayload;
 
 #[derive(Parser, Debug)]
 #[command(name = "benchkv")]
-#[command(about = "Distributed KV benchmark over copyrpc + inproc + ipc")]
+#[command(about = "Distributed KV benchmark over copyrpc + inproc + shm")]
 struct Cli {
     /// Benchmark duration in seconds
     #[arg(short = 'd', long, default_value = "30")]
@@ -61,8 +63,8 @@ struct Cli {
     #[arg(long, default_value = "1")]
     client_threads: usize,
 
-    /// Queue depth per client (power of 2)
-    #[arg(long, default_value = "4")]
+    /// Queue depth per client (unused, kept for CLI compat)
+    #[arg(long, default_value = "1")]
     queue_depth: u32,
 
     /// Key range per node
@@ -137,8 +139,8 @@ fn main() {
     let num_clients = cli.client_threads;
 
     eprintln!(
-        "rank {}: {} daemons, {} clients, QD={}, key_range={}, ranks={}, mode={:?}",
-        rank, num_daemons, num_clients, cli.queue_depth, cli.key_range, size, cli.subcommand
+        "rank {}: {} daemons, {} clients, key_range={}, ranks={}, mode={:?}",
+        rank, num_daemons, num_clients, cli.key_range, size, cli.subcommand
     );
 
     let all_rows = match &cli.subcommand {
@@ -203,11 +205,6 @@ fn run_meta(
     num_daemons: usize,
     num_clients: usize,
 ) -> Vec<parquet_out::BenchRow> {
-    let queue_depth = cli.queue_depth;
-    if queue_depth != 1 {
-        panic!("meta mode requires --queue-depth=1 (got {})", queue_depth);
-    }
-
     // CPU affinity
     let available_cores = affinity::get_available_cores(cli.device_index);
     let (ranks_on_node, rank_on_node) = mpi_util::node_local_rank(world);
@@ -234,28 +231,15 @@ fn run_meta(
         })
         .collect();
 
-    // Create ipc servers
+    // Create shm servers (one per daemon)
     let shm_paths: Vec<String> = (0..num_daemons)
         .map(|d| format!("/benchkv_{}_{}", rank, d))
         .collect();
 
-    // All clients connect to all daemons
     let max_clients_per_daemon = num_clients as u32;
-    let mut servers: Vec<Option<ipc::Server<Request, Response>>> = shm_paths
+    let mut servers: Vec<Option<shm::ShmServer>> = shm_paths
         .iter()
-        .map(|path| {
-            Some(
-                unsafe {
-                    ipc::Server::<Request, Response>::create(
-                        path,
-                        max_clients_per_daemon,
-                        queue_depth,
-                        message::CLIENT_SLOT_SIZE as u32,
-                    )
-                }
-                .expect("Failed to create ipc server"),
-            )
-        })
+        .map(|path| Some(shm::ShmServer::create(path, max_clients_per_daemon)))
         .collect();
 
     // Create Flux network (used for copyrpc recv forwarding between daemons)
@@ -277,7 +261,6 @@ fn run_meta(
     let ready_barrier = Arc::new(Barrier::new(num_daemons + 1));
 
     // copyrpc setup channels (per-daemon for multi-node)
-    // Each daemon handles remote ranks where rank % num_daemons == daemon_id
     let (copyrpc_local_rxs, copyrpc_remote_txs, copyrpc_setups) = if size > 1 {
         let mut local_rxs = Vec::with_capacity(num_daemons);
         let mut remote_txs = Vec::with_capacity(num_daemons);
@@ -325,7 +308,6 @@ fn run_meta(
         };
 
         let core = daemon_cores.get(d).copied();
-        let qd_interval = cli.qd_sample_dir.as_ref().map(|_| cli.qd_sample_interval);
 
         daemon_handles.push(std::thread::spawn(move || {
             if let Some(core_id) = core {
@@ -336,29 +318,22 @@ fn run_meta(
                 rank,
                 num_daemons,
                 key_range,
-                queue_depth,
                 server,
                 flux,
                 copyrpc_setup,
                 &stop,
                 &barrier,
-                qd_interval,
             )
         }));
     }
 
     // Main thread: MPI exchange for copyrpc (if multi-node)
-    // New topology: 1:1 per peer_rank
-    //   Pairing: (my_rank, daemon peer_rank%D) ↔ (peer_rank, daemon my_rank%D)
     if size > 1 {
-        // 1. Collect local endpoint infos from all daemons
-        //    Each daemon sends infos ordered by its my_remote_ranks list
         let daemon_local_infos: Vec<Vec<DcEndpointConnectionInfo>> = copyrpc_local_rxs
             .iter()
             .map(|rx| rx.recv().expect("Failed to receive daemon local info"))
             .collect();
 
-        // Compute each daemon's remote ranks list (same as what was passed to CopyrpcSetup)
         let daemon_remote_ranks: Vec<Vec<u32>> = (0..num_daemons)
             .map(|d| {
                 (0..size)
@@ -367,39 +342,28 @@ fn run_meta(
             })
             .collect();
 
-        // 2. Per-daemon accumulator for remote infos
         let mut daemon_remote_infos: Vec<Vec<DcEndpointConnectionInfo>> = (0..num_daemons)
             .map(|d| Vec::with_capacity(daemon_remote_ranks[d].len()))
             .collect();
 
-        // 3. For each peer rank, exchange 1 endpoint info
         for peer_rank in 0..size {
             if peer_rank == rank {
                 continue;
             }
-            // Local daemon handling this peer: peer_rank % num_daemons
             let local_daemon = (peer_rank as usize) % num_daemons;
-            // Find the index of peer_rank in that daemon's my_remote_ranks
             let local_ep_idx = daemon_remote_ranks[local_daemon]
                 .iter()
                 .position(|&r| r == peer_rank)
                 .expect("peer_rank must be in local_daemon's remote_ranks");
 
-            // Send this daemon's endpoint info for this peer
             let send_bytes = daemon_local_infos[local_daemon][local_ep_idx].to_bytes();
-
-            // Exchange with peer rank
             let recv_bytes =
                 mpi_util::exchange_bytes(world, rank as i32, peer_rank as i32, &send_bytes);
 
-            // The received info belongs to the remote daemon that handles our rank:
-            // remote daemon = rank % num_daemons (on peer_rank's node)
-            // But we need to give it to the local daemon that owns the connection: local_daemon
             let remote_info = DcEndpointConnectionInfo::from_bytes(&recv_bytes);
             daemon_remote_infos[local_daemon].push(remote_info);
         }
 
-        // 4. Send remote infos to each daemon (in my_remote_ranks order)
         for (d, tx) in copyrpc_remote_txs.iter().enumerate() {
             tx.send(std::mem::take(&mut daemon_remote_infos[d]))
                 .expect("Failed to send remote info to daemon");
@@ -413,12 +377,13 @@ fn run_meta(
     std::thread::sleep(Duration::from_millis(10));
     world.barrier();
 
-    // Spawn client threads (each connects to ALL daemons)
+    // Spawn client threads (each connects to ALL daemons via shm)
     let bench_start = Instant::now();
     let mut client_handles = Vec::with_capacity(num_clients);
-    for c in 0..num_clients {
+    for (c, pattern) in patterns.iter().enumerate() {
         let paths = shm_paths.clone();
-        let pattern = patterns[c].clone();
+        let nd = num_daemons;
+        let pattern = pattern.clone();
         let stop = stop_flag.clone();
         let core = client_cores.get(c).copied();
         let batch_size = cli.batch_size;
@@ -428,16 +393,12 @@ fn run_meta(
             if let Some(core_id) = core {
                 affinity::pin_thread(core_id, &format!("client-{}", c));
             }
-            client::run_client(
-                &paths,
-                num_daemons,
-                rank,
-                &pattern,
-                queue_depth,
-                &stop,
-                batch_size,
-                bs,
-            )
+            // Connect to all daemons via shm
+            let shm_clients: Vec<shm::ShmClient> = paths
+                .iter()
+                .map(|path| shm::ShmClient::connect(path, c as u32))
+                .collect();
+            client::run_client(shm_clients, nd, rank, &pattern, &stop, batch_size, bs)
         }));
     }
 
@@ -456,26 +417,8 @@ fn run_meta(
     // Stop
     stop_flag.store(true, Ordering::Release);
 
-    for (d, h) in daemon_handles.into_iter().enumerate() {
-        let samples = h.join().expect("Daemon thread panicked");
-        if let Some(ref dir) = cli.qd_sample_dir {
-            std::fs::create_dir_all(dir).ok();
-            let path = format!("{}/qd_rank{}_d{}.csv", dir, rank, d);
-            if let Err(e) = qd_sample::write_csv(&path, &samples) {
-                eprintln!(
-                    "  rank {} daemon {}: failed to write QD samples: {}",
-                    rank, d, e
-                );
-            } else {
-                eprintln!(
-                    "  rank {} daemon {}: {} QD samples -> {}",
-                    rank,
-                    d,
-                    samples.len(),
-                    path
-                );
-            }
-        }
+    for h in daemon_handles {
+        h.join().expect("Daemon thread panicked");
     }
 
     let client_batches: Vec<Vec<parquet_out::BatchRecord>> = client_handles
@@ -507,7 +450,7 @@ fn run_meta(
         &run_boundaries,
         num_daemons as u32,
         num_clients as u32,
-        queue_depth,
+        cli.queue_depth,
         cli.key_range,
         peak_process_rss_kb,
     )

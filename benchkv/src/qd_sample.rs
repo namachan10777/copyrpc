@@ -10,6 +10,16 @@ pub struct QdSample {
     pub extra: u32,
 }
 
+#[derive(Clone)]
+pub struct LoopSample {
+    pub elapsed_us: u64,
+    pub loops: u32,
+    pub cqe_recv: u32,
+    pub req_write: u32,
+    pub res_write: u32,
+    pub req_res_write_total: u32,
+}
+
 pub struct QdCollector {
     interval: u32,
     counter: u32,
@@ -65,6 +75,23 @@ pub fn write_csv(path: &str, samples: &[QdSample]) -> io::Result<()> {
             f,
             "{},{},{},{},{}",
             s.elapsed_us, s.copyrpc_inflight, s.flux_pending, s.ipc_inflight, s.extra
+        )?;
+    }
+    Ok(())
+}
+
+pub fn write_loop_csv(path: &str, samples: &[LoopSample]) -> io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    writeln!(
+        f,
+        "elapsed_us,loops,cqe_recv,req_write,res_write,req_res_write_total"
+    )?;
+    for s in samples {
+        writeln!(
+            f,
+            "{},{},{},{},{},{}",
+            s.elapsed_us, s.loops, s.cqe_recv, s.req_write, s.res_write, s.req_res_write_total
         )?;
     }
     Ok(())

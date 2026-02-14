@@ -771,6 +771,34 @@ impl Cq {
         count
     }
 
+    /// Check if there are pending CQEs without consuming them.
+    ///
+    /// This is a side-effect-free peek: it does not advance CI or consume mini CQEs.
+    /// Useful for fast-path checks to avoid closure construction when the CQ is empty.
+    #[inline(always)]
+    pub fn has_pending_cqe(&self) -> bool {
+        let pending = unsafe { &*self.state.pending_mini_cqes.get() };
+        if pending.is_some() {
+            return true;
+        }
+
+        let ci = self.state.ci.get();
+        let idx = ci & (self.state.cqe_cnt - 1);
+        let cqe_size = self.state.cqe_size as usize;
+        let cqe_ptr = unsafe { self.state.buf.add((idx as usize) * cqe_size) };
+        let cqe64_offset = if cqe_size == 128 { 64 } else { 0 };
+        let op_own = unsafe { std::ptr::read_volatile(cqe_ptr.add(cqe64_offset + 63)) };
+
+        let sw_owner = ((ci >> self.state.cqe_cnt_log2) & 1) as u8;
+        let hw_owner = op_own & 1;
+        sw_owner == hw_owner
+    }
+
+    /// Returns the current consumer index (CI) value.
+    pub fn ci(&self) -> u32 {
+        self.state.ci.get()
+    }
+
     /// Update the CQ doorbell record.
     ///
     /// Call this after processing completions to acknowledge them to the hardware.

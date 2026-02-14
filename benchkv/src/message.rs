@@ -4,7 +4,7 @@
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-// === ipc layer: Client ↔ Daemon ===
+// === Client ↔ Daemon (via /dev/shm slot) ===
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -22,6 +22,7 @@ pub enum Response {
     MetaGetNotFound,
 }
 
+// ipc::Serial needed by delegation_backend
 unsafe impl ipc::Serial for Request {}
 unsafe impl ipc::Serial for Response {}
 
@@ -39,18 +40,48 @@ impl Request {
             Request::MetaPut { key, .. } | Request::MetaGet { key, .. } => *key,
         }
     }
+
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                std::mem::size_of::<Self>(),
+            )
+        }
+    }
+
+    #[inline]
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        assert!(bytes.len() >= std::mem::size_of::<Self>());
+        unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const Self) }
+    }
+}
+
+impl Response {
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                std::mem::size_of::<Self>(),
+            )
+        }
+    }
+
+    #[inline]
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        assert!(bytes.len() >= std::mem::size_of::<Self>());
+        unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const Self) }
+    }
 }
 
 // === Flux layer: Daemon ↔ Daemon (intra-node delegation) ===
 
-/// Payload exchanged over Flux between daemon threads.
-/// Used for both the call value and the reply value.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub enum DelegatePayload {
-    /// A request forwarded to the key-owning daemon (or Daemon #0 for remote).
     Req(Request),
-    /// The response from the key-owning daemon.
     Resp(Response),
 }
 
@@ -58,14 +89,12 @@ unsafe impl inproc::Serial for DelegatePayload {}
 
 // === copyrpc layer: inter-node communication ===
 
-/// Serialized copyrpc request payload.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct RemoteRequest {
     pub request: Request,
 }
 
-/// Serialized copyrpc response payload.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct RemoteResponse {
