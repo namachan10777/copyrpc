@@ -7,31 +7,31 @@
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub enum Request {
-    MetaPut { rank: u32, key: u64, value: u64 },
-    MetaGet { rank: u32, key: u64 },
+    AggPut { rank: u32, key: u64, value: u64 },
+    AggGet { rank: u32, key: u64 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
 #[allow(clippy::enum_variant_names)]
 pub enum Response {
-    MetaPutOk,
-    MetaGetOk { value: u64 },
-    MetaGetNotFound,
+    AggPutOk,
+    AggGetOk { value: u64 },
+    AggGetNotFound,
 }
 
 impl Request {
     #[inline]
     pub fn rank(&self) -> u32 {
         match self {
-            Request::MetaPut { rank, .. } | Request::MetaGet { rank, .. } => *rank,
+            Request::AggPut { rank, .. } | Request::AggGet { rank, .. } => *rank,
         }
     }
 
     #[inline]
     pub fn key(&self) -> u64 {
         match self {
-            Request::MetaPut { key, .. } | Request::MetaGet { key, .. } => *key,
+            Request::AggPut { key, .. } | Request::AggGet { key, .. } => *key,
         }
     }
 

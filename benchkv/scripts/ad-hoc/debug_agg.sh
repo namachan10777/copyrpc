@@ -36,12 +36,12 @@ CLIENT_THREADS=46
 QD=1
 
 for NP in 2 4 6 8; do
-  echo "=== meta NP=$NP ==="
+  echo "=== agg NP=$NP ==="
   timeout 60 mpirun --hostfile "$PBS_NODEFILE" -np $NP --map-by node --bind-to none "$BENCH" \
     -d $DURATION -r $RUNS --server-threads $SERVER_THREADS --client-threads $CLIENT_THREADS --queue-depth $QD \
-    -o "$OUTDIR/debug_meta_np${NP}.parquet" \
-    meta \
-    || echo "FAILED: meta NP=$NP"
+    -o "$OUTDIR/debug_agg_np${NP}.parquet" \
+    agg \
+    || echo "FAILED: agg NP=$NP"
 done
 
 echo "=== copyrpc-direct comparison ==="

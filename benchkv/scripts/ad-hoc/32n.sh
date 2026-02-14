@@ -41,12 +41,12 @@ CLIENT_THREADS=46
 QD=1
 
 for NP in 24 32; do
-  echo "=== meta NP=$NP ==="
+  echo "=== agg NP=$NP ==="
   timeout 120 mpirun --hostfile "$PBS_NODEFILE" -np $NP --map-by node --bind-to none "$BENCH" \
     -d $DURATION -r $RUNS --server-threads $SERVER_THREADS --client-threads $CLIENT_THREADS --queue-depth $QD \
-    -o "$OUTDIR/meta_np${NP}.parquet" \
-    meta \
-    || echo "FAILED: meta NP=$NP"
+    -o "$OUTDIR/agg_np${NP}.parquet" \
+    agg \
+    || echo "FAILED: agg NP=$NP"
 
   echo "=== copyrpc-direct NP=$NP ==="
   timeout 120 mpirun --hostfile "$PBS_NODEFILE" -np $NP --map-by node --bind-to none "$BENCH" \

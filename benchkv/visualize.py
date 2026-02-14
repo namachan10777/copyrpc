@@ -91,7 +91,7 @@ summary = summary.with_columns(
 
 # Pretty mode names
 MODE_LABELS = {
-    "meta": "Meta (copyrpc+ipc+Flux)",
+    "agg": "Agg (copyrpc+ipc+Flux)",
     "copyrpc_direct": "copyrpc (direct)",
     "ucx_am": "UCX Active Message",
 }
@@ -102,7 +102,7 @@ summary = summary.with_columns(
 pdf = summary.to_pandas()
 
 # Consistent colors
-backend_order = ["Meta (copyrpc+ipc+Flux)", "copyrpc (direct)", "UCX Active Message"]
+backend_order = ["Agg (copyrpc+ipc+Flux)", "copyrpc (direct)", "UCX Active Message"]
 color_scale = alt.Scale(
     domain=backend_order,
     range=["#1f77b4", "#ff7f0e", "#d62728"],

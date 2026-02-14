@@ -643,25 +643,25 @@ fn run_direct_client_loop(
 
 fn handle_local(store: &mut ShardedStore, req: &Request) -> Response {
     match *req {
-        Request::MetaPut { key, value, .. } => {
+        Request::AggPut { key, value, .. } => {
             store.put(key, value);
-            Response::MetaPutOk
+            Response::AggPutOk
         }
-        Request::MetaGet { key, .. } => match store.get(key) {
-            Some(v) => Response::MetaGetOk { value: v },
-            None => Response::MetaGetNotFound,
+        Request::AggGet { key, .. } => match store.get(key) {
+            Some(v) => Response::AggGetOk { value: v },
+            None => Response::AggGetNotFound,
         },
     }
 }
 
 fn make_request(entry: &AccessEntry) -> Request {
     if entry.is_read {
-        Request::MetaGet {
+        Request::AggGet {
             rank: entry.rank,
             key: entry.key,
         }
     } else {
-        Request::MetaPut {
+        Request::AggPut {
             rank: entry.rank,
             key: entry.key,
             value: entry.key,

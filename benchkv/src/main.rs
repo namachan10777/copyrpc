@@ -86,11 +86,11 @@ struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 enum SubCmd {
-    /// copyrpc meta_put/meta_get benchmark
-    Meta,
-    /// UCX Active Message meta_put/meta_get benchmark
+    /// copyrpc agg_put/agg_get benchmark
+    Agg,
+    /// UCX Active Message agg_put/agg_get benchmark
     UcxAm,
-    /// copyrpc direct (no ipc/Flux) meta_put/meta_get benchmark
+    /// copyrpc direct (no ipc/Flux) agg_put/agg_get benchmark
     CopyrpcDirect,
 }
 
@@ -112,7 +112,7 @@ fn main() {
     );
 
     let all_rows = match &cli.subcommand {
-        SubCmd::Meta => run_meta(&cli, &world, rank, size, num_daemons, num_clients),
+        SubCmd::Agg => run_agg(&cli, &world, rank, size, num_daemons, num_clients),
         SubCmd::UcxAm => {
             ucx_am_backend::run_ucx_am(&cli, &world, rank, size, num_daemons, num_clients)
         }
@@ -137,7 +137,7 @@ fn main() {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_meta(
+fn run_agg(
     cli: &Cli,
     world: &mpi::topology::SimpleCommunicator,
     rank: u32,
@@ -381,10 +381,10 @@ fn run_meta(
         }
     }
 
-    let peak_process_rss_kb = memstat::report_peak_process_memory(world, rank, "meta");
+    let peak_process_rss_kb = memstat::report_peak_process_memory(world, rank, "agg");
 
     parquet_out::rows_from_batches(
-        "meta",
+        "agg",
         rank,
         &client_batches,
         &run_boundaries,

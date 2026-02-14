@@ -145,10 +145,11 @@ pub fn assign_cores(
     num_daemons: usize,
     num_clients: usize,
     _ranks_on_node: u32,
-    _rank_on_node: u32,
+    rank_on_node: u32,
 ) -> (Vec<usize>, Vec<usize>) {
     let total_needed = num_daemons + num_clients;
-    let my_cores = available;
+    let offset = rank_on_node as usize * total_needed;
+    let my_cores = &available[offset.min(available.len())..];
 
     let daemon_cores: Vec<usize> = my_cores.iter().take(num_daemons).copied().collect();
     let client_cores: Vec<usize> = my_cores

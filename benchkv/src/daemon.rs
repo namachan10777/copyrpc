@@ -85,6 +85,26 @@ impl DcEndpointConnectionInfo {
     }
 }
 
+// === Metrics types ===
+
+struct PhaseSample {
+    cq_poll_ns: u64,
+    incoming_ns: u64,
+    gq_scan_ns: u64,
+    flush_ns: u64,
+}
+
+#[allow(dead_code)]
+struct EventSample {
+    shm_req: u64,
+    shm_local: u64,
+    shm_remote: u64,
+    cqe_resp: u64,
+    incoming_req: u64,
+    flush: u64,
+    loops: u64,
+}
+
 // === Helpers ===
 
 fn handle_local(store: &mut ShardedStore, req: &Request) -> Response {
@@ -318,11 +338,34 @@ pub fn run_daemon(
     // Raw pointers for callback access without borrow conflicts.
     let ground_queue_ptr = std::ptr::addr_of_mut!(ground_queue);
 
-    // Loop timing instrumentation
+    // === Metrics instrumentation ===
     const SAMPLE_MASK: u64 = 4095; // sample every 4096 iterations
     let mut loop_counter: u64 = 0;
     let mut loop_time_samples: Vec<u64> = Vec::with_capacity(16384);
     let mut loop_start = fastant::Instant::now();
+
+    // Event counters (cumulative, recorded every SAMPLE_MASK iterations)
+    let mut total_shm_req: u64 = 0;
+    let mut total_shm_local: u64 = 0;
+    let mut total_shm_remote: u64 = 0;
+    let mut total_cqe_resp: u64 = 0;
+    let mut total_incoming_req: u64 = 0;
+    let mut total_flush: u64 = 0;
+    let mut total_ringfull_retry: u64 = 0;
+
+    // Per-sample event snapshots (for computing events/loop)
+    let mut prev_shm_req: u64 = 0;
+    let mut prev_shm_local: u64 = 0;
+    let mut prev_shm_remote: u64 = 0;
+    let mut prev_cqe_resp: u64 = 0;
+    let mut prev_incoming_req: u64 = 0;
+    let mut prev_flush: u64 = 0;
+
+    // Phase timing samples (ns per sampled iteration)
+    let mut phase_samples: Vec<PhaseSample> = Vec::with_capacity(16384);
+
+    // Per-sample event rate snapshots
+    let mut event_samples: Vec<EventSample> = Vec::with_capacity(16384);
 
     while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
         // Discover newly connected clients
@@ -333,6 +376,8 @@ pub fn run_daemon(
                 connected_count += 1;
             }
         }
+
+        let is_sample = (loop_counter & SAMPLE_MASK) == 0 && loop_counter > 0;
 
         // --- Prefetch: Phase 2 用の SHM slot を先行ロード ---
         #[cfg(target_arch = "x86_64")]
@@ -349,20 +394,23 @@ pub fn run_daemon(
             }
         }
 
-        // === Phase 1: Poll recv CQ + flush dirty endpoints (like ctx.poll()) ===
+        // === Phase 1: Poll recv CQ (no flush — separated to Phase 3) ===
+        let phase1_start = if is_sample { Some(fastant::Instant::now()) } else { None };
         if let Some(ctx) = ctx_ref {
-            ctx.poll(|ptrs: SlotPtrs, data: &[u8]| unsafe {
-
+            let cqe_count = ctx.poll_recv_counted(|ptrs: SlotPtrs, data: &[u8]| unsafe {
                 let req_seq = slot::slot_read_seq(ptrs.req);
                 let resp = RemoteResponse::from_bytes(data).response;
                 slot::slot_write(ptrs.resp, req_seq, resp.as_bytes());
                 (*ground_queue_ptr).push_back(ptrs.slot_idx as usize);
             });
+            total_cqe_resp += cqe_count as u64;
         }
 
-        // 1b. Handle incoming remote requests
+        // === Phase 1b: Handle incoming remote requests ===
+        let phase1b_start = if is_sample { Some(fastant::Instant::now()) } else { None };
         if let Some(ctx) = ctx_ref {
             while let Some(recv_handle) = ctx.recv() {
+                total_incoming_req += 1;
 
                 let req = RemoteRequest::from_bytes(recv_handle.data()).request;
                 let target_daemon = ShardedStore::owner_of(req.key(), num_daemons_u64) as usize;
@@ -408,6 +456,7 @@ pub fn run_daemon(
         }
 
         // === Phase 2: Ground Queue Scan ===
+        let phase2_start = if is_sample { Some(fastant::Instant::now()) } else { None };
         let scan_len = ground_queue.len();
         for _ in 0..scan_len {
             let slot_idx = ground_queue.pop_front().unwrap();
@@ -419,17 +468,21 @@ pub fn run_daemon(
                 continue;
             }
             last_req_seq[slot_idx] = req_seq;
+            total_shm_req += 1;
 
             let payload = unsafe { slot::slot_read_payload(s.req) };
             let req = Request::from_bytes(payload);
 
             let target_rank = req.rank();
             if target_rank == my_rank {
+                total_shm_local += 1;
                 let resp = handle_local(&mut store, &req);
                 unsafe { slot::slot_write(s.resp, req_seq, resp.as_bytes()) };
                 ground_queue.push_back(slot_idx);
                 continue;
             }
+
+            total_shm_remote += 1;
 
             let Some(ctx) = ctx_ref else {
                 // No copyrpc: respond with not-found
@@ -452,6 +505,7 @@ pub fn run_daemon(
                 Ok(_) => {}
                 Err(copyrpc::error::CallError::RingFull(_))
                 | Err(copyrpc::error::CallError::InsufficientCredit(_)) => {
+                    total_ringfull_retry += 1;
                     // Rollback: allow re-read next iteration
                     last_req_seq[slot_idx] = req_seq - 1;
                     ground_queue.push_back(slot_idx);
@@ -519,49 +573,145 @@ pub fn run_daemon(
         }
 
         // === Phase 3: Flush dirty endpoints ===
+        let phase3_start = if is_sample { Some(fastant::Instant::now()) } else { None };
         if let Some(ctx) = ctx_ref {
             if ctx.has_dirty_endpoints() {
+                total_flush += 1;
                 ctx.flush_endpoints();
             }
         }
 
-        // Sample loop time every 4096 iterations
-        if (loop_counter & SAMPLE_MASK) == 0 && loop_counter > 0 {
+        // === Sampling: record metrics every SAMPLE_MASK iterations ===
+        if is_sample {
             let now = fastant::Instant::now();
             let elapsed_ns = now.duration_since(loop_start).as_nanos() as u64;
-            // Per-iteration average over the last 4096 iterations
             let per_iter_ns = elapsed_ns / (SAMPLE_MASK + 1);
             loop_time_samples.push(per_iter_ns);
             loop_start = now;
+
+            // Phase timing for this sampled iteration
+            if let (Some(p1), Some(p1b), Some(p2), Some(p3)) =
+                (phase1_start, phase1b_start, phase2_start, phase3_start)
+            {
+                phase_samples.push(PhaseSample {
+                    cq_poll_ns: p1b.duration_since(p1).as_nanos() as u64,
+                    incoming_ns: p2.duration_since(p1b).as_nanos() as u64,
+                    gq_scan_ns: p3.duration_since(p2).as_nanos() as u64,
+                    flush_ns: now.duration_since(p3).as_nanos() as u64,
+                });
+            }
+
+            // Event rate snapshot
+            let interval = SAMPLE_MASK + 1;
+            event_samples.push(EventSample {
+                shm_req: total_shm_req - prev_shm_req,
+                shm_local: total_shm_local - prev_shm_local,
+                shm_remote: total_shm_remote - prev_shm_remote,
+                cqe_resp: total_cqe_resp - prev_cqe_resp,
+                incoming_req: total_incoming_req - prev_incoming_req,
+                flush: total_flush - prev_flush,
+                loops: interval,
+            });
+            prev_shm_req = total_shm_req;
+            prev_shm_local = total_shm_local;
+            prev_shm_remote = total_shm_remote;
+            prev_cqe_resp = total_cqe_resp;
+            prev_incoming_req = total_incoming_req;
+            prev_flush = total_flush;
         }
         loop_counter += 1;
     }
 
-    // Print loop time distribution
-    if !loop_time_samples.is_empty() {
-        let mut sorted = loop_time_samples.clone();
-        sorted.sort_unstable();
-        let len = sorted.len();
-        let sum: u64 = sorted.iter().sum();
-        let mean = sum / len as u64;
-        let p50 = sorted[len / 2];
-        let p90 = sorted[len * 90 / 100];
-        let p99 = sorted[len * 99 / 100];
-        let min = sorted[0];
-        let max = sorted[len - 1];
+    // === Print comprehensive metrics at shutdown ===
+    print_daemon_metrics(
+        daemon_id,
+        loop_counter,
+        total_shm_req,
+        total_shm_local,
+        total_shm_remote,
+        total_cqe_resp,
+        total_incoming_req,
+        total_flush,
+        total_ringfull_retry,
+        &loop_time_samples,
+        &phase_samples,
+        &event_samples,
+    );
+}
 
+fn percentile(sorted: &[u64], pct: usize) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = (sorted.len() * pct / 100).min(sorted.len() - 1);
+    sorted[idx]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_daemon_metrics(
+    daemon_id: usize,
+    loop_counter: u64,
+    total_shm_req: u64,
+    total_shm_local: u64,
+    total_shm_remote: u64,
+    total_cqe_resp: u64,
+    total_incoming_req: u64,
+    total_flush: u64,
+    total_ringfull_retry: u64,
+    loop_time_samples: &[u64],
+    phase_samples: &[PhaseSample],
+    event_samples: &[EventSample],
+) {
+    let n_samples = loop_time_samples.len();
+    eprintln!(
+        "[daemon-{daemon_id}] metrics ({loop_counter} loops, {n_samples} samples):"
+    );
+
+    // Cumulative event totals
+    let events_per_loop = |total: u64| -> f64 {
+        if loop_counter > 0 {
+            total as f64 / loop_counter as f64
+        } else {
+            0.0
+        }
+    };
+    eprintln!(
+        "  events/loop: shm_req={:.4} local={:.4} remote={:.4} cqe_resp={:.4} \
+         incoming={:.4} flush={:.4} ringfull={:.6}",
+        events_per_loop(total_shm_req),
+        events_per_loop(total_shm_local),
+        events_per_loop(total_shm_remote),
+        events_per_loop(total_cqe_resp),
+        events_per_loop(total_incoming_req),
+        events_per_loop(total_flush),
+        events_per_loop(total_ringfull_retry),
+    );
+    eprintln!(
+        "  totals: shm_req={total_shm_req} local={total_shm_local} remote={total_shm_remote} \
+         cqe_resp={total_cqe_resp} incoming={total_incoming_req} flush={total_flush} \
+         ringfull={total_ringfull_retry}",
+    );
+
+    // Loop time distribution
+    if !loop_time_samples.is_empty() {
+        let mut sorted = loop_time_samples.to_vec();
+        sorted.sort_unstable();
+        let sum: u64 = sorted.iter().sum();
+        let mean = sum / sorted.len() as u64;
         eprintln!(
-            "[daemon-{daemon_id}] loop time (ns/iter, {} samples, {} total iters): \
-             min={min} p50={p50} mean={mean} p90={p90} p99={p99} max={max}",
-            len,
-            loop_counter,
+            "  loop_ns (p50/p90/p99/max): {}/{}/{}/{} mean={}",
+            percentile(&sorted, 50),
+            percentile(&sorted, 90),
+            percentile(&sorted, 99),
+            sorted.last().copied().unwrap_or(0),
+            mean,
         );
 
         // Histogram with logarithmic buckets
         let buckets = [50, 100, 200, 500, 1000, 2000, 5000, 10000, 50000, 100000, u64::MAX];
         let labels = [
-            "≤50ns", "≤100ns", "≤200ns", "≤500ns", "≤1μs", "≤2μs", "≤5μs", "≤10μs", "≤50μs",
-            "≤100μs", ">100μs",
+            "<=50ns", "<=100ns", "<=200ns", "<=500ns", "<=1us", "<=2us",
+            "<=5us", "<=10us", "<=50us", "<=100us", ">100us",
         ];
         let mut counts = vec![0usize; buckets.len()];
         for &v in &sorted {
@@ -572,12 +722,60 @@ pub fn run_daemon(
                 }
             }
         }
-        eprint!("[daemon-{daemon_id}] histogram:");
+        eprint!("  loop_histogram:");
         for (i, &c) in counts.iter().enumerate() {
             if c > 0 {
                 eprint!(" {}={}", labels[i], c);
             }
         }
         eprintln!();
+    }
+
+    // Phase timing distribution
+    if !phase_samples.is_empty() {
+        let mut cq: Vec<u64> = phase_samples.iter().map(|s| s.cq_poll_ns).collect();
+        let mut inc: Vec<u64> = phase_samples.iter().map(|s| s.incoming_ns).collect();
+        let mut gq: Vec<u64> = phase_samples.iter().map(|s| s.gq_scan_ns).collect();
+        let mut fl: Vec<u64> = phase_samples.iter().map(|s| s.flush_ns).collect();
+        cq.sort_unstable();
+        inc.sort_unstable();
+        gq.sort_unstable();
+        fl.sort_unstable();
+        eprintln!(
+            "  phase_ns cq_poll  (p50/p90/p99): {}/{}/{}",
+            percentile(&cq, 50), percentile(&cq, 90), percentile(&cq, 99),
+        );
+        eprintln!(
+            "  phase_ns incoming (p50/p90/p99): {}/{}/{}",
+            percentile(&inc, 50), percentile(&inc, 90), percentile(&inc, 99),
+        );
+        eprintln!(
+            "  phase_ns gq_scan  (p50/p90/p99): {}/{}/{}",
+            percentile(&gq, 50), percentile(&gq, 90), percentile(&gq, 99),
+        );
+        eprintln!(
+            "  phase_ns flush    (p50/p90/p99): {}/{}/{}",
+            percentile(&fl, 50), percentile(&fl, 90), percentile(&fl, 99),
+        );
+    }
+
+    // Event rate per sample window
+    if !event_samples.is_empty() {
+        let mut req_rates: Vec<f64> = event_samples
+            .iter()
+            .map(|s| s.shm_req as f64 / s.loops as f64)
+            .collect();
+        let mut resp_rates: Vec<f64> = event_samples
+            .iter()
+            .map(|s| s.cqe_resp as f64 / s.loops as f64)
+            .collect();
+        req_rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        resp_rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let req_p50 = req_rates[req_rates.len() / 2];
+        let resp_p50 = resp_rates[resp_rates.len() / 2];
+        eprintln!(
+            "  event_rate/loop (p50): shm_req={:.4} cqe_resp={:.4}",
+            req_p50, resp_p50,
+        );
     }
 }

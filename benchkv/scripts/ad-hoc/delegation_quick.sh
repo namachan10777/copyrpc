@@ -37,12 +37,12 @@ for NP in 2 4; do
     delegation \
     || echo "FAILED: delegation NP=$NP"
 
-  echo "=== meta NP=$NP ==="
+  echo "=== agg NP=$NP ==="
   timeout 60 mpirun --hostfile "$PBS_NODEFILE" -np $NP --map-by node --bind-to none "$BENCH" \
     -d $DURATION -r $RUNS --server-threads $SERVER_THREADS --client-threads $CLIENT_THREADS --queue-depth $QD \
-    -o "$OUTDIR/deleg_meta_quick_np${NP}.parquet" \
-    meta \
-    || echo "FAILED: meta NP=$NP"
+    -o "$OUTDIR/deleg_agg_quick_np${NP}.parquet" \
+    agg \
+    || echo "FAILED: agg NP=$NP"
 done
 
 echo "=== Quick delegation test completed ==="

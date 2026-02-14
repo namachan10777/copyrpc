@@ -9,12 +9,12 @@ use crate::workload::AccessEntry;
 
 fn make_request(entry: &AccessEntry) -> Request {
     if entry.is_read {
-        Request::MetaGet {
+        Request::AggGet {
             rank: entry.rank,
             key: entry.key,
         }
     } else {
-        Request::MetaPut {
+        Request::AggPut {
             rank: entry.rank,
             key: entry.key,
             value: entry.key,

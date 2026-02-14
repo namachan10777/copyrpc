@@ -49,14 +49,14 @@ for NP in 2 4 6 8 16 24 32 48 64; do
     || echo "FAILED: delegation NP=$NP"
 done
 
-echo "=== meta comparison ==="
+echo "=== agg comparison ==="
 for NP in 2 4 8 16 32 64; do
-  echo "=== meta NP=$NP ==="
+  echo "=== agg NP=$NP ==="
   timeout 120 mpirun --hostfile "$PBS_NODEFILE" -np $NP --map-by node --bind-to none "$BENCH" \
     -d $DURATION -r $RUNS --server-threads $SERVER_THREADS --client-threads $CLIENT_THREADS --queue-depth $QD \
-    -o "$OUTDIR/deleg_meta_np${NP}.parquet" \
-    meta \
-    || echo "FAILED: meta NP=$NP"
+    -o "$OUTDIR/deleg_agg_np${NP}.parquet" \
+    agg \
+    || echo "FAILED: agg NP=$NP"
 done
 
 echo "=== Delegation benchmarks completed ==="
