@@ -433,6 +433,20 @@ impl<T> Srq<T> {
             .and_then(|s| s.process_completion(wqe_idx))
     }
 
+    /// Advance the SRQ consumer index by `count` without returning entries.
+    ///
+    /// This is used when CQEs are processed but the SRQ entry data is not needed
+    /// (e.g., RDMA WRITE+IMM where data goes directly to the target memory region,
+    /// not to the SRQ buffer). Advancing CI is still necessary so that `available()`
+    /// correctly tracks how many slots can be reposted.
+    pub fn advance_ci(&self, count: u32) {
+        let inner = self.0.borrow();
+        if let Some(state) = inner.state.as_ref() {
+            let ci = state.ci.get();
+            state.ci.set(ci.wrapping_add(count));
+        }
+    }
+
     /// Get a BlueFlame batch builder for low-latency SRQ WQE submission.
     ///
     /// Multiple receive WQEs can be accumulated in the BlueFlame buffer (up to 256 bytes)

@@ -411,6 +411,11 @@ impl<U> Context<U> {
         if recv_count > 0 {
             self.recv_cq.flush();
 
+            // Advance SRQ CI to match consumed entries. Each recv CQE consumes
+            // one SRQ entry; without advancing CI, available() stays at 0 and
+            // refill post_recv() calls silently fail.
+            self.srq.advance_ci(recv_count);
+
             let posted = self.srq_posted.get().saturating_sub(recv_count);
             self.srq_posted.set(posted);
 
@@ -442,6 +447,12 @@ impl<U> Context<U> {
 
     /// Dump credit state for all endpoints (debug).
     pub fn dump_credit_state(&self, label: &str) {
+        eprintln!(
+            "[{label}] pending_send_cqes={}, srq_posted={}, dirty_eps={}",
+            self.pending_send_cqes.get(),
+            self.srq_posted.get(),
+            !unsafe { &*self.dirty_endpoints.get() }.is_empty(),
+        );
         let endpoints = unsafe { &*self.endpoints.get() };
         for (id, ep) in endpoints.iter() {
             let ep = unsafe { &*ep.get() };
@@ -453,13 +464,11 @@ impl<U> Context<U> {
             let last_recv = ep.last_recv_pos.get();
             let last_notified = ep.last_notified_recv_pos.get();
             let unreturned = last_recv - last_notified;
-            let batch_count = ep.batch_message_count.get();
-            let wrap = ep.wrap_pending.get();
-            let flush_start = ep.flush_start_pos.get();
+            let pending_calls = unsafe { &*ep.pending_calls.get() }.len();
             eprintln!(
                 "[{label}] ep={id}: ring={ring_size}, producer={producer}, consumer={consumer}, \
                  in_flight={in_flight}, last_recv={last_recv}, last_notified={last_notified}, \
-                 unreturned={unreturned}, batch_count={batch_count}, wrap={wrap}, flush_start={flush_start}"
+                 unreturned={unreturned}, pending_calls={pending_calls}"
             );
         }
     }
@@ -565,7 +574,10 @@ impl<U> Context<U> {
         let endpoints = unsafe { &*endpoints.get() };
         let endpoint = match endpoints.get(endpoint_id) {
             Some(ep) => &**ep as *const UnsafeCell<EndpointInner<U>>,
-            None => return,
+            None => {
+                eprintln!("[dc WARN] process_cqe_static: endpoint_id={} not found", endpoint_id);
+                return;
+            }
         };
 
         let (delta, ring_credit_return, message_count);
@@ -575,9 +587,16 @@ impl<U> Context<U> {
             let recv_ring_mask = ep.recv_ring.len() as u64 - 1;
             let meta_offset = (pos & recv_ring_mask) as usize;
 
+            // Use volatile reads to prevent any compiler optimization from reading stale data.
             unsafe {
-                (delta, ring_credit_return, message_count) =
-                    decode_batch_header(ep.recv_ring[meta_offset..].as_ptr());
+                let hdr_ptr = ep.recv_ring[meta_offset..].as_ptr();
+                let ptr = hdr_ptr as *const u64;
+                let raw_delta = std::ptr::read_volatile(ptr);
+                let raw_credit = std::ptr::read_volatile(ptr.add(1));
+                let raw_msg_count = std::ptr::read_volatile(hdr_ptr.add(16) as *const u32);
+                delta = u64::from_le(raw_delta);
+                ring_credit_return = u64::from_le(raw_credit);
+                message_count = u32::from_le(raw_msg_count);
             }
 
             ep.recv_ring_producer

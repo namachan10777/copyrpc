@@ -794,6 +794,11 @@ impl Cq {
         sw_owner == hw_owner
     }
 
+    /// Returns the current consumer index (CI) value.
+    pub fn ci(&self) -> u32 {
+        self.state.ci.get()
+    }
+
     /// Update the CQ doorbell record.
     ///
     /// Call this after processing completions to acknowledge them to the hardware.
