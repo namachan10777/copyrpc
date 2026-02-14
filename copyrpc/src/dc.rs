@@ -28,6 +28,11 @@ pub const BATCH_HEADER_SIZE: usize = 32;
 /// DC-specific message header size (call_id + payload_len, no piggyback).
 const DC_HEADER_SIZE: usize = 8;
 
+/// Credit reserved in the remote recv ring for credit-return-only batches.
+/// This prevents bidirectional credit deadlock by ensuring there is always
+/// room to send a 0-message batch carrying `ring_credit_return`.
+const CREDIT_RETURN_RESERVE: u64 = BATCH_HEADER_SIZE as u64;
+
 #[inline(always)]
 fn dc_padded_message_size(payload_len: u32) -> u64 {
     let total = DC_HEADER_SIZE as u64 + payload_len as u64;
@@ -435,6 +440,30 @@ impl<U> Context<U> {
         !unsafe { &*self.dirty_endpoints.get() }.is_empty()
     }
 
+    /// Dump credit state for all endpoints (debug).
+    pub fn dump_credit_state(&self, label: &str) {
+        let endpoints = unsafe { &*self.endpoints.get() };
+        for (id, ep) in endpoints.iter() {
+            let ep = unsafe { &*ep.get() };
+            let remote_ring = ep.remote_recv_ring.get();
+            let ring_size = remote_ring.map(|r| r.size).unwrap_or(0);
+            let producer = ep.send_ring_producer.get();
+            let consumer = ep.remote_consumer_pos.get();
+            let in_flight = producer.saturating_sub(consumer);
+            let last_recv = ep.last_recv_pos.get();
+            let last_notified = ep.last_notified_recv_pos.get();
+            let unreturned = last_recv - last_notified;
+            let batch_count = ep.batch_message_count.get();
+            let wrap = ep.wrap_pending.get();
+            let flush_start = ep.flush_start_pos.get();
+            eprintln!(
+                "[{label}] ep={id}: ring={ring_size}, producer={producer}, consumer={consumer}, \
+                 in_flight={in_flight}, last_recv={last_recv}, last_notified={last_notified}, \
+                 unreturned={unreturned}, batch_count={batch_count}, wrap={wrap}, flush_start={flush_start}"
+            );
+        }
+    }
+
     pub fn flush_endpoints(&self) {
         let mut polled_send_cqes = 0u32;
         if self.pending_send_cqes.get() > 0 {
@@ -479,6 +508,10 @@ impl<U> Context<U> {
                         emitted |= was_emitted;
                         newly_signaled =
                             newly_signaled.saturating_add(ep_ref.take_newly_signaled_count());
+                        // Re-enqueue if there is still pending work (e.g. wrap deferred).
+                        if ep_ref.has_pending_flush() {
+                            unsafe { &mut *self.dirty_endpoints.get() }.push_back(endpoint_id);
+                        }
                     }
                     Err(Error::RingFull) => {
                         newly_signaled =
@@ -556,11 +589,14 @@ impl<U> Context<U> {
 
         if message_count == WRAP_MESSAGE_COUNT {
             let ep = unsafe { &*(*endpoint).get() };
+            // Skip the padding after the batch header. delta includes the header
+            // (BATCH_HEADER_SIZE) plus the padding to the cycle boundary.
+            // The old code recalculated remaining from the current position, which
+            // was wrong when the header exactly filled the remaining cycle bytes
+            // (remaining == 0 at offset 0 → miscomputed as ring_size).
+            let skip = delta - BATCH_HEADER_SIZE as u64;
             let pos = ep.last_recv_pos.get();
-            let recv_ring_len = ep.recv_ring.len() as u64;
-            let offset = pos & (recv_ring_len - 1);
-            let remaining = recv_ring_len - offset;
-            ep.last_recv_pos.set(pos + remaining);
+            ep.last_recv_pos.set(pos + skip);
             return;
         }
 
@@ -680,12 +716,16 @@ impl<U> EndpointInner<U> {
         }
     }
 
+    /// Check if the batch (header at meta_pos + all messages so far + this new
+    /// message of `msg_size`) fits within the current ring cycle without crossing
+    /// the ring boundary. RDMA WRITE is linear, so the entire batch must reside
+    /// within a single cycle.
     #[inline(always)]
     fn has_cycle_room_for(&self, msg_size: u64) -> bool {
-        let producer = self.send_ring_producer.get();
         let ring_size = self.send_ring.len() as u64;
-        let offset = producer & (ring_size - 1);
-        offset + msg_size < ring_size
+        let meta_offset = self.meta_pos.get() & (ring_size - 1);
+        let batch_end = self.send_ring_producer.get() + msg_size - self.meta_pos.get();
+        meta_offset + batch_end < ring_size
     }
 
     #[inline(always)]
@@ -697,7 +737,7 @@ impl<U> EndpointInner<U> {
             .set(producer + BATCH_HEADER_SIZE as u64);
     }
 
-    /// Emit the current batch: batch header as inline DS, messages via SGE.
+    /// Emit the current batch: entire batch (header + messages) via single SGE.
     #[inline(always)]
     fn emit_batch(&self, dci: &mut DciQp, message_count: u32) -> Result<()> {
         let remote_ring = self
@@ -710,29 +750,52 @@ impl<U> EndpointInner<U> {
         let end = self.send_ring_producer.get();
         let delta = end - start;
 
-        // Build batch header on stack (never written to send ring).
+        // Write batch header into the send ring's reserved header space.
         let ring_credit_return = self.last_recv_pos.get() - self.last_notified_recv_pos.get();
         self.last_notified_recv_pos.set(self.last_recv_pos.get());
-        let mut batch_header_buf = [0u8; BATCH_HEADER_SIZE];
+        let ring_mask = self.send_ring.len() as u64 - 1;
+        let start_offset = (start & ring_mask) as usize;
         unsafe {
             encode_batch_header(
-                batch_header_buf.as_mut_ptr(),
+                self.send_ring.as_ptr().add(start_offset) as *mut u8,
                 delta,
                 ring_credit_return,
                 message_count,
             );
         }
 
-        // SGE covers messages only (skip the 32B reserved header space in send ring).
-        let ring_mask = self.send_ring.len() as u64 - 1;
-        let start_offset = (start & ring_mask) as usize;
-        let msg_start_offset = start_offset + BATCH_HEADER_SIZE;
-        let msg_len = (delta - BATCH_HEADER_SIZE as u64) as u32;
+        // Single SGE covering the entire batch (header + messages).
+        let local_addr = self.send_ring_mr.addr() as u64 + start_offset as u64;
+        let sge_len = delta as u32;
 
         let remote_offset = start & (remote_ring.size - 1);
         let remote_addr = remote_ring.addr + remote_offset;
         let imm = self.remote_endpoint_id.get();
-        let local_addr = self.send_ring_mr.addr() as u64 + msg_start_offset as u64;
+
+        // Invariant: flush_start_pos == meta_pos at batch emit time.
+        debug_assert_eq!(
+            self.flush_start_pos.get(),
+            self.meta_pos.get(),
+            "flush_start_pos != meta_pos"
+        );
+
+        // Debug: verify RDMA WRITE doesn't cross remote ring boundary.
+        debug_assert!(
+            remote_offset + delta <= remote_ring.size,
+            "batch crosses remote ring boundary: remote_offset={remote_offset}, delta={delta}, \
+             ring_size={}, start={start}, end={end}, msg_count={message_count}, meta_pos={}",
+            remote_ring.size,
+            self.meta_pos.get(),
+        );
+
+        // Debug: verify local SGE doesn't exceed MR.
+        debug_assert!(
+            start_offset as u64 + delta <= self.send_ring.len() as u64,
+            "SGE exceeds MR: start_offset={start_offset}, delta={delta}, \
+             ring_size={}, start={start}, meta_pos={}",
+            self.send_ring.len(),
+            self.meta_pos.get(),
+        );
 
         let emit_ctx = dci.emit_ctx().map_err(Error::Io)?;
         let av = DcAvIb::new(remote_dct.dc_key, remote_dct.dctn, remote_dct.dlid);
@@ -746,8 +809,7 @@ impl<U> EndpointInner<U> {
                     flags: WqeFlags::empty(),
                     remote_addr: remote_addr,
                     rkey: remote_ring.rkey,
-                    inline: batch_header_buf.as_slice(),
-                    sge: { addr: local_addr, len: msg_len, lkey: self.send_ring_mr.lkey() },
+                    sge: { addr: local_addr, len: sge_len, lkey: self.send_ring_mr.lkey() },
                     imm: imm,
                     signaled: self.endpoint_id,
                 }
@@ -767,8 +829,7 @@ impl<U> EndpointInner<U> {
                     flags: WqeFlags::empty(),
                     remote_addr: remote_addr,
                     rkey: remote_ring.rkey,
-                    inline: batch_header_buf.as_slice(),
-                    sge: { addr: local_addr, len: msg_len, lkey: self.send_ring_mr.lkey() },
+                    sge: { addr: local_addr, len: sge_len, lkey: self.send_ring_mr.lkey() },
                     imm: imm,
                 }
             )
@@ -819,12 +880,45 @@ impl<U> EndpointInner<U> {
         }
 
         if self.wrap_pending.get() {
-            self.emit_wrap(dci)?;
-            self.wrap_pending.set(false);
-            emitted = true;
+            match self.emit_wrap(dci) {
+                Ok(()) => {
+                    self.wrap_pending.set(false);
+                    emitted = true;
+                }
+                Err(e) => {
+                    // If a batch WQE was already emitted above, return Ok(true)
+                    // so the caller rings the doorbell. wrap_pending stays true
+                    // for the next flush cycle.
+                    if emitted {
+                        return Ok(true);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        // Credit-return-only: when no data is pending but we have un-returned
+        // credit, send a 0-message batch carrying only ring_credit_return.
+        // This breaks bidirectional credit deadlock where both sides exhaust
+        // credit and can't piggyback credit returns on data batches.
+        // Safety: call()/reply() reserve CREDIT_RETURN_RESERVE bytes in the
+        // remote recv ring, so this 32B batch header always fits.
+        if !emitted {
+            let unreturned = self.last_recv_pos.get() - self.last_notified_recv_pos.get();
+            if unreturned > 0 {
+                self.emit_batch(dci, 0)?;
+                self.prepare_next_batch();
+                emitted = true;
+            }
         }
 
         Ok(emitted)
+    }
+
+    /// Returns true if this endpoint has unflushed work (pending batch or wrap).
+    #[inline(always)]
+    fn has_pending_flush(&self) -> bool {
+        self.wrap_pending.get() || self.batch_message_count.get() > 0
     }
 }
 
@@ -898,9 +992,12 @@ impl<U> Endpoint<U> {
         let producer = inner.send_ring_producer.get();
         let consumer = inner.remote_consumer_pos.get();
         let in_flight = producer.saturating_sub(consumer);
-        let available = remote_ring.size.saturating_sub(in_flight);
+        let available = remote_ring
+            .size
+            .saturating_sub(in_flight + CREDIT_RETURN_RESERVE);
 
         if available < msg_size {
+            ctx.mark_endpoint_dirty(inner.endpoint_id);
             return Err(error::CallError::RingFull(user_data));
         }
 
@@ -967,8 +1064,11 @@ impl<U> RecvHandle<'_, U> {
         let producer = inner.send_ring_producer.get();
         let consumer = inner.remote_consumer_pos.get();
         let in_flight = producer.saturating_sub(consumer);
-        let available = remote_ring.size.saturating_sub(in_flight);
+        let available = remote_ring
+            .size
+            .saturating_sub(in_flight + CREDIT_RETURN_RESERVE);
         if available < msg_size {
+            self.ctx.mark_endpoint_dirty(inner.endpoint_id);
             return Err(Error::RingFull);
         }
 
