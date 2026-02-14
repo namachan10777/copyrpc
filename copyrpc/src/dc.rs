@@ -1127,16 +1127,6 @@ unsafe fn encode_batch_header(
     std::ptr::write_bytes(buf.add(20), 0, 12);
 }
 
-#[inline]
-unsafe fn decode_batch_header(buf: *const u8) -> (u64, u64, u32) {
-    let ptr = buf as *const u64;
-    let delta = u64::from_le(std::ptr::read(ptr));
-    let ring_credit_return = u64::from_le(std::ptr::read(ptr.add(1)));
-    let ptr32 = buf.add(16) as *const u32;
-    let message_count = u32::from_le(std::ptr::read(ptr32));
-    (delta, ring_credit_return, message_count)
-}
-
 /// A pre-bound receive poller that stores a callback for reuse across poll iterations.
 ///
 /// This avoids reconstructing the closure environment on every call to `poll_recv_counted`.

@@ -9,7 +9,6 @@ use crate::slot;
 use crate::storage::ShardedStore;
 
 // === Type aliases ===
-
 pub type DaemonFlux = inproc::Flux<DelegatePayload, usize>;
 
 type CopyrpcCtx = copyrpc::dc::Context<SlotPtrs>;
@@ -101,7 +100,7 @@ fn handle_local(store: &mut ShardedStore, req: &Request) -> Response {
     }
 }
 
-// === RC QP connection info (used by delegation_backend, copyrpc_direct_backend) ===
+// === RC QP connection info (used by copyrpc_direct_backend) ===
 
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
@@ -180,17 +179,6 @@ pub fn auto_adjust_ring_size(
     }
     ring_size
 }
-
-pub struct CopyrpcSetup {
-    pub local_info_tx: std::sync::mpsc::Sender<Vec<EndpointConnectionInfo>>,
-    pub remote_info_rx: std::sync::mpsc::Receiver<Vec<EndpointConnectionInfo>>,
-    pub device_index: usize,
-    pub port: u8,
-    pub ring_size: usize,
-    pub my_remote_ranks: Vec<u32>,
-}
-
-// === DC copyrpc setup ===
 
 pub struct CopyrpcDcSetup {
     pub local_info_tx: std::sync::mpsc::Sender<Vec<DcEndpointConnectionInfo>>,

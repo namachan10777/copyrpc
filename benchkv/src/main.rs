@@ -2,13 +2,10 @@ mod affinity;
 mod client;
 mod copyrpc_direct_backend;
 mod daemon;
-mod delegation_backend;
-mod erpc_backend;
 mod message;
 mod memstat;
 mod mpi_util;
 mod parquet_out;
-mod qd_sample;
 mod shm;
 mod slot;
 mod storage;
@@ -83,14 +80,6 @@ struct Cli {
     #[arg(long, default_value = "4194304")]
     ring_size: usize,
 
-    /// Output directory for queue-depth samples (CSV). Disabled if not set.
-    #[arg(long)]
-    qd_sample_dir: Option<String>,
-
-    /// Queue-depth sampling interval (every N loop iterations)
-    #[arg(long, default_value = "1024")]
-    qd_sample_interval: u32,
-
     #[command(subcommand)]
     subcommand: SubCmd,
 }
@@ -99,31 +88,10 @@ struct Cli {
 enum SubCmd {
     /// copyrpc meta_put/meta_get benchmark
     Meta,
-    /// eRPC meta_put/meta_get benchmark
-    Erpc {
-        /// Session credits
-        #[arg(long, default_value = "32")]
-        session_credits: usize,
-        /// Request window size
-        #[arg(long, default_value = "8")]
-        req_window: usize,
-    },
     /// UCX Active Message meta_put/meta_get benchmark
     UcxAm,
     /// copyrpc direct (no ipc/Flux) meta_put/meta_get benchmark
     CopyrpcDirect,
-    /// Delegation: clients submit remote requests via shared-memory MPSC to Daemon#0
-    Delegation {
-        /// Recv coalescing RTT estimate [us] (0 = disabled)
-        #[arg(long, default_value = "0.0")]
-        coalesce_rtt_us: f64,
-        /// Reply batch hold time [us] (0 = disabled, initial value for adaptive)
-        #[arg(long, default_value = "10.0")]
-        batch_hold_us: f64,
-        /// Enable arrival-rate feedback to dynamically adjust hold time
-        #[arg(long, default_value = "true")]
-        adaptive_hold: bool,
-    },
 }
 
 fn main() {
@@ -145,19 +113,6 @@ fn main() {
 
     let all_rows = match &cli.subcommand {
         SubCmd::Meta => run_meta(&cli, &world, rank, size, num_daemons, num_clients),
-        SubCmd::Erpc {
-            session_credits,
-            req_window,
-        } => erpc_backend::run_erpc(
-            &cli,
-            &world,
-            rank,
-            size,
-            num_daemons,
-            num_clients,
-            *session_credits,
-            *req_window,
-        ),
         SubCmd::UcxAm => {
             ucx_am_backend::run_ucx_am(&cli, &world, rank, size, num_daemons, num_clients)
         }
@@ -168,21 +123,6 @@ fn main() {
             size,
             num_daemons,
             num_clients,
-        ),
-        SubCmd::Delegation {
-            coalesce_rtt_us,
-            batch_hold_us,
-            adaptive_hold,
-        } => delegation_backend::run_delegation(
-            &cli,
-            &world,
-            rank,
-            size,
-            num_daemons,
-            num_clients,
-            *coalesce_rtt_us,
-            *batch_hold_us,
-            *adaptive_hold,
         ),
     };
 

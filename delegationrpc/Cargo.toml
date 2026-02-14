@@ -1,8 +1,0 @@
-[package]
-name = "delegationrpc"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-nix.workspace = true
-libc.workspace = true

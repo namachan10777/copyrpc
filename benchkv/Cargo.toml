@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 copyrpc = { path = "../copyrpc" }
 inproc = { path = "../inproc" }
-ipc = { path = "../ipc" }
 mlx5 = { path = "../mlx5" }
 fastmap = { path = "../fastmap" }
 mpi.workspace = true
@@ -14,10 +13,6 @@ clap.workspace = true
 parquet.workspace = true
 arrow.workspace = true
 libc.workspace = true
-anyhow.workspace = true
-delegationrpc = { path = "../delegationrpc" }
-fastant.workspace = true
-erpc = { path = "../erpc" }
 ucx_sys = { path = "../ucx_sys" }
 gethostname = "1"
 rand = "0.9"

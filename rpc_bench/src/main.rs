@@ -1,7 +1,6 @@
 mod affinity;
 mod copyrpc_bench;
 mod epoch;
-mod erpc_bench;
 
 mod mpi_util;
 mod parquet_out;
@@ -73,19 +72,6 @@ enum SystemCmd {
         /// Ring buffer size
         #[arg(long, default_value = "1048576")]
         ring_size: usize,
-
-        #[command(subcommand)]
-        mode: ModeCmd,
-    },
-    /// eRPC benchmark
-    Erpc {
-        /// Session credits
-        #[arg(long, default_value = "8")]
-        session_credits: usize,
-
-        /// Request window size
-        #[arg(long, default_value = "64")]
-        req_window: usize,
 
         #[command(subcommand)]
         mode: ModeCmd,
@@ -165,11 +151,6 @@ fn main() {
         SystemCmd::Copyrpc { ring_size, mode } => {
             copyrpc_bench::run(&common, &world, ring_size, &mode)
         }
-        SystemCmd::Erpc {
-            session_credits,
-            req_window,
-            mode,
-        } => erpc_bench::run(&common, &world, session_credits, req_window, &mode),
         SystemCmd::UcxAm { mode } => ucx_am_bench::run(&common, &world, &mode),
         SystemCmd::RcSend { num_slots, mode } => {
             rc_send_recv_bench::run(&common, &world, num_slots, &mode)
