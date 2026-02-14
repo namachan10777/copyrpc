@@ -80,6 +80,10 @@ struct Cli {
     #[arg(long, default_value = "4194304")]
     ring_size: usize,
 
+    /// NUMA isolation: daemon on NIC NUMA, clients on remote NUMA first
+    #[arg(long)]
+    numa_isolate: bool,
+
     #[command(subcommand)]
     subcommand: SubCmd,
 }
@@ -148,8 +152,21 @@ fn run_agg(
     // CPU affinity
     let available_cores = affinity::get_available_cores(cli.device_index);
     let (ranks_on_node, rank_on_node) = mpi_util::node_local_rank(world);
+
+    // NUMA isolation test: daemon on NIC NUMA (core 2), clients on other NUMA first
+    let isolated_cores = {
+        let mut cores = vec![available_cores[0]]; // daemon core (NUMA 0)
+        // Add non-NUMA-0 cores first (16..31 on this machine)
+        cores.extend(available_cores.iter().copied().filter(|c| *c >= 16));
+        // Then NUMA-0 overflow
+        cores.extend(available_cores.iter().copied().filter(|c| *c >= 2 && *c < 16));
+        cores.dedup();
+        cores
+    };
+    let effective_cores = if cli.numa_isolate { &isolated_cores } else { &available_cores };
+
     let (daemon_cores, client_cores) = affinity::assign_cores(
-        &available_cores,
+        effective_cores,
         num_daemons,
         num_clients,
         ranks_on_node,
