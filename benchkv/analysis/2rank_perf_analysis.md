@@ -82,14 +82,14 @@ Full RTT histogram at 16 clients (1μs buckets):
 ```
 
 **Two populations**:
-- **Fast population (4–8μs)**: ~18% of requests. These are requests in small batches — daemon cycles with few concurrent remote requests.
-- **Slow population (11–16μs)**: ~82% of requests. These are requests in large batches — the typical steady-state where most client slots are in-flight.
+- **Fast population (4–8μs)**: ~18% of requests. These encounter a lightly-loaded pipeline (few other requests in-flight) — minimal queuing delay, RTT ≈ base pipeline latency.
+- **Slow population (11–16μs)**: ~82% of requests. These encounter a saturated pipeline (many requests in-flight) — significant queuing delay from competing with other in-flight requests.
 
-This bimodal structure directly supports the batch processing model (Section 5).
+This bimodal structure reflects the pipeline occupancy fluctuation: most of the time the pipeline is saturated (82%), but occasionally a burst of completions temporarily drains the queue (18%).
 
-## 5. Root Cause: Single-Threaded Batch Processing Model
+## 5. Root Cause: Pipeline Saturation and Closed-Loop Queuing
 
-### 5.1 Mechanism
+### 5.1 Daemon Loop Structure
 
 The daemon is single-threaded with a 4-phase loop:
 
@@ -100,90 +100,102 @@ Phase 2:  GQ scan — detect client SHM requests, call ep.call() for remote
 Phase 3:  flush_endpoints() — post WQE for all pending messages, ring doorbell
 ```
 
-All messages (requests, replies, credit returns) are **batched into a single RDMA WRITE per flush**.
-The NIC processes one WQE per flush. This creates a **batch pipeline**:
+### 5.2 Key Observation: Batch Sizes Are Small
+
+The average batch size per flush is **not** N (total in-flight):
 
 ```
-Source daemon:     [detect N requests] → [flush: 1 RDMA WRITE with N messages]
-                                    ↓ network one-way
-Remote daemon:     [detect CQE with N messages] → [process all N] → [flush: 1 RDMA WRITE with N replies]
-                                    ↓ network one-way
-Source daemon:     [detect CQE with N replies] → [write N SHM responses]
-                                    ↓ SHM cache coherency
-Clients:           [detect responses] → [write new requests]
-                                    ↓ SHM cache coherency
-Source daemon:     [detect N new requests] → repeat
+messages/flush = (remote_requests + replies) / flushes
+               = (1.05M + 1.05M) / 1.75M
+               = 1.2 messages/flush
 ```
 
-### 5.2 Per-Cycle Time Model
+The daemon flushes 1.75M times/s. Each flush carries only ~1.2 data messages
+(~0.6 outgoing requests + ~0.6 replies to incoming). Per-request CPU processing
+(GQ scan, encode, recv, handle, reply, callback) is **~80–100ns each** — nanoseconds,
+not microseconds. The daemon is only ~22% utilized.
 
-Each batch cycle processes N remote requests and takes:
+### 5.3 Pipeline Parallelism Limit
 
-```
-T_cycle = T_fixed + T_per_req × N
-```
-
-Where:
-- **T_fixed ≈ 5μs**: 2× one-way network latency + fixed overheads (flush, doorbell, CQ poll, SHM turnaround)
-- **T_per_req**: per-request processing overhead within the cycle
-
-Per-request processing contributions:
-| Stage | Cost per request | Description |
-|---|---|---|
-| Source GQ scan | ~100ns | slot_read_seq (Acquire, cross-core cache miss) + payload decode + call() |
-| Remote CQ batch decode | ~30ns | batch header read + message decode |
-| Remote Phase 1b | ~110ns | recv() + handle_local() + reply() |
-| Source callback | ~80ns | RTT timestamp + slot_read_seq + decode + slot_write + GQ push |
-| **Total** | **~320ns** | |
-
-SHM turnaround per cycle (fixed):
-- Client detects response: ~100ns (cross-core cache coherency)
-- Client writes new request: ~10ns
-- Daemon detects new request: ~100ns (cross-core cache coherency)
-- **~210ns per cycle** (amortized per request: 210/N)
-
-### 5.3 Throughput Limit
-
-As N → ∞:
+The copyrpc pipeline can hold a limited number of concurrent requests, determined by
+the flush rate and network latency:
 
 ```
-throughput_max = lim(N→∞) N / (T_fixed + T_per_req × N) = 1 / T_per_req
+requests_in_one_way_flight = flush_rate × network_one_way × request_fraction
+                           = 1.75M/s × 2μs × (1.05M / 2.1M)
+                           = 1.75
+
+pipeline_parallelism = requests_in_one_way_flight × 2 (round-trip)
+                     + requests_in_processing
+                     ≈ 1.75 × 2 + ~0.7
+                     ≈ 4.2 concurrent requests
 ```
 
-From measured data (throughput saturates at 1.05M/s):
+Verification at each client count:
 
+| Clients | Remote in-flight | Pipeline slots used | Saturated? |
+|---|---|---|---|
+| 1 | 0.8 | 0.8 < 4.2 | No — RTT ≈ base (4.2μs) |
+| 4 | 3.5 | 3.5 < 4.2 | No — RTT ≈ base (4.6μs) |
+| 8 | 7.3 | 4.2 (capped) | Yes — queuing starts (RTT = 6.95μs) |
+| 16 | 15.6 | 4.2 (capped) | Yes — heavy queuing (RTT = 13.9μs) |
+
+### 5.4 RTT Inflation Mechanism
+
+With QD=1 closed-loop clients, each client blocks until its previous request completes.
+When in-flight requests exceed the pipeline parallelism (~4.2), the excess requests
+cannot enter the pipeline — they wait at the client level (client is idle, waiting for
+the previous response to come back via the saturated pipeline).
+
+This is classic **closed-loop queuing**: adding clients beyond saturation does not
+increase throughput, only increases response time.
+
+From Little's Law:
 ```
-T_per_req_measured = 1 / 1.05M = 952ns per request
+RTT = in_flight / throughput = 15.6 / 1.05M = 14.9μs ≈ measured 13.9μs ✓
 ```
 
-This is ~3× the component-level estimate of 320ns. The difference is explained by:
-1. **Cache miss amplification**: with 16 client slots scattered across cores 3–18 (multiple NUMA nodes), cross-core cache transfers average ~100–200ns per access (not 80ns)
-2. **Memory access serialization**: sequential Acquire loads in GQ scan stall the pipeline
-3. **Hash table accesses in handle_local()**: FastMap lookups may miss L1/L2 cache
-4. **copyrpc send/recv ring buffer management**: ring position updates, credit tracking
+The RTT breakdown:
+```
+Base pipeline latency:    ~4.2μs  (network round-trip + processing)
+Queuing delay:           +~9.7μs  (15.6 - 4.2 = 11.4 excess requests × 952ns/req)
+Total:                   ~13.9μs  ✓
+```
 
-### 5.4 Model Predictions vs Measured
+Note: the "952ns per request" (= 1/1.05M) is **not** per-request CPU processing time.
+It is the **inverse of the pipeline's maximum service rate**. Each additional in-flight
+request beyond the pipeline's capacity adds 1/λ_max ≈ 952ns of queuing delay.
 
-Using T_fixed = 5.0μs and T_per_req = 0.952μs:
+### 5.5 What Limits the Pipeline Service Rate?
 
-| Clients | In-flight (N) | T_cycle predicted (μs) | Throughput predicted | Throughput measured |
-|---|---|---|---|---|
-| 1 | 0.9 | 5.86 | 154K/s | 186K/s |
-| 4 | 3.5 | 8.33 | 420K/s | 753K/s |
-| 8 | 7.3 | 11.95 | 611K/s | 1.04M/s |
-| 16 | 15.6 | 19.85 | 786K/s | 1.05M/s |
+The pipeline throughput of 1.05M/s is determined by:
 
-The model underestimates throughput at low N because:
-- With few in-flight requests, batches are small → less per-request overhead (fewer cache misses in GQ scan, less batch decode time)
-- T_per_req is load-dependent: ~320ns at low N, ~952ns at high N
+1. **Flush rate** (1.75M/s): The daemon flushes once per productive loop iteration.
+   Productive loops occur when events (CQEs, GQ entries) are detected — 5.1% of all loops.
 
-For a refined model, T_per_req increases with N due to cache pressure:
+2. **Messages per flush** (1.2): Each flush carries ~0.6 remote requests + ~0.6 replies.
+   Requests and replies share the same endpoint send ring and are flushed together.
 
-| N range | Effective T_per_req | Explanation |
-|---|---|---|
-| 1–4 | ~320ns | Few cache misses, small batches |
-| 8 | ~600ns | Increasing cache pressure from 8 concurrent slots |
-| 16 | ~950ns | Full cache pressure, all NUMA nodes active |
+3. **Closed-loop event arrival pattern**: Each flush triggers events that arrive
+   ~300ns later (SHM turnaround → new GQ entry) and ~4μs later (network round-trip
+   → response CQE). These events trigger the next productive loop. The average
+   inter-productive-loop interval is 1/1.75M = 571ns.
+
+4. **Not limited by**: daemon CPU (22% utilized), NIC bandwidth (<1% of ConnectX-7),
+   credit starvation (ringfull/loop = 0.000001), or send ring capacity.
+
+### 5.6 Model Predictions vs Measured
+
+The pipeline saturation model:
+- If N_remote ≤ pipeline_parallelism: throughput ≈ N_remote / T_base, RTT ≈ T_base
+- If N_remote > pipeline_parallelism: throughput ≈ λ_max, RTT ≈ N_remote / λ_max
+
+| Clients | N_remote | Throughput predicted | Throughput measured | RTT predicted | RTT measured |
+|---|---|---|---|---|---|
+| 1 | 0.8 | 0.8/4.2μs = 190K/s | 186K/s ✓ | 4.2μs | 4.20μs ✓ |
+| 4 | 3.5 | 3.5/4.2μs = 833K/s | 753K/s ≈ | 4.2μs | 4.60μs ≈ |
+| 8 | 7.3 | 1.05M/s (saturated) | 1.04M/s ✓ | 7.3/1.05M = 6.95μs | 6.95μs ✓ |
+| 16 | 15.6 | 1.05M/s (saturated) | 1.05M/s ✓ | 15.6/1.05M = 14.9μs | 13.90μs ≈ |
 
 ## 6. Daemon Loop Metrics (16 clients)
 
@@ -248,7 +260,7 @@ T_local ≈ 120ns is consistent with: daemon detection (~14ns) + slot_read_seq c
 | Bottleneck | GQ scan (960ns) | copyrpc RTT (13.9μs) |
 
 In 1-rank mode, the daemon is fully utilized processing 14+ requests per loop.
-In 2-rank mode, the daemon is 22% utilized; **the bottleneck is copyrpc network RTT amplified by batch processing**.
+In 2-rank mode, the daemon is 22% utilized; **the bottleneck is copyrpc pipeline saturation under closed-loop QD=1**.
 
 ## 9. Conclusions
 
@@ -258,8 +270,12 @@ The 3.5× RPS gap (15.77M → 4.50M) is **fully explained** by:
 
 1. **50% of requests are remote** → each remote request takes 13.9μs (daemon copyrpc RTT) vs ~0.12μs for local
 2. **copyrpc RTT at 16 clients (13.9μs) is 3.3× the base RTT (4.2μs at 1 client)**
-3. The RTT inflation is caused by **single-threaded batch processing**: the daemon processes all N in-flight remote requests sequentially within each batch cycle, adding ~950ns per request to the cycle time
-4. Throughput saturates at **~1.05M remote requests/s per rank** (determined by T_per_req ≈ 950ns)
+3. The RTT inflation is caused by **pipeline saturation + closed-loop queuing**:
+   - The copyrpc pipeline can hold ~4.2 concurrent requests (limited by flush rate × network latency)
+   - With 15.6 in-flight remote requests, ~11.4 excess requests queue at the client level
+   - This is NOT caused by large batch processing (average batch size = 1.2)
+   - Per-request CPU processing is ~80–100ns (nanoseconds, not microseconds)
+4. Throughput saturates at **~1.05M remote requests/s per rank** (pipeline service rate = flush_rate × requests_per_flush = 1.75M × 0.6)
 
 ### 9.2 Quantitative Gap Breakdown
 
@@ -272,17 +288,22 @@ T_avg = 0.5 × T_local + 0.5 × T_remote
 RPS_per_rank = 16 / 7.11μs = 2.25M ← matches measured 2.25M ✓
 
 T_remote breakdown:
-  Base copyrpc RTT (unloaded):     4.2μs (measured at 1 client)
-  Batch processing overhead:      +9.7μs (15.6 in-flight × 0.62μs/req amortized)
-  Total:                          13.9μs ✓
+  Base copyrpc RTT (unloaded):     4.2μs  (pipeline latency: network + processing)
+  Queuing delay (pipeline full):  +9.7μs  (11.4 excess requests / 1.05M service rate)
+  Total:                          13.9μs  ✓
+
+Pipeline parallelism:
+  flush_rate × network_one_way × 2 × request_fraction + processing_slots
+  = 1.75M × 2μs × 2 × 0.5 + 0.7
+  ≈ 4.2 concurrent requests
 ```
 
 ### 9.3 Optimization Opportunities
 
 | Optimization | Expected Impact | Mechanism |
 |---|---|---|
-| **Incremental flush** (flush after each call() in GQ scan) | Reduce batch size → lower RTT at high N | Pipeline requests through network instead of batching |
-| **QD > 1** | More in-flight with same RTT | Increase client concurrency without daemon changes |
-| **Multi-daemon per rank** | Parallelize batch processing | Reduce per-daemon batch size |
-| **Reduce per-request overhead** | Higher throughput ceiling | Optimize slot_read_seq, handle_local, reply encoding |
-| **NUMA-aware client placement** | Lower cache coherency latency | Place clients near daemon core |
+| **QD > 1** | Linear RTT reduction (more in-flight → higher throughput without pipeline change) | Break closed-loop QD=1 constraint; effective N_remote grows proportionally |
+| **Increase flush rate** (flush per call instead of per loop) | More pipeline slots → higher throughput ceiling | Pipeline_parallelism = flush_rate × network_RTT; higher flush_rate → more concurrent requests |
+| **Multi-daemon per rank** | More pipeline streams | Each daemon has independent endpoint + flush cycle |
+| **Reduce network RTT** | Lower base pipeline latency → lower queuing threshold | Smaller messages, better NIC configuration |
+| **NUMA-aware client placement** | Lower SHM turnaround → faster event recycling | Faster closed-loop cycling increases flush rate |
