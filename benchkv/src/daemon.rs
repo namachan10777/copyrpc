@@ -374,6 +374,8 @@ pub fn run_daemon(
     // Copyrpc round-trip time measurement
     let mut send_timestamps: Vec<fastant::Instant> = vec![fastant::Instant::now(); max_clients];
     let send_timestamps_ptr = send_timestamps.as_mut_ptr();
+    let mut flush_timestamps: Vec<fastant::Instant> = vec![fastant::Instant::now(); max_clients];
+    let flush_timestamps_ptr = flush_timestamps.as_mut_ptr();
     let mut rtt_hist = [0u64; RTT_HIST_BUCKETS];
     let mut rtt_sum: u64 = 0;
     let mut rtt_count: u64 = 0;
@@ -382,6 +384,18 @@ pub fn run_daemon(
     let rtt_sum_ptr = std::ptr::addr_of_mut!(rtt_sum);
     let rtt_count_ptr = std::ptr::addr_of_mut!(rtt_count);
     let rtt_max_ptr = std::ptr::addr_of_mut!(rtt_max);
+
+    // RTT sub-phase: call→flush and flush→callback histograms
+    let mut call_to_flush_hist = [0u64; RTT_HIST_BUCKETS];
+    let call_to_flush_hist_ptr = call_to_flush_hist.as_mut_ptr();
+    let mut flush_to_cb_hist = [0u64; RTT_HIST_BUCKETS];
+    let flush_to_cb_hist_ptr = flush_to_cb_hist.as_mut_ptr();
+
+    // Track which slots need flush timestamp update
+    let mut pending_flush_slots: Vec<usize> = Vec::with_capacity(32);
+
+    // Incoming request turnaround: CQ detect → reply flush
+    let mut incoming_turnaround_hist = [0u64; RTT_HIST_BUCKETS];
 
     // Ground queue size samples
     let mut gq_size_samples: Vec<u64> = Vec::with_capacity(16384);
@@ -414,12 +428,15 @@ pub fn run_daemon(
         }
 
         // === Phase 1: Poll recv CQ (no flush — separated to Phase 3) ===
-        let phase1_start = if is_sample { Some(fastant::Instant::now()) } else { None };
+        let incoming_before = total_incoming_req;
+        let iter_start = fastant::Instant::now();
+        let phase1_start = if is_sample { Some(iter_start) } else { None };
         if let Some(ctx) = ctx_ref {
             let cqe_count = ctx.poll_recv_counted(|ptrs: SlotPtrs, data: &[u8]| unsafe {
                 // Copyrpc RTT measurement
                 let now = fastant::Instant::now();
-                let ts = &*send_timestamps_ptr.add(ptrs.slot_idx as usize);
+                let sidx = ptrs.slot_idx as usize;
+                let ts = &*send_timestamps_ptr.add(sidx);
                 let rtt_ns = now.duration_since(*ts).as_nanos() as u64;
                 if rtt_ns < 1_000_000_000 {
                     *rtt_sum_ptr += rtt_ns;
@@ -430,12 +447,23 @@ pub fn run_daemon(
                     let bucket =
                         (rtt_ns / RTT_HIST_BUCKET_NS).min(RTT_HIST_BUCKETS as u64 - 1) as usize;
                     *rtt_hist_ptr.add(bucket) += 1;
+
+                    // Sub-phase: call→flush and flush→callback
+                    let flush_ts = &*flush_timestamps_ptr.add(sidx);
+                    let c2f_ns = flush_ts.duration_since(*ts).as_nanos() as u64;
+                    let f2cb_ns = now.duration_since(*flush_ts).as_nanos() as u64;
+                    let c2f_bucket =
+                        (c2f_ns / RTT_HIST_BUCKET_NS).min(RTT_HIST_BUCKETS as u64 - 1) as usize;
+                    *call_to_flush_hist_ptr.add(c2f_bucket) += 1;
+                    let f2cb_bucket =
+                        (f2cb_ns / RTT_HIST_BUCKET_NS).min(RTT_HIST_BUCKETS as u64 - 1) as usize;
+                    *flush_to_cb_hist_ptr.add(f2cb_bucket) += 1;
                 }
 
                 let req_seq = slot::slot_read_seq(ptrs.req);
                 let resp = RemoteResponse::from_bytes(data).response;
                 slot::slot_write(ptrs.resp, req_seq, resp.as_bytes());
-                (*ground_queue_ptr).push_back(ptrs.slot_idx as usize);
+                (*ground_queue_ptr).push_back(sidx);
             });
             total_cqe_resp += cqe_count as u64;
         }
@@ -540,6 +568,7 @@ pub fn run_daemon(
                     unsafe {
                         *send_timestamps_ptr.add(slot_idx) = fastant::Instant::now();
                     }
+                    pending_flush_slots.push(slot_idx);
                 }
                 Err(copyrpc::error::CallError::RingFull(_))
                 | Err(copyrpc::error::CallError::InsufficientCredit(_)) => {
@@ -616,6 +645,24 @@ pub fn run_daemon(
             if ctx.has_dirty_endpoints() {
                 total_flush += 1;
                 ctx.flush_endpoints();
+                // Record flush timestamp for all slots pending since last flush
+                let flush_now = fastant::Instant::now();
+                for &sidx in &pending_flush_slots {
+                    unsafe {
+                        *flush_timestamps_ptr.add(sidx) = flush_now;
+                    }
+                }
+                pending_flush_slots.clear();
+
+                // Record incoming turnaround for iterations that processed incoming requests
+                if total_incoming_req > incoming_before {
+                    let turnaround_ns = flush_now.duration_since(iter_start).as_nanos() as u64;
+                    if turnaround_ns < 1_000_000_000 {
+                        let bucket = (turnaround_ns / RTT_HIST_BUCKET_NS)
+                            .min(RTT_HIST_BUCKETS as u64 - 1) as usize;
+                        incoming_turnaround_hist[bucket] += 1;
+                    }
+                }
             }
         }
 
@@ -682,6 +729,9 @@ pub fn run_daemon(
         rtt_count,
         rtt_max,
         &gq_size_samples,
+        &call_to_flush_hist,
+        &flush_to_cb_hist,
+        &incoming_turnaround_hist,
     );
 }
 
@@ -724,6 +774,9 @@ fn print_daemon_metrics(
     rtt_count: u64,
     rtt_max: u64,
     gq_size_samples: &[u64],
+    call_to_flush_hist: &[u64; RTT_HIST_BUCKETS],
+    flush_to_cb_hist: &[u64; RTT_HIST_BUCKETS],
+    incoming_turnaround_hist: &[u64; RTT_HIST_BUCKETS],
 ) {
     let n_samples = loop_time_samples.len();
     eprintln!(
@@ -872,6 +925,88 @@ fn print_daemon_metrics(
             }
         }
         eprintln!();
+    }
+
+    // RTT sub-phase: call→flush histogram
+    {
+        let c2f_total: u64 = call_to_flush_hist.iter().sum();
+        if c2f_total > 0 {
+            let c2f_p50 = hist_percentile(call_to_flush_hist, c2f_total, 50, RTT_HIST_BUCKET_NS);
+            let c2f_p90 = hist_percentile(call_to_flush_hist, c2f_total, 90, RTT_HIST_BUCKET_NS);
+            let c2f_p99 = hist_percentile(call_to_flush_hist, c2f_total, 99, RTT_HIST_BUCKET_NS);
+            eprintln!(
+                "  call_to_flush_ns (count={c2f_total}): p50={c2f_p50} p90={c2f_p90} p99={c2f_p99}",
+            );
+            eprintln!(
+                "  call_to_flush_us: p50={:.2} p90={:.2} p99={:.2}",
+                c2f_p50 as f64 / 1000.0,
+                c2f_p90 as f64 / 1000.0,
+                c2f_p99 as f64 / 1000.0,
+            );
+            eprint!("  call_to_flush_hist_us:");
+            let us_buckets = RTT_HIST_BUCKETS * RTT_HIST_BUCKET_NS as usize / 1000;
+            for us in 0..us_buckets {
+                let lo = us * 1000 / RTT_HIST_BUCKET_NS as usize;
+                let hi = ((us + 1) * 1000 / RTT_HIST_BUCKET_NS as usize).min(RTT_HIST_BUCKETS);
+                let count: u64 = call_to_flush_hist[lo..hi].iter().sum();
+                if count > 0 {
+                    eprint!(" {}us={}", us, count);
+                }
+            }
+            eprintln!();
+        }
+    }
+
+    // RTT sub-phase: flush→callback histogram
+    {
+        let f2cb_total: u64 = flush_to_cb_hist.iter().sum();
+        if f2cb_total > 0 {
+            let f2cb_p50 = hist_percentile(flush_to_cb_hist, f2cb_total, 50, RTT_HIST_BUCKET_NS);
+            let f2cb_p90 = hist_percentile(flush_to_cb_hist, f2cb_total, 90, RTT_HIST_BUCKET_NS);
+            let f2cb_p99 = hist_percentile(flush_to_cb_hist, f2cb_total, 99, RTT_HIST_BUCKET_NS);
+            eprintln!(
+                "  flush_to_cb_ns (count={f2cb_total}): p50={f2cb_p50} p90={f2cb_p90} p99={f2cb_p99}",
+            );
+            eprintln!(
+                "  flush_to_cb_us: p50={:.2} p90={:.2} p99={:.2}",
+                f2cb_p50 as f64 / 1000.0,
+                f2cb_p90 as f64 / 1000.0,
+                f2cb_p99 as f64 / 1000.0,
+            );
+            eprint!("  flush_to_cb_hist_us:");
+            let us_buckets = RTT_HIST_BUCKETS * RTT_HIST_BUCKET_NS as usize / 1000;
+            for us in 0..us_buckets {
+                let lo = us * 1000 / RTT_HIST_BUCKET_NS as usize;
+                let hi = ((us + 1) * 1000 / RTT_HIST_BUCKET_NS as usize).min(RTT_HIST_BUCKETS);
+                let count: u64 = flush_to_cb_hist[lo..hi].iter().sum();
+                if count > 0 {
+                    eprint!(" {}us={}", us, count);
+                }
+            }
+            eprintln!();
+        }
+    }
+
+    // Incoming turnaround: CQ detect → reply flush
+    {
+        let inc_total: u64 = incoming_turnaround_hist.iter().sum();
+        if inc_total > 0 {
+            let inc_p50 =
+                hist_percentile(incoming_turnaround_hist, inc_total, 50, RTT_HIST_BUCKET_NS);
+            let inc_p90 =
+                hist_percentile(incoming_turnaround_hist, inc_total, 90, RTT_HIST_BUCKET_NS);
+            let inc_p99 =
+                hist_percentile(incoming_turnaround_hist, inc_total, 99, RTT_HIST_BUCKET_NS);
+            eprintln!(
+                "  incoming_turnaround_ns (count={inc_total}): p50={inc_p50} p90={inc_p90} p99={inc_p99}",
+            );
+            eprintln!(
+                "  incoming_turnaround_us: p50={:.2} p90={:.2} p99={:.2}",
+                inc_p50 as f64 / 1000.0,
+                inc_p90 as f64 / 1000.0,
+                inc_p99 as f64 / 1000.0,
+            );
+        }
     }
 
     // Ground queue size statistics
