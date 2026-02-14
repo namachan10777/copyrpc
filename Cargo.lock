@@ -370,6 +370,7 @@ dependencies = [
  "arrow",
  "clap",
  "copyrpc",
+ "fastant",
  "fastmap",
  "gethostname 1.1.0",
  "inproc",

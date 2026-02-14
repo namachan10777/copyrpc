@@ -89,13 +89,13 @@ impl DcEndpointConnectionInfo {
 
 fn handle_local(store: &mut ShardedStore, req: &Request) -> Response {
     match *req {
-        Request::MetaPut { key, value, .. } => {
+        Request::AggPut { key, value, .. } => {
             store.put(key, value);
-            Response::MetaPutOk
+            Response::AggPutOk
         }
-        Request::MetaGet { key, .. } => match store.get(key) {
-            Some(v) => Response::MetaGetOk { value: v },
-            None => Response::MetaGetNotFound,
+        Request::AggGet { key, .. } => match store.get(key) {
+            Some(v) => Response::AggGetOk { value: v },
+            None => Response::AggGetNotFound,
         },
     }
 }
@@ -318,6 +318,12 @@ pub fn run_daemon(
     // Raw pointers for callback access without borrow conflicts.
     let ground_queue_ptr = std::ptr::addr_of_mut!(ground_queue);
 
+    // Loop timing instrumentation
+    const SAMPLE_MASK: u64 = 4095; // sample every 4096 iterations
+    let mut loop_counter: u64 = 0;
+    let mut loop_time_samples: Vec<u64> = Vec::with_capacity(16384);
+    let mut loop_start = fastant::Instant::now();
+
     while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
         // Discover newly connected clients
         if connected_count < max_clients {
@@ -325,6 +331,21 @@ pub fn run_daemon(
             while connected_count < new_count && connected_count < max_clients {
                 ground_queue.push_back(connected_count);
                 connected_count += 1;
+            }
+        }
+
+        // --- Prefetch: Phase 2 用の SHM slot を先行ロード ---
+        #[cfg(target_arch = "x86_64")]
+        {
+            let prefetch_count = ground_queue.len().min(4);
+            for i in 0..prefetch_count {
+                let slot_idx = ground_queue[i];
+                unsafe {
+                    std::arch::x86_64::_mm_prefetch(
+                        slots[slot_idx].req as *const i8,
+                        std::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
             }
         }
 
@@ -381,6 +402,11 @@ pub fn run_daemon(
             }
         }
 
+        // --- Prefetch: 次の Phase 1 用の CQ entry を先行ロード ---
+        if let Some(ctx) = ctx_ref {
+            ctx.prefetch_recv_cqe();
+        }
+
         // === Phase 2: Ground Queue Scan ===
         let scan_len = ground_queue.len();
         for _ in 0..scan_len {
@@ -407,7 +433,7 @@ pub fn run_daemon(
 
             let Some(ctx) = ctx_ref else {
                 // No copyrpc: respond with not-found
-                let resp = Response::MetaGetNotFound;
+                let resp = Response::AggGetNotFound;
                 unsafe { slot::slot_write(s.resp, req_seq, resp.as_bytes()) };
                 ground_queue.push_back(slot_idx);
                 continue;
@@ -432,7 +458,7 @@ pub fn run_daemon(
                     ctx.flush_endpoints();
                 }
                 Err(copyrpc::error::CallError::Other(_)) => {
-                    let resp = Response::MetaGetNotFound;
+                    let resp = Response::AggGetNotFound;
                     unsafe { slot::slot_write(s.resp, req_seq, resp.as_bytes()) };
                     ground_queue.push_back(slot_idx);
                 }
@@ -498,5 +524,60 @@ pub fn run_daemon(
                 ctx.flush_endpoints();
             }
         }
+
+        // Sample loop time every 4096 iterations
+        if (loop_counter & SAMPLE_MASK) == 0 && loop_counter > 0 {
+            let now = fastant::Instant::now();
+            let elapsed_ns = now.duration_since(loop_start).as_nanos() as u64;
+            // Per-iteration average over the last 4096 iterations
+            let per_iter_ns = elapsed_ns / (SAMPLE_MASK + 1);
+            loop_time_samples.push(per_iter_ns);
+            loop_start = now;
+        }
+        loop_counter += 1;
+    }
+
+    // Print loop time distribution
+    if !loop_time_samples.is_empty() {
+        let mut sorted = loop_time_samples.clone();
+        sorted.sort_unstable();
+        let len = sorted.len();
+        let sum: u64 = sorted.iter().sum();
+        let mean = sum / len as u64;
+        let p50 = sorted[len / 2];
+        let p90 = sorted[len * 90 / 100];
+        let p99 = sorted[len * 99 / 100];
+        let min = sorted[0];
+        let max = sorted[len - 1];
+
+        eprintln!(
+            "[daemon-{daemon_id}] loop time (ns/iter, {} samples, {} total iters): \
+             min={min} p50={p50} mean={mean} p90={p90} p99={p99} max={max}",
+            len,
+            loop_counter,
+        );
+
+        // Histogram with logarithmic buckets
+        let buckets = [50, 100, 200, 500, 1000, 2000, 5000, 10000, 50000, 100000, u64::MAX];
+        let labels = [
+            "≤50ns", "≤100ns", "≤200ns", "≤500ns", "≤1μs", "≤2μs", "≤5μs", "≤10μs", "≤50μs",
+            "≤100μs", ">100μs",
+        ];
+        let mut counts = vec![0usize; buckets.len()];
+        for &v in &sorted {
+            for (i, &b) in buckets.iter().enumerate() {
+                if v <= b {
+                    counts[i] += 1;
+                    break;
+                }
+            }
+        }
+        eprint!("[daemon-{daemon_id}] histogram:");
+        for (i, &c) in counts.iter().enumerate() {
+            if c > 0 {
+                eprint!(" {}={}", labels[i], c);
+            }
+        }
+        eprintln!();
     }
 }

@@ -445,6 +445,12 @@ impl<U> Context<U> {
         !unsafe { &*self.dirty_endpoints.get() }.is_empty()
     }
 
+    /// Prefetch the next recv CQ entry to hide memory/DMA latency.
+    #[inline(always)]
+    pub fn prefetch_recv_cqe(&self) {
+        self.recv_cq.prefetch_next_entry();
+    }
+
     /// Dump credit state for all endpoints (debug).
     pub fn dump_credit_state(&self, label: &str) {
         eprintln!(

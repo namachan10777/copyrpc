@@ -794,6 +794,24 @@ impl Cq {
         sw_owner == hw_owner
     }
 
+    /// Prefetch the next CQE slot without reading it.
+    /// Call before doing other work to hide DMA/memory latency.
+    #[inline(always)]
+    pub fn prefetch_next_entry(&self) {
+        let pending = unsafe { &*self.state.pending_mini_cqes.get() };
+        if pending.is_some() {
+            return; // already have mini CQEs, no prefetch needed
+        }
+        let ci = self.state.ci.get();
+        let idx = ci & (self.state.cqe_cnt - 1);
+        let cqe_size = self.state.cqe_size as usize;
+        let cqe_ptr = unsafe { self.state.buf.add((idx as usize) * cqe_size) };
+        let cqe64_offset = if cqe_size == 128 { 64 } else { 0 };
+        // Safety: cqe_ptr and cqe64_offset are computed from valid CQ buffer bounds.
+        let target = unsafe { cqe_ptr.add(cqe64_offset) };
+        prefetch_for_read!(target);
+    }
+
     /// Returns the current consumer index (CI) value.
     pub fn ci(&self) -> u32 {
         self.state.ci.get()
